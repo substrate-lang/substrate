@@ -1,0 +1,449 @@
+;; rt: the kernel runtime (spec section 2).
+;;
+;; rt owns the shared memory and table, the allocator, and the data
+;; operations that every module imports. It is written in the kernel
+;; language and compiled before anything else, with no macros available.
+;;
+;; Conventions: functions with Scheme names (car, length, vector-ref, ...)
+;; take and return values (spec 2.2), so a count is a fixnum. Lower-level
+;; helpers (alloc, heap-type, fixnum-value, ...) work on raw i32s and say so.
+
+(memory mem 16)
+(table tbl 1)                      ; index 0 stays null
+
+(import host-write "host" "write" (i32 i32 i32 -> i32))
+(import host-trap "host" "trap" (i32 i32 ->))
+
+(global hp i32 4096)               ; next free heap byte (HEAP_BASE)
+(global symtab i32 0)              ; intern table, made on first use
+
+;; ---- words -------------------------------------------------------------
+
+(func (fixnum [n i32]) -> i32 (i32.or (i32.shl n 1) 1))          ; raw -> value
+(func (fixnum-value [w i32]) -> i32 (i32.shr_s w 1))            ; value -> raw
+(func (truth [c i32]) -> i32 (select #t #f c))                  ; raw test -> #t/#f
+
+(func (fixnum? [w i32]) -> i32 (truth (i32.and w 1)))
+(func (char? [w i32]) -> i32 (truth (i32.eq (i32.and w 7) 4)))
+(func (char->integer [c i32]) -> i32 (fixnum (i32.shr_u c 3)))
+(func (integer->char [n i32]) -> i32 (i32.or (i32.shl (fixnum-value n) 3) 4))
+(func (eq? [a i32] [b i32]) -> i32 (truth (i32.eq a b)))
+(func (not [a i32]) -> i32 (truth (i32.eqz a)))
+(func (null? [w i32]) -> i32 (truth (i32.eq w '())))
+(func (boolean? [w i32]) -> i32 (truth (i32.or (i32.eqz w) (i32.eq w #t))))
+
+(func (fx+ [a i32] [b i32]) -> i32 (i32.sub (i32.add a b) 1))
+(func (fx- [a i32] [b i32]) -> i32 (i32.add (i32.sub a b) 1))
+(func (fx* [a i32] [b i32]) -> i32 (fixnum (i32.mul (fixnum-value a) (fixnum-value b))))
+(func (fx< [a i32] [b i32]) -> i32 (truth (i32.lt_s a b)))
+(func (fx= [a i32] [b i32]) -> i32 (truth (i32.eq a b)))
+
+;; ---- heap ----------------------------------------------------------------
+
+;; Raw: the type code of the object w points to, or 0 if w is not a pointer.
+(func (heap-type [w i32]) -> i32
+  (if (i32.and (i32.eqz (i32.and w 7)) (i32.ne w 0))
+      (i32.and (i32.load w) 127)
+      0))
+
+;; Raw: field count or byte count from the header.
+(func (heap-length [w i32]) -> i32 (i32.shr_u (i32.load w) 8))
+
+;; Abort with a string value as the message.
+(func (fail [msg i32])
+  (host-trap (i32.add msg 4) (heap-length msg))
+  (unreachable))
+
+(func (check [w i32] [type i32] [msg i32])
+  (if (i32.ne (heap-type w) type) (fail msg)))
+
+;; Raw: n bytes, 8-aligned, from the bump allocator. Memory never reused is
+;; zero, so fresh fields read as #f.
+(func (alloc [n i32]) -> i32
+  (let* ([p hp]
+         [end (i32.and (i32.add (i32.add p n) 7) -8)]
+         [size (i32.shl (memory.size) 16)])
+    (if (i32.gt_u end size)
+        (if (i32.lt_s (memory.grow (i32.shr_u (i32.sub (i32.add end 65535) size) 16)) 0)
+            (fail "out of memory")))
+    (set! hp end)
+    p))
+
+;; Raw: a word object with n fields, all #f.
+(func (make-object [type i32] [n i32]) -> i32
+  (let ([p (alloc (i32.add 4 (i32.shl n 2)))])
+    (i32.store p (i32.or type (i32.shl n 8)))
+    p))
+
+;; Raw: a string of n bytes (contents zero). The compiler and the marshaller
+;; build strings with this and then copy the bytes in.
+(func (alloc-string [n i32]) -> i32
+  (let ([p (alloc (i32.add 4 n))])
+    (i32.store p (i32.or 3 (i32.shl n 8)))
+    p))
+
+;; ---- pairs and lists ------------------------------------------------------
+
+(func (cons [a i32] [d i32]) -> i32
+  (let ([p (make-object 1 2)])
+    (i32.store p a 4)
+    (i32.store p d 8)
+    p))
+
+(func (pair? [w i32]) -> i32 (truth (i32.eq (heap-type w) 1)))
+(func (car [p i32]) -> i32 (check p 1 "car: not a pair") (i32.load p 4))
+(func (cdr [p i32]) -> i32 (check p 1 "cdr: not a pair") (i32.load p 8))
+(func (set-car! [p i32] [v i32]) (check p 1 "set-car!: not a pair") (i32.store p v 4))
+(func (set-cdr! [p i32] [v i32]) (check p 1 "set-cdr!: not a pair") (i32.store p v 8))
+(func (cadr [p i32]) -> i32 (car (cdr p)))
+(func (cddr [p i32]) -> i32 (cdr (cdr p)))
+(func (caddr [p i32]) -> i32 (car (cddr p)))
+(func (cdddr [p i32]) -> i32 (cdr (cddr p)))
+
+(func (list? [l i32]) -> i32
+  (block done
+    (loop next
+      (br-if done (i32.eqz (pair? l)))
+      (set! l (cdr l))
+      (br next)))
+  (null? l))
+
+(func (length [l i32]) -> i32
+  (let ([n 0])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (set! n (i32.add n 1))
+        (set! l (cdr l))
+        (br next)))
+    (fixnum n)))
+
+(func (append [a i32] [b i32]) -> i32
+  (if (pair? a) (cons (car a) (append (cdr a) b)) b))
+
+(func (reverse [l i32]) -> i32
+  (let ([acc '()])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (set! acc (cons (car l) acc))
+        (set! l (cdr l))
+        (br next)))
+    acc))
+
+(func (list-ref [l i32] [k i32]) -> i32
+  (if (i32.eq k (fixnum 0)) (car l) (list-ref (cdr l) (fx- k (fixnum 1)))))
+
+(func (memq [x i32] [l i32]) -> i32
+  (if (pair? l) (if (i32.eq x (car l)) l (memq x (cdr l))) #f))
+
+(func (assq [x i32] [l i32]) -> i32
+  (if (pair? l) (if (i32.eq x (car (car l))) (car l) (assq x (cdr l))) #f))
+
+;; ---- vectors ----------------------------------------------------------------
+
+;; Raw n.
+(func (make-filled-vector [n i32] [fill i32]) -> i32
+  (let ([v (make-object 4 n)] [i 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (i32.store (i32.add v (i32.shl i 2)) fill 4)
+        (set! i (i32.add i 1))
+        (br next)))
+    v))
+
+(func (make-vector [n i32] [fill i32]) -> i32 (make-filled-vector (fixnum-value n) fill))
+(func (vector? [w i32]) -> i32 (truth (i32.eq (heap-type w) 4)))
+(func (vector-length [v i32]) -> i32 (check v 4 "vector-length: not a vector") (fixnum (heap-length v)))
+
+(func (vector-ref [v i32] [k i32]) -> i32
+  (check v 4 "vector-ref: not a vector")
+  (let ([i (fixnum-value k)])
+    (if (i32.ge_u i (heap-length v)) (fail "vector-ref: index out of range"))
+    (i32.load (i32.add v (i32.shl i 2)) 4)))
+
+(func (vector-set! [v i32] [k i32] [x i32])
+  (check v 4 "vector-set!: not a vector")
+  (let ([i (fixnum-value k)])
+    (if (i32.ge_u i (heap-length v)) (fail "vector-set!: index out of range"))
+    (i32.store (i32.add v (i32.shl i 2)) x 4)))
+
+(func (list->vector [l i32]) -> i32
+  (let* ([v (make-object 4 (fixnum-value (length l)))] [i 0])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (i32.store (i32.add v (i32.shl i 2)) (car l) 4)
+        (set! i (i32.add i 1))
+        (set! l (cdr l))
+        (br next)))
+    v))
+
+(func (vector->list [v i32]) -> i32
+  (check v 4 "vector->list: not a vector")
+  (let ([i (heap-length v)] [acc '()])
+    (block done
+      (loop next
+        (br-if done (i32.eqz i))
+        (set! i (i32.sub i 1))
+        (set! acc (cons (i32.load (i32.add v (i32.shl i 2)) 4) acc))
+        (br next)))
+    acc))
+
+;; ---- strings and symbols -----------------------------------------------------
+
+(func (string? [w i32]) -> i32 (truth (i32.eq (heap-type w) 3)))
+(func (string-length [s i32]) -> i32 (check s 3 "string-length: not a string") (fixnum (heap-length s)))
+
+(func (string=? [a i32] [b i32]) -> i32
+  (check a 3 "string=?: not a string")
+  (check b 3 "string=?: not a string")
+  (let ([n (heap-length a)] [i 0])
+    (if (i32.ne n (heap-length b)) (return #f))
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (if (i32.ne (i32.load8_u (i32.add a i) 4) (i32.load8_u (i32.add b i) 4)) (return #f))
+        (set! i (i32.add i 1))
+        (br next)))
+    #t))
+
+(func (string-append [a i32] [b i32]) -> i32
+  (check a 3 "string-append: not a string")
+  (check b 3 "string-append: not a string")
+  (let* ([na (heap-length a)] [nb (heap-length b)] [s (alloc-string (i32.add na nb))])
+    (memory.copy (i32.add s 4) (i32.add a 4) na)
+    (memory.copy (i32.add (i32.add s 4) na) (i32.add b 4) nb)
+    s))
+
+;; Raw: FNV-1a over the bytes.
+(func (string-hash [s i32]) -> i32
+  (let ([h #x811c9dc5] [i 0] [n (heap-length s)])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (set! h (i32.mul (i32.xor h (i32.load8_u (i32.add s i) 4)) 16777619))
+        (set! i (i32.add i 1))
+        (br next)))
+    h))
+
+(func (symbol? [w i32]) -> i32 (truth (i32.eq (heap-type w) 2)))
+(func (symbol->string [s i32]) -> i32 (check s 2 "symbol->string: not a symbol") (i32.load s 4))
+
+;; The symbol named by string name, made on first use. Two symbols are the
+;; same symbol iff their words are equal (spec 2.3).
+(func (intern [name i32]) -> i32
+  (check name 3 "intern: not a string")
+  (if (i32.eqz symtab) (set! symtab (make-filled-vector 1024 '())))
+  (let* ([h (string-hash name)]
+         [slot (i32.add (i32.add symtab 4) (i32.shl (i32.and h 1023) 2))]
+         [l (i32.load slot)])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (if (string=? (i32.load (car l) 4) name) (return (car l)))
+        (set! l (cdr l))
+        (br next)))
+    (let ([sym (make-object 2 2)])
+      (i32.store sym name 4)
+      (i32.store sym (fixnum (i32.shr_u h 2)) 8)
+      (i32.store slot (cons sym (i32.load slot)))
+      sym)))
+
+(func (string->symbol [s i32]) -> i32 (intern s))
+(func (symbol-append [a i32] [b i32]) -> i32
+  (intern (string-append (symbol->string a) (symbol->string b))))
+
+;; ---- boxes, procedures, srclocs ---------------------------------------------
+
+(func (box [v i32]) -> i32 (let ([b (make-object 8 1)]) (i32.store b v 4) b))
+(func (unbox [b i32]) -> i32 (check b 8 "unbox: not a box") (i32.load b 4))
+(func (set-box! [b i32] [v i32]) (check b 8 "set-box!: not a box") (i32.store b v 4))
+
+;; Raw table index -> procedure value (spec 2.3). No environment in v0.
+(func (make-procedure [index i32]) -> i32
+  (let ([p (make-object 7 2)])
+    (i32.store p (fixnum index) 4)
+    p))
+(func (procedure? [w i32]) -> i32 (truth (i32.eq (heap-type w) 7)))
+(func (procedure-index [p i32]) -> i32                            ; raw
+  (check p 7 "procedure-index: not a procedure")
+  (fixnum-value (i32.load p 4)))
+
+(func (make-srcloc [source i32] [line i32] [col i32] [pos i32] [span i32]) -> i32
+  (let ([p (make-object 9 5)])
+    (i32.store p source 4)
+    (i32.store p line 8)
+    (i32.store p col 12)
+    (i32.store p pos 16)
+    (i32.store p span 20)
+    p))
+
+;; ---- syntax objects (spec 2.4) ------------------------------------------------
+
+(func (make-syntax [e i32] [scopes i32] [srcloc i32] [props i32]) -> i32
+  (let ([p (make-object 6 4)])
+    (i32.store p e 4)
+    (i32.store p scopes 8)
+    (i32.store p srcloc 12)
+    (i32.store p props 16)
+    p))
+
+(func (syntax? [w i32]) -> i32 (truth (i32.eq (heap-type w) 6)))
+(func (syntax-e [s i32]) -> i32 (check s 6 "syntax-e: not a syntax object") (i32.load s 4))
+(func (syntax-scopes [s i32]) -> i32 (check s 6 "syntax-scopes: not a syntax object") (i32.load s 8))
+(func (syntax-srcloc [s i32]) -> i32 (check s 6 "syntax-srcloc: not a syntax object") (i32.load s 12))
+(func (syntax-props [s i32]) -> i32 (check s 6 "syntax-props: not a syntax object") (i32.load s 16))
+(func (identifier? [w i32]) -> i32 (if (syntax? w) (symbol? (syntax-e w)) #f))
+
+;; A copy of s with datum e: same scopes, srcloc and props. Used by
+;; quasisyntax to rebuild a template around new parts.
+(func (syntax-rewrap [s i32] [e i32]) -> i32
+  (make-syntax e (syntax-scopes s) (syntax-srcloc s) (syntax-props s)))
+
+;; The elements of a syntax list, or x itself if it is already a list.
+(func (splice-list [x i32]) -> i32 (if (syntax? x) (syntax-e x) x))
+
+;; The elements of a proper syntax list, or #f.
+(func (syntax->list [x i32]) -> i32
+  (let ([e (splice-list x)]) (if (list? e) e #f)))
+
+(func (syntax->datum [x i32]) -> i32
+  (if (syntax? x) (return (syntax->datum (syntax-e x))))
+  (if (pair? x) (return (cons (syntax->datum (car x)) (syntax->datum (cdr x)))))
+  (if (vector? x) (return (list->vector (syntax->datum (vector->list x)))))
+  x)
+
+;; Wrap datum d, giving every new syntax object ctx's scopes.
+(func (datum->syntax [ctx i32] [d i32]) -> i32
+  (wrap-datum d (if (syntax? ctx) (syntax-scopes ctx) '())))
+
+(func (wrap-datum [d i32] [scopes i32]) -> i32
+  (if (syntax? d) (return d))
+  (if (pair? d) (return (make-syntax (wrap-list d scopes) scopes #f '())))
+  (if (vector? d) (return (make-syntax (list->vector (wrap-list (vector->list d) scopes)) scopes #f '())))
+  (make-syntax d scopes #f '()))
+
+(func (wrap-list [d i32] [scopes i32]) -> i32
+  (if (pair? d) (return (cons (wrap-datum (car d) scopes) (wrap-list (cdr d) scopes))))
+  (if (null? d) (return '()))
+  (wrap-datum d scopes))
+
+;; ---- output -----------------------------------------------------------------------
+;; Addresses 1024..1127 are scratch for formatting (spec 2.1).
+
+(func (write-bytes [p i32] [n i32]) (drop (host-write 1 p n)))
+(func (write-string-bytes [s i32]) (write-bytes (i32.add s 4) (heap-length s)))
+(func (write-byte [b i32]) (i32.store8 1024 b) (write-bytes 1024 1))
+
+(func (write-utf8 [cp i32])
+  (if (i32.lt_u cp 128) (return (write-byte cp)))
+  (if (i32.lt_u cp 2048)
+      (begin
+        (i32.store8 1024 (i32.or 192 (i32.shr_u cp 6)))
+        (i32.store8 1025 (i32.or 128 (i32.and cp 63)))
+        (return (write-bytes 1024 2))))
+  (if (i32.lt_u cp 65536)
+      (begin
+        (i32.store8 1024 (i32.or 224 (i32.shr_u cp 12)))
+        (i32.store8 1025 (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
+        (i32.store8 1026 (i32.or 128 (i32.and cp 63)))
+        (return (write-bytes 1024 3))))
+  (i32.store8 1024 (i32.or 240 (i32.shr_u cp 18)))
+  (i32.store8 1025 (i32.or 128 (i32.and (i32.shr_u cp 12) 63)))
+  (i32.store8 1026 (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
+  (i32.store8 1027 (i32.or 128 (i32.and cp 63)))
+  (write-bytes 1024 4))
+
+;; Raw signed integer in decimal.
+(func (write-int [n i32])
+  (let ([p 1128] [u n] [neg (i32.lt_s n 0)])
+    (if neg (set! u (i32.sub 0 n)))
+    (block done
+      (loop next
+        (set! p (i32.sub p 1))
+        (i32.store8 p (i32.add 48 (i32.rem_u u 10)))
+        (set! u (i32.div_u u 10))
+        (br-if done (i32.eqz u))
+        (br next)))
+    (if neg
+        (begin (set! p (i32.sub p 1)) (i32.store8 p 45)))
+    (write-bytes p (i32.sub 1128 p))))
+
+(func (print-string [s i32] [write? i32])
+  (if (i32.eqz write?) (return (write-string-bytes s)))
+  (write-byte 34)
+  (let ([i 0] [n (heap-length s)])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (let ([c (i32.load8_u (i32.add s i) 4)])
+          (if (i32.eq c 10)
+              (write-string-bytes "\\n")
+              (begin
+                (if (i32.or (i32.eq c 34) (i32.eq c 92)) (write-byte 92))
+                (write-byte c))))
+        (set! i (i32.add i 1))
+        (br next))))
+  (write-byte 34))
+
+(func (print-char [c i32] [write? i32])
+  (let ([cp (i32.shr_u c 3)])
+    (if write?
+        (begin
+          (write-string-bytes "#\\")
+          (if (i32.eq cp 32) (return (write-string-bytes "space")))
+          (if (i32.eq cp 10) (return (write-string-bytes "newline")))))
+    (write-utf8 cp)))
+
+(func (print-list [l i32] [write? i32])
+  (write-byte 40)
+  (if (pair? l)
+      (begin
+        (print (car l) write?)
+        (set! l (cdr l))
+        (block done
+          (loop next
+            (br-if done (i32.eqz (pair? l)))
+            (write-byte 32)
+            (print (car l) write?)
+            (set! l (cdr l))
+            (br next)))
+        (if (i32.ne l '())
+            (begin (write-string-bytes " . ") (print l write?)))))
+  (write-byte 41))
+
+;; write? is a raw flag: 1 for write, 0 for display.
+(func (print [v i32] [write? i32])
+  (let ([t (heap-type v)])
+    (if (i32.and v 1) (return (write-int (fixnum-value v))))
+    (if (i32.eqz v) (return (write-string-bytes "#f")))
+    (if (i32.eq v #t) (return (write-string-bytes "#t")))
+    (if (i32.eq v '()) (return (write-string-bytes "()")))
+    (if (i32.eq v 26) (return (write-string-bytes "#<void>")))
+    (if (i32.eq v 34) (return (write-string-bytes "#<eof>")))
+    (if (i32.eq (i32.and v 7) 4) (return (print-char v write?)))
+    (if (i32.eq t 1) (return (print-list v write?)))
+    (if (i32.eq t 2) (return (write-string-bytes (symbol->string v))))
+    (if (i32.eq t 3) (return (print-string v write?)))
+    (if (i32.eq t 4) (begin (write-byte 35) (return (print-list (vector->list v) write?))))
+    (if (i32.eq t 6)
+        (begin
+          (write-string-bytes "#<syntax ")
+          (print (syntax->datum v) write?)
+          (return (write-byte 62))))
+    (if (i32.eq t 7)
+        (begin
+          (write-string-bytes "#<procedure ")
+          (write-int (procedure-index v))
+          (return (write-byte 62))))
+    (if (i32.eq t 8) (begin (write-string-bytes "#&") (return (print (unbox v) write?))))
+    (if (i32.eq t 9) (return (write-string-bytes "#<srcloc>")))
+    (write-string-bytes "#<object ")
+    (write-int t)
+    (write-byte 62)))
+
+(func (write [v i32]) (print v 1))
+(func (display [v i32]) (print v 0))
+(func (newline) (write-byte 10))
