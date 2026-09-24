@@ -84,8 +84,9 @@ are references, wasm's own type checking keeps them apart from numbers.
 
 ### 2.3 Functions
 
-`(require syntax)` binds these at the phase where it appears. They are
-imported from the instance `"syntax"`. Parameters are `eqref` unless marked
+`(require name syntax)` binds these as `name:function` at the phase where
+it appears, plus any it lists to bind unqualified (3.1). They are imported
+from the instance `"syntax"`. Parameters are `eqref` unless marked
 `i32`.
 
 | Group | Functions |
@@ -119,12 +120,22 @@ them in Chez; in a run-time store they trap.
   code.
 - `(provide id ...)` names the phase-0 bindings other modules get:
   functions, globals, macros, static values, types and data.
-- `(require spec ...)` makes another module's provided bindings available.
-  A spec is `"path"` (relative to the requiring file), `syntax` (the syntax
-  library, section 2), or `(for-syntax spec ...)` (one phase up). A module
-  required at phase *p* is **shifted** by *p*: its phase *q* is phase
-  *p* + *q* in the requiring module. Requiring is idempotent, and cycles are
-  an error.
+- `(require name source item ...)` imports what another module provides.
+  `source` is `"path"` (relative to the requiring file) or `syntax` (the
+  syntax library, section 2).
+  - Everything the source provides is bound **qualified**, as
+    `name:thing`. Nothing is imported unqualified by default.
+  - Each item also binds one thing unqualified: `x` binds `x`, and
+    `[new old]` binds `new` to the source's `old`, in `let` order.
+  - A require at phase *p* imports at phase *p*. To import for compile-time
+    code, put the require inside `begin-for-syntax`. The required module's
+    phase *q* is then phase *p* + *q* in the requiring module.
+  - Requiring the same module again is harmless; a name that already names
+    another module at that phase, and cycles, are errors.
+  - Qualified names are ordinary identifiers: `print:write-int` is one
+    symbol. Every kind of binding shares one namespace per phase, and
+    binding a name twice at the same phase, by definition or import, is an
+    error.
 - Expansion must run phase-1 code before the module is finished: a macro
   works on the line after its definition. So while a module is expanded,
   its phase ≥ 1 code is also compiled and instantiated in **chunks**, one
@@ -143,8 +154,8 @@ them in Chez; in a run-time store they trap.
   module at shift 0. The host adds the shift when it instantiates the part
   (section 4), so one compiled part serves at any phase.
 - A program runs in a fresh run-time store holding exactly the parts
-  reached from its phase-0 part at shift 0. A module required only
-  `for-syntax` is never loaded at run time.
+  reached from its phase-0 part at shift 0. A module required only inside
+  `begin-for-syntax` is never loaded at run time.
 - The other instance names are `syntax`, `host`, `expander`, chunks
   (`<module>@<phase>#<n>`) and per-store entry chunks (`entry#<n>`).
 
@@ -156,8 +167,8 @@ them in Chez; in a run-time store they trap.
   uses `quote`, `quasiquote`, `quote-syntax` or `quasisyntax`, imports from
   `"syntax"`.
 - **A module owns its memory and table, or takes them from a module it
-  requires.** `(memory pages)` defines memory 0. `(memory from "path")`
-  imports the memory of that module's part at the same phase, so a
+  requires.** `(memory pages)` defines memory 0. `(memory from name)`
+  imports the memory of the module required as `name` at the same phase, so a
   program's modules can share one memory. Tables likewise. Code that uses
   memory instructions or data segments needs a memory, and code that uses
   `func-index` or `call-indirect` needs a table. [v0] At phase ≥ 1 only the
@@ -240,12 +251,12 @@ quotation and compile-time forms.
 (func (name [param type] ...) [-> result] body ...)
 (global name type init)             ; numeric or nullable reference type
 (import name "module" "field" (type ... -> type ...))
-(memory pages)  (memory from "path")
-(table size)  (table from "path")
+(memory pages)  (memory from name)
+(table size)  (table from name)
 (data name offset "bytes" ...)      ; active segment at offset in memory
 (type name (struct (field fname ftype) ...))   ; ftype: storage or (mut storage)
 (type name (array ftype))                      ; storage: a type, i8 or i16
-(require spec ...)                  ; spec: "path", syntax, (for-syntax spec ...)
+(require name source item ...)      ; source: "path" or syntax; item: x or [new old]
 (provide id ...)                    ; phase 0 only
 (runtime-free)                      ; see 3.4
 (define-syntax name transformer)    ; transformer: a phase+1 function (2.1)
@@ -260,8 +271,8 @@ expands macro uses at the head of each form, registers definitions, runs
 `define-static` and `begin-for-syntax` at once, processes `require`, and
 splices `begin`. The second pass expands function bodies and expressions. So
 functions may be mutually recursive, and a macro must be defined before it
-is used. A transformer must come from an earlier `begin-for-syntax` or a
-module required `for-syntax`. A declared type may refer to itself.
+is used. A transformer must come from an earlier `begin-for-syntax`, or
+from a module required inside one. A declared type may refer to itself.
 
 ### 5.3 Expressions
 
@@ -316,7 +327,7 @@ GC instructions take their type and field immediates by name:
 ### 5.4 Literals
 
 Unquoted literals are wasm numbers. `quote` turns a literal into a value,
-and needs `(require syntax)`.
+and needs the syntax library required at that phase.
 
 | Source | Unquoted | Quoted |
 |---|---|---|
@@ -396,7 +407,7 @@ identifier with the scopes of the use, as if the user had written it.
 
 - `(define-syntax m f)`: `m` is a macro whose transformer is the phase+1
   function `f`, of type `(eqref) -> eqref`. `f` may come from a module
-  required `for-syntax`.
+  required inside `begin-for-syntax`.
 - `(define-static s expr)`: `expr` is compiled and run at phase+1 now, and
   `s` is bound to its value, an `eqref`. The value lives in a global of the
   phase+1 part, so another module that requires this one computes it again
@@ -416,9 +427,9 @@ self-hosted expander will hold references directly and need no copy.
   parts, and scope ids relative to the module.
 - **Per-phase scope sets in full**: v0 shifts only module scopes (6.1).
 - **Memory and table definitions at phase ≥ 1**: v0 supports only
-  `(memory from "path")` there.
-- **More require forms**: renaming, prefixes, `for-meta`, requiring only
-  some names.
+  `(memory from name)` there.
+- **More require and provide forms**: re-exporting, renaming on provide,
+  requiring several phases up without nesting `begin-for-syntax`.
 - **Extension points**: `#%app`, `#%module-begin`, `local-expand`, syntax
   properties (the `props` field is always `()` in v0), lifting definitions
   out of expressions.

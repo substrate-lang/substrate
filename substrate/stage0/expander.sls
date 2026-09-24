@@ -71,7 +71,8 @@
   ;; The state of one module's compilation.
   (define-record-type comp
     (fields module store (mutable chunk-counter) (mutable syntax-phases) (mutable use-site-scopes)
-            (mutable runtime-free-form) phase-forms memories tables (mutable provide-ids)))
+            (mutable runtime-free-form) phase-forms memories tables (mutable provide-ids)
+            (mutable require-names)))          ; ((name . phase) . module)
 
   (define current #f)                      ; the comp being expanded
 
@@ -88,7 +89,7 @@
   (define (ensure-library!)
     (unless syntax-lib
       (let* ([m (make-unit library-path library-path "syntax" 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
-             [c (make-comp m #f 0 '() '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '())])
+             [c (make-comp m #f 0 '() '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '())])
         (with-comp c
           (lambda ()
             (parameterize ([current-syntax-infos #f])
@@ -186,7 +187,8 @@
     (for-each (lambda (b)
                 (when (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
                            (not (equal? (hashtable-ref meanings (binding-key b) #f) meaning)))
-                  (raise-compile-error id "duplicate definition of ~a" (stx-e id))))
+                  (raise-compile-error id "~a is already bound~a" (stx-e id)
+                                       (if (> phase 0) (format " at phase ~a" phase) ""))))
               (hashtable-ref bindings (stx-e id) '())))
 
   ;; Bind a module-level definition. Use-site scopes come off the name, so
@@ -369,7 +371,7 @@
          (let* ([name (fresh-unit-name path)]
                 [m (make-unit path source name 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
                 [c (make-comp m (new-cstore #t) 0 '() '() #f
-                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '())])
+                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '())])
            (hashtable-set! registry path m)
            (hashtable-set! modules-by-name name m)
            (with-comp c
@@ -697,39 +699,60 @@
 
   ;; ---- require, provide, storage ----
 
-  ;; (require spec ...) where spec is "path", syntax, or (for-syntax spec ...).
-  ;; A module required at phase p is shifted by p: its phase q is p + q here.
+  ;; (require name source item ...), where source is "path" or syntax (the
+  ;; syntax library). Everything the source provides is bound as name:thing.
+  ;; Each item also binds one thing unqualified: x as itself, or [new old]
+  ;; as new. A require at phase p imports at phase p; inside
+  ;; begin-for-syntax it imports for compile-time code (spec 3.1).
   (define (require! f phase)
-    (for-each (lambda (spec) (require-spec! f spec phase)) (cdr (stx-list-of f 'require))))
+    (let ([parts (stx-list-of f 'require)])
+      (unless (and (>= (length parts) 3) (id? (cadr parts))
+                   (or (string? (stx-e (caddr parts))) (core-name? (caddr parts) 'syntax)))
+        (raise-compile-error f "expected (require name \"path\" item ...) or (require name syntax item ...)"))
+      (let* ([name (cadr parts)]
+             [source (caddr parts)]
+             [provided (if (string? (stx-e source))
+                           (require-module! f name source phase)
+                           (require-syntax! source phase))])
+        (for-each (lambda (p) (bind-import! (qualified name (car p)) phase (cdr p))) provided)
+        (for-each (lambda (item)
+                    (let* ([l (stx->list item)]
+                           [new (cond [(id? item) item]
+                                      [(and l (= (length l) 2) (id? (car l)) (id? (cadr l))) (car l)]
+                                      [else (raise-compile-error item "expected a name or [new-name name]")])]
+                           [old (if (id? item) item (cadr l))]
+                           [p (assq (stx-e old) provided)])
+                      (unless p
+                        (raise-compile-error old "~a does not provide ~a" (stx-e source) (stx-e old)))
+                      (bind-import! new phase (cdr p))))
+                  (cdddr parts)))))
 
-  (define (require-spec! f spec phase)
-    (let ([l (stx->list spec)])
-      (cond [(core-name? spec 'syntax) (require-syntax! spec phase)]
-            [(string? (stx-e spec)) (require-module! f spec phase)]
-            [(and l (pair? l) (core-name? (car l) 'for-syntax))
-             (for-each (lambda (s) (require-spec! f s (+ phase 1))) (cdr l))]
-            [else (raise-compile-error spec "expected \"path\", syntax, or (for-syntax spec ...)")])))
+  ;; name:thing, with the scopes of name.
+  (define (qualified name sym)
+    (datum->stx name (string->symbol (format "~a:~a" (stx-e name) sym)) (stx-srcloc name)))
 
-  ;; Bind the syntax library's contract functions at phase (spec 2.3), with
-  ;; the scopes of the `syntax` identifier.
-  (define (require-syntax! spec phase)
+  (define (bind-import! id phase meaning)
+    (check-unbound! id phase meaning)
+    (bind-module-level! (stx-e id) (stx-scopes id) phase meaning))
+
+  ;; The syntax library's contract functions (spec 2.3), as (symbol . meaning).
+  (define (require-syntax! source phase)
     (unless (current-syntax-infos)
-      (raise-compile-error spec "the syntax library cannot require itself"))
+      (raise-compile-error source "the syntax library cannot require itself"))
     (unless (memv phase (comp-syntax-phases current))
-      (comp-syntax-phases-set! current (cons phase (comp-syntax-phases current)))
-      (let-values ([(names infos) (hashtable-entries (current-syntax-infos))])
-        ;; sorted, for deterministic keys
-        (for-each (lambda (info)
-                    (bind-module-level! (func-info-name info) (stx-scopes spec) phase (list 'func info)))
-                  (list-sort (lambda (a b) (string<? (symbol->string (func-info-name a))
-                                                      (symbol->string (func-info-name b))))
-                             (filter (lambda (info) (not (internal-name? (func-info-name info))))
-                                     (vector->list infos)))))))
+      (comp-syntax-phases-set! current (cons phase (comp-syntax-phases current))))
+    (let-values ([(names infos) (hashtable-entries (current-syntax-infos))])
+      ;; sorted, for deterministic keys
+      (map (lambda (info) (cons (func-info-name info) (list 'func info)))
+           (list-sort (lambda (a b) (string<? (symbol->string (func-info-name a))
+                                               (symbol->string (func-info-name b))))
+                      (filter (lambda (info) (not (internal-name? (func-info-name info))))
+                              (vector->list infos))))))
 
   (define (require-syntax-for s name phase)
     (unless (memv phase (comp-syntax-phases current))
-      (raise-compile-error s "~a builds syntax-library data: add (require ~a)" name
-                           (if (> phase 0) "(for-syntax syntax)" "syntax"))))
+      (raise-compile-error s "~a builds syntax-library data: add (require name syntax)~a" name
+                           (if (> phase 0) (format " at phase ~a" phase) ""))))
 
   (define (module-path-of f spec)
     (let* ([loc (stx-srcloc f)]
@@ -739,30 +762,31 @@
           given
           (string-append dir given))))
 
-  ;; Compile the module if needed, bind what it provides at phase, and make
-  ;; its own bindings resolvable for its macros.
-  (define (require-module! f spec phase)
+  ;; Compile the module if needed and make its own bindings resolvable for
+  ;; its macros. Returns what it provides, as seen from phase.
+  (define (require-module! f name spec phase)
     (let* ([m (compile-module-file (module-path-of f spec))]
            [me (comp-module current)]
-           [req (cons m phase)])
+           [req (cons m phase)]
+           [key (cons (stx-e name) phase)]
+           [named (assoc key (comp-require-names current))])
+      (when (and named (not (eq? (cdr named) m)))
+        (raise-compile-error name "~a already names another module at this phase" (stx-e name)))
+      (unless named
+        (comp-require-names-set! current (cons (cons key m) (comp-require-names current))))
       (unless (member req (unit-requires me))
         (unit-requires-set! me (append (unit-requires me) (list req)))
-        (for-each (lambda (p)
-                    (let ([id (datum->stx spec (car p) (stx-srcloc spec))]
-                          [meaning (shift-meaning (cdr p) phase)])
-                      (check-unbound! id phase meaning)
-                      (bind-module-level! (car p) (stx-scopes spec) phase meaning)))
-                  (unit-provides m))
         (install-module-bindings! m phase)
-        (prepare-statics! m phase))))
+        (prepare-statics! m phase))
+      (map (lambda (p) (cons (car p) (shift-meaning (cdr p) phase))) (unit-provides m))))
 
-  ;; The module a string names, which must already be required at `shift`.
-  (define (required-module f spec shift)
-    (let* ([path (normalize-path (module-path-of f spec))]
-           [m (hashtable-ref registry path #f)])
-      (unless (and m (member (cons m shift) (unit-requires (comp-module current))))
-        (raise-compile-error spec "~a must be required at this phase first" (stx-e spec)))
-      m))
+  ;; The module a require named at this phase.
+  (define (required-module name phase)
+    (let ([named (and (id? name) (assoc (cons (stx-e name) phase) (comp-require-names current)))])
+      (unless named
+        (raise-compile-error name "~s is not the name of a module required at this phase" (stx->datum name)))
+      (cdr named)))
+
 
   ;; (provide id ...): the phase-0 bindings other modules get by requiring
   ;; this one.
@@ -772,8 +796,9 @@
       (for-each (lambda (id) (unless (id? id) (raise-compile-error id "provide takes identifiers"))) ids)
       (comp-provide-ids-set! current (append (reverse ids) (comp-provide-ids current)))))
 
-  ;; (memory pages) or (memory from "path"), and likewise (table ...): the
-  ;; module's memory or table at this phase (spec 3.3).
+  ;; (memory pages) or (memory from name), and likewise (table ...): the
+  ;; module's memory or table at this phase. name is a module required at
+  ;; this phase (spec 3.3).
   (define (declare-storage! f phase)
     (let* ([parts (stx-list-of f 'memory)]
            [kind (stx-e (car parts))]
@@ -785,13 +810,13 @@
        (cond
          [(and (= (length parts) 2) (fixnum? (stx-e (cadr parts))) (>= (stx-e (cadr parts)) 0))
           (unless (= phase 0)
-            (raise-compile-error f "v0 defines ~as at phase 0 only; at phase ~a use (~a from \"module\")"
+            (raise-compile-error f "v0 defines ~as at phase 0 only; at phase ~a use (~a from name)"
                                  kind phase kind))
           (list kind (stx-e (cadr parts)))]
-         [(and (= (length parts) 3) (core-name? (cadr parts) 'from) (string? (stx-e (caddr parts))))
-          (let ([m (required-module f (caddr parts) phase)])
+         [(and (= (length parts) 3) (core-name? (cadr parts) 'from))
+          (let ([m (required-module (caddr parts) phase)])
             (list (if (eq? kind 'memory) 'memory-import 'table-import) (part-name m 0 phase)))]
-         [else (raise-compile-error f "expected (~a size) or (~a from \"module\")" kind kind)]))))
+         [else (raise-compile-error f "expected (~a size) or (~a from name)" kind kind)]))))
 
   ;; (runtime-free): after expansion, the program needs nothing beyond the
   ;; host at run time (spec 3.4).
@@ -856,7 +881,7 @@
 
   ;; (define-syntax name f): name is a macro whose transformer is the phase+1
   ;; function f, of type (eqref) -> eqref, from an earlier begin-for-syntax
-  ;; or a module required for-syntax.
+  ;; or a module required inside begin-for-syntax.
   (define (define-syntax! f phase)
     (let ([parts (stx-list-of f 'define-syntax)])
       (unless (and (= (length parts) 3) (id? (cadr parts)) (id? (caddr parts)))
