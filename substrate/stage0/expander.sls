@@ -701,9 +701,19 @@
       (unless (ref-type? t) (raise-compile-error s "expected a reference type"))
       t))
 
-  ;; Type syntax words (ref, null, field, mut, struct, array) are compared by
-  ;; name, like i32.
+  ;; The words of type syntax are compared by name, like wasm's keywords, so
+  ;; they are reserved: no declared type may be named by one (spec 5.1).
   (define (core-name? s name) (and (id? s) (eq? (stx-e s) name)))
+
+  (define type-keywords '(ref null mut struct array field sub final func rec ->))
+
+  (define (check-type-name! id)
+    (let ([name (stx-e id)])
+      (cond [(or (memq name (append abstract-heaps '(i32 i64 f32 f64 i8 i16)))
+                 (assq name shorthand-refs))
+             (raise-compile-error id "~a names a built-in type" name)]
+            [(memq name type-keywords)
+             (raise-compile-error id "~a is a word of type syntax, so it cannot name a type" name)])))
 
   ;; A field or element type: a storage type, optionally (mut storage).
   (define (parse-field-type s phase)
@@ -792,8 +802,7 @@
       (unless (and (= (length parts) 3) (id? (cadr parts)) (stx->list (caddr parts))
                    (pair? (stx->list (caddr parts))))
         (raise-compile-error f "expected (type name (struct field ...)) or (type name (array type))"))
-      (when (memq (stx-e (cadr parts)) (append abstract-heaps '(i32 i64 f32 f64 i8 i16)))
-        (raise-compile-error (cadr parts) "~a names a built-in type" (stx-e (cadr parts))))
+      (check-type-name! (cadr parts))
       (let-values ([(def final? super) (parse-sub (caddr parts) phase)])
         (let ([kind (stx-e (car (stx->list def)))])
           (unless (memq kind '(struct array))

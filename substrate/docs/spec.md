@@ -266,6 +266,11 @@ quotation and compile-time forms.
 - References: `anyref`, `eqref`, `i31ref`, `structref`, `arrayref`,
   `funcref`, `externref`, and `(ref T)` or `(ref null T)` where `T` is one
   of `any eq i31 struct array func extern none` or a declared type.
+- The words of type syntax (`ref null mut struct array field sub final func
+  rec ->`) are compared by name, like wasm's keywords, not looked up as
+  bindings. So they are reserved: a declared type may not be named by one,
+  nor by a built-in type name (including `i8`, `i16` and the shorthands
+  such as `eqref`).
 - A function result is written `-> t` or `-> (t ...)`, or omitted when
   there is none. Function types in imports and `call-indirect` are written
   `(t ... -> t ...)`.
