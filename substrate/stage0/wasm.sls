@@ -17,7 +17,7 @@
   ;; exports: list of (name kind idx)
   ;; start:   funcidx or #f
   ;; declared: funcidxs referenced by ref.func (declarative elem segment)
-  ;; datas:   list of bytevectors (passive segments)
+  ;; datas:   list of (offset . bytevector): active segments in memory 0
   ;; names:   (module-name (funcidx . name) ...) for the name section, or #f
   (define-record-type wmodule
     (fields types imports funcs tables memories globals exports start declared datas names))
@@ -123,8 +123,6 @@
            (bytes! port bv))]
         [(ref.null) (b #xD0) (b (valtype-byte (car args)))]
         [(ref.func) (b #xD2) (u (car args))]
-        [(memory.init) (b #xFC) (u 8) (u (car args)) (b #x00)]
-        [(data.drop) (b #xFC) (u 9) (u (car args))]
         [(table.grow) (b #xFC) (u 15) (u (car args))]
         [(table.size) (b #xFC) (u 16) (u (car args))]
         [else
@@ -204,9 +202,6 @@
                (out-byte! p 3)          ; declarative, elemkind + funcidx vector
                (out-byte! p #x00)
                (vec! p declared uleb!)))))
-       (let ([datas (wmodule-datas m)])
-         (unless (null? datas)
-           (section! port 12 (lambda (p) (uleb! p (length datas))))))
        (let ([funcs (wmodule-funcs m)])
          (unless (null? funcs)
            (section! port 10
@@ -227,10 +222,12 @@
            (section! port 11
              (lambda (p)
                (vec! p datas
-                     (lambda (p bv)
-                       (out-byte! p 1)     ; passive
-                       (uleb! p (bytevector-length bv))
-                       (bytes! p bv)))))))
+                     (lambda (p d)
+                       (out-byte! p 0)     ; active, memory 0
+                       (instr! p (list 'i32.const (car d)))
+                       (out-byte! p #x0B)
+                       (uleb! p (bytevector-length (cdr d)))
+                       (bytes! p (cdr d))))))))
        (let ([names (wmodule-names m)])
          (when names
            (section! port 0

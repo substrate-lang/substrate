@@ -16,9 +16,10 @@ struct sub_host {
   /* The context every call uses. Inside a host function it is the caller's
    * context, so nested calls into wasm go through the right one. */
   wasmtime_context_t *ctx;
+  /* The memory the embedder reads and writes (sub_use_memory). The host's
+   * own imports never use it: they use the caller's memory. */
   wasmtime_memory_t mem;
-  wasmtime_table_t tbl;
-  bool have_rt;
+  bool have_mem;
   int32_t result;
   sub_callback cb;
   char *pending_trap;
@@ -68,25 +69,44 @@ static void take_failure(sub_host *h, const char *what, wasmtime_error_t *error,
 const char *sub_last_error(sub_host *h) { return h->err; }
 int32_t sub_result(sub_host *h) { return h->result; }
 
-/* ---- shared memory ---------------------------------------------------- */
+/* ---- memory ----------------------------------------------------------- */
 
-static uint8_t *mem_ptr(sub_host *h, uint32_t addr, uint32_t len) {
-  if (!h->have_rt) return NULL;
-  size_t size = wasmtime_memory_data_size(h->ctx, &h->mem);
+static uint8_t *range(wasmtime_context_t *ctx, const wasmtime_memory_t *mem, uint32_t addr, uint32_t len) {
+  size_t size = wasmtime_memory_data_size(ctx, mem);
   if ((uint64_t)addr + len > size) return NULL;
-  return wasmtime_memory_data(h->ctx, &h->mem) + addr;
+  return wasmtime_memory_data(ctx, mem) + addr;
+}
+
+/* The calling instance's memory: the one it exports as "memory". */
+static bool caller_memory(wasmtime_caller_t *caller, wasmtime_memory_t *out) {
+  wasmtime_extern_t ext;
+  if (!wasmtime_caller_export_get(caller, "memory", 6, &ext) || ext.kind != WASMTIME_EXTERN_MEMORY) return false;
+  *out = ext.of.memory;
+  return true;
+}
+
+int sub_use_memory(sub_host *h, const char *inst, const char *name) {
+  wasmtime_extern_t ext;
+  if (!wasmtime_linker_get(h->linker, h->ctx, inst, strlen(inst), name, strlen(name), &ext) ||
+      ext.kind != WASMTIME_EXTERN_MEMORY) {
+    set_err(h, "use_memory: no memory %s.%s", inst, name);
+    return 1;
+  }
+  h->mem = ext.of.memory;
+  h->have_mem = true;
+  return 0;
 }
 
 uintptr_t sub_mem_base(sub_host *h) {
-  return h->have_rt ? (uintptr_t)wasmtime_memory_data(h->ctx, &h->mem) : 0;
+  return h->have_mem ? (uintptr_t)wasmtime_memory_data(h->ctx, &h->mem) : 0;
 }
 
 size_t sub_mem_size(sub_host *h) {
-  return h->have_rt ? wasmtime_memory_data_size(h->ctx, &h->mem) : 0;
+  return h->have_mem ? wasmtime_memory_data_size(h->ctx, &h->mem) : 0;
 }
 
 int sub_mem_write(sub_host *h, uint32_t addr, const uint8_t *src, size_t len) {
-  uint8_t *dst = mem_ptr(h, addr, (uint32_t)len);
+  uint8_t *dst = h->have_mem ? range(h->ctx, &h->mem, addr, (uint32_t)len) : NULL;
   if (!dst) {
     set_err(h, "mem_write: [%u, +%zu) out of bounds", addr, len);
     return 1;
@@ -117,20 +137,6 @@ static int instantiate(sub_host *h, const char *name, size_t name_len, const uin
     take_failure(h, "register", error, NULL);
     return 1;
   }
-  if (name_len == 2 && memcmp(name, "rt", 2) == 0) {
-    wasmtime_extern_t ext;
-    if (!wasmtime_instance_export_get(h->ctx, &inst, "mem", 3, &ext) || ext.kind != WASMTIME_EXTERN_MEMORY) {
-      set_err(h, "rt does not export memory 'mem'");
-      return 1;
-    }
-    h->mem = ext.of.memory;
-    if (!wasmtime_instance_export_get(h->ctx, &inst, "tbl", 3, &ext) || ext.kind != WASMTIME_EXTERN_TABLE) {
-      set_err(h, "rt does not export table 'tbl'");
-      return 1;
-    }
-    h->tbl = ext.of.table;
-    h->have_rt = true;
-  }
   return 0;
 }
 
@@ -147,31 +153,6 @@ int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t 
 
 /* ---- calls ------------------------------------------------------------ */
 
-static int call_func(sub_host *h, const wasmtime_func_t *fn, int nargs, const int32_t *args) {
-  wasm_functype_t *ty = wasmtime_func_type(h->ctx, fn);
-  size_t nparams = wasm_functype_params(ty)->size;
-  size_t nresults = wasm_functype_results(ty)->size;
-  wasm_functype_delete(ty);
-  if ((size_t)nargs != nparams || nresults > 1) {
-    set_err(h, "call: function takes %zu arguments and returns %zu values, given %d arguments",
-            nparams, nresults, nargs);
-    return 1;
-  }
-  wasmtime_val_t argv[6], res[1];
-  for (int i = 0; i < nargs; i++) {
-    argv[i].kind = WASMTIME_I32;
-    argv[i].of.i32 = args[i];
-  }
-  wasm_trap_t *trap = NULL;
-  wasmtime_error_t *error = wasmtime_func_call(h->ctx, fn, argv, (size_t)nargs, res, nresults, &trap);
-  if (error || trap) {
-    take_failure(h, "trap", error, trap);
-    return 1;
-  }
-  h->result = (nresults == 1 && res[0].kind == WASMTIME_I32) ? res[0].of.i32 : 0;
-  return 0;
-}
-
 int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
              int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5) {
   int32_t args[6] = {a0, a1, a2, a3, a4, a5};
@@ -186,41 +167,48 @@ int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
     return 1;
   }
   wasmtime_func_t func = ext.of.func;
-  return call_func(h, &func, nargs, args);
-}
-
-int sub_call_index(sub_host *h, int32_t index, int nargs, int32_t a0, int32_t a1, int32_t a2) {
-  int32_t args[3] = {a0, a1, a2};
-  if (!h->have_rt) {
-    set_err(h, "call_index: rt is not instantiated");
+  wasm_functype_t *ty = wasmtime_func_type(h->ctx, &func);
+  size_t nparams = wasm_functype_params(ty)->size;
+  size_t nresults = wasm_functype_results(ty)->size;
+  wasm_functype_delete(ty);
+  if ((size_t)nargs != nparams || nresults > 1) {
+    set_err(h, "call: %s.%s takes %zu arguments and returns %zu values, given %d arguments",
+            inst, fn, nparams, nresults, nargs);
     return 1;
   }
-  wasmtime_val_t val;
-  if (index < 0 || !wasmtime_table_get(h->ctx, &h->tbl, (uint64_t)index, &val) ||
-      val.kind != WASMTIME_FUNCREF || val.of.funcref.store_id == 0) {
-    set_err(h, "call_index: no function at table index %d", index);
+  wasmtime_val_t argv[6], res[1];
+  for (int i = 0; i < nargs; i++) {
+    argv[i].kind = WASMTIME_I32;
+    argv[i].of.i32 = args[i];
+  }
+  wasm_trap_t *trap = NULL;
+  wasmtime_error_t *error = wasmtime_func_call(h->ctx, &func, argv, (size_t)nargs, res, nresults, &trap);
+  if (error || trap) {
+    take_failure(h, "trap", error, trap);
     return 1;
   }
-  return call_func(h, &val.of.funcref, nargs, args);
+  h->result = (nresults == 1 && res[0].kind == WASMTIME_I32) ? res[0].of.i32 : 0;
+  return 0;
 }
 
 /* ---- host imports ----------------------------------------------------- */
+/* Every pointer a host import receives is into the caller's own memory,
+ * the one it exports as "memory" (spec section 4). */
 
 /* Run a host function body with h->ctx set to the caller's context. */
 #define ENTER(h, caller) wasmtime_context_t *saved_ctx = (h)->ctx; (h)->ctx = wasmtime_caller_context(caller)
 #define LEAVE(h) (h)->ctx = saved_ctx
 
-static wasm_trap_t *trap_msg(const char *msg, size_t len) { return wasmtime_trap_new(msg, len); }
+static wasm_trap_t *trap_msg(const char *msg) { return wasmtime_trap_new(msg, strlen(msg)); }
 
 static wasm_trap_t *host_write(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
-  ENTER(h, caller);
   int32_t fd = args[0].of.i32;
   uint32_t ptr = (uint32_t)args[1].of.i32, len = (uint32_t)args[2].of.i32;
-  uint8_t *p = mem_ptr(h, ptr, len);
-  LEAVE(h);
-  if (!p) return trap_msg("host.write: out of bounds", 25);
+  wasmtime_memory_t mem;
+  if (!caller_memory(caller, &mem)) return trap_msg("host.write: caller exports no memory");
+  uint8_t *p = range(wasmtime_caller_context(caller), &mem, ptr, len);
+  if (!p) return trap_msg("host.write: out of bounds");
   FILE *out = fd == 2 ? stderr : stdout;
   fwrite(p, 1, len, out);
   fflush(out);
@@ -231,63 +219,67 @@ static wasm_trap_t *host_write(void *env, wasmtime_caller_t *caller, const wasmt
 
 static wasm_trap_t *host_trap(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                               size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
-  ENTER(h, caller);
   uint32_t ptr = (uint32_t)args[0].of.i32, len = (uint32_t)args[1].of.i32;
-  uint8_t *p = mem_ptr(h, ptr, len);
-  wasm_trap_t *t = p ? trap_msg((const char *)p, len) : trap_msg("host.trap: out of bounds", 24);
-  LEAVE(h);
-  return t;
+  wasmtime_memory_t mem;
+  if (!caller_memory(caller, &mem)) return trap_msg("host.trap: caller exports no memory");
+  uint8_t *p = range(wasmtime_caller_context(caller), &mem, ptr, len);
+  return p ? wasmtime_trap_new((const char *)p, len) : trap_msg("host.trap: out of bounds");
 }
 
 static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                      size_t nargs, wasmtime_val_t *results, size_t nresults) {
   sub_host *h = env;
-  ENTER(h, caller);
   uint32_t np = (uint32_t)args[0].of.i32, nl = (uint32_t)args[1].of.i32;
   uint32_t bp = (uint32_t)args[2].of.i32, bl = (uint32_t)args[3].of.i32;
-  uint8_t *name = mem_ptr(h, np, nl), *bytes = mem_ptr(h, bp, bl);
-  int rc = 1;
-  if (!name || !bytes) {
-    set_err(h, "host.instantiate: out of bounds");
-  } else {
-    char *name_copy = malloc(nl + 1);
-    memcpy(name_copy, name, nl);
-    name_copy[nl] = '\0';
-    uint8_t *copy = malloc(bl ? bl : 1);
-    memcpy(copy, bytes, bl);
-    rc = instantiate(h, name_copy, nl, copy, bl);
-    free(copy);
-    free(name_copy);
-  }
+  wasmtime_memory_t mem;
+  if (!caller_memory(caller, &mem)) return trap_msg("host.instantiate: caller exports no memory");
+  wasmtime_context_t *cctx = wasmtime_caller_context(caller);
+  uint8_t *name = range(cctx, &mem, np, nl), *bytes = range(cctx, &mem, bp, bl);
+  if (!name || !bytes) return trap_msg("host.instantiate: out of bounds");
+  /* Copy out before instantiating: the new module's start function may
+   * grow the caller's memory and move it. */
+  char *name_copy = malloc(nl + 1);
+  memcpy(name_copy, name, nl);
+  name_copy[nl] = '\0';
+  uint8_t *copy = malloc(bl ? bl : 1);
+  memcpy(copy, bytes, bl);
+  ENTER(h, caller);
+  int rc = instantiate(h, name_copy, nl, copy, bl);
   LEAVE(h);
+  free(copy);
+  free(name_copy);
   results[0].kind = WASMTIME_I32;
   results[0].of.i32 = rc;
   return NULL;
 }
 
+/* Append inst.field to the caller's table (exported as "table"). */
 static wasm_trap_t *host_export_index(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                       size_t nargs, wasmtime_val_t *results, size_t nresults) {
   sub_host *h = env;
-  ENTER(h, caller);
   uint32_t ip = (uint32_t)args[0].of.i32, il = (uint32_t)args[1].of.i32;
   uint32_t fp = (uint32_t)args[2].of.i32, fl = (uint32_t)args[3].of.i32;
-  uint8_t *inst = mem_ptr(h, ip, il), *field = mem_ptr(h, fp, fl);
+  wasmtime_memory_t mem;
+  if (!caller_memory(caller, &mem)) return trap_msg("host.export_index: caller exports no memory");
+  wasmtime_extern_t table;
+  if (!wasmtime_caller_export_get(caller, "table", 5, &table) || table.kind != WASMTIME_EXTERN_TABLE)
+    return trap_msg("host.export_index: caller exports no table");
+  wasmtime_context_t *cctx = wasmtime_caller_context(caller);
+  uint8_t *inst = range(cctx, &mem, ip, il), *field = range(cctx, &mem, fp, fl);
+  if (!inst || !field) return trap_msg("host.export_index: out of bounds");
   int32_t index = -1;
   wasmtime_extern_t ext;
-  if (inst && field && h->have_rt &&
-      wasmtime_linker_get(h->linker, h->ctx, (const char *)inst, il, (const char *)field, fl, &ext) &&
+  if (wasmtime_linker_get(h->linker, cctx, (const char *)inst, il, (const char *)field, fl, &ext) &&
       ext.kind == WASMTIME_EXTERN_FUNC) {
     wasmtime_val_t init = {.kind = WASMTIME_FUNCREF};
     init.of.funcref = ext.of.func;
     uint64_t prev = 0;
-    wasmtime_error_t *error = wasmtime_table_grow(h->ctx, &h->tbl, 1, &init, &prev);
+    wasmtime_error_t *error = wasmtime_table_grow(cctx, &table.of.table, 1, &init, &prev);
     if (error)
       take_failure(h, "host.export_index", error, NULL);
     else
       index = (int32_t)prev;
   }
-  LEAVE(h);
   results[0].kind = WASMTIME_I32;
   results[0].of.i32 = index;
   return NULL;
@@ -296,33 +288,32 @@ static wasm_trap_t *host_export_index(void *env, wasmtime_caller_t *caller, cons
 static wasm_trap_t *host_error_message(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                        size_t nargs, wasmtime_val_t *results, size_t nresults) {
   sub_host *h = env;
-  ENTER(h, caller);
   uint32_t bp = (uint32_t)args[0].of.i32, cap = (uint32_t)args[1].of.i32;
+  wasmtime_memory_t mem;
+  if (!caller_memory(caller, &mem)) return trap_msg("host.error_message: caller exports no memory");
   size_t n = strlen(h->err);
   if (n > cap) n = cap;
-  uint8_t *buf = mem_ptr(h, bp, (uint32_t)n);
+  uint8_t *buf = range(wasmtime_caller_context(caller), &mem, bp, (uint32_t)n);
   if (buf) memcpy(buf, h->err, n);
-  LEAVE(h);
   results[0].kind = WASMTIME_I32;
   results[0].of.i32 = buf ? (int32_t)n : -1;
   return NULL;
 }
 
-/* Expander API: forward to the embedder's callback. env points at an op
- * code; the host is found through the store's data pointer. */
+/* Expander queries (stage0 only): forward to the embedder's callback. env
+ * points at an op code; the host is found through the store's data. */
 static const int32_t op_codes[] = {SUB_OP_SYNTAX_LOCAL_VALUE, SUB_OP_SYNTAX_ERROR, SUB_OP_FREE_IDENTIFIER_EQ};
 
 static wasm_trap_t *expander_call(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                   size_t nargs, wasmtime_val_t *results, size_t nresults) {
   int32_t op = *(const int32_t *)env;
-  wasmtime_context_t *cctx = wasmtime_caller_context(caller);
-  sub_host *h = wasmtime_context_get_data(cctx);
-  if (!h->cb) return trap_msg("expander API used outside the expander", 38);
+  sub_host *h = wasmtime_context_get_data(wasmtime_caller_context(caller));
+  if (!h->cb) return trap_msg("expander query used outside the expander");
   ENTER(h, caller);
   int32_t r = h->cb(op, nargs > 0 ? args[0].of.i32 : 0, nargs > 1 ? args[1].of.i32 : 0);
   LEAVE(h);
   if (h->pending_trap) {
-    wasm_trap_t *t = trap_msg(h->pending_trap, strlen(h->pending_trap));
+    wasm_trap_t *t = trap_msg(h->pending_trap);
     free(h->pending_trap);
     h->pending_trap = NULL;
     return t;

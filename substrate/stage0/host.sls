@@ -1,6 +1,6 @@
 ;; FFI to host/subhost.c. One Scheme `host` is one wasm store.
 (library (stage0 host)
-  (export host-new host-instantiate! host-call host-call-index
+  (export host-new host-instantiate! host-call host-use-memory!
           host-mem-u8 host-mem-i32 host-mem-write! host-set-callback! host-request-trap!
           wasm-failure? wasm-failure-message)
   (import (chezscheme))
@@ -13,8 +13,8 @@
   (define c-last-error (foreign-procedure "sub_last_error" (uptr) string))
   (define c-instantiate (foreign-procedure "sub_instantiate" (uptr string u8* size_t) int))
   (define c-call (foreign-procedure "sub_call" (uptr string string int int int int int int int) int))
-  (define c-call-index (foreign-procedure "sub_call_index" (uptr int int int int int) int))
   (define c-result (foreign-procedure "sub_result" (uptr) int))
+  (define c-use-memory (foreign-procedure "sub_use_memory" (uptr string string) int))
   (define c-mem-base (foreign-procedure "sub_mem_base" (uptr) uptr))
   (define c-mem-size (foreign-procedure "sub_mem_size" (uptr) size_t))
   (define c-mem-write (foreign-procedure "sub_mem_write" (uptr unsigned-32 u8* size_t) int))
@@ -42,9 +42,8 @@
     (check h (apply c-call h inst fn (length args) (pad args 6)))
     (c-result h))
 
-  (define (host-call-index h index . args)
-    (check h (apply c-call-index h index (length args) (pad args 3)))
-    (c-result h))
+  ;; Choose the memory host-mem-* read and write: inst's export `name`.
+  (define (host-use-memory! h inst name) (check h (c-use-memory h inst name)))
 
   (define (host-mem-u8 h addr)
     (unless (< addr (c-mem-size h)) (error 'host-mem-u8 "out of bounds" addr))

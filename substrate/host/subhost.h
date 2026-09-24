@@ -1,7 +1,9 @@
 /* subhost: the substrate host over the wasmtime C API.
  *
- * One sub_host is one store: an engine, a linker, and the shared memory and
- * table that the "rt" instance exports. See docs/spec.md section 4.
+ * One sub_host is one store: an engine and a linker. Instances are
+ * registered by name and link to each other by name. The host owns no
+ * memory: each of its imports reads pointers from the calling instance's
+ * own memory (docs/spec.md section 4).
  *
  * Rule for embedders (stage0 calls this from Chez): no function here keeps a
  * pointer argument past its own return, and none reads one after it has run
@@ -16,7 +18,7 @@
 
 typedef struct sub_host sub_host;
 
-/* Expander API callback (stage0 only). op is one of SUB_OP_*. The return
+/* Expander query callback (stage0 only). op is one of SUB_OP_*. The return
  * value is the i32 result. To abort instead, call sub_request_trap before
  * returning. */
 typedef int32_t (*sub_callback)(int32_t op, int32_t a0, int32_t a1);
@@ -35,22 +37,19 @@ void sub_host_free(sub_host *h);
 const char *sub_last_error(sub_host *h);
 
 /* Compile and instantiate a module, link its imports by name, and register
- * it under `name`. Instantiating "rt" also makes its memory and table the
- * store's shared memory and table. */
+ * it under `name`. */
 int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t len);
 
 /* Call inst.fn with up to 6 i32 arguments. A single i32 result is left in
  * sub_result. */
 int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
              int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5);
-
-/* Call the function at index in the shared table. */
-int sub_call_index(sub_host *h, int32_t index, int nargs, int32_t a0, int32_t a1, int32_t a2);
-
 int32_t sub_result(sub_host *h);
 
-/* Shared memory access. The base pointer is invalid after any call that
- * runs wasm (memory may grow), so fetch it again each time. */
+/* The memory the embedder reads and writes with sub_mem_*: the memory that
+ * instance inst exports as name. The base pointer is invalid after any call
+ * that runs wasm (memory may grow), so fetch it again each time. */
+int sub_use_memory(sub_host *h, const char *inst, const char *name);
 uintptr_t sub_mem_base(sub_host *h);
 size_t sub_mem_size(sub_host *h);
 int sub_mem_write(sub_host *h, uint32_t addr, const uint8_t *src, size_t len);

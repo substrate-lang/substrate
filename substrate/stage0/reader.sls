@@ -138,8 +138,7 @@
       (next!)
       (let ([c (peek)])
         (cond [(not c) (fail start "unexpected end after #")]
-              [(char=? c #\() (next!) (let ([l (read-list start #\))])
-                                        (wrap start (list->vector (stx-e l))))]
+              [(char=? c #\() (fail start "vector syntax #( is not part of the kernel")]
               [(char=? c #\') (next!) (prefix-form start 'quote-syntax)]
               [(char=? c #\`) (next!) (prefix-form start 'quasisyntax)]
               [(char=? c #\,)

@@ -4,7 +4,7 @@
 ;;
 ;;  module forms:
 ;;    (func info ((key . type) ...) body)   (global info init-or-#f)
-;;    (memory name min)   (table name min)  (expr e)
+;;    (memory pages)   (table size)   (data dinfo)   (expr e)
 ;;  expressions:
 ;;    (int n) (float x) (const type n)
 ;;    (lref key) (lset key e) (gref ginfo) (gset ginfo e)
@@ -18,6 +18,7 @@
 ;; by their info records, which say which instance defines them.
 (library (stage0 core)
   (export make-func-info func-info? func-info-name func-info-params func-info-results
+          make-data-info data-info? data-info-name data-info-offset data-info-bytes
           func-info-instance func-info-instance-set! func-info-export func-info-export-set!
           make-global-info global-info? global-info-name global-info-type
           global-info-instance global-info-instance-set! global-info-export global-info-export-set!
@@ -31,6 +32,9 @@
 
   (define-record-type global-info
     (fields name type (mutable instance) (mutable export)))
+
+  ;; An active data segment: bytes placed at offset in the module's memory.
+  (define-record-type data-info (fields name offset bytes))
 
   (define key-counter 0)
   (define (reset-keys!) (set! key-counter 0))

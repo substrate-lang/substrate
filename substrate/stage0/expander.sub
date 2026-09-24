@@ -1,0 +1,261 @@
+;; The wasm half of stage0's expander (spec section 2).
+;;
+;; Macros run as wasm, so the syntax they work on has to be in wasm memory.
+;; This module keeps it in its own memory and exports the functions macros
+;; use to take syntax apart and build it. That function list is the macro
+;; contract. Functions whose names start with % are internal: the compiler
+;; and stage0's marshaller use them, and macros never see them.
+;;
+;; The data layout below is private to this file and to stage0's marshaller
+;; (spec appendix A). After bootstrap this module becomes part of the
+;; self-hosted compiler.
+;;
+;; Contract conventions: counts, indices, bytes and predicate results are
+;; wasm numbers (i32, predicates return 1 or 0). Everything else is a value
+;; word, where 0 means #f and two words are the same datum only if they are
+;; equal (symbols are interned).
+
+(memory 16)
+
+(import %host-trap "host" "trap" (i32 i32 ->))
+
+(global %hp i32 4096)            ; next free heap byte
+(global %symtab i32 0)           ; intern table, made on first use
+
+;; Error messages, one 32-byte slot each.
+(data %msg-pair 1024 "expected a pair")
+(data %msg-symbol 1056 "expected a symbol")
+(data %msg-string 1088 "expected a string")
+(data %msg-syntax 1120 "expected a syntax object")
+(data %msg-range 1152 "index out of range")
+(data %msg-memory 1184 "out of memory")
+
+;; ---- value words ----------------------------------------------------------
+
+(func (fixnum [n i32]) -> i32 (i32.or (i32.shl n 1) 1))
+(func (fixnum-value [w i32]) -> i32 (i32.shr_s w 1))
+(func (fixnum? [w i32]) -> i32 (i32.and w 1))
+(func (char? [w i32]) -> i32 (i32.eq (i32.and w 7) 4))
+(func (char->integer [c i32]) -> i32 (i32.shr_u c 3))
+(func (integer->char [n i32]) -> i32 (i32.or (i32.shl n 3) 4))
+(func (boolean? [w i32]) -> i32 (i32.or (i32.eqz w) (i32.eq w '#t)))
+(func (null? [w i32]) -> i32 (i32.eq w '()))
+
+;; ---- heap -------------------------------------------------------------------
+
+;; The type code of the object w points to, or 0 if w is not a pointer.
+(func (%type [w i32]) -> i32
+  (if (i32.and (i32.eqz (i32.and w 7)) (i32.ne w 0))
+      (i32.and (i32.load w) 127)
+      0))
+
+;; Field count or byte count from the header.
+(func (%count [w i32]) -> i32 (i32.shr_u (i32.load w) 8))
+
+(func (%fail [addr i32] [len i32])
+  (%host-trap addr len)
+  (unreachable))
+
+(func (%type-error [type i32])
+  (if (i32.eq type 1) (%fail (data-address %msg-pair) (data-size %msg-pair)))
+  (if (i32.eq type 2) (%fail (data-address %msg-symbol) (data-size %msg-symbol)))
+  (if (i32.eq type 3) (%fail (data-address %msg-string) (data-size %msg-string)))
+  (%fail (data-address %msg-syntax) (data-size %msg-syntax)))
+
+(func (%expect [w i32] [type i32])
+  (if (i32.ne (%type w) type) (%type-error type)))
+
+;; n bytes, 8-aligned, from the bump allocator. The heap is one arena per
+;; store and is never freed. Memory never used before is zero.
+(func (%alloc [n i32]) -> i32
+  (let* ([p %hp]
+         [end (i32.and (i32.add (i32.add p n) 7) -8)]
+         [size (i32.shl (memory.size) 16)])
+    (if (i32.gt_u end size)
+        (if (i32.lt_s (memory.grow (i32.shr_u (i32.sub (i32.add end 65535) size) 16)) 0)
+            (%fail (data-address %msg-memory) (data-size %msg-memory))))
+    (set! %hp end)
+    p))
+
+;; An object of `type` with n word fields, all 0.
+(func (%object [type i32] [n i32]) -> i32
+  (let ([p (%alloc (i32.add 4 (i32.shl n 2)))])
+    (i32.store p (i32.or type (i32.shl n 8)))
+    p))
+
+;; ---- pairs and lists ----------------------------------------------------------
+
+(func (cons [a i32] [d i32]) -> i32
+  (let ([p (%object 1 2)])
+    (i32.store p a 4)
+    (i32.store p d 8)
+    p))
+
+(func (pair? [w i32]) -> i32 (i32.eq (%type w) 1))
+(func (car [p i32]) -> i32 (%expect p 1) (i32.load p 4))
+(func (cdr [p i32]) -> i32 (%expect p 1) (i32.load p 8))
+(func (cadr [p i32]) -> i32 (car (cdr p)))
+(func (cddr [p i32]) -> i32 (cdr (cdr p)))
+(func (caddr [p i32]) -> i32 (car (cddr p)))
+(func (cdddr [p i32]) -> i32 (cdr (cddr p)))
+
+(func (list? [l i32]) -> i32
+  (block done
+    (loop next
+      (br-if done (i32.eqz (pair? l)))
+      (set! l (cdr l))
+      (br next)))
+  (null? l))
+
+(func (length [l i32]) -> i32
+  (let ([n 0])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (set! n (i32.add n 1))
+        (set! l (cdr l))
+        (br next)))
+    n))
+
+(func (append [a i32] [b i32]) -> i32
+  (if (pair? a) (cons (car a) (append (cdr a) b)) b))
+
+(func (reverse [l i32]) -> i32
+  (let ([acc '()])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (set! acc (cons (car l) acc))
+        (set! l (cdr l))
+        (br next)))
+    acc))
+
+;; ---- strings and symbols --------------------------------------------------------
+
+;; A string of n zero bytes. The compiler and the marshaller build strings
+;; with this and %string-set-byte!.
+(func (%alloc-string [n i32]) -> i32
+  (let ([p (%alloc (i32.add 4 n))])
+    (i32.store p (i32.or 3 (i32.shl n 8)))
+    p))
+
+(func (%string-set-byte! [s i32] [i i32] [b i32])
+  (i32.store8 (i32.add s i) b 4))
+
+(func (string? [w i32]) -> i32 (i32.eq (%type w) 3))
+(func (string-length [s i32]) -> i32 (%expect s 3) (%count s))
+
+(func (string-byte [s i32] [i i32]) -> i32
+  (%expect s 3)
+  (if (i32.ge_u i (%count s)) (%fail (data-address %msg-range) (data-size %msg-range)))
+  (i32.load8_u (i32.add s i) 4))
+
+(func (string=? [a i32] [b i32]) -> i32
+  (%expect a 3)
+  (%expect b 3)
+  (let ([n (%count a)] [i 0])
+    (if (i32.ne n (%count b)) (return 0))
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (if (i32.ne (i32.load8_u (i32.add a i) 4) (i32.load8_u (i32.add b i) 4)) (return 0))
+        (set! i (i32.add i 1))
+        (br next)))
+    1))
+
+(func (string-append [a i32] [b i32]) -> i32
+  (%expect a 3)
+  (%expect b 3)
+  (let* ([na (%count a)] [nb (%count b)] [s (%alloc-string (i32.add na nb))])
+    (memory.copy (i32.add s 4) (i32.add a 4) na)
+    (memory.copy (i32.add (i32.add s 4) na) (i32.add b 4) nb)
+    s))
+
+;; FNV-1a over the bytes.
+(func (%string-hash [s i32]) -> i32
+  (let ([h #x811c9dc5] [i 0] [n (%count s)])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (set! h (i32.mul (i32.xor h (i32.load8_u (i32.add s i) 4)) 16777619))
+        (set! i (i32.add i 1))
+        (br next)))
+    h))
+
+(func (symbol? [w i32]) -> i32 (i32.eq (%type w) 2))
+(func (symbol->string [s i32]) -> i32 (%expect s 2) (i32.load s 4))
+
+;; The symbol named by string `name`, made on first use.
+(func (intern [name i32]) -> i32
+  (%expect name 3)
+  (if (i32.eqz %symtab) (set! %symtab (%object 6 1024)))
+  (let* ([slot (i32.add (i32.add %symtab 4) (i32.shl (i32.and (%string-hash name) 1023) 2))]
+         [l (i32.load slot)])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (if (string=? (i32.load (car l) 4) name) (return (car l)))
+        (set! l (cdr l))
+        (br next)))
+    (let ([sym (%object 2 1)])
+      (i32.store sym name 4)
+      (i32.store slot (cons sym (i32.load slot)))
+      sym)))
+
+(func (symbol-append [a i32] [b i32]) -> i32
+  (intern (string-append (symbol->string a) (symbol->string b))))
+
+;; ---- syntax objects -------------------------------------------------------------
+
+(func (%make-syntax [e i32] [scopes i32] [srcloc i32] [props i32]) -> i32
+  (let ([p (%object 4 4)])
+    (i32.store p e 4)
+    (i32.store p scopes 8)
+    (i32.store p srcloc 12)
+    (i32.store p props 16)
+    p))
+
+(func (%make-srcloc [source i32] [line i32] [col i32] [pos i32] [span i32]) -> i32
+  (let ([p (%object 5 5)])
+    (i32.store p source 4)
+    (i32.store p line 8)
+    (i32.store p col 12)
+    (i32.store p pos 16)
+    (i32.store p span 20)
+    p))
+
+(func (syntax? [w i32]) -> i32 (i32.eq (%type w) 4))
+(func (syntax-e [s i32]) -> i32 (%expect s 4) (i32.load s 4))
+(func (identifier? [w i32]) -> i32 (if (syntax? w) (symbol? (syntax-e w)) 0))
+
+;; A copy of s holding datum e: same scopes, srcloc and props. Used by
+;; quasisyntax to rebuild a template around new parts.
+(func (syntax-rewrap [s i32] [e i32]) -> i32
+  (%expect s 4)
+  (%make-syntax e (i32.load s 8) (i32.load s 12) (i32.load s 16)))
+
+;; The elements of a syntax list, or x itself if it is already a list.
+(func (splice-list [x i32]) -> i32 (if (syntax? x) (syntax-e x) x))
+
+;; The elements of a proper syntax list, or #f.
+(func (syntax->list [x i32]) -> i32
+  (let ([e (splice-list x)]) (if (list? e) e #f)))
+
+(func (syntax->datum [x i32]) -> i32
+  (if (syntax? x) (return (syntax->datum (syntax-e x))))
+  (if (pair? x) (return (cons (syntax->datum (car x)) (syntax->datum (cdr x)))))
+  x)
+
+;; Wrap datum d, giving every new syntax object the scopes of ctx.
+(func (datum->syntax [ctx i32] [d i32]) -> i32
+  (%wrap d (if (syntax? ctx) (i32.load ctx 8) '())))
+
+(func (%wrap [d i32] [scopes i32]) -> i32
+  (if (syntax? d) (return d))
+  (if (pair? d) (return (%make-syntax (%wrap-list d scopes) scopes #f '())))
+  (%make-syntax d scopes #f '()))
+
+(func (%wrap-list [d i32] [scopes i32]) -> i32
+  (if (pair? d) (return (cons (%wrap (car d) scopes) (%wrap-list (cdr d) scopes))))
+  (if (null? d) (return '()))
+  (%wrap d scopes))

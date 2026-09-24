@@ -1,13 +1,13 @@
 ;; subc: the stage0 driver.
 ;;
-;;   subc run FILE           compile FILE and run its main function
-;;   subc compile FILE [-o OUT]   write FILE's phase-0 module
-;;   subc expand FILE        print FILE's fully expanded kernel forms
-;;   subc rt [-o OUT]        write the compiled rt module
+;;   subc run FILE                 compile FILE and run its main function
+;;   subc compile FILE [-o OUT]    write FILE's phase-0 module
+;;   subc expand FILE              print FILE's fully expanded kernel forms
+;;   subc expander-module [-o OUT] write the compiled expander module
 (import (chezscheme) (stage0 syntax) (stage0 expander) (stage0 host))
 
 (define root (or (getenv "SUBSTRATE_ROOT") "."))
-(define rt-path (string-append root "/rt/rt.sub"))
+(define expander-module-path (string-append root "/stage0/expander.sub"))
 
 (define (write-file path bv)
   (call-with-port (open-file-output-port path (file-options no-fail))
@@ -30,9 +30,12 @@
   (newline (current-error-port))
   (exit code))
 
-(define (run-program sess bytes)
+;; Run a compiled program in a fresh store. The expander module is loaded
+;; only if the program imports it (spec 3.3).
+(define (run-program sess bytes imports)
   (let ([h (host-new)])
-    (host-instantiate! h "rt" (session-rt-bytes sess))
+    (when (member "expander" imports)
+      (host-instantiate! h "expander" (session-module-bytes sess)))
     (host-instantiate! h "main" bytes)
     (guard (c [(and (wasm-failure? c)
                     (let ([m (wasm-failure-message c)])
@@ -51,19 +54,20 @@
              (exit 3)])
     (cond
       [(and (= (length args) 2) (string=? (car args) "run"))
-       (let ([sess (make-session rt-path)])
-         (run-program sess (compile-source sess (cadr args))))]
+       (let ([sess (make-session expander-module-path)])
+         (let-values ([(bytes imports) (compile-source sess (cadr args))])
+           (run-program sess bytes imports)))]
       [(and (>= (length args) 2) (string=? (car args) "compile"))
-       (let ([sess (make-session rt-path)])
-         (write-file (option args "-o" (replace-extension (cadr args) ".wasm"))
-                     (compile-source sess (cadr args))))]
+       (let ([sess (make-session expander-module-path)])
+         (let-values ([(bytes imports) (compile-source sess (cadr args))])
+           (write-file (option args "-o" (replace-extension (cadr args) ".wasm")) bytes)))]
       [(and (= (length args) 2) (string=? (car args) "expand"))
-       (let ([sess (make-session rt-path)])
+       (let ([sess (make-session expander-module-path)])
          (for-each (lambda (f) (pretty-print (strip-ast f))) (expand-source sess (cadr args))))]
-      [(and (>= (length args) 1) (string=? (car args) "rt"))
-       (let ([sess (make-session rt-path)])
-         (write-file (option args "-o" "build/rt.wasm") (session-rt-bytes sess)))]
-      [else (die 64 "usage: subc run FILE | compile FILE [-o OUT] | expand FILE | rt [-o OUT]")])
+      [(and (>= (length args) 1) (string=? (car args) "expander-module"))
+       (let ([sess (make-session expander-module-path)])
+         (write-file (option args "-o" "build/expander.wasm") (session-module-bytes sess)))]
+      [else (die 64 "usage: subc run FILE | compile FILE [-o OUT] | expand FILE | expander-module [-o OUT]")])
     (flush-output-port (current-output-port))))
 
 (main (command-line-arguments))
