@@ -1346,9 +1346,14 @@
             [(3)                        ; free-identifier=?
              (let ([x (decode ms a)] [y (decode ms b)])
                (unless (and (id? x) (id? y)) (raise-compile-error api-where "free-identifier=?: expected identifiers"))
-               ;; Same meaning, so an import and what it imports are equal.
-               (let ([mx (meaning-of x api-phase)] [my (meaning-of y api-phase)])
-                 (if (if (or mx my) (equal? mx my) (eq? (stx-e x) (stx-e y))) 1 0)))]
+               ;; The same meanings, as a value and as a type, so an import
+               ;; and what it imports are equal.
+               (let ([vx (meaning-of x api-phase)] [vy (meaning-of y api-phase)]
+                     [tx (type-meaning-of x api-phase)] [ty (type-meaning-of y api-phase)])
+                 (if (if (or vx vy tx ty)
+                         (and (equal? vx vy) (equal? tx ty))
+                         (eq? (stx-e x) (stx-e y)))
+                     1 0)))]
             [(4)                        ; binding-kind
              (let ([id (decode ms a)])
                (unless (id? id) (raise-compile-error api-where "binding-kind: expected an identifier"))
@@ -1361,7 +1366,7 @@
                               [(data) 'data]
                               [(label) 'label]
                               [(core prim) 'core]
-                              [else #f]))))]
+                              [else (and (type-meaning-of id api-phase) 'type)]))))]
             [(5)                        ; local-expand
              ;; As in Racket, the running macro's introduction scope is
              ;; flipped around the expansion, so code from the macro's input

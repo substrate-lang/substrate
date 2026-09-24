@@ -113,14 +113,15 @@ from the instance `"syntax"`. Parameters are `eqref` unless marked
   returns syntax holding another GC object is an error.
 - Accessors trap with a message ("expected a pair") when given the wrong
   kind of value.
-- `free-identifier=?` is 1 when `a` and `b` refer to the same binding, as
-  values at the running macro's phase. An imported name and the definition
-  it imports are the same binding. Two unbound identifiers are equal when
-  their names are.
+- `free-identifier=?` is 1 when `a` and `b` refer to the same bindings at
+  the running macro's phase, as a value and as a type (6.1). An imported
+  name and the definition it imports are the same binding. Two identifiers
+  bound in neither namespace are equal when their names are.
 - `binding-kind` says what identifier `id` is bound to as a value at the
   running macro's phase: the symbol `function`, `variable` (a local or
   global), `macro`, `static`, `data`, `label` or `core` (a core form or wasm
-  operator), or `#f` if it is unbound. An implicit `#%app` (5.3) uses it to
+  operator); `type` if it is bound only as a type; or `#f` if it is
+  unbound. An implicit `#%app` (5.3) uses it to
   tell a call of a function from a call through a variable.
 - `local-expand` expands expression `stx` at the running macro's phase and
   returns it as expanded code (6.4), so a macro can look at what its input
