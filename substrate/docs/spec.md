@@ -74,8 +74,9 @@ The contract promises this about them:
 - `#f` is the null reference, so `(ref.is_null v)` tests for it.
 - `ref.eq` is identity. Symbols are interned, so two symbols with the same
   name are `ref.eq`. Small integers (fixnums) are `ref.eq` when they are
-  equal. Characters and strings are not guaranteed to be `ref.eq`; compare
-  them with `char->integer` and `string=?`.
+  equal. Characters, strings, larger integers and flonums are not
+  guaranteed to be `ref.eq`; compare characters and strings with
+  `char->integer` and `string=?`, and numbers by their values.
 - Everything else about the representation is private (appendix A).
 
 Counts, indices, bytes and predicate results are `i32`, not values:
@@ -86,17 +87,25 @@ are references, wasm's own type checking keeps them apart from numbers.
 
 `(require name syntax)` binds these as `name:function` at the phase where
 it appears, plus any it lists to bind unqualified (3.1). They are imported
-from the instance `"syntax"`. Parameters are `eqref` unless marked
-`i32`.
+from the instance `"syntax"`. Parameters are `eqref` unless marked with
+another type, such as `n:i32`.
 
 | Group | Functions |
 |---|---|
-| atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
+| atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
 | queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)`, `(local-expand stx)`, `(lift-definition form)` |
 
+- **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
+  otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
+  wasm's constants do, and are kept exactly. `integer?` holds for both
+  kinds. `integer-value` is the value's 64-bit two's complement, what
+  arithmetic wants, and with `integer-negative?` it gives the exact value:
+  a non-negative one is `integer-value` read as unsigned. `integer` makes
+  the fixnum or integer value for a signed `i64`. A decimal literal is a
+  flonum, an `f64`.
 - `syntax-e` of an identifier is a symbol, and of a literal it is the
   literal's value. Of a list it is a list whose elements are syntax.
 - `datum->syntax` wraps a value, giving every new syntax object the scopes
@@ -452,8 +461,8 @@ it (3.4).
 
 | Source | Unquoted | Quoted |
 |---|---|---|
-| `42` | integer constant, type from context | fixnum value |
-| `1.5` | float constant | not supported in v0 |
+| `42` | integer constant, type from context | fixnum or integer value |
+| `1.5` | float constant | flonum value |
 | `#\a` | `i32` 97 | character value |
 | `#t` / `#f` | `i32` 1 / 0 | `#t` value / null |
 | `"text"` | error: use `data` for bytes | string value |
@@ -461,8 +470,9 @@ it (3.4).
 The unchanged parts of a `quasisyntax` template keep their lexical context,
 which is what macro templates need. The reader abbreviations are
 `'` `` ` `` `,` `,@` and `#'` `` #` `` `#,` `#,@`. The reader reads `#%name`
-as the symbol `#%name`. Integers outside the
-fixnum range (31 bits) cannot be quoted.
+as the symbol `#%name`. An integer literal must fit in 64 bits, from -2^63
+to 2^64 - 1, and a number literal is an integer or a decimal: the reader
+rejects others, such as `1/2`.
 
 ### 5.5 Base bindings
 
@@ -664,8 +674,6 @@ A library usually provides a macro that expands into the declaration.
   conversion for a typed language, would need the checker to write types
   into expanded code before the pass, and queries for the types of
   imported definitions. Nothing planned before bootstrap needs this.
-- **More kinds of data**: bignums, floats and vectors as values are not in
-  v0.
 
 ## Appendix A: stage0's syntax library representation (not part of the contract)
 
@@ -685,6 +693,8 @@ expander.
   | `%syntax` | `(struct (field e eqref) (field scopes eqref) (field srcloc eqref) (field props eqref))` | syntax objects |
   | `%srcloc` | `(struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32))` | source locations |
   | `%table` | `(array (mut eqref))` | the intern table and the handle table |
+  | `%integer` | `(struct (field negative i32) (field magnitude i64))` | integers beyond the fixnum range |
+  | `%flonum` | `(struct (field value f64))` | flonums |
 
 - **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
   single `%atom` objects made at start. Quoted strings in compiled code are
@@ -700,7 +710,8 @@ expander.
 - **Embedder interface (stage0 only)**: Chez cannot hold GC references, so
   it names objects by `i32` handles, indexes into the library's handle
   table (handle 0 is `#f`). The `%h-` functions build and take apart
-  objects through handles. Handles made while a macro runs are released
+  objects through handles, passing 64-bit values as two `i32` halves.
+  Handles made while a macro runs are released
   when it returns. Each store gets a small entry chunk per transformer and
   per static value it uses, which converts between handles and references.
   After bootstrap this section goes away.

@@ -32,8 +32,14 @@
   ;; A Chez datum -> a handle.
   (define (encode st d)
     (cond [(and (integer? d) (exact? d))
-           (unless (<= fixnum-min d fixnum-max) (error 'encode "integer outside the fixnum range" d))
-           (lib st "%h-fixnum" d)]
+           (cond [(<= fixnum-min d fixnum-max) (lib st "%h-fixnum" d)]
+                 [(<= (- (expt 2 63)) d (- (expt 2 64) 1))
+                  (let ([m (abs d)])
+                    (lib st "%h-integer" (if (< d 0) 1 0) (high-half m) (low-half m)))]
+                 [else (error 'encode "integer beyond 64 bits" d)])]
+          [(flonum? d)
+           (let ([bits (flonum-bits d)])
+             (lib st "%h-flonum" (high-half bits) (low-half bits)))]
           [(eq? d #f) 0]
           [(eq? d #t) (lib st "%h-true")]
           [(null? d) (lib st "%h-nil")]
@@ -76,4 +82,22 @@
       [(9) (make-srcloc (decode st (lib st "%h-srcloc-source" h))
                         (lib st "%h-srcloc-field" h 1) (lib st "%h-srcloc-field" h 2)
                         (lib st "%h-srcloc-field" h 3) (lib st "%h-srcloc-field" h 4))]
-      [else (make-wasm-value h)])))
+      [(10) (let ([m (join-halves (lib st "%h-integer-part" h 1) (lib st "%h-integer-part" h 2))])
+              (if (= (lib st "%h-integer-part" h 0) 1) (- m) m))]
+      [(11) (let ([bv (make-bytevector 8)])
+              (bytevector-u64-set! bv 0 (join-halves (lib st "%h-flonum-half" h 0) (lib st "%h-flonum-half" h 1))
+                                   (endianness little))
+              (bytevector-ieee-double-ref bv 0 (endianness little)))]
+      [else (make-wasm-value h)]))
+
+  ;; 64-bit values cross the i32-only interface as two halves (appendix A),
+  ;; each passed as a signed i32.
+  (define (signed32 x) (if (>= x (expt 2 31)) (- x (expt 2 32)) x))
+  (define (high-half n) (signed32 (bitwise-arithmetic-shift-right n 32)))
+  (define (low-half n) (signed32 (bitwise-and n #xFFFFFFFF)))
+  (define (join-halves hi lo)
+    (+ (* (bitwise-and hi #xFFFFFFFF) (expt 2 32)) (bitwise-and lo #xFFFFFFFF)))
+  (define (flonum-bits x)
+    (let ([bv (make-bytevector 8)])
+      (bytevector-ieee-double-set! bv 0 x (endianness little))
+      (bytevector-u64-ref bv 0 (endianness little)))))

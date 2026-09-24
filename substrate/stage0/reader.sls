@@ -156,7 +156,7 @@
                (let ([tok (read-token)])
                  (cond [(member tok '("t" "true")) (wrap start #t)]
                        [(member tok '("f" "false")) (wrap start #f)]
-                       [(string->number (string-append "#" tok)) => (lambda (n) (wrap start n))]
+                       [(string->number (string-append "#" tok)) => (lambda (n) (wrap start (check-number start n)))]
                        [else (fail start "unknown syntax #~a" tok)]))])))
 
     (define (read-datum)
@@ -175,10 +175,19 @@
               [(char=? c #\") (read-string-lit start)]
               [(char=? c #\#) (read-hash start)]
               [else
-               (let ([tok (read-token)])
-                 (wrap start (or (and (not (string=? tok "."))
-                                      (string->number tok))
-                                 (string->symbol tok))))])))
+               (let* ([tok (read-token)]
+                      [n (and (not (string=? tok ".")) (string->number tok))])
+                 (wrap start (if n (check-number start n) (string->symbol tok))))])))
+
+    ;; The kernel's number literals are integers of up to 64 bits, from
+    ;; -2^63 to 2^64 - 1 as in wasm, and floats (spec 5.4).
+    (define (check-number start n)
+      (cond [(and (integer? n) (exact? n))
+             (unless (<= (- (expt 2 63)) n (- (expt 2 64) 1))
+               (fail start "the integer ~a does not fit in 64 bits" n))
+             n]
+            [(flonum? n) n]
+            [else (fail start "~a is not a number literal: use integers and decimals" n)]))
 
     (let loop ([acc '()])
       (let ([d (read-datum)])

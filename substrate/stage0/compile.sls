@@ -433,9 +433,8 @@
       [(unreachable) () (values '((unreachable)) 'bottom)]
       [(nop) () (finish '((nop)) '())]
       [(quote) (d)
-       (cond [(and (integer? d) (exact? d))
-              (unless (<= fixnum-min d fixnum-max)
-                (fail "integer ~a is outside the fixnum range" d))
+       ;; A quoted fixnum or #f is a constant; other data is built once.
+       (cond [(and (integer? d) (exact? d) (<= fixnum-min d fixnum-max))
               (finish `((i32.const ,d) (ref.i31)) (list (make-ref #f 'i31)))]
              [(eq? d #f) (finish '((ref.null eq)) (list eqref))]
              [else (finish `((global.get ,(new-synth! ms 'const d))) (list eqref))])]
@@ -454,8 +453,11 @@
         (append (apply append (map i32 (bytevector->u8-list bv)))
                 `((array.new_fixed ,string-type ,(bytevector-length bv))))))
     (cond [(and (integer? d) (exact? d))
-           (unless (<= fixnum-min d fixnum-max) (fail "integer ~a is outside the fixnum range" d))
-           `((i32.const ,d) (ref.i31))]
+           (if (<= fixnum-min d fixnum-max)
+               `((i32.const ,d) (ref.i31))
+               ;; Beyond the fixnum range: a sign and a 64-bit magnitude.
+               (append (i32 (if (< d 0) 1 0)) `((i64.const ,(s64 (abs d)))) (call '%make-integer)))]
+          [(flonum? d) (append `((f64.const ,d)) (call 'flonum))]
           [(eq? d #f) '((ref.null eq))]
           [(eq? d #t) (call '%the-true)]
           [(null? d) (call '%the-nil)]
