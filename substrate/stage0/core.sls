@@ -28,7 +28,7 @@
 (library (stage0 core)
   (export make-func-info func-info? func-info-name func-info-params func-info-results
           func-info-instance func-info-instance-set! func-info-export func-info-export-set!
-          make-global-info global-info? global-info-name global-info-type
+          make-global-info global-info? global-info-name global-info-type global-info-mutable?
           global-info-instance global-info-instance-set! global-info-export global-info-export-set!
           make-data-info data-info? data-info-name data-info-offset data-info-bytes
           make-type-info type-info? type-info-name type-info-kind type-info-fields type-info-fields-set!
@@ -44,7 +44,7 @@
     (fields name params results (mutable instance) (mutable export)))
 
   (define-record-type global-info
-    (fields name type (mutable instance) (mutable export)))
+    (fields name type mutable? (mutable instance) (mutable export)))
 
   ;; An active data segment: bytes placed at offset in the module's memory.
   (define-record-type data-info (fields name offset bytes))

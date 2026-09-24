@@ -264,7 +264,8 @@ quotation and compile-time forms.
 
 ```
 (func (name [param type] ...) [-> result] body ...)
-(global name type init)             ; numeric or nullable reference type
+(global name type init)             ; immutable; init is a constant expression
+(global name (mut type) init)       ; mutable
 (import name "module" "field" (type ... -> type ...))
 (memory pages)  (memory from name)
 (table size)  (table from name)
@@ -297,6 +298,19 @@ supertype's fields, and a field may narrow its type only if it is
 immutable. `(sub final ...)` has no subtypes. A declared type may refer to
 itself, and to earlier types, but not to later ones: each type is its own
 recursion group in v0.
+
+Globals follow wasm too. A global is immutable unless its type is written
+`(mut type)`, and `set!` of an immutable global is an error. An initializer
+that is a **constant expression** is compiled into the global itself, as
+wasm requires of an immutable global. The constant expressions are
+literals, `ref.null`, `ref.i31`, `struct.new`, `array.new`,
+`array.new_default` and `array.new_fixed`, `add`, `sub` and `mul` on `i32`
+and `i64`, and reads of immutable globals that are imported or defined
+earlier in the module, each with constant operands. Any other initializer
+runs when the module is instantiated, in source order with the module's
+other expressions, so only a mutable global of a numeric or nullable type
+may have one. Another module that imports a global imports its mutability
+with it.
 
 ### 5.3 Expressions
 

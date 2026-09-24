@@ -297,6 +297,9 @@
        (note-global! ms info)
        (finish `((global.get ,info)) (list (global-info-type info)))]
       [(gset) (info v)
+       (unless (global-info-mutable? info)
+         (fail "~a is immutable: declare it (global ~a (mut type) init) to set it"
+               (global-info-name info) (global-info-name info)))
        (note-global! ms info)
        (finish (append (code-of v (global-info-type info)) `((global.set ,info))) '())]
       [(let) (bindings body)
@@ -461,15 +464,24 @@
 
   ;; ---- module -------------------------------------------------------------------
 
-  (define (literal-init init)
-    (let loop ([init init])
-      (and (pair? init)
-           (case (car init)
-             [(at) (loop (caddr init))]
-             [(int) (cadr init)]
-             [(float) (cadr init)]
-             [(const) (caddr init)]
-             [else #f]))))
+  ;; Is e a constant expression in wasm's sense (spec 5.2)? It may read
+  ;; immutable globals that are imported or among `earlier`, this module's
+  ;; globals defined before the one e initializes.
+  (define (constant-expr? ms e earlier)
+    (let loop ([e e])
+      (case (car e)
+        [(at) (loop (caddr e))]
+        [(int float const) #t]
+        [(gref) (let ([g (cadr e)])
+                  (and (not (global-info-mutable? g))
+                       (or (external? ms (global-info-instance g)) (memq g earlier) #f)))]
+        [(prim) (and (memq (cadr e) '(i32.add i32.sub i32.mul i64.add i64.sub i64.mul))
+                     (for-all loop (cadddr e)))]
+        [(gc) (and (memq (cadr e) '(struct.new array.new array.new_default array.new_fixed ref.null ref.i31))
+                   (for-all loop (cadddr e)))]
+        [else #f])))
+
+  (define (loc-of e) (and (pair? e) (eq? (car e) 'at) (cadr e)))
 
   (define (const-op t) (string->symbol (string-append (symbol->string t) ".const")))
 
@@ -530,12 +542,31 @@
     (define assigned-globals
       (for-each (lambda (f)
                   (let ([info (cadr f)])
-                    (unless (defaultable? (global-info-type info))
-                      (fail "global ~a: a global must have a numeric or nullable reference type"
-                            (global-info-name info)))
                     (global-info-instance-set! info self)
                     (global-info-export-set! info (export-name! (global-info-name info)))))
                 global-forms))
+
+    ;; Global initializers (spec 5.2). A constant expression is compiled
+    ;; into the global itself: an alist info -> code, in definition order.
+    ;; Any other initializer runs in the start function, so its global must
+    ;; be mutable and start with a default value.
+    (define constant-inits
+      (let loop ([fs global-forms] [earlier '()] [acc '()])
+        (if (null? fs)
+            (reverse acc)
+            (let* ([info (cadr (car fs))] [init (caddr (car fs))] [t (global-info-type info)])
+              (parameterize ([current-loc (loc-of init)])
+                (cond
+                  [(and init (constant-expr? ms init earlier))
+                   (let-values ([(c _) (cx ms (new-fctx '() '()) '() init (list t) #f)])
+                     (loop (cdr fs) (cons info earlier) (cons (cons info c) acc)))]
+                  [(not (global-info-mutable? info))
+                   (fail "global ~a is immutable, so its initializer must be a constant expression; declare it (mut ~a) to compute it when the module starts"
+                         (global-info-name info) (valtype->string t))]
+                  [(not (defaultable? t))
+                   (fail "global ~a: a global computed when the module starts must have a numeric or nullable reference type"
+                         (global-info-name info))]
+                  [else (loop (cdr fs) (cons info earlier) acc)]))))))
 
     ;; Function bodies.
     (define compiled-funcs
@@ -557,7 +588,7 @@
                        (case (car f)
                          [(global)
                           (let ([info (cadr f)] [init (caddr f)])
-                            (if (or (not init) (and (numeric-type? (global-info-type info)) (literal-init init)))
+                            (if (or (not init) (assq info constant-inits))
                                 '()
                                 (let-values ([(c _) (cx ms start-fc '() init (list (global-info-type info)) #f)])
                                   (append c `((global.set ,info))))))]
@@ -609,7 +640,7 @@
                            (map (lambda (cf) (list (cadr cf) (caddr cf) (cadddr cf))) compiled-funcs)
                            (fctx-extra start-fc) start-code
                            (map (lambda (info) (list (func-info-params info) (func-info-results info))) func-imports)
-                           (map global-info-type global-imports)
+                           (map global-info-type global-imports) (map cdr constant-inits)
                            (map (lambda (f) (global-info-type (cadr f))) global-forms))))
     (define gc-index
       (let ([table (make-eq-hashtable)])
@@ -670,7 +701,7 @@
                        (type-index (list 'func (func-info-params info) (func-info-results info)))))
                func-imports)
        (map-lr (lambda (g) (list (global-info-instance g) (global-info-export g) 'global
-                                 (list (rv (global-info-type g)) #t)))
+                                 (list (rv (global-info-type g)) (global-info-mutable? g))))
                global-imports)
        (if (imported? memory-form) (list (list (cadr memory-form) "memory" 'memory '(0 #f))) '())
        (if (imported? table-form) (list (list (cadr table-form) "table" 'table '(0 #f))) '())))
@@ -694,14 +725,9 @@
       (append
        (map-lr (lambda (f)
                  (let* ([info (cadr f)] [t (global-info-type info)]
-                        [lit (and (caddr f) (numeric-type? t) (literal-init (caddr f)))])
-                   (list (rv t) #t
-                         (if lit
-                             (list (list (const-op t)
-                                         (cond [(memq t '(f32 f64)) (inexact lit)]
-                                               [(eq? t 'i32) (s32 lit)]
-                                               [else (s64 lit)])))
-                             (zero-init t)))))
+                        [init (assq info constant-inits)])
+                   (list (rv t) (global-info-mutable? info)
+                         (if init (resolve (cdr init)) (zero-init t)))))
                global-forms)
        (map-lr (lambda (s) (if (eq? (synth-kind s) 'fidx)
                                (list 'i32 #t '((i32.const 0)))

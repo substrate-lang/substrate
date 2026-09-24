@@ -290,7 +290,7 @@
                                 (make-func-info (func-info-name info) (func-info-params info) (func-info-results info)
                                                 (shift-instance (func-info-instance info) k) (func-info-export info))]
                                [(global-info? info)
-                                (make-global-info (global-info-name info) (global-info-type info)
+                                (make-global-info (global-info-name info) (global-info-type info) (global-info-mutable? info)
                                                   (shift-instance (global-info-instance info) k) (global-info-export info))]
                                [else info])])
                 (hashtable-set! shifted-infos info (cons (cons k new) cache))
@@ -740,12 +740,15 @@
       (list 'func info (map-lr (lambda (k pr) (cons k (cdr pr))) keys params)
             (expand-seq (map-lr (lambda (b) (add-scope b sc)) body) phase f))))
 
-  ;; (global name type init)
+  ;; (global name type init) or (global name (mut type) init), as in wasm.
   (define (declare-global f phase)
     (let ([parts (stx-list-of f 'global)])
       (unless (and (= (length parts) 4) (id? (cadr parts)))
-        (raise-compile-error f "expected (global name type init)"))
-      (let ([info (make-global-info (stx-e (cadr parts)) (parse-type (caddr parts) phase) #f #f)])
+        (raise-compile-error f "expected (global name type init) or (global name (mut type) init)"))
+      (let* ([t (stx->list (caddr parts))]
+             [mutable? (and t (= (length t) 2) (core-name? (car t) 'mut))]
+             [info (make-global-info (stx-e (cadr parts)) (parse-type (if mutable? (cadr t) (caddr parts)) phase)
+                                     mutable? #f #f)])
         (bind-definition! (cadr parts) phase (list 'global info))
         (list 'global info (cadddr parts)))))
 
@@ -977,7 +980,7 @@
         (raise-compile-error f "expected (define-static name expr)"))
       (let* ([name (string->symbol (string-append "__static." (symbol->string (stx-e (cadr parts)))))]
              [rhs (expand-expr (caddr parts) (+ phase 1))]
-             [global (make-global-info name eqref #f #f)]
+             [global (make-global-info name eqref #t #f #f)]
              [getter (make-func-info name '() (list eqref) #f #f)])
         (run-chunk! (list (list 'global global rhs) (list 'func getter '() (list 'gref global)))
                     (+ phase 1) f)
