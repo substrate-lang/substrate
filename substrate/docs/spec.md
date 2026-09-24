@@ -174,10 +174,13 @@ them in Chez; in a run-time store they trap.
     `[new old]` binds `new` to the source's `old`, in `let` order.
   - `(require-unqualified name source)` is `require` with every name the
     source provides bound unqualified too, with the scopes of `name`. It
-    is meant for the few forms a language's code is written in, such as
-    its `define` and `#%app`, and little else: unqualified names hide
-    where a binding comes from, and a later definition of one of them is
-    an error.
+    is meant for a language: the forms and functions its code is written
+    in, such as its `define` and `#%app`, and little else, since
+    unqualified names hide where a binding comes from. As in Racket, where
+    a module's definitions shadow its language's bindings, a module-level
+    definition of one of these names shadows the import throughout the
+    module. It is an error if a macro use in the module relied on the
+    import before the definition, since that expansion cannot be undone.
   - A require at phase *p* imports at phase *p*. To import for compile-time
     code, put the require inside `begin-for-syntax`. The required module's
     phase *q* is then phase *p* + *q* in the requiring module.

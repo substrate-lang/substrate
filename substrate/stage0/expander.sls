@@ -52,6 +52,10 @@
 
   (define bindings (make-eq-hashtable))    ; symbol -> list of binding
   (define meanings (make-eqv-hashtable))   ; key -> meaning
+  ;; The keys of bindings require-unqualified made, each -> whether a macro
+  ;; use has relied on it: a definition of the same name may shadow one it
+  ;; has not (spec 3.1).
+  (define unqualified-imports (make-eqv-hashtable))
   (define scope-counter 0)
   (define base-installed? #f)
   (define registry (make-hashtable string-hash string=?))        ; absolute path -> module
@@ -241,15 +245,43 @@
   ;; Bind a module-level definition. Use-site scopes come off the name, so
   ;; a definition a macro makes from its input is visible to the rest of
   ;; the module (spec 6.2). A second binding of the same name with the same
-  ;; scopes at the same phase is an error, except in what a module pass
+  ;; scopes at the same phase is an error, except that a definition shadows
+  ;; what require-unqualified imports (spec 3.1), and in what a module pass
   ;; returns, where it replaces this module's definition (spec 6.5).
   (define (bind-definition! id phase meaning)
     (let ([id (remove-scopes id (comp-use-site-scopes current))])
       (unless (and redefining? (redefine! id phase meaning))
+        (shadow-import! id phase meaning)
         (check-unbound! id phase meaning)
         (let ([key (bind-module-level! (stx-e id) (stx-scopes id) phase meaning)])
           (when (eqv? phase 0)
             (comp-definition-keys-set! current (cons key (comp-definition-keys current))))))))
+
+  ;; A definition shadows a binding require-unqualified made with the same
+  ;; name, scopes, phase and namespace: that binding goes, here and in the
+  ;; module's recorded entries (spec 3.1). It is an error if a macro use in
+  ;; this module already relied on it.
+  (define (shadow-import! id phase meaning)
+    (let ([b (find (lambda (b)
+                     (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
+                          (eq? (binding-namespace b) (meaning-namespace meaning))
+                          (hashtable-contains? unqualified-imports (binding-key b))))
+                   (hashtable-ref bindings (stx-e id) '()))])
+      (when b
+        (when (hashtable-ref unqualified-imports (binding-key b) #f)
+          (raise-compile-error id "~a is defined here, but a macro use before this definition used the ~a it imports"
+                               (stx-e id) (stx-e id)))
+        (hashtable-delete! unqualified-imports (binding-key b))
+        (hashtable-update! bindings (stx-e id) (lambda (l) (remq b l)) '())
+        (let ([m (comp-module current)])
+          (unit-entries-set! m (filter (lambda (e) (not (eqv? (cadddr e) (binding-key b)))) (unit-entries m)))))))
+
+  ;; A macro use relied on id's binding: if require-unqualified made it, no
+  ;; definition may shadow it now.
+  (define (note-macro-use! id phase)
+    (let ([key (resolve id phase 'value)])
+      (when (and key (hashtable-contains? unqualified-imports key))
+        (hashtable-set! unqualified-imports key #t))))
 
   ;; Give this module's definition of id, if it has one in the namespace
   ;; of meaning, the new meaning. Returns #f if there is none.
@@ -1133,7 +1165,10 @@
                            (require-syntax! source phase))])
         (for-each (lambda (p) (bind-import! (qualified name (car p)) phase (cdr p))) provided)
         (when all?
-          (for-each (lambda (p) (bind-import! (datum->stx name (car p) (stx-srcloc name)) phase (cdr p)))
+          (for-each (lambda (p)
+                      (hashtable-set! unqualified-imports
+                                      (bind-import! (datum->stx name (car p) (stx-srcloc name)) phase (cdr p))
+                                      #f))
                     provided))
         (for-each (lambda (item)
                     (let* ([l (stx->list item)]
@@ -1397,6 +1432,7 @@
   ;; In a definition context (use-site? is true) the input also gets a fresh
   ;; use-site scope, which stays.
   (define (apply-macro head transformer s phase use-site?)
+    (note-macro-use! head phase)
     (let* ([intro (new-scope!)]
            [s (flip-scope s intro)]
            [s (if use-site?
