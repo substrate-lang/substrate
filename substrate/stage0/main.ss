@@ -28,17 +28,12 @@
   (let ([m (member flag args)])
     (if (and m (pair? (cdr m))) (cadr m) default)))
 
-;; Print an expanded form. Chez writes the symbol #%app as \x23;%app, since
-;; its own reader gives #% another meaning; print it as written.
-(define (print-expanded f)
-  (let ([s (with-output-to-string (lambda () (pretty-print (stx->datum f))))]
-        [from "\\x23;%"])
-    (let loop ([i 0])
-      (cond [(= i (string-length s)) (void)]
-            [(and (<= (+ i (string-length from)) (string-length s))
-                  (string=? (substring s i (+ i (string-length from))) from))
-             (display "#%") (loop (+ i (string-length from)))]
-            [else (write-char (string-ref s i)) (loop (+ i 1))]))))
+;; Forms are written as the reader reads them. Chez escapes the # of a
+;; symbol such as #%app, since its own reader gives #% another meaning;
+;; with extended identifiers on, it writes #%app as written.
+(print-extended-identifiers #t)
+
+(define (print-expanded f) (pretty-print (stx->datum f)))
 
 (define (die code fmt . args)
   (flush-output-port (current-output-port))

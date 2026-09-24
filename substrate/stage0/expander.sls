@@ -128,8 +128,10 @@
                           forms)
                 (let-values ([(bytes imports gc?) (compile-module forms "syntax")])
                   (let ([table (make-eq-hashtable)])
-                    (for-each (lambda (f) (when (eq? (car f) 'func)
-                                            (hashtable-set! table (func-info-name (cadr f)) (cadr f))))
+                    (for-each (lambda (f)
+                                (case (car f)
+                                  [(func) (hashtable-set! table (func-info-name (cadr f)) (cadr f))]
+                                  [(global) (hashtable-set! table (global-info-name (cadr f)) (cadr f))]))
                               forms)
                     (set! syntax-lib (cons bytes table)))))))))))
 
@@ -1157,7 +1159,7 @@
       (map (lambda (info) (cons (func-info-name info) (list 'func info)))
            (list-sort (lambda (a b) (string<? (symbol->string (func-info-name a))
                                                (symbol->string (func-info-name b))))
-                      (filter (lambda (info) (not (internal-name? (func-info-name info))))
+                      (filter (lambda (info) (and (func-info? info) (not (internal-name? (func-info-name info)))))
                               (vector->list infos))))))
 
   (define (module-path-of f spec)

@@ -255,9 +255,11 @@ Then the part's start function runs:
    source order.
 
 Quoted fixnums and `#f` need no global: they are the constant expressions
-`(ref.i31 n)` and `(ref.null eq)`. A phase-1 part's module-level
-expressions run each time the part is instantiated, which is once per
-compilation that needs it.
+`(ref.i31 n)` and `(ref.null eq)`. Nor do `'()` and `#t`: they read
+immutable globals the syntax library defines for them, which is also a
+constant expression. A phase-1 part's module-level expressions run each
+time the part is instantiated, which is once per compilation that needs
+it.
 
 ## 4. Host interface
 
@@ -401,7 +403,8 @@ Globals follow wasm too. A global is immutable unless its type is written
 `(mut type)`, and `set!` of an immutable global is an error. An initializer
 that is a **constant expression** is compiled into the global itself, as
 wasm requires of an immutable global. The constant expressions are
-literals, `ref.null`, `ref.i31`, `ref.func`, `struct.new`, `array.new`,
+literals, the quoted data `'n` for a fixnum n, `'#f`, `'()` and `'#t`,
+`ref.null`, `ref.i31`, `ref.func`, `struct.new`, `array.new`,
 `array.new_default` and `array.new_fixed`, `add`, `sub` and `mul` on `i32`
 and `i64`, and reads of immutable globals that are imported or defined
 earlier in the module, each with constant operands. Any other initializer

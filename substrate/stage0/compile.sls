@@ -13,8 +13,8 @@
   (export compile-module current-syntax-infos fixnum-min fixnum-max set-string-type!)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 wasm))
 
-  ;; symbol -> func-info for the syntax library's exports; #f while
-  ;; compiling the syntax library itself.
+  ;; symbol -> func-info or global-info for the syntax library's exports;
+  ;; #f while compiling the syntax library itself.
   (define current-syntax-infos (make-parameter #f))
 
   (define fixnum-min (- (expt 2 30)))
@@ -171,6 +171,16 @@
       (unless info (fail "internal: the syntax library has no function ~a" name))
       (note-func! ms info)
       info))
+
+  ;; The syntax library's immutable global holding datum d, when d is '()
+  ;; or #t and another module is being compiled; else #f. Reading it is a
+  ;; constant expression.
+  (define (datum-global d)
+    (and (current-syntax-infos)
+         (or (null? d) (eq? d #t))
+         (let ([info (hashtable-ref (current-syntax-infos) (if (null? d) '%nil '%true) #f)])
+           (unless (global-info? info) (fail "internal: the syntax library has no global for ~s" d))
+           info)))
 
   (define (struct-field tinfo index) (list-ref (type-info-fields tinfo) index))
 
@@ -445,10 +455,12 @@
       [(unreachable) () (values '((unreachable)) 'bottom)]
       [(nop) () (finish '((nop)) '())]
       [(quote) (d)
-       ;; A quoted fixnum or #f is a constant; other data is built once.
+       ;; A quoted fixnum or #f is a constant, and so are '() and #t, which
+       ;; are globals of the syntax library; other data is built once.
        (cond [(and (integer? d) (exact? d) (<= fixnum-min d fixnum-max))
               (finish `((i32.const ,d) (ref.i31)) (list (make-ref #f 'i31)))]
              [(eq? d #f) (finish '((ref.null eq)) (list eqref))]
+             [(datum-global d) => (lambda (g) (sub `(gref ,g) expected tail?))]
              [else (finish `((global.get ,(new-synth! ms 'const d))) (list eqref))])]
       [else (fail "internal: unknown kernel form ~s" (car e))]))
 
@@ -493,6 +505,10 @@
       (case (car e)
         [(at) (loop (caddr e))]
         [(int float const ref-func) #t]
+        [(quote) (let ([d (cadr e)])
+                   (or (and (integer? d) (exact? d) (<= fixnum-min d fixnum-max))
+                       (eq? d #f)
+                       (and (datum-global d) #t)))]
         [(gref) (let ([g (cadr e)])
                   (and (not (global-info-mutable? g))
                        (or (external? ms (global-info-instance g)) (memq g earlier) #f)))]
