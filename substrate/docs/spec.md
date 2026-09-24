@@ -222,8 +222,10 @@ them in Chez; in a run-time store they trap.
   imports the memory of the module required as `name` at the same phase, so a
   program's modules can share one memory. Tables likewise. Code that uses
   memory instructions or data segments needs a memory, and code that uses
-  `func-index` or `call-indirect` needs a table. [v0] At phase ≥ 1 only the
-  `from` form is supported.
+  `func-index` or `call-indirect` needs a table. At phase ≥ 1 these work the
+  same way. There the chunks of a phase (3.1) share one memory: the first
+  chunk after `(memory pages)` defines it and later ones import it, so, as
+  with macros, code can use it only after the declaration. Tables likewise.
 - A part exports its memory as `"memory"` and its table as `"table"` (the
   host relies on this, section 4), and every module-level function and
   global under its name. If two bindings share a name, the compiler appends
@@ -686,8 +688,6 @@ A library usually provides a macro that expands into the declaration.
 
 ## 7. Open questions and later milestones
 
-- **Memory and table definitions at phase ≥ 1**: v0 supports only
-  `(memory from name)` there.
 - **Type functions across modules**: a type function declares its type in
   each module that uses it, and declared types are compared by
   declaration (5.1), so `(tuple i32 3)` in two modules is two types to

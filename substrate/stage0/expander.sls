@@ -91,7 +91,8 @@
             (mutable runtime-free-form) phase-forms memories tables (mutable provide-ids)
             (mutable require-names)            ; ((name . phase) . module)
             (mutable passes)                   ; ((function-info . form) ...), in order
-            (mutable definition-keys)))        ; keys of its phase-0 definitions
+            (mutable definition-keys)          ; keys of its phase-0 definitions
+            (mutable storage-chunks)))         ; ((memory-or-table . phase) . chunk that defines it)
 
   (define current #f)                      ; the comp being expanded
 
@@ -116,7 +117,7 @@
   (define (ensure-library!)
     (unless syntax-lib
       (let* ([m (make-unit library-path library-path "syntax" 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
-             [c (make-comp m #f 0 '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '())])
+             [c (make-comp m #f 0 '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '() '())])
         (with-comp c
           (lambda ()
             (parameterize ([current-syntax-infos #f])
@@ -451,7 +452,7 @@
          (let* ([name (fresh-unit-name path)]
                 [m (make-unit path source name 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
                 [c (make-comp m (new-cstore #t) 0 '() #f
-                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '())])
+                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '() '())])
            (hashtable-set! registry path m)
            (hashtable-set! modules-by-name name m)
            (with-comp c
@@ -1227,9 +1228,6 @@
        table phase
        (cond
          [(and (= (length parts) 2) (fixnum? (stx-e (cadr parts))) (>= (stx-e (cadr parts)) 0))
-          (unless (= phase 0)
-            (raise-compile-error f "v0 defines ~as at phase 0 only; at phase ~a use (~a from name)"
-                                 kind phase kind))
           (list kind (stx-e (cadr parts)))]
          [(and (= (length parts) 3) (core-name? (cadr parts) 'from))
           (let ([m (required-module (caddr parts) phase)])
@@ -1265,10 +1263,26 @@
   ;; part of the module's phase-`phase` part.
   (define (run-chunk! forms phase where)
     (add-phase-forms! phase forms)
-    (instantiate-chunk! (comp-store current)
-                        (next-chunk-name! (format "~a@~a" (unit-name (comp-module current)) phase))
-                        (append (storage-forms phase) forms)
-                        where))
+    (let ([name (next-chunk-name! (format "~a@~a" (unit-name (comp-module current)) phase))])
+      (instantiate-chunk! (comp-store current) name (append (chunk-storage-forms phase name) forms) where)))
+
+  ;; The memory and table forms for a chunk at phase, named name (spec 3.3).
+  ;; A phase's chunks share one memory: the first chunk after (memory pages)
+  ;; defines it, and later ones import it from that chunk. Tables likewise.
+  (define (chunk-storage-forms phase name)
+    (filter values
+            (map-lr (lambda (kind table)
+                      (let ([form (hashtable-ref table phase #f)])
+                        (cond [(not (and form (eq? (car form) kind))) form]
+                              [(assoc (cons kind phase) (comp-storage-chunks current))
+                               => (lambda (owner)
+                                    (list (if (eq? kind 'memory) 'memory-import 'table-import) (cdr owner)))]
+                              [else
+                               (comp-storage-chunks-set! current (cons (cons (cons kind phase) name)
+                                                                       (comp-storage-chunks current)))
+                               form])))
+                    '(memory table)
+                    (list (comp-memories current) (comp-tables current)))))
 
   ;; A one-function chunk in st giving Chez an i32 entry point: it turns
   ;; handles into references around `body`, which returns an eqref.
