@@ -1,10 +1,13 @@
 # Substrate kernel specification (v0 draft)
 
-Substrate is a thin Lisp over WebAssembly. Its one real addition to wasm is
-compile-time execution: macros are ordinary kernel code, compiled to wasm
-and run by the same engine that runs programs. The aim is that different
-languages can be built as libraries over one small kernel, and that the
-code they produce carries no runtime it did not ask for.
+Substrate is a Lisp over WebAssembly. This document specifies its kernel,
+whose one real addition to wasm is compile-time execution: macros are
+ordinary kernel code, compiled to wasm and run by the same engine that runs
+programs. The aim is that different languages can be built as libraries
+over one small kernel, and that the code they produce carries no runtime
+it did not ask for. The language most code is written in, also called
+Substrate, is one such library (`lib/substrate.sub`), as `racket/base` is
+built over Racket's `#%kernel`.
 
 Status markers: **[v0]** is implemented by stage0 now, **[planned]** is
 specified but not built yet.
@@ -37,21 +40,21 @@ specified but not built yet.
 | compiler | Reader, expander, kernel compiler, binary encoder. | stage0: `stage0/*.sls` (Chez Scheme) |
 | syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `compiler/syntax.sub` (kernel code) |
 | libraries | Ordinary modules: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
-| languages | Libraries that together make a language, such as the planned dynamic Lisp. | not yet |
+| languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub` |
 
 ### 1.3 What runs where
 
 | | While compiling | While a program runs |
 |---|---|---|
-| the syntax library | always instantiated in each compile-time store; macros link to it | instantiated only if the program's parts import it |
+| the syntax library | always instantiated in each compile-time store; macros link to it | instantiated only if the program's linklets import it |
 | GC | syntax data lives in the engine's GC heap | only if the program's code uses GC types or the syntax library |
 | each module's memory and table | its own, if it defines them | its own, if it defines them |
 | the host | no memory of its own; reads and writes the caller's | same |
 
 A **store** is one wasm store with one linker. Each module is compiled
 with its own **compile-time store**, which holds the syntax library, the
-module's chunks and the parts of what it requires (3.2). A **run-time
-store** holds the parts a program loads.
+linklets the module's compile-time code runs in, and the linklets of what it
+requires (3.2). A **run-time store** holds the linklets a program loads.
 
 The compile-time environment is garbage collected: syntax objects are GC
 objects. A compiled program is garbage collected only if its own code uses
@@ -64,7 +67,8 @@ GC types or requires the syntax library.
 A **transformer** is a phase-1 function of type `(eqref) -> eqref`. The
 expander calls it with the syntax object for a macro use (the whole form,
 or the identifier alone) and expands the syntax object it returns.
-`(define-syntax m f)` makes `m` a macro whose transformer is `f`.
+`(define-syntax m f)` makes `m` a macro whose transformer is `f`; given
+any other expression, `define-syntax` binds a compile-time value (6.3).
 
 ### 2.2 Values
 
@@ -94,9 +98,9 @@ another type, such as `n:i32`.
 |---|---|
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
-| strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32` |
+| strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
-| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)`, `(local-expand stx)`, `(lift-definition form)` |
+| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, or `#f`), `(raise-syntax-error name message stx)` (aborts expansion; returns nothing), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
   otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
@@ -134,18 +138,23 @@ another type, such as `n:i32`.
   the running macro's phase, as a value and as a type (6.1). An imported
   name and the definition it imports are the same binding. Two identifiers
   bound in neither namespace are equal when their names are.
-- `binding-kind` says what identifier `id` is bound to as a value at the
-  running macro's phase: the symbol `function`, `variable` (a local or
-  global), `macro`, `static`, `data`, `label` or `core` (a core form or wasm
-  operator); `type` if it is bound only as a type; or `#f` if it is
-  unbound. An implicit `#%app` (5.3) uses it to
-  tell a call of a function from a call through a variable.
+- `raise-syntax-error` is Racket's: it aborts expansion with `message`,
+  a string, blamed on `stx`. The message is prefixed with `name: `, or if
+  `name` is `#f` with the name `stx` gives: an identifier's own, or that
+  of the identifier heading a list. A macro that blames part of its input
+  passes its own name.
+- `identifier-binding-kind` says what identifier `id` is bound to as a
+  value at the running macro's phase: the symbol `function`, `variable` (a
+  local or global), `macro`, `compile-time-value`, `data`, `label` or
+  `core` (a core form or wasm operator); `type` if it is bound only as a
+  type; or `#f` if it is unbound. An implicit `#%app` (5.3) uses it to tell
+  a call of a function from a call through a variable.
 - `local-expand` expands expression `stx` at the running macro's phase and
-  returns it as expanded code (6.4), so a macro can look at what its input
+  returns it as fully expanded code (6.4), so a macro can look at what its input
   becomes, and put the result in its output. As in Racket, the macro's
   introduction scope is flipped around the expansion, so code from the
   macro's input expands as it would at the use site.
-- `lift-definition` adds a module-level form (a `func`, `global`,
+- `syntax-local-lift-definition` adds a module-level form (a `func`, `global`,
   `import`, `type` or `data` form, or an expression) to the module body
   being expanded, at the running macro's phase (6.4). It returns the form
   as it is declared: with the macro's introduction scope, like the
@@ -154,17 +163,17 @@ another type, such as `n:i32`.
 The queries only work while an expander is running. [v0] Stage0 answers
 them in Chez; in a run-time store they trap.
 
-## 3. Modules, parts and linking
+## 3. Modules, linklets and linking
 
-### 3.1 Modules and parts
+### 3.1 Modules and linklets
 
 - One source file is one module. A module's code at one phase compiles to
-  one wasm module, called a **part**. Phase 0 is the program. Phase *n*+1
-  code runs while phase *n* is expanded, so a module's phase-1 part holds
-  its transformers, its `define-static` values and its `begin-for-syntax`
-  code.
+  one wasm module, called a **linklet**, as in Racket. Phase 0 is the
+  program. Phase *n*+1 code runs while phase *n* is expanded, so a module's
+  phase-1 linklet holds its transformers, its compile-time values and its
+  `begin-for-syntax` code.
 - `(provide item ...)` names the phase-0 bindings other modules get:
-  functions, globals, macros, static values, types and data, whether the
+  functions, globals, macros, compile-time values, types and data, whether the
   module defines them or imported them. An item `x` provides `x`, and
   `[new old]` provides `old` under the name `new`. A name bound both as a
   type and as a value provides both. One name cannot be provided for two
@@ -196,34 +205,37 @@ them in Chez; in a run-time store they trap.
     by definition or import, is an error.
 - Expansion must run phase-1 code before the module is finished: a macro
   works on the line after its definition. So while a module is expanded,
-  its phase ≥ 1 code is also compiled and instantiated in **chunks**, one
-  per `begin-for-syntax` or `define-static`, in source order. When the
-  module is done, each phase's code is compiled again as a whole, into the
-  part. Other modules only ever use the parts.
+  each `begin-for-syntax`, and each `define-syntax` of a compile-time
+  value, is compiled into a linklet of its own and instantiated at once, in
+  source order, as Racket evaluates them. When the module is done, each
+  phase's code is compiled again as a whole, into the module's linklet for
+  that phase. Other modules only ever use those.
 
 ### 3.2 Stores and instance names
 
-- Each module is compiled with a fresh compile-time store. The module's
-  own chunks, and the parts of the modules it requires, are instantiated
-  there on demand. So no compile-time state is shared between the
+- Each module is compiled with a fresh compile-time store. The linklets of
+  the module's compile-time code, and those of the modules it requires, are
+  instantiated there on demand. So no compile-time state is shared between the
   compilations of two modules, as in Racket. Compiled wasm code is not
-  state: the host compiles a part's bytes once and instantiates the result
+  state: the host compiles a linklet's bytes once and instantiates the result
   in every store that needs it.
-- A part instantiated at shift *t* is registered as `<module>@<phase>+<t>`.
-  A compiled part imports from other parts by names relative to its own
-  module at shift 0. The host adds the shift when it instantiates the part
-  (section 4), so one compiled part serves at any phase.
-- A program runs in a fresh run-time store holding exactly the parts
-  reached from its phase-0 part at shift 0. A module required only inside
-  `begin-for-syntax` is never loaded at run time.
-- The other instance names are `syntax`, `host`, `expander`, chunks
-  (`<module>@<phase>#<n>`) and per-store entry chunks (`entry#<n>`).
+- A module's linklet instantiated at phase shift *t* is registered as
+  `<module>@<phase>+<t>`. A compiled linklet imports from other linklets by
+  names relative to its own module at phase shift 0. The host adds the
+  phase shift when it instantiates the linklet (section 4), so one compiled
+  linklet serves at any phase.
+- A program runs in a fresh run-time store holding exactly the linklets
+  reached from its phase-0 linklet at phase shift 0. A module required
+  only inside `begin-for-syntax` is never loaded at run time.
+- The other instance names are `syntax`, `host`, `expander`, the linklets
+  of compile-time code (`<module>@<phase>#<n>`) and per-store entry
+  linklets (`entry#<n>`).
 
 ### 3.3 Linking
 
 - **A module imports only what its code uses.** Nothing is bound or
   imported by default. Code that calls a required module's functions
-  imports from that module's part. Code that calls the syntax library, or
+  imports from that module's linklet. Code that calls the syntax library, or
   uses `quote`, `quasiquote`, `quote-syntax` or `quasisyntax`, imports from
   `"syntax"`.
 - **A module owns its memory and table, or takes them from a module it
@@ -232,47 +244,48 @@ them in Chez; in a run-time store they trap.
   program's modules can share one memory. Tables likewise. Code that uses
   memory instructions or data segments needs a memory, and code that uses
   `func-index` or `call-indirect` needs a table. At phase ≥ 1 these work the
-  same way. There the chunks of a phase (3.1) share one memory: the first
-  chunk after `(memory pages)` defines it and later ones import it, so, as
-  with macros, code can use it only after the declaration. Tables likewise.
-- A part exports its memory as `"memory"` and its table as `"table"` (the
+  same way. There the compile-time linklets of a phase (3.1) share one
+  memory: the first linklet after `(memory pages)` defines it and later
+  ones import it, so, as with macros, code can use it only after the
+  declaration. Tables likewise.
+- A linklet exports its memory as `"memory"` and its table as `"table"` (the
   host relies on this, section 4), and every module-level function and
   global under its name. If two bindings share a name, the compiler appends
   `.<n>` to later ones.
 
-### 3.4 Runtime-free modules
+### 3.4 Freestanding modules
 
-`(runtime-free)` declares that the program needs nothing beyond the host at
-run time. After expansion, the compiler checks every part the program would
-load: each may import only from the host and from the program's other
-parts, and none may use GC types. The check runs after expansion because
+`(freestanding)` declares that the program needs nothing beyond the host at
+run time, in the sense C, Zig and Rust give the word: no run-time library.
+After expansion, the compiler checks every linklet the program would load:
+each may import only from the host and from the program's other linklets,
+and none may use GC types. The check runs after expansion because
 macros can add dependencies the program never wrote.
 
 ### 3.5 Initialization
 
 A global whose initializer is a constant expression (5.2) gets it as its
 wasm initializer. The others start at their type's default, zero or null.
-Then the part's start function runs:
+Then the linklet's start function runs:
 
-1. For each function whose table index the part takes (`func-index`),
+1. For each function whose table index the linklet takes (`func-index`),
    append it to the table and keep the index in a global, in the order the
    compiler meets them.
-2. Build the part's quoted data.
+2. Build the linklet's quoted data.
 3. The other global initializers and module-level expressions, in
    source order.
 
 Quoted fixnums and `#f` are the constant expressions `(ref.i31 n)` and
 `(ref.null eq)`, and `'()` and `#t` read immutable globals the syntax
 library defines for them, also a constant expression. The compiler
-serializes the part's other quoted data into one passive data segment,
-which the syntax library turns into a table of objects when the part
+serializes the linklet's other quoted data into one passive data segment,
+which the syntax library turns into a table of objects when the linklet
 starts; code reads a quoted datum from the table. So compiled code does
 not grow with its literals, and each is built once per instance. As in
 Scheme, equal quoted data may share structure: whether two quoted data,
-or parts of them, are the same reference is unspecified, except that a
-quoted string, which is mutable, is never shared.
+or parts of them, are the same reference is unspecified.
 
-A phase-1 part's module-level expressions run each time the part is
+A phase-1 linklet's module-level expressions run each time the linklet is
 instantiated, which is once per compilation that needs it.
 
 ## 4. Host interface
@@ -287,7 +300,7 @@ depends on.
 |---|---|---|
 | `write` | `(fd ptr len) -> i32` | write bytes to fd 1 or 2; returns `len` |
 | `trap` | `(ptr len) -> ()` | abort with the UTF-8 message at `ptr` |
-| `instantiate` | `(name name-len bytes bytes-len shift) -> i32` | compile and instantiate the wasm module in `bytes`, link its imports by name, and register it as `name`. At `shift` > 0, each import from a part `<module>@<phase>+<t>` links to `<module>@<phase>+<t + shift>` instead (3.2). 0 on success. |
+| `instantiate` | `(name name-len bytes bytes-len shift) -> i32` | compile and instantiate the wasm module in `bytes`, link its imports by name, and register it as `name`. At a phase shift `shift` > 0, each import from a linklet `<module>@<phase>+<t>` links to `<module>@<phase>+<t + shift>` instead (3.2). 0 on success. |
 | `export_index` | `(inst inst-len field field-len) -> i32` | append the function `inst.field` to the caller's table (exported as `"table"`) and return its index, or -1 |
 | `error_message` | `(buf cap) -> i32` | copy the last `instantiate` error into `buf`; returns its length |
 
@@ -339,9 +352,10 @@ quotation and compile-time forms.
 - **Type functions.** In a type position, a form whose head is a macro is
   expanded until it is not, so a compile-time function can compute a
   type: `(ref (tuple i32 3))`, as in Zig. Such a macro usually declares the
-  type with `lift-definition` and returns its name. Uses in any module get
-  the same type, since the declarations have the same structure; the macro
-  can remember a name to declare the type once per module
+  type with `syntax-local-lift-definition` and returns its name. Uses in
+  any module get the same type, since the declarations have the same
+  structure; the macro can remember a name to declare the type once per
+  module
   (`tests/fixtures/tuple.sub`).
   Type positions are the types of parameters, results, globals, `let`
   bindings, fields and signatures, and the type immediates of GC
@@ -365,10 +379,10 @@ quotation and compile-time forms.
 (require name source item ...)      ; source: "path" or syntax; item: x or [new old]
 (require-unqualified name source)   ; every provided name unqualified too (3.1)
 (provide item ...)                  ; phase 0 only; item: x or [new old]
-(runtime-free)                      ; see 3.4
+(freestanding)                      ; see 3.4
 (module-pass f)                     ; phase 0; f: a phase+1 function (6.5)
 (define-syntax name transformer)    ; transformer: a phase+1 function (2.1)
-(define-static name expr)           ; expr is phase+1 code, run now
+(define-syntax name expr)           ; a compile-time value, run at phase+1 (6.3)
 (begin-for-syntax form ...)         ; forms at phase+1
 (begin form ...)                    ; spliced
 expr                                ; runs at instantiation
@@ -376,21 +390,22 @@ expr                                ; runs at instantiation
 
 A module body is expanded in two passes, as in Racket. The first pass
 expands macro uses at the head of each form, registers definitions, runs
-`define-static` and `begin-for-syntax` at once, processes `require`, and
-splices `begin`. The second pass expands function bodies and expressions. So
-functions may be mutually recursive, and a macro must be defined before it
-is used. A transformer must come from an earlier `begin-for-syntax`, or
-from a module required inside one.
+`begin-for-syntax` and the expressions of compile-time values at once,
+processes `require`, and splices `begin`. The second pass expands function
+bodies and expressions. So functions may be mutually recursive, and a
+macro must be defined before it is used. A transformer must come from an
+earlier `begin-for-syntax`, or from a module required inside one.
 
 A macro used at module level runs in the first pass, so it sees only the
-definitions before it; `binding-kind` reports a later one as unbound. A
+definitions before it; `identifier-binding-kind` reports a later one as
+unbound. A
 macro that needs the whole module can expand into a core expression form,
 such as `let`, whose contents wait for the second pass. Module-level
 applications and literals are expressions: their implicit `#%app` and
 `#%datum` (5.3, 5.4) are applied in the second pass, when every
 definition is known. Racket applies `#%app` in the first pass, which is
 harmless there because its `#%app` does not depend on what the function
-is; here a language's `#%app` usually does (`binding-kind`). So an
+is; here a language's `#%app` usually does (`identifier-binding-kind`). So an
 application cannot expand into a definition; a language provides a named
 form, such as `define`, for that.
 
@@ -514,9 +529,9 @@ which would expand through it again.
 
 Under the core `#%datum`, unquoted literals are wasm numbers. `quote` turns
 a literal into a value.
-Values are syntax-library data, so a part that quotes imports from the
+Values are syntax-library data, so a linklet that quotes imports from the
 syntax library, as it would for any library function it calls; at phase 0
-that is visible in what the program links, and `(runtime-free)` rejects
+that is visible in what the program imports, and `(freestanding)` rejects
 it (3.4).
 
 | Source | Unquoted | Quoted |
@@ -556,7 +571,7 @@ reference is an error.
   in the value namespace. Positions that take a type (`(ref T)`, the `T`
   of a GC instruction, a supertype) look up types; all others look up
   values. So one name can be both, as a struct library needs for a type
-  and its constructor or static information.
+  and its constructor or compile-time value.
 
 - Core bindings have the scope set `{0}`, which every module body carries.
   A module's own definitions have more scopes, so they shadow core names.
@@ -568,18 +583,19 @@ reference is an error.
   its module's scopes, so they keep resolving to its module's bindings,
   including ones it does not provide, when another module expands them.
 - **Phases.** Bindings are recorded per phase, and a syntax object has one
-  scope set. A module required at shift *s* ≠ 0 has its bindings installed
-  at their phase + *s*, with its module scope replaced by a copy for that
-  shift. So a module required at two shifts, which has bindings from both
-  at the same phase (a macro `m` shifted up, next to the phase-1 function
-  behind `m`), keeps them apart. The syntax literals a part builds when
-  instantiated at shift *t* are shifted the same way: every module scope in
-  them, module *X*'s copy for shift *s*, becomes *X*'s copy for *s* + *t*.
+  scope set. A module required at phase shift *s* ≠ 0 has its bindings
+  installed at their phase + *s*, with its module scope replaced by a copy
+  for that phase shift. So a module required at two phase shifts, which
+  has bindings from both at the same phase (a macro `m` shifted up, next to
+  the phase-1 function behind `m`), keeps them apart. The syntax literals a
+  linklet builds when instantiated at phase shift *t* are shifted the same
+  way: every module scope in them, module *X*'s copy for phase shift *s*,
+  becomes *X*'s copy for *s* + *t*.
   A literal can hold other modules' scopes as well as its own module's,
   for example when another module's macro wrote part of its code. Only
   module scopes shift; introduction and use-site scopes, and the core
   scope, mean the same at every phase. This is Racket's per-phase module
-  scopes, applied eagerly per shift.
+  scopes, applied eagerly per phase shift.
 
 ### 6.2 Hygiene
 
@@ -618,23 +634,29 @@ a local scope.
 
 ### 6.3 Compile-time bindings
 
-- `(define-syntax m f)`: `m` is a macro whose transformer is the phase+1
-  function `f`, of type `(eqref) -> eqref`. `f` may come from a module
-  required inside `begin-for-syntax`.
-- `(define-static s expr)`: `expr` is compiled and run at phase+1 now, and
-  `s` is bound to its value, an `eqref`. The value lives in a global of the
-  phase+1 part, so another module that requires this one computes it again
-  in its own compile-time store. Using `s` as an expression is an
-  error, but macros read the value with `syntax-local-value`. This is how
-  extensions share information, for example a struct form and a match form.
+`define-syntax` binds a name at compile time, as in Racket:
+
+- `(define-syntax m f)`, where `f` names a phase+1 function, of type
+  `(eqref) -> eqref`: `m` is a macro whose transformer is `f`. `f` may come
+  from a module required inside `begin-for-syntax`.
+- `(define-syntax s expr)`, for any other `expr`: `expr` is compiled and
+  run at phase+1 now, and `s` is bound to its value, an `eqref`, a
+  **compile-time value**. The value lives in a global of the phase+1
+  linklet, so another module that requires this one computes it again in
+  its own compile-time store. Using `s` as an expression is an error, but
+  macros read the value with `syntax-local-value`. This is how extensions
+  share information, for example a struct form and a match form. Racket
+  makes a transformer of any procedure value; the kernel has no procedure
+  values, so a transformer is named instead.
 
 [v0] Stage0 expands in Chez, so syntax crosses between Chez and wasm by
 copy, through the syntax library's embedder functions (appendix A). The
 self-hosted expander will hold references directly and need no copy.
 
-### 6.4 Expanded code
+### 6.4 Fully expanded code
 
-Expansion turns a module into **expanded code**: syntax in the grammar
+Expansion turns a module into **fully expanded code**, as Racket calls it:
+syntax in the grammar
 below, with every macro use expanded and every application and literal
 explicit. `local-expand` returns it, module passes receive and return it,
 `subc expand` prints it, and the compiler compiles it.
@@ -663,39 +685,40 @@ expr ::= id                                   ; a local or global variable
 ```
 
 - The other module-level forms (`require`, `provide`, `memory`, `table`,
-  `runtime-free`, `module-pass`, `define-syntax`, `define-static`,
-  `begin-for-syntax`) take effect during expansion and leave nothing.
+  `freestanding`, `module-pass`, `define-syntax`, `begin-for-syntax`)
+  take effect during expansion and leave nothing.
   `let*` becomes nested `let`s. `quasiquote` and `quasisyntax` become
   calls to the syntax library's functions, through identifiers with a
   scope of their own that no module's code has, so user code cannot name
   them.
 - Types appear where the source wrote them: parameters, results,
-  globals, and `let` bindings that give one. Expanded code carries no
+  globals, and `let` bindings that give one. Fully expanded code carries no
   inferred types; the kernel's checker infers them after the passes, as
-  it does for any code. Type functions (5.1) are expanded: types in
+  it does for any code. Type functions (5.1) are expanded: types in fully
   expanded code contain no macro uses.
-- **The core forms in expanded code are named by identifiers with only the
-  core scope**, so they mean the core forms in any module, whatever it
+- **The core forms in fully expanded code are named by identifiers with
+  only the core scope**, so they mean the core forms in any module, whatever it
   binds, for example its own `let` or `#%app`. Every other identifier keeps
   its scopes and resolves as before.
-- **Expanded code can be expanded again**, with the same meaning. Its
+- **Fully expanded code can be expanded again**, with the same meaning. Its
   binding forms bind again under fresh scopes, which the references inside
   them get too. So a macro can put `local-expand`'s result into its
   output.
-- **Lifted definitions** (`lift-definition`, 2.3) are declared as soon as
-  they are lifted, so their names can be used at once, and their expanded
-  code goes before the module-level form whose expansion lifted them.
+- **Lifted definitions** (`syntax-local-lift-definition`, 2.3) are declared
+  as soon as they are lifted, so their names can be used at once, and their
+  fully expanded code goes before the module-level form whose expansion
+  lifted them.
 
 ### 6.5 Module passes
 
 `(module-pass f)` declares that once the module is expanded, the phase+1
 function `f`, of type `(eqref) -> eqref` like a transformer, rewrites the
-module's phase-0 expanded code. Passes run in the order they are declared.
+module's phase-0 fully expanded code. Passes run in the order they are declared.
 A library usually provides a macro that expands into the declaration.
 
 - A pass gets the module's forms as one syntax list and returns a list of
   forms, as a syntax list or a plain list. It may add, remove and rewrite
-  forms, and write any code, not only expanded code.
+  forms, and write any code, not only fully expanded code.
 - What it returns is expanded again, then type-checked and compiled like
   any code, so a pass's mistakes are compile errors. A definition it
   returns with the same name and scopes as one of the module's replaces
@@ -707,19 +730,20 @@ A library usually provides a macro that expands into the declaration.
 - A pass has an introduction scope, as a macro use does (6.2): flipped on
   its input and its output, so the names it introduces, such as a global
   it adds, cannot capture the module's names or be named by them.
-- Racket reaches a module's expanded code through `#%module-begin` and
+- Racket reaches a module's fully expanded code through `#%module-begin` and
   `local-expand` of the whole body. The kernel has no `#%module-begin`: a
   library that wants a module's body gets it by having the module wrap the
   body in one of its macros, and a pass works on the expanded result.
 
 ## 7. Open questions and later milestones
 
-- **Inferred types in expanded code**: expanded code carries only the
-  types the source wrote (6.4). A pass that creates wasm declarations from
-  the code it rewrites, such as CPS for general effect handlers or closure
-  conversion for a typed language, would need the checker to write types
-  into expanded code before the pass, and queries for the types of
-  imported definitions. Nothing planned before bootstrap needs this.
+- **Inferred types in fully expanded code**: fully expanded code carries
+  only the types the source wrote (6.4). A pass that creates wasm
+  declarations from the code it rewrites, such as CPS for general effect
+  handlers or closure conversion for a typed language, would need the
+  checker to write types into fully expanded code before the pass, and
+  queries for the types of imported definitions. Nothing planned before
+  bootstrap needs this.
 - **Structs after the typed layer**: declared types are identified by
   structure (5.1), so `lib/struct.sub`'s accessors check brands at run
   time: passing a `fahrenheit` to `celsius-t` is a run-time error, where
@@ -744,16 +768,16 @@ expander.
   | `%atom` | `(struct (field kind i32) (field value i32))` | characters (kind 0), `#t` (1), `()` (2) |
   | `%syntax` | `(struct (field e eqref) (field scopes eqref) (field srcloc eqref) (field props eqref))` | syntax objects |
   | `%srcloc` | `(struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32))` | source locations |
-  | `%table` | `(array (mut eqref))` | the intern table, the handle table and a part's quoted data |
+  | `%table` | `(array (mut eqref))` | the symbol table, the handle table and a linklet's quoted data |
   | `%integer` | `(struct (field negative i32) (field magnitude i64))` | integers beyond the fixnum range |
   | `%flonum` | `(struct (field value f64))` | flonums |
   | `%builder` | `(struct (field bytes (mut (ref %string))) (field length (mut i32)))` | string builders |
 
 - **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
-  single `%atom` objects made at start. A part's quoted data is a
+  single `%atom` objects made at start. A linklet's quoted data is a
   `%string` made with `array.new_data` from its data segment, which
   `%deserialize` turns into a `%table` of objects (the format is in
-  `compiler/syntax.sub`). The compiler declares these types in the part;
+  `compiler/syntax.sub`). The compiler declares these types in the linklet;
   wasm makes them the same types as the library's.
 - **Syntax objects** are wrapped eagerly: the datum of a list is a list
   whose elements are syntax objects. Scopes are a list of fixnum scope ids
@@ -766,16 +790,18 @@ expander.
 - **Embedder interface (stage0 only)**: Chez cannot hold GC references, so
   it names objects by `i32` handles, indexes into the library's handle
   table (handle 0 is `#f`). A value crosses whole, in the format of a
-  part's quoted data, through the buffer: stage0 writes the bytes and
+  linklet's quoted data, through the buffer: stage0 writes the bytes and
   `%h-deserialize` builds the objects, or `%h-serialize` writes a value
   and stage0 reads the bytes. A value the format has no kind for crosses
   as a handle. Handles made while a macro runs are released when it
-  returns. Each store gets a small entry chunk per transformer and
-  per static value it uses, which converts between handles and references.
+  returns. Each store gets a small entry linklet per transformer and per
+  compile-time value it uses, which converts between handles and
+  references.
   After bootstrap this section goes away.
 - **Shifted literals**: `%scope-map-add` tells `%make-syntax` to replace
-  one scope id with another. Stage0 records which module and shift each
-  module scope stands for, and each part lists the module scopes in its
-  literals. Around the instantiation of a part at shift *t* ≠ 0 it maps
-  each of them to its copy for its shift + *t* (6.1), and clears the map
+  one scope id with another. Stage0 records which module and phase shift
+  each module scope stands for, and each linklet lists the module scopes in
+  its literals. Around the instantiation of a linklet at phase shift *t* ≠ 0
+  it maps each of them to its copy for its phase shift + *t* (6.1), and
+  clears the map
   after (`%scope-map-clear`).

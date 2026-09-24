@@ -21,8 +21,8 @@ line says the same.
 | `compiler/` | the compiler, written in the language. Today only `syntax.sub`, the syntax library; the rest arrives as the compiler is rewritten for bootstrap | permanent, grows |
 | `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: frozen once the compiler compiles itself |
 | `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match`, and the dynamic Lisp (`lisp.sub`) | permanent, grows |
-| `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.links`) and any modules it requires in `NAME/`; checked by `make check` | grows |
-| `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.links` (what the compiled phase-0 part may import). `tests/fixtures/` holds modules the tests require | grows |
+| `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.imports`) and any modules it requires in `NAME/`; checked by `make check` | grows |
+| `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.imports` (what the compiled phase-0 linklet may import). `tests/fixtures/` holds modules the tests require | grows |
 | `bin/subc` | the entry point | permanent; runs stage0 until bootstrap |
 
 A library in `lib/` is one we intend to build on, not the only way to do
@@ -38,7 +38,7 @@ nix develop
 make check                      # build the host library, run the tests
 bin/subc run tests/macros.sub   # compile and run a program's main
 bin/subc expand FILE            # print fully expanded kernel forms
-bin/subc compile FILE -o OUT    # write FILE's parts (phase 0 to OUT)
+bin/subc compile FILE -o OUT    # write FILE's linklets (phase 0 to OUT)
 bin/subc syntax-library -o build/syntax.wasm      # write the syntax library
 wasm-tools print OUT            # inspect a module
 SUBHOST_PROFILE=1 bin/subc run FILE   # time per category, printed at exit
@@ -51,30 +51,31 @@ Stage0 goes from source to a running program: reader, expander, kernel
 compiler, binary wasm, then wasmtime. Macros work end to end: a
 transformer is a phase-1 function over GC syntax objects, compiled and
 instantiated in the compile-time store and called by the expander.
-`define-static`, `syntax-local-value`, `syntax-error`, `free-identifier=?`,
-`binding-kind` and syntax properties work too, and macros are hygienic
+Compile-time values (`define-syntax`, `syntax-local-value`),
+`raise-syntax-error`, `free-identifier=?`, `identifier-binding-kind` and
+syntax properties work too, and macros are hygienic
 (introduction and use-site scopes, spec 6.2). A module can change what
 application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
-5.4). Expansion produces expanded code, syntax in a fixed grammar (spec
+5.4). Expansion produces fully expanded code, syntax in a fixed grammar (spec
 6.4): a macro can see its input's with `local-expand`, a module pass
 (spec 6.5) can rewrite a whole module's, and `subc expand` prints it.
 Modules `require` each other by name, with
 qualified imports (`print:write-int`), at any phase:
-each phase of a module compiles to its own wasm part, and a program loads
-only the parts it reaches at run time (spec 3). Compiled programs import
+each phase of a module compiles to its own wasm module, a linklet, and a
+program loads only the linklets it reaches at run time (spec 3). Compiled programs import
 only what they use:
-`(runtime-free)` is checked by the compiler, and `.links` files check
+`(freestanding)` is checked by the compiler, and `.imports` files check
 imports in the tests and examples.
 
 `lib/struct.sub` and `lib/match.sub` are the first libraries that work
-together: `struct` and `enum` define GC types and leave static
-information that `match` reads, checking patterns at compile time.
+together: `struct` and `enum` define GC types and leave compile-time
+values that `match` reads, checking patterns at compile time.
 `examples/shapes.sub` matches, in one module, types defined in another.
 `lib/lisp.sub` is the dynamic Lisp the compiler will be written in: every
 value is an `eqref`, and closure and assignment conversion run per
-definition, on expanded code. `examples/effects.sub` is an effect language
+definition, on fully expanded code. `examples/effects.sub` is an effect language
 on the Lisp (`examples/effects/handlers.sub`): declared effects, handlers
 with a clause per operation, and Koka's evidence passing, built from
-`#%app`, `local-expand` and static information.
+`#%app`, `local-expand` and compile-time values.
 
 Open questions are in `docs/spec.md` section 7.

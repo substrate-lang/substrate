@@ -1,18 +1,18 @@
 ;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
 ;; compiler compiles itself.
 ;;
-;; Expander: syntax objects -> expanded code, which is syntax too (spec
+;; Expander: syntax objects -> fully expanded code, which is syntax too (spec
 ;; 6.4) -> after the module passes (spec 6.5), lowered to the compiler's
 ;; input (core.sls).
 ;;
 ;; Binding is by sets of scopes (spec 6.1). A module is a file; each of its
-;; phases compiles to one wasm module, a part (spec 3.1). While a module is
-;; expanded, its phase >= 1 code is compiled into chunks and run in that
+;; phases compiles to one wasm module, a linklet (spec 3.1). While a module is
+;; expanded, each begin-for-syntax is compiled into a linklet and run in that
 ;; module's compile-time store. A macro is a phase-1 function from syntax to
 ;; syntax (spec 2.1). Syntax objects are GC objects of the syntax library
 ;; (compiler/syntax.sub), which every compile-time store instantiates.
 (library (stage0 expander)
-  (export set-syntax-library-path! compile-module-file run-module module-part-list module-expanded-forms
+  (export set-syntax-library-path! compile-module-file run-module module-linklet-list module-expanded-forms
           syntax-library-bytes)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 compile)
           (stage0 host) (stage0 marshal) (stage0 reader))
@@ -34,8 +34,8 @@
 
   (define core-forms
     (append
-     '(func global import memory table data type rec define-syntax define-static begin-for-syntax
-       begin require require-unqualified provide runtime-free module-pass set! let let* if block loop br br-if return
+     '(func global import memory table data type rec define-syntax begin-for-syntax
+       begin require require-unqualified provide freestanding module-pass set! let let* if block loop br br-if return
        call-indirect call-ref ref.func func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
      (list app-sym datum-sym)
@@ -67,40 +67,40 @@
 
   ;; meaning: (core name) (prim name) (func info) (global info) (data info)
   ;;          (type info) (local key) (label key) (macro transformer-info)
-  ;;          (static getter-info)
+  ;;          (compile-time-value getter-info)
   ;; A type meaning is in the type namespace, every other one in the value
   ;; namespace. Locals and labels are bound before their meaning is set, so
   ;; #f counts as a value.
   (define (meaning-namespace meaning)
     (if (and meaning (eq? (car meaning) 'type)) 'type 'value))
 
-  ;; A compiled (or compiling) module. parts: phase -> part. requires: list
+  ;; A compiled (or compiling) module. linklets: phase -> linklet. requires: list
   ;; of (module . shift). provides: list of (symbol . meaning). entries: its
   ;; module-level bindings, as (symbol scopes phase key). scope: its module
   ;; scope.
   (define-record-type unit
-    (fields path source name (mutable state) parts (mutable requires) (mutable provides)
+    (fields path source name (mutable state) linklets (mutable requires) (mutable provides)
             (mutable entries) (mutable expanded) (mutable scope)))
 
   ;; One phase of a module, compiled: bytes, the instance names it imports
-  ;; from (relative to the module at shift 0), whether it uses GC, and the
+  ;; from (relative to the module at phase shift 0), whether it uses GC, and the
   ;; module scopes in its syntax literals (spec 6.1).
-  (define-record-type part (fields bytes imports gc? scopes))
+  (define-record-type linklet (fields bytes imports gc? scopes))
 
   ;; One wasm store: a compile-time store (one per module compilation) or a
   ;; run-time store. instances: names instantiated in it. wrappers and
-  ;; statics: per-store entry chunks and static-value handles.
+  ;; values: per-store handles of compile-time values.
   (define-record-type cstore
-    (fields host marshal instances wrappers statics (mutable counter)))
+    (fields host marshal instances wrappers values (mutable counter)))
 
   ;; The state of one module's compilation.
   (define-record-type comp
-    (fields module store (mutable chunk-counter) (mutable use-site-scopes)
-            (mutable runtime-free-form) phase-forms memories tables (mutable provide-ids)
+    (fields module store (mutable linklet-counter) (mutable use-site-scopes)
+            (mutable freestanding-form) phase-forms memories tables (mutable provide-ids)
             (mutable require-names)            ; ((name . phase) . module)
             (mutable passes)                   ; ((function-info . form) ...), in order
             (mutable definition-keys)          ; keys of its phase-0 definitions
-            (mutable storage-chunks)))         ; ((memory-or-table . phase) . chunk that defines it)
+            (mutable storage-linklets)))         ; ((memory-or-table . phase) . linklet that defines it)
 
   (define current #f)                      ; the comp being expanded
 
@@ -161,10 +161,10 @@
       (when compile-time? (ensure-import! st "syntax" 0))
       st))
 
-  ;; Instance names of module parts: "<module>@<phase>+<shift>" (spec 3.2).
-  (define (part-name m q t) (format "~a@~a+~a" (unit-name m) q t))
+  ;; Instance names of module linklets: "<module>@<phase>+<shift>" (spec 3.2).
+  (define (linklet-name m q t) (format "~a@~a+~a" (unit-name m) q t))
 
-  (define (parse-part-name s)
+  (define (parse-linklet-name s)
     (let ([at (let loop ([i 0]) (cond [(= i (string-length s)) #f]
                                       [(char=? (string-ref s i) #\@) i]
                                       [else (loop (+ i 1))]))]
@@ -177,37 +177,38 @@
              (and q t (list (substring s 0 at) q t))))))
 
   ;; Make sure the instance an import names exists in st. imp is relative
-  ;; to a module instantiated at `shift`.
+  ;; to a module instantiated at phase shift `shift`.
   (define (ensure-import! st imp shift)
     (cond [(member imp '("host" "expander")) (void)]
           [(string=? imp "syntax")
            (unless (hashtable-contains? (cstore-instances st) "syntax")
              (host-instantiate! (cstore-host st) "syntax" (car syntax-lib))
              (hashtable-set! (cstore-instances st) "syntax" #t))]
-          [(parse-part-name imp)
-           => (lambda (p) (ensure-part! st (hashtable-ref modules-by-name (car p) #f) (cadr p) (+ (caddr p) shift)))]
-          [else (void)]))                  ; a chunk, already instantiated
+          [(parse-linklet-name imp)
+           => (lambda (p) (ensure-linklet! st (hashtable-ref modules-by-name (car p) #f) (cadr p) (+ (caddr p) shift)))]
+          [else (void)]))                  ; a begin-for-syntax linklet, already instantiated
 
-  ;; Instantiate module m's phase-q part at shift t in st, dependencies first.
-  (define (ensure-part! st m q t)
-    (let ([name (part-name m q t)])
+  ;; Instantiate module m's phase-q linklet at phase shift t in st,
+  ;; dependencies first.
+  (define (ensure-linklet! st m q t)
+    (let ([name (linklet-name m q t)])
       (unless (hashtable-contains? (cstore-instances st) name)
-        (let ([p (hashtable-ref (unit-parts m) q #f)])
-          (unless p (raise-compile-error #f "internal: ~a has no phase ~a part" (unit-name m) q))
-          (for-each (lambda (imp) (ensure-import! st imp t)) (part-imports p))
+        (let ([p (hashtable-ref (unit-linklets m) q #f)])
+          (unless p (raise-compile-error #f "internal: ~a has no phase ~a linklet" (unit-name m) q))
+          (for-each (lambda (imp) (ensure-import! st imp t)) (linklet-imports p))
           (flush-output-port (current-output-port))
-          ;; The syntax literals the part builds are shifted too (spec 6.1):
-          ;; each module scope in them, module X's copy for shift s, becomes
-          ;; X's copy for s + t. The syntax library maps them while the part
+          ;; The syntax literals the linklet builds are shifted too (spec 6.1):
+          ;; each module scope in them, module X's copy for phase shift s, becomes
+          ;; X's copy for s + t. The syntax library maps them while the linklet
           ;; starts.
-          (let ([shifted? (and (not (= t 0)) (pair? (part-scopes p)))])
+          (let ([shifted? (and (not (= t 0)) (pair? (linklet-scopes p)))])
             (when shifted?
               (for-each (lambda (sc)
                           (let ([origin (hashtable-ref module-scope-origins sc #f)])
                             (host-call (cstore-host st) "syntax" "%scope-map-add"
                                        sc (module-scope-at (car origin) (+ (cdr origin) t)))))
-                        (part-scopes p)))
-            (host-instantiate-shifted! (cstore-host st) name (part-bytes p) t)
+                        (linklet-scopes p)))
+            (host-instantiate-shifted! (cstore-host st) name (linklet-bytes p) t)
             (when shifted?
               (host-call (cstore-host st) "syntax" "%scope-map-clear")))
           (hashtable-set! (cstore-instances st) name #t)))))
@@ -223,7 +224,7 @@
       key))
 
   ;; A module-level binding of the current module: recorded, so that a
-  ;; module requiring this one at a shift can install a shifted copy.
+  ;; module requiring this one at a phase shift can install a shifted copy.
   (define (bind-module-level! sym scopes phase meaning)
     (let ([key (bind-raw! sym scopes phase meaning)])
       (when current
@@ -345,12 +346,12 @@
 
   ;; ---- phase shifting ----
 
-  ;; A meaning as seen from `shift` phases up: its part instances move by
-  ;; shift. Shifted infos are cached so each is one record.
+  ;; A meaning as seen `shift` phases up: its linklet instances move by the
+  ;; phase shift. Shifted infos are cached so each is one record.
   (define shifted-infos (make-eq-hashtable))   ; info -> alist shift -> info
 
   (define (shift-instance inst k)
-    (let ([p (and (string? inst) (parse-part-name inst))])
+    (let ([p (and (string? inst) (parse-linklet-name inst))])
       (if p (format "~a@~a+~a" (car p) (cadr p) (+ (caddr p) k)) inst)))
 
   (define (shift-info info k)
@@ -372,13 +373,14 @@
                 new)))))
 
   (define (shift-meaning meaning k)
-    (if (and meaning (memq (car meaning) '(func global macro static)))
+    (if (and meaning (memq (car meaning) '(func global macro compile-time-value)))
         (list (car meaning) (shift-info (cadr meaning) k))
         meaning))
 
-  ;; A module's scope at shift s (spec 6.1). A module used at two shifts has
-  ;; bindings at the same phase from both; giving each shift its own copy of
-  ;; the module scope keeps them apart. Shift 0 uses the module scope itself.
+  ;; A module's scope at phase shift s (spec 6.1). A module used at two
+  ;; phase shifts has bindings at the same phase from both; giving each phase
+  ;; shift its own copy of the module scope keeps them apart. Phase shift 0
+  ;; uses the module scope itself.
   (define shifted-scopes (make-hashtable string-hash string=?))
   (define (module-scope-at m s)
     (if (= s 0)
@@ -406,7 +408,7 @@
               [else (void)]))
       (list-sort < (vector->list (hashtable-keys found)))))
 
-  ;; Make module m's bindings resolvable at shift s, and those of the modules
+  ;; Make module m's bindings resolvable at phase shift s, and those of the modules
   ;; it requires. Needed for m's macros: their templates carry m's scopes.
   (define (install-module-bindings! m s)
     (let ([key (format "~a|~a" (unit-path m) s)])
@@ -420,10 +422,10 @@
                       (reverse (unit-entries m)))))
         (for-each (lambda (r) (install-module-bindings! (car r) (+ s (cdr r)))) (unit-requires m)))))
 
-  ;; Compute, in the current store, the value of every static binding m and
-  ;; its requires make visible at shift s. Done eagerly, outside any macro
+  ;; Compute, in the current store, every compile-time value m binds and
+  ;; its requires make visible at phase shift s. Done eagerly, outside any macro
   ;; call, so the handles outlive it.
-  (define (prepare-statics! m s)
+  (define (prepare-compile-time-values! m s)
     (let ([seen (make-hashtable string-hash string=?)])
       (let walk ([m m] [s s])
         (let ([key (format "~a|~a" (unit-path m) s)])
@@ -431,8 +433,8 @@
             (hashtable-set! seen key #t)
             (for-each (lambda (e)
                         (let ([meaning (hashtable-ref meanings (cadddr e) #f)])
-                          (when (and meaning (eq? (car meaning) 'static))
-                            (static-handle (comp-store current) (shift-info (cadr meaning) s)))))
+                          (when (and meaning (eq? (car meaning) 'compile-time-value))
+                            (compile-time-value-handle (comp-store current) (shift-info (cadr meaning) s)))))
                       (unit-entries m))
             (for-each (lambda (r) (walk (car r) (+ s (cdr r)))) (unit-requires m)))))))
 
@@ -520,7 +522,7 @@
       (append (if mem (list mem) '()) (if tbl (list tbl) '()))))
 
   ;; Run the module passes over the expanded phase-0 code, resolve provides,
-  ;; compile each phase's part, check (runtime-free).
+  ;; compile each phase's linklet, check (freestanding).
   (define (finish-module! c)
     (let ([m (comp-module c)])
       (unit-expanded-set! m (apply-module-passes c (unit-expanded m)))
@@ -533,7 +535,7 @@
               (map-lr (lambda (item)
                         (let* ([id (cdr item)]
                                [value (let ([v (meaning-of id 0)])
-                                        (and v (memq (car v) '(func global macro static data)) v))]
+                                        (and v (memq (car v) '(func global macro compile-time-value data)) v))]
                                [found (filter values (list (type-meaning-of id 0) value))])
                           (when (null? found)
                             (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
@@ -545,41 +547,41 @@
                                    (let ([ps (vector->list ks)]) (if (memv 0 ps) ps (cons 0 ps)))))])
         (for-each (lambda (p)
                     (let ([forms (append (storage-forms p) (reverse (hashtable-ref (comp-phase-forms c) p '())))])
-                      (let-values ([(bytes imports gc?) (profiled-compile-module forms (part-name m p 0))])
-                        (hashtable-set! (unit-parts m) p
-                                        (make-part bytes imports gc? (literal-module-scopes forms))))))
+                      (let-values ([(bytes imports gc?) (profiled-compile-module forms (linklet-name m p 0))])
+                        (hashtable-set! (unit-linklets m) p
+                                        (make-linklet bytes imports gc? (literal-module-scopes forms))))))
                   phases))
       (hashtable-set! installed (format "~a|0" (unit-path m)) #t)
       (unit-state-set! m 'done)
-      (let ([form (comp-runtime-free-form c)])
-        (when form (check-runtime-free! m form)))))
+      (let ([form (comp-freestanding-form c)])
+        (when form (check-freestanding! m form)))))
 
-  ;; The parts a program instantiates at run time: phase 0 at shift 0,
+  ;; The linklets a program instantiates at run time: phase 0 at phase shift 0,
   ;; reached through phase-0 requires.
   (define (runtime-closure m)
     (let loop ([todo (list m)] [seen '()])
       (cond [(null? todo) (reverse seen)]
             [(memq (car todo) seen) (loop (cdr todo) seen)]
             [else
-             (let* ([p (hashtable-ref (unit-parts (car todo)) 0 #f)]
+             (let* ([p (hashtable-ref (unit-linklets (car todo)) 0 #f)]
                     [deps (filter values
                                   (map (lambda (imp)
-                                         (let ([pp (parse-part-name imp)])
+                                         (let ([pp (parse-linklet-name imp)])
                                            (and pp (= (cadr pp) 0) (= (caddr pp) 0)
                                                 (hashtable-ref modules-by-name (car pp) #f))))
-                                       (part-imports p)))])
+                                       (linklet-imports p)))])
                (loop (append (cdr todo) deps) (cons (car todo) seen)))])))
 
-  ;; (runtime-free): the program's run-time parts import only from the host
+  ;; (freestanding): the program's run-time parts import only from the host
   ;; and each other, and use no GC (spec 3.4).
-  (define (check-runtime-free! m form)
+  (define (check-freestanding! m form)
     (for-each (lambda (mm)
-                (let* ([p (hashtable-ref (unit-parts mm) 0 #f)]
-                       [extra (filter (lambda (imp) (not (or (string=? imp "host") (parse-part-name imp))))
-                                      (part-imports p))])
-                  (unless (and (null? extra) (not (part-gc? p)))
+                (let* ([p (hashtable-ref (unit-linklets mm) 0 #f)]
+                       [extra (filter (lambda (imp) (not (or (string=? imp "host") (parse-linklet-name imp))))
+                                      (linklet-imports p))])
+                  (unless (and (null? extra) (not (linklet-gc? p)))
                     (raise-compile-error form
-                                         "this module is declared runtime-free, but after expansion ~a ~a"
+                                         "this module is declared freestanding, but after expansion ~a ~a"
                                          (if (eq? mm m) "it" (format "the module ~a it requires" (unit-name mm)))
                                          (if (pair? extra) (format "imports from ~a" extra) "uses GC objects")))))
               (runtime-closure m)))
@@ -587,21 +589,21 @@
   ;; The fully expanded phase-0 forms of m, for `subc expand`.
   (define (module-expanded-forms m) (unit-expanded m))
 
-  ;; (phase . bytes) for each part of m.
-  (define (module-part-list m)
+  ;; (phase . bytes) for each linklet of m.
+  (define (module-linklet-list m)
     (list-sort (lambda (a b) (< (car a) (car b)))
-               (let-values ([(ks vs) (hashtable-entries (unit-parts m))])
-                 (map (lambda (k v) (cons k (part-bytes v))) (vector->list ks) (vector->list vs)))))
+               (let-values ([(ks vs) (hashtable-entries (unit-linklets m))])
+                 (map (lambda (k v) (cons k (linklet-bytes v))) (vector->list ks) (vector->list vs)))))
 
   ;; Instantiate m's program in a fresh run-time store and call its main.
   (define (run-module m)
     (let ([st (new-cstore #f)])
-      (ensure-part! st m 0 0)
+      (ensure-linklet! st m 0 0)
       (guard (c [(and (wasm-failure? c)
                       (let ([msg (wasm-failure-message c)])
                         (and (>= (string-length msg) 17) (string=? (substring msg 0 17) "call: no function"))))
                  (void)])
-        (host-call (cstore-host st) (part-name m 0 0) "main"))))
+        (host-call (cstore-host st) (linklet-name m 0 0) "main"))))
 
   ;; ==== module bodies ============================================================
 
@@ -634,7 +636,7 @@
 
   (define current-body #f)                 ; the innermost body being expanded
 
-  ;; A module body -> its expanded code: func, global, import, type and
+  ;; A module body -> its fully expanded code: func, global, import, type and
   ;; data forms and expressions (spec 6.4). Other module-level forms take
   ;; effect during expansion and leave nothing.
   (define (expand-body forms phase)
@@ -665,8 +667,8 @@
            [kind (core-head f phase)])
       (define (item! x) (body-items-set! b (cons x (body-items b))))
       (when (and only
-                 (memq kind '(require require-unqualified provide runtime-free module-pass memory table
-                              define-syntax define-static begin-for-syntax)))
+                 (memq kind '(require require-unqualified provide freestanding module-pass memory table
+                              define-syntax begin-for-syntax)))
         (raise-compile-error f "~a (~a ...), but only func, global, import, type and data forms and expressions are allowed there"
                              only kind))
       (case kind
@@ -674,7 +676,7 @@
         [(require) (require! f phase #f)]
         [(require-unqualified) (require! f phase #t)]
         [(provide) (provide! f phase)]
-        [(runtime-free) (runtime-free! f phase)]
+        [(freestanding) (freestanding! f phase)]
         [(module-pass) (module-pass! f phase)]
         [(func) (item! (declare-func f phase))]
         [(global) (item! (declare-global f phase))]
@@ -684,11 +686,10 @@
         [(type) (item! (declare-type f phase))]
         [(rec) (item! (declare-rec f phase))]
         [(define-syntax) (define-syntax! f phase)]
-        [(define-static) (define-static! f phase)]
         [(begin-for-syntax) (begin-for-syntax! f phase)]
         [else (item! (list 'expr f))])))
 
-  ;; Pass 2 for one item: its expanded code.
+  ;; Pass 2 for one item: its fully expanded code.
   (define (expand-item item phase)
     (case (car item)
       [(func) (expand-func item phase)]
@@ -698,13 +699,13 @@
 
   ;; Lift form, from a macro, to the module level of the body being
   ;; expanded (spec 6.4): declare it now, so its names can be used at once,
-  ;; and put its expanded code before the form whose expansion lifted it.
+  ;; and put its fully expanded code before the form whose expansion lifted it.
   (define (lift! form where phase)
     (let ([b current-body])
       (unless (and b (eqv? (body-phase b) phase))
-        (raise-compile-error where "lift-definition: no module body is being expanded at phase ~a" phase))
+        (raise-compile-error where "syntax-local-lift-definition: no module body is being expanded at phase ~a" phase))
       (let ([before (body-items b)])
-        (declare-form! form b "lift-definition was given")
+        (declare-form! form b "syntax-local-lift-definition was given")
         ;; In pass 2 the new items are expanded now; in pass 1 they wait
         ;; for pass 2 like the others.
         (when (body-pass2? b)
@@ -780,8 +781,8 @@
   ;;
   ;; In a type position, a form whose head is a macro is expanded until it
   ;; is not (spec 5.1): a type function. The expand- functions return type
-  ;; syntax with every such use expanded, which is what expanded code holds;
-  ;; the parse- functions then read it.
+  ;; syntax with every such use expanded, which is what fully expanded code
+  ;; holds; the parse- functions then read it.
 
   ;; The macro meaning of s's head if s is (macro ...), else #f.
   (define (type-macro-use s phase)
@@ -1227,7 +1228,7 @@
       (unless (member req (unit-requires me))
         (unit-requires-set! me (append (unit-requires me) (list req)))
         (install-module-bindings! m phase)
-        (prepare-statics! m phase))
+        (prepare-compile-time-values! m phase))
       (map (lambda (p) (cons (car p) (shift-meaning (cdr p) phase))) (unit-provides m))))
 
   ;; The module a require named at this phase.
@@ -1275,25 +1276,25 @@
           (list kind (stx-e (cadr parts)))]
          [(and (= (length parts) 3) (core-name? (cadr parts) 'from))
           (let ([m (required-module (caddr parts) phase)])
-            (list (if (eq? kind 'memory) 'memory-import 'table-import) (part-name m 0 phase)))]
+            (list (if (eq? kind 'memory) 'memory-import 'table-import) (linklet-name m 0 phase)))]
          [else (raise-compile-error f "expected (~a size) or (~a from name)" kind kind)]))))
 
-  ;; (runtime-free): after expansion, the program needs nothing beyond the
+  ;; (freestanding): after expansion, the program needs nothing beyond the
   ;; host at run time (spec 3.4).
-  (define (runtime-free! f phase)
-    (unless (and (= phase 0) (equal? (map stx-e (stx-list-of f 'runtime-free)) '(runtime-free)))
-      (raise-compile-error f "(runtime-free) takes nothing and belongs at phase 0"))
-    (comp-runtime-free-form-set! current f))
+  (define (freestanding! f phase)
+    (unless (and (= phase 0) (equal? (map stx-e (stx-list-of f 'freestanding)) '(freestanding)))
+      (raise-compile-error f "(freestanding) takes nothing and belongs at phase 0"))
+    (comp-freestanding-form-set! current f))
 
   ;; ==== compile-time evaluation ===================================================
 
-  (define (next-chunk-name! prefix)
-    (let ([n (comp-chunk-counter current)])
-      (comp-chunk-counter-set! current (+ n 1))
+  (define (next-linklet-name! prefix)
+    (let ([n (comp-linklet-counter current)])
+      (comp-linklet-counter-set! current (+ n 1))
       (format "~a#~a" prefix n)))
 
   ;; Compile forms and instantiate them in store st, after what they import.
-  (define (instantiate-chunk! st name forms where)
+  (define (instantiate-linklet! st name forms where)
     (let-values ([(bytes imports gc?) (profiled-compile-module forms name)])
       (for-each (lambda (imp) (ensure-import! st imp 0)) imports)
       (guard (c [(wasm-failure? c)
@@ -1303,67 +1304,80 @@
       (hashtable-set! (cstore-instances st) name #t)
       name))
 
-  ;; A chunk of this module's phase-`phase` code, run now. It also becomes
-  ;; part of the module's phase-`phase` part.
-  (define (run-chunk! forms phase where)
+  ;; A linklet of this module's phase-`phase` code, run now, as each
+  ;; begin-for-syntax is. Its code also goes into the module's
+  ;; phase-`phase` linklet.
+  (define (run-compile-time-linklet! forms phase where)
     (add-phase-forms! phase forms)
-    (let ([name (next-chunk-name! (format "~a@~a" (unit-name (comp-module current)) phase))])
-      (instantiate-chunk! (comp-store current) name (append (chunk-storage-forms phase name) forms) where)))
+    (let ([name (next-linklet-name! (format "~a@~a" (unit-name (comp-module current)) phase))])
+      (instantiate-linklet! (comp-store current) name (append (linklet-storage-forms phase name) forms) where)))
 
-  ;; The memory and table forms for a chunk at phase, named name (spec 3.3).
-  ;; A phase's chunks share one memory: the first chunk after (memory pages)
-  ;; defines it, and later ones import it from that chunk. Tables likewise.
-  (define (chunk-storage-forms phase name)
+  ;; The memory and table forms for a linklet at phase, named name (spec 3.3).
+  ;; A phase's linklets share one memory: the first linklet after (memory pages)
+  ;; defines it, and later ones import it from that linklet. Tables likewise.
+  (define (linklet-storage-forms phase name)
     (filter values
             (map-lr (lambda (kind table)
                       (let ([form (hashtable-ref table phase #f)])
                         (cond [(not (and form (eq? (car form) kind))) form]
-                              [(assoc (cons kind phase) (comp-storage-chunks current))
+                              [(assoc (cons kind phase) (comp-storage-linklets current))
                                => (lambda (owner)
                                     (list (if (eq? kind 'memory) 'memory-import 'table-import) (cdr owner)))]
                               [else
-                               (comp-storage-chunks-set! current (cons (cons (cons kind phase) name)
-                                                                       (comp-storage-chunks current)))
+                               (comp-storage-linklets-set! current (cons (cons (cons kind phase) name)
+                                                                       (comp-storage-linklets current)))
                                form])))
                     '(memory table)
                     (list (comp-memories current) (comp-tables current)))))
 
-  ;; A one-function chunk in st giving Chez an i32 entry point: it turns
+  ;; A one-function linklet in st giving Chez an i32 entry point: it turns
   ;; handles into references around `body`, which returns an eqref.
-  (define (entry-chunk! st param? body)
+  (define (entry-linklet! st param? body)
     (let* ([key (and param? (fresh-key!))]
            [entry (make-func-info '__entry (if param? '(i32) '()) '(i32) #f #f #f)]
            [body (body (and param? (list 'call (syntax-info '%deref) (list (list 'lref key)))))])
       (cstore-counter-set! st (+ (cstore-counter st) 1))
-      (instantiate-chunk! st (format "entry#~a" (cstore-counter st))
+      (instantiate-linklet! st (format "entry#~a" (cstore-counter st))
                           (list (list 'func entry (if param? (list (cons key 'i32)) '())
                                       (list 'call (syntax-info '%handle) (list body))))
                           #f)))
 
-  ;; The entry chunk that calls transformer f, in st.
+  ;; The entry linklet that calls transformer f, in st.
   (define (macro-entry st f)
     (or (hashtable-ref (cstore-wrappers st) f #f)
-        (let ([chunk (entry-chunk! st #t (lambda (arg) (list 'call f (list arg))))])
-          (hashtable-set! (cstore-wrappers st) f chunk)
-          chunk)))
+        (let ([entry (entry-linklet! st #t (lambda (arg) (list 'call f (list arg))))])
+          (hashtable-set! (cstore-wrappers st) f entry)
+          entry)))
 
-  ;; The handle of a static value in st, from its getter function.
-  (define (static-handle st getter)
-    (or (hashtable-ref (cstore-statics st) getter #f)
-        (let* ([chunk (entry-chunk! st #f (lambda (_) (list 'call getter '())))]
-               [h (call-in-store st #f (lambda (host) (host-call host chunk "__entry")))])
-          (hashtable-set! (cstore-statics st) getter h)
+  ;; The handle of a compile-time value in st, from its getter function.
+  (define (compile-time-value-handle st getter)
+    (or (hashtable-ref (cstore-values st) getter #f)
+        (let* ([entry (entry-linklet! st #f (lambda (_) (list 'call getter '())))]
+               [h (call-in-store st #f (lambda (host) (host-call host entry "__entry")))])
+          (hashtable-set! (cstore-values st) getter h)
           h)))
 
-  ;; (define-syntax name f): name is a macro whose transformer is the phase+1
-  ;; function f, of type (eqref) -> eqref, from an earlier begin-for-syntax
-  ;; or a module required inside begin-for-syntax.
+  ;; (define-syntax name expr), as in Racket: if expr names a phase+1
+  ;; function, name is a macro with that transformer; otherwise name is
+  ;; bound to expr's value at phase+1, a compile-time value, which macros
+  ;; read with syntax-local-value. The value lives in a global of the
+  ;; phase+1 linklet, computed when the linklet is instantiated.
   (define (define-syntax! f phase)
     (let ([parts (stx-list-of f 'define-syntax)])
-      (unless (and (= (length parts) 3) (id? (cadr parts)) (id? (caddr parts)))
-        (raise-compile-error f "expected (define-syntax name transformer-function)"))
-      (bind-definition! (cadr parts) phase
-                        (list 'macro (syntax-function-of (caddr parts) phase "a transformer")))))
+      (unless (and (= (length parts) 3) (id? (cadr parts)))
+        (raise-compile-error f "expected (define-syntax name transformer-function) or (define-syntax name expr)"))
+      (let* ([rhs (caddr parts)] [m (and (id? rhs) (meaning-of rhs (+ phase 1)))])
+        (if (and m (eq? (car m) 'func))
+            (bind-definition! (cadr parts) phase
+                              (list 'macro (syntax-function-of rhs phase "a transformer")))
+            (let* ([name (string->symbol (string-append "__value." (symbol->string (stx-e (cadr parts)))))]
+                   [rhs (lower-expr (expand-expr rhs (+ phase 1)) (+ phase 1))]
+                   [global (make-global-info name eqref #t #f #f)]
+                   [getter (make-func-info name '() (list eqref) #f #f #f)])
+              (run-compile-time-linklet! (list (list 'global global rhs) (list 'func getter '() (list 'gref global)))
+                          (+ phase 1) f)
+              (compile-time-value-handle (comp-store current) getter)
+              (bind-definition! (cadr parts) phase (list 'compile-time-value getter)))))))
 
   ;; The phase+1 function id names, checked to take and return syntax and
   ;; to be defined already: a transformer or a module pass.
@@ -1391,26 +1405,10 @@
       (comp-passes-set! current (append (comp-passes current)
                                         (list (cons (syntax-function-of (cadr parts) phase "a module pass") f))))))
 
-  ;; (define-static name expr): name is bound to the value of expr at
-  ;; phase+1. The value lives in a global of the phase+1 part, computed when
-  ;; the part is instantiated; macros read it with syntax-local-value.
-  (define (define-static! f phase)
-    (let ([parts (stx-list-of f 'define-static)])
-      (unless (and (= (length parts) 3) (id? (cadr parts)))
-        (raise-compile-error f "expected (define-static name expr)"))
-      (let* ([name (string->symbol (string-append "__static." (symbol->string (stx-e (cadr parts)))))]
-             [rhs (lower-expr (expand-expr (caddr parts) (+ phase 1)) (+ phase 1))]
-             [global (make-global-info name eqref #t #f #f)]
-             [getter (make-func-info name '() (list eqref) #f #f #f)])
-        (run-chunk! (list (list 'global global rhs) (list 'func getter '() (list 'gref global)))
-                    (+ phase 1) f)
-        (static-handle (comp-store current) getter)
-        (bind-definition! (cadr parts) phase (list 'static getter)))))
-
   ;; (begin-for-syntax form ...)
   (define (begin-for-syntax! f phase)
     (let ([forms (expand-body (cdr (stx-list-of f 'begin-for-syntax)) (+ phase 1))])
-      (run-chunk! (lower-forms forms (+ phase 1)) (+ phase 1) f)))
+      (run-compile-time-linklet! (lower-forms forms (+ phase 1)) (+ phase 1) f)))
 
   ;; ==== macros ======================================================================
 
@@ -1452,7 +1450,7 @@
   ;; which calls more macros.
   (define (call-syntax-function who info s phase intro list-ok?)
     (let* ([st (comp-store current)]
-           [chunk (macro-entry st info)]
+           [entry (macro-entry st info)]
            [saved-phase api-phase] [saved-where api-where] [saved-intro api-intro])
       (dynamic-wind
         (lambda () (set! api-phase phase) (set! api-where s) (set! api-intro intro))
@@ -1460,7 +1458,7 @@
           (let* ([ms (cstore-marshal st)]
                  [mark (handle-mark ms)]
                  [in (encode ms s)]
-                 [out (call-in-store st s (lambda (h) (host-call h chunk "__entry" in)))]
+                 [out (call-in-store st s (lambda (h) (host-call h entry "__entry" in)))]
                  [result (decode ms out)])
             (handle-release! ms mark)
             (unless (or (stx? result) (and list-ok? (list? result)))
@@ -1468,7 +1466,7 @@
                                    (if (wasm-value? result) '<object> (stx->datum result))))
             ;; [v0] Stage0 keeps syntax as Chez data, so it cannot keep a
             ;; GC object the syntax library does not represent (appendix A).
-            (when (opaque-part result)
+            (when (find-opaque result)
               (raise-compile-error s "~a returned syntax holding an object stage0 cannot keep (only syntax-library data can be kept in syntax and its properties)"
                                    who))
             result))
@@ -1499,10 +1497,10 @@
 
   ;; An object inside syntax x (its datum or its properties) with no Chez
   ;; counterpart, or #f.
-  (define (opaque-part x)
+  (define (find-opaque x)
     (cond [(wasm-value? x) x]
-          [(stx? x) (or (opaque-part (stx-e x)) (opaque-part (stx-props x)))]
-          [(pair? x) (or (opaque-part (car x)) (opaque-part (cdr x)))]
+          [(stx? x) (or (find-opaque (stx-e x)) (find-opaque (stx-props x)))]
+          [(pair? x) (or (find-opaque (car x)) (find-opaque (cdr x)))]
           [else #f]))
 
   ;; Entry point for wasm calls to the expander queries. Arguments and results
@@ -1525,11 +1523,11 @@
             [(1)                        ; syntax-local-value
              (let ([id (decode ms a)])
                (let ([m (and (id? id) (meaning-of id api-phase))])
-                 (if (and m (eq? (car m) 'static))
-                     (or (hashtable-ref (cstore-statics st) (cadr m) #f)
-                         (raise-compile-error api-where "internal: static value of ~a not prepared" (stx-e id)))
+                 (if (and m (eq? (car m) 'compile-time-value))
+                     (or (hashtable-ref (cstore-values st) (cadr m) #f)
+                         (raise-compile-error api-where "internal: compile-time value of ~a not prepared" (stx-e id)))
                      0)))]
-            [(2)                        ; syntax-error
+            [(2)                        ; raise-syntax-error
              (let ([s (decode ms a)] [msg (decode ms b)])
                (raise-compile-error (if (and (stx? s) (stx-srcloc s)) s api-where) "~a~a"
                                     (if (string? msg) msg (format "~s" msg))
@@ -1545,15 +1543,15 @@
                          (and (equal? vx vy) (equal? tx ty))
                          (eq? (stx-e x) (stx-e y)))
                      1 0)))]
-            [(4)                        ; binding-kind
+            [(4)                        ; identifier-binding-kind
              (let ([id (decode ms a)])
-               (unless (id? id) (raise-compile-error api-where "binding-kind: expected an identifier"))
+               (unless (id? id) (raise-compile-error api-where "identifier-binding-kind: expected an identifier"))
                (let ([m (meaning-of id api-phase)])
                  (encode ms (case (and m (car m))
                               [(func) 'function]
                               [(local global) 'variable]
                               [(macro) 'macro]
-                              [(static) 'static]
+                              [(compile-time-value) 'compile-time-value]
                               [(data) 'data]
                               [(label) 'label]
                               [(core prim) 'core]
@@ -1563,37 +1561,37 @@
              ;; flipped around the expansion, so code from the macro's input
              ;; expands as it would at the use site.
              (let ([s (decode ms a)])
-               (unless (and (stx? s) (not (opaque-part s)))
+               (unless (and (stx? s) (not (find-opaque s)))
                  (raise-compile-error api-where "local-expand: expected syntax"))
                (encode ms (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro)))]
-            [(6)                        ; lift-definition
+            [(6)                        ; syntax-local-lift-definition
              ;; The form gets the macro's introduction scope, as its output
              ;; does. The macro gets back the form as it is declared.
              (let ([form (decode ms a)])
-               (unless (and (stx? form) (not (opaque-part form)))
-                 (raise-compile-error api-where "lift-definition: expected syntax"))
+               (unless (and (stx? form) (not (find-opaque form)))
+                 (raise-compile-error api-where "syntax-local-lift-definition: expected syntax"))
                (let ([introduced (flip-scope form api-intro)])
                  (lift! introduced api-where api-phase)
                  (encode ms introduced)))]
             [else (raise-compile-error api-where "unknown expander query ~a" op)])))))
 
-  ;; ==== expanded code =================================================================
+  ;; ==== fully expanded code =================================================
   ;;
-  ;; Expansion turns code into expanded code (spec 6.4): syntax in the
+  ;; Expansion turns code into fully expanded code (spec 6.4): syntax in the
   ;; kernel's core grammar, with every macro use expanded and every
-  ;; application and literal explicit. Lowering (below) turns expanded code
-  ;; into the compiler's input (core.sls).
+  ;; application and literal explicit. Lowering (below) turns fully expanded
+  ;; code into the compiler's input (core.sls).
   ;;
-  ;; The core forms in expanded code are named by identifiers with only the
-  ;; core scope, so they mean the core forms in any module, whatever it
-  ;; binds. Everything else keeps its scopes. So expanded code can be
+  ;; The core forms in fully expanded code are named by identifiers with only
+  ;; the core scope, so they mean the core forms in any module, whatever it
+  ;; binds. Everything else keeps its scopes. So fully expanded code can be
   ;; expanded again: macros can embed the result of local-expand, and a
-  ;; module pass returns expanded code.
+  ;; module pass returns fully expanded code.
 
-  ;; The identifier for core form `name` in expanded code.
+  ;; The identifier for core form `name` in fully expanded code.
   (define (core-id name where) (make-stx name (list core-scope) (and where (stx-srcloc where)) '()))
 
-  ;; A list in expanded code, located at where.
+  ;; A list in fully expanded code, located at where.
   (define (out-list where items) (make-stx items (list core-scope) (and where (stx-srcloc where)) '()))
 
   ;; The core form (name part ...), located at where.
@@ -1604,7 +1602,7 @@
 
   ;; An identifier for one of the syntax library's functions, for the calls
   ;; quasiquote and quasisyntax expand into. Its private scope is on no
-  ;; module's code, so only expanded code can refer to it.
+  ;; module's code, so only fully expanded code can refer to it.
   (define syntax-lib-scope #f)
   (define syntax-lib-ids (make-eq-hashtable))
   (define (syntax-lib-id name)
@@ -1631,7 +1629,7 @@
            (case (and m (car m))
              [(local global) s]
              [(macro) (expand-expr (apply-macro s (cadr m) s phase #f) phase)]
-             [(static) (raise-compile-error s "~a is static information: read it with syntax-local-value" e)]
+             [(compile-time-value) (raise-compile-error s "~a is bound to a compile-time value: read it with syntax-local-value" e)]
              [(func) (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e)]
              [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
              [(core prim) (raise-compile-error s "bad use of ~a" e)]
@@ -1692,7 +1690,7 @@
       (case (and m (car m))
         [(func) (apply out s app-sym f (map-lr (lambda (a) (expand-expr a phase)) (cddr parts)))]
         [(local global) (raise-compile-error s "~a is a variable, not a function" (stx-e f))]
-        [(static data label core prim macro)
+        [(compile-time-value data label core prim macro)
          (raise-compile-error s "~a is not a function" (stx-e f))]
         [else (if (id? f)
                   (unbound f (stx-e f) phase)
@@ -1954,8 +1952,8 @@
 
   ;; ==== quasiquote / quasisyntax =========================================================
   ;;
-  ;; One walker for both. The result is expanded code that calls the syntax
-  ;; library. For quasisyntax, unchanged subtemplates become syntax
+  ;; One walker for both. The result is fully expanded code that calls the
+  ;; syntax library. For quasisyntax, unchanged subtemplates become syntax
   ;; constants and changed lists are rewrapped with the template's own
   ;; scopes and srcloc (syntax-rewrap).
 
@@ -2004,14 +2002,15 @@
 
   ;; ==== lowering ===================================================================
   ;;
-  ;; Expanded code -> the compiler's input (core.sls). Lowering only
+  ;; Fully expanded code -> the compiler's input (core.sls). Lowering only
   ;; resolves names: expansion has already checked the code and bound every
   ;; variable and label, so anything else is an internal error.
 
   (define (at s ast) (list 'at (stx-srcloc s) ast))
 
   (define (not-expanded s)
-    (raise-compile-error s "internal: not expanded code: ~s" (stx->datum s)))
+    (raise-compile-error s "internal: not fully expanded code: ~s"
+                         (stx->datum s)))
 
   (define (lower-forms forms phase)
     (apply append (map-lr (lambda (f) (lower-form f phase)) forms)))

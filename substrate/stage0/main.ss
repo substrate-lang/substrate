@@ -4,7 +4,7 @@
 ;; subc: the stage0 driver.
 ;;
 ;;   subc run FILE                 compile FILE (and what it requires), run its main
-;;   subc compile FILE [-o OUT]    write FILE's parts: phase 0 to OUT, phase p
+;;   subc compile FILE [-o OUT]    write FILE's linklets: phase 0 to OUT, phase p
 ;;                                 to OUT with .phase<p>.wasm
 ;;   subc expand FILE              print FILE's fully expanded phase-0 forms
 ;;   subc syntax-library [-o OUT]  write the compiled syntax library
@@ -61,7 +61,7 @@
                                      out
                                      (format "~a.phase~a.wasm" (strip-extension out) (car p)))
                                  (cdr p)))
-                   (module-part-list m)))]
+                   (module-linklet-list m)))]
       [(and (= (length args) 2) (string=? (car args) "expand"))
        (for-each print-expanded (module-expanded-forms (compile-module-file (cadr args))))]
       [(and (>= (length args) 1) (string=? (car args) "syntax-library"))

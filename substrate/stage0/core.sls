@@ -3,8 +3,8 @@
 ;;
 ;; Records and types shared by the expander and the compiler.
 ;;
-;; The compiler's input is made of lists. The expander lowers expanded code
-;; (spec 6.4) to it:
+;; The compiler's input is made of lists. The expander lowers fully expanded
+;; code (spec 6.4) to it:
 ;;
 ;;  module forms:
 ;;    (func info ((key . type) ...) body)   (global info init-or-#f)

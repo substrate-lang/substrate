@@ -25,11 +25,11 @@
 ;; Expander queries. Stage0 answers them in Chez; they take and return
 ;; handles (see the embedder section below).
 (import %query-local-value "expander" "syntax-local-value" (i32 -> i32))
-(import %query-error "expander" "syntax-error" (i32 i32 -> i32))
+(import %query-error "expander" "raise-syntax-error" (i32 i32 -> i32))
 (import %query-free-identifier=? "expander" "free-identifier=?" (i32 i32 -> i32))
-(import %query-binding-kind "expander" "binding-kind" (i32 -> i32))
+(import %query-identifier-binding-kind "expander" "identifier-binding-kind" (i32 -> i32))
 (import %query-local-expand "expander" "local-expand" (i32 -> i32))
-(import %query-lift-definition "expander" "lift-definition" (i32 -> i32))
+(import %query-syntax-local-lift-definition "expander" "syntax-local-lift-definition" (i32 -> i32))
 
 (data %msg-pair 0 "expected a pair")
 (data %msg-symbol 32 "expected a symbol")
@@ -311,7 +311,7 @@
 
 ;; The symbol named by string `name`, made on first use. Two symbols with
 ;; the same name are the same reference.
-(func (intern [name eqref]) -> eqref
+(func (string->symbol [name eqref]) -> eqref
   (let* ([str (%as-string name)]
          [hash (%string-hash str)]
          [slot (i32.and hash 1023)]
@@ -333,13 +333,13 @@
   (struct.get %symbol hash (ref.cast (ref %symbol) s)))
 
 (func (symbol-append [a eqref] [b eqref]) -> eqref
-  (intern (string-append (symbol->string a) (symbol->string b))))
+  (string->symbol (string-append (symbol->string a) (symbol->string b))))
 
 ;; ---- syntax objects -------------------------------------------------------------
 
-;; While a module part instantiated at a shift starts, the syntax literals
-;; it builds are shifted too (spec 6.1): each module scope in them becomes
-;; its copy for the shift. %scope-map holds the replacements then, as a
+;; While a module's linklet instantiated at a phase shift starts, the
+;; syntax literals it builds are shifted too (spec 6.1): each module scope in
+;; them becomes its copy for the phase shift. %scope-map holds the replacements then, as a
 ;; list of (from . to) fixnum pairs, and is empty otherwise.
 (global %scope-map (mut eqref) %nil)
 (func (%scope-map-add [from i32] [to i32])
@@ -453,7 +453,7 @@
 ;;   12 a handle, in data stage0 writes (the embedder interface below)
 ;;
 ;; Syntax objects are made with %make-syntax, so they are shifted as the
-;; literals of a part instantiated at a shift are.
+;; literals of a linklet instantiated at a phase shift are.
 
 (global %in (mut (ref null %string)) (ref.null %string))
 (global %at (mut i32) 0)
@@ -508,7 +508,7 @@
     (if (i32.eq kind 3) (return %nil))
     (if (i32.eq kind 4) (return (integer->char (%in-uleb))))
     (if (i32.eq kind 5) (return (cons (%in-object objs) (%in-object objs))))
-    (if (i32.eq kind 6) (return (intern (%in-string))))
+    (if (i32.eq kind 6) (return (string->symbol (%in-string))))
     (if (i32.eq kind 7) (return (%in-string)))
     (if (i32.eq kind 8)
         (return (%make-syntax (%in-object objs) (%in-object objs) (%in-object objs) (%in-object objs))))
@@ -535,22 +535,47 @@
 
 ;; ---- expander queries -------------------------------------------------------------
 
-;; The value bound by define-static to id, or #f.
+;; The compile-time value define-syntax bound id to, or #f.
 (func (syntax-local-value [id eqref]) -> eqref
   (%deref (%query-local-value (%handle id))))
 
-;; Abort expansion with message msg (a string), blamed on stx.
-(func (syntax-error [stx eqref] [msg eqref])
-  (drop (%query-error (%handle stx) (%handle msg)))
+;; As Racket's: abort expansion with message, a string, blamed on stx. The
+;; message is prefixed with "name: ", or if name is #f with the name stx
+;; gives: an identifier's own, or that of the identifier heading a list.
+;; Returns nothing.
+(func (raise-syntax-error [name eqref] [message eqref] [stx eqref])
+  (let ([who (if (symbol? name) name (%form-name stx))])
+    (drop (%query-error (%handle stx)
+                        (%handle (if (ref.is_null who)
+                                     message
+                                     (%prefixed (symbol->string who) message))))))
   (unreachable))
+
+(func (%form-name [stx eqref]) -> eqref
+  (if (identifier? stx) (return (syntax-e stx)))
+  (if (syntax? stx)
+      (let ([e (syntax-e stx)])
+        (if (pair? e)
+            (if (identifier? (car e)) (return (syntax-e (car e)))))))
+  (ref.null eq))
+
+;; "who: message"
+(func (%prefixed [who eqref] [message eqref]) -> eqref
+  (let ([b (make-string-builder)])
+    (string-builder-add! b who 0 (string-length who))
+    (string-builder-add-byte! b 58)
+    (string-builder-add-byte! b 32)
+    (string-builder-add! b message 0 (string-length message))
+    (string-builder->string b)))
 
 (func (free-identifier=? [a eqref] [b eqref]) -> i32
   (%query-free-identifier=? (%handle a) (%handle b)))
 
 ;; What identifier id is bound to as a value, as a symbol: function,
-;; variable, macro, static, data, label or core; #f if it is unbound.
-(func (binding-kind [id eqref]) -> eqref
-  (%deref (%query-binding-kind (%handle id))))
+;; variable, macro, compile-time-value, data, label or core; #f if it is
+;; unbound.
+(func (identifier-binding-kind [id eqref]) -> eqref
+  (%deref (%query-identifier-binding-kind (%handle id))))
 
 ;; Expression stx, expanded (spec 6.4): its macros expanded and its
 ;; applications and literals explicit.
@@ -561,8 +586,8 @@
 ;; being expanded, before the form the running macro is expanding. Returns
 ;; the form as it is declared: with the macro's introduction scope, like
 ;; the macro's output.
-(func (lift-definition [form eqref]) -> eqref
-  (%deref (%query-lift-definition (%handle form))))
+(func (syntax-local-lift-definition [form eqref]) -> eqref
+  (%deref (%query-syntax-local-lift-definition (%handle form))))
 
 ;; ---- embedder interface (stage0 only) -------------------------------------------------
 ;;

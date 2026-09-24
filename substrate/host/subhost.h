@@ -27,11 +27,11 @@ typedef int32_t (*sub_callback)(int32_t op, int32_t a0, int32_t a1);
 
 enum {
   SUB_OP_SYNTAX_LOCAL_VALUE = 1,
-  SUB_OP_SYNTAX_ERROR = 2,
+  SUB_OP_RAISE_SYNTAX_ERROR = 2,
   SUB_OP_FREE_IDENTIFIER_EQ = 3,
-  SUB_OP_BINDING_KIND = 4,
+  SUB_OP_IDENTIFIER_BINDING_KIND = 4,
   SUB_OP_LOCAL_EXPAND = 5,
-  SUB_OP_LIFT_DEFINITION = 6,
+  SUB_OP_SYNTAX_LOCAL_LIFT_DEFINITION = 6,
 };
 
 sub_host *sub_host_new(void);
@@ -45,8 +45,8 @@ const char *sub_last_error(sub_host *h);
  * it under `name`. */
 int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t len);
 
-/* Like sub_instantiate, for a module part compiled at shift 0 and
- * instantiated at `shift`: imports from "<module>@<phase>+<t>" resolve to
+/* Like sub_instantiate, for a module's linklet compiled at phase shift 0
+ * and instantiated at phase shift `shift`: imports from "<module>@<phase>+<t>" resolve to
  * "<module>@<phase>+<t + shift>" (spec 3.2). */
 int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes, size_t len, int32_t shift);
 

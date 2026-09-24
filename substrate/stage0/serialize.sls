@@ -2,7 +2,7 @@
 ;; compiler compiles itself.
 ;;
 ;; The byte format of syntax-library data (compiler/syntax.sub, "quoted
-;; data"). The compiler writes a part's quoted data in it (spec 3.5), and
+;; data"). The compiler writes a linklet's quoted data in it (spec 3.5), and
 ;; stage0 copies syntax between Chez and the wasm heap in it (marshal.sls).
 (library (stage0 serialize)
   (export fixnum-min fixnum-max make-serializer serialize! serializer-bytes deserialize)
@@ -15,10 +15,9 @@
   (define (fixnum-range? d) (and (integer? d) (exact? d) (<= fixnum-min d fixnum-max)))
 
   ;; Objects are written as they are met, each after the objects it is made
-  ;; of. Equal immutable objects are written once and shared, as Scheme
-  ;; allows of literals; strings, which are mutable, never are. other: a
-  ;; procedure giving the handle of a value the format has no kind for
-  ;; (written as kind 12), or failing.
+  ;; of. Equal objects, all immutable, are written once and shared, as Scheme
+  ;; allows of literals. other: a procedure giving the handle of a value the
+  ;; format has no kind for (written as kind 12), or failing.
   (define-record-type (serializer new-serializer serializer?) (fields port get (mutable count) shared other))
 
   (define (make-serializer other)
@@ -65,7 +64,7 @@
          (let* ([a (loop (car d))] [b (loop (cdr d))])
            (object! (list 5 a b) (lambda () (put-u8 p 5) (uleb! p a) (uleb! p b))))]
         [(symbol? d) (object! (list 6 d) (lambda () (put-u8 p 6) (utf8! (symbol->string d))))]
-        [(string? d) (object! #f (lambda () (put-u8 p 7) (utf8! d)))]
+        [(string? d) (object! (list 7 d) (lambda () (put-u8 p 7) (utf8! d)))]
         [(stx? d)
          (let* ([e (loop (stx-e d))] [sc (loop (stx-scopes d))]
                 [l (loop (stx-srcloc d))] [r (loop (stx-props d))])

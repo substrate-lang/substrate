@@ -109,7 +109,7 @@ static void p_report(void) {
   fprintf(stderr, "  %-12s %8.3f\n", "total", total);
   fprintf(stderr, "  calls into wasm %ld; compiles %ld (%zu bytes), cache hits %ld\n", p_calls, p_compiles,
           p_compiled_bytes, p_cache_hits);
-  fprintf(stderr, "  queries: local-value %ld, error %ld, free-id %ld, binding-kind %ld, local-expand %ld, lift %ld\n",
+  fprintf(stderr, "  queries: syntax-local-value %ld, raise-syntax-error %ld, free-identifier=? %ld, identifier-binding-kind %ld, local-expand %ld, syntax-local-lift-definition %ld\n",
           p_callbacks[1], p_callbacks[2], p_callbacks[3], p_callbacks[4], p_callbacks[5], p_callbacks[6]);
 }
 
@@ -310,18 +310,19 @@ int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t 
   return rc;
 }
 
-/* A module part's instance name is "<module>@<phase>+<shift>" (spec 3.2).
- * Compiled parts import from other parts by names relative to their own
- * module at shift 0; instantiating at shift s adds s to each such name.
+/* A module linklet's instance name is "<module>@<phase>+<shift>" (spec 3.2).
+ * Compiled linklets import from other linklets by names relative to their
+ * own module at phase shift 0; instantiating at phase shift s adds s to each
+ * such name.
  * Writes the mapped name to out; other names are copied unchanged. */
 static void shift_name(const char *name, size_t len, int32_t shift, char *out, size_t cap) {
   size_t plus = len;
   for (size_t i = len; i > 0; i--)
     if (name[i - 1] == '+') { plus = i - 1; break; }
-  bool part = plus < len && memchr(name, '@', plus) != NULL && plus + 1 < len;
-  for (size_t i = plus + 1; part && i < len; i++)
-    if (name[i] < '0' || name[i] > '9') part = false;
-  if (!part || shift == 0) {
+  bool linklet = plus < len && memchr(name, '@', plus) != NULL && plus + 1 < len;
+  for (size_t i = plus + 1; linklet && i < len; i++)
+    if (name[i] < '0' || name[i] > '9') linklet = false;
+  if (!linklet || shift == 0) {
     snprintf(out, cap, "%.*s", (int)len, name);
     return;
   }
@@ -469,7 +470,7 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   uint32_t np = (uint32_t)args[0].of.i32, nl = (uint32_t)args[1].of.i32;
   uint32_t bp = (uint32_t)args[2].of.i32, bl = (uint32_t)args[3].of.i32;
   int32_t shift = args[4].of.i32;
-  if (shift < 0) return trap_msg("host.instantiate: negative shift");
+  if (shift < 0) return trap_msg("host.instantiate: negative phase shift");
   wasmtime_memory_t mem;
   if (!caller_memory(caller, &mem)) return trap_msg("host.instantiate: caller exports no memory");
   wasmtime_context_t *cctx = wasmtime_caller_context(caller);
@@ -483,7 +484,7 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   uint8_t *copy = malloc(bl ? bl : 1);
   memcpy(copy, bytes, bl);
   ENTER(h, caller);
-  /* At a shift, part names in the module's imports are shifted (spec 3.2). */
+  /* At a phase shift, linklet names in the module's imports are shifted (spec 3.2). */
   int rc = shift == 0 ? instantiate(h, name_copy, nl, copy, bl)
                       : sub_instantiate_shifted(h, name_copy, copy, bl, shift);
   LEAVE(h);
@@ -543,8 +544,9 @@ static wasm_trap_t *host_error_message(void *env, wasmtime_caller_t *caller, con
 
 /* Expander queries (stage0 only): forward to the embedder's callback. env
  * points at an op code; the host is found through the store's data. */
-static const int32_t op_codes[] = {SUB_OP_SYNTAX_LOCAL_VALUE, SUB_OP_SYNTAX_ERROR, SUB_OP_FREE_IDENTIFIER_EQ,
-                                   SUB_OP_BINDING_KIND, SUB_OP_LOCAL_EXPAND, SUB_OP_LIFT_DEFINITION};
+static const int32_t op_codes[] = {SUB_OP_SYNTAX_LOCAL_VALUE, SUB_OP_RAISE_SYNTAX_ERROR, SUB_OP_FREE_IDENTIFIER_EQ,
+                                   SUB_OP_IDENTIFIER_BINDING_KIND, SUB_OP_LOCAL_EXPAND,
+                                   SUB_OP_SYNTAX_LOCAL_LIFT_DEFINITION};
 
 static wasm_trap_t *expander_call(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                   size_t nargs, wasmtime_val_t *results, size_t nresults) {
@@ -611,11 +613,11 @@ sub_host *sub_host_new(void) {
       define(h, "host", "export_index", 4, 1, host_export_index, h) ||
       define(h, "host", "error_message", 2, 1, host_error_message, h) ||
       define(h, "expander", "syntax-local-value", 1, 1, expander_call, (void *)&op_codes[0]) ||
-      define(h, "expander", "syntax-error", 2, 1, expander_call, (void *)&op_codes[1]) ||
+      define(h, "expander", "raise-syntax-error", 2, 1, expander_call, (void *)&op_codes[1]) ||
       define(h, "expander", "free-identifier=?", 2, 1, expander_call, (void *)&op_codes[2]) ||
-      define(h, "expander", "binding-kind", 1, 1, expander_call, (void *)&op_codes[3]) ||
+      define(h, "expander", "identifier-binding-kind", 1, 1, expander_call, (void *)&op_codes[3]) ||
       define(h, "expander", "local-expand", 1, 1, expander_call, (void *)&op_codes[4]) ||
-      define(h, "expander", "lift-definition", 1, 1, expander_call, (void *)&op_codes[5])) {
+      define(h, "expander", "syntax-local-lift-definition", 1, 1, expander_call, (void *)&op_codes[5])) {
     fprintf(stderr, "subhost: %s\n", h->err);
     abort();
   }
