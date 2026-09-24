@@ -5,7 +5,8 @@
 ;; crossing this boundary is an i32: stage0 refers to GC objects in the
 ;; syntax library through integer handles (spec appendix A).
 (library (stage0 host)
-  (export with-profile host-new host-instantiate! host-instantiate-shifted! host-call host-set-callback! host-request-trap!
+  (export with-profile host-new host-instantiate! host-instantiate-shifted! host-call host-memory-write! host-memory-read
+          host-set-callback! host-request-trap!
           wasm-failure? wasm-failure-message)
   (import (chezscheme))
 
@@ -19,6 +20,8 @@
   (define c-instantiate-shifted (foreign-procedure "sub_instantiate_shifted" (uptr string u8* size_t int) int))
   (define c-call (foreign-procedure "sub_call" (uptr string string int int int int int int int) int))
   (define c-result (foreign-procedure "sub_result" (uptr) int))
+  (define c-memory-write (foreign-procedure "sub_memory_write" (uptr string unsigned-32 u8* size_t) int))
+  (define c-memory-read (foreign-procedure "sub_memory_read" (uptr string unsigned-32 u8* size_t) int))
   (define c-set-callback (foreign-procedure "sub_set_callback" (uptr uptr) void))
   (define c-request-trap (foreign-procedure "sub_request_trap" (uptr string) void))
   (define c-profile-push (foreign-procedure "sub_profile_push" (int) void))
@@ -58,6 +61,16 @@
   (define (host-call h inst fn . args)
     (check h (apply c-call h inst fn (length args) (pad args 6)))
     (c-result h))
+
+  ;; Copy bytevector bv to address addr of instance inst's memory, or len
+  ;; bytes from there to a new bytevector.
+  (define (host-memory-write! h inst addr bv)
+    (check h (c-memory-write h inst addr bv (bytevector-length bv))))
+
+  (define (host-memory-read h inst addr len)
+    (let ([bv (make-bytevector len)])
+      (check h (c-memory-read h inst addr bv len))
+      bv))
 
   ;; proc: (op a0 a1) -> i32. The callable is locked so the collector
   ;; cannot move it while C holds its entry point.

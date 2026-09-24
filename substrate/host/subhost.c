@@ -159,6 +159,33 @@ static uint8_t *range(wasmtime_context_t *ctx, const wasmtime_memory_t *mem, uin
   return wasmtime_memory_data(ctx, mem) + addr;
 }
 
+/* The len bytes at addr in the memory instance inst exports as "memory". */
+static uint8_t *instance_range(sub_host *h, const char *inst, uint32_t addr, size_t len) {
+  wasmtime_extern_t ext;
+  if (!wasmtime_linker_get(h->linker, h->ctx, inst, strlen(inst), "memory", 6, &ext) ||
+      ext.kind != WASMTIME_EXTERN_MEMORY) {
+    set_err(h, "memory: %s exports no memory", inst);
+    return NULL;
+  }
+  uint8_t *p = len > UINT32_MAX ? NULL : range(h->ctx, &ext.of.memory, addr, (uint32_t)len);
+  if (!p) set_err(h, "memory: %zu bytes at %u are outside %s's memory", len, addr, inst);
+  return p;
+}
+
+int sub_memory_write(sub_host *h, const char *inst, uint32_t addr, const uint8_t *bytes, size_t len) {
+  uint8_t *p = instance_range(h, inst, addr, len);
+  if (!p) return 1;
+  memcpy(p, bytes, len);
+  return 0;
+}
+
+int sub_memory_read(sub_host *h, const char *inst, uint32_t addr, uint8_t *out, size_t len) {
+  uint8_t *p = instance_range(h, inst, addr, len);
+  if (!p) return 1;
+  memcpy(out, p, len);
+  return 0;
+}
+
 /* The calling instance's memory: the one it exports as "memory". */
 static bool caller_memory(wasmtime_caller_t *caller, wasmtime_memory_t *out) {
   wasmtime_extern_t ext;

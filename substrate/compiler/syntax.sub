@@ -357,6 +357,7 @@
 ;;   8 syntax: e scopes srcloc props    9 srcloc: source, then signed line col pos span
 ;;   10 integer: sign byte, magnitude as 8 bytes, little-endian
 ;;   11 flonum: its 8 bytes, little-endian
+;;   12 a handle, in data stage0 writes (the embedder interface below)
 ;;
 ;; Syntax objects are made with %make-syntax, so they are shifted as the
 ;; literals of a part instantiated at a shift are.
@@ -422,6 +423,7 @@
         (return (%make-srcloc (%in-object objs) (%in-sleb) (%in-sleb) (%in-sleb) (%in-sleb))))
     (if (i32.eq kind 10) (return (%make-integer (%in-byte) (%in-u64))))
     (if (i32.eq kind 11) (return (flonum (f64.reinterpret_i64 (%in-u64)))))
+    (if (i32.eq kind 12) (return (%in-handle)))
     (unreachable)))
 
 ;; The objects that bytes describe, in order.
@@ -497,79 +499,138 @@
   (array.fill %table %handles mark (ref.null eq) (i32.sub %handle-count mark))
   (set! %handle-count mark))
 
-;; Building
-(func (%h-fixnum [n i32]) -> i32 (%handle (fixnum n)))
-(func (%h-char [n i32]) -> i32 (%handle (integer->char n)))
-(func (%h-true) -> i32 (%handle %true))
-(func (%h-nil) -> i32 (%handle %nil))
-(func (%h-make-string [n i32]) -> i32 (%handle (array.new_default %string n)))
-(func (%h-string-set! [h i32] [i i32] [b i32]) (array.set %string (%as-string (%deref h)) i b))
-(func (%h-intern [h i32]) -> i32 (%handle (intern (%deref h))))
-(func (%h-cons [a i32] [d i32]) -> i32 (%handle (cons (%deref a) (%deref d))))
-(func (%h-syntax [e i32] [s i32] [l i32] [p i32]) -> i32
-  (%handle (struct.new %syntax (%deref e) (%deref s) (%deref l) (%deref p))))
-(func (%h-srcloc [source i32] [line i32] [col i32] [pos i32] [span i32]) -> i32
-  (%handle (%make-srcloc (%deref source) line col pos span)))
+;; Copying in bulk. Stage0 writes and reads values in the format of quoted
+;; data, at the buffer in this library's memory, so a value crosses in a
+;; few calls whatever its size. A value the format has no kind for crosses
+;; as a handle (kind 12).
 
-;; Taking apart. %h-kind: 0 #f, 1 fixnum, 2 #t, 3 (), 4 char, 5 pair,
-;; 6 symbol, 7 string, 8 syntax, 9 srcloc, 10 anything else.
-(func (%h-kind [h i32]) -> i32
-  (let ([v (%deref h)])
-    (if (ref.is_null v) (return 0))
-    (if (fixnum? v) (return 1))
-    (if (ref.eq v %true) (return 2))
-    (if (null? v) (return 3))
-    (if (char? v) (return 4))
-    (if (pair? v) (return 5))
-    (if (symbol? v) (return 6))
-    (if (string? v) (return 7))
-    (if (syntax? v) (return 8))
-    (if (ref.test (ref %srcloc) v) (return 9))
-    (if (integer? v) (return 10))
-    (if (flonum? v) (return 11))
-    12))
+(global %buffer i32 1024)
 
-;; 64-bit values cross as two i32 halves: high, then low.
-(func (%h-i64 [hi i32] [lo i32]) -> i64
-  (i64.or (i64.shl (i64.extend_i32_u hi) 32) (i64.extend_i32_u lo)))
-(func (%h-half [x i64] [i i32]) -> i32
-  (i32.wrap_i64 (if (i32.eqz i) (i64.shr_u x 32) x)))
+;; Grow memory, if need be, to hold the bytes below address end.
+(func (%buffer-reserve [end i32])
+  (let ([have (i32.mul (memory.size) 65536)])
+    (if (i32.gt_u end have)
+        (drop (memory.grow (i32.div_u (i32.add (i32.sub end have) 65535) 65536))))))
 
-(func (%h-integer [negative i32] [hi i32] [lo i32]) -> i32
-  (%handle (%make-integer negative (%h-i64 hi lo))))
-;; i: 0 negative, 1 high half of the magnitude, 2 low half.
-(func (%h-integer-part [h i32] [i i32]) -> i32
-  (let ([x (%as-integer (%deref h))])
-    (if (i32.eqz i)
-        (struct.get %integer negative x)
-        (%h-half (struct.get %integer magnitude x) (i32.sub i 1)))))
+;; The buffer's address, with room for n bytes.
+(func (%h-buffer [n i32]) -> i32
+  (%buffer-reserve (i32.add %buffer n))
+  %buffer)
 
-(func (%h-flonum [hi i32] [lo i32]) -> i32
-  (%handle (flonum (f64.reinterpret_i64 (%h-i64 hi lo)))))
-(func (%h-flonum-half [h i32] [i i32]) -> i32
-  (%h-half (i64.reinterpret_f64 (flonum-value (%deref h))) i))
+;; A handle of object root of the n bytes at the buffer.
+(func (%h-deserialize [n i32] [root i32]) -> i32
+  (let ([bytes (array.new_default %string n)] [i 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (array.set %string bytes i (i32.load8_u (i32.add %buffer i)))
+        (set! i (i32.add i 1))
+        (br next)))
+    (%handle (array.get %table (%deserialize bytes) root))))
 
-(func (%h-fixnum-value [h i32]) -> i32 (fixnum-value (%deref h)))
-(func (%h-char-code [h i32]) -> i32 (char->integer (%deref h)))
-(func (%h-car [h i32]) -> i32 (%handle (car (%deref h))))
-(func (%h-cdr [h i32]) -> i32 (%handle (cdr (%deref h))))
-(func (%h-symbol-name [h i32]) -> i32 (%handle (symbol->string (%deref h))))
-(func (%h-string-length [h i32]) -> i32 (string-length (%deref h)))
-(func (%h-string-byte [h i32] [i i32]) -> i32 (string-byte (%deref h) i))
+(func (%in-handle) -> eqref (%deref (%in-uleb)))
 
-(func (%h-syntax-part [h i32] [i i32]) -> i32
-  (let ([s (%as-syntax (%deref h))])
-    (if (i32.eqz i) (return (%handle (struct.get %syntax e s))))
-    (if (i32.eq i 1) (return (%handle (struct.get %syntax scopes s))))
-    (if (i32.eq i 2) (return (%handle (struct.get %syntax srcloc s))))
-    (%handle (struct.get %syntax props s))))
+;; Handle h's value, written at the buffer: nothing is shared, and the value
+;; is the last object. Returns the number of bytes.
+(global %out-at (mut i32) 0)
+(global %out-count (mut i32) 0)
 
-(func (%h-srcloc-source [h i32]) -> i32
-  (%handle (struct.get %srcloc source (ref.cast (ref %srcloc) (%deref h)))))
+(func (%h-serialize [h i32]) -> i32
+  (set! %out-at (i32.add %buffer 5))
+  (set! %out-count 0)
+  (drop (%out (%deref h)))
+  ;; The number of objects, before them, as a five-byte LEB128.
+  (let ([k 0])
+    (loop next
+      (i32.store8 (i32.add %buffer k)
+                  (if (i32.lt_u k 4)
+                      (i32.or (i32.and (i32.shr_u %out-count (i32.mul k 7)) 127) 128)
+                      (i32.shr_u %out-count 28)))
+      (set! k (i32.add k 1))
+      (br-if next (i32.lt_u k 5))))
+  (i32.sub %out-at %buffer))
 
-(func (%h-srcloc-field [h i32] [i i32]) -> i32
-  (let ([l (ref.cast (ref %srcloc) (%deref h))])
-    (if (i32.eq i 1) (return (struct.get %srcloc line l)))
-    (if (i32.eq i 2) (return (struct.get %srcloc col l)))
-    (if (i32.eq i 3) (return (struct.get %srcloc pos l)))
-    (struct.get %srcloc span l)))
+(func (%out-byte [b i32])
+  (%buffer-reserve (i32.add %out-at 1))
+  (i32.store8 %out-at b)
+  (set! %out-at (i32.add %out-at 1)))
+
+(func (%out-uleb [x i32])
+  (let ([n x])
+    (block done
+      (loop next
+        (br-if done (i32.lt_u n 128))
+        (%out-byte (i32.or (i32.and n 127) 128))
+        (set! n (i32.shr_u n 7))
+        (br next)))
+    (%out-byte n)))
+
+(func (%out-sleb [x i32])
+  (let ([n x] [b 0])
+    (loop next
+      (set! b (i32.and n 127))
+      (set! n (i32.shr_s n 7))
+      (if (i32.or (i32.and (i32.eqz n) (i32.eqz (i32.and b 64)))
+                  (i32.and (i32.eq n -1) (i32.ne (i32.and b 64) 0)))
+          (%out-byte b)
+          (begin (%out-byte (i32.or b 128)) (br next))))))
+
+(func (%out-u64 [x i64])
+  (let ([i 0])
+    (loop next
+      (%out-byte (i32.wrap_i64 (i64.shr_u x (i64.extend_i32_u (i32.mul i 8)))))
+      (set! i (i32.add i 1))
+      (br-if next (i32.lt_u i 8)))))
+
+(func (%out-string [s (ref %string)])
+  (let ([n (array.len s)] [i 0])
+    (%out-uleb n)
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (%out-byte (array.get_u %string s i))
+        (set! i (i32.add i 1))
+        (br next)))))
+
+;; Start an object of this kind; returns its index.
+(func (%out-new [kind i32]) -> i32
+  (%out-byte kind)
+  (set! %out-count (i32.add %out-count 1))
+  (i32.sub %out-count 1))
+
+;; Write v, after the objects it is made of; returns its index.
+(func (%out [v eqref]) -> i32
+  (if (ref.is_null v) (return (%out-new 0)))
+  (if (fixnum? v) (let ([i (%out-new 1)]) (%out-sleb (fixnum-value v)) (return i)))
+  (if (ref.eq v %true) (return (%out-new 2)))
+  (if (null? v) (return (%out-new 3)))
+  (if (char? v) (let ([i (%out-new 4)]) (%out-uleb (char->integer v)) (return i)))
+  (if (pair? v)
+      (let* ([a (%out (car v))] [d (%out (cdr v))] [i (%out-new 5)])
+        (%out-uleb a) (%out-uleb d)
+        (return i)))
+  (if (symbol? v) (let ([i (%out-new 6)]) (%out-string (%as-string (symbol->string v))) (return i)))
+  (if (string? v) (let ([i (%out-new 7)]) (%out-string (%as-string v)) (return i)))
+  (if (syntax? v)
+      (let* ([x (%as-syntax v)]
+             [e (%out (struct.get %syntax e x))] [s (%out (struct.get %syntax scopes x))]
+             [l (%out (struct.get %syntax srcloc x))] [p (%out (struct.get %syntax props x))]
+             [i (%out-new 8)])
+        (%out-uleb e) (%out-uleb s) (%out-uleb l) (%out-uleb p)
+        (return i)))
+  (if (ref.test (ref %srcloc) v)
+      (let* ([l (ref.cast (ref %srcloc) v)] [source (%out (struct.get %srcloc source l))] [i (%out-new 9)])
+        (%out-uleb source)
+        (%out-sleb (struct.get %srcloc line l)) (%out-sleb (struct.get %srcloc col l))
+        (%out-sleb (struct.get %srcloc pos l)) (%out-sleb (struct.get %srcloc span l))
+        (return i)))
+  (if (ref.test (ref %integer) v)
+      (let* ([n (ref.cast (ref %integer) v)] [i (%out-new 10)])
+        (%out-byte (struct.get %integer negative n))
+        (%out-u64 (struct.get %integer magnitude n))
+        (return i)))
+  (if (flonum? v)
+      (let ([i (%out-new 11)]) (%out-u64 (i64.reinterpret_f64 (flonum-value v))) (return i)))
+  (let ([i (%out-new 12)])
+    (%out-uleb (%handle v))
+    i))

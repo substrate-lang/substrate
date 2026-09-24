@@ -751,13 +751,16 @@ expander.
   a symbol naming the file. Line is 1-based, column and position 0-based.
   Properties are a list of `(key . value)` pairs, newest first, with each
   key at most once.
-- **Memory**: the library's memory holds only its error messages.
+- **Memory**: the library's memory holds its error messages, and from
+  address 1024 the buffer stage0 copies values through.
 - **Embedder interface (stage0 only)**: Chez cannot hold GC references, so
   it names objects by `i32` handles, indexes into the library's handle
-  table (handle 0 is `#f`). The `%h-` functions build and take apart
-  objects through handles, passing 64-bit values as two `i32` halves.
-  Handles made while a macro runs are released
-  when it returns. Each store gets a small entry chunk per transformer and
+  table (handle 0 is `#f`). A value crosses whole, in the format of a
+  part's quoted data, through the buffer: stage0 writes the bytes and
+  `%h-deserialize` builds the objects, or `%h-serialize` writes a value
+  and stage0 reads the bytes. A value the format has no kind for crosses
+  as a handle. Handles made while a macro runs are released when it
+  returns. Each store gets a small entry chunk per transformer and
   per static value it uses, which converts between handles and references.
   After bootstrap this section goes away.
 - **Shifted literals**: `%scope-map-add` tells `%make-syntax` to replace

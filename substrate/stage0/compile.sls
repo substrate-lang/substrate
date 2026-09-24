@@ -11,14 +11,11 @@
 ;; memory or table must be given one: defined, or imported from a module.
 (library (stage0 compile)
   (export compile-module current-syntax-infos fixnum-min fixnum-max set-syntax-types!)
-  (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 wasm))
+  (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 wasm) (stage0 serialize))
 
   ;; symbol -> func-info or global-info for the syntax library's exports;
   ;; #f while compiling the syntax library itself.
   (define current-syntax-infos (make-parameter #f))
-
-  (define fixnum-min (- (expt 2 30)))
-  (define fixnum-max (- (expt 2 30) 1))
 
   ;; The syntax library's string and table types, set once the library is
   ;; compiled. A module's quoted data is a string of bytes that the library
@@ -467,88 +464,25 @@
              [(eq? d #f) (finish '((ref.null eq)) (list eqref))]
              [(datum-global d) => (lambda (g) (sub `(gref ,g) expected tail?))]
              [else
-              (let* ([lits (module-literals ms)] [i (literal-index! lits d)])
+              (let* ([lits (module-literals ms)] [i (serialize! (literals-serializer lits) d)])
                 (mstate-uses-gc-set! ms #t)
                 (finish `((global.get ,(literals-table lits)) (i32.const ,i) (array.get ,table-type)) (list eqref)))])]
       [else (fail "internal: unknown kernel form ~s" (car e))]))
 
   ;; ---- quoted data ----------------------------------------------------------------
 
-  ;; A module's quoted data, other than the constants, is written as it is
-  ;; met into one string of bytes, which becomes a passive data segment; the
-  ;; syntax library's %deserialize turns it into a table of objects when the
-  ;; module starts (spec 3.5, compiler/syntax.sub for the format). Each object
-  ;; is written after the objects it is made of. Equal immutable objects are
-  ;; written once and shared, as Scheme allows of literals; strings, which
-  ;; are mutable, never are. table: the synth holding the table.
-  (define-record-type literals (fields port get table (mutable count) shared))
+  ;; A module's quoted data, other than the constants, is serialized as it is
+  ;; met (stage0/serialize.sls) into one passive data segment, which the
+  ;; syntax library's %deserialize turns into a table of objects when the
+  ;; module starts (spec 3.5). table: the synth holding the table.
+  (define-record-type literals (fields serializer table))
 
   (define (module-literals ms)
     (or (mstate-literals ms)
-        (let-values ([(port get) (open-bytevector-output-port)])
-          (let ([lits (make-literals port get (new-synth! ms 'literals #f) 0 (make-hashtable equal-hash equal?))])
-            (mstate-literals-set! ms lits)
-            lits))))
-
-  ;; The index of datum d in the table, writing it if need be.
-  (define (literal-index! lits d)
-    (define p (literals-port lits))
-    ;; Write an object with write!, unless one with the same key was; a key
-    ;; of #f is never shared.
-    (define (object! key write!)
-      (or (and key (hashtable-ref (literals-shared lits) key #f))
-          (let ([i (literals-count lits)])
-            (write!)
-            (literals-count-set! lits (+ i 1))
-            (when key (hashtable-set! (literals-shared lits) key i))
-            i)))
-    (define (utf8! s)
-      (let ([bv (string->utf8 s)])
-        (uleb! p (bytevector-length bv))
-        (put-bytevector p bv)))
-    (define (u64! n)
-      (let ([bv (make-bytevector 8)])
-        (bytevector-u64-set! bv 0 n (endianness little))
-        (put-bytevector p bv)))
-    (let loop ([d d])
-      (cond
-        [(eq? d #f) (object! '(0) (lambda () (put-u8 p 0)))]
-        [(and (integer? d) (exact? d) (<= fixnum-min d fixnum-max))
-         (object! (list 1 d) (lambda () (put-u8 p 1) (sleb! p d)))]
-        [(and (integer? d) (exact? d))
-         ;; Beyond the fixnum range: a sign and a 64-bit magnitude.
-         (object! (list 10 d) (lambda () (put-u8 p 10) (put-u8 p (if (< d 0) 1 0)) (u64! (abs d))))]
-        [(flonum? d)
-         (object! (list 11 d) (lambda ()
-                                (let ([bv (make-bytevector 8)])
-                                  (put-u8 p 11)
-                                  (bytevector-ieee-double-set! bv 0 d (endianness little))
-                                  (put-bytevector p bv))))]
-        [(eq? d #t) (object! '(2) (lambda () (put-u8 p 2)))]
-        [(null? d) (object! '(3) (lambda () (put-u8 p 3)))]
-        [(char? d) (object! (list 4 d) (lambda () (put-u8 p 4) (uleb! p (char->integer d))))]
-        [(pair? d)
-         (let* ([a (loop (car d))] [b (loop (cdr d))])
-           (object! (list 5 a b) (lambda () (put-u8 p 5) (uleb! p a) (uleb! p b))))]
-        [(symbol? d) (object! (list 6 d) (lambda () (put-u8 p 6) (utf8! (symbol->string d))))]
-        [(string? d) (object! #f (lambda () (put-u8 p 7) (utf8! d)))]
-        [(stx? d)
-         (let* ([e (loop (stx-e d))] [s (loop (stx-scopes d))]
-                [l (loop (stx-srcloc d))] [r (loop (stx-props d))])
-           (object! (list 8 e s l r) (lambda () (put-u8 p 8) (for-each (lambda (i) (uleb! p i)) (list e s l r)))))]
-        [(srcloc? d)
-         (let ([src (loop (srcloc-source d))]
-               [fields (list (srcloc-line d) (srcloc-col d) (srcloc-pos d) (srcloc-span d))])
-           (object! (cons* 9 src fields)
-                    (lambda () (put-u8 p 9) (uleb! p src) (for-each (lambda (n) (sleb! p n)) fields))))]
-        [else (fail "cannot quote ~s" d)])))
-
-  ;; The data segment: the number of objects, then the objects.
-  (define (literals-bytes lits)
-    (let-values ([(port get) (open-bytevector-output-port)])
-      (uleb! port (literals-count lits))
-      (put-bytevector port ((literals-get lits)))
-      (get)))
+        (let ([lits (make-literals (make-serializer (lambda (d) (fail "cannot quote ~s" d)))
+                                   (new-synth! ms 'literals #f))])
+          (mstate-literals-set! ms lits)
+          lits)))
 
   ;; ---- module -------------------------------------------------------------------
 
@@ -694,7 +628,7 @@
     ;; the code above met them.
     ;; The quoted data, complete now that all code is compiled. Its segment
     ;; follows the module's own data segments.
-    (define literal-segment (and (mstate-literals ms) (literals-bytes (mstate-literals ms))))
+    (define literal-segment (and (mstate-literals ms) (serializer-bytes (literals-serializer (mstate-literals ms)))))
     (define setup-code
       (apply append
              (map-lr (lambda (s)

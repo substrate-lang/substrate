@@ -56,6 +56,11 @@ int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
              int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5);
 int32_t sub_result(sub_host *h);
 
+/* Copy len bytes to or from address addr of the memory instance inst
+ * exports as "memory". */
+int sub_memory_write(sub_host *h, const char *inst, uint32_t addr, const uint8_t *bytes, size_t len);
+int sub_memory_read(sub_host *h, const char *inst, uint32_t addr, uint8_t *out, size_t len);
+
 void sub_set_callback(sub_host *h, sub_callback cb);
 void sub_request_trap(sub_host *h, const char *msg);
 

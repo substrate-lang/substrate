@@ -4,14 +4,15 @@
 ;; Copy syntax between Chez and the syntax library's GC objects.
 ;;
 ;; Stage0 cannot hold wasm GC references in Chez, so it refers to them
-;; through integer handles into a table kept by the syntax library, and
-;; builds and takes apart objects with the library's embedder functions
-;; (the %h- functions, spec appendix A). Handle 0 is #f. Handles made while
-;; a macro runs are released when it returns (see handle-mark).
+;; through integer handles into a table kept by the syntax library (the
+;; embedder interface, spec appendix A). Handle 0 is #f. Handles made while
+;; a macro runs are released when it returns (see handle-mark). A value
+;; crosses in bulk, in the format of quoted data (serialize.sls), through a
+;; buffer in the library's memory.
 (library (stage0 marshal)
   (export make-store store? store-host encode decode handle-mark handle-release!
           make-wasm-value wasm-value? wasm-value-handle)
-  (import (chezscheme) (stage0 syntax) (stage0 host) (stage0 compile))
+  (import (chezscheme) (stage0 syntax) (stage0 host) (stage0 serialize))
 
   (define-record-type store (fields host))
 
@@ -23,83 +24,28 @@
   (define (handle-mark st) (lib st "%handle-mark"))
   (define (handle-release! st mark) (lib st "%handle-release" mark))
 
-  (define (encode-string st s)
-    (let* ([bv (string->utf8 s)]
-           [h (lib st "%h-make-string" (bytevector-length bv))])
-      (do ([i 0 (+ i 1)]) ((= i (bytevector-length bv)) h)
-        (lib st "%h-string-set!" h i (bytevector-u8-ref bv i)))))
-
   ;; A Chez datum -> a handle.
-  (define (encode st d) (with-profile (quote marshal) (lambda () (encode* st d))))
-  (define (encode* st d)
-    (cond [(and (integer? d) (exact? d))
-           (cond [(<= fixnum-min d fixnum-max) (lib st "%h-fixnum" d)]
-                 [(<= (- (expt 2 63)) d (- (expt 2 64) 1))
-                  (let ([m (abs d)])
-                    (lib st "%h-integer" (if (< d 0) 1 0) (high-half m) (low-half m)))]
-                 [else (error 'encode "integer beyond 64 bits" d)])]
-          [(flonum? d)
-           (let ([bits (flonum-bits d)])
-             (lib st "%h-flonum" (high-half bits) (low-half bits)))]
-          [(eq? d #f) 0]
-          [(eq? d #t) (lib st "%h-true")]
-          [(null? d) (lib st "%h-nil")]
-          [(char? d) (lib st "%h-char" (char->integer d))]
-          [(string? d) (encode-string st d)]
-          [(symbol? d) (lib st "%h-intern" (encode-string st (symbol->string d)))]
-          [(pair? d) (let* ([a (encode* st (car d))] [b (encode* st (cdr d))]) (lib st "%h-cons" a b))]
-          [(stx? d)
-           (let* ([e (encode* st (stx-e d))]
-                  [scopes (encode* st (stx-scopes d))]
-                  [loc (encode* st (stx-srcloc d))]
-                  [props (encode* st (stx-props d))])
-             (lib st "%h-syntax" e scopes loc props))]
-          [(srcloc? d)
-           (lib st "%h-srcloc" (encode* st (srcloc-source d))
-                (srcloc-line d) (srcloc-col d) (srcloc-pos d) (srcloc-span d))]
-          [(wasm-value? d) (wasm-value-handle d)]
-          [else (error 'encode "cannot represent this value in the syntax library" d)]))
-
-  (define (decode-string st h)
-    (let* ([n (lib st "%h-string-length" h)] [bv (make-bytevector n)])
-      (do ([i 0 (+ i 1)]) ((= i n) (utf8->string bv))
-        (bytevector-u8-set! bv i (lib st "%h-string-byte" h i)))))
+  (define (encode st d)
+    (if (eq? d #f)
+        0
+        (with-profile 'marshal
+          (lambda ()
+            (let* ([s (make-serializer
+                       (lambda (v)
+                         (if (wasm-value? v)
+                             (wasm-value-handle v)
+                             (error 'encode "cannot represent this value in the syntax library" v))))]
+                   [root (serialize! s d)]
+                   [bv (serializer-bytes s)])
+              (host-memory-write! (store-host st) "syntax" (lib st "%h-buffer" (bytevector-length bv)) bv)
+              (lib st "%h-deserialize" (bytevector-length bv) root))))))
 
   ;; A handle -> a Chez datum.
-  (define (decode st h) (with-profile (quote marshal) (lambda () (decode* st h))))
-  (define (decode* st h)
-    (case (lib st "%h-kind" h)
-      [(0) #f]
-      [(1) (lib st "%h-fixnum-value" h)]
-      [(2) #t]
-      [(3) '()]
-      [(4) (integer->char (lib st "%h-char-code" h))]
-      [(5) (cons (decode* st (lib st "%h-car" h)) (decode* st (lib st "%h-cdr" h)))]
-      [(6) (string->symbol (decode-string st (lib st "%h-symbol-name" h)))]
-      [(7) (decode-string st h)]
-      ;; Scope sets are sorted in Chez; a shifted literal may be out of order.
-      [(8) (make-stx (decode* st (lib st "%h-syntax-part" h 0))
-                     (list-sort < (decode* st (lib st "%h-syntax-part" h 1)))
-                     (decode* st (lib st "%h-syntax-part" h 2)) (decode* st (lib st "%h-syntax-part" h 3)))]
-      [(9) (make-srcloc (decode* st (lib st "%h-srcloc-source" h))
-                        (lib st "%h-srcloc-field" h 1) (lib st "%h-srcloc-field" h 2)
-                        (lib st "%h-srcloc-field" h 3) (lib st "%h-srcloc-field" h 4))]
-      [(10) (let ([m (join-halves (lib st "%h-integer-part" h 1) (lib st "%h-integer-part" h 2))])
-              (if (= (lib st "%h-integer-part" h 0) 1) (- m) m))]
-      [(11) (let ([bv (make-bytevector 8)])
-              (bytevector-u64-set! bv 0 (join-halves (lib st "%h-flonum-half" h 0) (lib st "%h-flonum-half" h 1))
-                                   (endianness little))
-              (bytevector-ieee-double-ref bv 0 (endianness little)))]
-      [else (make-wasm-value h)]))
-
-  ;; 64-bit values cross the i32-only interface as two halves (appendix A),
-  ;; each passed as a signed i32.
-  (define (signed32 x) (if (>= x (expt 2 31)) (- x (expt 2 32)) x))
-  (define (high-half n) (signed32 (bitwise-arithmetic-shift-right n 32)))
-  (define (low-half n) (signed32 (bitwise-and n #xFFFFFFFF)))
-  (define (join-halves hi lo)
-    (+ (* (bitwise-and hi #xFFFFFFFF) (expt 2 32)) (bitwise-and lo #xFFFFFFFF)))
-  (define (flonum-bits x)
-    (let ([bv (make-bytevector 8)])
-      (bytevector-ieee-double-set! bv 0 x (endianness little))
-      (bytevector-u64-ref bv 0 (endianness little)))))
+  (define (decode st h)
+    (if (zero? h)
+        #f
+        (with-profile 'marshal
+          (lambda ()
+            (let ([n (lib st "%h-serialize" h)])
+              (deserialize (host-memory-read (store-host st) "syntax" (lib st "%h-buffer" 0) n)
+                           make-wasm-value)))))))
