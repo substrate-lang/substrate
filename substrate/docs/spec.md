@@ -347,7 +347,7 @@ quotation and compile-time forms.
   types, such as a type function, should declare each strongly connected
   set of them as one group, in a canonical order. Code that must tell
   values of the same structure apart stores the difference in the value,
-  as `lib/struct.sub` does with a brand per variant and the Lisp's records
+  as `lib/struct.sub` does with a brand per variant and Substrate's records
   with a descriptor.
 - **Type functions.** In a type position, a form whose head is a macro is
   expanded until it is not, so a compile-time function can compute a
@@ -507,10 +507,9 @@ GC instructions take their type and field immediates by name:
   The `#%app` identifier gets the scopes of the form, so it means what
   `#%app` is bound to where the form was written, not where it is
   expanded. A module changes the meaning of its applications by binding
-  `#%app` to a macro, usually by importing one:
-  `(require dl "dynlisp.sub" [#%app app])`. Code a macro introduces keeps
-  its own module's `#%app`. The core `#%app` calls a function directly and
-  rejects anything else. A macro standing for `#%app` must not return an
+  `#%app` to a macro, usually by importing one, as a module written in
+  Substrate does. Code a macro introduces keeps its own module's `#%app`.
+  The core `#%app` calls a function directly and rejects anything else. A macro standing for `#%app` must not return an
   application written with the use's scopes, which would expand through it
   again; one written with its own module's scopes uses that module's
   `#%app`. Wasm operators are not applications and never go through

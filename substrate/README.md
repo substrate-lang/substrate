@@ -1,9 +1,10 @@
 # substrate
 
-A thin Lisp over WebAssembly whose main addition to wasm is compile-time
-execution. Macros are kernel code, compiled to wasm and run by the same
-engine that runs the program. The hope is that different languages can be
-built as libraries over one small kernel.
+Substrate is a Lisp over WebAssembly. Its kernel's main addition to wasm
+is compile-time execution: macros are kernel code, compiled to wasm and run
+by the same engine that runs the program. The hope is that different
+languages can be built as libraries over one small kernel. The language
+most code is written in, also called Substrate, is one of them.
 
 `docs/spec.md` starts from its principles (section 1) and fixes what the
 bootstrap must preserve: the macro contract, the units of compilation, and
@@ -20,7 +21,7 @@ line says the same.
 | `host/` | the host, in C over wasmtime: stores, linking, the `host` imports and the instantiate hook | permanent: after bootstrap it runs the compiler |
 | `compiler/` | the compiler, written in the language. Today only `syntax.sub`, the syntax library; the rest arrives as the compiler is rewritten for bootstrap | permanent, grows |
 | `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: frozen once the compiler compiles itself |
-| `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match`, and the dynamic Lisp (`lisp.sub`) | permanent, grows |
+| `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match`, and Substrate itself (`substrate.sub`), the language built on the kernel | permanent, grows |
 | `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.imports`) and any modules it requires in `NAME/`; checked by `make check` | grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.imports` (what the compiled phase-0 linklet may import). `tests/fixtures/` holds modules the tests require | grows |
 | `bin/subc` | the entry point | permanent; runs stage0 until bootstrap |
@@ -71,10 +72,10 @@ imports in the tests and examples.
 together: `struct` and `enum` define GC types and leave compile-time
 values that `match` reads, checking patterns at compile time.
 `examples/shapes.sub` matches, in one module, types defined in another.
-`lib/lisp.sub` is the dynamic Lisp the compiler will be written in: every
-value is an `eqref`, and closure and assignment conversion run per
-definition, on fully expanded code. `examples/effects.sub` is an effect language
-on the Lisp (`examples/effects/handlers.sub`): declared effects, handlers
+`lib/substrate.sub` is Substrate, the language the compiler will be
+written in, on the Substrate kernel: every value is an `eqref`, and
+closure and assignment conversion run per definition, on fully expanded
+code. `examples/effects.sub` is an effect language on Substrate (`examples/effects/handlers.sub`): declared effects, handlers
 with a clause per operation, and Koka's evidence passing, built from
 `#%app`, `local-expand` and compile-time values.
 
