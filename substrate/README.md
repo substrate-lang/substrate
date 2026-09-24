@@ -68,8 +68,11 @@ imports in the tests and examples.
 together: `struct` and `enum` define GC types and leave static
 information that `match` reads, checking patterns at compile time.
 `examples/shapes.sub` matches, in one module, types defined in another.
-`examples/effects.sub` passes an effect as a hidden argument, a spike for
-the effects rung built from `#%app`, `local-expand` and typed function
-references.
+`lib/lisp.sub` is the dynamic Lisp the compiler will be written in: every
+value is an `eqref`, and closure and assignment conversion run per
+definition, on expanded code. `examples/effects.sub` is an effect language
+on the Lisp (`examples/effects/handlers.sub`): declared effects, handlers
+with a clause per operation, and Koka's evidence passing, built from
+`#%app`, `local-expand` and static information.
 
 Open questions are in `docs/spec.md` section 7.

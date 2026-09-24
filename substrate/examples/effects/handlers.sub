@@ -1,0 +1,214 @@
+;; Lifecycle: example. Effect handlers on the dynamic Lisp (lib/lisp.sub).
+;; Operations are tail-resumptive, like Koka's fun operations: a clause
+;; runs where its operation is performed, and the clause's value is the
+;; operation's result. A module takes these forms, and the Lisp's, with
+;; require-unqualified:
+;;
+;;   (effect Name (op x ...) ...)      declare an effect and its operations
+;;   (define (f x ...) body ...)       a function, whose body may perform
+;;                                     operations
+;;   (op arg ...)                      perform an operation
+;;   (with-handler (Name [(op x ...) body ...] ...) body ...)
+;;                                     body, with Name's operations handled
+;;                                     by the clauses, one per operation
+;;
+;; Which handler an operation reaches, as in Effekt: a function defined
+;; with define gets the handlers of its caller; a lambda keeps the
+;; handlers of the code it is written in; a clause's own operations go to
+;; the handlers outside its with-handler. Performing an operation with no
+;; handler for its effect is a run-time error; Koka and Effekt report it
+;; as a type error. Clauses are closures, so they can use and assign the
+;; variables around their with-handler.
+;;
+;; Functions defined with define are called, not used as values, like
+;; Effekt's def functions; (lambda (x) (f x)) is f as a value. Anything
+;; else, such as a lambda or a Lisp function, is called as the Lisp calls
+;; it and is not given handlers.
+;;
+;; How handlers reach operations: evidence passing, as in Koka. A function
+;; defined here takes a hidden first argument, the evidence: the handlers
+;; around the call, innermost first. A call passes its evidence on, a
+;; with-handler extends it for its body, and an operation calls the
+;; innermost clause for it. In code, the evidence is first written as
+;; hole, a global of this library; with-evidence then expands the code
+;; (local-expand, spec 2.3) and replaces each hole, compared by binding,
+;; with the evidence in scope. So the evidence stays hygienic and also
+;; reaches calls in other libraries' macro templates
+;; (examples/effects/beeps.sub). A hole outside every with-evidence, in a
+;; kernel function or a global's initial value, is the empty evidence.
+
+(require-unqualified l "../../lib/lisp.sub")
+(require s syntax)
+
+(provide [define effect-define] [#%app effect-app] effect with-handler
+         lambda set! if cond else when unless and or let letrec #%datum
+         cons car cdr pair? null? list? length append reverse eq? not
+         + - * quotient remainder < > <= >= = zero? display newline error)
+
+;; ---- evidence ------------------------------------------------------------------------
+;;
+;; A list of handlers, innermost first. A handler is (tag . clauses): its
+;; effect's tag, and a closure per operation, in the order the effect
+;; declares them.
+
+(global hole eqref '())
+
+(define (no-handler tag)
+  (error (s:string-append "an operation was performed with no handler for the effect "
+                          (s:symbol->string (car tag)))))
+
+(define (handler-for tag ev)
+  (cond [(null? ev) (no-handler tag)]
+        [(eq? (car (car ev)) tag) (cdr (car ev))]
+        [else (handler-for tag (cdr ev))]))
+
+(define (nth-clause clauses i)
+  (if (= i 0) (car clauses) (nth-clause (cdr clauses) (- i 1))))
+
+;; The clause for operation i of the effect with this tag.
+(define (clause-of ev tag i) (nth-clause (handler-for tag ev) i))
+
+;; ---- forms -----------------------------------------------------------------------------
+;;
+;; Static information, read by effect-app and with-handler:
+;;   (effectful impl n)          a function defined here: impl takes the
+;;                               evidence and n arguments
+;;   (operation tag i n)         operation i of the effect with this tag,
+;;                               taking n arguments
+;;   (effect tag ((op n) ...))   an effect: its tag and operations
+
+(begin-for-syntax
+  (require s syntax)
+
+  (func (named? [x eqref] [name eqref]) -> i32
+    (if (s:identifier? x) (ref.eq (s:syntax-e x) name) 0))
+
+  (func (number [n i32]) -> eqref (s:datum->syntax #'here (s:fixnum n) '#f))
+
+  ;; hole, at the location of stx.
+  (func (hole-at [stx eqref]) -> eqref (s:datum->syntax #'hole 'hole stx))
+
+  ;; The static information bound to x with this head, or #f.
+  (func (info [x eqref] [head eqref]) -> eqref
+    (if (i32.eqz (s:identifier? x)) (return '#f))
+    (if (i32.eqz (ref.eq (s:binding-kind x) 'static)) (return '#f))
+    (let ([l (s:syntax->list (s:syntax-local-value x))])
+      (if (ref.is_null l) (return '#f))
+      (if (s:null? l) (return '#f))
+      (if (named? (s:car l) head) l '#f)))
+
+  (func (check-count [args eqref] [n eqref] [stx eqref])
+    (if (i32.ne (s:length args) (s:fixnum-value (s:syntax-e n)))
+        (s:syntax-error stx '"wrong number of arguments")))
+
+  ;; (define (f x ...) body ...): the function under a name of its own,
+  ;; taking the evidence first, and f bound to static information pointing
+  ;; at it. (define x e) is the Lisp's.
+  (func (effect-define [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      (if (s:identifier? (s:cadr parts))
+          (return #`(define #,@(s:cdr parts))))
+      (let ([head (s:syntax->list (s:cadr parts))])
+        #`(begin
+            (define (impl ev #,@(s:cdr head)) (with-evidence ev #,@(s:cddr parts)))
+            (define-static #,(s:car head)
+              (quote-syntax (effectful impl #,(number (s:length (s:cdr head))))))))))
+
+  ;; (f arg ...): a function defined here is given the evidence, and an
+  ;; operation calls its clause. Anything else is called as the Lisp calls
+  ;; it.
+  (func (effect-app [stx eqref]) -> eqref
+    (let* ([parts (s:cdr (s:syntax->list stx))] [f (s:car parts)] [args (s:cdr parts)]
+           [call (s:syntax-rewrap stx parts)]  ; the call as written, for errors
+           [fn (info f 'effectful)] [op (info f 'operation)])
+      (if (i32.eqz (ref.is_null fn))
+          (begin
+            (check-count args (s:caddr fn) call)
+            (return #`(#,(s:cadr fn) #,(hole-at stx) #,@args))))
+      (if (i32.eqz (ref.is_null op))
+          (begin
+            (check-count args (s:car (s:cdddr op)) call)
+            (return #`((clause-of #,(hole-at stx) #,(s:cadr op) #,(s:caddr op)) #,@args))))
+      #`(#,f #,@args)))
+
+  ;; (with-evidence ev body ...): body, expanded, with each hole replaced by
+  ;; ev.
+  (func (with-evidence [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      (fill (s:local-expand #`(begin #,@(s:cddr parts))) (s:cadr parts))))
+
+  (func (fill [x eqref] [ev eqref]) -> eqref
+    (if (s:identifier? x)
+        (return (if (named? x 'hole) (if (s:free-identifier=? x #'hole) ev x) x)))
+    (let ([l (s:syntax->list x)])
+      (if (ref.is_null l) (return x))
+      (if (s:null? l) (return x))
+      (if (i32.or (named? (s:car l) 'quote) (named? (s:car l) 'quote-syntax)) (return x))
+      (s:syntax-rewrap x (fill-list l ev))))
+
+  (func (fill-list [l eqref] [ev eqref]) -> eqref
+    (if (s:null? l) '() (s:cons (fill (s:car l) ev) (fill-list (s:cdr l) ev))))
+
+  ;; (effect Name (op x ...) ...): the effect's tag, a pair made for it and
+  ;; compared by identity, and static information for Name and each op.
+  (func (effect [stx eqref]) -> eqref
+    (let* ([parts (s:syntax->list stx)] [name (s:cadr parts)] [ops (s:cddr parts)])
+      #`(begin
+          (define tag (cons '#,name '()))
+          (define-static #,name (quote-syntax (effect tag (#,@(op-arities ops)))))
+          #,@(op-statics ops 0))))
+
+  (func (op-arity [op eqref]) -> eqref (number (s:length (s:cdr (s:syntax->list op)))))
+
+  (func (op-arities [ops eqref]) -> eqref
+    (if (s:null? ops)
+        '()
+        (s:cons #`(#,(s:car (s:syntax->list (s:car ops))) #,(op-arity (s:car ops)))
+                (op-arities (s:cdr ops)))))
+
+  (func (op-statics [ops eqref] [i i32]) -> eqref
+    (if (s:null? ops)
+        '()
+        (s:cons #`(define-static #,(s:car (s:syntax->list (s:car ops)))
+                    (quote-syntax (operation tag #,(number i) #,(op-arity (s:car ops)))))
+                (op-statics (s:cdr ops) (i32.add i 1)))))
+
+  ;; The clause in clauses whose head is op, or #f.
+  (func (clause-for [op eqref] [clauses eqref]) -> eqref
+    (if (s:null? clauses) (return '#f))
+    (let ([head (s:car (s:syntax->list (s:car (s:syntax->list (s:car clauses)))))])
+      (if (s:free-identifier=? head op) (return (s:car clauses))))
+    (clause-for op (s:cdr clauses)))
+
+  ;; The clauses as closures, in a list in the order the effect declares
+  ;; its operations.
+  (func (clause-list [ops eqref] [clauses eqref] [where eqref]) -> eqref
+    (if (s:null? ops) (return #''()))
+    (let* ([op (s:syntax->list (s:car ops))]
+           [clause (clause-for (s:car op) clauses)])
+      (if (ref.is_null clause)
+          (s:syntax-error where (s:string-append '"no clause for the operation "
+                                                 (s:symbol->string (s:syntax-e (s:car op))))))
+      (let* ([c (s:syntax->list clause)] [params (s:cdr (s:syntax->list (s:car c)))])
+        (if (i32.ne (s:length params) (s:fixnum-value (s:syntax-e (s:cadr op))))
+            (s:syntax-error (s:car c) '"this clause's parameters do not match its operation's"))
+        #`(cons (lambda (#,@params) #,@(s:cdr c)) #,(clause-list (s:cdr ops) clauses where)))))
+
+  ;; (with-handler (Name [(op x ...) body ...] ...) body ...)
+  (func (with-handler [stx eqref]) -> eqref
+    (let* ([parts (s:syntax->list stx)]
+           [spec (s:syntax->list (s:cadr parts))]
+           [effect (info (s:car spec) 'effect)])
+      (if (ref.is_null effect) (s:syntax-error (s:car spec) '"expected the name of an effect"))
+      (let ([ops (s:syntax->list (s:caddr effect))])
+        (if (i32.ne (s:length (s:cdr spec)) (s:length ops))
+            (s:syntax-error (s:cadr parts) '"a handler has one clause for each operation of its effect"))
+        #`(let ([ev (cons (cons #,(s:cadr effect) #,(clause-list ops (s:cdr spec) (s:cadr parts)))
+                          #,(hole-at stx))])
+            (with-evidence ev #,@(s:cddr parts)))))))
+
+(define-syntax effect-define effect-define)
+(define-syntax effect-app effect-app)
+(define-syntax with-evidence with-evidence)
+(define-syntax effect effect)
+(define-syntax with-handler with-handler)
