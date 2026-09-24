@@ -30,8 +30,7 @@
 ;; and the functions the provide below lists, grouped as they are defined
 ;; at the end. A function given an argument of the wrong type, or the wrong
 ;; number of arguments, stops with an error that names it. Characters are
-;; classified and cased as ASCII. Strings have only the operations that do
-;; not depend on how they are indexed, which is still open.
+;; classified and cased as ASCII. Strings are UTF-8, indexed by byte.
 ;;
 ;; Integers are exact up to 64 bits; arithmetic beyond that is an error.
 ;; A program's entry point is a kernel function: (func (main) (run)).
@@ -82,7 +81,8 @@
          char-alphabetic? char-numeric? char-whitespace? char-upcase char-downcase digit-value
          ;; strings and symbols
          string? symbol? string=? string<? string>? string<=? string>=? string-append
-         symbol->string string->symbol string->utf8
+         symbol->string string->symbol string-length string-byte string-char char-utf8-length
+         substring string-copy string->list list->string string utf8->string string->utf8
          ;; vectors and bytevectors
          vector? vector make-vector vector-length vector-ref vector-set! vector->list
          list->vector vector-fill! vector-copy
@@ -1509,8 +1509,10 @@
 
 ;; ---- strings and symbols ----
 ;;
-;; Only what does not depend on how strings are indexed, which is still
-;; open.
+;; Strings are the syntax library's: immutable UTF-8, indexed by byte.
+;; string-length counts bytes, and an index is a byte offset, which must be
+;; where a character starts wherever a function takes characters. Languages
+;; above can index strings otherwise.
 
 (func (string-arg [s eqref] [who eqref]) -> eqref
   (if (i32.eqz (s:string? s)) (drop (wrong-type who '"a string" s)))
@@ -1588,15 +1590,161 @@
   (s:symbol->string x))
 (lisp-define (string->symbol x) (s:intern (string-arg x '"string->symbol")))
 
-(lisp-define (string->utf8 x)
-  (let* ([s (string-arg x '"string->utf8")] [n (s:string-length s)] [b (array.new bytevector 0 n)] [i 0])
+(func (continuation-byte? [b i32]) -> i32 (i32.eq (i32.and b 192) 128))
+
+;; Is byte offset i of s where a character starts, or its end?
+(func (char-start? [s eqref] [i i32]) -> i32
+  (if (i32.ge_u i (s:string-length s)) (return 1))
+  (i32.eqz (continuation-byte? (s:string-byte s i))))
+
+(func (inside-char-error [who eqref] [k eqref]) -> eqref
+  (set! out-length 0)
+  (out-string who 0)
+  (out-string '": byte " 0)
+  (out-datum k 0)
+  (out-string '" is inside a character" 0)
+  (fail-out))
+
+;; Byte offset k of string s, for function who: from 0 to its length, where
+;; a character starts.
+(func (char-offset [k eqref] [s eqref] [who eqref]) -> i32
+  (let ([i (bound k (s:string-length s) who)])
+    (if (i32.eqz (char-start? s i)) (drop (inside-char-error who k)))
+    i))
+
+(func (continuation [s eqref] [i i32]) -> i32 (i32.and (s:string-byte s i) 63))
+
+;; The code point of the character at byte offset i of s.
+(func (decode-char [s eqref] [i i32]) -> i32
+  (let ([b (s:string-byte s i)])
+    (if (i32.lt_u b 128) (return b))
+    (if (i32.lt_u b 224)
+        (return (i32.or (i32.shl (i32.and b 31) 6) (continuation s (i32.add i 1)))))
+    (if (i32.lt_u b 240)
+        (return (i32.or (i32.shl (i32.and b 15) 12)
+                        (i32.or (i32.shl (continuation s (i32.add i 1)) 6) (continuation s (i32.add i 2))))))
+    (i32.or (i32.or (i32.shl (i32.and b 7) 18) (i32.shl (continuation s (i32.add i 1)) 12))
+            (i32.or (i32.shl (continuation s (i32.add i 2)) 6) (continuation s (i32.add i 3))))))
+
+(func (utf8-length [cp i32]) -> i32
+  (if (i32.lt_u cp 128) (return 1))
+  (if (i32.lt_u cp 2048) (return 2))
+  (if (i32.lt_u cp 65536) (return 3))
+  4)
+
+;; Add code point cp to string builder b, as UTF-8.
+(func (add-char [b eqref] [cp i32])
+  (if (i32.lt_u cp 128) (return (s:string-builder-add-byte! b cp)))
+  (if (i32.lt_u cp 2048)
+      (begin
+        (s:string-builder-add-byte! b (i32.or 192 (i32.shr_u cp 6)))
+        (return (s:string-builder-add-byte! b (i32.or 128 (i32.and cp 63))))))
+  (if (i32.lt_u cp 65536)
+      (begin
+        (s:string-builder-add-byte! b (i32.or 224 (i32.shr_u cp 12)))
+        (s:string-builder-add-byte! b (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
+        (return (s:string-builder-add-byte! b (i32.or 128 (i32.and cp 63))))))
+  (s:string-builder-add-byte! b (i32.or 240 (i32.shr_u cp 18)))
+  (s:string-builder-add-byte! b (i32.or 128 (i32.and (i32.shr_u cp 12) 63)))
+  (s:string-builder-add-byte! b (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
+  (s:string-builder-add-byte! b (i32.or 128 (i32.and cp 63))))
+
+;; The byte offsets of string x from start to end (#f: its start, its end),
+;; for function who, as (start . end) fixnums.
+(func (string-range [x eqref] [start eqref] [end eqref] [who eqref]) -> eqref
+  (let* ([e (if (ref.is_null end) (s:string-length x) (char-offset end x who))]
+         [b (if (ref.is_null start) 0 (char-offset start x who))])
+    (if (i32.gt_u b e) (drop (index-error who start)))
+    (s:cons (s:fixnum b) (s:fixnum e))))
+
+(func (substring* [s eqref] [start eqref] [end eqref] [who eqref]) -> eqref
+  (let* ([x (string-arg s who)] [r (string-range x start end who)] [builder (s:make-string-builder)])
+    (s:string-builder-add! builder x (s:fixnum-value (s:car r)) (s:fixnum-value (s:cdr r)))
+    (s:string-builder->string builder)))
+
+(func (string->list* [s eqref] [start eqref] [end eqref] [who eqref]) -> eqref
+  (let* ([x (string-arg s who)] [r (string-range x start end who)]
+         [i (s:fixnum-value (s:car r))] [e (s:fixnum-value (s:cdr r))] [acc '()] [cp 0])
     (block done
       (loop next
-        (br-if done (i32.ge_u i n))
-        (array.set bytevector b i (s:string-byte s i))
+        (br-if done (i32.ge_u i e))
+        (set! cp (decode-char x i))
+        (set! acc (s:cons (s:integer->char cp) acc))
+        (set! i (i32.add i (utf8-length cp)))
+        (br next)))
+    (s:reverse acc)))
+
+(func (list->string* [chars eqref] [who eqref]) -> eqref
+  (let ([b (s:make-string-builder)] [l (list-arg chars who)])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (s:pair? l)))
+        (add-char b (char-arg (s:car l) who))
+        (set! l (s:cdr l))
+        (br next)))
+    (s:string-builder->string b)))
+
+(func (utf8->string* [v eqref] [start eqref] [end eqref] [who eqref]) -> eqref
+  (let* ([a (bytevector-arg v who)]
+         [e (if (ref.is_null end) (array.len a) (bound end (array.len a) who))]
+         [i (if (ref.is_null start) 0 (bound start e who))]
+         [b (s:make-string-builder)]
+         [s eqref '#f])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i e))
+        (s:string-builder-add-byte! b (array.get_u bytevector a i))
         (set! i (i32.add i 1))
         (br next)))
+    (set! s (s:string-builder->string b))
+    (if (ref.is_null s) (return (wrong-type who '"UTF-8 bytes" v)))
+    s))
+
+(func (string->utf8* [s eqref] [start eqref] [end eqref] [who eqref]) -> eqref
+  (let* ([x (string-arg s who)] [r (string-range x start end who)]
+         [i (s:fixnum-value (s:car r))] [e (s:fixnum-value (s:cdr r))]
+         [b (array.new bytevector 0 (i32.sub e i))] [j 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i e))
+        (array.set bytevector b j (s:string-byte x i))
+        (set! i (i32.add i 1))
+        (set! j (i32.add j 1))
+        (br next)))
     b))
+
+(lisp-define (string-length s) (s:fixnum (s:string-length (string-arg s '"string-length"))))
+(lisp-define (string-byte s k)
+  (let ([x (string-arg s '"string-byte")])
+    (s:fixnum (s:string-byte x (index k (s:string-length x) '"string-byte")))))
+(lisp-define (string-char s k)
+  (let* ([x (string-arg s '"string-char")] [i (index k (s:string-length x) '"string-char")])
+    (if (i32.eqz (char-start? x i)) (return (inside-char-error '"string-char" k)))
+    (s:integer->char (decode-char x i))))
+(lisp-define (char-utf8-length c) (s:fixnum (utf8-length (char-arg c '"char-utf8-length"))))
+(lisp-define (substring s start end) (substring* s start end '"substring"))
+(lisp-define string-copy
+  (lisp-case-lambda
+    [(s) (substring* s '#f '#f '"string-copy")]
+    [(s start) (substring* s start '#f '"string-copy")]
+    [(s start end) (substring* s start end '"string-copy")]))
+(lisp-define string->list
+  (lisp-case-lambda
+    [(s) (string->list* s '#f '#f '"string->list")]
+    [(s start) (string->list* s start '#f '"string->list")]
+    [(s start end) (string->list* s start end '"string->list")]))
+(lisp-define (list->string chars) (list->string* chars '"list->string"))
+(lisp-define (string . chars) (list->string* chars '"string"))
+(lisp-define utf8->string
+  (lisp-case-lambda
+    [(v) (utf8->string* v '#f '#f '"utf8->string")]
+    [(v start) (utf8->string* v start '#f '"utf8->string")]
+    [(v start end) (utf8->string* v start end '"utf8->string")]))
+(lisp-define string->utf8
+  (lisp-case-lambda
+    [(s) (string->utf8* s '#f '#f '"string->utf8")]
+    [(s start) (string->utf8* s start '#f '"string->utf8")]
+    [(s start end) (string->utf8* s start end '"string->utf8")]))
 
 ;; ---- vectors ----
 

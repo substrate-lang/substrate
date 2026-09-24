@@ -94,7 +94,7 @@ another type, such as `n:i32`.
 |---|---|
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
-| strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)` |
+| strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
 | queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)`, `(local-expand stx)`, `(lift-definition form)` |
 
@@ -106,6 +106,10 @@ another type, such as `n:i32`.
   a non-negative one is `integer-value` read as unsigned. `integer` makes
   the fixnum or integer value for a signed `i64`. A decimal literal is a
   flonum, an `f64`.
+- **Strings** are immutable UTF-8, and their lengths and indexes count
+  bytes. A string builder collects bytes, singly or as a range of a
+  string's, and `string-builder->string` makes a new string of them, or
+  `#f` if they are not UTF-8, so every string is.
 - `syntax-e` of an identifier is a symbol, and of a literal it is the
   literal's value. Of a list it is a list whose elements are syntax.
 - `datum->syntax` wraps a value, giving every new syntax object the scopes
@@ -741,6 +745,7 @@ expander.
   | `%table` | `(array (mut eqref))` | the intern table, the handle table and a part's quoted data |
   | `%integer` | `(struct (field negative i32) (field magnitude i64))` | integers beyond the fixnum range |
   | `%flonum` | `(struct (field value f64))` | flonums |
+  | `%builder` | `(struct (field bytes (mut (ref %string))) (field length (mut i32)))` | string builders |
 
 - **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
   single `%atom` objects made at start. A part's quoted data is a
