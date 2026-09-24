@@ -95,7 +95,7 @@ another type, such as `n:i32`.
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)` |
-| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
+| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
 | queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)`, `(local-expand stx)`, `(lift-definition form)` |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
@@ -109,7 +109,11 @@ another type, such as `n:i32`.
 - `syntax-e` of an identifier is a symbol, and of a literal it is the
   literal's value. Of a list it is a list whose elements are syntax.
 - `datum->syntax` wraps a value, giving every new syntax object the scopes
-  of `ctx` (a syntax object, or `#f` for none).
+  of `ctx` and the source location of `loc`, each a syntax object or `#f`
+  for none. As in Racket, the two are separate: a macro usually takes
+  scopes from its own templates or the use, and the location from the part
+  of the input the new syntax stands for, so errors in the code it builds
+  point at code the user wrote.
 - `syntax-rewrap` copies syntax object `s` around a new datum `e`, keeping
   its scopes, source location and properties. `quasisyntax` is built on it.
 - **Properties** attach values to a syntax object, for example a type a
@@ -543,7 +547,7 @@ This is the same trade Racket makes: a module-level *definition* made from
 a macro's input can still capture the macro's own references to that name.
 Local bindings cannot.
 
-A transformer can capture on purpose: `(datum->syntax stx 'it)` makes an
+A transformer can capture on purpose: `(datum->syntax stx 'it stx)` makes an
 identifier with the scopes of the use, as if the user had written it.
 
 **Literals drop local scopes.** `quote-syntax` and the constant parts of
