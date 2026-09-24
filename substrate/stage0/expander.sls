@@ -554,44 +554,91 @@
   ;; True while expanding the forms a module pass returned (spec 6.5).
   (define redefining? #f)
 
+  ;; A module body being expanded: its phase, the items pass 1 found
+  ;; (reversed), whether pass 2 has started, and the expanded forms lifted
+  ;; while pass 2 expands the current item (reversed).
+  (define-record-type body (fields phase (mutable items) (mutable pass2?) (mutable lifted)))
+
+  (define current-body #f)                 ; the innermost body being expanded
+
   ;; A module body -> its expanded code: func, global, import, type and
   ;; data forms and expressions (spec 6.4). Other module-level forms take
   ;; effect during expansion and leave nothing.
   (define (expand-body forms phase)
-    ;; Pass 1: find definitions, run compile-time forms, splice begins.
-    (let loop ([forms forms] [pending '()])
-      (if (pair? forms)
-          (let* ([f (head-expand (car forms) phase)]
-                 [rest (cdr forms)]
-                 [kind (core-head f phase)])
-            (when (and redefining?
-                       (memq kind '(require provide runtime-free module-pass memory table
-                                    define-syntax define-static begin-for-syntax)))
-              (raise-compile-error f "a module pass returned (~a ...), but a pass may return only func, global, import, type and data forms and expressions" kind))
-            (case kind
-              [(begin) (loop (append (cdr (stx-list-of f 'begin)) rest) pending)]
-              [(require) (require! f phase) (loop rest pending)]
-              [(provide) (provide! f phase) (loop rest pending)]
-              [(runtime-free) (runtime-free! f phase) (loop rest pending)]
-              [(module-pass) (module-pass! f phase) (loop rest pending)]
-              [(func) (loop rest (cons (declare-func f phase) pending))]
-              [(global) (loop rest (cons (declare-global f phase) pending))]
-              [(import) (declare-import f phase) (loop rest (cons (list 'plain (core-headed f 'import)) pending))]
-              [(memory table) (declare-storage! f phase) (loop rest pending)]
-              [(data) (declare-data f phase) (loop rest (cons (list 'plain (core-headed f 'data)) pending))]
-              [(type) (declare-type f phase) (loop rest (cons (list 'plain (core-headed f 'type)) pending))]
-              [(define-syntax) (define-syntax! f phase) (loop rest pending)]
-              [(define-static) (define-static! f phase) (loop rest pending)]
-              [(begin-for-syntax) (begin-for-syntax! f phase) (loop rest pending)]
-              [else (loop rest (cons (list 'expr f) pending))]))
-          ;; Pass 2: expand bodies and expressions.
-          (map-lr (lambda (p)
-                    (case (car p)
-                      [(func) (expand-func p phase)]
-                      [(global) (expand-global p phase)]
-                      [(plain) (cadr p)]
-                      [(expr) (expand-expr (cadr p) phase)]))
-                  (reverse pending)))))
+    (let ([b (make-body phase '() #f '())] [saved current-body])
+      (dynamic-wind
+        (lambda () (set! current-body b))
+        (lambda ()
+          ;; Pass 1: find definitions, run compile-time forms, splice begins.
+          (for-each (lambda (f) (declare-form! f b (and redefining? "a module pass returned"))) forms)
+          ;; Pass 2: expand bodies and expressions. What an item lifts goes
+          ;; before it.
+          (body-pass2?-set! b #t)
+          (apply append
+                 (map-lr (lambda (item)
+                           (body-lifted-set! b '())
+                           (let ([out (expand-item item phase)])
+                             (append (reverse (body-lifted b)) (list out))))
+                         (reverse (body-items b)))))
+        (lambda () (set! current-body saved)))))
+
+  ;; Pass 1 for module-level form f0 of body b: expand macro uses at its
+  ;; head, then declare it, run it, or keep it for pass 2. only is #f, or
+  ;; says where the form came from if it may only be a definition or an
+  ;; expression (what a module pass returns, or what a macro lifts).
+  (define (declare-form! f0 b only)
+    (let* ([phase (body-phase b)]
+           [f (head-expand f0 phase)]
+           [kind (core-head f phase)])
+      (define (item! x) (body-items-set! b (cons x (body-items b))))
+      (when (and only
+                 (memq kind '(require provide runtime-free module-pass memory table
+                              define-syntax define-static begin-for-syntax)))
+        (raise-compile-error f "~a (~a ...), but only func, global, import, type and data forms and expressions are allowed there"
+                             only kind))
+      (case kind
+        [(begin) (for-each (lambda (g) (declare-form! g b only)) (cdr (stx-list-of f 'begin)))]
+        [(require) (require! f phase)]
+        [(provide) (provide! f phase)]
+        [(runtime-free) (runtime-free! f phase)]
+        [(module-pass) (module-pass! f phase)]
+        [(func) (item! (declare-func f phase))]
+        [(global) (item! (declare-global f phase))]
+        [(import) (item! (declare-import f phase))]
+        [(memory table) (declare-storage! f phase)]
+        [(data) (item! (declare-data f phase))]
+        [(type) (item! (declare-type f phase))]
+        [(define-syntax) (define-syntax! f phase)]
+        [(define-static) (define-static! f phase)]
+        [(begin-for-syntax) (begin-for-syntax! f phase)]
+        [else (item! (list 'expr f))])))
+
+  ;; Pass 2 for one item: its expanded code.
+  (define (expand-item item phase)
+    (case (car item)
+      [(func) (expand-func item phase)]
+      [(global) (expand-global item phase)]
+      [(plain) (cadr item)]
+      [(expr) (expand-expr (cadr item) phase)]))
+
+  ;; Lift form, from a macro, to the module level of the body being
+  ;; expanded (spec 6.4): declare it now, so its names can be used at once,
+  ;; and put its expanded code before the form whose expansion lifted it.
+  (define (lift! form where phase)
+    (let ([b current-body])
+      (unless (and b (eqv? (body-phase b) phase))
+        (raise-compile-error where "lift-definition: no module body is being expanded at phase ~a" phase))
+      (let ([before (body-items b)])
+        (declare-form! form b "lift-definition was given")
+        ;; In pass 2 the new items are expanded now; in pass 1 they wait
+        ;; for pass 2 like the others.
+        (when (body-pass2? b)
+          (let ([new (list-head (body-items b) (- (length (body-items b)) (length before)))])
+            (body-items-set! b before)
+            (for-each (lambda (item)
+                        (let ([out (expand-item item phase)])
+                          (body-lifted-set! b (cons out (body-lifted b)))))
+                      (reverse new)))))))
 
   ;; ==== types ====================================================================
 
@@ -640,6 +687,74 @@
   (define (parse-storage s phase)
     (if (and (id? s) (memq (stx-e s) '(i8 i16))) (stx-e s) (parse-type s phase)))
 
+  ;; ---- macros in types ----
+  ;;
+  ;; In a type position, a form whose head is a macro is expanded until it
+  ;; is not (spec 5.1): a type function. The expand- functions return type
+  ;; syntax with every such use expanded, which is what expanded code holds;
+  ;; the parse- functions then read it.
+
+  ;; The macro meaning of s's head if s is (macro ...), else #f.
+  (define (type-macro-use s phase)
+    (and (stx? s) (pair? (stx-e s)) (id? (car (stx-e s)))
+         (let ([m (meaning-of (car (stx-e s)) phase)])
+           (and m (eq? (car m) 'macro) m))))
+
+  ;; A type name or heap type: macro uses at its head expanded.
+  (define (expand-type-name s phase)
+    (let ([m (type-macro-use s phase)])
+      (if m (expand-type-name (apply-macro (car (stx-e s)) (cadr m) s phase #f) phase) s)))
+
+  ;; A value type.
+  (define (expand-type s phase)
+    (let* ([s (expand-type-name s phase)]
+           [l (stx->list s)])
+      (if (and l (memv (length l) '(2 3)) (core-name? (car l) 'ref))
+          (stx-rewrap s (append (list-head l (- (length l) 1)) (list (expand-type-name (list-ref l (- (length l) 1)) phase))))
+          s)))
+
+  ;; A field, element or global type: a type, i8, i16, or (mut ...) of one.
+  (define (expand-field-type s phase)
+    (let ([l (stx->list s)])
+      (cond [(and l (= (length l) 2) (core-name? (car l) 'mut))
+             (stx-rewrap s (list (car l) (expand-field-type (cadr l) phase)))]
+            [(and (id? s) (memq (stx-e s) '(i8 i16))) s]
+            [else (expand-type s phase)])))
+
+  ;; A signature (t ... -> r ...).
+  (define (expand-signature s phase)
+    (let ([l (stx-list-of s "signature")])
+      (stx-rewrap s (map-lr (lambda (t) (if (core-name? t '->) t (expand-type t phase))) l))))
+
+  ;; The result part of a func, `-> r`, where r is one type or a list of
+  ;; them. A macro use is one type, though it looks like a list.
+  (define (expand-arrow arrow phase)
+    (if (null? arrow)
+        arrow
+        (let* ([r (cadr arrow)] [l (stx->list r)])
+          (list (car arrow)
+                (if (and l (pair? l) (not (core-name? (car l) 'ref)) (not (type-macro-use r phase)))
+                    (stx-rewrap r (map-lr (lambda (t) (expand-type t phase)) l))
+                    (expand-type r phase))))))
+
+  ;; A type definition: (struct (field name t) ...), (array t), or
+  ;; (sub ... def).
+  (define (expand-type-def s phase)
+    (let ([l (stx->list s)])
+      (cond [(and l (pair? l) (core-name? (car l) 'sub))
+             (stx-rewrap s (append (list-head l (- (length l) 1)) (list (expand-type-def (list-ref l (- (length l) 1)) phase))))]
+            [(and l (pair? l) (core-name? (car l) 'struct))
+             (stx-rewrap s (cons (car l)
+                                 (map-lr (lambda (fs)
+                                           (let ([fp (stx->list fs)])
+                                             (if (and fp (= (length fp) 3))
+                                                 (stx-rewrap fs (list (car fp) (cadr fp) (expand-field-type (caddr fp) phase)))
+                                                 fs)))
+                                         (cdr l))))]
+            [(and l (= (length l) 2) (core-name? (car l) 'array))
+             (stx-rewrap s (list (car l) (expand-field-type (cadr l) phase)))]
+            [else s])))
+
   ;; (type name def), where def is (struct (field fname ftype) ...),
   ;; (array etype), or (sub [final] [super] def) as in wasm (spec 5.3). A
   ;; def without sub is final, with no supertype. The name is bound before
@@ -664,9 +779,13 @@
               (raise-compile-error (caddr parts) "~a is final: it cannot be a supertype" (type-info-name super))))
           (let ([info (make-type-info (stx-e (cadr parts)) kind #f super final?)])
             (bind-definition! (cadr parts) phase (list 'type info))
-            (type-info-fields-set! info (parse-type-fields def kind phase))
-            (when super (check-subtype-fields! info super def))
-            (list 'type info))))))
+            ;; The field types are expanded after the name is bound, so a
+            ;; type function may be given the type being declared.
+            (let*-values ([(xdef) (expand-type-def (caddr parts) phase)]
+                          [(xinner xfinal? xsuper) (parse-sub xdef phase)])
+              (type-info-fields-set! info (parse-type-fields xinner kind phase))
+              (when super (check-subtype-fields! info super xinner))
+              (list 'plain (out f 'type (cadr parts) xdef))))))))
 
   ;; (sub [final] [super] def) -> def, final?, super's type-info or #f.
   (define (parse-sub s phase)
@@ -766,12 +885,17 @@
                                (let ([pp (stx->list p)])
                                  (unless (and pp (= (length pp) 2) (id? (car pp)))
                                    (raise-compile-error p "expected [name type]"))
-                                 pp))
+                                 (list (car pp) (expand-type (cadr pp) phase))))
                              (cdr hparts))]
-             [types (map-lr (lambda (pp) (parse-type (cadr pp) phase)) params)])
-        (let-values ([(results body) (parse-results (cddr parts) phase)])
-          (let ([info (make-func-info (stx-e name) types results #f #f)]
-                [arrow (list-head (cddr parts) (- (length (cddr parts)) (length body)))])
+             [types (map-lr (lambda (pp) (parse-type (cadr pp) phase)) params)]
+             [rest (cddr parts)]
+             [arrow (if (and (pair? rest) (core-name? (car rest) '->))
+                        (begin
+                          (when (null? (cdr rest)) (raise-compile-error (car rest) "expected a type after ->"))
+                          (expand-arrow (list-head rest 2) phase))
+                        '())])
+        (let-values ([(results body) (parse-results (append arrow (list-tail rest (length arrow))) phase)])
+          (let ([info (make-func-info (stx-e name) types results #f #f)])
             (bind-definition! name phase (list 'func info))
             (list 'func name params arrow body f))))))
 
@@ -791,16 +915,17 @@
     (let ([parts (stx-list-of f 'global)])
       (unless (and (= (length parts) 4) (id? (cadr parts)))
         (raise-compile-error f "expected (global name type init) or (global name (mut type) init)"))
-      (let* ([t (stx->list (caddr parts))]
+      (let* ([xt (expand-field-type (caddr parts) phase)]
+             [t (stx->list xt)]
              [mutable? (and t (= (length t) 2) (core-name? (car t) 'mut))]
-             [info (make-global-info (stx-e (cadr parts)) (parse-type (if mutable? (cadr t) (caddr parts)) phase)
+             [info (make-global-info (stx-e (cadr parts)) (parse-type (if mutable? (cadr t) xt) phase)
                                      mutable? #f #f)])
         (bind-definition! (cadr parts) phase (list 'global info))
-        (list 'global f))))
+        (list 'global f xt))))
 
   (define (expand-global p phase)
     (let ([parts (stx->list (cadr p))])
-      (out (cadr p) 'global (cadr parts) (caddr parts) (expand-expr (cadddr parts) phase))))
+      (out (cadr p) 'global (cadr parts) (caddr p) (expand-expr (cadddr parts) phase))))
 
   ;; (import name "module" "field" (t ... -> r ...))
   (define (declare-import f phase)
@@ -808,10 +933,12 @@
       (unless (and (= (length parts) 5) (id? (cadr parts))
                    (string? (stx-e (caddr parts))) (string? (stx-e (cadddr parts))))
         (raise-compile-error f "expected (import name \"module\" \"field\" (type ... -> type ...))"))
-      (let-values ([(params results) (parse-signature (list-ref parts 4) phase)])
-        (bind-definition! (cadr parts) phase
-               (list 'func (make-func-info (stx-e (cadr parts)) params results
-                                           (stx-e (caddr parts)) (stx-e (cadddr parts))))))))
+      (let ([sig (expand-signature (list-ref parts 4) phase)])
+        (let-values ([(params results) (parse-signature sig phase)])
+          (bind-definition! (cadr parts) phase
+                 (list 'func (make-func-info (stx-e (cadr parts)) params results
+                                             (stx-e (caddr parts)) (stx-e (cadddr parts)))))
+          (list 'plain (out f 'import (cadr parts) (caddr parts) (cadddr parts) sig))))))
 
 
   ;; (data name offset "bytes" ...): an active segment in the module's memory.
@@ -824,7 +951,7 @@
       (let ([info (make-data-info (stx-e (cadr parts)) (stx-e (caddr parts))
                                   (string->utf8 (apply string-append (map stx-e (cdddr parts)))))])
         (bind-definition! (cadr parts) phase (list 'data info))
-        (list 'data info))))
+        (list 'plain (core-headed f 'data)))))
 
   ;; ---- require, provide, storage ----
 
@@ -1206,6 +1333,15 @@
                (unless (and (stx? s) (not (opaque-part s)))
                  (raise-compile-error api-where "local-expand: expected syntax"))
                (encode ms (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro)))]
+            [(6)                        ; lift-definition
+             ;; The form gets the macro's introduction scope, as its output
+             ;; does. The macro gets back the form as it is declared.
+             (let ([form (decode ms a)])
+               (unless (and (stx? form) (not (opaque-part form)))
+                 (raise-compile-error api-where "lift-definition: expected syntax"))
+               (let ([introduced (flip-scope form api-intro)])
+                 (lift! introduced api-where api-phase)
+                 (encode ms introduced)))]
             [else (raise-compile-error api-where "unknown expander query ~a" op)])))))
 
   ;; ==== expanded code =================================================================
@@ -1398,8 +1534,26 @@
        (values '() (list (car args)))]
       [else (raise-compile-error (car parts) "internal: unknown GC form ~a" name)]))
 
-  (define (expand-gc name s parts phase)
-    (let-values ([(imms args) (gc-parts name parts phase)])
+  ;; parts of GC form (name immediate ... arg ...) with the type immediates
+  ;; expanded (spec 5.1).
+  (define (expand-gc-immediates name parts phase)
+    (let ([n (case name
+               [(ref.null ref.test ref.cast) 1]
+               [(array.copy) 2]
+               [(ref.eq array.len ref.is_null ref.as_non_null ref.i31 i31.get_s i31.get_u) 0]
+               [else 1])])
+      (if (< (length parts) (+ n 1))
+          parts
+          (cons (car parts)
+                (append (map-lr (lambda (t) (if (memq name '(ref.test ref.cast))
+                                                (expand-type t phase)
+                                                (expand-type-name t phase)))
+                                (list-head (cdr parts) n))
+                        (list-tail (cdr parts) n))))))
+
+  (define (expand-gc name s parts0 phase)
+    (let*-values ([(parts) (expand-gc-immediates name parts0 phase)]
+                  [(imms args) (gc-parts name parts phase)])
       (apply out s name (append (list-head (cdr parts) (- (length (cdr parts)) (length args)))
                                 (map-lr (lambda (a) (expand-expr a phase)) args)))))
 
@@ -1449,8 +1603,11 @@
                                 (let ([bp (stx->list b)])
                                   (unless (and bp (memv (length bp) '(2 3)) (id? (car bp)))
                                     (raise-compile-error b "expected [name init] or [name type init]"))
-                                  (when (= (length bp) 3) (parse-type (cadr bp) phase))
-                                  bp))
+                                  (if (= (length bp) 3)
+                                      (let ([t (expand-type (cadr bp) phase)])
+                                        (parse-type t phase)
+                                        (list (car bp) t (caddr bp)))
+                                      bp)))
                               (or (stx->list (cadr parts)) (raise-compile-error s "bad bindings")))]
                   [body (cddr parts)])
               (if (eq? name 'let)
@@ -1485,8 +1642,9 @@
             (apply o (map-lr ex (cdr parts)))]
            [(call-indirect)
             (arity-check (>= (length parts) 3))
-            (parse-signature (cadr parts) phase)
-            (apply o (cadr parts) (map-lr ex (cddr parts)))]
+            (let ([sig (expand-signature (cadr parts) phase)])
+              (parse-signature sig phase)
+              (apply o sig (map-lr ex (cddr parts))))]
            [(func-index)
             (arity-check (and (= (length parts) 2) (id? (cadr parts))))
             (let ([m (meaning-of (cadr parts) phase)])

@@ -95,7 +95,7 @@ from the instance `"syntax"`. Parameters are `eqref` unless marked
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
-| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)`, `(local-expand stx)` |
+| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)`, `(local-expand stx)`, `(lift-definition form)` |
 
 - `syntax-e` of an identifier is a symbol, and of a literal it is the
   literal's value. Of a list it is a list whose elements are syntax.
@@ -127,6 +127,11 @@ from the instance `"syntax"`. Parameters are `eqref` unless marked
   becomes, and put the result in its output. As in Racket, the macro's
   introduction scope is flipped around the expansion, so code from the
   macro's input expands as it would at the use site.
+- `lift-definition` adds a module-level form (a `func`, `global`,
+  `import`, `type` or `data` form, or an expression) to the module body
+  being expanded, at the running macro's phase (6.4). It returns the form
+  as it is declared: with the macro's introduction scope, like the
+  macro's output, so each use gets fresh names.
 
 The queries only work while an expander is running. [v0] Stage0 answers
 them in Chez; in a run-time store they trap.
@@ -277,6 +282,14 @@ quotation and compile-time forms.
   though never one of a different shape. Code that must tell same-shaped
   values apart at run time stores the difference in the value, as
   `lib/struct.sub` does with a brand per variant.
+- **Type functions.** In a type position, a form whose head is a macro is
+  expanded until it is not, so a compile-time function can compute a
+  type: `(ref (tuple i32 3))`, as in Zig. Such a macro usually declares the
+  type with `lift-definition` and returns its name, remembering the name
+  so later uses in the module get the same type (`tests/fixtures/tuple.sub`).
+  Type positions are the types of parameters, results, globals, `let`
+  bindings, fields and signatures, and the type immediates of GC
+  instructions.
 
 ### 5.2 Module-level forms
 
@@ -561,7 +574,8 @@ expr ::= id                                   ; a local or global variable
 - Types appear where the source wrote them: parameters, results,
   globals, and `let` bindings that give one. Expanded code carries no
   inferred types; the kernel's checker infers them after the passes, as
-  it does for any code.
+  it does for any code. Type functions (5.1) are expanded: types in
+  expanded code contain no macro uses.
 - **The core forms in expanded code are named by identifiers with only the
   core scope**, so they mean the core forms in any module, whatever it
   binds, for example its own `let` or `#%app`. Every other identifier keeps
@@ -570,6 +584,9 @@ expr ::= id                                   ; a local or global variable
   binding forms bind again under fresh scopes, which the references inside
   them get too. So a macro can put `local-expand`'s result into its
   output.
+- **Lifted definitions** (`lift-definition`, 2.3) are declared as soon as
+  they are lifted, so their names can be used at once, and their expanded
+  code goes before the module-level form whose expansion lifted them.
 
 ### 6.5 Module passes
 
@@ -608,10 +625,14 @@ A library usually provides a macro that expands into the declaration.
   `(memory from name)` there.
 - **More require and provide forms**: re-exporting, renaming on provide,
   requiring several phases up without nesting `begin-for-syntax`.
-- **Lifting definitions out of expressions**: wasm has no nested
-  functions, so a `lambda` must become a module-level function, which its
-  macro adds to the module. Needed for closures, which come after
-  bootstrap.
+- **Type functions across modules**: a type function declares its type in
+  each module that uses it, and declared types are compared by
+  declaration (5.1), so `(tuple i32 3)` in two modules is two types to
+  the checker, though one to wasm, and a value cannot pass between the
+  modules at that type. Zig gives the same arguments the same type
+  everywhere. Dependent types, a rung after bootstrap, need that. One way
+  is declarations the checker compares by structure, as wasm does, for
+  type functions to use; nothing planned before bootstrap needs it.
 - **Inferred types in expanded code**: expanded code carries only the
   types the source wrote (6.4). A pass that creates wasm declarations from
   the code it rewrites, such as CPS for general effect handlers or closure

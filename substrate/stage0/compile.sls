@@ -53,7 +53,12 @@
           [(eq? type 'bottom) (values code expected)]
           [(types<=? type expected) (values code expected)]
           [(null? expected) (values (append code (map-lr (lambda (_) '(drop)) type)) '())]
-          [else (fail "type mismatch: expected ~a, got ~a" (type->string expected) (type->string type))]))
+          [else
+           (let ([e (type->string expected)] [g (type->string type)])
+             ;; Two declarations can have the same name, for example one
+             ;; in each module (spec 5.1).
+             (fail "type mismatch: expected ~a, got ~a~a" e g
+                   (if (string=? e g) ", a different type declared with the same name" "")))]))
 
   (define (join-types a b)
     (cond [(eq? a 'bottom) b]

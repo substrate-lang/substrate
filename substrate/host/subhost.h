@@ -30,6 +30,7 @@ enum {
   SUB_OP_FREE_IDENTIFIER_EQ = 3,
   SUB_OP_BINDING_KIND = 4,
   SUB_OP_LOCAL_EXPAND = 5,
+  SUB_OP_LIFT_DEFINITION = 6,
 };
 
 sub_host *sub_host_new(void);
