@@ -33,7 +33,7 @@
           global-info-instance global-info-instance-set! global-info-export global-info-export-set!
           make-data-info data-info? data-info-name data-info-offset data-info-bytes
           make-type-info type-info? type-info-name type-info-kind type-info-fields type-info-fields-set!
-          type-info-super type-info-final?
+          type-info-super type-info-final? type-info-group type-info-group-set!
           ref-type? make-ref ref-nullable? ref-heap abstract-heaps numeric-type?
           valtype<=? types<=? valtype-join valtype->string unpacked defaultable?
           fresh-key! reset-keys!)
@@ -54,8 +54,9 @@
   ;; list of (name storage mutable?); an array's are one (storage mutable?).
   ;; storage is a value type, or i8 or i16. super: the declared supertype's
   ;; type-info, or #f. final?: whether other types may declare it as their
-  ;; supertype.
-  (define-record-type type-info (fields name kind (mutable fields) super final?))
+  ;; supertype. group: the type-infos of its recursion group in order, or
+  ;; #f if it is alone in one.
+  (define-record-type type-info (fields name kind (mutable fields) super final? (mutable group)))
 
   ;; ---- value types ----------------------------------------------------------
 

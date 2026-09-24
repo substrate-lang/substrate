@@ -30,7 +30,7 @@
 
   (define core-forms
     (append
-     '(func global import memory table data type define-syntax define-static begin-for-syntax
+     '(func global import memory table data type rec define-syntax define-static begin-for-syntax
        begin require provide runtime-free module-pass set! let let* if block loop br br-if return
        call-indirect func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
@@ -122,6 +122,9 @@
             (parameterize ([current-syntax-infos #f])
               (let* ([forms (lower-forms (expand-module-body (read-file library-path)) 0)]
                      [forms (append (storage-forms 0) forms)])
+                (for-each (lambda (f) (when (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) '%string))
+                                        (set-string-type! (cadr f))))
+                          forms)
                 (let-values ([(bytes imports gc?) (compile-module forms "syntax")])
                   (let ([table (make-eq-hashtable)])
                     (for-each (lambda (f) (when (eq? (car f) 'func)
@@ -636,6 +639,7 @@
         [(memory table) (declare-storage! f phase)]
         [(data) (item! (declare-data f phase))]
         [(type) (item! (declare-type f phase))]
+        [(rec) (item! (declare-rec f phase))]
         [(define-syntax) (define-syntax! f phase)]
         [(define-static) (define-static! f phase)]
         [(begin-for-syntax) (begin-for-syntax! f phase)]
@@ -794,10 +798,58 @@
             [else s])))
 
   ;; (type name def), where def is (struct (field fname ftype) ...),
-  ;; (array etype), or (sub [final] [super] def) as in wasm (spec 5.3). A
+  ;; (array etype), or (sub [final] [super] def) as in wasm (spec 5.2). A
   ;; def without sub is final, with no supertype. The name is bound before
   ;; the fields are read, so a type may refer to itself.
   (define (declare-type f phase)
+    (let ([m (begin-type-member f phase)])
+      (finish-type-member! m phase)
+      (list 'plain (type-member-out m))))
+
+  ;; (rec (type name def) ...): types that may refer to each other, one wasm
+  ;; recursion group (spec 5.2). Every name is bound before any fields are
+  ;; read. A supertype must still come earlier, as in wasm.
+  (define (declare-rec f phase)
+    (let ([parts (stx-list-of f 'rec)])
+      (unless (pair? (cdr parts))
+        (raise-compile-error f "expected (rec (type name def) ...)"))
+      (let* ([members (let loop ([ts (cdr parts)])
+                        (if (null? ts)
+                            '()
+                            (let ([t (car ts)])
+                              (unless (eq? (core-head t phase) 'type)
+                                (raise-compile-error t "a rec group holds (type name def) forms"))
+                              (check-super-not-later t (cdr ts))
+                              (let ([m (begin-type-member t phase)])
+                                (cons m (loop (cdr ts)))))))]
+             [infos (map type-member-info members)])
+        (for-each (lambda (m) (finish-type-member! m phase)) members)
+        (for-each (lambda (info) (type-info-group-set! info infos)) infos)
+        (list 'plain (apply out f 'rec (map type-member-out members))))))
+
+  ;; A member of a rec group whose supertype is a later member.
+  (define (check-super-not-later t later)
+    (let* ([def (stx->list (list-ref (stx->list t) 2))]
+           [super (and def (pair? def) (core-name? (car def) 'sub)
+                       (let ([rest (if (and (pair? (cdr def)) (core-name? (cadr def) 'final)) (cddr def) (cdr def))])
+                         (and (= (length rest) 2) (car rest))))])
+      (when (and super (id? super)
+                 (exists (lambda (u) (let ([up (stx->list u)])
+                                       (and up (>= (length up) 2) (id? (cadr up)) (eq? (stx-e (cadr up)) (stx-e super)))))
+                         later))
+        (raise-compile-error super "~a must be declared before its subtype ~a, as in wasm"
+                             (stx-e super) (stx-e (cadr (stx->list t)))))))
+
+  ;; A type declaration being read: the (type name def) form and the
+  ;; declared type; xdef is def with its types expanded, once read.
+  (define-record-type type-member (fields form name def info (mutable xdef)))
+
+  (define (type-member-out m)
+    (out (type-member-form m) 'type (type-member-name m) (type-member-xdef m)))
+
+  ;; Check (type name def), resolve its supertype, and bind name. The
+  ;; fields are read afterwards (finish-type-member!).
+  (define (begin-type-member f phase)
     (let ([parts (stx-list-of f 'type)])
       (unless (and (= (length parts) 3) (id? (cadr parts)) (stx->list (caddr parts))
                    (pair? (stx->list (caddr parts))))
@@ -814,15 +866,19 @@
                                    (type-info-name super)))
             (when (type-info-final? super)
               (raise-compile-error (caddr parts) "~a is final: it cannot be a supertype" (type-info-name super))))
-          (let ([info (make-type-info (stx-e (cadr parts)) kind #f super final?)])
+          (let ([info (make-type-info (stx-e (cadr parts)) kind #f super final? #f)])
             (bind-definition! (cadr parts) phase (list 'type info))
-            ;; The field types are expanded after the name is bound, so a
-            ;; type function may be given the type being declared.
-            (let*-values ([(xdef) (expand-type-def (caddr parts) phase)]
-                          [(xinner xfinal? xsuper) (parse-sub xdef phase)])
-              (type-info-fields-set! info (parse-type-fields xinner kind phase))
-              (when super (check-subtype-fields! info super xinner))
-              (list 'plain (out f 'type (cadr parts) xdef))))))))
+            (make-type-member f (cadr parts) (caddr parts) info #f))))))
+
+  ;; Read the fields of a type whose name is bound. They are expanded after
+  ;; the name is bound, so a type function may be given the type itself.
+  (define (finish-type-member! m phase)
+    (let*-values ([(info) (type-member-info m)]
+                  [(xdef) (expand-type-def (type-member-def m) phase)]
+                  [(xinner xfinal? xsuper) (parse-sub xdef phase)])
+      (type-info-fields-set! info (parse-type-fields xinner (type-info-kind info) phase))
+      (when (type-info-super info) (check-subtype-fields! info (type-info-super info) xinner))
+      (type-member-xdef-set! m xdef)))
 
   ;; (sub [final] [super] def) -> def, final?, super's type-info or #f.
   (define (parse-sub s phase)
@@ -1805,9 +1861,10 @@
     (raise-compile-error s "internal: not expanded code: ~s" (stx->datum s)))
 
   (define (lower-forms forms phase)
-    (filter values (map-lr (lambda (f) (lower-form f phase)) forms)))
+    (apply append (map-lr (lambda (f) (lower-form f phase)) forms)))
 
-  ;; A module-level form, or #f for one that needs no code (import).
+  ;; A module-level form, as a list of forms for the compiler: none for an
+  ;; import, one per type for a recursion group.
   (define (lower-form f phase)
     (let ([parts (stx->list f)])
       (case (core-head f phase)
@@ -1815,17 +1872,18 @@
          (let* ([head (stx->list (cadr parts))]
                 [info (func-info-of (car head) phase)])
            (let-values ([(results body) (parse-results (cddr parts) phase)])
-             (list 'func info
+             (list (list 'func info
                    (map-lr (lambda (p t) (cons (local-key-of (car (stx->list p)) phase) t))
                            (cdr head) (func-info-params info))
-                   (lower-seq body f phase))))]
+                   (lower-seq body f phase)))))]
         [(global)
          (let ([m (meaning-of (cadr parts) phase)])
-           (list 'global (cadr m) (lower-expr (cadddr parts) phase)))]
-        [(import) #f]
-        [(type) (list 'type (type-of (cadr parts) phase))]
-        [(data) (list 'data (data-info-of (cadr parts) phase))]
-        [else (list 'expr (lower-expr f phase))])))
+           (list (list 'global (cadr m) (lower-expr (cadddr parts) phase))))]
+        [(import) '()]
+        [(type) (list (list 'type (type-of (cadr parts) phase)))]
+        [(rec) (map-lr (lambda (t) (list 'type (type-of (cadr (stx->list t)) phase))) (cdr parts))]
+        [(data) (list (list 'data (data-info-of (cadr parts) phase)))]
+        [else (list (list 'expr (lower-expr f phase)))])))
 
   (define (lower-seq forms where phase)
     (at where (cons 'seq (map-lr (lambda (f) (lower-expr f phase)) forms))))

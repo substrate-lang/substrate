@@ -15,7 +15,8 @@
   (import (chezscheme) (stage0 ops))
 
   ;; types:   list of (func (param ...) (result ...)) | (struct ((storage mut?) ...))
-  ;;          | (array (storage mut?)) | (sub final? (supertypeidx ...) comptype);
+  ;;          | (array (storage mut?)) | (sub final? (supertypeidx ...) comptype)
+  ;;          | (rec entry ...), a recursion group of sub or comptype entries;
   ;;          storage is a valtype, i8 or i16
   ;; imports: list of (module field kind desc); kind func: typeidx,
   ;;          memory/table: (min max-or-#f), global: (valtype mutable?)
@@ -205,7 +206,7 @@
              (lambda (p)
                (vec! p types
                      (lambda (p t)
-                       (let comptype! ([t t])
+                       (let entry! ([t t])
                          (case (car t)
                            [(func) (out-byte! p #x60) (vec! p (cadr t) valtype!) (vec! p (caddr t) valtype!)]
                            [(struct) (out-byte! p #x5F) (vec! p (cadr t) field!)]
@@ -216,7 +217,10 @@
                                     (unless (and final? (null? supers))
                                       (out-byte! p (if final? #x4F #x50))
                                       (vec! p supers (lambda (p i) (uleb! p i))))
-                                    (comptype! (cadddr t)))]
+                                    (entry! (cadddr t)))]
+                           ;; A recursion group: one entry, but each member has
+                           ;; its own type index.
+                           [(rec) (out-byte! p #x4E) (vec! p (cdr t) (lambda (p m) (entry! m)))]
                            [else (error 'encode "unknown type" t)]))))))))
        (let ([imports (wmodule-imports m)])
          (unless (null? imports)

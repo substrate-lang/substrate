@@ -10,7 +10,7 @@
 ;; A module imports only what its code uses (spec 3.3). Code that needs a
 ;; memory or table must be given one: defined, or imported from a module.
 (library (stage0 compile)
-  (export compile-module current-syntax-infos fixnum-min fixnum-max string-type)
+  (export compile-module current-syntax-infos fixnum-min fixnum-max set-string-type!)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 wasm))
 
   ;; symbol -> func-info for the syntax library's exports; #f while
@@ -20,10 +20,12 @@
   (define fixnum-min (- (expt 2 30)))
   (define fixnum-max (- (expt 2 30) 1))
 
-  ;; The syntax library's string type. Quoted strings are built with
-  ;; array.new_fixed of this type; wasm treats identical type definitions in
-  ;; different modules as the same type (spec appendix A).
-  (define string-type (make-type-info '%string 'array '(i8 #t) #f #t))
+  ;; The syntax library's string type, set once the library is compiled.
+  ;; Quoted strings are built with array.new_fixed of it, so a module that
+  ;; quotes one declares the library's recursion group, and wasm makes it
+  ;; the library's type (spec appendix A).
+  (define string-type #f)
+  (define (set-string-type! t) (set! string-type t))
 
   (define eqref (make-ref #t 'eq))
 
@@ -491,16 +493,18 @@
   (define (const-op t) (string->symbol (string-append (symbol->string t) ".const")))
 
   ;; Every type-info mentioned anywhere in x, dependencies first: its
-  ;; supertype, then the types its fields mention. Each type is its own
-  ;; recursion group, so a type may mention itself but not a later type.
+  ;; supertype, then the types its fields mention. A recursion group comes
+  ;; as a unit: the types its members mention outside the group first, then
+  ;; the members in order. Outside a group a type may mention itself, but
+  ;; not a later type.
   (define (collect-types x)
     (let ([found '()] [visiting '()])
       (define (add! t)
         (unless (or (memq t found) (memq t visiting))
-          (set! visiting (cons t visiting))
-          (walk (type-info-super t))
-          (walk (type-info-fields t))
-          (set! found (cons t found))))
+          (let ([members (or (type-info-group t) (list t))])
+            (set! visiting (append members visiting))
+            (for-each (lambda (m) (walk (type-info-super m)) (walk (type-info-fields m))) members)
+            (for-each (lambda (m) (set! found (cons m found))) members))))
       (define (walk x)
         (cond [(type-info? x) (add! x)]
               [(pair? x) (walk (car x)) (walk (cdr x))]
@@ -755,14 +759,23 @@
        (let loop ([fs wfuncs] [i n-func-imports])
          (if (null? fs) '() (cons (cons i (cadddr (car fs))) (loop (cdr fs) (+ i 1)))))))
 
+    (define (type-entry t)
+      (list 'sub (type-info-final? t)
+            (if (type-info-super t) (list (heap-index (type-info-super t))) '())
+            (if (eq? (type-info-kind t) 'struct)
+                (list 'struct (map (lambda (f) (list (rstorage (cadr f)) (caddr f))) (type-info-fields t)))
+                (list 'array (list (rstorage (car (type-info-fields t))) (cadr (type-info-fields t)))))))
+
+    ;; One entry per recursion group: collect-types keeps a group's members
+    ;; together and in order.
     (define gc-type-entries
-      (map-lr (lambda (t)
-                (list 'sub (type-info-final? t)
-                      (if (type-info-super t) (list (heap-index (type-info-super t))) '())
-                      (if (eq? (type-info-kind t) 'struct)
-                          (list 'struct (map (lambda (f) (list (rstorage (cadr f)) (caddr f))) (type-info-fields t)))
-                          (list 'array (list (rstorage (car (type-info-fields t))) (cadr (type-info-fields t)))))))
-              gc-types))
+      (let loop ([ts gc-types] [acc '()])
+        (cond [(null? ts) (reverse acc)]
+              [(type-info-group (car ts))
+               => (lambda (g)
+                    (let ([n (length g)])
+                      (loop (list-tail ts n) (cons (cons 'rec (map-lr type-entry (list-head ts n))) acc))))]
+              [else (loop (cdr ts) (cons (type-entry (car ts)) acc))])))
 
     (define bytes
       (encode-module

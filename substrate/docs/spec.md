@@ -310,6 +310,7 @@ quotation and compile-time forms.
 (type name (struct (field fname ftype) ...))   ; ftype: storage or (mut storage)
 (type name (array ftype))                      ; storage: a type, i8 or i16
 (type name (sub [final] [super] def))          ; def: (struct ...) or (array ...)
+(rec (type name def) ...)                      ; types that refer to each other
 (require name source item ...)      ; source: "path" or syntax; item: x or [new old]
 (provide id ...)                    ; phase 0 only
 (runtime-free)                      ; see 3.4
@@ -345,9 +346,13 @@ Type declarations follow wasm. A type without `sub` is final and has no
 supertype. `(sub super def)` declares a subtype of `super`, which must be
 an earlier non-final type of the same kind; a struct starts with its
 supertype's fields, and a field may narrow its type only if it is
-immutable. `(sub final ...)` has no subtypes. A declared type may refer to
-itself, and to earlier types, but not to later ones: each type is its own
-recursion group in v0.
+immutable. `(sub final ...)` has no subtypes. A `type` form is a recursion
+group of its own, so its type may refer to itself and to earlier types,
+but not to later ones. `(rec (type name def) ...)` declares types that may
+refer to each other, as one wasm recursion group; a supertype must still
+be an earlier member or an earlier type. Wasm compares declared types
+group by group, so a type in a group is the same wasm type only as the
+same member of an identical group.
 
 Globals follow wasm too. A global is immutable unless its type is written
 `(mut type)`, and `set!` of an immutable global is an error. An initializer
@@ -568,7 +573,7 @@ explicit. `local-expand` returns it, module passes receive and return it,
 form ::= (func (id [id type] ...) [-> result] expr ...)
        | (global id type expr) | (global id (mut type) expr)
        | (import id "module" "field" (type ... -> type ...))
-       | (type id def) | (data id offset "bytes" ...)
+       | (type id def) | (rec (type id def) ...) | (data id offset "bytes" ...)
        | expr
 
 expr ::= id                                   ; a local or global variable
@@ -659,12 +664,6 @@ A library usually provides a macro that expands into the declaration.
   conversion for a typed language, would need the checker to write types
   into expanded code before the pass, and queries for the types of
   imported definitions. Nothing planned before bootstrap needs this.
-- **Type identity at run time**: wasm treats identical type definitions as
-  the same type (5.1). A program type with the same shape as one of the
-  syntax library's (a struct of two immutable `eqref` fields, say) would
-  pass the library's type tests. Recursion groups can make types distinct
-  when this matters, and would also allow mutually recursive types, which
-  v0 lacks.
 - **More kinds of data**: bignums, floats and vectors as values are not in
   v0.
 
@@ -674,7 +673,8 @@ This describes `compiler/syntax.sub` and `stage0/marshal.sls` as they are.
 Macros must not depend on it; the compiler may, because it is part of the
 expander.
 
-- **Types** (each in its own recursion group):
+- **Types**, all in one recursion group, so that no type declared elsewhere
+  is the same wasm type unless it copies the whole group (5.2):
 
   | Type | Definition | Holds |
   |---|---|---|
