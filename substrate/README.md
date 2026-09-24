@@ -68,5 +68,8 @@ imports in the tests and examples.
 together: `struct` and `enum` define GC types and leave static
 information that `match` reads, checking patterns at compile time.
 `examples/shapes.sub` matches, in one module, types defined in another.
+`examples/effects.sub` passes an effect as a hidden argument, a spike for
+the effects rung built from `#%app`, `local-expand` and typed function
+references.
 
 Open questions are in `docs/spec.md` section 7.
