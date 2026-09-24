@@ -853,6 +853,7 @@
   (define (declare-type f phase)
     (let ([m (begin-type-member f phase)])
       (finish-type-member! m phase)
+      (identify-group! (list (type-member-info m)))
       (list 'plain (type-member-out m))))
 
   ;; (rec (type name def) ...): types that may refer to each other, one wasm
@@ -874,6 +875,7 @@
              [infos (map type-member-info members)])
         (for-each (lambda (m) (finish-type-member! m phase)) members)
         (for-each (lambda (info) (type-info-group-set! info infos)) infos)
+        (identify-group! infos)
         (list 'plain (apply out f 'rec (map type-member-out members))))))
 
   ;; A member of a rec group whose supertype is a later member.

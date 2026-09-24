@@ -33,7 +33,8 @@
           global-info-instance global-info-instance-set! global-info-export global-info-export-set!
           make-data-info data-info? data-info-name data-info-offset data-info-bytes
           make-type-info type-info? type-info-name type-info-kind type-info-fields type-info-fields-set!
-          type-info-super type-info-final? type-info-group type-info-group-set! func-type? func-info-type
+          type-info-super type-info-final? type-info-group type-info-group-set! type-info-identity
+          identify-group! same-type? func-type? func-info-type
           ref-type? make-ref ref-nullable? ref-heap abstract-heaps numeric-type?
           valtype<=? types<=? valtype-join valtype->string unpacked defaultable?
           fresh-key! reset-keys!)
@@ -57,9 +58,67 @@
   ;; storage is a value type, or i8 or i16. super: the declared supertype's
   ;; type-info, or #f. final?: whether other types may declare it as their
   ;; supertype. group: the type-infos of its recursion group in order, or
-  ;; #f if it is alone in one.
-  (define-record-type type-info (fields name kind (mutable fields) super final? (mutable group)))
+  ;; #f if it is alone in one. identity: the type it is, once its group is
+  ;; declared (identify-group!); two declarations of the same type share it.
+  (define-record-type type-info
+    (fields name kind (mutable fields) super final? (mutable group) (mutable identity))
+    (protocol (lambda (new)
+                (lambda (name kind fields super final? group) (new name kind fields super final? group #f)))))
 
+
+  ;; ---- type identity ----------------------------------------------------------
+
+  ;; A declared type is what wasm makes it (spec 5.1): its recursion group's
+  ;; structure and its place in the group. Names, including field names, are
+  ;; not part of it. A group's canonical form lists its members' kinds,
+  ;; finality, supertypes and field or signature types, with a reference to a
+  ;; member as (member i) and to another group's type as that type's
+  ;; identity. Identical forms get the same identities, so two declarations
+  ;; of one type, in any modules, are the same type.
+  (define-record-type type-identity (fields id index))
+
+  (define identity-count 0)
+  (define identities (make-hashtable equal-hash equal?))   ; form -> vector of type-identity
+
+  ;; Give the type-infos of a recursion group, in order, their identities.
+  (define (identify-group! members)
+    (let* ([form (map (lambda (t) (canonical-type t members)) members)]
+           [ids (or (hashtable-ref identities form #f)
+                    (let ([v (list->vector
+                              (map (lambda (i)
+                                     (set! identity-count (+ identity-count 1))
+                                     (make-type-identity identity-count i))
+                                   (iota (length members))))])
+                      (hashtable-set! identities form v)
+                      v))])
+      (for-each (lambda (t i) (type-info-identity-set! t (vector-ref ids i))) members (iota (length members)))))
+
+  (define (canonical-type t members)
+    (define (ref u)
+      (let ([tail (memq u members)])
+        (if tail
+            (list 'member (- (length members) (length tail)))
+            (let ([x (type-info-identity u)])
+              (unless x (error 'canonical-type "a type outside the group has no identity yet" (type-info-name u)))
+              (list 'type (type-identity-id x))))))
+    (define (valtype v)
+      (if (ref-type? v)
+          (list 'ref (ref-nullable? v) (let ([h (ref-heap v)]) (if (type-info? h) (ref h) h)))
+          v))
+    (define (storage s) (if (memq s '(i8 i16)) s (valtype s)))
+    (let ([fields (type-info-fields t)])
+      (list (type-info-kind t) (type-info-final? t)
+            (and (type-info-super t) (ref (type-info-super t)))
+            (case (type-info-kind t)
+              [(struct) (map (lambda (f) (list (storage (cadr f)) (caddr f))) fields)]
+              [(array) (list (storage (car fields)) (cadr fields))]
+              [(func) (list (map valtype (car fields)) (map valtype (cadr fields)))]))))
+
+  ;; Are a and b the same type?
+  (define (same-type? a b)
+    (or (eq? a b)
+        (let ([x (type-info-identity a)])
+          (and x (eq? x (type-info-identity b))))))
   ;; ---- value types ----------------------------------------------------------
 
   (define abstract-heaps '(any eq i31 struct array func extern none nofunc noextern))
@@ -70,12 +129,12 @@
   (define (ref-nullable? t) (cadr t))
   (define (ref-heap t) (caddr t))
 
-  ;; Declared types are compared by declaration: a declared type is a subtype
-  ;; only of itself, the supertypes it names, and the abstract types above
-  ;; them. Wasm compares declared types by structure, so two declarations of
-  ;; the same shape are one type to wasm and two types here (spec 5.3).
+  ;; A declared type is a subtype of itself, of the supertypes it names, and
+  ;; of the abstract types above them. Declared types are compared by
+  ;; identity: two declarations of the same type are one (spec 5.1).
   (define (heap<=? a b)
     (cond [(eq? a b) #t]
+          [(and (type-info? a) (type-info? b) (same-type? a b)) #t]
           [(eq? a 'none) (or (and (type-info? b) (not (func-type? b))) (memq b '(any eq i31 struct array)))]
           [(eq? a 'nofunc) (or (eq? b 'func) (and (type-info? b) (func-type? b)))]
           [(eq? a 'noextern) (eq? b 'extern)]

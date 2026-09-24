@@ -322,20 +322,27 @@ quotation and compile-time forms.
   `(ref null T)` is expected, a declared struct type fits `structref` and
   its declared supertypes, every struct, array and `i31ref` fits `eqref`,
   and so on.
-- **Declared types are compared by declaration.** Two `type` forms make two
-  types, even when they have the same fields, and a declared type fits
-  another only through the supertypes it names. Wasm compares declared
-  types by structure instead, and so do its run-time tests: `ref.test` and
-  `ref.cast` cannot tell apart two declarations of the same shape. A cast
-  can therefore give the checker a type the value was not declared with,
-  though never one of a different shape. Code that must tell same-shaped
-  values apart at run time stores the difference in the value, as
-  `lib/struct.sub` does with a brand per variant.
+- **Declared types are identified as wasm identifies them**: a type is its
+  recursion group's structure and its place in the group, that is, the
+  members' kinds, finality, supertypes, and field and signature types, in
+  order. Names, field names included, are not part of it. So two
+  declarations of the same structure are one type wherever they are, in two
+  modules or lifted by a macro, and the checker agrees with wasm's
+  run-time tests, `ref.test` and `ref.cast`. A type standing alone is a
+  group of one. Mutually recursive types are written in one `rec` group,
+  whose member order matters, as in wasm, so code that generates recursive
+  types, such as a type function, should declare each strongly connected
+  set of them as one group, in a canonical order. Code that must tell
+  values of the same structure apart stores the difference in the value,
+  as `lib/struct.sub` does with a brand per variant and the Lisp's records
+  with a descriptor.
 - **Type functions.** In a type position, a form whose head is a macro is
   expanded until it is not, so a compile-time function can compute a
   type: `(ref (tuple i32 3))`, as in Zig. Such a macro usually declares the
-  type with `lift-definition` and returns its name, remembering the name
-  so later uses in the module get the same type (`tests/fixtures/tuple.sub`).
+  type with `lift-definition` and returns its name. Uses in any module get
+  the same type, since the declarations have the same structure; the macro
+  can remember a name to declare the type once per module
+  (`tests/fixtures/tuple.sub`).
   Type positions are the types of parameters, results, globals, `let`
   bindings, fields and signatures, and the type immediates of GC
   instructions.
@@ -707,17 +714,6 @@ A library usually provides a macro that expands into the declaration.
 
 ## 7. Open questions and later milestones
 
-- **Type functions across modules**: a type function declares its type in
-  each module that uses it, and declared types are compared by
-  declaration (5.1), so `(tuple i32 3)` in two modules is two types to
-  the checker, though one to wasm, and a value cannot pass between the
-  modules at that type. Zig gives the same arguments the same type
-  everywhere, and dependent types, a rung after bootstrap, need that. One
-  way is to identify the types a type function declares by a hash of
-  their content. Done correctly, that hashes each strongly connected
-  component of the type graph as a unit, with a canonical order of its
-  members, which needs recursion groups, and it should agree with wasm's
-  own canonicalization of recursion groups.
 - **Inferred types in expanded code**: expanded code carries only the
   types the source wrote (6.4). A pass that creates wasm declarations from
   the code it rewrites, such as CPS for general effect handlers or closure
