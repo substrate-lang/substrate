@@ -89,7 +89,8 @@
     (fields module store (mutable chunk-counter) (mutable use-site-scopes)
             (mutable runtime-free-form) phase-forms memories tables (mutable provide-ids)
             (mutable require-names)            ; ((name . phase) . module)
-            (mutable passes)))                 ; ((function-info . form) ...), in order
+            (mutable passes)                   ; ((function-info . form) ...), in order
+            (mutable definition-keys)))        ; keys of its phase-0 definitions
 
   (define current #f)                      ; the comp being expanded
 
@@ -114,7 +115,7 @@
   (define (ensure-library!)
     (unless syntax-lib
       (let* ([m (make-unit library-path library-path "syntax" 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
-             [c (make-comp m #f 0 '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '())])
+             [c (make-comp m #f 0 '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '())])
         (with-comp c
           (lambda ()
             (parameterize ([current-syntax-infos #f])
@@ -228,7 +229,9 @@
     (let ([id (remove-scopes id (comp-use-site-scopes current))])
       (unless (and redefining? (redefine! id phase meaning))
         (check-unbound! id phase meaning)
-        (bind-module-level! (stx-e id) (stx-scopes id) phase meaning))))
+        (let ([key (bind-module-level! (stx-e id) (stx-scopes id) phase meaning)])
+          (when (eqv? phase 0)
+            (comp-definition-keys-set! current (cons key (comp-definition-keys current))))))))
 
   ;; Give this module's definition of id, if it has one in the namespace
   ;; of meaning, the new meaning. Returns #f if there is none.
@@ -418,7 +421,7 @@
          (let* ([name (fresh-unit-name path)]
                 [m (make-unit path source name 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
                 [c (make-comp m (new-cstore #t) 0 '() #f
-                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '())])
+                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '())])
            (hashtable-set! registry path m)
            (hashtable-set! modules-by-name name m)
            (with-comp c
@@ -450,6 +453,7 @@
   (define (finish-module! c)
     (let ([m (comp-module c)])
       (unit-expanded-set! m (apply-module-passes c (unit-expanded m)))
+      (removed-definitions (definitions-removed c (unit-expanded m)))
       (add-phase-forms! 0 (lower-forms (unit-expanded m) 0))
       ;; A provided name exports its binding in each namespace it has one.
       (unit-provides-set!
@@ -461,8 +465,10 @@
                                [found (filter values (list (type-meaning-of id 0) value))])
                           (when (null? found)
                             (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
+                          (for-each (lambda (meaning) (check-not-removed (cadr meaning) id)) found)
                           (map (lambda (meaning) (cons (stx-e id) meaning)) found)))
                       (reverse (comp-provide-ids c)))))
+      (removed-definitions #f)
       (let ([phases (list-sort < (let-values ([(ks vs) (hashtable-entries (comp-phase-forms c))])
                                    (let ([ps (vector->list ks)]) (if (memv 0 ps) ps (cons 0 ps)))))])
         (for-each (lambda (p)
@@ -1627,7 +1633,40 @@
   (define (func-info-of id phase)
     (let ([m (and (id? id) (meaning-of id phase))])
       (unless (and m (eq? (car m) 'func)) (not-expanded id))
+      (check-not-removed (cadr m) id)
       (cadr m)))
+
+  (define (lowered-data-info id phase)
+    (let ([info (data-info-of id phase)])
+      (check-not-removed info id)
+      info))
+
+  ;; While lowering a module's phase-0 code: the infos of its definitions
+  ;; that its module passes removed, which its code must not use.
+  (define removed-definitions (make-parameter #f))
+
+  (define (check-not-removed info id)
+    (let ([removed (removed-definitions)])
+      (when (and removed (hashtable-contains? removed info))
+        (raise-compile-error id "~a is used, but a module pass removed its definition" (stx-e id)))))
+
+  ;; The infos of c's phase-0 definitions (functions, imports, globals,
+  ;; data) that forms, its code after the module passes, no longer defines.
+  (define (definitions-removed c forms)
+    (let ([kept (make-eq-hashtable)] [removed (make-eq-hashtable)])
+      (for-each (lambda (f)
+                  (let ([parts (stx->list f)])
+                    (case (core-head f 0)
+                      [(func) (hashtable-set! kept (cadr (meaning-of (car (stx->list (cadr parts))) 0)) #t)]
+                      [(import global data) (hashtable-set! kept (cadr (meaning-of (cadr parts) 0)) #t)]
+                      [else (void)])))
+                forms)
+      (for-each (lambda (key)
+                  (let ([m (hashtable-ref meanings key #f)])
+                    (when (and m (memq (car m) '(func global data)) (not (hashtable-contains? kept (cadr m))))
+                      (hashtable-set! removed (cadr m) #t))))
+                (comp-definition-keys c))
+      removed))
 
   (define (local-key-of id phase)
     (let ([m (and (id? id) (meaning-of id phase))])
@@ -1642,7 +1681,7 @@
              (let ([m (meaning-of s phase)])
                (case (and m (car m))
                  [(local) (list 'lref (cadr m))]
-                 [(global) (list 'gref (cadr m))]
+                 [(global) (check-not-removed (cadr m) s) (list 'gref (cadr m))]
                  [else (not-expanded s)]))]
             [(pair? e)
              (let* ([parts (stx->list s)]
@@ -1665,13 +1704,13 @@
        (case name
          [(quote) (list 'quote (stx->datum (cadr parts)))]
          [(quote-syntax) (list 'quote (cadr parts))]
-         [(data-address) (list 'const 'i32 (data-info-offset (data-info-of (cadr parts) phase)))]
-         [(data-size) (list 'const 'i32 (bytevector-length (data-info-bytes (data-info-of (cadr parts) phase))))]
+         [(data-address) (list 'const 'i32 (data-info-offset (lowered-data-info (cadr parts) phase)))]
+         [(data-size) (list 'const 'i32 (bytevector-length (data-info-bytes (lowered-data-info (cadr parts) phase))))]
          [(set!)
           (let ([m (meaning-of (cadr parts) phase)])
             (case (and m (car m))
               [(local) (list 'lset (cadr m) (lo (caddr parts)))]
-              [(global) (list 'gset (cadr m) (lo (caddr parts)))]
+              [(global) (check-not-removed (cadr m) (cadr parts)) (list 'gset (cadr m) (lo (caddr parts)))]
               [else (not-expanded s)]))]
          [(let)
           (list 'let

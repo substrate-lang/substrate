@@ -586,6 +586,8 @@ A library usually provides a macro that expands into the declaration.
   any code, so a pass's mistakes are compile errors. A definition it
   returns with the same name and scopes as one of the module's replaces
   that definition, so a pass can change a function's body or signature.
+  A definition it leaves out is removed, and code that still uses it, or
+  a `provide` of it, is an error.
   It may return only `func`, `global`, `import`, `type` and `data` forms
   and expressions.
 - A pass has an introduction scope, as a macro use does (6.2): flipped on
