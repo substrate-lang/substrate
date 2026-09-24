@@ -267,14 +267,13 @@ depends on.
 |---|---|---|
 | `write` | `(fd ptr len) -> i32` | write bytes to fd 1 or 2; returns `len` |
 | `trap` | `(ptr len) -> ()` | abort with the UTF-8 message at `ptr` |
-| `instantiate` | `(name name-len bytes bytes-len) -> i32` | compile and instantiate the wasm module in `bytes`, link its imports by name, and register it as `name`. 0 on success. |
+| `instantiate` | `(name name-len bytes bytes-len shift) -> i32` | compile and instantiate the wasm module in `bytes`, link its imports by name, and register it as `name`. At `shift` > 0, each import from a part `<module>@<phase>+<t>` links to `<module>@<phase>+<t + shift>` instead (3.2). 0 on success. |
 | `export_index` | `(inst inst-len field field-len) -> i32` | append the function `inst.field` to the caller's table (exported as `"table"`) and return its index, or -1 |
 | `error_message` | `(buf cap) -> i32` | copy the last `instantiate` error into `buf`; returns its length |
 
 `instantiate` is **the hook**: wasm cannot make new code executable by
 itself, and this is how it does. The self-hosted compiler will use it the
-way stage0 uses the equivalent C functions; the embedder API also has a
-variant that instantiates a part at a shift (3.2). An instantiated module can reach
+way stage0 uses the equivalent C functions. An instantiated module can reach
 exactly what its imports name, so compile-time code runs sandboxed.
 [v0: all five, tested from kernel code in `tests/hook.sub`.]
 

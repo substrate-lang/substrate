@@ -267,6 +267,8 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   sub_host *h = env;
   uint32_t np = (uint32_t)args[0].of.i32, nl = (uint32_t)args[1].of.i32;
   uint32_t bp = (uint32_t)args[2].of.i32, bl = (uint32_t)args[3].of.i32;
+  int32_t shift = args[4].of.i32;
+  if (shift < 0) return trap_msg("host.instantiate: negative shift");
   wasmtime_memory_t mem;
   if (!caller_memory(caller, &mem)) return trap_msg("host.instantiate: caller exports no memory");
   wasmtime_context_t *cctx = wasmtime_caller_context(caller);
@@ -280,7 +282,9 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   uint8_t *copy = malloc(bl ? bl : 1);
   memcpy(copy, bytes, bl);
   ENTER(h, caller);
-  int rc = instantiate(h, name_copy, nl, copy, bl);
+  /* At a shift, part names in the module's imports are shifted (spec 3.2). */
+  int rc = shift == 0 ? instantiate(h, name_copy, nl, copy, bl)
+                      : sub_instantiate_shifted(h, name_copy, copy, bl, shift);
   LEAVE(h);
   free(copy);
   free(name_copy);
@@ -410,7 +414,7 @@ sub_host *sub_host_new(void) {
   h->linker = wasmtime_linker_new(h->engine);
   if (define(h, "host", "write", 3, 1, host_write, h) ||
       define(h, "host", "trap", 2, 0, host_trap, h) ||
-      define(h, "host", "instantiate", 4, 1, host_instantiate, h) ||
+      define(h, "host", "instantiate", 5, 1, host_instantiate, h) ||
       define(h, "host", "export_index", 4, 1, host_export_index, h) ||
       define(h, "host", "error_message", 2, 1, host_error_message, h) ||
       define(h, "expander", "syntax-local-value", 1, 1, expander_call, (void *)&op_codes[0]) ||
