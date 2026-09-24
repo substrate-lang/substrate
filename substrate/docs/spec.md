@@ -18,7 +18,7 @@ specified but not built yet.
    model and no runtime of its own.
 2. **Pay as you go.** Compiled code contains only what its code uses. A
    module can declare that it needs nothing beyond the host at run time,
-   and the compiler checks the declaration after expansion (3.3).
+   and the compiler checks the declaration after expansion (3.4).
 3. **Phases are uniform.** The language is the same at every phase. Code
    requires the libraries it uses, at the phase that uses them, and each
    phase gets its own instances.
@@ -36,22 +36,22 @@ specified but not built yet.
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime) |
 | compiler | Reader, expander, kernel compiler, binary encoder. | stage0: `stage0/*.sls` (Chez Scheme) |
 | syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `stage0/syntax.sub` (kernel code) |
-| libraries | Ordinary kernel code: printing, `define-macro`. Included by source until modules exist. | `lib/*.sub` |
+| libraries | Ordinary modules: printing, `define-macro`. | `lib/*.sub` |
 | languages | Later libraries built on the kernel: structs, effects, a dynamic Lisp, ... | not yet |
 
 ### 1.3 What runs where
 
 | | While compiling | While a program runs |
 |---|---|---|
-| the syntax library | always instantiated in the compile-time store; macros link to it | instantiated only if the program requires it |
+| the syntax library | always instantiated in each compile-time store; macros link to it | instantiated only if the program's parts import it |
 | GC | syntax data lives in the engine's GC heap | only if the program's code uses GC types or the syntax library |
 | each module's memory and table | its own, if it defines them | its own, if it defines them |
 | the host | no memory of its own; reads and writes the caller's | same |
 
-A **store** is one wasm store with one linker. The **compile-time store**
-lives for one compiler run and holds the syntax library and every module
-instantiated to run phase ≥ 1 code. A **run-time store** holds a program's
-modules and whatever they import.
+A **store** is one wasm store with one linker. Each module is compiled
+with its own **compile-time store**, which holds the syntax library, the
+module's chunks and the parts of what it requires (3.2). A **run-time
+store** holds the parts a program loads.
 
 The compile-time environment is garbage collected: syntax objects are GC
 objects. A compiled program is garbage collected only if its own code uses
@@ -108,62 +108,90 @@ imported from the instance `"syntax"`. Parameters are `eqref` unless marked
 The queries only work while an expander is running. [v0] Stage0 answers
 them in Chez; in a run-time store they trap.
 
-## 3. Units of compilation and linking
+## 3. Modules, parts and linking
 
-### 3.1 Modules, phases and chunks
+### 3.1 Modules and parts
 
-- One source file is one module. The code of a module at one phase compiles
-  to one wasm module. Phase 0 is the program. Phase *n*+1 code runs while
-  phase *n* is expanded.
+- One source file is one module. A module's code at one phase compiles to
+  one wasm module, called a **part**. Phase 0 is the program. Phase *n*+1
+  code runs while phase *n* is expanded, so a module's phase-1 part holds
+  its transformers, its `define-static` values and its `begin-for-syntax`
+  code.
+- `(provide id ...)` names the phase-0 bindings other modules get:
+  functions, globals, macros, static values, types and data.
+- `(require spec ...)` makes another module's provided bindings available.
+  A spec is `"path"` (relative to the requiring file), `syntax` (the syntax
+  library, section 2), or `(for-syntax spec ...)` (one phase up). A module
+  required at phase *p* is **shifted** by *p*: its phase *q* is phase
+  *p* + *q* in the requiring module. Requiring is idempotent, and cycles are
+  an error.
 - Expansion must run phase-1 code before the module is finished: a macro
-  works on the line after its definition. So phase ≥ 1 code is compiled and
-  instantiated in **chunks**, in source order: one per `begin-for-syntax`
-  form, and one per `define-static` or `define-syntax`. A chunk may use the
-  functions and globals of earlier chunks.
-- [v0] Only the phase-0 module is written out. Writing out phase-1 modules,
-  for use by other modules, is **[planned]** with `require` of modules.
+  works on the line after its definition. So while a module is expanded,
+  its phase ≥ 1 code is also compiled and instantiated in **chunks**, one
+  per `begin-for-syntax` or `define-static`, in source order. When the
+  module is done, each phase's code is compiled again as a whole, into the
+  part. Other modules only ever use the parts.
 
-### 3.2 Linking
+### 3.2 Stores and instance names
 
-- Every instance in a store is registered under a unique name: `syntax`,
-  the program's `main`, and chunks named `<module>@<phase>#<n>`. Modules
-  import from each other by those names.
+- Each module is compiled with a fresh compile-time store. The module's
+  own chunks, and the parts of the modules it requires, are instantiated
+  there on demand. So no compile-time state is shared between the
+  compilations of two modules, as in Racket.
+- A part instantiated at shift *t* is registered as `<module>@<phase>+<t>`.
+  A compiled part imports from other parts by names relative to its own
+  module at shift 0. The host adds the shift when it instantiates the part
+  (section 4), so one compiled part serves at any phase.
+- A program runs in a fresh run-time store holding exactly the parts
+  reached from its phase-0 part at shift 0. A module required only
+  `for-syntax` is never loaded at run time.
+- The other instance names are `syntax`, `host`, `expander`, chunks
+  (`<module>@<phase>#<n>`) and per-store entry chunks (`entry#<n>`).
+
+### 3.3 Linking
+
 - **A module imports only what its code uses.** Nothing is bound or
-  imported by default. Code that requires the syntax library and calls it,
-  or that uses `quote`, `quasiquote`, `quote-syntax` or `quasisyntax`,
-  imports from `"syntax"`.
-- **A module owns its memory and table.** Code that uses memory
-  instructions or data segments needs a `(memory ...)` in its module, and
-  code that uses `func-index` or `call-indirect` needs a `(table ...)`.
-  Importing a memory or table from another module is **[planned]** with
-  modules.
-- A module exports its memory as `"memory"` and its table as `"table"`
-  (the host relies on this, section 4), and every module-level function and
+  imported by default. Code that calls a required module's functions
+  imports from that module's part. Code that calls the syntax library, or
+  uses `quote`, `quasiquote`, `quote-syntax` or `quasisyntax`, imports from
+  `"syntax"`.
+- **A module owns its memory and table, or takes them from a module it
+  requires.** `(memory pages)` defines memory 0. `(memory from "path")`
+  imports the memory of that module's part at the same phase, so a
+  program's modules can share one memory. Tables likewise. Code that uses
+  memory instructions or data segments needs a memory, and code that uses
+  `func-index` or `call-indirect` needs a table. [v0] At phase ≥ 1 only the
+  `from` form is supported.
+- A part exports its memory as `"memory"` and its table as `"table"` (the
+  host relies on this, section 4), and every module-level function and
   global under its name. If two bindings share a name, the compiler appends
   `.<n>` to later ones.
 
-### 3.3 Runtime-free modules
+### 3.4 Runtime-free modules
 
-`(runtime-free)` declares that the module needs nothing beyond the host at
-run time. After expansion, the compiler checks that the phase-0 module
-imports only from `"host"` and uses no GC types. The check runs after
-expansion because macros can add dependencies the program never wrote.
+`(runtime-free)` declares that the program needs nothing beyond the host at
+run time. After expansion, the compiler checks every part the program would
+load: each may import only from the host and from the program's other
+parts, and none may use GC types. The check runs after expansion because
+macros can add dependencies the program never wrote.
 
-### 3.4 Initialization
+### 3.5 Initialization
 
 Globals whose initializer is a numeric literal get it as their wasm
-constant initializer, and reference globals start as null. Then the
-module's start function runs:
+constant initializer, and reference globals start as null. Then the part's
+start function runs:
 
-1. For each function whose table index the module takes (`func-index`),
-   append it to the module's table and keep the index in a global. Build
-   each quoted constant with the syntax library's functions and keep it in
-   a global. These happen in the order the compiler meets them.
+1. For each function whose table index the part takes (`func-index`),
+   append it to the table and keep the index in a global. Build each quoted
+   constant with the syntax library's functions and keep it in a global.
+   These happen in the order the compiler meets them.
 2. The remaining global initializers and module-level expressions, in
    source order.
 
 Quoted fixnums and `#f` need no global: they are the constant expressions
-`(ref.i31 n)` and `(ref.null eq)`.
+`(ref.i31 n)` and `(ref.null eq)`. A phase-1 part's module-level
+expressions run each time the part is instantiated, which is once per
+compilation that needs it.
 
 ## 4. Host interface
 
@@ -183,7 +211,8 @@ depends on.
 
 `instantiate` is **the hook**: wasm cannot make new code executable by
 itself, and this is how it does. The self-hosted compiler will use it the
-way stage0 uses the equivalent C function. An instantiated module can reach
+way stage0 uses the equivalent C functions; the embedder API also has a
+variant that instantiates a part at a shift (3.2). An instantiated module can reach
 exactly what its imports name, so compile-time code runs sandboxed.
 [v0: all five, tested from kernel code in `tests/hook.sub`.]
 
@@ -211,28 +240,28 @@ quotation and compile-time forms.
 (func (name [param type] ...) [-> result] body ...)
 (global name type init)             ; numeric or nullable reference type
 (import name "module" "field" (type ... -> type ...))
-(memory pages)
-(table size)
+(memory pages)  (memory from "path")
+(table size)  (table from "path")
 (data name offset "bytes" ...)      ; active segment at offset in memory
 (type name (struct (field fname ftype) ...))   ; ftype: storage or (mut storage)
 (type name (array ftype))                      ; storage: a type, i8 or i16
-(require syntax)                    ; bind the syntax library at this phase
-(runtime-free)                      ; see 3.3
+(require spec ...)                  ; spec: "path", syntax, (for-syntax spec ...)
+(provide id ...)                    ; phase 0 only
+(runtime-free)                      ; see 3.4
 (define-syntax name transformer)    ; transformer: a phase+1 function (2.1)
 (define-static name expr)           ; expr is phase+1 code, run now
 (begin-for-syntax form ...)         ; forms at phase+1
 (begin form ...)                    ; spliced
-(include "path")                    ; temporary, until modules exist
 expr                                ; runs at instantiation
 ```
 
 A module body is expanded in two passes, as in Racket. The first pass
 expands macro uses at the head of each form, registers definitions, runs
-`define-static` and `begin-for-syntax` at once, and splices `begin` and
-`include`. The second pass expands function bodies and expressions. So
+`define-static` and `begin-for-syntax` at once, processes `require`, and
+splices `begin`. The second pass expands function bodies and expressions. So
 functions may be mutually recursive, and a macro must be defined before it
-is used. A transformer must come from an earlier `begin-for-syntax`. A
-declared type may refer to itself.
+is used. A transformer must come from an earlier `begin-for-syntax` or a
+module required `for-syntax`. A declared type may refer to itself.
 
 ### 5.3 Expressions
 
@@ -322,8 +351,21 @@ error.
 - Core bindings have the scope set `{0}`, which every module body carries.
   A module's own definitions have more scopes, so they shadow core names.
 - A module-level definition of a name that is already defined with the same
-  scope set at the same phase is an error.
-- [v0] Bindings are recorded per phase. Scope sets are not yet per phase.
+  scope set at the same phase is an error. So is a reference whose best
+  candidates have identical scope sets but different meanings.
+- **Bindings outlive a module's compilation.** The binding table and scope
+  ids last for the whole compiler run. A macro's template identifiers carry
+  its module's scopes, so they keep resolving to its module's bindings,
+  including ones it does not provide, when another module expands them.
+- **Phases.** Bindings are recorded per phase, and a syntax object has one
+  scope set. A module required at shift *s* ≠ 0 has its bindings installed
+  at their phase + *s*, with its module scope replaced by a copy for that
+  shift. The syntax literals its parts build when instantiated at shift *s*
+  carry the same copy. So a module required at two shifts, which has
+  bindings from both at the same phase (a macro `m` shifted up, next to the
+  phase-1 function behind `m`), keeps them apart. This is Racket's
+  per-phase module scopes, applied eagerly per shift; v0 shifts only module
+  scopes.
 
 ### 6.2 Hygiene
 
@@ -353,9 +395,12 @@ identifier with the scopes of the use, as if the user had written it.
 ### 6.3 Compile-time bindings
 
 - `(define-syntax m f)`: `m` is a macro whose transformer is the phase+1
-  function `f`, of type `(eqref) -> eqref`.
+  function `f`, of type `(eqref) -> eqref`. `f` may come from a module
+  required `for-syntax`.
 - `(define-static s expr)`: `expr` is compiled and run at phase+1 now, and
-  `s` is bound to its value, an `eqref`. Using `s` as an expression is an
+  `s` is bound to its value, an `eqref`. The value lives in a global of the
+  phase+1 part, so another module that requires this one computes it again
+  in its own compile-time store. Using `s` as an expression is an
   error, but macros read the value with `syntax-local-value`. This is how
   extensions share information, for example a struct form and a match form.
 
@@ -365,10 +410,15 @@ self-hosted expander will hold references directly and need no copy.
 
 ## 7. Open questions and later milestones
 
-- **Modules and phases**: `require` of modules, `for-syntax` imports,
-  writing out phase-1 modules, per-phase scope sets as in Racket, scope ids
-  that survive separate compilation, and importing a memory or table from
-  another module. Modules replace `include`.
+- **Reusing compiled modules across runs**: v0 compiles every required
+  module in each run, and a compiled part is valid only in the run that
+  produced it. Reuse needs a module's binding table written out with its
+  parts, and scope ids relative to the module.
+- **Per-phase scope sets in full**: v0 shifts only module scopes (6.1).
+- **Memory and table definitions at phase ≥ 1**: v0 supports only
+  `(memory from "path")` there.
+- **More require forms**: renaming, prefixes, `for-meta`, requiring only
+  some names.
 - **Extension points**: `#%app`, `#%module-begin`, `local-expand`, syntax
   properties (the `props` field is always `()` in v0), lifting definitions
   out of expressions.
@@ -413,6 +463,10 @@ expander.
   it names objects by `i32` handles, indexes into the library's handle
   table (handle 0 is `#f`). The `%h-` functions build and take apart
   objects through handles. Handles made while a macro runs are released
-  when it returns. Each `define-syntax` and `define-static` compiles a small
-  entry chunk that converts between handles and references. After
-  bootstrap this section goes away.
+  when it returns. Each store gets a small entry chunk per transformer and
+  per static value it uses, which converts between handles and references.
+  After bootstrap this section goes away.
+- **Shifted literals**: `%set-scope-shift` tells `%make-syntax` to replace
+  one scope id with another. Stage0 sets it around the instantiation of a
+  part at shift *s* ≠ 0, mapping the module's scope to its copy for *s*
+  (6.1), and clears it after.

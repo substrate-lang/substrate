@@ -18,10 +18,10 @@ the host interface.
 - `stage0/`: the stage0 compiler in Chez Scheme (reader, expander,
   compiler, wasm encoder, FFI), plus `syntax.sub`, the syntax library:
   syntax objects as wasm GC objects, and the functions macros call.
-- `lib/`: ordinary kernel libraries (printing, `define-macro`), included by
-  source until modules exist.
+- `lib/`: ordinary modules: printing, `write-datum`, `define-macro`.
 - `tests/`: `.sub` programs, with `.out` (expected output) or `.err`
-  (expected error) files, and `.links` (what the compiled module may import).
+  (expected error) files, and `.links` (what the compiled phase-0 part may
+  import). `tests/modules/` holds modules the tests require.
 
 ## Use
 
@@ -32,7 +32,7 @@ nix develop
 make check                      # build the host library, run the tests
 bin/subc run tests/macros.sub   # compile and run a program's main
 bin/subc expand FILE            # print fully expanded kernel forms
-bin/subc compile FILE -o OUT    # write the phase-0 wasm module
+bin/subc compile FILE -o OUT    # write FILE's parts (phase 0 to OUT)
 bin/subc syntax-library -o build/syntax.wasm      # write the syntax library
 wasm-tools print OUT            # inspect a module
 ```
@@ -45,8 +45,11 @@ transformer is a phase-1 function over GC syntax objects, compiled and
 instantiated in the compile-time store and called by the expander.
 `define-static`, `syntax-local-value`, `syntax-error` and
 `free-identifier=?` work too, and macros are hygienic (introduction and
-use-site scopes, spec 6.2). Compiled programs import only what they use:
+use-site scopes, spec 6.2). Modules `require` and `provide`, at any phase:
+each phase of a module compiles to its own wasm part, and a program loads
+only the parts it reaches at run time (spec 3). Compiled programs import
+only what they use:
 `(runtime-free)` is checked by the compiler, and `tests/*.links` checks
 imports in the tests.
 
-Next: modules and phases. See `docs/spec.md` section 7.
+Open questions are in `docs/spec.md` section 7.

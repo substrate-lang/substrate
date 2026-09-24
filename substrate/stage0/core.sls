@@ -5,6 +5,7 @@
 ;;  module forms:
 ;;    (func info ((key . type) ...) body)   (global info init-or-#f)
 ;;    (memory pages)   (table size)   (data dinfo)   (type tinfo)   (expr e)
+;;    (memory-import instance)   (table-import instance)
 ;;  expressions:
 ;;    (int n) (float x) (const type n)
 ;;    (lref key) (lset key e) (gref ginfo) (gset ginfo e)

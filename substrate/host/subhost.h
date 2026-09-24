@@ -40,6 +40,11 @@ const char *sub_last_error(sub_host *h);
  * it under `name`. */
 int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t len);
 
+/* Like sub_instantiate, for a module part compiled at shift 0 and
+ * instantiated at `shift`: imports from "<module>@<phase>+<t>" resolve to
+ * "<module>@<phase>+<t + shift>" (spec 3.2). */
+int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes, size_t len, int32_t shift);
+
 /* Call inst.fn with up to 6 i32 arguments. A single i32 result is left in
  * sub_result. */
 int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,

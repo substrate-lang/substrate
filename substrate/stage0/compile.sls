@@ -4,8 +4,8 @@
 ;; records instead of indices; a final pass assigns indices once every
 ;; import, type and synthesized global is known.
 ;;
-;; A module imports only what its code uses (spec 3.2). It owns its memory
-;; and table: code that needs one must define it.
+;; A module imports only what its code uses (spec 3.3). Code that needs a
+;; memory or table must be given one: defined, or imported from a module.
 (library (stage0 compile)
   (export compile-module current-syntax-infos fixnum-min fixnum-max string-type)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 wasm))
@@ -496,8 +496,11 @@
     (define global-forms (filter (lambda (f) (eq? (car f) 'global)) forms))
     (define data-forms (filter (lambda (f) (eq? (car f) 'data)) forms))
     (define type-forms (filter (lambda (f) (eq? (car f) 'type)) forms))
-    (define memory-form (find (lambda (f) (eq? (car f) 'memory)) forms))
-    (define table-form (find (lambda (f) (eq? (car f) 'table)) forms))
+    ;; (memory pages) defines memory 0; (memory-import instance) imports the
+    ;; memory another instance exports. Tables likewise.
+    (define memory-form (find (lambda (f) (memq (car f) '(memory memory-import))) forms))
+    (define table-form (find (lambda (f) (memq (car f) '(table table-import))) forms))
+    (define (imported? form) (and form (memq (car form) '(memory-import table-import))))
     (define exported (make-hashtable string-hash string=?))
 
     (define (export-name! name)
@@ -661,7 +664,9 @@
                func-imports)
        (map-lr (lambda (g) (list (global-info-instance g) (global-info-export g) 'global
                                  (list (rv (global-info-type g)) #t)))
-               global-imports)))
+               global-imports)
+       (if (imported? memory-form) (list (list (cadr memory-form) "memory" 'memory '(0 #f))) '())
+       (if (imported? table-form) (list (list (cadr table-form) "table" 'table '(0 #f))) '())))
 
     (define wfuncs
       (append
@@ -723,8 +728,8 @@
       (encode-module
        (make-wmodule (append gc-type-entries func-types) imports
                      (map-lr (lambda (f) (list (car f) (cadr f) (caddr f) (cadddr f))) wfuncs)
-                     (if table-form (list (list (cadr table-form) #f)) '())
-                     (if memory-form (list (list (cadr memory-form) #f)) '())
+                     (if (and table-form (not (imported? table-form))) (list (list (cadr table-form) #f)) '())
+                     (if (and memory-form (not (imported? memory-form))) (list (list (cadr memory-form) #f)) '())
                      wglobals exports
                      (and has-start? start-index)
                      (reverse declared)

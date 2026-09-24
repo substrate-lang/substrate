@@ -118,6 +118,74 @@ int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t 
   return rc;
 }
 
+/* A module part's instance name is "<module>@<phase>+<shift>" (spec 3.2).
+ * Compiled parts import from other parts by names relative to their own
+ * module at shift 0; instantiating at shift s adds s to each such name.
+ * Writes the mapped name to out; other names are copied unchanged. */
+static void shift_name(const char *name, size_t len, int32_t shift, char *out, size_t cap) {
+  size_t plus = len;
+  for (size_t i = len; i > 0; i--)
+    if (name[i - 1] == '+') { plus = i - 1; break; }
+  bool part = plus < len && memchr(name, '@', plus) != NULL && plus + 1 < len;
+  for (size_t i = plus + 1; part && i < len; i++)
+    if (name[i] < '0' || name[i] > '9') part = false;
+  if (!part || shift == 0) {
+    snprintf(out, cap, "%.*s", (int)len, name);
+    return;
+  }
+  /* Parse the digits within len: an import name is not NUL-terminated. */
+  long t = 0;
+  for (size_t i = plus + 1; i < len; i++) t = t * 10 + (name[i] - '0');
+  snprintf(out, cap, "%.*s+%ld", (int)plus, name, t + shift);
+}
+
+int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes, size_t len, int32_t shift) {
+  char *name_copy = strdup(name);
+  uint8_t *copy = malloc(len ? len : 1);
+  memcpy(copy, bytes, len);
+  int rc = 1;
+  wasmtime_module_t *module = NULL;
+  wasm_importtype_vec_t imports = {0};
+  wasmtime_extern_t *externs = NULL;
+  wasmtime_error_t *error = wasmtime_module_new(h->engine, copy, len, &module);
+  if (error) {
+    take_failure(h, "compile", error, NULL);
+    goto done;
+  }
+  wasmtime_module_imports(module, &imports);
+  externs = calloc(imports.size ? imports.size : 1, sizeof *externs);
+  for (size_t i = 0; i < imports.size; i++) {
+    const wasm_name_t *mod = wasm_importtype_module(imports.data[i]);
+    const wasm_name_t *field = wasm_importtype_name(imports.data[i]);
+    char mapped[512];
+    shift_name(mod->data, mod->size, shift, mapped, sizeof mapped);
+    if (!wasmtime_linker_get(h->linker, h->ctx, mapped, strlen(mapped), field->data, field->size, &externs[i])) {
+      set_err(h, "instantiate %s: no import %s.%.*s", name_copy, mapped, (int)field->size, field->data);
+      goto done;
+    }
+  }
+  wasmtime_instance_t inst;
+  wasm_trap_t *trap = NULL;
+  error = wasmtime_instance_new(h->ctx, module, externs, imports.size, &inst, &trap);
+  if (error || trap) {
+    take_failure(h, "instantiate", error, trap);
+    goto done;
+  }
+  error = wasmtime_linker_define_instance(h->linker, h->ctx, name_copy, strlen(name_copy), &inst);
+  if (error) {
+    take_failure(h, "register", error, NULL);
+    goto done;
+  }
+  rc = 0;
+done:
+  free(externs);
+  wasm_importtype_vec_delete(&imports);
+  if (module) wasmtime_module_delete(module);
+  free(copy);
+  free(name_copy);
+  return rc;
+}
+
 /* ---- calls ------------------------------------------------------------ */
 
 int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,

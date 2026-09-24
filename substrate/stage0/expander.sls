@@ -1,22 +1,16 @@
 ;; Expander: syntax objects -> fully expanded kernel forms (core.sls).
 ;;
-;; Binding is by sets of scopes (spec 6.1). Phase >= 1 code is compiled
-;; into chunks and run in the compile-time store as expansion goes
-;; (spec 3.1). A macro is a phase-1 function from syntax to syntax
-;; (spec 2.1). Syntax objects are GC objects of the syntax library
+;; Binding is by sets of scopes (spec 6.1). A module is a file; each of its
+;; phases compiles to one wasm module, a part (spec 3.1). While a module is
+;; expanded, its phase >= 1 code is compiled into chunks and run in that
+;; module's compile-time store. A macro is a phase-1 function from syntax to
+;; syntax (spec 2.1). Syntax objects are GC objects of the syntax library
 ;; (stage0/syntax.sub), which every compile-time store instantiates.
 (library (stage0 expander)
-  (export make-session session-library-bytes session-store compile-source expand-source
-          strip-ast)
+  (export set-syntax-library-path! compile-module-file run-module module-part-list module-expanded-forms
+          syntax-library-bytes strip-ast)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 compile)
           (stage0 host) (stage0 marshal) (stage0 reader))
-
-  ;; ==== sessions ==============================================================
-  ;;
-  ;; A session is one compile-time store with the syntax library
-  ;; instantiated in it, plus the library's functions by name.
-
-  (define-record-type (session new-session session?) (fields store library-bytes infos))
 
   (define gc-forms
     '(struct.new struct.get struct.get_s struct.get_u struct.set
@@ -27,88 +21,149 @@
   (define core-forms
     (append
      '(func global import memory table data type define-syntax define-static begin-for-syntax
-       begin include require runtime-free set! let let* if block loop br br-if return
+       begin require provide runtime-free set! let let* if block loop br br-if return
        call-indirect func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
      gc-forms))
 
   (define eqref (make-ref #t 'eq))
 
-  ;; library-path: the kernel source of the syntax library. Compiles it,
-  ;; starts a compile-time store and instantiates the library there.
-  (define (make-session library-path)
-    (let* ([h (host-new)]
-           [st (make-store h)])
-      (host-set-callback! h expander-callback)
-      (let-values ([(forms infos) (parameterize ([current-syntax-infos #f])
-                                    (expand-module (read-file library-path) 'syntax st))])
-        (let-values ([(bytes imports gc?) (parameterize ([current-syntax-infos #f])
-                                            (compile-module forms "syntax"))])
-          (let ([table (make-eq-hashtable)])
-            (for-each (lambda (info) (hashtable-set! table (func-info-name info) info)) infos)
-            (host-instantiate! h "syntax" bytes)
-            (new-session st bytes table))))))
-
-  ;; Expand and compile one source file. Returns the phase-0 module bytes and
-  ;; the instance names it imports from.
-  (define (compile-source sess path)
-    (parameterize ([current-syntax-infos (session-infos sess)])
-      (let-values ([(forms _) (expand-module (read-file path) (module-name path) (session-store sess))])
-        (let-values ([(bytes imports gc?) (compile-module forms "main")])
-          (when runtime-free-form
-            (let ([extra (filter (lambda (i) (not (equal? i "host"))) imports)])
-              (unless (and (null? extra) (not gc?))
-                (raise-compile-error runtime-free-form
-                                     "this module is declared runtime-free, but after expansion it ~a"
-                                     (cond [(pair? extra) (format "imports from ~a" extra)]
-                                           [else "uses GC objects"])))))
-          (values bytes imports)))))
-
-  (define (expand-source sess path)
-    (parameterize ([current-syntax-infos (session-infos sess)])
-      (let-values ([(forms _) (expand-module (read-file path) (module-name path) (session-store sess))])
-        forms)))
-
-  (define (module-name path)
-    (let* ([base (let loop ([cs (reverse (string->list path))] [acc '()])
-                   (if (or (null? cs) (char=? (car cs) #\/)) (list->string acc) (loop (cdr cs) (cons (car cs) acc))))]
-           [dot (let loop ([i (- (string-length base) 1)])
-                  (cond [(< i 0) #f] [(char=? (string-ref base i) #\.) i] [else (loop (- i 1))]))])
-      (string->symbol (if dot (substring base 0 dot) base))))
-
-  ;; ==== per-module expansion state =============================================
+  ;; ==== the run ===================================================================
+  ;;
+  ;; Everything below is shared by all modules compiled in one run of the
+  ;; compiler: the binding table, scope ids, and compiled modules. A macro's
+  ;; template identifiers keep resolving to its own module's bindings when
+  ;; another module expands it, because those bindings stay in the table.
 
   (define bindings (make-eq-hashtable))    ; symbol -> list of binding
   (define meanings (make-eqv-hashtable))   ; key -> meaning
   (define scope-counter 0)
-  (define chunk-counter 0)
-  (define current-module 'main)
-  (define current-store #f)
-  (define syntax-phases '())               ; phases where (require syntax) appeared
-  (define use-site-scopes '())             ; use-site scopes made in this module (spec 6.2)
-  (define runtime-free-form #f)            ; the (runtime-free) form, if any
+  (define base-installed? #f)
+  (define registry (make-hashtable string-hash string=?))        ; absolute path -> module
+  (define modules-by-name (make-hashtable string-hash string=?)) ; instance name stem -> module
+  (define installed (make-hashtable string-hash string=?))       ; "path|shift" -> #t
 
   ;; phase: an integer, or 'all
   (define-record-type binding (fields scopes phase key))
 
   ;; meaning: (core name) (prim name) (func info) (global info) (data info)
-  ;;          (type info) (local key) (label key) (macro chunk) (static handle)
+  ;;          (type info) (local key) (label key) (macro transformer-info)
+  ;;          (static getter-info)
 
-  (define (reset-state! module st)
-    (set! bindings (make-eq-hashtable))
-    (set! meanings (make-eqv-hashtable))
-    (set! scope-counter 0)
-    (set! chunk-counter 0)
-    (set! current-module module)
-    (set! current-store st)
-    (set! syntax-phases '())
-    (set! use-site-scopes '())
-    (set! runtime-free-form #f)
-    (reset-keys!))
+  ;; A compiled (or compiling) module. parts: phase -> part. requires: list
+  ;; of (module . shift). provides: list of (symbol . meaning). entries: its
+  ;; module-level bindings, as (symbol scopes phase key). scope: its module
+  ;; scope.
+  (define-record-type unit
+    (fields path source name (mutable state) parts (mutable requires) (mutable provides)
+            (mutable entries) (mutable expanded) (mutable scope)))
+
+  ;; One phase of a module, compiled: bytes, the instance names it imports
+  ;; from (relative to the module at shift 0), and whether it uses GC.
+  (define-record-type part (fields bytes imports gc?))
+
+  ;; One wasm store: a compile-time store (one per module compilation) or a
+  ;; run-time store. instances: names instantiated in it. wrappers and
+  ;; statics: per-store entry chunks and static-value handles.
+  (define-record-type cstore
+    (fields host marshal instances wrappers statics (mutable counter)))
+
+  ;; The state of one module's compilation.
+  (define-record-type comp
+    (fields module store (mutable chunk-counter) (mutable syntax-phases) (mutable use-site-scopes)
+            (mutable runtime-free-form) phase-forms memories tables (mutable provide-ids)))
+
+  (define current #f)                      ; the comp being expanded
 
   (define (new-scope!) (set! scope-counter (+ scope-counter 1)) scope-counter)
 
   (define core-scope 0)
+
+  ;; ---- the syntax library ----
+
+  (define library-path #f)
+  (define syntax-lib #f)                      ; (bytes . infos)
+  (define (set-syntax-library-path! p) (set! library-path p))
+
+  (define (ensure-library!)
+    (unless syntax-lib
+      (let* ([m (make-unit library-path library-path "syntax" 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
+             [c (make-comp m #f 0 '() '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '())])
+        (with-comp c
+          (lambda ()
+            (parameterize ([current-syntax-infos #f])
+              (let* ([forms (expand-module-body (read-file library-path))]
+                     [forms (append (storage-forms 0) forms)])
+                (let-values ([(bytes imports gc?) (compile-module forms "syntax")])
+                  (let ([table (make-eq-hashtable)])
+                    (for-each (lambda (f) (when (eq? (car f) 'func)
+                                            (hashtable-set! table (func-info-name (cadr f)) (cadr f))))
+                              forms)
+                    (set! syntax-lib (cons bytes table)))))))))))
+
+  (define (syntax-library-bytes) (ensure-library!) (car syntax-lib))
+
+  (define (syntax-info name)
+    (or (hashtable-ref (current-syntax-infos) name #f)
+        (raise-compile-error #f "internal: the syntax library has no ~a" name)))
+
+  ;; ---- stores ----
+
+  (define (new-cstore compile-time?)
+    (ensure-library!)
+    (let* ([h (host-new)]
+           [st (make-cstore h (make-store h) (make-hashtable string-hash string=?)
+                            (make-eq-hashtable) (make-eq-hashtable) 0)])
+      (host-set-callback! h expander-callback)
+      (when compile-time? (ensure-import! st "syntax" 0))
+      st))
+
+  ;; Instance names of module parts: "<module>@<phase>+<shift>" (spec 3.2).
+  (define (part-name m q t) (format "~a@~a+~a" (unit-name m) q t))
+
+  (define (parse-part-name s)
+    (let ([at (let loop ([i 0]) (cond [(= i (string-length s)) #f]
+                                      [(char=? (string-ref s i) #\@) i]
+                                      [else (loop (+ i 1))]))]
+          [plus (let loop ([i (- (string-length s) 1)]) (cond [(< i 0) #f]
+                                                               [(char=? (string-ref s i) #\+) i]
+                                                               [else (loop (- i 1))]))])
+      (and at plus (< at plus)
+           (let ([q (string->number (substring s (+ at 1) plus))]
+                 [t (string->number (substring s (+ plus 1) (string-length s)))])
+             (and q t (list (substring s 0 at) q t))))))
+
+  ;; Make sure the instance an import names exists in st. imp is relative
+  ;; to a module instantiated at `shift`.
+  (define (ensure-import! st imp shift)
+    (cond [(member imp '("host" "expander")) (void)]
+          [(string=? imp "syntax")
+           (unless (hashtable-contains? (cstore-instances st) "syntax")
+             (host-instantiate! (cstore-host st) "syntax" (car syntax-lib))
+             (hashtable-set! (cstore-instances st) "syntax" #t))]
+          [(parse-part-name imp)
+           => (lambda (p) (ensure-part! st (hashtable-ref modules-by-name (car p) #f) (cadr p) (+ (caddr p) shift)))]
+          [else (void)]))                  ; a chunk, already instantiated
+
+  ;; Instantiate module m's phase-q part at shift t in st, dependencies first.
+  (define (ensure-part! st m q t)
+    (let ([name (part-name m q t)])
+      (unless (hashtable-contains? (cstore-instances st) name)
+        (let ([p (hashtable-ref (unit-parts m) q #f)])
+          (unless p (raise-compile-error #f "internal: ~a has no phase ~a part" (unit-name m) q))
+          (for-each (lambda (imp) (ensure-import! st imp t)) (part-imports p))
+          (flush-output-port (current-output-port))
+          ;; Syntax literals the part builds carry the module scope for this
+          ;; shift (spec 6.1). The syntax library maps it while the part starts.
+          (let ([shifted? (and (not (= t 0)) (unit-scope m))])
+            (when shifted?
+              (host-call (cstore-host st) "syntax" "%set-scope-shift" (unit-scope m) (module-scope-at m t)))
+            (host-instantiate-shifted! (cstore-host st) name (part-bytes p) t)
+            (when shifted?
+              (host-call (cstore-host st) "syntax" "%set-scope-shift" -1 0)))
+          (hashtable-set! (cstore-instances st) name #t)))))
+
+  ;; ---- bindings ----
 
   (define (bind-raw! sym scopes phase meaning)
     (let ([key (fresh-key!)])
@@ -116,19 +171,32 @@
       (hashtable-set! meanings key meaning)
       key))
 
+  ;; A module-level binding of the current module: recorded, so that a
+  ;; module requiring this one at a shift can install a shifted copy.
+  (define (bind-module-level! sym scopes phase meaning)
+    (let ([key (bind-raw! sym scopes phase meaning)])
+      (when current
+        (let ([m (comp-module current)])
+          (unit-entries-set! m (cons (list sym scopes phase key) (unit-entries m)))))
+      key))
+
   (define (bind! id phase meaning) (bind-raw! (stx-e id) (stx-scopes id) phase meaning))
+
+  (define (check-unbound! id phase meaning)
+    (for-each (lambda (b)
+                (when (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
+                           (not (equal? (hashtable-ref meanings (binding-key b) #f) meaning)))
+                  (raise-compile-error id "duplicate definition of ~a" (stx-e id))))
+              (hashtable-ref bindings (stx-e id) '())))
 
   ;; Bind a module-level definition. Use-site scopes come off the name, so
   ;; a definition a macro makes from its input is visible to the rest of
-  ;; the module (spec 6.2). A second definition of the same name with the
-  ;; same scopes at the same phase is an error.
+  ;; the module (spec 6.2). A second binding of the same name with the same
+  ;; scopes at the same phase is an error.
   (define (bind-definition! id phase meaning)
-    (let ([id (remove-scopes id use-site-scopes)])
-      (for-each (lambda (b)
-                  (when (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id)))
-                    (raise-compile-error id "duplicate definition of ~a" (stx-e id))))
-                (hashtable-ref bindings (stx-e id) '()))
-      (bind! id phase meaning)))
+    (let ([id (remove-scopes id (comp-use-site-scopes current))])
+      (check-unbound! id phase meaning)
+      (bind-module-level! (stx-e id) (stx-scopes id) phase meaning)))
 
   (define (phase-matches? b phase)
     (let ([p (binding-phase b)])
@@ -145,7 +213,10 @@
                                    (if (> (length (binding-scopes b)) (length (binding-scopes best))) b best))
                                  (car cands) (cdr cands))])
             (for-each (lambda (b)
-                        (unless (scopes-subset? (binding-scopes b) (binding-scopes best))
+                        (when (or (not (scopes-subset? (binding-scopes b) (binding-scopes best)))
+                                  (and (not (eq? b best)) (equal? (binding-scopes b) (binding-scopes best))
+                                       (not (equal? (hashtable-ref meanings (binding-key b) #f)
+                                                    (hashtable-ref meanings (binding-key best) #f)))))
                           (raise-compile-error id "identifier ~a is ambiguous" (stx-e id))))
                       cands)
             (binding-key best)))))
@@ -165,19 +236,241 @@
   ;; Core forms and primitive operators, at every phase (spec 5.5). Nothing
   ;; else is bound until a module requires it.
   (define (install-base!)
-    (for-each (lambda (name) (bind-raw! name (list core-scope) 'all (list 'core name))) core-forms)
-    (for-each (lambda (name) (bind-raw! name (list core-scope) 'all (list 'prim name))) (prim-names)))
+    (unless base-installed?
+      (set! base-installed? #t)
+      (for-each (lambda (name) (bind-raw! name (list core-scope) 'all (list 'core name))) core-forms)
+      (for-each (lambda (name) (bind-raw! name (list core-scope) 'all (list 'prim name))) (prim-names))))
+
+  ;; ---- phase shifting ----
+
+  ;; A meaning as seen from `shift` phases up: its part instances move by
+  ;; shift. Shifted infos are cached so each is one record.
+  (define shifted-infos (make-eq-hashtable))   ; info -> alist shift -> info
+
+  (define (shift-instance inst k)
+    (let ([p (and (string? inst) (parse-part-name inst))])
+      (if p (format "~a@~a+~a" (car p) (cadr p) (+ (caddr p) k)) inst)))
+
+  (define (shift-info info k)
+    (if (= k 0)
+        info
+        (let* ([cache (hashtable-ref shifted-infos info '())]
+               [hit (assv k cache)])
+          (if hit
+              (cdr hit)
+              (let ([new (cond [(func-info? info)
+                                (make-func-info (func-info-name info) (func-info-params info) (func-info-results info)
+                                                (shift-instance (func-info-instance info) k) (func-info-export info))]
+                               [(global-info? info)
+                                (make-global-info (global-info-name info) (global-info-type info)
+                                                  (shift-instance (global-info-instance info) k) (global-info-export info))]
+                               [else info])])
+                (hashtable-set! shifted-infos info (cons (cons k new) cache))
+                new)))))
+
+  (define (shift-meaning meaning k)
+    (if (and meaning (memq (car meaning) '(func global macro static)))
+        (list (car meaning) (shift-info (cadr meaning) k))
+        meaning))
+
+  ;; A module's scope at shift s (spec 6.1). A module used at two shifts has
+  ;; bindings at the same phase from both; giving each shift its own copy of
+  ;; the module scope keeps them apart. Shift 0 uses the module scope itself.
+  (define shifted-scopes (make-hashtable string-hash string=?))
+  (define (module-scope-at m s)
+    (if (= s 0)
+        (unit-scope m)
+        (let ([key (format "~a|~a" (unit-path m) s)])
+          (or (hashtable-ref shifted-scopes key #f)
+              (let ([sc (new-scope!)]) (hashtable-set! shifted-scopes key sc) sc)))))
+
+  ;; Make module m's bindings resolvable at shift s, and those of the modules
+  ;; it requires. Needed for m's macros: their templates carry m's scopes.
+  (define (install-module-bindings! m s)
+    (let ([key (format "~a|~a" (unit-path m) s)])
+      (unless (hashtable-contains? installed key)
+        (hashtable-set! installed key #t)
+        (unless (= s 0)
+          (let ([from (unit-scope m)] [to (module-scope-at m s)])
+            (for-each (lambda (e)
+                        (bind-raw! (car e) (scopes-add (scopes-remove (cadr e) from) to) (+ (caddr e) s)
+                                   (shift-meaning (hashtable-ref meanings (cadddr e) #f) s)))
+                      (reverse (unit-entries m)))))
+        (for-each (lambda (r) (install-module-bindings! (car r) (+ s (cdr r)))) (unit-requires m)))))
+
+  ;; Compute, in the current store, the value of every static binding m and
+  ;; its requires make visible at shift s. Done eagerly, outside any macro
+  ;; call, so the handles outlive it.
+  (define (prepare-statics! m s)
+    (let ([seen (make-hashtable string-hash string=?)])
+      (let walk ([m m] [s s])
+        (let ([key (format "~a|~a" (unit-path m) s)])
+          (unless (hashtable-contains? seen key)
+            (hashtable-set! seen key #t)
+            (for-each (lambda (e)
+                        (let ([meaning (hashtable-ref meanings (cadddr e) #f)])
+                          (when (and meaning (eq? (car meaning) 'static))
+                            (static-handle (comp-store current) (shift-info (cadr meaning) s)))))
+                      (unit-entries m))
+            (for-each (lambda (r) (walk (car r) (+ s (cdr r)))) (unit-requires m)))))))
+
+  ;; ==== modules ====================================================================
+
+  (define (with-comp c thunk)
+    (let ([saved current])
+      (dynamic-wind (lambda () (set! current c)) thunk (lambda () (set! current saved)))))
+
+  (define (normalize-path p)
+    (let* ([abs (if (and (> (string-length p) 0) (char=? (string-ref p 0) #\/))
+                    p
+                    (string-append (current-directory) "/" p))]
+           [parts (let split ([s abs] [acc '()] [cur '()])
+                    (cond [(= (string-length s) 0) (reverse (cons (list->string (reverse cur)) acc))]
+                          [(char=? (string-ref s 0) #\/)
+                           (split (substring s 1 (string-length s)) (cons (list->string (reverse cur)) acc) '())]
+                          [else (split (substring s 1 (string-length s)) acc (cons (string-ref s 0) cur))]))]
+           [kept (fold-left (lambda (acc seg)
+                              (cond [(or (string=? seg "") (string=? seg ".")) acc]
+                                    [(string=? seg "..") (if (pair? acc) (cdr acc) acc)]
+                                    [else (cons seg acc)]))
+                            '() parts)])
+      (apply string-append (map (lambda (seg) (string-append "/" seg)) (reverse kept)))))
+
+  (define (directory-of path)
+    (let loop ([i (- (string-length path) 1)])
+      (cond [(< i 0) ""]
+            [(char=? (string-ref path i) #\/) (substring path 0 (+ i 1))]
+            [else (loop (- i 1))])))
+
+  ;; An instance-name stem from the file name: letters, digits, - and _.
+  (define (fresh-unit-name path)
+    (let* ([base (let loop ([cs (reverse (string->list path))] [acc '()])
+                   (if (or (null? cs) (char=? (car cs) #\/)) (list->string acc) (loop (cdr cs) (cons (car cs) acc))))]
+           [stem (let ([dot (let loop ([i (- (string-length base) 1)])
+                              (cond [(< i 0) #f] [(char=? (string-ref base i) #\.) i] [else (loop (- i 1))]))])
+                   (if dot (substring base 0 dot) base))]
+           [clean (list->string (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_))) c #\_))
+                                     (string->list stem)))])
+      (let loop ([n 1])
+        (let ([name (if (= n 1) clean (format "~a-~a" clean n))])
+          (if (hashtable-contains? modules-by-name name) (loop (+ n 1)) name)))))
+
+  ;; Compile the module in file `source` (and, first, what it requires).
+  ;; Returns the module. Each module is compiled once per run.
+  (define (compile-module-file source)
+    (let* ([path (normalize-path source)]
+           [known (hashtable-ref registry path #f)])
+      (cond
+        [(and known (eq? (unit-state known) 'done)) known]
+        [known (raise-compile-error #f "cyclic require: ~a requires itself" source)]
+        [else
+         (unless (file-exists? source) (raise-compile-error #f "no module file ~a" source))
+         (ensure-library!)
+         (let* ([name (fresh-unit-name path)]
+                [m (make-unit path source name 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
+                [c (make-comp m (new-cstore #t) 0 '() '() #f
+                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '())])
+           (hashtable-set! registry path m)
+           (hashtable-set! modules-by-name name m)
+           (with-comp c
+             (lambda ()
+               (parameterize ([current-syntax-infos (cdr syntax-lib)])
+                 (let ([forms (expand-module-body (read-file source))])
+                   (add-phase-forms! 0 forms)
+                   (unit-expanded-set! m forms)
+                   (finish-module! c)))))
+           m)])))
+
+  ;; Expand a module body at phase 0; phase >= 1 code runs as it goes.
+  (define (expand-module-body forms)
+    (install-base!)
+    (let ([msc (new-scope!)])
+      (unit-scope-set! (comp-module current) msc)
+      (expand-body (map-lr (lambda (f) (add-scope (add-scope f core-scope) msc)) forms) 0)))
+
+  (define (add-phase-forms! phase forms)
+    (let ([t (comp-phase-forms current)])
+      (hashtable-set! t phase (append (reverse forms) (hashtable-ref t phase '())))))
+
+  ;; The memory and table forms declared for phase (spec 3.3).
+  (define (storage-forms phase)
+    (let ([mem (hashtable-ref (comp-memories current) phase #f)]
+          [tbl (hashtable-ref (comp-tables current) phase #f)])
+      (append (if mem (list mem) '()) (if tbl (list tbl) '()))))
+
+  ;; Compile each phase's part, resolve provides, check (runtime-free).
+  (define (finish-module! c)
+    (let ([m (comp-module c)])
+      (unit-provides-set!
+       m
+       (map-lr (lambda (id)
+                 (let ([meaning (meaning-of id 0)])
+                   (unless (and meaning (memq (car meaning) '(func global macro static type data)))
+                     (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
+                   (cons (stx-e id) meaning)))
+               (reverse (comp-provide-ids c))))
+      (let ([phases (list-sort < (let-values ([(ks vs) (hashtable-entries (comp-phase-forms c))])
+                                   (let ([ps (vector->list ks)]) (if (memv 0 ps) ps (cons 0 ps)))))])
+        (for-each (lambda (p)
+                    (let ([forms (append (storage-forms p) (reverse (hashtable-ref (comp-phase-forms c) p '())))])
+                      (let-values ([(bytes imports gc?) (compile-module forms (part-name m p 0))])
+                        (hashtable-set! (unit-parts m) p (make-part bytes imports gc?)))))
+                  phases))
+      (hashtable-set! installed (format "~a|0" (unit-path m)) #t)
+      (unit-state-set! m 'done)
+      (let ([form (comp-runtime-free-form c)])
+        (when form (check-runtime-free! m form)))))
+
+  ;; The parts a program instantiates at run time: phase 0 at shift 0,
+  ;; reached through phase-0 requires.
+  (define (runtime-closure m)
+    (let loop ([todo (list m)] [seen '()])
+      (cond [(null? todo) (reverse seen)]
+            [(memq (car todo) seen) (loop (cdr todo) seen)]
+            [else
+             (let* ([p (hashtable-ref (unit-parts (car todo)) 0 #f)]
+                    [deps (filter values
+                                  (map (lambda (imp)
+                                         (let ([pp (parse-part-name imp)])
+                                           (and pp (= (cadr pp) 0) (= (caddr pp) 0)
+                                                (hashtable-ref modules-by-name (car pp) #f))))
+                                       (part-imports p)))])
+               (loop (append (cdr todo) deps) (cons (car todo) seen)))])))
+
+  ;; (runtime-free): the program's run-time parts import only from the host
+  ;; and each other, and use no GC (spec 3.4).
+  (define (check-runtime-free! m form)
+    (for-each (lambda (mm)
+                (let* ([p (hashtable-ref (unit-parts mm) 0 #f)]
+                       [extra (filter (lambda (imp) (not (or (string=? imp "host") (parse-part-name imp))))
+                                      (part-imports p))])
+                  (unless (and (null? extra) (not (part-gc? p)))
+                    (raise-compile-error form
+                                         "this module is declared runtime-free, but after expansion ~a ~a"
+                                         (if (eq? mm m) "it" (format "the module ~a it requires" (unit-name mm)))
+                                         (if (pair? extra) (format "imports from ~a" extra) "uses GC objects")))))
+              (runtime-closure m)))
+
+  ;; The fully expanded phase-0 forms of m, for `subc expand`.
+  (define (module-expanded-forms m) (unit-expanded m))
+
+  ;; (phase . bytes) for each part of m.
+  (define (module-part-list m)
+    (list-sort (lambda (a b) (< (car a) (car b)))
+               (let-values ([(ks vs) (hashtable-entries (unit-parts m))])
+                 (map (lambda (k v) (cons k (part-bytes v))) (vector->list ks) (vector->list vs)))))
+
+  ;; Instantiate m's program in a fresh run-time store and call its main.
+  (define (run-module m)
+    (let ([st (new-cstore #f)])
+      (ensure-part! st m 0 0)
+      (guard (c [(and (wasm-failure? c)
+                      (let ([msg (wasm-failure-message c)])
+                        (and (>= (string-length msg) 17) (string=? (substring msg 0 17) "call: no function"))))
+                 (void)])
+        (host-call (cstore-host st) (part-name m 0 0) "main"))))
 
   ;; ==== module bodies ============================================================
-
-  ;; Expand a module. Returns (values phase-0-forms defined-func-infos).
-  (define (expand-module forms module st)
-    (reset-state! module st)
-    (install-base!)
-    (let* ([msc (new-scope!)]
-           [forms (map-lr (lambda (f) (add-scope (add-scope f core-scope) msc)) forms)]
-           [out (expand-body forms 0)])
-      (values out (map cadr (filter (lambda (f) (eq? (car f) 'func)) out)))))
 
   (define (stx-list-of s who)
     (or (stx->list s) (raise-compile-error s "bad ~a form" who)))
@@ -206,13 +499,13 @@
                  [rest (cdr forms)])
             (case (core-head f phase)
               [(begin) (loop (append (cdr (stx-list-of f 'begin)) rest) pending)]
-              [(include) (loop (append (read-include f) rest) pending)]
               [(require) (require! f phase) (loop rest pending)]
+              [(provide) (provide! f phase) (loop rest pending)]
               [(runtime-free) (runtime-free! f phase) (loop rest pending)]
               [(func) (loop rest (cons (declare-func f phase) pending))]
               [(global) (loop rest (cons (declare-global f phase) pending))]
               [(import) (declare-import f phase) (loop rest pending)]
-              [(memory table) (loop rest (cons (list 'plain (parse-size f)) pending))]
+              [(memory table) (declare-storage! f phase) (loop rest pending)]
               [(data) (loop rest (cons (list 'plain (declare-data f phase)) pending))]
               [(type) (loop rest (cons (list 'plain (declare-type f phase)) pending))]
               [(define-syntax) (define-syntax! f phase) (loop rest pending)]
@@ -389,12 +682,6 @@
                (list 'func (make-func-info (stx-e (cadr parts)) params results
                                            (stx-e (caddr parts)) (stx-e (cadddr parts))))))))
 
-  ;; (memory pages) / (table size)
-  (define (parse-size f)
-    (let ([parts (stx-list-of f 'memory)])
-      (unless (and (= (length parts) 2) (fixnum? (stx-e (cadr parts))) (>= (stx-e (cadr parts)) 0))
-        (raise-compile-error f "expected (~a size)" (stx-e (car parts))))
-      (list (stx-e (car parts)) (stx-e (cadr parts)))))
 
   ;; (data name offset "bytes" ...): an active segment in the module's memory.
   (define (declare-data f phase)
@@ -408,92 +695,168 @@
         (bind-definition! (cadr parts) phase (list 'data info))
         (list 'data info))))
 
-  ;; (require syntax): bind the syntax library's contract functions at this
-  ;; phase (spec 2.3). The only library v0 knows; modules generalize it.
+  ;; ---- require, provide, storage ----
+
+  ;; (require spec ...) where spec is "path", syntax, or (for-syntax spec ...).
+  ;; A module required at phase p is shifted by p: its phase q is p + q here.
   (define (require! f phase)
-    (let ([parts (stx-list-of f 'require)])
-      (unless (and (= (length parts) 2) (core-name? (cadr parts) 'syntax))
-        (raise-compile-error f "v0 can only (require syntax)"))
-      (unless (current-syntax-infos)
-        (raise-compile-error f "the syntax library cannot require itself"))
-      (unless (memv phase syntax-phases)
-        (set! syntax-phases (cons phase syntax-phases))
-        (let-values ([(names infos) (hashtable-entries (current-syntax-infos))])
-          ;; sorted, for deterministic keys
-          (for-each (lambda (info) (bind-raw! (func-info-name info) (stx-scopes (car parts)) phase (list 'func info)))
-                    (list-sort (lambda (a b) (string<? (symbol->string (func-info-name a))
-                                                        (symbol->string (func-info-name b))))
-                               (filter (lambda (info) (not (internal-name? (func-info-name info))))
-                                       (vector->list infos))))))))
+    (for-each (lambda (spec) (require-spec! f spec phase)) (cdr (stx-list-of f 'require))))
+
+  (define (require-spec! f spec phase)
+    (let ([l (stx->list spec)])
+      (cond [(core-name? spec 'syntax) (require-syntax! spec phase)]
+            [(string? (stx-e spec)) (require-module! f spec phase)]
+            [(and l (pair? l) (core-name? (car l) 'for-syntax))
+             (for-each (lambda (s) (require-spec! f s (+ phase 1))) (cdr l))]
+            [else (raise-compile-error spec "expected \"path\", syntax, or (for-syntax spec ...)")])))
+
+  ;; Bind the syntax library's contract functions at phase (spec 2.3), with
+  ;; the scopes of the `syntax` identifier.
+  (define (require-syntax! spec phase)
+    (unless (current-syntax-infos)
+      (raise-compile-error spec "the syntax library cannot require itself"))
+    (unless (memv phase (comp-syntax-phases current))
+      (comp-syntax-phases-set! current (cons phase (comp-syntax-phases current)))
+      (let-values ([(names infos) (hashtable-entries (current-syntax-infos))])
+        ;; sorted, for deterministic keys
+        (for-each (lambda (info)
+                    (bind-module-level! (func-info-name info) (stx-scopes spec) phase (list 'func info)))
+                  (list-sort (lambda (a b) (string<? (symbol->string (func-info-name a))
+                                                      (symbol->string (func-info-name b))))
+                             (filter (lambda (info) (not (internal-name? (func-info-name info))))
+                                     (vector->list infos)))))))
 
   (define (require-syntax-for s name phase)
-    (unless (memv phase syntax-phases)
-      (raise-compile-error s "~a builds syntax-library data: add (require syntax)~a" name
-                           (if (> phase 0) (format " at phase ~a" phase) ""))))
+    (unless (memv phase (comp-syntax-phases current))
+      (raise-compile-error s "~a builds syntax-library data: add (require ~a)" name
+                           (if (> phase 0) "(for-syntax syntax)" "syntax"))))
 
-  ;; (runtime-free): after expansion, the phase-0 module may import only from
-  ;; the host and may not use GC objects (spec 3.2).
+  (define (module-path-of f spec)
+    (let* ([loc (stx-srcloc f)]
+           [dir (if loc (directory-of (symbol->string (srcloc-source loc))) "")]
+           [given (stx-e spec)])
+      (if (and (> (string-length given) 0) (char=? (string-ref given 0) #\/))
+          given
+          (string-append dir given))))
+
+  ;; Compile the module if needed, bind what it provides at phase, and make
+  ;; its own bindings resolvable for its macros.
+  (define (require-module! f spec phase)
+    (let* ([m (compile-module-file (module-path-of f spec))]
+           [me (comp-module current)]
+           [req (cons m phase)])
+      (unless (member req (unit-requires me))
+        (unit-requires-set! me (append (unit-requires me) (list req)))
+        (for-each (lambda (p)
+                    (let ([id (datum->stx spec (car p) (stx-srcloc spec))]
+                          [meaning (shift-meaning (cdr p) phase)])
+                      (check-unbound! id phase meaning)
+                      (bind-module-level! (car p) (stx-scopes spec) phase meaning)))
+                  (unit-provides m))
+        (install-module-bindings! m phase)
+        (prepare-statics! m phase))))
+
+  ;; The module a string names, which must already be required at `shift`.
+  (define (required-module f spec shift)
+    (let* ([path (normalize-path (module-path-of f spec))]
+           [m (hashtable-ref registry path #f)])
+      (unless (and m (member (cons m shift) (unit-requires (comp-module current))))
+        (raise-compile-error spec "~a must be required at this phase first" (stx-e spec)))
+      m))
+
+  ;; (provide id ...): the phase-0 bindings other modules get by requiring
+  ;; this one.
+  (define (provide! f phase)
+    (unless (= phase 0) (raise-compile-error f "provide belongs at phase 0"))
+    (let ([ids (cdr (stx-list-of f 'provide))])
+      (for-each (lambda (id) (unless (id? id) (raise-compile-error id "provide takes identifiers"))) ids)
+      (comp-provide-ids-set! current (append (reverse ids) (comp-provide-ids current)))))
+
+  ;; (memory pages) or (memory from "path"), and likewise (table ...): the
+  ;; module's memory or table at this phase (spec 3.3).
+  (define (declare-storage! f phase)
+    (let* ([parts (stx-list-of f 'memory)]
+           [kind (stx-e (car parts))]
+           [table (if (eq? kind 'memory) (comp-memories current) (comp-tables current))])
+      (when (hashtable-ref table phase #f)
+        (raise-compile-error f "a second ~a declaration at this phase" kind))
+      (hashtable-set!
+       table phase
+       (cond
+         [(and (= (length parts) 2) (fixnum? (stx-e (cadr parts))) (>= (stx-e (cadr parts)) 0))
+          (unless (= phase 0)
+            (raise-compile-error f "v0 defines ~as at phase 0 only; at phase ~a use (~a from \"module\")"
+                                 kind phase kind))
+          (list kind (stx-e (cadr parts)))]
+         [(and (= (length parts) 3) (core-name? (cadr parts) 'from) (string? (stx-e (caddr parts))))
+          (let ([m (required-module f (caddr parts) phase)])
+            (list (if (eq? kind 'memory) 'memory-import 'table-import) (part-name m 0 phase)))]
+         [else (raise-compile-error f "expected (~a size) or (~a from \"module\")" kind kind)]))))
+
+  ;; (runtime-free): after expansion, the program needs nothing beyond the
+  ;; host at run time (spec 3.4).
   (define (runtime-free! f phase)
     (unless (and (= phase 0) (equal? (map stx-e (stx-list-of f 'runtime-free)) '(runtime-free)))
       (raise-compile-error f "(runtime-free) takes nothing and belongs at phase 0"))
-    (set! runtime-free-form f))
-
-  ;; (include "path"): the forms of another file, spliced in place, with the
-  ;; include form's scopes. A relative path is relative to the including file.
-  ;; Temporary: modules replace it (spec section 7).
-  (define (read-include f)
-    (let ([parts (stx-list-of f 'include)])
-      (unless (and (= (length parts) 2) (string? (stx-e (cadr parts))))
-        (raise-compile-error f "expected (include \"path\")"))
-      (let* ([loc (stx-srcloc f)]
-             [dir (if loc (directory-of (symbol->string (srcloc-source loc))) "")]
-             [given (stx-e (cadr parts))]
-             [path (if (and (> (string-length given) 0) (char=? (string-ref given 0) #\/))
-                       given
-                       (string-append dir given))]
-             [scopes (stx-scopes (car parts))])
-        (unless (file-exists? path) (raise-compile-error f "include: no file ~a" path))
-        (map-lr (lambda (form) (fold-left add-scope form scopes)) (read-file path)))))
-
-  (define (directory-of path)
-    (let loop ([i (- (string-length path) 1)])
-      (cond [(< i 0) ""]
-            [(char=? (string-ref path i) #\/) (substring path 0 (+ i 1))]
-            [else (loop (- i 1))])))
+    (comp-runtime-free-form-set! current f))
 
   ;; ==== compile-time evaluation ===================================================
 
-  (define (next-chunk-name! phase)
-    (let ([n chunk-counter])
-      (set! chunk-counter (+ n 1))
-      (format "~a@~a#~a" current-module phase n)))
+  (define (next-chunk-name! prefix)
+    (let ([n (comp-chunk-counter current)])
+      (comp-chunk-counter-set! current (+ n 1))
+      (format "~a#~a" prefix n)))
 
+  ;; Compile forms and instantiate them in store st, after what they import.
+  (define (instantiate-chunk! st name forms where)
+    (let-values ([(bytes imports gc?) (compile-module forms name)])
+      (for-each (lambda (imp) (ensure-import! st imp 0)) imports)
+      (guard (c [(wasm-failure? c)
+                 (raise-compile-error where "compile-time code failed: ~a" (wasm-failure-message c))])
+        (flush-output-port (current-output-port))
+        (host-instantiate! (cstore-host st) name bytes))
+      (hashtable-set! (cstore-instances st) name #t)
+      name))
+
+  ;; A chunk of this module's phase-`phase` code, run now. It also becomes
+  ;; part of the module's phase-`phase` part.
   (define (run-chunk! forms phase where)
-    (let ([name (next-chunk-name! phase)])
-      (let-values ([(bytes imports gc?) (compile-module forms name)])
-        (guard (c [(wasm-failure? c)
-                   (raise-compile-error where "compile-time code failed: ~a" (wasm-failure-message c))])
-          (flush-output-port (current-output-port))
-          (host-instantiate! (store-host current-store) name bytes))
-        name)))
+    (add-phase-forms! phase forms)
+    (instantiate-chunk! (comp-store current)
+                        (next-chunk-name! (format "~a@~a" (unit-name (comp-module current)) phase))
+                        (append (storage-forms phase) forms)
+                        where))
 
-  (define (syntax-info name)
-    (or (hashtable-ref (current-syntax-infos) name #f)
-        (raise-compile-error #f "internal: the syntax library has no ~a" name)))
-
-  ;; A one-function chunk that gives Chez an i32 entry point: it turns
+  ;; A one-function chunk in st giving Chez an i32 entry point: it turns
   ;; handles into references around `body`, which returns an eqref.
-  (define (handle-chunk! param? body phase where)
+  (define (entry-chunk! st param? body)
     (let* ([key (and param? (fresh-key!))]
-           [wrapper (make-func-info '__entry (if param? '(i32) '()) '(i32) #f #f)]
-           [body (body (and param? (list 'call (syntax-info '%deref) (list (list 'lref key)))))]
-           [chunk (run-chunk! (list (list 'func wrapper (if param? (list (cons key 'i32)) '())
-                                          (list 'call (syntax-info '%handle) (list body))))
-                              phase where)])
-      chunk))
+           [entry (make-func-info '__entry (if param? '(i32) '()) '(i32) #f #f)]
+           [body (body (and param? (list 'call (syntax-info '%deref) (list (list 'lref key)))))])
+      (cstore-counter-set! st (+ (cstore-counter st) 1))
+      (instantiate-chunk! st (format "entry#~a" (cstore-counter st))
+                          (list (list 'func entry (if param? (list (cons key 'i32)) '())
+                                      (list 'call (syntax-info '%handle) (list body))))
+                          #f)))
+
+  ;; The entry chunk that calls transformer f, in st.
+  (define (macro-entry st f)
+    (or (hashtable-ref (cstore-wrappers st) f #f)
+        (let ([chunk (entry-chunk! st #t (lambda (arg) (list 'call f (list arg))))])
+          (hashtable-set! (cstore-wrappers st) f chunk)
+          chunk)))
+
+  ;; The handle of a static value in st, from its getter function.
+  (define (static-handle st getter)
+    (or (hashtable-ref (cstore-statics st) getter #f)
+        (let* ([chunk (entry-chunk! st #f (lambda (_) (list 'call getter '())))]
+               [h (call-in-store st #f (lambda (host) (host-call host chunk "__entry")))])
+          (hashtable-set! (cstore-statics st) getter h)
+          h)))
 
   ;; (define-syntax name f): name is a macro whose transformer is the phase+1
-  ;; function f, of type (eqref) -> eqref, from an earlier begin-for-syntax.
+  ;; function f, of type (eqref) -> eqref, from an earlier begin-for-syntax
+  ;; or a module required for-syntax.
   (define (define-syntax! f phase)
     (let ([parts (stx-list-of f 'define-syntax)])
       (unless (and (= (length parts) 3) (id? (cadr parts)) (id? (caddr parts)))
@@ -509,19 +872,23 @@
           (unless (func-info-instance info)
             (raise-compile-error (caddr parts) "~a must be defined by an earlier begin-for-syntax"
                                  (stx-e (caddr parts))))
-          (let ([chunk (handle-chunk! #t (lambda (arg) (list 'call info (list arg))) (+ phase 1) f)])
-            (bind-definition! (cadr parts) phase (list 'macro chunk)))))))
+          (bind-definition! (cadr parts) phase (list 'macro info))))))
 
-  ;; (define-static name expr): name is bound to the value of expr, computed
-  ;; now at phase+1. Macros read it with syntax-local-value.
+  ;; (define-static name expr): name is bound to the value of expr at
+  ;; phase+1. The value lives in a global of the phase+1 part, computed when
+  ;; the part is instantiated; macros read it with syntax-local-value.
   (define (define-static! f phase)
     (let ([parts (stx-list-of f 'define-static)])
       (unless (and (= (length parts) 3) (id? (cadr parts)))
         (raise-compile-error f "expected (define-static name expr)"))
-      (let* ([rhs (expand-expr (caddr parts) (+ phase 1))]
-             [chunk (handle-chunk! #f (lambda (_) rhs) (+ phase 1) f)]
-             [handle (call-in-store f (lambda (h) (host-call h chunk "__entry")))])
-        (bind-definition! (cadr parts) phase (list 'static handle)))))
+      (let* ([name (string->symbol (string-append "__static." (symbol->string (stx-e (cadr parts)))))]
+             [rhs (expand-expr (caddr parts) (+ phase 1))]
+             [global (make-global-info name eqref #f #f)]
+             [getter (make-func-info name '() (list eqref) #f #f)])
+        (run-chunk! (list (list 'global global rhs) (list 'func getter '() (list 'gref global)))
+                    (+ phase 1) f)
+        (static-handle (comp-store current) getter)
+        (bind-definition! (cadr parts) phase (list 'static getter)))))
 
   ;; (begin-for-syntax form ...)
   (define (begin-for-syntax! f phase)
@@ -535,36 +902,39 @@
   (define api-where #f)               ; the form the running macro was given
   (define api-error #f)
 
-  (define (call-in-store where proc)
+  (define (call-in-store st where proc)
     (set! api-error #f)
     (guard (c [(wasm-failure? c)
                (if api-error
                    (let ([e api-error]) (set! api-error #f) (raise e))
                    (raise-compile-error where "~a" (wasm-failure-message c)))])
       (flush-output-port (current-output-port))
-      (proc (store-host current-store))))
+      (proc (cstore-host st))))
 
   ;; Hygiene (spec 6.2): a fresh introduction scope is flipped on the input
   ;; and on the output, so only what the transformer introduced carries it.
   ;; In a definition context (use-site? is true) the input also gets a fresh
   ;; use-site scope, which stays.
-  (define (apply-macro head chunk s phase use-site?)
-    (let* ([intro (new-scope!)]
+  (define (apply-macro head transformer s phase use-site?)
+    (let* ([st (comp-store current)]
+           [chunk (macro-entry st transformer)]
+           [intro (new-scope!)]
            [s (flip-scope s intro)]
            [s (if use-site?
                   (let ([use (new-scope!)])
-                    (set! use-site-scopes (cons use use-site-scopes))
+                    (comp-use-site-scopes-set! current (cons use (comp-use-site-scopes current)))
                     (add-scope s use))
                   s)]
            [saved-phase api-phase] [saved-where api-where])
       (dynamic-wind
         (lambda () (set! api-phase phase) (set! api-where s))
         (lambda ()
-          (let* ([mark (handle-mark current-store)]
-                 [in (encode current-store s)]
-                 [out (call-in-store s (lambda (h) (host-call h chunk "__entry" in)))]
-                 [result (decode current-store out)])
-            (handle-release! current-store mark)
+          (let* ([ms (cstore-marshal st)]
+                 [mark (handle-mark ms)]
+                 [in (encode ms s)]
+                 [out (call-in-store st s (lambda (h) (host-call h chunk "__entry" in)))]
+                 [result (decode ms out)])
+            (handle-release! ms mark)
             (unless (stx? result)
               (raise-compile-error s "macro ~a returned a non-syntax value: ~s" (stx-e head)
                                    (if (wasm-value? result) '<object> (stx->datum result))))
@@ -575,31 +945,37 @@
   ;; are handles. Must never raise: an exception here would unwind through C
   ;; and wasm frames.
   (define (expander-callback op a b)
-    (guard (c [#t (set! api-error
-                        (if (compile-error? c)
-                            c
-                            (condition (make-error) (make-message-condition
-                                                     (if (message-condition? c)
-                                                         (condition-message c)
-                                                         (format "~s" c))))))
-                  (host-request-trap! (store-host current-store) "expander query failed")
-                  0])
-      (case op
-        [(1)                            ; syntax-local-value
-         (let ([id (decode current-store a)])
-           (let ([m (and (id? id) (meaning-of id api-phase))])
-             (if (and m (eq? (car m) 'static)) (cadr m) 0)))]
-        [(2)                            ; syntax-error
-         (let ([s (decode current-store a)] [msg (decode current-store b)])
-           (raise-compile-error (if (and (stx? s) (stx-srcloc s)) s api-where) "~a~a"
-                                (if (string? msg) msg (format "~s" msg))
-                                (if (stx? s) (format "\n  in: ~s" (stx->datum s)) "")))]
-        [(3)                            ; free-identifier=?
-         (let ([x (decode current-store a)] [y (decode current-store b)])
-           (unless (and (id? x) (id? y)) (raise-compile-error api-where "free-identifier=?: expected identifiers"))
-           (let ([kx (resolve x api-phase)] [ky (resolve y api-phase)])
-             (if (if (or kx ky) (eqv? kx ky) (eq? (stx-e x) (stx-e y))) 1 0)))]
-        [else (raise-compile-error api-where "unknown expander query ~a" op)])))
+    (let ([st (and current (comp-store current))])
+      (guard (c [#t (set! api-error
+                          (if (compile-error? c)
+                              c
+                              (condition (make-error) (make-message-condition
+                                                       (if (message-condition? c)
+                                                           (condition-message c)
+                                                           (format "~s" c))))))
+                    (when st (host-request-trap! (cstore-host st) "expander query failed"))
+                    0])
+        (unless st (raise-compile-error #f "an expander query ran outside expansion"))
+        (let ([ms (cstore-marshal st)])
+          (case op
+            [(1)                        ; syntax-local-value
+             (let ([id (decode ms a)])
+               (let ([m (and (id? id) (meaning-of id api-phase))])
+                 (if (and m (eq? (car m) 'static))
+                     (or (hashtable-ref (cstore-statics st) (cadr m) #f)
+                         (raise-compile-error api-where "internal: static value of ~a not prepared" (stx-e id)))
+                     0)))]
+            [(2)                        ; syntax-error
+             (let ([s (decode ms a)] [msg (decode ms b)])
+               (raise-compile-error (if (and (stx? s) (stx-srcloc s)) s api-where) "~a~a"
+                                    (if (string? msg) msg (format "~s" msg))
+                                    (if (stx? s) (format "\n  in: ~s" (stx->datum s)) "")))]
+            [(3)                        ; free-identifier=?
+             (let ([x (decode ms a)] [y (decode ms b)])
+               (unless (and (id? x) (id? y)) (raise-compile-error api-where "free-identifier=?: expected identifiers"))
+               (let ([kx (resolve x api-phase)] [ky (resolve y api-phase)])
+                 (if (if (or kx ky) (eqv? kx ky) (eq? (stx-e x) (stx-e y))) 1 0)))]
+            [else (raise-compile-error api-where "unknown expander query ~a" op)])))))
 
   ;; ==== expressions ===================================================================
 

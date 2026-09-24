@@ -25,8 +25,9 @@ for t in tests/*.sub; do
     if [ $code -ne 0 ] || [ "$actual" != "$(cat "tests/$name.out")" ]; then
       problem="output differs (exit $code)"
     elif ! (cd tests && ../bin/subc compile "$name.sub" -o "../build/tests/$name.wasm" > /dev/null) ||
-         ! wasm-tools validate "build/tests/$name.wasm"; then
-      problem="compiled module does not validate"
+         ! for part in build/tests/$name.wasm build/tests/$name.phase*.wasm; do
+             [ -e "$part" ] || continue; wasm-tools validate "$part" || exit 1; done; then
+      problem="a compiled part does not validate"
     elif [ -f "tests/$name.links" ]; then
       links="$(wasm-tools print "build/tests/$name.wasm" | sed -n 's/^ *(import "\([^"]*\)".*/\1/p' | sort -u)"
       if [ "$links" != "$(sort -u "tests/$name.links")" ]; then

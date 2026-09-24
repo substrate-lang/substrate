@@ -66,7 +66,9 @@
       [(5) (cons (decode st (lib st "%h-car" h)) (decode st (lib st "%h-cdr" h)))]
       [(6) (string->symbol (decode-string st (lib st "%h-symbol-name" h)))]
       [(7) (decode-string st h)]
-      [(8) (make-stx (decode st (lib st "%h-syntax-part" h 0)) (decode st (lib st "%h-syntax-part" h 1))
+      ;; Scope sets are sorted in Chez; a shifted literal may be out of order.
+      [(8) (make-stx (decode st (lib st "%h-syntax-part" h 0))
+                     (list-sort < (decode st (lib st "%h-syntax-part" h 1)))
                      (decode st (lib st "%h-syntax-part" h 2)) (decode st (lib st "%h-syntax-part" h 3)))]
       [(9) (make-srcloc (decode st (lib st "%h-srcloc-source" h))
                         (lib st "%h-srcloc-field" h 1) (lib st "%h-srcloc-field" h 2)

@@ -2,7 +2,7 @@
 ;; crossing this boundary is an i32: stage0 refers to GC objects in the
 ;; syntax library through integer handles (spec appendix A).
 (library (stage0 host)
-  (export host-new host-instantiate! host-call host-set-callback! host-request-trap!
+  (export host-new host-instantiate! host-instantiate-shifted! host-call host-set-callback! host-request-trap!
           wasm-failure? wasm-failure-message)
   (import (chezscheme))
 
@@ -13,6 +13,7 @@
   (define c-host-new (foreign-procedure "sub_host_new" () uptr))
   (define c-last-error (foreign-procedure "sub_last_error" (uptr) string))
   (define c-instantiate (foreign-procedure "sub_instantiate" (uptr string u8* size_t) int))
+  (define c-instantiate-shifted (foreign-procedure "sub_instantiate_shifted" (uptr string u8* size_t int) int))
   (define c-call (foreign-procedure "sub_call" (uptr string string int int int int int int int) int))
   (define c-result (foreign-procedure "sub_result" (uptr) int))
   (define c-set-callback (foreign-procedure "sub_set_callback" (uptr uptr) void))
@@ -29,6 +30,9 @@
 
   (define (host-instantiate! h name bytes)
     (check h (c-instantiate h name bytes (bytevector-length bytes))))
+
+  (define (host-instantiate-shifted! h name bytes shift)
+    (check h (c-instantiate-shifted h name bytes (bytevector-length bytes) shift)))
 
   (define (pad args n)
     (let loop ([args args] [n n])
