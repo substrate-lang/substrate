@@ -11,7 +11,7 @@
 ;; Value types are resolved: i32 i64 f32 f64, or (ref nullable? heap) where
 ;; heap is an abstract heap type symbol or a type index.
 (library (stage0 wasm)
-  (export make-wmodule encode-module)
+  (export make-wmodule encode-module uleb! sleb!)
   (import (chezscheme) (stage0 ops))
 
   ;; types:   list of (func (param ...) (result ...)) | (struct ((storage mut?) ...))
@@ -26,7 +26,8 @@
   ;; exports: list of (name kind idx)
   ;; start:   funcidx or #f
   ;; declared: funcidxs referenced by ref.func (declarative elem segment)
-  ;; datas:   list of (offset . bytevector): active segments in memory 0
+  ;; datas:   list of (offset . bytevector): an active segment in memory 0,
+  ;;          or a passive one if offset is #f
   ;; names:   (module-name (funcidx . name) ...) for the name section, or #f
   (define-record-type wmodule
     (fields types imports funcs tables memories globals exports start declared datas names))
@@ -174,6 +175,7 @@
         [(array.new) (gc 6) (u (car args))]
         [(array.new_default) (gc 7) (u (car args))]
         [(array.new_fixed) (gc 8) (u (car args)) (u (cadr args))]
+        [(array.new_data) (gc 9) (u (car args)) (u (cadr args))]
         [(array.get) (gc 11) (u (car args))]
         [(array.get_s) (gc 12) (u (car args))]
         [(array.get_u) (gc 13) (u (car args))]
@@ -277,6 +279,10 @@
                (out-byte! p 3)          ; declarative, elemkind + funcidx vector
                (out-byte! p #x00)
                (vec! p declared uleb!)))))
+       ;; The data count, which code referring to segments needs.
+       (let ([datas (wmodule-datas m)])
+         (unless (null? datas)
+           (section! port 12 (lambda (p) (uleb! p (length datas))))))
        (let ([funcs (wmodule-funcs m)])
          (unless (null? funcs)
            (section! port 10
@@ -298,9 +304,11 @@
              (lambda (p)
                (vec! p datas
                      (lambda (p d)
-                       (out-byte! p 0)     ; active, memory 0
-                       (instr! p (list 'i32.const (car d)))
-                       (out-byte! p #x0B)
+                       (if (car d)
+                           (begin (out-byte! p 0)     ; active, memory 0
+                                  (instr! p (list 'i32.const (car d)))
+                                  (out-byte! p #x0B))
+                           (out-byte! p 1))           ; passive
                        (uleb! p (bytevector-length (cdr d)))
                        (bytes! p (cdr d))))))))
        (let ([names (wmodule-names m)])

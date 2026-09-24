@@ -248,18 +248,25 @@ wasm initializer. The others start at their type's default, zero or null.
 Then the part's start function runs:
 
 1. For each function whose table index the part takes (`func-index`),
-   append it to the table and keep the index in a global. Build each quoted
-   constant with the syntax library's functions and keep it in a global.
-   These happen in the order the compiler meets them.
-2. The other global initializers and module-level expressions, in
+   append it to the table and keep the index in a global, in the order the
+   compiler meets them.
+2. Build the part's quoted data.
+3. The other global initializers and module-level expressions, in
    source order.
 
-Quoted fixnums and `#f` need no global: they are the constant expressions
-`(ref.i31 n)` and `(ref.null eq)`. Nor do `'()` and `#t`: they read
-immutable globals the syntax library defines for them, which is also a
-constant expression. A phase-1 part's module-level expressions run each
-time the part is instantiated, which is once per compilation that needs
-it.
+Quoted fixnums and `#f` are the constant expressions `(ref.i31 n)` and
+`(ref.null eq)`, and `'()` and `#t` read immutable globals the syntax
+library defines for them, also a constant expression. The compiler
+serializes the part's other quoted data into one passive data segment,
+which the syntax library turns into a table of objects when the part
+starts; code reads a quoted datum from the table. So compiled code does
+not grow with its literals, and each is built once per instance. As in
+Scheme, equal quoted data may share structure: whether two quoted data,
+or parts of them, are the same reference is unspecified, except that a
+quoted string, which is mutable, is never shared.
+
+A phase-1 part's module-level expressions run each time the part is
+instantiated, which is once per compilation that needs it.
 
 ## 4. Host interface
 
@@ -728,14 +735,16 @@ expander.
   | `%atom` | `(struct (field kind i32) (field value i32))` | characters (kind 0), `#t` (1), `()` (2) |
   | `%syntax` | `(struct (field e eqref) (field scopes eqref) (field srcloc eqref) (field props eqref))` | syntax objects |
   | `%srcloc` | `(struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32))` | source locations |
-  | `%table` | `(array (mut eqref))` | the intern table and the handle table |
+  | `%table` | `(array (mut eqref))` | the intern table, the handle table and a part's quoted data |
   | `%integer` | `(struct (field negative i32) (field magnitude i64))` | integers beyond the fixnum range |
   | `%flonum` | `(struct (field value f64))` | flonums |
 
 - **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
-  single `%atom` objects made at start. Quoted strings in compiled code are
-  built with `array.new_fixed` of `%string`, which the compiler declares in
-  the module; wasm makes it the same type as the library's.
+  single `%atom` objects made at start. A part's quoted data is a
+  `%string` made with `array.new_data` from its data segment, which
+  `%deserialize` turns into a `%table` of objects (the format is in
+  `compiler/syntax.sub`). The compiler declares these types in the part;
+  wasm makes them the same types as the library's.
 - **Syntax objects** are wrapped eagerly: the datum of a list is a list
   whose elements are syntax objects. Scopes are a list of fixnum scope ids
   in ascending order; scope 0 is the core scope. The source of a srcloc is

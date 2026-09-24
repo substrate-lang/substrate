@@ -10,7 +10,7 @@
 ;; A module imports only what its code uses (spec 3.3). Code that needs a
 ;; memory or table must be given one: defined, or imported from a module.
 (library (stage0 compile)
-  (export compile-module current-syntax-infos fixnum-min fixnum-max set-string-type!)
+  (export compile-module current-syntax-infos fixnum-min fixnum-max set-syntax-types!)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 wasm))
 
   ;; symbol -> func-info or global-info for the syntax library's exports;
@@ -20,12 +20,14 @@
   (define fixnum-min (- (expt 2 30)))
   (define fixnum-max (- (expt 2 30) 1))
 
-  ;; The syntax library's string type, set once the library is compiled.
-  ;; Quoted strings are built with array.new_fixed of it, so a module that
-  ;; quotes one declares the library's recursion group, and wasm makes it
-  ;; the library's type (spec appendix A).
+  ;; The syntax library's string and table types, set once the library is
+  ;; compiled. A module's quoted data is a string of bytes that the library
+  ;; turns into a table of objects (spec 3.5), so a module that quotes data
+  ;; declares the library's recursion group, and wasm makes these the
+  ;; library's types (spec appendix A).
   (define string-type #f)
-  (define (set-string-type! t) (set! string-type t))
+  (define table-type #f)
+  (define (set-syntax-types! string table) (set! string-type string) (set! table-type table))
 
   (define eqref (make-ref #t 'eq))
 
@@ -118,7 +120,8 @@
 
   ;; ---- module state -------------------------------------------------------------
 
-  ;; A synthesized global: a quoted constant or a function's table index.
+  ;; A synthesized global: a function's table index (kind fidx), or the
+  ;; table of quoted data (kind literals).
   (define-record-type synth (fields kind datum))
 
   (define-record-type mstate
@@ -129,7 +132,8 @@
             (mutable fidx)           ; alist func-info -> synth
             (mutable uses-memory)    ; where code first needs a memory, or #f
             (mutable uses-table)     ; where code first needs a table, or #f
-            (mutable uses-gc)))      ; does code allocate or inspect GC objects?
+            (mutable uses-gc)        ; does code allocate or inspect GC objects?
+            (mutable literals)))     ; the quoted data, or #f
 
   (define (external? ms info-instance) (not (equal? info-instance (mstate-self ms))))
 
@@ -456,44 +460,95 @@
       [(nop) () (finish '((nop)) '())]
       [(quote) (d)
        ;; A quoted fixnum or #f is a constant, and so are '() and #t, which
-       ;; are globals of the syntax library; other data is built once.
+       ;; are globals of the syntax library. Other data is an entry in the
+       ;; module's table of quoted data.
        (cond [(and (integer? d) (exact? d) (<= fixnum-min d fixnum-max))
               (finish `((i32.const ,d) (ref.i31)) (list (make-ref #f 'i31)))]
              [(eq? d #f) (finish '((ref.null eq)) (list eqref))]
              [(datum-global d) => (lambda (g) (sub `(gref ,g) expected tail?))]
-             [else (finish `((global.get ,(new-synth! ms 'const d))) (list eqref))])]
+             [else
+              (let* ([lits (module-literals ms)] [i (literal-index! lits d)])
+                (mstate-uses-gc-set! ms #t)
+                (finish `((global.get ,(literals-table lits)) (i32.const ,i) (array.get ,table-type)) (list eqref)))])]
       [else (fail "internal: unknown kernel form ~s" (car e))]))
 
-  ;; ---- quoted constants ---------------------------------------------------------
+  ;; ---- quoted data ----------------------------------------------------------------
 
-  ;; Code that builds datum d with the syntax library's functions and leaves
-  ;; it on the stack as an eqref. tmp is unused scratch kept for symmetry.
-  (define (build-datum d ex)
-    (define (call name) `((call ,(ex name))))
-    (define (build d) (build-datum d ex))
-    (define (i32 n) `((i32.const ,n)))
-    (define (string-code s)
+  ;; A module's quoted data, other than the constants, is written as it is
+  ;; met into one string of bytes, which becomes a passive data segment; the
+  ;; syntax library's %deserialize turns it into a table of objects when the
+  ;; module starts (spec 3.5, compiler/syntax.sub for the format). Each object
+  ;; is written after the objects it is made of. Equal immutable objects are
+  ;; written once and shared, as Scheme allows of literals; strings, which
+  ;; are mutable, never are. table: the synth holding the table.
+  (define-record-type literals (fields port get table (mutable count) shared))
+
+  (define (module-literals ms)
+    (or (mstate-literals ms)
+        (let-values ([(port get) (open-bytevector-output-port)])
+          (let ([lits (make-literals port get (new-synth! ms 'literals #f) 0 (make-hashtable equal-hash equal?))])
+            (mstate-literals-set! ms lits)
+            lits))))
+
+  ;; The index of datum d in the table, writing it if need be.
+  (define (literal-index! lits d)
+    (define p (literals-port lits))
+    ;; Write an object with write!, unless one with the same key was; a key
+    ;; of #f is never shared.
+    (define (object! key write!)
+      (or (and key (hashtable-ref (literals-shared lits) key #f))
+          (let ([i (literals-count lits)])
+            (write!)
+            (literals-count-set! lits (+ i 1))
+            (when key (hashtable-set! (literals-shared lits) key i))
+            i)))
+    (define (utf8! s)
       (let ([bv (string->utf8 s)])
-        (append (apply append (map i32 (bytevector->u8-list bv)))
-                `((array.new_fixed ,string-type ,(bytevector-length bv))))))
-    (cond [(and (integer? d) (exact? d))
-           (if (<= fixnum-min d fixnum-max)
-               `((i32.const ,d) (ref.i31))
-               ;; Beyond the fixnum range: a sign and a 64-bit magnitude.
-               (append (i32 (if (< d 0) 1 0)) `((i64.const ,(s64 (abs d)))) (call '%make-integer)))]
-          [(flonum? d) (append `((f64.const ,d)) (call 'flonum))]
-          [(eq? d #f) '((ref.null eq))]
-          [(eq? d #t) (call '%the-true)]
-          [(null? d) (call '%the-nil)]
-          [(char? d) (append (i32 (char->integer d)) (call 'integer->char))]
-          [(string? d) (string-code d)]
-          [(symbol? d) (append (string-code (symbol->string d)) (call 'intern))]
-          [(pair? d) (append (build (car d)) (build (cdr d)) (call 'cons))]
-          [(stx? d) (append (build (stx-e d)) (build (stx-scopes d))
-                            (build (stx-srcloc d)) (build (stx-props d)) (call '%make-syntax))]
-          [(srcloc? d) (append (build (srcloc-source d)) (i32 (srcloc-line d)) (i32 (srcloc-col d))
-                               (i32 (srcloc-pos d)) (i32 (srcloc-span d)) (call '%make-srcloc))]
-          [else (fail "cannot quote ~s" d)]))
+        (uleb! p (bytevector-length bv))
+        (put-bytevector p bv)))
+    (define (u64! n)
+      (let ([bv (make-bytevector 8)])
+        (bytevector-u64-set! bv 0 n (endianness little))
+        (put-bytevector p bv)))
+    (let loop ([d d])
+      (cond
+        [(eq? d #f) (object! '(0) (lambda () (put-u8 p 0)))]
+        [(and (integer? d) (exact? d) (<= fixnum-min d fixnum-max))
+         (object! (list 1 d) (lambda () (put-u8 p 1) (sleb! p d)))]
+        [(and (integer? d) (exact? d))
+         ;; Beyond the fixnum range: a sign and a 64-bit magnitude.
+         (object! (list 10 d) (lambda () (put-u8 p 10) (put-u8 p (if (< d 0) 1 0)) (u64! (abs d))))]
+        [(flonum? d)
+         (object! (list 11 d) (lambda ()
+                                (let ([bv (make-bytevector 8)])
+                                  (put-u8 p 11)
+                                  (bytevector-ieee-double-set! bv 0 d (endianness little))
+                                  (put-bytevector p bv))))]
+        [(eq? d #t) (object! '(2) (lambda () (put-u8 p 2)))]
+        [(null? d) (object! '(3) (lambda () (put-u8 p 3)))]
+        [(char? d) (object! (list 4 d) (lambda () (put-u8 p 4) (uleb! p (char->integer d))))]
+        [(pair? d)
+         (let* ([a (loop (car d))] [b (loop (cdr d))])
+           (object! (list 5 a b) (lambda () (put-u8 p 5) (uleb! p a) (uleb! p b))))]
+        [(symbol? d) (object! (list 6 d) (lambda () (put-u8 p 6) (utf8! (symbol->string d))))]
+        [(string? d) (object! #f (lambda () (put-u8 p 7) (utf8! d)))]
+        [(stx? d)
+         (let* ([e (loop (stx-e d))] [s (loop (stx-scopes d))]
+                [l (loop (stx-srcloc d))] [r (loop (stx-props d))])
+           (object! (list 8 e s l r) (lambda () (put-u8 p 8) (for-each (lambda (i) (uleb! p i)) (list e s l r)))))]
+        [(srcloc? d)
+         (let ([src (loop (srcloc-source d))]
+               [fields (list (srcloc-line d) (srcloc-col d) (srcloc-pos d) (srcloc-span d))])
+           (object! (cons* 9 src fields)
+                    (lambda () (put-u8 p 9) (uleb! p src) (for-each (lambda (n) (sleb! p n)) fields))))]
+        [else (fail "cannot quote ~s" d)])))
+
+  ;; The data segment: the number of objects, then the objects.
+  (define (literals-bytes lits)
+    (let-values ([(port get) (open-bytevector-output-port)])
+      (uleb! port (literals-count lits))
+      (put-bytevector port ((literals-get lits)))
+      (get)))
 
   ;; ---- module -------------------------------------------------------------------
 
@@ -548,7 +603,7 @@
   ;; module bytes, the instance names it imports from, and whether its code
   ;; uses GC objects.
   (define (compile-module forms self)
-    (define ms (make-mstate self '() '() '() '() #f #f #f))
+    (define ms (make-mstate self '() '() '() '() #f #f #f #f))
     (define func-forms (filter (lambda (f) (eq? (car f) 'func)) forms))
     (define global-forms (filter (lambda (f) (eq? (car f) 'global)) forms))
     (define data-forms (filter (lambda (f) (eq? (car f) 'data)) forms))
@@ -637,12 +692,17 @@
                      forms)))
     ;; Table registration for func-index and quoted constants, in the order
     ;; the code above met them.
+    ;; The quoted data, complete now that all code is compiled. Its segment
+    ;; follows the module's own data segments.
+    (define literal-segment (and (mstate-literals ms) (literals-bytes (mstate-literals ms))))
     (define setup-code
       (apply append
              (map-lr (lambda (s)
                        (if (eq? (synth-kind s) 'fidx)
                            `((ref.func ,(synth-datum s)) (i32.const 1) (table.grow 0) (global.set ,s))
-                           (append (build-datum (synth-datum s) ex) `((global.set ,s)))))
+                           `((i32.const 0) (i32.const ,(bytevector-length literal-segment))
+                             (array.new_data ,string-type ,(length data-forms))
+                             (call ,(ex '%deserialize)) (global.set ,s))))
                      (reverse (mstate-synths ms)))))
     (define start-code (append setup-code init-code))
     (define has-start? (not (null? start-code)))
@@ -733,6 +793,7 @@
                   [(struct.get struct.get_s struct.get_u struct.set array.new_fixed)
                    (list (car i) (ti (cadr i)) (caddr i))]
                   [(array.copy) (list 'array.copy (ti (cadr i)) (ti (caddr i)))]
+                  [(array.new_data) (list 'array.new_data (ti (cadr i)) (caddr i))]
                   [else i]))
               instrs))
     (define (resolve-bt bt)
@@ -777,7 +838,7 @@
                global-forms)
        (map-lr (lambda (s) (if (eq? (synth-kind s) 'fidx)
                                (list 'i32 #t '((i32.const 0)))
-                               (list (rv eqref) #t '((ref.null eq)))))
+                               (list (rv (make-ref #t table-type)) #t `((ref.null ,(heap-index table-type))))))
                synths)))
 
     ;; A module's memory and table are exported as "memory" and "table":
@@ -824,7 +885,8 @@
                      wglobals exports
                      (and has-start? start-index)
                      (reverse declared)
-                     (map-lr (lambda (f) (cons (data-info-offset (cadr f)) (data-info-bytes (cadr f)))) data-forms)
+                     (append (map-lr (lambda (f) (cons (data-info-offset (cadr f)) (data-info-bytes (cadr f)))) data-forms)
+                             (if literal-segment (list (cons #f literal-segment)) '()))
                      (cons self names))))
 
     (values bytes

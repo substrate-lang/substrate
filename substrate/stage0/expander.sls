@@ -127,9 +127,10 @@
             (parameterize ([current-syntax-infos #f])
               (let* ([forms (lower-forms (expand-module-body (profiled-read-file library-path)) 0)]
                      [forms (append (storage-forms 0) forms)])
-                (for-each (lambda (f) (when (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) '%string))
-                                        (set-string-type! (cadr f))))
-                          forms)
+                (let ([type (lambda (name)
+                              (cadr (find (lambda (f) (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) name)))
+                                          forms)))])
+                  (set-syntax-types! (type '%string) (type '%table)))
                 (let-values ([(bytes imports gc?) (profiled-compile-module forms "syntax")])
                   (let ([table (make-eq-hashtable)])
                     (for-each (lambda (f)
