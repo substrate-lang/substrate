@@ -46,12 +46,17 @@
   (define modules-by-name (make-hashtable string-hash string=?)) ; instance name stem -> module
   (define installed (make-hashtable string-hash string=?))       ; "path|shift" -> #t
 
-  ;; phase: an integer, or 'all
-  (define-record-type binding (fields scopes phase key))
+  ;; phase: an integer, or 'all. namespace: type or value (spec 6.1).
+  (define-record-type binding (fields scopes phase namespace key))
 
   ;; meaning: (core name) (prim name) (func info) (global info) (data info)
   ;;          (type info) (local key) (label key) (macro transformer-info)
   ;;          (static getter-info)
+  ;; A type meaning is in the type namespace, every other one in the value
+  ;; namespace. Locals and labels are bound before their meaning is set, so
+  ;; #f counts as a value.
+  (define (meaning-namespace meaning)
+    (if (and meaning (eq? (car meaning) 'type)) 'type 'value))
 
   ;; A compiled (or compiling) module. parts: phase -> part. requires: list
   ;; of (module . shift). provides: list of (symbol . meaning). entries: its
@@ -73,7 +78,7 @@
 
   ;; The state of one module's compilation.
   (define-record-type comp
-    (fields module store (mutable chunk-counter) (mutable syntax-phases) (mutable use-site-scopes)
+    (fields module store (mutable chunk-counter) (mutable use-site-scopes)
             (mutable runtime-free-form) phase-forms memories tables (mutable provide-ids)
             (mutable require-names)))          ; ((name . phase) . module)
 
@@ -92,7 +97,7 @@
   (define (ensure-library!)
     (unless syntax-lib
       (let* ([m (make-unit library-path library-path "syntax" 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
-             [c (make-comp m #f 0 '() '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '())])
+             [c (make-comp m #f 0 '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '())])
         (with-comp c
           (lambda ()
             (parameterize ([current-syntax-infos #f])
@@ -171,7 +176,9 @@
 
   (define (bind-raw! sym scopes phase meaning)
     (let ([key (fresh-key!)])
-      (hashtable-update! bindings sym (lambda (l) (cons (make-binding scopes phase key) l)) '())
+      (hashtable-update! bindings sym
+                         (lambda (l) (cons (make-binding scopes phase (meaning-namespace meaning) key) l))
+                         '())
       (hashtable-set! meanings key meaning)
       key))
 
@@ -189,6 +196,7 @@
   (define (check-unbound! id phase meaning)
     (for-each (lambda (b)
                 (when (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
+                           (eq? (binding-namespace b) (meaning-namespace meaning))
                            (not (equal? (hashtable-ref meanings (binding-key b) #f) meaning)))
                   (raise-compile-error id "~a is already bound~a" (stx-e id)
                                        (if (> phase 0) (format " at phase ~a" phase) ""))))
@@ -207,10 +215,11 @@
     (let ([p (binding-phase b)])
       (or (eq? p 'all) (eqv? p phase))))
 
-  ;; The key id refers to at phase, or #f if unbound.
-  (define (resolve id phase)
+  ;; The key id refers to at phase in namespace ns, or #f if unbound.
+  (define (resolve id phase ns)
     (let* ([scopes (stx-scopes id)]
-           [cands (filter (lambda (b) (and (phase-matches? b phase) (scopes-subset? (binding-scopes b) scopes)))
+           [cands (filter (lambda (b) (and (phase-matches? b phase) (eq? (binding-namespace b) ns)
+                                           (scopes-subset? (binding-scopes b) scopes)))
                           (hashtable-ref bindings (stx-e id) '()))])
       (if (null? cands)
           #f
@@ -226,8 +235,14 @@
                       cands)
             (binding-key best)))))
 
+  ;; What id means at phase in the value namespace. Only type positions
+  ;; (parse-heap, type-of) look in the type namespace, with type-meaning-of.
   (define (meaning-of id phase)
-    (let ([key (resolve id phase)])
+    (let ([key (resolve id phase 'value)])
+      (and key (hashtable-ref meanings key #f))))
+
+  (define (type-meaning-of id phase)
+    (let ([key (resolve id phase 'type)])
       (and key (hashtable-ref meanings key #f))))
 
   ;; Is id bound to the core form `name`?
@@ -373,7 +388,7 @@
          (ensure-library!)
          (let* ([name (fresh-unit-name path)]
                 [m (make-unit path source name 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
-                [c (make-comp m (new-cstore #t) 0 '() '() #f
+                [c (make-comp m (new-cstore #t) 0 '() #f
                               (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '())])
            (hashtable-set! registry path m)
            (hashtable-set! modules-by-name name m)
@@ -406,14 +421,18 @@
   ;; Compile each phase's part, resolve provides, check (runtime-free).
   (define (finish-module! c)
     (let ([m (comp-module c)])
+      ;; A provided name exports its binding in each namespace it has one.
       (unit-provides-set!
        m
-       (map-lr (lambda (id)
-                 (let ([meaning (meaning-of id 0)])
-                   (unless (and meaning (memq (car meaning) '(func global macro static type data)))
-                     (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
-                   (cons (stx-e id) meaning)))
-               (reverse (comp-provide-ids c))))
+       (apply append
+              (map-lr (lambda (id)
+                        (let* ([value (let ([v (meaning-of id 0)])
+                                        (and v (memq (car v) '(func global macro static data)) v))]
+                               [found (filter values (list (type-meaning-of id 0) value))])
+                          (when (null? found)
+                            (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
+                          (map (lambda (meaning) (cons (stx-e id) meaning)) found)))
+                      (reverse (comp-provide-ids c)))))
       (let ([phases (list-sort < (let-values ([(ks vs) (hashtable-entries (comp-phase-forms c))])
                                    (let ([ps (vector->list ks)]) (if (memv 0 ps) ps (cons 0 ps)))))])
         (for-each (lambda (p)
@@ -536,9 +555,8 @@
   (define (parse-heap s phase)
     (cond [(and (id? s) (memq (stx-e s) abstract-heaps)) (stx-e s)]
           [(id? s)
-           (let ([m (meaning-of s phase)])
-             (unless (and m (eq? (car m) 'type))
-               (raise-compile-error s "~a is not a type" (stx-e s)))
+           (let ([m (type-meaning-of s phase)])
+             (unless m (raise-compile-error s "~a is not a type" (stx-e s)))
              (cadr m))]
           [else (raise-compile-error s "expected a heap type, got ~s" (stx->datum s))]))
 
@@ -574,8 +592,10 @@
   (define (parse-storage s phase)
     (if (and (id? s) (memq (stx-e s) '(i8 i16))) (stx-e s) (parse-type s phase)))
 
-  ;; (type name (struct (field fname ftype) ...)) or (type name (array etype)).
-  ;; The name is bound first, so a type may refer to itself.
+  ;; (type name def), where def is (struct (field fname ftype) ...),
+  ;; (array etype), or (sub [final] [super] def) as in wasm (spec 5.3). A
+  ;; def without sub is final, with no supertype. The name is bound before
+  ;; the fields are read, so a type may refer to itself.
   (define (declare-type f phase)
     (let ([parts (stx-list-of f 'type)])
       (unless (and (= (length parts) 3) (id? (cadr parts)) (stx->list (caddr parts))
@@ -583,30 +603,75 @@
         (raise-compile-error f "expected (type name (struct field ...)) or (type name (array type))"))
       (when (memq (stx-e (cadr parts)) (append abstract-heaps '(i32 i64 f32 f64 i8 i16)))
         (raise-compile-error (cadr parts) "~a names a built-in type" (stx-e (cadr parts))))
-      (let* ([def (stx->list (caddr parts))]
-             [kind (stx-e (car def))])
-        (unless (memq kind '(struct array))
-          (raise-compile-error (caddr parts) "a type is (struct field ...) or (array type)"))
-        (let ([info (make-type-info (stx-e (cadr parts)) kind #f)])
-          (bind-definition! (cadr parts) phase (list 'type info))
-          (type-info-fields-set!
-           info
-           (if (eq? kind 'struct)
-               (map-lr (lambda (fs)
-                         (let ([fp (stx->list fs)])
-                           (unless (and fp (= (length fp) 3) (core-name? (car fp) 'field) (id? (cadr fp)))
-                             (raise-compile-error fs "expected (field name type)"))
-                           (cons (stx-e (cadr fp)) (parse-field-type (caddr fp) phase))))
-                       (cdr def))
-               (begin
-                 (unless (= (length def) 2) (raise-compile-error (caddr parts) "expected (array type)"))
-                 (parse-field-type (cadr def) phase))))
-          (list 'type info)))))
+      (let-values ([(def final? super) (parse-sub (caddr parts) phase)])
+        (let ([kind (stx-e (car (stx->list def)))])
+          (unless (memq kind '(struct array))
+            (raise-compile-error def "a type is (struct field ...), (array type) or (sub ...)"))
+          (when super
+            (unless (eq? (type-info-kind super) kind)
+              (raise-compile-error (caddr parts) "a~a type cannot have the ~a type ~a as its supertype"
+                                   (if (eq? kind 'struct) " struct" "n array") (type-info-kind super)
+                                   (type-info-name super)))
+            (when (type-info-final? super)
+              (raise-compile-error (caddr parts) "~a is final: it cannot be a supertype" (type-info-name super))))
+          (let ([info (make-type-info (stx-e (cadr parts)) kind #f super final?)])
+            (bind-definition! (cadr parts) phase (list 'type info))
+            (type-info-fields-set! info (parse-type-fields def kind phase))
+            (when super (check-subtype-fields! info super def))
+            (list 'type info))))))
+
+  ;; (sub [final] [super] def) -> def, final?, super's type-info or #f.
+  (define (parse-sub s phase)
+    (let ([l (stx->list s)])
+      (if (core-name? (car l) 'sub)
+          (let* ([rest (cdr l)]
+                 [final? (and (pair? rest) (core-name? (car rest) 'final))]
+                 [rest (if final? (cdr rest) rest)])
+            (case (length rest)
+              [(1) (values (car rest) final? #f)]
+              [(2) (values (cadr rest) final? (type-of (car rest) phase))]
+              [else (raise-compile-error s "expected (sub [final] [supertype] (struct ...) or (array ...))")]))
+          (values s #t #f))))
+
+  (define (parse-type-fields def kind phase)
+    (let ([l (stx->list def)])
+      (if (eq? kind 'struct)
+          (map-lr (lambda (fs)
+                    (let ([fp (stx->list fs)])
+                      (unless (and fp (= (length fp) 3) (core-name? (car fp) 'field) (id? (cadr fp)))
+                        (raise-compile-error fs "expected (field name type)"))
+                      (cons (stx-e (cadr fp)) (parse-field-type (caddr fp) phase))))
+                  (cdr l))
+          (begin
+            (unless (= (length l) 2) (raise-compile-error def "expected (array type)"))
+            (parse-field-type (cadr l) phase)))))
+
+  ;; Wasm's rule for a declared supertype: a struct starts with its
+  ;; supertype's fields, and an array's element matches. An immutable field
+  ;; may narrow its type; a mutable one keeps it.
+  (define (check-subtype-fields! info super where)
+    (define (field<=? a b)                 ; (storage mutable?)
+      (and (eq? (cadr a) (cadr b))
+           (if (or (memq (car a) '(i8 i16)) (memq (car b) '(i8 i16)))
+               (eq? (car a) (car b))
+               (and (valtype<=? (car a) (car b)) (or (not (cadr a)) (valtype<=? (car b) (car a)))))))
+    (if (eq? (type-info-kind info) 'struct)
+        (let ([mine (type-info-fields info)] [theirs (type-info-fields super)])
+          (when (< (length mine) (length theirs))
+            (raise-compile-error where "~a has fewer fields than its supertype ~a"
+                                 (type-info-name info) (type-info-name super)))
+          (for-each (lambda (a b)
+                      (unless (field<=? (cdr a) (cdr b))
+                        (raise-compile-error where "~a's field ~a does not match field ~a of its supertype ~a"
+                                             (type-info-name info) (car a) (car b) (type-info-name super))))
+                    (list-head mine (length theirs)) theirs))
+        (unless (field<=? (type-info-fields info) (type-info-fields super))
+          (raise-compile-error where "~a's element type does not match its supertype ~a's"
+                               (type-info-name info) (type-info-name super)))))
 
   (define (type-of id phase)
-    (let ([m (and (id? id) (meaning-of id phase))])
-      (unless (and m (eq? (car m) 'type))
-        (raise-compile-error id "~s is not a declared type" (stx->datum id)))
+    (let ([m (and (id? id) (type-meaning-of id phase))])
+      (unless m (raise-compile-error id "~s is not a declared type" (stx->datum id)))
       (cadr m)))
 
   (define (field-index tinfo id)
@@ -724,10 +789,10 @@
                                       [(and l (= (length l) 2) (id? (car l)) (id? (cadr l))) (car l)]
                                       [else (raise-compile-error item "expected a name or [new-name name]")])]
                            [old (if (id? item) item (cadr l))]
-                           [p (assq (stx-e old) provided)])
-                      (unless p
+                           [ps (filter (lambda (p) (eq? (car p) (stx-e old))) provided)])
+                      (when (null? ps)
                         (raise-compile-error old "~a does not provide ~a" (stx-e source) (stx-e old)))
-                      (bind-import! new phase (cdr p))))
+                      (for-each (lambda (p) (bind-import! new phase (cdr p))) ps)))
                   (cdddr parts)))))
 
   ;; name:thing, with the scopes of name.
@@ -742,8 +807,6 @@
   (define (require-syntax! source phase)
     (unless (current-syntax-infos)
       (raise-compile-error source "the syntax library cannot require itself"))
-    (unless (memv phase (comp-syntax-phases current))
-      (comp-syntax-phases-set! current (cons phase (comp-syntax-phases current))))
     (let-values ([(names infos) (hashtable-entries (current-syntax-infos))])
       ;; sorted, for deterministic keys
       (map (lambda (info) (cons (func-info-name info) (list 'func info)))
@@ -751,11 +814,6 @@
                                                (symbol->string (func-info-name b))))
                       (filter (lambda (info) (not (internal-name? (func-info-name info))))
                               (vector->list infos))))))
-
-  (define (require-syntax-for s name phase)
-    (unless (memv phase (comp-syntax-phases current))
-      (raise-compile-error s "~a builds syntax-library data: add (require name syntax)~a" name
-                           (if (> phase 0) (format " at phase ~a" phase) ""))))
 
   (define (module-path-of f spec)
     (let* ([loc (stx-srcloc f)]
@@ -1001,7 +1059,7 @@
             [(3)                        ; free-identifier=?
              (let ([x (decode ms a)] [y (decode ms b)])
                (unless (and (id? x) (id? y)) (raise-compile-error api-where "free-identifier=?: expected identifiers"))
-               (let ([kx (resolve x api-phase)] [ky (resolve y api-phase)])
+               (let ([kx (resolve x api-phase 'value)] [ky (resolve y api-phase 'value)])
                  (if (if (or kx ky) (eqv? kx ky) (eq? (stx-e x) (stx-e y))) 1 0)))]
             [else (raise-compile-error api-where "unknown expander query ~a" op)])))))
 
@@ -1018,8 +1076,11 @@
   ;; its data (quasiquote, quasisyntax).
   (define (syntax-call name . args) (list 'call (syntax-info name) args))
 
+  ;; s has no value binding. It may still name a type.
   (define (unbound s sym phase)
-    (raise-compile-error s "unbound identifier ~a~a" sym (if (> phase 0) (format " at phase ~a" phase) "")))
+    (if (type-meaning-of s phase)
+        (raise-compile-error s "~a is a type, not a value" sym)
+        (raise-compile-error s "unbound identifier ~a~a" sym (if (> phase 0) (format " at phase ~a" phase) ""))))
 
   (define (expand-expr s phase)
     (let ([e (stx-e s)])
@@ -1033,7 +1094,6 @@
              [(static) (raise-compile-error s "~a is static information: read it with syntax-local-value" e)]
              [(func) (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e)]
              [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
-             [(type) (raise-compile-error s "~a is a type" e)]
              [(core prim) (raise-compile-error s "bad use of ~a" e)]
              [(label) (raise-compile-error s "~a is a label" e)]
              [else (unbound s e phase)]))]
@@ -1049,7 +1109,7 @@
                [(func) (let ([args (or (stx->list (cdr e)) (raise-compile-error s "bad call syntax"))])
                          (at s (list 'call (cadr m) (map-lr (lambda (a) (expand-expr a phase)) args))))]
                [(local global) (raise-compile-error s "~a is a variable, not a function" (stx-e head))]
-               [(static data label type) (raise-compile-error s "~a is not a function or a macro" (stx-e head))]
+               [(static data label) (raise-compile-error s "~a is not a function or a macro" (stx-e head))]
                [else (unbound head (stx-e head) phase)])))]
         [(null? e) (raise-compile-error s "empty form ()")]
         ;; Unquoted literals are wasm numbers (spec 5.4).
@@ -1134,19 +1194,15 @@
       (case name
         [(quote)
          (arity-check (= (length parts) 2))
-         (require-syntax-for s name phase)
          (list 'quote (stx->datum (cadr parts)))]
         [(quote-syntax)
          (arity-check (= (length parts) 2))
-         (require-syntax-for s name phase)
          (list 'quote (cadr parts))]
         [(quasiquote)
          (arity-check (= (length parts) 2))
-         (require-syntax-for s name phase)
          (quasi (cadr parts) 0 phase 'quasiquote 'unquote 'unquote-splicing #f)]
         [(quasisyntax)
          (arity-check (= (length parts) 2))
-         (require-syntax-for s name phase)
          (quasi (cadr parts) 0 phase 'quasisyntax 'unsyntax 'unsyntax-splicing #t)]
         [(unquote unquote-splicing unsyntax unsyntax-splicing)
          (raise-compile-error s "~a is not inside a quasi form" name)]

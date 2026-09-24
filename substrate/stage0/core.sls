@@ -32,6 +32,7 @@
           global-info-instance global-info-instance-set! global-info-export global-info-export-set!
           make-data-info data-info? data-info-name data-info-offset data-info-bytes
           make-type-info type-info? type-info-name type-info-kind type-info-fields type-info-fields-set!
+          type-info-super type-info-final?
           ref-type? make-ref ref-nullable? ref-heap abstract-heaps numeric-type?
           valtype<=? types<=? valtype-join valtype->string unpacked defaultable?
           fresh-key! reset-keys!)
@@ -50,8 +51,10 @@
 
   ;; A declared GC type. kind is struct or array. A struct's fields are a
   ;; list of (name storage mutable?); an array's are one (storage mutable?).
-  ;; storage is a value type, or i8 or i16.
-  (define-record-type type-info (fields name kind (mutable fields)))
+  ;; storage is a value type, or i8 or i16. super: the declared supertype's
+  ;; type-info, or #f. final?: whether other types may declare it as their
+  ;; supertype.
+  (define-record-type type-info (fields name kind (mutable fields) super final?))
 
   ;; ---- value types ----------------------------------------------------------
 
@@ -63,6 +66,10 @@
   (define (ref-nullable? t) (cadr t))
   (define (ref-heap t) (caddr t))
 
+  ;; Declared types are compared by declaration: a declared type is a subtype
+  ;; only of itself, the supertypes it names, and the abstract types above
+  ;; them. Wasm compares declared types by structure, so two declarations of
+  ;; the same shape are one type to wasm and two types here (spec 5.3).
   (define (heap<=? a b)
     (cond [(eq? a b) #t]
           [(eq? a 'none) (or (type-info? b) (memq b '(any eq i31 struct array)))]
@@ -72,7 +79,17 @@
           [(eq? a 'eq) (eq? b 'any)]
           [(type-info? a)
            (or (memq b '(eq any))
-               (eq? b (type-info-kind a)))]
+               (eq? b (type-info-kind a))
+               (and (type-info-super a) (heap<=? (type-info-super a) b)))]
+          [else #f]))
+
+  ;; The least heap type above both a and b.
+  (define (heap-join a b)
+    (cond [(heap<=? b a) a]
+          [(heap<=? a b) b]
+          [(type-info? a) (heap-join (or (type-info-super a) (type-info-kind a)) b)]
+          [(and (heap<=? a 'eq) (heap<=? b 'eq)) 'eq]
+          [(and (heap<=? a 'any) (heap<=? b 'any)) 'any]
           [else #f]))
 
   (define (valtype<=? a b)
@@ -89,10 +106,8 @@
     (cond [(valtype<=? a b) b]
           [(valtype<=? b a) a]
           [(and (ref-type? a) (ref-type? b))
-           (let ([n (or (ref-nullable? a) (ref-nullable? b))])
-             (cond [(and (heap<=? (ref-heap a) 'eq) (heap<=? (ref-heap b) 'eq)) (make-ref n 'eq)]
-                   [(and (heap<=? (ref-heap a) 'any) (heap<=? (ref-heap b) 'any)) (make-ref n 'any)]
-                   [else #f]))]
+           (let ([h (heap-join (ref-heap a) (ref-heap b))])
+             (and h (make-ref (or (ref-nullable? a) (ref-nullable? b)) h)))]
           [else #f]))
 
   (define (unpacked storage) (if (memq storage '(i8 i16)) 'i32 storage))

@@ -23,7 +23,7 @@
   ;; The syntax library's string type. Quoted strings are built with
   ;; array.new_fixed of this type; wasm treats identical type definitions in
   ;; different modules as the same type (spec appendix A).
-  (define string-type (make-type-info '%string 'array '(i8 #t)))
+  (define string-type (make-type-info '%string 'array '(i8 #t) #f #t))
 
   (define eqref (make-ref #t 'eq))
 
@@ -473,12 +473,15 @@
 
   (define (const-op t) (string->symbol (string-append (symbol->string t) ".const")))
 
-  ;; Every type-info mentioned anywhere in x, dependencies first.
+  ;; Every type-info mentioned anywhere in x, dependencies first: its
+  ;; supertype, then the types its fields mention. Each type is its own
+  ;; recursion group, so a type may mention itself but not a later type.
   (define (collect-types x)
     (let ([found '()] [visiting '()])
       (define (add! t)
         (unless (or (memq t found) (memq t visiting))
           (set! visiting (cons t visiting))
+          (walk (type-info-super t))
           (walk (type-info-fields t))
           (set! found (cons t found))))
       (define (walk x)
@@ -722,9 +725,11 @@
 
     (define gc-type-entries
       (map-lr (lambda (t)
-                (if (eq? (type-info-kind t) 'struct)
-                    (list 'struct (map (lambda (f) (list (rstorage (cadr f)) (caddr f))) (type-info-fields t)))
-                    (list 'array (list (rstorage (car (type-info-fields t))) (cadr (type-info-fields t))))))
+                (list 'sub (type-info-final? t)
+                      (if (type-info-super t) (list (heap-index (type-info-super t))) '())
+                      (if (eq? (type-info-kind t) 'struct)
+                          (list 'struct (map (lambda (f) (list (rstorage (cadr f)) (caddr f))) (type-info-fields t)))
+                          (list 'array (list (rstorage (car (type-info-fields t))) (cadr (type-info-fields t)))))))
               gc-types))
 
     (define bytes

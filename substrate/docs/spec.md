@@ -119,7 +119,8 @@ them in Chez; in a run-time store they trap.
   its transformers, its `define-static` values and its `begin-for-syntax`
   code.
 - `(provide id ...)` names the phase-0 bindings other modules get:
-  functions, globals, macros, static values, types and data.
+  functions, globals, macros, static values, types and data. A name bound
+  both as a type and as a value provides both.
 - `(require name source item ...)` imports what another module provides.
   `source` is `"path"` (relative to the requiring file) or `syntax` (the
   syntax library, section 2).
@@ -133,9 +134,9 @@ them in Chez; in a run-time store they trap.
   - Requiring the same module again is harmless; a name that already names
     another module at that phase, and cycles, are errors.
   - Qualified names are ordinary identifiers: `print:write-int` is one
-    symbol. Every kind of binding shares one namespace per phase, and
-    binding a name twice at the same phase, by definition or import, is an
-    error.
+    symbol. An import binds the name in each namespace the source provides
+    it in (6.1). Binding a name twice in one namespace at the same phase,
+    by definition or import, is an error.
 - Expansion must run phase-1 code before the module is finished: a macro
   works on the line after its definition. So while a module is expanded,
   its phase ≥ 1 code is also compiled and instantiated in **chunks**, one
@@ -242,8 +243,18 @@ quotation and compile-time forms.
   there is none. Function types in imports and `call-indirect` are written
   `(t ... -> t ...)`.
 - Types are checked with wasm's subtyping: `(ref T)` fits where
-  `(ref null T)` is expected, a declared struct type fits `structref`,
-  every struct, array and `i31ref` fits `eqref`, and so on.
+  `(ref null T)` is expected, a declared struct type fits `structref` and
+  its declared supertypes, every struct, array and `i31ref` fits `eqref`,
+  and so on.
+- **Declared types are compared by declaration.** Two `type` forms make two
+  types, even when they have the same fields, and a declared type fits
+  another only through the supertypes it names. Wasm compares declared
+  types by structure instead, and so do its run-time tests: `ref.test` and
+  `ref.cast` cannot tell apart two declarations of the same shape. A cast
+  can therefore give the checker a type the value was not declared with,
+  though never one of a different shape. Code that must tell same-shaped
+  values apart at run time stores the difference in the value, as
+  `lib/struct.sub` does with a brand per variant.
 
 ### 5.2 Module-level forms
 
@@ -256,6 +267,7 @@ quotation and compile-time forms.
 (data name offset "bytes" ...)      ; active segment at offset in memory
 (type name (struct (field fname ftype) ...))   ; ftype: storage or (mut storage)
 (type name (array ftype))                      ; storage: a type, i8 or i16
+(type name (sub [final] [super] def))          ; def: (struct ...) or (array ...)
 (require name source item ...)      ; source: "path" or syntax; item: x or [new old]
 (provide id ...)                    ; phase 0 only
 (runtime-free)                      ; see 3.4
@@ -272,7 +284,15 @@ expands macro uses at the head of each form, registers definitions, runs
 splices `begin`. The second pass expands function bodies and expressions. So
 functions may be mutually recursive, and a macro must be defined before it
 is used. A transformer must come from an earlier `begin-for-syntax`, or
-from a module required inside one. A declared type may refer to itself.
+from a module required inside one.
+
+Type declarations follow wasm. A type without `sub` is final and has no
+supertype. `(sub super def)` declares a subtype of `super`, which must be
+an earlier non-final type of the same kind; a struct starts with its
+supertype's fields, and a field may narrow its type only if it is
+immutable. `(sub final ...)` has no subtypes. A declared type may refer to
+itself, and to earlier types, but not to later ones: each type is its own
+recursion group in v0.
 
 ### 5.3 Expressions
 
@@ -315,8 +335,8 @@ GC instructions take their type and field immediates by name:
   emitted.
 - Non-final expressions in a body are dropped. An `if` without an else,
   and any expression whose value is unused, has no value. The branches of
-  an `if` may differ when one reference type contains the other, or both
-  fit `eqref` or `anyref`.
+  an `if` may differ when both are references: its type is the least type
+  both fit, such as their common declared supertype, or `eqref`.
 - A call in tail position whose callee's result types fit the function's
   is emitted as `return_call`, so recursion in tail position runs in
   constant stack.
@@ -326,8 +346,11 @@ GC instructions take their type and field immediates by name:
 
 ### 5.4 Literals
 
-Unquoted literals are wasm numbers. `quote` turns a literal into a value,
-and needs the syntax library required at that phase.
+Unquoted literals are wasm numbers. `quote` turns a literal into a value.
+Values are syntax-library data, so a part that quotes imports from the
+syntax library, as it would for any library function it calls; at phase 0
+that is visible in what the program links, and `(runtime-free)` rejects
+it (3.4).
 
 | Source | Unquoted | Quoted |
 |---|---|---|
@@ -354,10 +377,16 @@ the module: its own definitions, `import`, and `require`.
 
 Binding follows Flatt's sets of scopes. Every binding form (`func`, `let`,
 `let*`, `block`, `loop`) creates a fresh scope and adds it to the syntax it
-governs. A binding is recorded as (symbol, scope set, phase) and maps to a
-key. An identifier refers to the binding whose scope set is the largest
-subset of its own. If there is no unique largest subset, the reference is an
-error.
+governs. A binding is recorded as (symbol, scope set, phase, namespace)
+and maps to a key. An identifier refers to the binding whose scope set is
+the largest subset of its own. If there is no unique largest subset, the
+reference is an error.
+
+- **Namespaces.** Types are bound in the type namespace and everything else
+  in the value namespace. Positions that take a type (`(ref T)`, the `T`
+  of a GC instruction, a supertype) look up types; all others look up
+  values. So one name can be both, as a struct library needs for a type
+  and its constructor or static information.
 
 - Core bindings have the scope set `{0}`, which every module body carries.
   A module's own definitions have more scopes, so they shadow core names.
@@ -433,11 +462,12 @@ self-hosted expander will hold references directly and need no copy.
 - **Extension points**: `#%app`, `#%module-begin`, `local-expand`, syntax
   properties (the `props` field is always `()` in v0), lifting definitions
   out of expressions.
-- **Type identity of library data**: wasm treats identical type
-  definitions as the same type. A program type with the same shape as one
-  of the syntax library's (a struct of two immutable `eqref` fields, say)
-  would pass the library's type tests. Recursion groups can make the
-  library's types distinct if this matters.
+- **Type identity at run time**: wasm treats identical type definitions as
+  the same type (5.1). A program type with the same shape as one of the
+  syntax library's (a struct of two immutable `eqref` fields, say) would
+  pass the library's type tests. Recursion groups can make types distinct
+  when this matters, and would also allow mutually recursive types, which
+  v0 lacks.
 - **Seed without an engine**: a Zig-style seed translated to native code
   would need a GC implementation. Wastrel has one.
 - **More kinds of data**: bignums, floats and vectors as values are not in

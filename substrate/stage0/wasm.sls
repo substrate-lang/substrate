@@ -15,7 +15,8 @@
   (import (chezscheme) (stage0 ops))
 
   ;; types:   list of (func (param ...) (result ...)) | (struct ((storage mut?) ...))
-  ;;          | (array (storage mut?)); storage is a valtype, i8 or i16
+  ;;          | (array (storage mut?)) | (sub final? (supertypeidx ...) comptype);
+  ;;          storage is a valtype, i8 or i16
   ;; imports: list of (module field kind desc); kind func: typeidx,
   ;;          memory/table: (min max-or-#f), global: (valtype mutable?)
   ;; funcs:   list of (typeidx locals instrs name)
@@ -204,11 +205,19 @@
              (lambda (p)
                (vec! p types
                      (lambda (p t)
-                       (case (car t)
-                         [(func) (out-byte! p #x60) (vec! p (cadr t) valtype!) (vec! p (caddr t) valtype!)]
-                         [(struct) (out-byte! p #x5F) (vec! p (cadr t) field!)]
-                         [(array) (out-byte! p #x5E) (field! p (cadr t))]
-                         [else (error 'encode "unknown type" t)])))))))
+                       (let comptype! ([t t])
+                         (case (car t)
+                           [(func) (out-byte! p #x60) (vec! p (cadr t) valtype!) (vec! p (caddr t) valtype!)]
+                           [(struct) (out-byte! p #x5F) (vec! p (cadr t) field!)]
+                           [(array) (out-byte! p #x5E) (field! p (cadr t))]
+                           ;; A final type with no supertype is written as its
+                           ;; comptype alone.
+                           [(sub) (let ([final? (cadr t)] [supers (caddr t)])
+                                    (unless (and final? (null? supers))
+                                      (out-byte! p (if final? #x4F #x50))
+                                      (vec! p supers (lambda (p i) (uleb! p i))))
+                                    (comptype! (cadddr t)))]
+                           [else (error 'encode "unknown type" t)]))))))))
        (let ([imports (wmodule-imports m)])
          (unless (null? imports)
            (section! port 2
