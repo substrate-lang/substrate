@@ -720,6 +720,12 @@ A library usually provides a macro that expands into the declaration.
   conversion for a typed language, would need the checker to write types
   into expanded code before the pass, and queries for the types of
   imported definitions. Nothing planned before bootstrap needs this.
+- **Structs after the typed layer**: declared types are identified by
+  structure (5.1), so `lib/struct.sub`'s accessors check brands at run
+  time: passing a `fahrenheit` to `celsius-t` is a run-time error, where
+  under nominal types it was a compile-time one. With the typed layer, a
+  rung after bootstrap, revisit `struct.sub`, `match` and
+  `examples/shapes.sub` so that it is a compile-time error again.
 
 ## Appendix A: stage0's syntax library representation (not part of the contract)
 

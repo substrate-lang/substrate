@@ -22,8 +22,16 @@
 ;; struct and variant has a brand: an object made when the defining module
 ;; is instantiated, held in an immutable global that only the generated code
 ;; can name. Every value holds its brand in its first field, and the
-;; predicates and match compare brands by identity. A brand costs one field
-;; per value.
+;; predicates, match and the accessors compare brands by identity. A brand
+;; costs one field per value. It also holds its struct's name and field
+;; names, for the accessors' errors.
+;;
+;; Accessors. The checker identifies types by structure too, so a
+;; (ref celsius) parameter accepts a fahrenheit: each accessor checks the
+;; brand, and stops with an error naming it, such as "celsius-t: expected a
+;; celsius, got a fahrenheit". [revisit] With the typed layer (a rung after
+;; bootstrap), revisit this library and match, and examples/shapes.sub with
+;; them, so that such uses are compile-time errors.
 ;;
 ;; The static information is a syntax object:
 ;;   (variant <name> <type> <brand> (<field> ...))
@@ -35,11 +43,49 @@
 
 (provide struct enum)
 
-;; A brand: an object compared by identity.
-(type brand (struct))
+;; A brand: an object compared by identity, with its struct's name and
+;; field names as UTF-8 bytes.
+(type name-bytes (array i8))
+(type names (array (ref name-bytes)))
+(type brand (struct (field name (ref name-bytes)) (field fields (ref names))))
 
 ;; Every struct and enum type is a subtype of branded.
 (type branded (sub (struct (field brand (ref brand)))))
+
+;; ---- accessor errors ----
+
+(memory 1)
+(import host-trap "host" "trap" (i32 i32 ->))
+(data msg-expected 0 ": expected a ")
+(data msg-got 16 ", got a ")
+
+;; Copy the bytes of a to memory at address at; returns the address after.
+(func (put-bytes [at i32] [a (ref name-bytes)]) -> i32
+  (let ([i 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i (array.len a)))
+        (i32.store8 (i32.add at i) (array.get_u name-bytes a i))
+        (set! i (i32.add i 1))
+        (br next)))
+    (i32.add at (array.len a))))
+
+(func (put-data [at i32] [addr i32] [len i32]) -> i32
+  (memory.copy at addr len)
+  (i32.add at len))
+
+;; The accessor for field index field of the struct with brand b was given
+;; v, which has another brand: stop, naming the accessor and both structs.
+;; The message is built from address 1024.
+(func (wrong-struct [b (ref brand)] [field i32] [v (ref branded)])
+  (let ([at (put-bytes 1024 (struct.get brand name b))])
+    (i32.store8 at 45)
+    (set! at (put-bytes (i32.add at 1) (array.get names (struct.get brand fields b) field)))
+    (set! at (put-data at (data-address msg-expected) (data-size msg-expected)))
+    (set! at (put-bytes at (struct.get brand name b)))
+    (set! at (put-data at (data-address msg-got) (data-size msg-got)))
+    (set! at (put-bytes at (struct.get brand name (struct.get branded brand v))))
+    (host-trap 1024 (i32.sub at 1024))))
 
 (begin-for-syntax
   (require s syntax)
@@ -86,15 +132,34 @@
         '()
         (s:cons (s:car (s:syntax->list (s:car lists))) (heads (s:cdr lists)))))
 
-  ;; An accessor function for each field of type name.
-  (func (accessors [name eqref] [fields eqref]) -> eqref
+  (func (number [n i32]) -> eqref (s:datum->syntax #'here (s:fixnum n) '#f))
+
+  ;; An identifier's name as UTF-8 bytes: (array.new_fixed name-bytes b ...).
+  (func (name-array [id eqref]) -> eqref
+    (let* ([str (s:symbol->string (s:syntax-e id))] [i (s:string-length str)] [bytes '()])
+      (block done
+        (loop next
+          (br-if done (i32.eqz i))
+          (set! i (i32.sub i 1))
+          (set! bytes (s:cons (number (s:string-byte str i)) bytes))
+          (br next)))
+      #`(array.new_fixed name-bytes #,@bytes)))
+
+  (func (name-arrays [ids eqref]) -> eqref
+    (if (s:null? ids) '() (s:cons (name-array (s:car ids)) (name-arrays (s:cdr ids)))))
+
+  ;; An accessor function for each field of type name, from index i, which
+  ;; checks the value's brand.
+  (func (accessors [name eqref] [brand eqref] [fields eqref] [i i32]) -> eqref
     (if (s:null? fields)
         '()
         (let* ([f (s:syntax->list (s:car fields))]
                [field (s:car f)])
           (s:cons #`(func (#,(suffixed (suffixed name '-) (s:syntax-e field)) [v (ref #,name)]) -> #,(s:cadr f)
+                      (if (i32.eqz (ref.eq (struct.get #,name brand v) #,brand))
+                          (wrong-struct #,brand #,(number i) v))
                       (struct.get #,name #,field v))
-                  (accessors name (s:cdr fields))))))
+                  (accessors name brand (s:cdr fields) (i32.add i 1))))))
 
   ;; The definitions for one struct or variant, as a list: its brand, type,
   ;; constructor, accessors, predicate and static information. super is
@@ -102,11 +167,12 @@
   (func (variant-forms [name eqref] [super eqref] [type eqref] [brand eqref] [fields eqref]) -> eqref
     (check-fields fields)
     (s:syntax->list
-     #`((global #,brand (ref brand) (struct.new brand))
+     #`((global #,brand (ref brand)
+                (struct.new brand #,(name-array name) (array.new_fixed names #,@(name-arrays (heads fields)))))
         (type #,name (sub final #,super (struct (field brand (ref brand)) #,@(field-decls fields))))
         (func (#,(prefixed 'make- name) #,@fields) -> (ref #,name)
           (struct.new #,name #,brand #,@(heads fields)))
-        #,@(accessors name fields)
+        #,@(accessors name brand fields 0)
         (func (#,(suffixed name '?) [v eqref]) -> i32
           (if (ref.test (ref #,name) v)
               (ref.eq (struct.get #,name brand (ref.cast (ref #,name) v)) #,brand)
