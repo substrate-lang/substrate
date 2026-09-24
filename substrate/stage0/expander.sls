@@ -21,12 +21,18 @@
       array.len array.copy array.fill
       ref.null ref.is_null ref.eq ref.as_non_null ref.test ref.cast ref.i31 i31.get_s i31.get_u))
 
+  ;; The implicit forms (spec 5.3, 5.4). Chez reads #%name as a primitive
+  ;; reference, so these are built from strings.
+  (define app-sym (string->symbol "#%app"))
+  (define datum-sym (string->symbol "#%datum"))
+
   (define core-forms
     (append
      '(func global import memory table data type define-syntax define-static begin-for-syntax
        begin require provide runtime-free set! let let* if block loop br br-if return
        call-indirect func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
+     (list app-sym datum-sym)
      gc-forms))
 
   (define eqref (make-ref #t 'eq))
@@ -1035,8 +1041,21 @@
             (unless (stx? result)
               (raise-compile-error s "macro ~a returned a non-syntax value: ~s" (stx-e head)
                                    (if (wasm-value? result) '<object> (stx->datum result))))
+            ;; [v0] Stage0 keeps syntax as Chez data, so it cannot keep a
+            ;; GC object the syntax library does not represent (appendix A).
+            (when (opaque-part result)
+              (raise-compile-error s "macro ~a returned syntax holding an object stage0 cannot keep (only syntax-library data can be kept in syntax and its properties)"
+                                   (stx-e head)))
             (flip-scope result intro)))
         (lambda () (set! api-phase saved-phase) (set! api-where saved-where)))))
+
+  ;; An object inside syntax x (its datum or its properties) with no Chez
+  ;; counterpart, or #f.
+  (define (opaque-part x)
+    (cond [(wasm-value? x) x]
+          [(stx? x) (or (opaque-part (stx-e x)) (opaque-part (stx-props x)))]
+          [(pair? x) (or (opaque-part (car x)) (opaque-part (cdr x)))]
+          [else #f]))
 
   ;; Entry point for wasm calls to the expander queries. Arguments and results
   ;; are handles. Must never raise: an exception here would unwind through C
@@ -1073,6 +1092,19 @@
                ;; Same meaning, so an import and what it imports are equal.
                (let ([mx (meaning-of x api-phase)] [my (meaning-of y api-phase)])
                  (if (if (or mx my) (equal? mx my) (eq? (stx-e x) (stx-e y))) 1 0)))]
+            [(4)                        ; binding-kind
+             (let ([id (decode ms a)])
+               (unless (id? id) (raise-compile-error api-where "binding-kind: expected an identifier"))
+               (let ([m (meaning-of id api-phase)])
+                 (encode ms (case (and m (car m))
+                              [(func) 'function]
+                              [(local global) 'variable]
+                              [(macro) 'macro]
+                              [(static) 'static]
+                              [(data) 'data]
+                              [(label) 'label]
+                              [(core prim) 'core]
+                              [else #f]))))]
             [else (raise-compile-error api-where "unknown expander query ~a" op)])))))
 
   ;; ==== expressions ===================================================================
@@ -1110,29 +1142,64 @@
              [(label) (raise-compile-error s "~a is a label" e)]
              [else (unbound s e phase)]))]
         [(pair? e)
-         (let ([head (car e)])
-           (unless (id? head)
-             (raise-compile-error s "the head of a form must be an identifier, got ~s" (stx->datum head)))
-           (let ([m (meaning-of head phase)])
-             (case (and m (car m))
-               [(core) (at s (expand-core (cadr m) s phase))]
-               [(macro) (expand-expr (apply-macro head (cadr m) s phase #f) phase)]
-               [(prim) (at s (expand-prim (cadr m) s phase))]
-               [(func) (let ([args (or (stx->list (cdr e)) (raise-compile-error s "bad call syntax"))])
-                         (at s (list 'call (cadr m) (map-lr (lambda (a) (expand-expr a phase)) args))))]
-               [(local global) (raise-compile-error s "~a is a variable, not a function" (stx-e head))]
-               [(static data label) (raise-compile-error s "~a is not a function or a macro" (stx-e head))]
-               [else (unbound head (stx-e head) phase)])))]
+         (let* ([head (car e)]
+                [m (and (id? head) (meaning-of head phase))])
+           (case (and m (car m))
+             [(core) (at s (expand-core (cadr m) s phase))]
+             [(macro) (expand-expr (apply-macro head (cadr m) s phase #f) phase)]
+             [(prim) (at s (expand-prim (cadr m) s phase))]
+             [else
+              ;; Any other form is an application: (#%app f arg ...), where
+              ;; #%app has the scopes of the form (spec 5.3).
+              (when (and (id? head) (eq? (stx-e head) app-sym))
+                (if m
+                    (raise-compile-error s "#%app is bound here, but not to a macro or the core form")
+                    (unbound head app-sym phase)))
+              (expand-expr (stx-rewrap s (cons (implicit-id s app-sym) e)) phase)]))]
         [(null? e) (raise-compile-error s "empty form ()")]
-        ;; Unquoted literals are wasm numbers (spec 5.4).
-        [(and (integer? e) (exact? e)) (at s (list 'int e))]
-        [(flonum? e) (at s (list 'float e))]
-        [(char? e) (at s (list 'int (char->integer e)))]
-        [(eq? e #t) (at s '(const i32 1))]
-        [(eq? e #f) (at s '(const i32 0))]
-        [(string? e)
-         (raise-compile-error s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for a syntax-library string")]
+        [(literal? e)
+         ;; A literal is (#%datum literal), where #%datum has the scopes of
+         ;; the literal (spec 5.4).
+         (let* ([id (implicit-id s datum-sym)]
+                [m (meaning-of id phase)])
+           (case (and m (car m))
+             [(core) (at s (core-datum s))]
+             [(macro) (expand-expr (apply-macro id (cadr m) (stx-rewrap s (list id s)) phase #f) phase)]
+             [else (raise-compile-error s "the literal ~s needs #%datum, which is ~a here" (stx->datum s)
+                                        (if m "not a macro or the core form" "unbound"))]))]
         [else (raise-compile-error s "~s is not an expression" (stx->datum s))])))
+
+  (define (literal? e)
+    (or (and (integer? e) (exact? e)) (flonum? e) (char? e) (boolean? e) (string? e)))
+
+  ;; The identifier `name` with the scopes and srcloc of s: the implicit
+  ;; #%app of a form or #%datum of a literal.
+  (define (implicit-id s name) (datum->stx s name (stx-srcloc s)))
+
+  ;; The core #%datum: an unquoted literal is a wasm number (spec 5.4).
+  (define (core-datum s)
+    (let ([e (stx-e s)])
+      (cond [(and (integer? e) (exact? e)) (list 'int e)]
+            [(flonum? e) (list 'float e)]
+            [(char? e) (list 'int (char->integer e))]
+            [(eq? e #t) '(const i32 1)]
+            [(eq? e #f) '(const i32 0)]
+            [(string? e)
+             (raise-compile-error s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for a syntax-library string")]
+            [else (raise-compile-error s "~s is not a literal" (stx->datum s))])))
+
+  ;; The core #%app: (#%app f arg ...) calls the function f.
+  (define (core-app s parts phase)
+    (let* ([f (cadr parts)]
+           [m (and (id? f) (meaning-of f phase))])
+      (case (and m (car m))
+        [(func) (list 'call (cadr m) (map-lr (lambda (a) (expand-expr a phase)) (cddr parts)))]
+        [(local global) (raise-compile-error s "~a is a variable, not a function" (stx-e f))]
+        [(static data label core prim macro)
+         (raise-compile-error s "~a is not a function" (stx-e f))]
+        [else (if (id? f)
+                  (unbound f (stx-e f) phase)
+                  (raise-compile-error s "a function call needs a function name, got ~s" (stx->datum f)))])))
 
   (define (expand-prim name s phase)
     (let* ([p (lookup-prim name)]
@@ -1203,6 +1270,17 @@
       (define (arity-check ok?)
         (unless ok? (raise-compile-error s "bad ~a syntax" name)))
       (define (ex x) (expand-expr x phase))
+      (cond
+        [(eq? name app-sym)
+         (arity-check (>= (length parts) 2))
+         (core-app s parts phase)]
+        [(eq? name datum-sym)
+         (arity-check (= (length parts) 2))
+         (core-datum (cadr parts))]
+        [else (expand-core-form name s parts phase arity-check ex)])))
+
+  (define (expand-core-form name s parts phase arity-check ex)
+    (let ()
       (case name
         [(quote)
          (arity-check (= (length parts) 2))

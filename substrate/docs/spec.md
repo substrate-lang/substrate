@@ -94,21 +94,34 @@ from the instance `"syntax"`. Parameters are `eqref` unless marked
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)` |
-| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d)`, `(syntax-rewrap s e)`, `(splice-list v)` |
-| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32` |
+| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
+| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)` |
 
 - `syntax-e` of an identifier is a symbol, and of a literal it is the
   literal's value. Of a list it is a list whose elements are syntax.
 - `datum->syntax` wraps a value, giving every new syntax object the scopes
   of `ctx` (a syntax object, or `#f` for none).
 - `syntax-rewrap` copies syntax object `s` around a new datum `e`, keeping
-  its scopes and source location. `quasisyntax` is built on it.
+  its scopes, source location and properties. `quasisyntax` is built on it.
+- **Properties** attach values to a syntax object, for example a type a
+  macro computed for it. `syntax-property-set` returns a copy of `s` with
+  `key` set; keys are compared with `ref.eq`, so symbols make good keys.
+  Scope operations (6.2) do not reach into property values. The expander
+  keeps a syntax object's properties when it adds or removes scopes, but
+  does not copy the properties of a macro use onto the macro's result.
+  [v0] Stage0 can keep only syntax-library data in properties; a macro that
+  returns syntax holding another GC object is an error.
 - Accessors trap with a message ("expected a pair") when given the wrong
   kind of value.
 - `free-identifier=?` is 1 when `a` and `b` refer to the same binding, as
   values at the running macro's phase. An imported name and the definition
   it imports are the same binding. Two unbound identifiers are equal when
   their names are.
+- `binding-kind` says what identifier `id` is bound to as a value at the
+  running macro's phase: the symbol `function`, `variable` (a local or
+  global), `macro`, `static`, `data`, `label` or `core` (a core form or wasm
+  operator), or `#f` if it is unbound. An implicit `#%app` (5.3) uses it to
+  tell a call of a function from a call through a variable.
 
 The queries only work while an expander is running. [v0] Stage0 answers
 them in Chez; in a run-time store they trap.
@@ -325,7 +338,8 @@ id                                  ; local or global variable
 (block label body ...)              ; br to label exits the block
 (loop label body ...)               ; br to label restarts the loop
 (br label [expr])  (br-if label test)  (return [expr])
-(f arg ...)                         ; direct call
+(f arg ...)                         ; application: (#%app f arg ...)
+(#%app f arg ...)                   ; core: a direct call of the function f
 (op arg ... [offset])               ; a numeric or memory instruction, e.g. (i32.add a b)
 (call-indirect (t ... -> t ...) index arg ...)
 (func-index f)                      ; i32 index of f in the module's table
@@ -361,10 +375,34 @@ GC instructions take their type and field immediates by name:
 - Loads and stores take an optional trailing literal offset:
   `(i32.load p 8)`, `(i32.store p v 8)`.
 - Labels are bindings and obey scope like variables.
+- **Application is an implicit form**, as in Racket. A form whose head is
+  not bound to a macro, a core form or a wasm operator, including one
+  whose head is not an identifier, is expanded as `(#%app head arg ...)`.
+  The `#%app` identifier gets the scopes of the form, so it means what
+  `#%app` is bound to where the form was written, not where it is
+  expanded. A module changes the meaning of its applications by binding
+  `#%app` to a macro, usually by importing one:
+  `(require dl "dynlisp.sub" [#%app app])`. Code a macro introduces keeps
+  its own module's `#%app`. The core `#%app` calls a function directly and
+  rejects anything else. A macro standing for `#%app` must not return an
+  application written with the use's scopes, which would expand through it
+  again; one written with its own module's scopes uses that module's
+  `#%app`. Wasm operators are not applications and never go through
+  `#%app`.
 
 ### 5.4 Literals
 
-Unquoted literals are wasm numbers. `quote` turns a literal into a value.
+A literal is an implicit form too: `42` is expanded as `(#%datum 42)`,
+where `#%datum` gets the scopes of the literal (5.3). Racket writes this
+`(#%datum . 42)`; the kernel uses a proper list. The core `#%datum` makes
+unquoted literals wasm numbers, as the table below says. A module that
+binds `#%datum` to a macro gives its literals another meaning, such as
+values, while the literals in other modules' macro templates keep theirs.
+The macro must not return a bare literal written with the use's scopes,
+which would expand through it again.
+
+Under the core `#%datum`, unquoted literals are wasm numbers. `quote` turns
+a literal into a value.
 Values are syntax-library data, so a part that quotes imports from the
 syntax library, as it would for any library function it calls; at phase 0
 that is visible in what the program links, and `(runtime-free)` rejects
@@ -380,14 +418,16 @@ it (3.4).
 
 The unchanged parts of a `quasisyntax` template keep their lexical context,
 which is what macro templates need. The reader abbreviations are
-`'` `` ` `` `,` `,@` and `#'` `` #` `` `#,` `#,@`. Integers outside the
+`'` `` ` `` `,` `,@` and `#'` `` #` `` `#,` `#,@`. The reader reads `#%name`
+as the symbol `#%name`. Integers outside the
 fixnum range (31 bits) cannot be quoted.
 
 ### 5.5 Base bindings
 
-Every module sees, at every phase, only the kernel forms and the wasm
-numeric and memory operators. Everything else comes from a declaration in
-the module: its own definitions, `import`, and `require`.
+Every module sees, at every phase, only the kernel forms, including the
+core `#%app` and `#%datum`, and the wasm numeric and memory operators.
+Everything else comes from a declaration in the module: its own
+definitions, `import`, and `require`.
 
 ## 6. Expansion
 
@@ -487,9 +527,14 @@ self-hosted expander will hold references directly and need no copy.
   `(memory from name)` there.
 - **More require and provide forms**: re-exporting, renaming on provide,
   requiring several phases up without nesting `begin-for-syntax`.
-- **Extension points**: `#%app`, `#%module-begin`, `local-expand`, syntax
-  properties (the `props` field is always `()` in v0), lifting definitions
-  out of expressions.
+- **Extension points**: still to come are fully expanded code as syntax
+  (a grammar that becomes part of the macro contract), `local-expand` for
+  expressions, a hook for passes over a module's fully expanded code, and
+  lifting definitions out of expressions (a `lambda` must become a
+  module-level function). Racket's `#%module-begin` is not planned: a
+  library that wants a whole module body gets it by having the module
+  wrap its body in the library's macro, and the pass hook covers work on
+  the expanded result.
 - **Type identity at run time**: wasm treats identical type definitions as
   the same type (5.1). A program type with the same shape as one of the
   syntax library's (a struct of two immutable `eqref` fields, say) would
@@ -527,6 +572,8 @@ expander.
   whose elements are syntax objects. Scopes are a list of fixnum scope ids
   in ascending order; scope 0 is the core scope. The source of a srcloc is
   a symbol naming the file. Line is 1-based, column and position 0-based.
+  Properties are a list of `(key . value)` pairs, newest first, with each
+  key at most once.
 - **Memory**: the library's memory holds only its error messages.
 - **Embedder interface (stage0 only)**: Chez cannot hold GC references, so
   it names objects by `i32` handles, indexes into the library's handle

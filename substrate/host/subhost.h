@@ -28,6 +28,7 @@ enum {
   SUB_OP_SYNTAX_LOCAL_VALUE = 1,
   SUB_OP_SYNTAX_ERROR = 2,
   SUB_OP_FREE_IDENTIFIER_EQ = 3,
+  SUB_OP_BINDING_KIND = 4,
 };
 
 sub_host *sub_host_new(void);

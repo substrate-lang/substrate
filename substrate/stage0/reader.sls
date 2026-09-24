@@ -150,6 +150,8 @@
                    (begin (next!) (prefix-form start 'unsyntax-splicing))
                    (prefix-form start 'unsyntax))]
               [(char=? c #\\) (next!) (read-char-lit start)]
+              ;; #%name is a symbol, used for implicit forms like #%app.
+              [(char=? c #\%) (wrap start (string->symbol (string-append "#" (read-token))))]
               [else
                (let ([tok (read-token)])
                  (cond [(member tok '("t" "true")) (wrap start #t)]

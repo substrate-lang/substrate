@@ -338,7 +338,8 @@ static wasm_trap_t *host_error_message(void *env, wasmtime_caller_t *caller, con
 
 /* Expander queries (stage0 only): forward to the embedder's callback. env
  * points at an op code; the host is found through the store's data. */
-static const int32_t op_codes[] = {SUB_OP_SYNTAX_LOCAL_VALUE, SUB_OP_SYNTAX_ERROR, SUB_OP_FREE_IDENTIFIER_EQ};
+static const int32_t op_codes[] = {SUB_OP_SYNTAX_LOCAL_VALUE, SUB_OP_SYNTAX_ERROR, SUB_OP_FREE_IDENTIFIER_EQ,
+                                   SUB_OP_BINDING_KIND};
 
 static wasm_trap_t *expander_call(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                   size_t nargs, wasmtime_val_t *results, size_t nresults) {
@@ -414,7 +415,8 @@ sub_host *sub_host_new(void) {
       define(h, "host", "error_message", 2, 1, host_error_message, h) ||
       define(h, "expander", "syntax-local-value", 1, 1, expander_call, (void *)&op_codes[0]) ||
       define(h, "expander", "syntax-error", 2, 1, expander_call, (void *)&op_codes[1]) ||
-      define(h, "expander", "free-identifier=?", 2, 1, expander_call, (void *)&op_codes[2])) {
+      define(h, "expander", "free-identifier=?", 2, 1, expander_call, (void *)&op_codes[2]) ||
+      define(h, "expander", "binding-kind", 1, 1, expander_call, (void *)&op_codes[3])) {
     fprintf(stderr, "subhost: %s\n", h->err);
     abort();
   }

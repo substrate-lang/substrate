@@ -49,9 +49,12 @@ Stage0 goes from source to a running program: reader, expander, kernel
 compiler, binary wasm, then wasmtime. Macros work end to end: a
 transformer is a phase-1 function over GC syntax objects, compiled and
 instantiated in the compile-time store and called by the expander.
-`define-static`, `syntax-local-value`, `syntax-error` and
-`free-identifier=?` work too, and macros are hygienic (introduction and
-use-site scopes, spec 6.2). Modules `require` each other by name, with
+`define-static`, `syntax-local-value`, `syntax-error`, `free-identifier=?`,
+`binding-kind` and syntax properties work too, and macros are hygienic
+(introduction and use-site scopes, spec 6.2). A module can change what
+application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
+5.4).
+Modules `require` each other by name, with
 qualified imports (`print:write-int`), at any phase:
 each phase of a module compiles to its own wasm part, and a program loads
 only the parts it reaches at run time (spec 3). Compiled programs import
