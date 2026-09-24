@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; FFI to host/subhost.c. One Scheme `host` is one wasm store. Everything
 ;; crossing this boundary is an i32: stage0 refers to GC objects in the
 ;; syntax library through integer handles (spec appendix A).

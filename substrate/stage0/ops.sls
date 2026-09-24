@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; The wasm instructions the kernel exposes as primitive operators
 ;; (spec 5.3), with their opcodes and types.
 (library (stage0 ops)

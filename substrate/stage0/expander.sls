@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; Expander: syntax objects -> fully expanded kernel forms (core.sls).
 ;;
 ;; Binding is by sets of scopes (spec 6.1). A module is a file; each of its
@@ -5,7 +8,7 @@
 ;; expanded, its phase >= 1 code is compiled into chunks and run in that
 ;; module's compile-time store. A macro is a phase-1 function from syntax to
 ;; syntax (spec 2.1). Syntax objects are GC objects of the syntax library
-;; (stage0/syntax.sub), which every compile-time store instantiates.
+;; (compiler/syntax.sub), which every compile-time store instantiates.
 (library (stage0 expander)
   (export set-syntax-library-path! compile-module-file run-module module-part-list module-expanded-forms
           syntax-library-bytes strip-ast)

@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; Records and types shared by the expander and the compiler.
 ;;
 ;; Fully expanded kernel code (the compiler's input) is made of lists:

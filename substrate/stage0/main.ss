@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; subc: the stage0 driver.
 ;;
 ;;   subc run FILE                 compile FILE (and what it requires), run its main
@@ -8,7 +11,7 @@
 (import (chezscheme) (stage0 syntax) (stage0 expander) (stage0 host))
 
 (define root (or (getenv "SUBSTRATE_ROOT") "."))
-(set-syntax-library-path! (string-append root "/stage0/syntax.sub"))
+(set-syntax-library-path! (string-append root "/compiler/syntax.sub"))
 
 (define (write-file path bv)
   (call-with-port (open-file-output-port path (file-options no-fail))

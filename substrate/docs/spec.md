@@ -35,7 +35,7 @@ specified but not built yet.
 |---|---|---|
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime) |
 | compiler | Reader, expander, kernel compiler, binary encoder. | stage0: `stage0/*.sls` (Chez Scheme) |
-| syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `stage0/syntax.sub` (kernel code) |
+| syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `compiler/syntax.sub` (kernel code) |
 | libraries | Ordinary modules: printing, `define-macro`. | `lib/*.sub` |
 | languages | Later libraries built on the kernel: structs, effects, a dynamic Lisp, ... | not yet |
 
@@ -445,7 +445,7 @@ self-hosted expander will hold references directly and need no copy.
 
 ## Appendix A: stage0's syntax library representation (not part of the contract)
 
-This describes `stage0/syntax.sub` and `stage0/marshal.sls` as they are.
+This describes `compiler/syntax.sub` and `stage0/marshal.sls` as they are.
 Macros must not depend on it; the compiler may, because it is part of the
 expander.
 

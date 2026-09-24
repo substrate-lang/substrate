@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; Binary wasm encoder. The compiler builds a module description and this
 ;; turns it into bytes; nothing here knows about the kernel language.
 ;;

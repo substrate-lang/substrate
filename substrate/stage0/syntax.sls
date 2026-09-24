@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; Syntax objects and source locations, mirroring spec section 2.4 field for
 ;; field so that marshalling to the wasm heap is a direct copy.
 (library (stage0 syntax)

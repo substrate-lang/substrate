@@ -1,3 +1,4 @@
+/* Lifecycle: permanent. After bootstrap the host runs the compiler. */
 /* subhost: the substrate host over the wasmtime C API.
  *
  * One sub_host is one store: an engine and a linker. Instances are

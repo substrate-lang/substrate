@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; Compiler: fully expanded kernel forms (see core.sls) -> wasm module bytes.
 ;;
 ;; Expressions are compiled to symbolic instructions that mention info

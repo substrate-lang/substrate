@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; Reader: text -> syntax objects with source locations and empty scopes.
 (library (stage0 reader)
   (export read-file read-string-all)

@@ -1,42 +1,50 @@
 #!/usr/bin/env bash
-# Run every tests/*.sub.
+# Lifecycle: test harness.
+#
+# Run every tests/*.sub and examples/*.sub. Next to each file:
 #   NAME.out    expected output of a successful run
 #   NAME.err    a line that must appear in the output of a failing run
-#   NAME.links  the instance names the compiled module may import from,
-#               one per line (checks that modules link only what they use)
+#   NAME.links  the instance names the compiled phase-0 part may import
+#               from, one per line (checks that programs link only what they
+#               use)
 set -uo pipefail
+shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-mkdir -p build/tests
 
 # Build the syntax library once first, so library compile notices stay out
 # of test output.
+mkdir -p build
 bin/subc syntax-library -o build/syntax.wasm > /dev/null
 wasm-tools validate build/syntax.wasm || { echo "FAIL syntax.wasm does not validate"; exit 1; }
 
 pass=0
 fail=0
-for t in tests/*.sub; do
+for t in tests/*.sub examples/*.sub; do
+  dir="$(dirname "$t")"
   name="$(basename "$t" .sub)"
-  actual="$(cd tests && ../bin/subc run "$name.sub" 2>&1)"
+  base="$dir/$name"
+  out="build/$dir"
+  mkdir -p "$out"
+  actual="$(cd "$dir" && "$root/bin/subc" run "$name.sub" 2>&1)"
   code=$?
   problem=""
-  if [ -f "tests/$name.out" ]; then
-    if [ $code -ne 0 ] || [ "$actual" != "$(cat "tests/$name.out")" ]; then
+  if [ -f "$base.out" ]; then
+    if [ $code -ne 0 ] || [ "$actual" != "$(cat "$base.out")" ]; then
       problem="output differs (exit $code)"
-    elif ! (cd tests && ../bin/subc compile "$name.sub" -o "../build/tests/$name.wasm" > /dev/null) ||
-         ! for part in build/tests/$name.wasm build/tests/$name.phase*.wasm; do
-             [ -e "$part" ] || continue; wasm-tools validate "$part" || exit 1; done; then
+    elif ! (cd "$dir" && "$root/bin/subc" compile "$name.sub" -o "$root/$out/$name.wasm" > /dev/null) ||
+         ! for part in "$out/$name.wasm" "$out/$name".phase*.wasm; do
+             wasm-tools validate "$part" || exit 1; done; then
       problem="a compiled part does not validate"
-    elif [ -f "tests/$name.links" ]; then
-      links="$(wasm-tools print "build/tests/$name.wasm" | sed -n 's/^ *(import "\([^"]*\)".*/\1/p' | sort -u)"
-      if [ "$links" != "$(sort -u "tests/$name.links")" ]; then
-        problem="imports from: $(echo $links), expected: $(echo $(cat "tests/$name.links"))"
+    elif [ -f "$base.links" ]; then
+      links="$(wasm-tools print "$out/$name.wasm" | sed -n 's/^ *(import "\([^"]*\)".*/\1/p' | sort -u)"
+      if [ "$links" != "$(sort -u "$base.links")" ]; then
+        problem="imports from: $(echo $links), expected: $(echo $(cat "$base.links"))"
       fi
     fi
-  elif [ -f "tests/$name.err" ]; then
-    if [ $code -eq 0 ] || ! grep -qF -- "$(cat "tests/$name.err")" <<< "$actual"; then
-      problem="expected an error containing: $(cat "tests/$name.err")"
+  elif [ -f "$base.err" ]; then
+    if [ $code -eq 0 ] || ! grep -qF -- "$(cat "$base.err")" <<< "$actual"; then
+      problem="expected an error containing: $(cat "$base.err")"
     fi
   else
     problem="no .out or .err file"
@@ -45,8 +53,8 @@ for t in tests/*.sub; do
     pass=$((pass + 1))
   else
     fail=$((fail + 1))
-    echo "FAIL $name: $problem"
-    if [ -f "tests/$name.out" ]; then diff <(echo "$actual") "tests/$name.out" | head -20; else echo "$actual" | head -10; fi
+    echo "FAIL $base: $problem"
+    if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
 echo "$pass passed, $fail failed"

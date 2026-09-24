@@ -11,17 +11,23 @@ the host interface.
 
 ## Layout
 
-- `docs/spec.md`: the kernel specification (v0 draft).
-- `host/`: the host, in C over the wasmtime C API. It creates stores,
-  links instances by name, and provides the `host` imports, including the
-  instantiate hook. It owns no memory.
-- `stage0/`: the stage0 compiler in Chez Scheme (reader, expander,
-  compiler, wasm encoder, FFI), plus `syntax.sub`, the syntax library:
-  syntax objects as wasm GC objects, and the functions macros call.
-- `lib/`: ordinary modules: printing, `write-datum`, `define-macro`.
-- `tests/`: `.sub` programs, with `.out` (expected output) or `.err`
-  (expected error) files, and `.links` (what the compiled phase-0 part may
-  import). `tests/modules/` holds modules the tests require.
+What each directory is, and how long it lives. Every source file's first
+line says the same.
+
+| Directory | What it holds | Lifecycle |
+|---|---|---|
+| `docs/` | the kernel specification | permanent |
+| `host/` | the host, in C over wasmtime: stores, linking, the `host` imports and the instantiate hook | permanent: after bootstrap it runs the compiler |
+| `compiler/` | the compiler, written in the language. Today only `syntax.sub`, the syntax library; the rest arrives as the compiler is rewritten for bootstrap | permanent, grows |
+| `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: frozen once the compiler compiles itself |
+| `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro` | permanent, grows |
+| `examples/` | demos meant to be read; checked by `make check` | grows |
+| `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.links` (what the compiled phase-0 part may import). `tests/fixtures/` holds modules the tests require | grows |
+| `bin/subc` | the entry point | permanent; runs stage0 until bootstrap |
+
+A library in `lib/` is one we intend to build on, not the only way to do
+what it does: languages on the kernel can bring their own. If one turns out
+to be only illustrative, it moves to `examples/`.
 
 ## Use
 

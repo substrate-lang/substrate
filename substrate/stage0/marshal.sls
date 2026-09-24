@@ -1,3 +1,6 @@
+;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
+;; compiler compiles itself.
+;;
 ;; Copy syntax between Chez and the syntax library's GC objects.
 ;;
 ;; Stage0 cannot hold wasm GC references in Chez, so it refers to them

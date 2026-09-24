@@ -1,3 +1,4 @@
+/* Lifecycle: permanent. After bootstrap the host runs the compiler. */
 /* subhost: see subhost.h and docs/spec.md section 4. */
 #include "subhost.h"
 
