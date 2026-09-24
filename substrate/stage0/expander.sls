@@ -75,8 +75,9 @@
             (mutable entries) (mutable expanded) (mutable scope)))
 
   ;; One phase of a module, compiled: bytes, the instance names it imports
-  ;; from (relative to the module at shift 0), and whether it uses GC.
-  (define-record-type part (fields bytes imports gc?))
+  ;; from (relative to the module at shift 0), whether it uses GC, and the
+  ;; module scopes in its syntax literals (spec 6.1).
+  (define-record-type part (fields bytes imports gc? scopes))
 
   ;; One wasm store: a compile-time store (one per module compilation) or a
   ;; run-time store. instances: names instantiated in it. wrappers and
@@ -180,14 +181,20 @@
           (unless p (raise-compile-error #f "internal: ~a has no phase ~a part" (unit-name m) q))
           (for-each (lambda (imp) (ensure-import! st imp t)) (part-imports p))
           (flush-output-port (current-output-port))
-          ;; Syntax literals the part builds carry the module scope for this
-          ;; shift (spec 6.1). The syntax library maps it while the part starts.
-          (let ([shifted? (and (not (= t 0)) (unit-scope m))])
+          ;; The syntax literals the part builds are shifted too (spec 6.1):
+          ;; each module scope in them, module X's copy for shift s, becomes
+          ;; X's copy for s + t. The syntax library maps them while the part
+          ;; starts.
+          (let ([shifted? (and (not (= t 0)) (pair? (part-scopes p)))])
             (when shifted?
-              (host-call (cstore-host st) "syntax" "%set-scope-shift" (unit-scope m) (module-scope-at m t)))
+              (for-each (lambda (sc)
+                          (let ([origin (hashtable-ref module-scope-origins sc #f)])
+                            (host-call (cstore-host st) "syntax" "%scope-map-add"
+                                       sc (module-scope-at (car origin) (+ (cdr origin) t)))))
+                        (part-scopes p)))
             (host-instantiate-shifted! (cstore-host st) name (part-bytes p) t)
             (when shifted?
-              (host-call (cstore-host st) "syntax" "%set-scope-shift" -1 0)))
+              (host-call (cstore-host st) "syntax" "%scope-map-clear")))
           (hashtable-set! (cstore-instances st) name #t)))))
 
   ;; ---- bindings ----
@@ -334,7 +341,26 @@
         (unit-scope m)
         (let ([key (format "~a|~a" (unit-path m) s)])
           (or (hashtable-ref shifted-scopes key #f)
-              (let ([sc (new-scope!)]) (hashtable-set! shifted-scopes key sc) sc)))))
+              (let ([sc (new-scope!)])
+                (hashtable-set! shifted-scopes key sc)
+                (hashtable-set! module-scope-origins sc (cons m s))
+                sc)))))
+
+  ;; Every module scope, and its copies, as scope -> (module . shift).
+  (define module-scope-origins (make-eqv-hashtable))
+
+  ;; The module scopes in syntax literals of lowered forms x (spec 6.1).
+  (define (literal-module-scopes x)
+    (let ([found (make-eqv-hashtable)])
+      (let walk ([x x])
+        (cond [(stx? x)
+               (for-each (lambda (sc) (when (hashtable-contains? module-scope-origins sc)
+                                        (hashtable-set! found sc #t)))
+                         (stx-scopes x))
+               (walk (stx-e x))]
+              [(pair? x) (walk (car x)) (walk (cdr x))]
+              [else (void)]))
+      (list-sort < (vector->list (hashtable-keys found)))))
 
   ;; Make module m's bindings resolvable at shift s, and those of the modules
   ;; it requires. Needed for m's macros: their templates carry m's scopes.
@@ -436,6 +462,7 @@
     (install-base!)
     (let ([msc (new-scope!)])
       (unit-scope-set! (comp-module current) msc)
+      (hashtable-set! module-scope-origins msc (cons (comp-module current) 0))
       (expand-body (map-lr (lambda (f) (add-scope (add-scope f core-scope) msc)) forms) 0)))
 
   (define (add-phase-forms! phase forms)
@@ -474,7 +501,8 @@
         (for-each (lambda (p)
                     (let ([forms (append (storage-forms p) (reverse (hashtable-ref (comp-phase-forms c) p '())))])
                       (let-values ([(bytes imports gc?) (compile-module forms (part-name m p 0))])
-                        (hashtable-set! (unit-parts m) p (make-part bytes imports gc?)))))
+                        (hashtable-set! (unit-parts m) p
+                                        (make-part bytes imports gc? (literal-module-scopes forms))))))
                   phases))
       (hashtable-set! installed (format "~a|0" (unit-path m)) #t)
       (unit-state-set! m 'done)

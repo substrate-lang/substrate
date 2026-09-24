@@ -477,12 +477,16 @@ reference is an error.
 - **Phases.** Bindings are recorded per phase, and a syntax object has one
   scope set. A module required at shift *s* ≠ 0 has its bindings installed
   at their phase + *s*, with its module scope replaced by a copy for that
-  shift. The syntax literals its parts build when instantiated at shift *s*
-  carry the same copy. So a module required at two shifts, which has
-  bindings from both at the same phase (a macro `m` shifted up, next to the
-  phase-1 function behind `m`), keeps them apart. This is Racket's
-  per-phase module scopes, applied eagerly per shift; v0 shifts only module
-  scopes.
+  shift. So a module required at two shifts, which has bindings from both
+  at the same phase (a macro `m` shifted up, next to the phase-1 function
+  behind `m`), keeps them apart. The syntax literals a part builds when
+  instantiated at shift *t* are shifted the same way: every module scope in
+  them, module *X*'s copy for shift *s*, becomes *X*'s copy for *s* + *t*.
+  A literal can hold other modules' scopes as well as its own module's,
+  for example when another module's macro wrote part of its code. Only
+  module scopes shift; introduction and use-site scopes, and the core
+  scope, mean the same at every phase. This is Racket's per-phase module
+  scopes, applied eagerly per shift.
 
 ### 6.2 Hygiene
 
@@ -620,7 +624,6 @@ A library usually provides a macro that expands into the declaration.
   module in each run, and a compiled part is valid only in the run that
   produced it. Reuse needs a module's binding table written out with its
   parts, and scope ids relative to the module.
-- **Per-phase scope sets in full**: v0 shifts only module scopes (6.1).
 - **Memory and table definitions at phase ≥ 1**: v0 supports only
   `(memory from name)` there.
 - **More require and provide forms**: re-exporting, renaming on provide,
@@ -686,7 +689,9 @@ expander.
   when it returns. Each store gets a small entry chunk per transformer and
   per static value it uses, which converts between handles and references.
   After bootstrap this section goes away.
-- **Shifted literals**: `%set-scope-shift` tells `%make-syntax` to replace
-  one scope id with another. Stage0 sets it around the instantiation of a
-  part at shift *s* ≠ 0, mapping the module's scope to its copy for *s*
-  (6.1), and clears it after.
+- **Shifted literals**: `%scope-map-add` tells `%make-syntax` to replace
+  one scope id with another. Stage0 records which module and shift each
+  module scope stands for, and each part lists the module scopes in its
+  literals. Around the instantiation of a part at shift *t* ≠ 0 it maps
+  each of them to its copy for its shift + *t* (6.1), and clears the map
+  after (`%scope-map-clear`).
