@@ -138,6 +138,8 @@
         [(call_indirect) (b #x11) (u (car args)) (u (cadr args))]
         [(return_call) (b #x12) (u (car args))]
         [(return_call_indirect) (b #x13) (u (car args)) (u (cadr args))]
+        [(call_ref) (b #x14) (u (car args))]
+        [(return_call_ref) (b #x15) (u (car args))]
         [(drop) (b #x1A)]
         [(select) (b #x1B)]
         [(select-typed) (b #x1C) (u 1) (valtype! port (car args))]

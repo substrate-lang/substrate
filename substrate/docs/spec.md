@@ -288,7 +288,9 @@ quotation and compile-time forms.
 - Numbers: `i32`, `i64`, `f32`, `f64`.
 - References: `anyref`, `eqref`, `i31ref`, `structref`, `arrayref`,
   `funcref`, `externref`, and `(ref T)` or `(ref null T)` where `T` is one
-  of `any eq i31 struct array func extern none` or a declared type.
+  of `any eq i31 struct array func extern none nofunc` or a declared type.
+  A declared function type is below `func` only: functions are not in the
+  `any` hierarchy.
 - The words of type syntax (`ref null mut struct array field sub final func
   rec ->`) are compared by name, like wasm's keywords, not looked up as
   bindings. So they are reserved: a declared type may not be named by one,
@@ -322,16 +324,17 @@ quotation and compile-time forms.
 ### 5.2 Module-level forms
 
 ```
-(func (name [param type] ...) [-> result] body ...)
+(func (name [param type] ...) [-> result] [(type T)] body ...)   ; T: a function type
 (global name type init)             ; immutable; init is a constant expression
 (global name (mut type) init)       ; mutable
-(import name "module" "field" (type ... -> type ...))
+(import name "module" "field" (type ... -> type ...))   ; or a function type name
 (memory pages)  (memory from name)
 (table size)  (table from name)
 (data name offset "bytes" ...)      ; active segment at offset in memory
 (type name (struct (field fname ftype) ...))   ; ftype: storage or (mut storage)
 (type name (array ftype))                      ; storage: a type, i8 or i16
 (type name (sub [final] [super] def))          ; def: (struct ...) or (array ...)
+(type name (func (t ... -> t ...)))            ; a function type
 (rec (type name def) ...)                      ; types that refer to each other
 (require name source item ...)      ; source: "path" or syntax; item: x or [new old]
 (require-unqualified name source)   ; every provided name unqualified too (3.1)
@@ -377,6 +380,20 @@ be an earlier member or an earlier type. Wasm compares declared types
 group by group, so a type in a group is the same wasm type only as the
 same member of an identical group.
 
+**Function types** are declared like the others:
+`(type T (func (t ... -> r ...)))`, also with `sub` and in a `rec` group. A
+function subtype takes parameters its supertype's fit and returns results
+that fit its supertype's, as in wasm. A function is given a declared type
+by a `(type T)` clause first in its body, as in wasm's
+`(func $f (type $t) ...)`; its parameters and results must be `T`'s. That type is part of the
+function's declaration, so other modules import it at `T`, and
+`(ref.func f)` is a `(ref T)`. A function without the clause has only its
+signature, and `ref.func` does not accept it. An `import` can name a
+function type in place of the signature. `(call-ref T f arg ...)` calls
+`f`, a `(ref null T)`, and is emitted as `return_call_ref` in tail
+position. A closure is the usual case: its struct and its code's function
+type refer to each other, so they are one `rec` group.
+
 Globals follow wasm too. A global is immutable unless its type is written
 `(mut type)`, and `set!` of an immutable global is an error. An initializer
 that is a **constant expression** is compiled into the global itself, as
@@ -407,6 +424,8 @@ id                                  ; local or global variable
 (#%app f arg ...)                   ; core: a direct call of the function f
 (op arg ... [offset])               ; a numeric or memory instruction, e.g. (i32.add a b)
 (call-indirect (t ... -> t ...) index arg ...)
+(ref.func f)                        ; (ref T), for f declared with (type T)
+(call-ref T f arg ...)              ; call f, a (ref null T)
 (func-index f)                      ; i32 index of f in the module's table
 (data-address name)  (data-size name)
 (select a b test)  (drop expr)  (unreachable)  (nop)
@@ -594,9 +613,9 @@ explicit. `local-expand` returns it, module passes receive and return it,
 `subc expand` prints it, and the compiler compiles it.
 
 ```
-form ::= (func (id [id type] ...) [-> result] expr ...)
+form ::= (func (id [id type] ...) [-> result] [(type id)] expr ...)
        | (global id type expr) | (global id (mut type) expr)
-       | (import id "module" "field" (type ... -> type ...))
+       | (import id "module" "field" (type ... -> type ...)) | (import id "module" "field" id)
        | (type id def) | (rec (type id def) ...) | (data id offset "bytes" ...)
        | expr
 
@@ -611,6 +630,7 @@ expr ::= id                                   ; a local or global variable
        | (block id expr ...) | (loop id expr ...)
        | (br id [expr]) | (br-if id expr) | (return [expr])
        | (call-indirect (type ... -> type ...) expr expr ...)
+       | (ref.func id) | (call-ref id expr expr ...)
        | (func-index id) | (data-address id) | (data-size id)
        | (select expr expr expr) | (drop expr) | (unreachable) | (nop)
 ```

@@ -32,7 +32,7 @@
     (append
      '(func global import memory table data type rec define-syntax define-static begin-for-syntax
        begin require require-unqualified provide runtime-free module-pass set! let let* if block loop br br-if return
-       call-indirect func-index data-address data-size select drop unreachable nop
+       call-indirect call-ref ref.func func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
      (list app-sym datum-sym)
      gc-forms))
@@ -322,7 +322,8 @@
               (cdr hit)
               (let ([new (cond [(func-info? info)
                                 (make-func-info (func-info-name info) (func-info-params info) (func-info-results info)
-                                                (shift-instance (func-info-instance info) k) (func-info-export info))]
+                                                (shift-instance (func-info-instance info) k) (func-info-export info)
+                                                (func-info-type info))]
                                [(global-info? info)
                                 (make-global-info (global-info-name info) (global-info-type info) (global-info-mutable? info)
                                                   (shift-instance (global-info-instance info) k) (global-info-export info))]
@@ -713,6 +714,10 @@
 
   (define type-keywords '(ref null mut struct array field sub final func rec ->))
 
+  ;; A kind of declared type, with its article, for messages.
+  (define (kind-word kind)
+    (case kind [(struct) "a struct"] [(array) "an array"] [(func) "a function"] [else "a"]))
+
   (define (check-type-name! id)
     (let ([name (stx-e id)])
       (cond [(or (memq name (append abstract-heaps '(i32 i64 f32 f64 i8 i16)))
@@ -795,6 +800,8 @@
                                                  (stx-rewrap fs (list (car fp) (cadr fp) (expand-field-type (caddr fp) phase)))
                                                  fs)))
                                          (cdr l))))]
+            [(and l (= (length l) 2) (core-name? (car l) 'func))
+             (stx-rewrap s (list (car l) (expand-signature (cadr l) phase)))]
             [(and l (= (length l) 2) (core-name? (car l) 'array))
              (stx-rewrap s (list (car l) (expand-field-type (cadr l) phase)))]
             [else s])))
@@ -859,13 +866,13 @@
       (check-type-name! (cadr parts))
       (let-values ([(def final? super) (parse-sub (caddr parts) phase)])
         (let ([kind (stx-e (car (stx->list def)))])
-          (unless (memq kind '(struct array))
-            (raise-compile-error def "a type is (struct field ...), (array type) or (sub ...)"))
+          (unless (memq kind '(struct array func))
+            (raise-compile-error def "a type is (struct field ...), (array type), (func signature) or (sub ...)"))
           (when super
             (unless (eq? (type-info-kind super) kind)
-              (raise-compile-error (caddr parts) "a~a type cannot have the ~a type ~a as its supertype"
-                                   (if (eq? kind 'struct) " struct" "n array") (type-info-kind super)
-                                   (type-info-name super)))
+              (raise-compile-error (caddr parts) "~a type cannot have ~a, ~a type, as its supertype"
+                                   (kind-word kind) (type-info-name super)
+                                   (kind-word (type-info-kind super))))
             (when (type-info-final? super)
               (raise-compile-error (caddr parts) "~a is final: it cannot be a supertype" (type-info-name super))))
           (let ([info (make-type-info (stx-e (cadr parts)) kind #f super final? #f)])
@@ -905,8 +912,12 @@
                       (cons (stx-e (cadr fp)) (parse-field-type (caddr fp) phase))))
                   (cdr l))
           (begin
-            (unless (= (length l) 2) (raise-compile-error def "expected (array type)"))
-            (parse-field-type (cadr l) phase)))))
+            (unless (= (length l) 2)
+              (raise-compile-error def (if (eq? kind 'func) "expected (func signature)" "expected (array type)")))
+            (if (eq? kind 'func)
+                (let-values ([(params results) (parse-signature (cadr l) phase)])
+                  (list params results))
+                (parse-field-type (cadr l) phase))))))
 
   ;; Wasm's rule for a declared supertype: a struct starts with its
   ;; supertype's fields, and an array's element matches. An immutable field
@@ -917,19 +928,28 @@
            (if (or (memq (car a) '(i8 i16)) (memq (car b) '(i8 i16)))
                (eq? (car a) (car b))
                (and (valtype<=? (car a) (car b)) (or (not (cadr a)) (valtype<=? (car b) (car a)))))))
-    (if (eq? (type-info-kind info) 'struct)
-        (let ([mine (type-info-fields info)] [theirs (type-info-fields super)])
-          (when (< (length mine) (length theirs))
-            (raise-compile-error where "~a has fewer fields than its supertype ~a"
-                                 (type-info-name info) (type-info-name super)))
-          (for-each (lambda (a b)
-                      (unless (field<=? (cdr a) (cdr b))
-                        (raise-compile-error where "~a's field ~a does not match field ~a of its supertype ~a"
-                                             (type-info-name info) (car a) (car b) (type-info-name super))))
-                    (list-head mine (length theirs)) theirs))
-        (unless (field<=? (type-info-fields info) (type-info-fields super))
-          (raise-compile-error where "~a's element type does not match its supertype ~a's"
-                               (type-info-name info) (type-info-name super)))))
+    (case (type-info-kind info)
+      [(struct)
+       (let ([mine (type-info-fields info)] [theirs (type-info-fields super)])
+         (when (< (length mine) (length theirs))
+           (raise-compile-error where "~a has fewer fields than its supertype ~a"
+                                (type-info-name info) (type-info-name super)))
+         (for-each (lambda (a b)
+                     (unless (field<=? (cdr a) (cdr b))
+                       (raise-compile-error where "~a's field ~a does not match field ~a of its supertype ~a"
+                                            (type-info-name info) (car a) (car b) (type-info-name super))))
+                   (list-head mine (length theirs)) theirs))]
+      [(array)
+       (unless (field<=? (type-info-fields info) (type-info-fields super))
+         (raise-compile-error where "~a's element type does not match its supertype ~a's"
+                              (type-info-name info) (type-info-name super)))]
+      ;; A function subtype accepts at least its supertype's parameters and
+      ;; returns at most its results.
+      [(func)
+       (let ([mine (type-info-fields info)] [theirs (type-info-fields super)])
+         (unless (and (types<=? (car theirs) (car mine)) (types<=? (cadr mine) (cadr theirs)))
+           (raise-compile-error where "~a's signature does not fit its supertype ~a's"
+                                (type-info-name info) (type-info-name super))))]))
 
   (define (type-of id phase)
     (let ([m (and (id? id) (type-meaning-of id phase))])
@@ -989,21 +1009,43 @@
                           (when (null? (cdr rest)) (raise-compile-error (car rest) "expected a type after ->"))
                           (expand-arrow (list-head rest 2) phase))
                         '())])
-        (let-values ([(results body) (parse-results (append arrow (list-tail rest (length arrow))) phase)])
-          (let ([info (make-func-info (stx-e name) types results #f #f)])
+        (let*-values ([(results body0) (parse-results (append arrow (list-tail rest (length arrow))) phase)]
+                      [(clause ftype body) (func-type-clause body0 types results phase)])
+          (let ([info (make-func-info (stx-e name) types results #f #f ftype)])
             (bind-definition! name phase (list 'func info))
-            (list 'func name params arrow body f))))))
+            (list 'func name params arrow body f clause))))))
+
+  (define (type-clause? s)
+    (let ([l (stx->list s)]) (and l (= (length l) 2) (core-name? (car l) 'type))))
+
+  ;; An optional (type T) first in a func's body declares its function type
+  ;; T, as in wasm (spec 5.2): the type other modules and ref.func see it
+  ;; at. Its parameters and results must be T's. Returns the clause, T, and
+  ;; the rest of the body.
+  (define (func-type-clause body params results phase)
+    (let ([l (and (pair? body) (type-clause? (car body)) (stx->list (car body)))])
+      (if l
+          (let* ([tname (expand-type-name (cadr l) phase)]
+                 [t (type-of tname phase)])
+            (unless (func-type? t)
+              (raise-compile-error (cadr l) "~a is not a function type" (type-info-name t)))
+            (unless (and (equal? params (car (type-info-fields t))) (equal? results (cadr (type-info-fields t))))
+              (raise-compile-error (car body) "the function's parameters and results are not those of ~a"
+                                   (type-info-name t)))
+            (values (stx-rewrap (car body) (list (car l) tname)) t (cdr body)))
+          (values #f #f body))))
 
   ;; (func (name [p t] ...) [-> r] body ...), expanded.
   (define (expand-func p phase)
     (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
-           [f (list-ref p 5)]
+           [f (list-ref p 5)] [clause (list-ref p 6)]
            [sc (new-local-scope!)]
            [xs (map-lr (lambda (pp) (let ([x (add-scope (car pp) sc)]) (bind-local! x phase) x)) params)])
       (apply out f 'func
              (out-list (cadr (stx->list f))
                        (cons name (map-lr (lambda (x pp) (out-list x (list x (cadr pp)))) xs params)))
-             (append arrow (map-lr (lambda (b) (expand-expr (add-scope b sc) phase)) body)))))
+             (append arrow (if clause (list (core-headed clause 'type)) '())
+                     (map-lr (lambda (b) (expand-expr (add-scope b sc) phase)) body)))))
 
   ;; (global name type init) or (global name (mut type) init), as in wasm.
   (define (declare-global f phase)
@@ -1022,17 +1064,27 @@
     (let ([parts (stx->list (cadr p))])
       (out (cadr p) 'global (cadr parts) (caddr p) (expand-expr (cadddr parts) phase))))
 
-  ;; (import name "module" "field" (t ... -> r ...))
+  ;; (import name "module" "field" (t ... -> r ...)), or with a function
+  ;; type's name in place of the signature, to import the function at that
+  ;; type (spec 5.2).
   (define (declare-import f phase)
     (let ([parts (stx-list-of f 'import)])
       (unless (and (= (length parts) 5) (id? (cadr parts))
                    (string? (stx-e (caddr parts))) (string? (stx-e (cadddr parts))))
         (raise-compile-error f "expected (import name \"module\" \"field\" (type ... -> type ...))"))
-      (let ([sig (expand-signature (list-ref parts 4) phase)])
-        (let-values ([(params results) (parse-signature sig phase)])
+      (let* ([given (list-ref parts 4)]
+             [ftype (and (or (id? given) (type-macro-use given phase))
+                         (let ([t (type-of (expand-type-name given phase) phase)])
+                           (unless (func-type? t)
+                             (raise-compile-error given "~a is not a function type" (type-info-name t)))
+                           t))]
+             [sig (if ftype (expand-type-name given phase) (expand-signature given phase))])
+        (let-values ([(params results) (if ftype
+                                           (values (car (type-info-fields ftype)) (cadr (type-info-fields ftype)))
+                                           (parse-signature sig phase))])
           (bind-definition! (cadr parts) phase
                  (list 'func (make-func-info (stx-e (cadr parts)) params results
-                                             (stx-e (caddr parts)) (stx-e (cadddr parts)))))
+                                             (stx-e (caddr parts)) (stx-e (cadddr parts)) ftype)))
           (list 'plain (out f 'import (cadr parts) (caddr parts) (cadddr parts) sig))))))
 
 
@@ -1222,7 +1274,7 @@
   ;; handles into references around `body`, which returns an eqref.
   (define (entry-chunk! st param? body)
     (let* ([key (and param? (fresh-key!))]
-           [entry (make-func-info '__entry (if param? '(i32) '()) '(i32) #f #f)]
+           [entry (make-func-info '__entry (if param? '(i32) '()) '(i32) #f #f #f)]
            [body (body (and param? (list 'call (syntax-info '%deref) (list (list 'lref key)))))])
       (cstore-counter-set! st (+ (cstore-counter st) 1))
       (instantiate-chunk! st (format "entry#~a" (cstore-counter st))
@@ -1291,7 +1343,7 @@
       (let* ([name (string->symbol (string-append "__static." (symbol->string (stx-e (cadr parts)))))]
              [rhs (lower-expr (expand-expr (caddr parts) (+ phase 1)) (+ phase 1))]
              [global (make-global-info name eqref #t #f #f)]
-             [getter (make-func-info name '() (list eqref) #f #f)])
+             [getter (make-func-info name '() (list eqref) #f #f #f)])
         (run-chunk! (list (list 'global global rhs) (list 'func getter '() (list 'gref global)))
                     (+ phase 1) f)
         (static-handle (comp-store current) getter)
@@ -1767,6 +1819,24 @@
             (let ([sig (expand-signature (cadr parts) phase)])
               (parse-signature sig phase)
               (apply o sig (map-lr ex (cddr parts))))]
+           ;; (ref.func f): a reference to f, at its declared function type.
+           [(ref.func)
+            (arity-check (and (= (length parts) 2) (id? (cadr parts))))
+            (let ([m (meaning-of (cadr parts) phase)])
+              (unless (and m (eq? (car m) 'func))
+                (raise-compile-error (cadr parts) "ref.func: ~a is not a function" (stx-e (cadr parts))))
+              (unless (func-info-type (cadr m))
+                (raise-compile-error (cadr parts) "ref.func: ~a has no declared function type; give it one with (type T)"
+                                     (stx-e (cadr parts)))))
+            (o (cadr parts))]
+           ;; (call-ref T f arg ...): call f, a (ref null T), with the args.
+           [(call-ref)
+            (arity-check (>= (length parts) 3))
+            (let* ([tname (expand-type-name (cadr parts) phase)]
+                   [t (type-of tname phase)])
+              (unless (func-type? t)
+                (raise-compile-error (cadr parts) "call-ref: ~a is not a function type" (type-info-name t)))
+              (apply o tname (map-lr ex (cddr parts))))]
            [(func-index)
             (arity-check (and (= (length parts) 2) (id? (cadr parts))))
             (let ([m (meaning-of (cadr parts) phase)])
@@ -1899,7 +1969,8 @@
              (list (list 'func info
                    (map-lr (lambda (p t) (cons (local-key-of (car (stx->list p)) phase) t))
                            (cdr head) (func-info-params info))
-                   (lower-seq body f phase)))))]
+                   ;; A (type T) clause first is in the info already.
+                   (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase)))))]
         [(global)
          (let ([m (meaning-of (cadr parts) phase)])
            (list (list 'global (cadr m) (lower-expr (cadddr parts) phase))))]
@@ -2013,6 +2084,8 @@
           (let-values ([(params results) (parse-signature (cadr parts) phase)])
             (list 'call-indirect params results (lo (caddr parts)) (map-lr lo (cdddr parts))))]
          [(func-index) (list 'func-index (func-info-of (cadr parts) phase))]
+         [(ref.func) (list 'ref-func (func-info-of (cadr parts) phase))]
+         [(call-ref) (list 'call-ref (type-of (cadr parts) phase) (lo (caddr parts)) (map-lr lo (cdddr parts)))]
          [(select) (list 'select (lo (cadr parts)) (lo (caddr parts)) (lo (cadddr parts)))]
          [(drop) (list 'drop (lo (cadr parts)))]
          [(unreachable) '(unreachable)]

@@ -33,16 +33,17 @@
           global-info-instance global-info-instance-set! global-info-export global-info-export-set!
           make-data-info data-info? data-info-name data-info-offset data-info-bytes
           make-type-info type-info? type-info-name type-info-kind type-info-fields type-info-fields-set!
-          type-info-super type-info-final? type-info-group type-info-group-set!
+          type-info-super type-info-final? type-info-group type-info-group-set! func-type? func-info-type
           ref-type? make-ref ref-nullable? ref-heap abstract-heaps numeric-type?
           valtype<=? types<=? valtype-join valtype->string unpacked defaultable?
           fresh-key! reset-keys!)
   (import (chezscheme))
 
   ;; instance: name of the instance that defines it, or #f while it is being
-  ;; compiled. export: the export (or import field) name.
+  ;; compiled. export: the export (or import field) name. type: its declared
+  ;; function type (a type-info), or #f if it has only its signature.
   (define-record-type func-info
-    (fields name params results (mutable instance) (mutable export)))
+    (fields name params results (mutable instance) (mutable export) type))
 
   (define-record-type global-info
     (fields name type mutable? (mutable instance) (mutable export)))
@@ -50,8 +51,9 @@
   ;; An active data segment: bytes placed at offset in the module's memory.
   (define-record-type data-info (fields name offset bytes))
 
-  ;; A declared GC type. kind is struct or array. A struct's fields are a
-  ;; list of (name storage mutable?); an array's are one (storage mutable?).
+  ;; A declared type. kind is struct, array or func. A struct's fields are a
+  ;; list of (name storage mutable?); an array's are one (storage mutable?);
+  ;; a function type's are (params results).
   ;; storage is a value type, or i8 or i16. super: the declared supertype's
   ;; type-info, or #f. final?: whether other types may declare it as their
   ;; supertype. group: the type-infos of its recursion group in order, or
@@ -74,16 +76,20 @@
   ;; the same shape are one type to wasm and two types here (spec 5.3).
   (define (heap<=? a b)
     (cond [(eq? a b) #t]
-          [(eq? a 'none) (or (type-info? b) (memq b '(any eq i31 struct array)))]
-          [(eq? a 'nofunc) (eq? b 'func)]
+          [(eq? a 'none) (or (and (type-info? b) (not (func-type? b))) (memq b '(any eq i31 struct array)))]
+          [(eq? a 'nofunc) (or (eq? b 'func) (and (type-info? b) (func-type? b)))]
           [(eq? a 'noextern) (eq? b 'extern)]
           [(memq a '(i31 struct array)) (memq b '(eq any))]
           [(eq? a 'eq) (eq? b 'any)]
+          ;; A declared function type is below func only: functions are not
+          ;; in the any hierarchy.
           [(type-info? a)
-           (or (memq b '(eq any))
+           (or (and (not (func-type? a)) (memq b '(eq any)))
                (eq? b (type-info-kind a))
                (and (type-info-super a) (heap<=? (type-info-super a) b)))]
           [else #f]))
+
+  (define (func-type? t) (eq? (type-info-kind t) 'func))
 
   ;; The least heap type above both a and b.
   (define (heap-join a b)

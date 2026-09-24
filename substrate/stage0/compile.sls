@@ -419,6 +419,18 @@
              (finish (append code ic `((call_indirect ,sig 0))) results)))]
       [(func-index) (info)
        (finish `((global.get ,(fidx-synth! ms info))) '(i32))]
+      [(ref-func) (info)
+       (note-func! ms info)
+       (unless (func-info-type info)
+         (fail "internal: ref.func of ~a, which has no declared function type" (func-info-name info)))
+       (finish `((ref.func ,info)) (list (make-ref #f (func-info-type info))))]
+      [(call-ref) (t f args)
+       (let ([code (args-code args (car (type-info-fields t)))]
+             [fcode (code-of f (make-ref #t t))]
+             [results (cadr (type-info-fields t))])
+         (if (and tail? (types<=? results (fctx-results fc)))
+             (values (append code fcode `((return_call_ref ,t))) results)
+             (finish (append code fcode `((call_ref ,t))) results)))]
       [(gc) (op imms args)
        (mstate-uses-gc-set! ms #t)
        (compile-gc op imms args)]
@@ -650,7 +662,9 @@
       (collect-types (list (map cadr type-forms)
                            (map (lambda (cf) (list (cadr cf) (caddr cf) (cadddr cf))) compiled-funcs)
                            (fctx-extra start-fc) start-code
-                           (map (lambda (info) (list (func-info-params info) (func-info-results info))) func-imports)
+                           (map (lambda (info) (list (func-info-params info) (func-info-results info) (func-info-type info)))
+                                func-imports)
+                           (map (lambda (cf) (func-info-type (car cf))) compiled-funcs)
                            (map global-info-type global-imports) (map cdr constant-inits)
                            (map (lambda (f) (global-info-type (cadr f))) global-forms))))
     (define gc-index
@@ -677,6 +691,10 @@
       (or (hashtable-ref global-index g #f)
           (fail "internal: global has no index")))
     (define (ti t) (or (hashtable-ref gc-index t #f) (fail "internal: type has no index")))
+    ;; A function's type index: its declared function type's, or else its
+    ;; signature's.
+    (define (func-type-index info sig)
+      (if (func-info-type info) (ti (func-info-type info)) (type-index sig)))
 
     (define declared '())
     (define (resolve instrs)
@@ -688,6 +706,7 @@
                                 (list 'ref.func n))]
                   [(global.get global.set) (list (car i) (gi (cadr i)))]
                   [(call_indirect return_call_indirect) (list (car i) (type-index (cadr i)) (caddr i))]
+                  [(call_ref return_call_ref) (list (car i) (ti (cadr i)))]
                   [(block loop) (list (car i) (resolve-bt (cadr i)) (resolve (caddr i)))]
                   [(if) (list 'if (resolve-bt (cadr i)) (resolve (caddr i)) (resolve (cadddr i)))]
                   [(select-typed) (list 'select-typed (rv (cadr i)))]
@@ -709,7 +728,7 @@
       (append
        (map-lr (lambda (info)
                  (list (func-info-instance info) (func-info-export info) 'func
-                       (type-index (list 'func (func-info-params info) (func-info-results info)))))
+                       (func-type-index info (list 'func (func-info-params info) (func-info-results info)))))
                func-imports)
        (map-lr (lambda (g) (list (global-info-instance g) (global-info-export g) 'global
                                  (list (rv (global-info-type g)) (global-info-mutable? g))))
@@ -720,7 +739,7 @@
     (define wfuncs
       (append
        (map-lr (lambda (cf)
-                 (list (type-index (cadr cf)) (map rv (caddr cf)) (resolve (cadddr cf))
+                 (list (func-type-index (car cf) (cadr cf)) (map rv (caddr cf)) (resolve (cadddr cf))
                        (func-info-export (car cf))))
                compiled-funcs)
        (if has-start?
@@ -764,9 +783,10 @@
     (define (type-entry t)
       (list 'sub (type-info-final? t)
             (if (type-info-super t) (list (heap-index (type-info-super t))) '())
-            (if (eq? (type-info-kind t) 'struct)
-                (list 'struct (map (lambda (f) (list (rstorage (cadr f)) (caddr f))) (type-info-fields t)))
-                (list 'array (list (rstorage (car (type-info-fields t))) (cadr (type-info-fields t)))))))
+            (case (type-info-kind t)
+              [(struct) (list 'struct (map (lambda (f) (list (rstorage (cadr f)) (caddr f))) (type-info-fields t)))]
+              [(array) (list 'array (list (rstorage (car (type-info-fields t))) (cadr (type-info-fields t))))]
+              [(func) (list 'func (map rv (car (type-info-fields t))) (map rv (cadr (type-info-fields t))))])))
 
     ;; One entry per recursion group: collect-types keeps a group's members
     ;; together and in order.
@@ -796,4 +816,4 @@
               (cond [(null? is) (reverse acc)]
                     [(member (caar is) acc) (loop (cdr is) acc)]
                     [else (loop (cdr is) (cons (caar is) acc))]))
-            (or (mstate-uses-gc ms) (not (null? gc-types))))))
+            (or (mstate-uses-gc ms) (exists (lambda (t) (not (func-type? t))) gc-types)))))
