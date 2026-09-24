@@ -4,11 +4,15 @@
 ;; Instructions are lists (op imm ...). Structured ones nest:
 ;;   (block bt instrs) (loop bt instrs) (if bt then-instrs else-instrs)
 ;; where bt is () | valtype | (type n).
+;;
+;; Value types are resolved: i32 i64 f32 f64, or (ref nullable? heap) where
+;; heap is an abstract heap type symbol or a type index.
 (library (stage0 wasm)
   (export make-wmodule encode-module)
   (import (chezscheme) (stage0 ops))
 
-  ;; types:   list of (params . results)
+  ;; types:   list of (func (param ...) (result ...)) | (struct ((storage mut?) ...))
+  ;;          | (array (storage mut?)); storage is a valtype, i8 or i16
   ;; imports: list of (module field kind desc); kind func: typeidx,
   ;;          memory/table: (min max-or-#f), global: (valtype mutable?)
   ;; funcs:   list of (typeidx locals instrs name)
@@ -64,11 +68,35 @@
 
   ;; ---- types --------------------------------------------------------------
 
-  (define (valtype-byte t)
-    (case t
-      [(i32) #x7F] [(i64) #x7E] [(f32) #x7D] [(f64) #x7C] [(v128) #x7B]
-      [(funcref) #x70] [(externref) #x6F]
-      [else (error 'encode "unknown value type" t)]))
+  (define (heap! port h)
+    (if (integer? h)
+        (sleb! port h)
+        (out-byte! port
+                   (case h
+                     [(func) #x70] [(extern) #x6F] [(any) #x6E] [(eq) #x6D] [(i31) #x6C]
+                     [(struct) #x6B] [(array) #x6A] [(none) #x71] [(noextern) #x72] [(nofunc) #x73]
+                     [else (error 'encode "unknown heap type" h)]))))
+
+  (define (valtype! port t)
+    (cond [(pair? t)
+           (out-byte! port (if (cadr t) #x63 #x64))
+           (heap! port (caddr t))]
+          [else
+           (out-byte! port
+                      (case t
+                        [(i32) #x7F] [(i64) #x7E] [(f32) #x7D] [(f64) #x7C] [(v128) #x7B]
+                        [(funcref) #x70] [(externref) #x6F]
+                        [else (error 'encode "unknown value type" t)]))]))
+
+  (define (storage! port s)
+    (case s
+      [(i8) (out-byte! port #x78)]
+      [(i16) (out-byte! port #x77)]
+      [else (valtype! port s)]))
+
+  (define (field! port f)
+    (storage! port (car f))
+    (out-byte! port (if (cadr f) 1 0)))
 
   (define (limits! port lim)
     (let ([min (car lim)] [max (cadr lim)])
@@ -78,8 +106,8 @@
 
   (define (blocktype! port bt)
     (cond [(null? bt) (out-byte! port #x40)]
-          [(symbol? bt) (out-byte! port (valtype-byte bt))]
-          [else (sleb! port (cadr bt))]))
+          [(and (pair? bt) (eq? (car bt) 'type)) (sleb! port (cadr bt))]
+          [else (valtype! port bt)]))
 
   ;; ---- instructions -------------------------------------------------------
 
@@ -89,6 +117,7 @@
     (let ([op (car i)] [args (cdr i)])
       (define (u n) (uleb! port n))
       (define (b n) (out-byte! port n))
+      (define (gc n) (b #xFB) (u n))
       (case op
         [(unreachable) (b #x00)]
         [(nop) (b #x01)]
@@ -106,6 +135,7 @@
         [(return_call_indirect) (b #x13) (u (car args)) (u (cadr args))]
         [(drop) (b #x1A)]
         [(select) (b #x1B)]
+        [(select-typed) (b #x1C) (u 1) (valtype! port (car args))]
         [(local.get) (b #x20) (u (car args))]
         [(local.set) (b #x21) (u (car args))]
         [(local.tee) (b #x22) (u (car args))]
@@ -121,10 +151,35 @@
          (let ([bv (make-bytevector 8)])
            (bytevector-ieee-double-set! bv 0 (car args) (endianness little))
            (bytes! port bv))]
-        [(ref.null) (b #xD0) (b (valtype-byte (car args)))]
+        [(ref.null) (b #xD0) (heap! port (car args))]
+        [(ref.is_null) (b #xD1)]
         [(ref.func) (b #xD2) (u (car args))]
+        [(ref.eq) (b #xD3)]
+        [(ref.as_non_null) (b #xD4)]
         [(table.grow) (b #xFC) (u 15) (u (car args))]
         [(table.size) (b #xFC) (u 16) (u (car args))]
+        ;; GC (0xFB prefix)
+        [(struct.new) (gc 0) (u (car args))]
+        [(struct.get) (gc 2) (u (car args)) (u (cadr args))]
+        [(struct.get_s) (gc 3) (u (car args)) (u (cadr args))]
+        [(struct.get_u) (gc 4) (u (car args)) (u (cadr args))]
+        [(struct.set) (gc 5) (u (car args)) (u (cadr args))]
+        [(array.new) (gc 6) (u (car args))]
+        [(array.new_default) (gc 7) (u (car args))]
+        [(array.new_fixed) (gc 8) (u (car args)) (u (cadr args))]
+        [(array.get) (gc 11) (u (car args))]
+        [(array.get_s) (gc 12) (u (car args))]
+        [(array.get_u) (gc 13) (u (car args))]
+        [(array.set) (gc 14) (u (car args))]
+        [(array.len) (gc 15)]
+        [(array.fill) (gc 16) (u (car args))]
+        [(array.copy) (gc 17) (u (car args)) (u (cadr args))]
+        ;; (ref.test nullable? heap) / (ref.cast nullable? heap)
+        [(ref.test) (gc (if (car args) 21 20)) (heap! port (cadr args))]
+        [(ref.cast) (gc (if (car args) 23 22)) (heap! port (cadr args))]
+        [(ref.i31) (gc 28)]
+        [(i31.get_s) (gc 29)]
+        [(i31.get_u) (gc 30)]
         [else
          (let ([p (lookup-prim op)])
            (unless p (error 'encode "unknown instruction" i))
@@ -146,9 +201,11 @@
              (lambda (p)
                (vec! p types
                      (lambda (p t)
-                       (out-byte! p #x60)
-                       (vec! p (car t) (lambda (p v) (out-byte! p (valtype-byte v))))
-                       (vec! p (cdr t) (lambda (p v) (out-byte! p (valtype-byte v))))))))))
+                       (case (car t)
+                         [(func) (out-byte! p #x60) (vec! p (cadr t) valtype!) (vec! p (caddr t) valtype!)]
+                         [(struct) (out-byte! p #x5F) (vec! p (cadr t) field!)]
+                         [(array) (out-byte! p #x5E) (field! p (cadr t))]
+                         [else (error 'encode "unknown type" t)])))))))
        (let ([imports (wmodule-imports m)])
          (unless (null? imports)
            (section! port 2
@@ -162,7 +219,7 @@
                            [(func) (out-byte! p 0) (uleb! p desc)]
                            [(table) (out-byte! p 1) (out-byte! p #x70) (limits! p desc)]
                            [(memory) (out-byte! p 2) (limits! p desc)]
-                           [(global) (out-byte! p 3) (out-byte! p (valtype-byte (car desc)))
+                           [(global) (out-byte! p 3) (valtype! p (car desc))
                                      (out-byte! p (if (cadr desc) 1 0))]))))))))
        (let ([funcs (wmodule-funcs m)])
          (unless (null? funcs)
@@ -179,7 +236,7 @@
              (lambda (p)
                (vec! p globals
                      (lambda (p g)
-                       (out-byte! p (valtype-byte (car g)))
+                       (valtype! p (car g))
                        (out-byte! p (if (cadr g) 1 0))
                        (instrs! p (caddr g))
                        (out-byte! p #x0B)))))))
@@ -212,7 +269,7 @@
                                     (lambda (q)
                                       (let ([groups (group-locals (cadr f))])
                                         (vec! q groups
-                                              (lambda (q g) (uleb! q (cdr g)) (out-byte! q (valtype-byte (car g))))))
+                                              (lambda (q g) (uleb! q (cdr g)) (valtype! q (car g)))))
                                       (instrs! q (caddr f))
                                       (out-byte! q #x0B)))])
                          (uleb! p (bytevector-length body))
@@ -246,6 +303,6 @@
   (define (group-locals types)
     (let loop ([ts types] [acc '()])
       (cond [(null? ts) (reverse acc)]
-            [(and (pair? acc) (eq? (caar acc) (car ts)))
+            [(and (pair? acc) (equal? (caar acc) (car ts)))
              (loop (cdr ts) (cons (cons (caar acc) (+ 1 (cdar acc))) (cdr acc)))]
             [else (loop (cdr ts) (cons (cons (car ts) 1) acc))]))))

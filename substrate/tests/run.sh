@@ -9,10 +9,10 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 mkdir -p build/tests
 
-# Build the expander module once first, so library compile notices stay out
+# Build the syntax library once first, so library compile notices stay out
 # of test output.
-bin/subc expander-module -o build/expander.wasm > /dev/null
-wasm-tools validate build/expander.wasm || { echo "FAIL expander.wasm does not validate"; exit 1; }
+bin/subc syntax-library -o build/syntax.wasm > /dev/null
+wasm-tools validate build/syntax.wasm || { echo "FAIL syntax.wasm does not validate"; exit 1; }
 
 pass=0
 fail=0

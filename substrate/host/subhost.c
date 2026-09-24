@@ -16,10 +16,6 @@ struct sub_host {
   /* The context every call uses. Inside a host function it is the caller's
    * context, so nested calls into wasm go through the right one. */
   wasmtime_context_t *ctx;
-  /* The memory the embedder reads and writes (sub_use_memory). The host's
-   * own imports never use it: they use the caller's memory. */
-  wasmtime_memory_t mem;
-  bool have_mem;
   int32_t result;
   sub_callback cb;
   char *pending_trap;
@@ -85,35 +81,6 @@ static bool caller_memory(wasmtime_caller_t *caller, wasmtime_memory_t *out) {
   return true;
 }
 
-int sub_use_memory(sub_host *h, const char *inst, const char *name) {
-  wasmtime_extern_t ext;
-  if (!wasmtime_linker_get(h->linker, h->ctx, inst, strlen(inst), name, strlen(name), &ext) ||
-      ext.kind != WASMTIME_EXTERN_MEMORY) {
-    set_err(h, "use_memory: no memory %s.%s", inst, name);
-    return 1;
-  }
-  h->mem = ext.of.memory;
-  h->have_mem = true;
-  return 0;
-}
-
-uintptr_t sub_mem_base(sub_host *h) {
-  return h->have_mem ? (uintptr_t)wasmtime_memory_data(h->ctx, &h->mem) : 0;
-}
-
-size_t sub_mem_size(sub_host *h) {
-  return h->have_mem ? wasmtime_memory_data_size(h->ctx, &h->mem) : 0;
-}
-
-int sub_mem_write(sub_host *h, uint32_t addr, const uint8_t *src, size_t len) {
-  uint8_t *dst = h->have_mem ? range(h->ctx, &h->mem, addr, (uint32_t)len) : NULL;
-  if (!dst) {
-    set_err(h, "mem_write: [%u, +%zu) out of bounds", addr, len);
-    return 1;
-  }
-  memcpy(dst, src, len);
-  return 0;
-}
 
 /* ---- instantiation ---------------------------------------------------- */
 
@@ -362,6 +329,8 @@ sub_host *sub_host_new(void) {
   wasmtime_config_wasm_multi_value_set(config, true);
   wasmtime_config_wasm_bulk_memory_set(config, true);
   wasmtime_config_wasm_reference_types_set(config, true);
+  wasmtime_config_wasm_function_references_set(config, true);
+  wasmtime_config_wasm_gc_set(config, true);
   /* max_wasm_stack may not exceed async_stack_size, even without async. */
   wasmtime_config_async_stack_size_set(config, (size_t)8 << 20);
   wasmtime_config_max_wasm_stack_set(config, (size_t)4 << 20);

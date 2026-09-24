@@ -46,14 +46,6 @@ int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
              int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5);
 int32_t sub_result(sub_host *h);
 
-/* The memory the embedder reads and writes with sub_mem_*: the memory that
- * instance inst exports as name. The base pointer is invalid after any call
- * that runs wasm (memory may grow), so fetch it again each time. */
-int sub_use_memory(sub_host *h, const char *inst, const char *name);
-uintptr_t sub_mem_base(sub_host *h);
-size_t sub_mem_size(sub_host *h);
-int sub_mem_write(sub_host *h, uint32_t addr, const uint8_t *src, size_t len);
-
 void sub_set_callback(sub_host *h, sub_callback cb);
 void sub_request_trap(sub_host *h, const char *msg);
 

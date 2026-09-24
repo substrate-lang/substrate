@@ -1,7 +1,8 @@
-;; FFI to host/subhost.c. One Scheme `host` is one wasm store.
+;; FFI to host/subhost.c. One Scheme `host` is one wasm store. Everything
+;; crossing this boundary is an i32: stage0 refers to GC objects in the
+;; syntax library through integer handles (spec appendix A).
 (library (stage0 host)
-  (export host-new host-instantiate! host-call host-use-memory!
-          host-mem-u8 host-mem-i32 host-mem-write! host-set-callback! host-request-trap!
+  (export host-new host-instantiate! host-call host-set-callback! host-request-trap!
           wasm-failure? wasm-failure-message)
   (import (chezscheme))
 
@@ -14,10 +15,6 @@
   (define c-instantiate (foreign-procedure "sub_instantiate" (uptr string u8* size_t) int))
   (define c-call (foreign-procedure "sub_call" (uptr string string int int int int int int int) int))
   (define c-result (foreign-procedure "sub_result" (uptr) int))
-  (define c-use-memory (foreign-procedure "sub_use_memory" (uptr string string) int))
-  (define c-mem-base (foreign-procedure "sub_mem_base" (uptr) uptr))
-  (define c-mem-size (foreign-procedure "sub_mem_size" (uptr) size_t))
-  (define c-mem-write (foreign-procedure "sub_mem_write" (uptr unsigned-32 u8* size_t) int))
   (define c-set-callback (foreign-procedure "sub_set_callback" (uptr uptr) void))
   (define c-request-trap (foreign-procedure "sub_request_trap" (uptr string) void))
 
@@ -41,20 +38,6 @@
   (define (host-call h inst fn . args)
     (check h (apply c-call h inst fn (length args) (pad args 6)))
     (c-result h))
-
-  ;; Choose the memory host-mem-* read and write: inst's export `name`.
-  (define (host-use-memory! h inst name) (check h (c-use-memory h inst name)))
-
-  (define (host-mem-u8 h addr)
-    (unless (< addr (c-mem-size h)) (error 'host-mem-u8 "out of bounds" addr))
-    (foreign-ref 'unsigned-8 (c-mem-base h) addr))
-
-  (define (host-mem-i32 h addr)
-    (unless (<= (+ addr 4) (c-mem-size h)) (error 'host-mem-i32 "out of bounds" addr))
-    (foreign-ref 'integer-32 (c-mem-base h) addr))
-
-  (define (host-mem-write! h addr bv)
-    (check h (c-mem-write h addr bv (bytevector-length bv))))
 
   ;; proc: (op a0 a1) -> i32. The callable is locked so the collector
   ;; cannot move it while C holds its entry point.

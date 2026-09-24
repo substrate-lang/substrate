@@ -1,0 +1,339 @@
+;; The syntax library (spec section 2).
+;;
+;; Syntax objects, and the data inside them, are immutable wasm GC objects.
+;; This module defines their types and exports the functions macros use to
+;; take syntax apart and build it; that function list is the macro contract.
+;; Code gets these functions with (require syntax). Macros link to the
+;; running compiler's instance, so this interface is part of the bootstrap
+;; seed.
+;;
+;; Functions whose names start with % are internal: the compiler and
+;; stage0's marshaller use them, and (require syntax) does not bind them.
+;; The type definitions are private too (spec appendix A).
+;;
+;; Contract conventions: data are eqref values; #f is the null reference.
+;; Counts, indices, bytes and predicate results are i32 (predicates return
+;; 1 or 0).
+
+;; The memory holds error messages only. No syntax data lives in it.
+(memory 1)
+
+(import %host-trap "host" "trap" (i32 i32 ->))
+;; Expander queries. Stage0 answers them in Chez; they take and return
+;; handles (see the embedder section below).
+(import %query-local-value "expander" "syntax-local-value" (i32 -> i32))
+(import %query-error "expander" "syntax-error" (i32 i32 -> i32))
+(import %query-free-identifier=? "expander" "free-identifier=?" (i32 i32 -> i32))
+
+(data %msg-pair 0 "expected a pair")
+(data %msg-symbol 32 "expected a symbol")
+(data %msg-string 64 "expected a string")
+(data %msg-syntax 96 "expected a syntax object")
+(data %msg-char 128 "expected a character")
+(data %msg-fixnum 160 "expected a fixnum")
+(data %msg-range 192 "index out of range")
+
+(type %string (array (mut i8)))
+(type %pair (struct (field car eqref) (field cdr eqref)))
+(type %symbol (struct (field name (ref %string))))
+(type %atom (struct (field kind i32) (field value i32)))    ; kind 0 char, 1 #t, 2 ()
+(type %syntax (struct (field e eqref) (field scopes eqref) (field srcloc eqref) (field props eqref)))
+(type %srcloc (struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32)))
+(type %table (array (mut eqref)))
+
+(global %true eqref (struct.new %atom 1 0))
+(global %nil eqref (struct.new %atom 2 0))
+(global %symbols (ref null %table) (array.new %table (ref.null eq) 1024))
+
+(func (%fail [addr i32] [len i32])
+  (%host-trap addr len)
+  (unreachable))
+
+(func (%the-true) -> eqref %true)
+(func (%the-nil) -> eqref %nil)
+
+;; ---- atoms ------------------------------------------------------------------
+
+(func (fixnum [n i32]) -> eqref (ref.i31 n))
+(func (fixnum? [v eqref]) -> i32 (ref.test (ref i31) v))
+(func (fixnum-value [v eqref]) -> i32
+  (if (i32.eqz (fixnum? v)) (%fail (data-address %msg-fixnum) (data-size %msg-fixnum)))
+  (i31.get_s (ref.cast (ref i31) v)))
+
+(func (%atom? [v eqref] [kind i32]) -> i32
+  (if (ref.test (ref %atom) v)
+      (i32.eq (struct.get %atom kind (ref.cast (ref %atom) v)) kind)
+      0))
+
+(func (char? [v eqref]) -> i32 (%atom? v 0))
+(func (integer->char [n i32]) -> eqref (struct.new %atom 0 n))
+(func (char->integer [c eqref]) -> i32
+  (if (i32.eqz (char? c)) (%fail (data-address %msg-char) (data-size %msg-char)))
+  (struct.get %atom value (ref.cast (ref %atom) c)))
+
+(func (null? [v eqref]) -> i32 (ref.eq v %nil))
+(func (boolean? [v eqref]) -> i32 (i32.or (ref.is_null v) (ref.eq v %true)))
+
+;; ---- pairs and lists ----------------------------------------------------------
+
+(func (cons [a eqref] [d eqref]) -> eqref (struct.new %pair a d))
+(func (pair? [v eqref]) -> i32 (ref.test (ref %pair) v))
+
+(func (%as-pair [v eqref]) -> (ref %pair)
+  (if (i32.eqz (pair? v)) (%fail (data-address %msg-pair) (data-size %msg-pair)))
+  (ref.cast (ref %pair) v))
+
+(func (car [p eqref]) -> eqref (struct.get %pair car (%as-pair p)))
+(func (cdr [p eqref]) -> eqref (struct.get %pair cdr (%as-pair p)))
+(func (cadr [p eqref]) -> eqref (car (cdr p)))
+(func (cddr [p eqref]) -> eqref (cdr (cdr p)))
+(func (caddr [p eqref]) -> eqref (car (cddr p)))
+(func (cdddr [p eqref]) -> eqref (cdr (cddr p)))
+
+(func (list? [l eqref]) -> i32
+  (block done
+    (loop next
+      (br-if done (i32.eqz (pair? l)))
+      (set! l (cdr l))
+      (br next)))
+  (null? l))
+
+(func (length [l eqref]) -> i32
+  (let ([n 0])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (set! n (i32.add n 1))
+        (set! l (cdr l))
+        (br next)))
+    n))
+
+(func (append [a eqref] [b eqref]) -> eqref
+  (if (pair? a) (cons (car a) (append (cdr a) b)) b))
+
+(func (reverse [l eqref]) -> eqref
+  (let ([acc %nil])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (set! acc (cons (car l) acc))
+        (set! l (cdr l))
+        (br next)))
+    acc))
+
+;; ---- strings and symbols --------------------------------------------------------
+
+(func (string? [v eqref]) -> i32 (ref.test (ref %string) v))
+
+(func (%as-string [v eqref]) -> (ref %string)
+  (if (i32.eqz (string? v)) (%fail (data-address %msg-string) (data-size %msg-string)))
+  (ref.cast (ref %string) v))
+
+(func (string-length [s eqref]) -> i32 (array.len (%as-string s)))
+
+(func (string-byte [s eqref] [i i32]) -> i32
+  (let ([a (%as-string s)])
+    (if (i32.ge_u i (array.len a)) (%fail (data-address %msg-range) (data-size %msg-range)))
+    (array.get_u %string a i)))
+
+(func (string=? [a eqref] [b eqref]) -> i32
+  (let* ([x (%as-string a)] [y (%as-string b)] [n (array.len x)] [i 0])
+    (if (i32.ne n (array.len y)) (return 0))
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (if (i32.ne (array.get_u %string x i) (array.get_u %string y i)) (return 0))
+        (set! i (i32.add i 1))
+        (br next)))
+    1))
+
+(func (string-append [a eqref] [b eqref]) -> eqref
+  (let* ([x (%as-string a)] [y (%as-string b)]
+         [nx (array.len x)] [ny (array.len y)]
+         [s (array.new_default %string (i32.add nx ny))])
+    (array.copy %string %string s 0 x 0 nx)
+    (array.copy %string %string s nx y 0 ny)
+    s))
+
+;; FNV-1a over the bytes.
+(func (%string-hash [s (ref %string)]) -> i32
+  (let ([h #x811c9dc5] [i 0] [n (array.len s)])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (set! h (i32.mul (i32.xor h (array.get_u %string s i)) 16777619))
+        (set! i (i32.add i 1))
+        (br next)))
+    h))
+
+(func (symbol? [v eqref]) -> i32 (ref.test (ref %symbol) v))
+
+(func (symbol->string [s eqref]) -> eqref
+  (if (i32.eqz (symbol? s)) (%fail (data-address %msg-symbol) (data-size %msg-symbol)))
+  (struct.get %symbol name (ref.cast (ref %symbol) s)))
+
+;; The symbol named by string `name`, made on first use. Two symbols with
+;; the same name are the same reference.
+(func (intern [name eqref]) -> eqref
+  (let* ([str (%as-string name)]
+         [slot (i32.and (%string-hash str) 1023)]
+         [l (array.get %table %symbols slot)])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? l)))
+        (if (string=? (symbol->string (car l)) name) (return (car l)))
+        (set! l (cdr l))
+        (br next)))
+    (let ([sym (struct.new %symbol str)])
+      (array.set %table %symbols slot (cons sym (array.get %table %symbols slot)))
+      sym)))
+
+(func (symbol-append [a eqref] [b eqref]) -> eqref
+  (intern (string-append (symbol->string a) (symbol->string b))))
+
+;; ---- syntax objects -------------------------------------------------------------
+
+(func (%make-syntax [e eqref] [scopes eqref] [srcloc eqref] [props eqref]) -> eqref
+  (struct.new %syntax e scopes srcloc props))
+
+(func (%make-srcloc [source eqref] [line i32] [col i32] [pos i32] [span i32]) -> eqref
+  (struct.new %srcloc source line col pos span))
+
+(func (syntax? [v eqref]) -> i32 (ref.test (ref %syntax) v))
+
+(func (%as-syntax [v eqref]) -> (ref %syntax)
+  (if (i32.eqz (syntax? v)) (%fail (data-address %msg-syntax) (data-size %msg-syntax)))
+  (ref.cast (ref %syntax) v))
+
+(func (syntax-e [s eqref]) -> eqref (struct.get %syntax e (%as-syntax s)))
+(func (identifier? [v eqref]) -> i32 (if (syntax? v) (symbol? (syntax-e v)) 0))
+
+;; A copy of s holding datum e: same scopes, srcloc and props. Used by
+;; quasisyntax to rebuild a template around new parts.
+(func (syntax-rewrap [s eqref] [e eqref]) -> eqref
+  (let ([x (%as-syntax s)])
+    (struct.new %syntax e (struct.get %syntax scopes x) (struct.get %syntax srcloc x)
+                (struct.get %syntax props x))))
+
+;; The elements of a syntax list, or x itself if it is already a list.
+(func (splice-list [x eqref]) -> eqref (if (syntax? x) (syntax-e x) x))
+
+;; The elements of a proper syntax list, or #f.
+(func (syntax->list [x eqref]) -> eqref
+  (let ([e (splice-list x)]) (if (list? e) e (ref.null eq))))
+
+(func (syntax->datum [x eqref]) -> eqref
+  (if (syntax? x) (return (syntax->datum (syntax-e x))))
+  (if (pair? x) (return (cons (syntax->datum (car x)) (syntax->datum (cdr x)))))
+  x)
+
+;; Wrap datum d, giving every new syntax object the scopes of ctx.
+(func (datum->syntax [ctx eqref] [d eqref]) -> eqref
+  (%wrap d (if (syntax? ctx) (struct.get %syntax scopes (%as-syntax ctx)) %nil)))
+
+(func (%wrap [d eqref] [scopes eqref]) -> eqref
+  (if (syntax? d) (return d))
+  (if (pair? d) (return (%make-syntax (%wrap-list d scopes) scopes (ref.null eq) %nil)))
+  (%make-syntax d scopes (ref.null eq) %nil))
+
+(func (%wrap-list [d eqref] [scopes eqref]) -> eqref
+  (if (pair? d) (return (cons (%wrap (car d) scopes) (%wrap-list (cdr d) scopes))))
+  (if (null? d) (return %nil))
+  (%wrap d scopes))
+
+;; ---- expander queries -------------------------------------------------------------
+
+;; The value bound by define-static to id, or #f.
+(func (syntax-local-value [id eqref]) -> eqref
+  (%deref (%query-local-value (%handle id))))
+
+;; Abort expansion with message msg (a string), blamed on stx.
+(func (syntax-error [stx eqref] [msg eqref])
+  (drop (%query-error (%handle stx) (%handle msg)))
+  (unreachable))
+
+(func (free-identifier=? [a eqref] [b eqref]) -> i32
+  (%query-free-identifier=? (%handle a) (%handle b)))
+
+;; ---- embedder interface (stage0 only) -------------------------------------------------
+;;
+;; Stage0 is Chez Scheme and cannot hold GC references, so it names objects
+;; by handles: indexes into %handles. Handle 0 is #f. Handles made while a
+;; macro runs are released when it returns (%handle-mark, %handle-release).
+;; After bootstrap the compiler holds references directly and this section
+;; goes away.
+
+(global %handles (ref null %table) (array.new %table (ref.null eq) 256))
+(global %handle-count i32 1)
+
+(func (%handle [v eqref]) -> i32
+  (if (ref.is_null v) (return 0))
+  (if (i32.ge_u %handle-count (array.len %handles))
+      (let ([bigger (array.new %table (ref.null eq) (i32.shl (array.len %handles) 1))])
+        (array.copy %table %table bigger 0 %handles 0 (array.len %handles))
+        (set! %handles bigger)))
+  (array.set %table %handles %handle-count v)
+  (set! %handle-count (i32.add %handle-count 1))
+  (i32.sub %handle-count 1))
+
+(func (%deref [h i32]) -> eqref (array.get %table %handles h))
+(func (%handle-mark) -> i32 %handle-count)
+
+(func (%handle-release [mark i32])
+  (array.fill %table %handles mark (ref.null eq) (i32.sub %handle-count mark))
+  (set! %handle-count mark))
+
+;; Building
+(func (%h-fixnum [n i32]) -> i32 (%handle (fixnum n)))
+(func (%h-char [n i32]) -> i32 (%handle (integer->char n)))
+(func (%h-true) -> i32 (%handle %true))
+(func (%h-nil) -> i32 (%handle %nil))
+(func (%h-make-string [n i32]) -> i32 (%handle (array.new_default %string n)))
+(func (%h-string-set! [h i32] [i i32] [b i32]) (array.set %string (%as-string (%deref h)) i b))
+(func (%h-intern [h i32]) -> i32 (%handle (intern (%deref h))))
+(func (%h-cons [a i32] [d i32]) -> i32 (%handle (cons (%deref a) (%deref d))))
+(func (%h-syntax [e i32] [s i32] [l i32] [p i32]) -> i32
+  (%handle (%make-syntax (%deref e) (%deref s) (%deref l) (%deref p))))
+(func (%h-srcloc [source i32] [line i32] [col i32] [pos i32] [span i32]) -> i32
+  (%handle (%make-srcloc (%deref source) line col pos span)))
+
+;; Taking apart. %h-kind: 0 #f, 1 fixnum, 2 #t, 3 (), 4 char, 5 pair,
+;; 6 symbol, 7 string, 8 syntax, 9 srcloc, 10 anything else.
+(func (%h-kind [h i32]) -> i32
+  (let ([v (%deref h)])
+    (if (ref.is_null v) (return 0))
+    (if (fixnum? v) (return 1))
+    (if (ref.eq v %true) (return 2))
+    (if (null? v) (return 3))
+    (if (char? v) (return 4))
+    (if (pair? v) (return 5))
+    (if (symbol? v) (return 6))
+    (if (string? v) (return 7))
+    (if (syntax? v) (return 8))
+    (if (ref.test (ref %srcloc) v) (return 9))
+    10))
+
+(func (%h-fixnum-value [h i32]) -> i32 (fixnum-value (%deref h)))
+(func (%h-char-code [h i32]) -> i32 (char->integer (%deref h)))
+(func (%h-car [h i32]) -> i32 (%handle (car (%deref h))))
+(func (%h-cdr [h i32]) -> i32 (%handle (cdr (%deref h))))
+(func (%h-symbol-name [h i32]) -> i32 (%handle (symbol->string (%deref h))))
+(func (%h-string-length [h i32]) -> i32 (string-length (%deref h)))
+(func (%h-string-byte [h i32] [i i32]) -> i32 (string-byte (%deref h) i))
+
+(func (%h-syntax-part [h i32] [i i32]) -> i32
+  (let ([s (%as-syntax (%deref h))])
+    (if (i32.eqz i) (return (%handle (struct.get %syntax e s))))
+    (if (i32.eq i 1) (return (%handle (struct.get %syntax scopes s))))
+    (if (i32.eq i 2) (return (%handle (struct.get %syntax srcloc s))))
+    (%handle (struct.get %syntax props s))))
+
+(func (%h-srcloc-source [h i32]) -> i32
+  (%handle (struct.get %srcloc source (ref.cast (ref %srcloc) (%deref h)))))
+
+(func (%h-srcloc-field [h i32] [i i32]) -> i32
+  (let ([l (ref.cast (ref %srcloc) (%deref h))])
+    (if (i32.eq i 1) (return (struct.get %srcloc line l)))
+    (if (i32.eq i 2) (return (struct.get %srcloc col l)))
+    (if (i32.eq i 3) (return (struct.get %srcloc pos l)))
+    (struct.get %srcloc span l)))

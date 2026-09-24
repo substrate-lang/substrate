@@ -3,7 +3,8 @@
 Substrate is a thin Lisp over WebAssembly. Its one real addition to wasm is
 compile-time execution: macros are ordinary kernel code, compiled to wasm
 and run by the same engine that runs programs. The aim is that different
-languages can be built as libraries over one small kernel.
+languages can be built as libraries over one small kernel, and that the
+code they produce carries no runtime it did not ask for.
 
 Status markers: **[v0]** is implemented by stage0 now, **[planned]** is
 specified but not built yet.
@@ -12,22 +13,21 @@ specified but not built yet.
 
 ### 1.1 Principles
 
-Every rule in this document follows from these four.
-
-1. **The kernel is wasm with names, plus compile-time execution.** Memory,
-   heaps, garbage collection and value representations are either plain wasm
-   or libraries. The kernel adds no memory model: a module manages its memory
-   with wasm instructions.
-2. **Phases are uniform.** The language is the same at every phase. Each
-   phase gets its own instances of whatever its code uses, so a program and
-   the macros that compile it never share state.
-3. **Syntax belongs to the expander.** Macros create and inspect syntax only
-   by calling the expander's functions (section 2). The list of those
-   functions, with what their `i32`s mean, is the contract. How syntax is
-   laid out in memory is not part of it.
-4. **The compiler is an ordinary program.** After bootstrap it links the
-   expander, because it transforms code, and the language it is written in,
-   like any other program would.
+1. **The kernel is wasm with names, plus compile-time execution.** "Wasm" is
+   Wasm 3.0, including reference types and GC. The kernel adds no memory
+   model and no runtime of its own.
+2. **Pay as you go.** Compiled code contains only what its code uses. A
+   module can declare that it needs nothing beyond the host at run time,
+   and the compiler checks the declaration after expansion (3.3).
+3. **Phases are uniform.** The language is the same at every phase. Code
+   requires the libraries it uses, at the phase that uses them, and each
+   phase gets its own instances.
+4. **Syntax belongs to the expander.** Macros create and inspect syntax
+   only through the syntax library's functions (section 2). At compile time
+   they link to the running compiler's instance of that library, so its
+   interface is part of the bootstrap seed.
+5. **The compiler is an ordinary program.** After bootstrap it requires the
+   syntax library at phase 0, as any program that transforms code would.
 
 ### 1.2 Components
 
@@ -35,50 +35,58 @@ Every rule in this document follows from these four.
 |---|---|---|
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime) |
 | compiler | Reader, expander, kernel compiler, binary encoder. | stage0: `stage0/*.sls` (Chez Scheme) |
-| expander module | The wasm half of stage0's expander: syntax in its own memory, and the contract functions of section 2. After bootstrap it becomes part of the self-hosted compiler. | `stage0/expander.sub` (kernel code) |
+| syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `stage0/syntax.sub` (kernel code) |
 | libraries | Ordinary kernel code: printing, `define-macro`. Included by source until modules exist. | `lib/*.sub` |
 | languages | Later libraries built on the kernel: structs, effects, a dynamic Lisp, ... | not yet |
 
-### 1.3 Who owns what
+### 1.3 What runs where
 
 | | While compiling | While a program runs |
 |---|---|---|
-| expander module (syntax) | always instantiated in the compile-time store, with its own memory | instantiated only if the program calls an expander function |
+| the syntax library | always instantiated in the compile-time store; macros link to it | instantiated only if the program requires it |
+| GC | syntax data lives in the engine's GC heap | only if the program's code uses GC types or the syntax library |
 | each module's memory and table | its own, if it defines them | its own, if it defines them |
 | the host | no memory of its own; reads and writes the caller's | same |
 
 A **store** is one wasm store with one linker. The **compile-time store**
-lives for one compiler run and holds the expander module and every module
+lives for one compiler run and holds the syntax library and every module
 instantiated to run phase ≥ 1 code. A **run-time store** holds a program's
 modules and whatever they import.
+
+The compile-time environment is garbage collected: syntax objects are GC
+objects. A compiled program is garbage collected only if its own code uses
+GC types or requires the syntax library.
 
 ## 2. The macro contract
 
 ### 2.1 Transformers
 
-A **transformer** is a phase-1 function of type `(i32) -> i32`. The
+A **transformer** is a phase-1 function of type `(eqref) -> eqref`. The
 expander calls it with the syntax object for a macro use (the whole form,
 or the identifier alone) and expands the syntax object it returns.
 `(define-syntax m f)` makes `m` a macro whose transformer is `f`.
 
 ### 2.2 Values
 
-The functions below pass **values**: `i32` words that stand for data.
-The contract promises only this about them:
+The syntax library represents data as **values** of wasm type `eqref`.
+The contract promises this about them:
 
-- `#f` is the word 0, so `if` treats a value as true unless it is `#f`.
-- Two values are the same datum only if their words are equal. Symbols are
-  interned: two symbols with the same name are the same word.
-- Everything else about the encoding is private to the expander
-  (appendix A).
+- `#f` is the null reference, so `(ref.is_null v)` tests for it.
+- `ref.eq` is identity. Symbols are interned, so two symbols with the same
+  name are `ref.eq`. Small integers (fixnums) are `ref.eq` when they are
+  equal. Characters and strings are not guaranteed to be `ref.eq`; compare
+  them with `char->integer` and `string=?`.
+- Everything else about the representation is private (appendix A).
 
-Counts, indices, bytes and predicate results are wasm numbers, not values:
-`(length l)` is an `i32` count and `(pair? v)` is 1 or 0.
+Counts, indices, bytes and predicate results are `i32`, not values:
+`(length l)` is an `i32` count and `(pair? v)` is 1 or 0. Because values
+are references, wasm's own type checking keeps them apart from numbers.
 
 ### 2.3 Functions
 
-All are imported from the instance `"expander"`. Parameters are values
-unless marked `i32`.
+`(require syntax)` binds these at the phase where it appears. They are
+imported from the instance `"syntax"`. Parameters are `eqref` unless marked
+`i32`.
 
 | Group | Functions |
 |---|---|
@@ -86,7 +94,7 @@ unless marked `i32`.
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d)`, `(syntax-rewrap s e)`, `(splice-list v)` |
-| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`), `(free-identifier=? a b) -> i32` |
+| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32` |
 
 - `syntax-e` of an identifier is a symbol, and of a literal it is the
   literal's value. Of a list it is a list whose elements are syntax.
@@ -97,9 +105,8 @@ unless marked `i32`.
 - Accessors trap with a message ("expected a pair") when given the wrong
   kind of value.
 
-[v0] Stage0 implements the queries in Chez and reaches them through host
-imports. The rest are functions of `stage0/expander.sub`, whose other
-exports (named with a leading `%`) are internal to the compiler.
+The queries only work while an expander is running. [v0] Stage0 answers
+them in Chez; in a run-time store they trap.
 
 ## 3. Units of compilation and linking
 
@@ -110,22 +117,21 @@ exports (named with a leading `%`) are internal to the compiler.
   phase *n* is expanded.
 - Expansion must run phase-1 code before the module is finished: a macro
   works on the line after its definition. So phase ≥ 1 code is compiled and
-  instantiated in **chunks**, one per `begin-for-syntax` form and one per
-  `define-static` right-hand side, in source order. A chunk may use the
-  functions and globals of earlier chunks, not later ones.
-- [v0] Only the phase-0 module is written out. Writing out the phase-1
-  module, for use by other modules, is **[planned]** with `require`.
+  instantiated in **chunks**, in source order: one per `begin-for-syntax`
+  form, and one per `define-static` or `define-syntax`. A chunk may use the
+  functions and globals of earlier chunks.
+- [v0] Only the phase-0 module is written out. Writing out phase-1 modules,
+  for use by other modules, is **[planned]** with `require` of modules.
 
 ### 3.2 Linking
 
-- Every instance in a store is registered with the linker under a unique
-  name: `expander`, the program's `main`, and chunks named
-  `<module>@<phase>#<n>`. Modules import from each other by those names.
-- **A module imports only what its code uses.** Calling an expander
-  function, quoting data that lives in the expander's heap (pairs, symbols,
-  strings), or using `quote-syntax` or `quasisyntax` imports from
-  `"expander"`. Quoted atoms such as `'()`, `'#t` and `'5` are constants
-  and import nothing. Nothing is imported by default.
+- Every instance in a store is registered under a unique name: `syntax`,
+  the program's `main`, and chunks named `<module>@<phase>#<n>`. Modules
+  import from each other by those names.
+- **A module imports only what its code uses.** Nothing is bound or
+  imported by default. Code that requires the syntax library and calls it,
+  or that uses `quote`, `quasiquote`, `quote-syntax` or `quasisyntax`,
+  imports from `"syntax"`.
 - **A module owns its memory and table.** Code that uses memory
   instructions or data segments needs a `(memory ...)` in its module, and
   code that uses `func-index` or `call-indirect` needs a `(table ...)`.
@@ -136,20 +142,28 @@ exports (named with a leading `%`) are internal to the compiler.
   global under its name. If two bindings share a name, the compiler appends
   `.<n>` to later ones.
 
-### 3.3 Initialization
+### 3.3 Runtime-free modules
 
-Globals whose initializer is a literal get it as their wasm constant
-initializer. Then the module's start function runs:
+`(runtime-free)` declares that the module needs nothing beyond the host at
+run time. After expansion, the compiler checks that the phase-0 module
+imports only from `"host"` and uses no GC types. The check runs after
+expansion because macros can add dependencies the program never wrote.
+
+### 3.4 Initialization
+
+Globals whose initializer is a numeric literal get it as their wasm
+constant initializer, and reference globals start as null. Then the
+module's start function runs:
 
 1. For each function whose table index the module takes (`func-index`),
    append it to the module's table and keep the index in a global. Build
-   each quoted constant by calling the expander's functions and keep its
-   value in a global. These happen in the order the compiler meets them.
+   each quoted constant with the syntax library's functions and keep it in
+   a global. These happen in the order the compiler meets them.
 2. The remaining global initializers and module-level expressions, in
    source order.
 
-Quoted data is rebuilt at instantiation, so compiled modules contain no
-addresses in the expander's memory.
+Quoted fixnums and `#f` need no global: they are the constant expressions
+`(ref.i31 n)` and `(ref.null eq)`.
 
 ## 4. Host interface
 
@@ -180,19 +194,30 @@ quotation and compile-time forms.
 
 ### 5.1 Types
 
-`i32`, `i64`, `f32`, `f64`. A function result is written `-> t` or
-`-> (t ...)`, or omitted when there is none. Function types in imports and
-`call-indirect` are written `(t ... -> t ...)`.
+- Numbers: `i32`, `i64`, `f32`, `f64`.
+- References: `anyref`, `eqref`, `i31ref`, `structref`, `arrayref`,
+  `funcref`, `externref`, and `(ref T)` or `(ref null T)` where `T` is one
+  of `any eq i31 struct array func extern none` or a declared type.
+- A function result is written `-> t` or `-> (t ...)`, or omitted when
+  there is none. Function types in imports and `call-indirect` are written
+  `(t ... -> t ...)`.
+- Types are checked with wasm's subtyping: `(ref T)` fits where
+  `(ref null T)` is expected, a declared struct type fits `structref`,
+  every struct, array and `i31ref` fits `eqref`, and so on.
 
 ### 5.2 Module-level forms
 
 ```
 (func (name [param type] ...) [-> result] body ...)
-(global name type init)
+(global name type init)             ; numeric or nullable reference type
 (import name "module" "field" (type ... -> type ...))
 (memory pages)
 (table size)
 (data name offset "bytes" ...)      ; active segment at offset in memory
+(type name (struct (field fname ftype) ...))   ; ftype: storage or (mut storage)
+(type name (array ftype))                      ; storage: a type, i8 or i16
+(require syntax)                    ; bind the syntax library at this phase
+(runtime-free)                      ; see 3.3
 (define-syntax name transformer)    ; transformer: a phase+1 function (2.1)
 (define-static name expr)           ; expr is phase+1 code, run now
 (begin-for-syntax form ...)         ; forms at phase+1
@@ -206,7 +231,8 @@ expands macro uses at the head of each form, registers definitions, runs
 `define-static` and `begin-for-syntax` at once, and splices `begin` and
 `include`. The second pass expands function bodies and expressions. So
 functions may be mutually recursive, and a macro must be defined before it
-is used. A transformer must come from an earlier `begin-for-syntax`.
+is used. A transformer must come from an earlier `begin-for-syntax`. A
+declared type may refer to itself.
 
 ### 5.3 Expressions
 
@@ -222,13 +248,25 @@ id                                  ; local or global variable
 (loop label body ...)               ; br to label restarts the loop
 (br label [expr])  (br-if label test)  (return [expr])
 (f arg ...)                         ; direct call
-(op arg ... [offset])               ; a wasm instruction, e.g. (i32.add a b)
+(op arg ... [offset])               ; a numeric or memory instruction, e.g. (i32.add a b)
 (call-indirect (t ... -> t ...) index arg ...)
 (func-index f)                      ; i32 index of f in the module's table
 (data-address name)  (data-size name)
 (select a b test)  (drop expr)  (unreachable)  (nop)
-(quote d)  (quasiquote d)           ; expander data (values)
+(quote d)  (quasiquote d)           ; syntax-library data (values)
 (quote-syntax d)  (quasisyntax d)   ; syntax objects
+```
+
+GC instructions take their type and field immediates by name:
+
+```
+(struct.new T arg ...)   (struct.get T field e)   (struct.get_s T field e)
+(struct.get_u T field e) (struct.set T field e v)
+(array.new T init len)   (array.new_default T len)   (array.new_fixed T arg ...)
+(array.get T a i)  (array.get_s T a i)  (array.get_u T a i)  (array.set T a i v)
+(array.len a)  (array.fill T a i v n)  (array.copy T1 T2 dst di src si n)
+(ref.null heap)  (ref.is_null e)  (ref.eq a b)  (ref.as_non_null e)
+(ref.test reftype e)  (ref.cast reftype e)  (ref.i31 e)  (i31.get_s e)  (i31.get_u e)
 ```
 
 - Types are checked bidirectionally. An integer literal takes the type its
@@ -236,38 +274,39 @@ id                                  ; local or global variable
   context says `f32`. A mismatch is a compile error before any wasm is
   emitted.
 - Non-final expressions in a body are dropped. An `if` without an else,
-  and any expression whose value is unused, has no value.
-- A call in tail position whose callee's result types match the function's
+  and any expression whose value is unused, has no value. The branches of
+  an `if` may differ when one reference type contains the other, or both
+  fit `eqref` or `anyref`.
+- A call in tail position whose callee's result types fit the function's
   is emitted as `return_call`, so recursion in tail position runs in
   constant stack.
-- Primitive operators are every wasm numeric, conversion and memory
-  instruction under its WAT name. Loads and stores take an optional trailing
-  literal offset: `(i32.load p 8)`, `(i32.store p v 8)`.
+- Loads and stores take an optional trailing literal offset:
+  `(i32.load p 8)`, `(i32.store p v 8)`.
 - Labels are bindings and obey scope like variables.
 
 ### 5.4 Literals
 
-Unquoted literals are wasm numbers. `quote` turns a literal into a value.
+Unquoted literals are wasm numbers. `quote` turns a literal into a value,
+and needs `(require syntax)`.
 
 | Source | Unquoted | Quoted |
 |---|---|---|
 | `42` | integer constant, type from context | fixnum value |
 | `1.5` | float constant | not supported in v0 |
 | `#\a` | `i32` 97 | character value |
-| `#t` / `#f` | `i32` 1 / 0 | `#t` / `#f` values |
+| `#t` / `#f` | `i32` 1 / 0 | `#t` value / null |
 | `"text"` | error: use `data` for bytes | string value |
 
-`quote`, `quasiquote`, `quote-syntax` and `quasisyntax` build expander data,
-so code that uses them links the expander (3.2), at whatever phase it runs.
 The unchanged parts of a `quasisyntax` template keep their lexical context,
 which is what macro templates need. The reader abbreviations are
 `'` `` ` `` `,` `,@` and `#'` `` #` `` `#,` `#,@`. Integers outside the
-fixnum range cannot be quoted.
+fixnum range (31 bits) cannot be quoted.
 
 ### 5.5 Base bindings
 
-Every module sees, at every phase: the kernel forms, the wasm operators,
-and the contract functions of section 2.3.
+Every module sees, at every phase, only the kernel forms and the wasm
+numeric and memory operators. Everything else comes from a declaration in
+the module: its own definitions, `import`, and `require`.
 
 ## 6. Expansion
 
@@ -290,62 +329,67 @@ error.
 ### 6.2 Compile-time bindings
 
 - `(define-syntax m f)`: `m` is a macro whose transformer is the phase+1
-  function `f`.
+  function `f`, of type `(eqref) -> eqref`.
 - `(define-static s expr)`: `expr` is compiled and run at phase+1 now, and
-  `s` is bound to its value. Using `s` as an expression is an error, but
-  macros read the value with `syntax-local-value`. This is how extensions
-  share information, for example a struct form and a match form.
+  `s` is bound to its value, an `eqref`. Using `s` as an expression is an
+  error, but macros read the value with `syntax-local-value`. This is how
+  extensions share information, for example a struct form and a match form.
 
-[v0] Syntax crosses between Chez and wasm by copy: stage0 writes the use's
-syntax into the expander module's memory and reads the result back. The
-self-hosted expander will not need the copy.
+[v0] Stage0 expands in Chez, so syntax crosses between Chez and wasm by
+copy, through the syntax library's embedder functions (appendix A). The
+self-hosted expander will hold references directly and need no copy.
 
 ## 7. Open questions and later milestones
 
 - **Hygiene** (next): introduction and use-site scopes (6.1).
-- **Modules and phases**: `require`/`provide`, `for-syntax` imports,
+- **Modules and phases**: `require` of modules, `for-syntax` imports,
   writing out phase-1 modules, per-phase scope sets as in Racket, scope ids
   that survive separate compilation, and importing a memory or table from
-  another module (so a language's runtime can supply them). Modules replace
-  `include`.
+  another module. Modules replace `include`.
 - **Extension points**: `#%app`, `#%module-begin`, `local-expand`, syntax
-  properties (the `props` field is always empty in v0), lifting
-  definitions out of expressions.
-- **Expander data at run time**: the expander module's heap is one arena
-  that is never freed. That suits a compilation. Programs that keep calling
-  the expander (a REPL, a long-lived compiler) will need memory management
-  for it.
-- **Baking compile-time data into output**: a language can emit data it
-  computed at compile time as `data` segments. The kernel provides `data`;
-  the layout of what is baked in is the language's business.
+  properties (the `props` field is always `()` in v0), lifting definitions
+  out of expressions.
+- **Type identity of library data**: wasm treats identical type
+  definitions as the same type. A program type with the same shape as one
+  of the syntax library's (a struct of two immutable `eqref` fields, say)
+  would pass the library's type tests. Recursion groups can make the
+  library's types distinct if this matters.
+- **Seed without an engine**: a Zig-style seed translated to native code
+  would need a GC implementation. Wastrel has one.
 - **More kinds of data**: bignums, floats and vectors as values are not in
   v0.
 
-## Appendix A: stage0's expander data layout (not part of the contract)
+## Appendix A: stage0's syntax library representation (not part of the contract)
 
-This describes `stage0/expander.sub` and `stage0/marshal.sls` as they are.
+This describes `stage0/syntax.sub` and `stage0/marshal.sls` as they are.
 Macros must not depend on it; the compiler may, because it is part of the
 expander.
 
-- **Memory**: the expander module's own. Bytes 1024..1215 hold its error
-  messages, and its heap starts at 4096. The heap is a bump allocator, one
-  arena per store, never freed.
-- **Value words**: fixnum `(n << 1) | 1`, `#f` 0, `#t` 10, `()` 18,
-  character `(code point << 3) | 4`. Any other word with its low three bits
-  clear is the address of a heap object (8-aligned).
-- **Heap objects**: a 32-bit header (bits 0..6 a type code, bits 8..31 a
-  field or byte count), then 4-byte fields.
+- **Types** (each in its own recursion group):
 
-  | Code | Object | Contents |
+  | Type | Definition | Holds |
   |---|---|---|
-  | 1 | pair | car, cdr |
-  | 2 | symbol | name (string) |
-  | 3 | string | UTF-8 bytes |
-  | 4 | syntax | datum, scopes, srcloc, props |
-  | 5 | srcloc | source, line, column, position, span |
-  | 6 | intern table | 1024 buckets, each a list of symbols |
+  | `%string` | `(array (mut i8))` | UTF-8 bytes |
+  | `%pair` | `(struct (field car eqref) (field cdr eqref))` | pairs |
+  | `%symbol` | `(struct (field name (ref %string)))` | symbols |
+  | `%atom` | `(struct (field kind i32) (field value i32))` | characters (kind 0), `#t` (1), `()` (2) |
+  | `%syntax` | `(struct (field e eqref) (field scopes eqref) (field srcloc eqref) (field props eqref))` | syntax objects |
+  | `%srcloc` | `(struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32))` | source locations |
+  | `%table` | `(array (mut eqref))` | the intern table and the handle table |
 
+- **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
+  single `%atom` objects made at start. Quoted strings in compiled code are
+  built with `array.new_fixed` of `%string`, which the compiler declares in
+  the module; wasm makes it the same type as the library's.
 - **Syntax objects** are wrapped eagerly: the datum of a list is a list
   whose elements are syntax objects. Scopes are a list of fixnum scope ids
   in ascending order; scope 0 is the core scope. The source of a srcloc is
   a symbol naming the file. Line is 1-based, column and position 0-based.
+- **Memory**: the library's memory holds only its error messages.
+- **Embedder interface (stage0 only)**: Chez cannot hold GC references, so
+  it names objects by `i32` handles, indexes into the library's handle
+  table (handle 0 is `#f`). The `%h-` functions build and take apart
+  objects through handles. Handles made while a macro runs are released
+  when it returns. Each `define-syntax` and `define-static` compiles a small
+  entry chunk that converts between handles and references. After
+  bootstrap this section goes away.

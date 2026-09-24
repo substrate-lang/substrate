@@ -2,62 +2,71 @@
 ;;
 ;; Binding is by sets of scopes (spec 6.1). Phase >= 1 code is compiled
 ;; into chunks and run in the compile-time store as expansion goes
-;; (spec 3.2). A macro is a phase-1 function the expander calls with the
-;; syntax of a use (spec 2.1). Syntax lives in the memory of the expander
-;; module (stage0/expander.sub), which is instantiated in every
-;; compile-time store.
+;; (spec 3.1). A macro is a phase-1 function from syntax to syntax
+;; (spec 2.1). Syntax objects are GC objects of the syntax library
+;; (stage0/syntax.sub), which every compile-time store instantiates.
 (library (stage0 expander)
-  (export make-session session-module-bytes session-store compile-source expand-source
+  (export make-session session-library-bytes session-store compile-source expand-source
           strip-ast)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 compile)
           (stage0 host) (stage0 marshal) (stage0 reader))
 
   ;; ==== sessions ==============================================================
   ;;
-  ;; A session is one compile-time store with the expander module
-  ;; instantiated in it, plus that module's functions by name.
+  ;; A session is one compile-time store with the syntax library
+  ;; instantiated in it, plus the library's functions by name.
 
-  (define-record-type (session new-session session?) (fields store module-bytes infos))
+  (define-record-type (session new-session session?) (fields store library-bytes infos))
+
+  (define gc-forms
+    '(struct.new struct.get struct.get_s struct.get_u struct.set
+      array.new array.new_default array.new_fixed array.get array.get_s array.get_u array.set
+      array.len array.copy array.fill
+      ref.null ref.is_null ref.eq ref.as_non_null ref.test ref.cast ref.i31 i31.get_s i31.get_u))
 
   (define core-forms
-    '(func global import memory table data define-syntax define-static begin-for-syntax
-      begin include set! let let* if block loop br br-if return call-indirect func-index
-      data-address data-size select drop unreachable nop quote quasiquote unquote
-      unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing))
+    (append
+     '(func global import memory table data type define-syntax define-static begin-for-syntax
+       begin include require runtime-free set! let let* if block loop br br-if return
+       call-indirect func-index data-address data-size select drop unreachable nop
+       quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
+     gc-forms))
 
-  ;; Expander queries (spec 2.3). Stage0 answers them from Chez through the
-  ;; host; they live in the "expander" namespace with the module's functions.
-  (define expander-queries
-    (list (make-func-info 'syntax-local-value '(i32) '(i32) "expander" "syntax-local-value")
-          (make-func-info 'syntax-error '(i32 i32) '(i32) "expander" "syntax-error")
-          (make-func-info 'free-identifier=? '(i32 i32) '(i32) "expander" "free-identifier=?")))
+  (define eqref (make-ref #t 'eq))
 
-  ;; module-path: the kernel source of the expander module. Compiles it,
-  ;; starts a compile-time store and instantiates the module there.
-  (define (make-session module-path)
+  ;; library-path: the kernel source of the syntax library. Compiles it,
+  ;; starts a compile-time store and instantiates the library there.
+  (define (make-session library-path)
     (let* ([h (host-new)]
            [st (make-store h)])
       (host-set-callback! h expander-callback)
-      (let-values ([(forms infos) (parameterize ([current-expander-infos #f])
-                                    (expand-module (read-file module-path) 'expander #f st))])
-        (let-values ([(bytes imports) (parameterize ([current-expander-infos #f])
-                                        (compile-module forms "expander"))])
+      (let-values ([(forms infos) (parameterize ([current-syntax-infos #f])
+                                    (expand-module (read-file library-path) 'syntax st))])
+        (let-values ([(bytes imports gc?) (parameterize ([current-syntax-infos #f])
+                                            (compile-module forms "syntax"))])
           (let ([table (make-eq-hashtable)])
             (for-each (lambda (info) (hashtable-set! table (func-info-name info) info)) infos)
-            (host-instantiate! h "expander" bytes)
-            (host-use-memory! h "expander" "memory")
+            (host-instantiate! h "syntax" bytes)
             (new-session st bytes table))))))
 
   ;; Expand and compile one source file. Returns the phase-0 module bytes and
   ;; the instance names it imports from.
   (define (compile-source sess path)
-    (parameterize ([current-expander-infos (session-infos sess)])
-      (let-values ([(forms _) (expand-module (read-file path) (module-name path) #t (session-store sess))])
-        (compile-module forms "main"))))
+    (parameterize ([current-syntax-infos (session-infos sess)])
+      (let-values ([(forms _) (expand-module (read-file path) (module-name path) (session-store sess))])
+        (let-values ([(bytes imports gc?) (compile-module forms "main")])
+          (when runtime-free-form
+            (let ([extra (filter (lambda (i) (not (equal? i "host"))) imports)])
+              (unless (and (null? extra) (not gc?))
+                (raise-compile-error runtime-free-form
+                                     "this module is declared runtime-free, but after expansion it ~a"
+                                     (cond [(pair? extra) (format "imports from ~a" extra)]
+                                           [else "uses GC objects"])))))
+          (values bytes imports)))))
 
   (define (expand-source sess path)
-    (parameterize ([current-expander-infos (session-infos sess)])
-      (let-values ([(forms _) (expand-module (read-file path) (module-name path) #t (session-store sess))])
+    (parameterize ([current-syntax-infos (session-infos sess)])
+      (let-values ([(forms _) (expand-module (read-file path) (module-name path) (session-store sess))])
         forms)))
 
   (define (module-name path)
@@ -75,12 +84,14 @@
   (define chunk-counter 0)
   (define current-module 'main)
   (define current-store #f)
+  (define syntax-phases '())               ; phases where (require syntax) appeared
+  (define runtime-free-form #f)            ; the (runtime-free) form, if any
 
   ;; phase: an integer, or 'all
   (define-record-type binding (fields scopes phase key))
 
   ;; meaning: (core name) (prim name) (func info) (global info) (data info)
-  ;;          (local key) (label key) (macro func-info) (static word)
+  ;;          (type info) (local key) (label key) (macro chunk) (static handle)
 
   (define (reset-state! module st)
     (set! bindings (make-eq-hashtable))
@@ -89,6 +100,8 @@
     (set! chunk-counter 0)
     (set! current-module module)
     (set! current-store st)
+    (set! syntax-phases '())
+    (set! runtime-free-form #f)
     (reset-keys!))
 
   (define (new-scope!) (set! scope-counter (+ scope-counter 1)) scope-counter)
@@ -135,30 +148,18 @@
 
   (define (internal-name? sym) (char=? (string-ref (symbol->string sym) 0) #\%))
 
-  ;; Core forms, primitive operators, and (except for the expander module
-  ;; itself) the expander's contract functions, at every phase (spec 5.5).
-  (define (install-base! expander-infos)
+  ;; Core forms and primitive operators, at every phase (spec 5.5). Nothing
+  ;; else is bound until a module requires it.
+  (define (install-base!)
     (for-each (lambda (name) (bind-raw! name (list core-scope) 'all (list 'core name))) core-forms)
-    (for-each (lambda (name) (bind-raw! name (list core-scope) 'all (list 'prim name))) (prim-names))
-    (when expander-infos
-      (let-values ([(names infos) (hashtable-entries expander-infos)])
-        ;; sorted, for deterministic keys
-        (for-each (lambda (info) (bind-raw! (func-info-name info) (list core-scope) 'all (list 'func info)))
-                  (list-sort (lambda (a b) (string<? (symbol->string (func-info-name a))
-                                                      (symbol->string (func-info-name b))))
-                             (filter (lambda (info) (not (internal-name? (func-info-name info))))
-                                     (vector->list infos)))))
-      (for-each (lambda (info) (bind-raw! (func-info-name info) (list core-scope) 'all (list 'func info)))
-                expander-queries)))
+    (for-each (lambda (name) (bind-raw! name (list core-scope) 'all (list 'prim name))) (prim-names)))
 
   ;; ==== module bodies ============================================================
 
-  ;; Expand a module. with-expander?: bind the expander's contract (#f only
-  ;; for the expander module itself). Returns (values phase-0-forms
-  ;; defined-func-infos).
-  (define (expand-module forms module with-expander? st)
+  ;; Expand a module. Returns (values phase-0-forms defined-func-infos).
+  (define (expand-module forms module st)
     (reset-state! module st)
-    (install-base! (and with-expander? (current-expander-infos)))
+    (install-base!)
     (let* ([msc (new-scope!)]
            [forms (map-lr (lambda (f) (add-scope (add-scope f core-scope) msc)) forms)]
            [out (expand-body forms 0)])
@@ -192,11 +193,14 @@
             (case (core-head f phase)
               [(begin) (loop (append (cdr (stx-list-of f 'begin)) rest) pending)]
               [(include) (loop (append (read-include f) rest) pending)]
+              [(require) (require! f phase) (loop rest pending)]
+              [(runtime-free) (runtime-free! f phase) (loop rest pending)]
               [(func) (loop rest (cons (declare-func f phase) pending))]
               [(global) (loop rest (cons (declare-global f phase) pending))]
               [(import) (declare-import f phase) (loop rest pending)]
               [(memory table) (loop rest (cons (list 'plain (parse-size f)) pending))]
               [(data) (loop rest (cons (list 'plain (declare-data f phase)) pending))]
+              [(type) (loop rest (cons (list 'plain (declare-type f phase)) pending))]
               [(define-syntax) (define-syntax! f phase) (loop rest pending)]
               [(define-static) (define-static! f phase) (loop rest pending)]
               [(begin-for-syntax) (begin-for-syntax! f phase) (loop rest pending)]
@@ -210,31 +214,120 @@
                       [(expr) (list 'expr (expand-expr (cadr p) phase))]))
                   (reverse pending)))))
 
-  (define (parse-type s)
-    (let ([t (and (id? s) (stx-e s))])
-      (unless (memq t '(i32 i64 f32 f64))
-        (raise-compile-error s "expected a type (i32, i64, f32 or f64), got ~s" (stx->datum s)))
+  ;; ==== types ====================================================================
+
+  (define shorthand-refs
+    '((anyref . any) (eqref . eq) (i31ref . i31) (structref . struct) (arrayref . array)
+      (funcref . func) (externref . extern)))
+
+  ;; A heap type: an abstract name, or a type declared with `type`.
+  (define (parse-heap s phase)
+    (cond [(and (id? s) (memq (stx-e s) abstract-heaps)) (stx-e s)]
+          [(id? s)
+           (let ([m (meaning-of s phase)])
+             (unless (and m (eq? (car m) 'type))
+               (raise-compile-error s "~a is not a type" (stx-e s)))
+             (cadr m))]
+          [else (raise-compile-error s "expected a heap type, got ~s" (stx->datum s))]))
+
+  (define (parse-type s phase)
+    (let ([d (stx-e s)])
+      (cond [(and (symbol? d) (memq d '(i32 i64 f32 f64))) d]
+            [(and (symbol? d) (assq d shorthand-refs)) => (lambda (p) (make-ref #t (cdr p)))]
+            [(and (stx->list s) (pair? (stx->list s)) (core-name? (car (stx->list s)) 'ref))
+             (let ([parts (stx->list s)])
+               (cond [(= (length parts) 2) (make-ref #f (parse-heap (cadr parts) phase))]
+                     [(and (= (length parts) 3) (id? (cadr parts)) (eq? (stx-e (cadr parts)) 'null))
+                      (make-ref #t (parse-heap (caddr parts) phase))]
+                     [else (raise-compile-error s "expected (ref T) or (ref null T)")]))]
+            [else (raise-compile-error s "expected a type (i32, i64, f32, f64 or a reference type), got ~s"
+                                       (stx->datum s))])))
+
+  (define (parse-reftype s phase)
+    (let ([t (parse-type s phase)])
+      (unless (ref-type? t) (raise-compile-error s "expected a reference type"))
       t))
 
+  ;; Type syntax words (ref, null, field, mut, struct, array) are compared by
+  ;; name, like i32.
+  (define (core-name? s name) (and (id? s) (eq? (stx-e s) name)))
+
+  ;; A field or element type: a storage type, optionally (mut storage).
+  (define (parse-field-type s phase)
+    (let ([parts (stx->list s)])
+      (if (and parts (= (length parts) 2) (core-name? (car parts) 'mut))
+          (list (parse-storage (cadr parts) phase) #t)
+          (list (parse-storage s phase) #f))))
+
+  (define (parse-storage s phase)
+    (if (and (id? s) (memq (stx-e s) '(i8 i16))) (stx-e s) (parse-type s phase)))
+
+  ;; (type name (struct (field fname ftype) ...)) or (type name (array etype)).
+  ;; The name is bound first, so a type may refer to itself.
+  (define (declare-type f phase)
+    (let ([parts (stx-list-of f 'type)])
+      (unless (and (= (length parts) 3) (id? (cadr parts)) (stx->list (caddr parts))
+                   (pair? (stx->list (caddr parts))))
+        (raise-compile-error f "expected (type name (struct field ...)) or (type name (array type))"))
+      (when (memq (stx-e (cadr parts)) (append abstract-heaps '(i32 i64 f32 f64 i8 i16)))
+        (raise-compile-error (cadr parts) "~a names a built-in type" (stx-e (cadr parts))))
+      (let* ([def (stx->list (caddr parts))]
+             [kind (stx-e (car def))])
+        (unless (memq kind '(struct array))
+          (raise-compile-error (caddr parts) "a type is (struct field ...) or (array type)"))
+        (let ([info (make-type-info (stx-e (cadr parts)) kind #f)])
+          (bind! (cadr parts) phase (list 'type info))
+          (type-info-fields-set!
+           info
+           (if (eq? kind 'struct)
+               (map-lr (lambda (fs)
+                         (let ([fp (stx->list fs)])
+                           (unless (and fp (= (length fp) 3) (core-name? (car fp) 'field) (id? (cadr fp)))
+                             (raise-compile-error fs "expected (field name type)"))
+                           (cons (stx-e (cadr fp)) (parse-field-type (caddr fp) phase))))
+                       (cdr def))
+               (begin
+                 (unless (= (length def) 2) (raise-compile-error (caddr parts) "expected (array type)"))
+                 (parse-field-type (cadr def) phase))))
+          (list 'type info)))))
+
+  (define (type-of id phase)
+    (let ([m (and (id? id) (meaning-of id phase))])
+      (unless (and m (eq? (car m) 'type))
+        (raise-compile-error id "~s is not a declared type" (stx->datum id)))
+      (cadr m)))
+
+  (define (field-index tinfo id)
+    (unless (eq? (type-info-kind tinfo) 'struct)
+      (raise-compile-error id "~a is not a struct type" (type-info-name tinfo)))
+    (let loop ([fs (type-info-fields tinfo)] [i 0])
+      (cond [(null? fs) (raise-compile-error id "~a has no field ~s" (type-info-name tinfo) (stx->datum id))]
+            [(and (id? id) (eq? (car (car fs)) (stx-e id))) i]
+            [else (loop (cdr fs) (+ i 1))])))
+
+  ;; ==== other module-level forms ==================================================
+
   ;; `-> t` or `-> (t ...)`; returns the result list and the rest of body.
-  (define (parse-results body)
+  (define (parse-results body phase)
     (if (and (pair? body) (id? (car body)) (eq? (stx-e (car body)) '->))
         (begin
           (when (null? (cdr body)) (raise-compile-error (car body) "expected a type after ->"))
-          (let ([r (cadr body)])
-            (values (if (stx->list r) (map-lr parse-type (stx->list r)) (list (parse-type r)))
+          (let* ([r (cadr body)] [l (stx->list r)])
+            (values (if (and l (not (core-name? (car l) 'ref)))
+                        (map-lr (lambda (t) (parse-type t phase)) l)
+                        (list (parse-type r phase)))
                     (cddr body))))
         (values '() body)))
 
   ;; (t ... -> r ...)
-  (define (parse-signature s)
+  (define (parse-signature s phase)
     (let* ([parts (stx-list-of s "signature")]
            [arrow (let loop ([ps parts] [i 0])
                     (cond [(null? ps) (raise-compile-error s "a signature needs ->")]
                           [(and (id? (car ps)) (eq? (stx-e (car ps)) '->)) i]
                           [else (loop (cdr ps) (+ i 1))]))])
-      (values (map-lr parse-type (list-head parts arrow))
-              (map-lr parse-type (list-tail parts (+ arrow 1))))))
+      (values (map-lr (lambda (t) (parse-type t phase)) (list-head parts arrow))
+              (map-lr (lambda (t) (parse-type t phase)) (list-tail parts (+ arrow 1))))))
 
   ;; (func (name [p t] ...) [-> r] body ...)
   (define (declare-func f phase)
@@ -248,9 +341,9 @@
                                (let ([pp (stx->list p)])
                                  (unless (and pp (= (length pp) 2) (id? (car pp)))
                                    (raise-compile-error p "expected [name type]"))
-                                 (cons (car pp) (parse-type (cadr pp)))))
+                                 (cons (car pp) (parse-type (cadr pp) phase))))
                              (cdr hparts))])
-        (let-values ([(results body) (parse-results (cddr parts))])
+        (let-values ([(results body) (parse-results (cddr parts) phase)])
           (let ([info (make-func-info (stx-e name) (map cdr params) results #f #f)])
             (bind! name phase (list 'func info))
             (list 'func info params body f))))))
@@ -267,7 +360,7 @@
     (let ([parts (stx-list-of f 'global)])
       (unless (and (= (length parts) 4) (id? (cadr parts)))
         (raise-compile-error f "expected (global name type init)"))
-      (let ([info (make-global-info (stx-e (cadr parts)) (parse-type (caddr parts)) #f #f)])
+      (let ([info (make-global-info (stx-e (cadr parts)) (parse-type (caddr parts) phase) #f #f)])
         (bind! (cadr parts) phase (list 'global info))
         (list 'global info (cadddr parts)))))
 
@@ -277,7 +370,7 @@
       (unless (and (= (length parts) 5) (id? (cadr parts))
                    (string? (stx-e (caddr parts))) (string? (stx-e (cadddr parts))))
         (raise-compile-error f "expected (import name \"module\" \"field\" (type ... -> type ...))"))
-      (let-values ([(params results) (parse-signature (list-ref parts 4))])
+      (let-values ([(params results) (parse-signature (list-ref parts 4) phase)])
         (bind! (cadr parts) phase
                (list 'func (make-func-info (stx-e (cadr parts)) params results
                                            (stx-e (caddr parts)) (stx-e (cadddr parts))))))))
@@ -300,6 +393,36 @@
                                   (string->utf8 (apply string-append (map stx-e (cdddr parts)))))])
         (bind! (cadr parts) phase (list 'data info))
         (list 'data info))))
+
+  ;; (require syntax): bind the syntax library's contract functions at this
+  ;; phase (spec 2.3). The only library v0 knows; modules generalize it.
+  (define (require! f phase)
+    (let ([parts (stx-list-of f 'require)])
+      (unless (and (= (length parts) 2) (core-name? (cadr parts) 'syntax))
+        (raise-compile-error f "v0 can only (require syntax)"))
+      (unless (current-syntax-infos)
+        (raise-compile-error f "the syntax library cannot require itself"))
+      (unless (memv phase syntax-phases)
+        (set! syntax-phases (cons phase syntax-phases))
+        (let-values ([(names infos) (hashtable-entries (current-syntax-infos))])
+          ;; sorted, for deterministic keys
+          (for-each (lambda (info) (bind-raw! (func-info-name info) (stx-scopes (car parts)) phase (list 'func info)))
+                    (list-sort (lambda (a b) (string<? (symbol->string (func-info-name a))
+                                                        (symbol->string (func-info-name b))))
+                               (filter (lambda (info) (not (internal-name? (func-info-name info))))
+                                       (vector->list infos))))))))
+
+  (define (require-syntax-for s name phase)
+    (unless (memv phase syntax-phases)
+      (raise-compile-error s "~a builds syntax-library data: add (require syntax)~a" name
+                           (if (> phase 0) (format " at phase ~a" phase) ""))))
+
+  ;; (runtime-free): after expansion, the phase-0 module may import only from
+  ;; the host and may not use GC objects (spec 3.2).
+  (define (runtime-free! f phase)
+    (unless (and (= phase 0) (equal? (map stx-e (stx-list-of f 'runtime-free)) '(runtime-free)))
+      (raise-compile-error f "(runtime-free) takes nothing and belongs at phase 0"))
+    (set! runtime-free-form f))
 
   ;; (include "path"): the forms of another file, spliced in place, with the
   ;; include form's scopes. The path is relative to the including file.
@@ -330,15 +453,30 @@
 
   (define (run-chunk! forms phase where)
     (let ([name (next-chunk-name! phase)])
-      (let-values ([(bytes imports) (compile-module forms name)])
+      (let-values ([(bytes imports gc?) (compile-module forms name)])
         (guard (c [(wasm-failure? c)
                    (raise-compile-error where "compile-time code failed: ~a" (wasm-failure-message c))])
           (flush-output-port (current-output-port))
           (host-instantiate! (store-host current-store) name bytes))
         name)))
 
-  ;; (define-syntax name f): name is a macro; f is a phase+1 function from
-  ;; syntax to syntax, defined by an earlier begin-for-syntax.
+  (define (syntax-info name)
+    (or (hashtable-ref (current-syntax-infos) name #f)
+        (raise-compile-error #f "internal: the syntax library has no ~a" name)))
+
+  ;; A one-function chunk that gives Chez an i32 entry point: it turns
+  ;; handles into references around `body`, which returns an eqref.
+  (define (handle-chunk! param? body phase where)
+    (let* ([key (and param? (fresh-key!))]
+           [wrapper (make-func-info '__entry (if param? '(i32) '()) '(i32) #f #f)]
+           [body (body (and param? (list 'call (syntax-info '%deref) (list (list 'lref key)))))]
+           [chunk (run-chunk! (list (list 'func wrapper (if param? (list (cons key 'i32)) '())
+                                          (list 'call (syntax-info '%handle) (list body))))
+                              phase where)])
+      chunk))
+
+  ;; (define-syntax name f): name is a macro whose transformer is the phase+1
+  ;; function f, of type (eqref) -> eqref, from an earlier begin-for-syntax.
   (define (define-syntax! f phase)
     (let ([parts (stx-list-of f 'define-syntax)])
       (unless (and (= (length parts) 3) (id? (cadr parts)) (id? (caddr parts)))
@@ -348,12 +486,14 @@
           (raise-compile-error (caddr parts) "~a is not a function at phase ~a"
                                (stx-e (caddr parts)) (+ phase 1)))
         (let ([info (cadr m)])
-          (unless (and (equal? (func-info-params info) '(i32)) (equal? (func-info-results info) '(i32)))
-            (raise-compile-error (caddr parts) "a transformer takes one i32 and returns one i32"))
+          (unless (and (equal? (func-info-params info) (list eqref))
+                       (types<=? (func-info-results info) (list eqref)))
+            (raise-compile-error (caddr parts) "a transformer takes one eqref (syntax) and returns one eqref"))
           (unless (func-info-instance info)
             (raise-compile-error (caddr parts) "~a must be defined by an earlier begin-for-syntax"
                                  (stx-e (caddr parts))))
-          (bind! (cadr parts) phase (list 'macro info))))))
+          (let ([chunk (handle-chunk! #t (lambda (arg) (list 'call info (list arg))) (+ phase 1) f)])
+            (bind! (cadr parts) phase (list 'macro chunk)))))))
 
   ;; (define-static name expr): name is bound to the value of expr, computed
   ;; now at phase+1. Macros read it with syntax-local-value.
@@ -362,10 +502,9 @@
       (unless (and (= (length parts) 3) (id? (cadr parts)))
         (raise-compile-error f "expected (define-static name expr)"))
       (let* ([rhs (expand-expr (caddr parts) (+ phase 1))]
-             [thunk (make-func-info '__static '() '(i32) #f #f)]
-             [chunk (run-chunk! (list (list 'func thunk '() rhs)) (+ phase 1) f)]
-             [word (call-in-store f (lambda (h) (host-call h chunk (func-info-export thunk))))])
-        (bind! (cadr parts) phase (list 'static word)))))
+             [chunk (handle-chunk! #f (lambda (_) rhs) (+ phase 1) f)]
+             [handle (call-in-store f (lambda (h) (host-call h chunk "__entry")))])
+        (bind! (cadr parts) phase (list 'static handle)))))
 
   ;; (begin-for-syntax form ...)
   (define (begin-for-syntax! f phase)
@@ -388,22 +527,25 @@
       (flush-output-port (current-output-port))
       (proc (store-host current-store))))
 
-  (define (apply-macro head info s phase)
+  (define (apply-macro head chunk s phase)
     (let ([saved-phase api-phase] [saved-where api-where])
       (dynamic-wind
         (lambda () (set! api-phase phase) (set! api-where s))
         (lambda ()
-          (let* ([in (encode current-store s)]
-                 [out (call-in-store s (lambda (h) (host-call h (func-info-instance info) (func-info-export info) in)))]
+          (let* ([mark (handle-mark current-store)]
+                 [in (encode current-store s)]
+                 [out (call-in-store s (lambda (h) (host-call h chunk "__entry" in)))]
                  [result (decode current-store out)])
+            (handle-release! current-store mark)
             (unless (stx? result)
               (raise-compile-error s "macro ~a returned a non-syntax value: ~s" (stx-e head)
-                                   (stx->datum result)))
+                                   (if (wasm-value? result) '<object> (stx->datum result))))
             result))
         (lambda () (set! api-phase saved-phase) (set! api-where saved-where)))))
 
-  ;; Entry point for wasm calls to the expander queries. Must never raise:
-  ;; an exception here would unwind through C and wasm frames.
+  ;; Entry point for wasm calls to the expander queries. Arguments and results
+  ;; are handles. Must never raise: an exception here would unwind through C
+  ;; and wasm frames.
   (define (expander-callback op a b)
     (guard (c [#t (set! api-error
                         (if (compile-error? c)
@@ -440,12 +582,9 @@
         (at where '(seq))
         (at where (cons 'seq (map-lr (lambda (f) (expand-expr f phase)) forms)))))
 
-  ;; A call to one of the expander module's functions, for forms that build
-  ;; expander data (quasiquote, quasisyntax).
-  (define (expander-call name . args)
-    (let ([info (and (current-expander-infos) (hashtable-ref (current-expander-infos) name #f))])
-      (unless info (raise-compile-error #f "this form needs the expander module (~a)" name))
-      (list 'call info args)))
+  ;; A call to one of the syntax library's functions, for forms that build
+  ;; its data (quasiquote, quasisyntax).
+  (define (syntax-call name . args) (list 'call (syntax-info name) args))
 
   (define (unbound s sym phase)
     (raise-compile-error s "unbound identifier ~a~a" sym (if (> phase 0) (format " at phase ~a" phase) "")))
@@ -462,6 +601,7 @@
              [(static) (raise-compile-error s "~a is static information: read it with syntax-local-value" e)]
              [(func) (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e)]
              [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
+             [(type) (raise-compile-error s "~a is a type" e)]
              [(core prim) (raise-compile-error s "bad use of ~a" e)]
              [(label) (raise-compile-error s "~a is a label" e)]
              [else (unbound s e phase)]))]
@@ -477,7 +617,7 @@
                [(func) (let ([args (or (stx->list (cdr e)) (raise-compile-error s "bad call syntax"))])
                          (at s (list 'call (cadr m) (map-lr (lambda (a) (expand-expr a phase)) args))))]
                [(local global) (raise-compile-error s "~a is a variable, not a function" (stx-e head))]
-               [(static data label) (raise-compile-error s "~a is not a function or a macro" (stx-e head))]
+               [(static data label type) (raise-compile-error s "~a is not a function or a macro" (stx-e head))]
                [else (unbound head (stx-e head) phase)])))]
         [(null? e) (raise-compile-error s "empty form ()")]
         ;; Unquoted literals are wasm numbers (spec 5.4).
@@ -487,7 +627,7 @@
         [(eq? e #t) (at s '(const i32 1))]
         [(eq? e #f) (at s '(const i32 0))]
         [(string? e)
-         (raise-compile-error s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for an expander string")]
+         (raise-compile-error s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for a syntax-library string")]
         [else (raise-compile-error s "~s is not an expression" (stx->datum s))])))
 
   (define (expand-prim name s phase)
@@ -510,6 +650,50 @@
         (raise-compile-error id "~s is not data" (stx->datum id)))
       (cadr m)))
 
+  ;; GC forms: (op immediate ... arg ...). Immediates are types, fields and
+  ;; reference types, resolved here.
+  (define (expand-gc name parts phase)
+    (define (ex x) (expand-expr x phase))
+    (define (arity n) (unless (= (length parts) n) (raise-compile-error (car parts) "bad ~a syntax" name)))
+    (define args (cdr parts))
+    (case name
+      [(struct.new array.new_fixed)
+       (unless (>= (length args) 1) (raise-compile-error (car parts) "bad ~a syntax" name))
+       (let ([t (type-of (car args) phase)])
+         (unless (eq? (type-info-kind t) (if (eq? name 'struct.new) 'struct 'array))
+           (raise-compile-error (car args) "~a is not a~a type" (type-info-name t)
+                                (if (eq? name 'struct.new) " struct" "n array")))
+         (list 'gc name (list t) (map-lr ex (cdr args))))]
+      [(struct.get struct.get_s struct.get_u)
+       (arity 4)
+       (let ([t (type-of (car args) phase)])
+         (list 'gc name (list t (field-index t (cadr args))) (list (ex (caddr args)))))]
+      [(struct.set)
+       (arity 5)
+       (let ([t (type-of (car args) phase)])
+         (list 'gc name (list t (field-index t (cadr args))) (list (ex (caddr args)) (ex (cadddr args)))))]
+      [(array.new array.new_default array.get array.get_s array.get_u array.set array.fill)
+       (arity (+ 2 (case name [(array.new_default) 1] [(array.new array.get array.get_s array.get_u) 2]
+                     [(array.set) 3] [(array.fill) 4])))
+       (let ([t (type-of (car args) phase)])
+         (unless (eq? (type-info-kind t) 'array)
+           (raise-compile-error (car args) "~a is not an array type" (type-info-name t)))
+         (list 'gc name (list t) (map-lr ex (cdr args))))]
+      [(array.copy)
+       (arity 8)
+       (list 'gc name (list (type-of (car args) phase) (type-of (cadr args) phase)) (map-lr ex (cddr args)))]
+      [(ref.null)
+       (arity 2)
+       (list 'gc name (list (parse-heap (car args) phase)) '())]
+      [(ref.test ref.cast)
+       (arity 3)
+       (list 'gc name (list (parse-reftype (car args) phase)) (list (ex (cadr args))))]
+      [(ref.eq) (arity 3) (list 'gc name '() (map-lr ex args))]
+      [(array.len ref.is_null ref.as_non_null ref.i31 i31.get_s i31.get_u)
+       (arity 2)
+       (list 'gc name '() (list (ex (car args))))]
+      [else (raise-compile-error (car parts) "internal: unknown GC form ~a" name)]))
+
   (define (expand-core name s phase)
     (let ([parts (or (stx->list s) (raise-compile-error s "bad ~a syntax" name))])
       (define (arity-check ok?)
@@ -518,15 +702,19 @@
       (case name
         [(quote)
          (arity-check (= (length parts) 2))
+         (require-syntax-for s name phase)
          (list 'quote (stx->datum (cadr parts)))]
         [(quote-syntax)
          (arity-check (= (length parts) 2))
+         (require-syntax-for s name phase)
          (list 'quote (cadr parts))]
         [(quasiquote)
          (arity-check (= (length parts) 2))
+         (require-syntax-for s name phase)
          (quasi (cadr parts) 0 phase 'quasiquote 'unquote 'unquote-splicing #f)]
         [(quasisyntax)
          (arity-check (= (length parts) 2))
+         (require-syntax-for s name phase)
          (quasi (cadr parts) 0 phase 'quasisyntax 'unsyntax 'unsyntax-splicing #t)]
         [(unquote unquote-splicing unsyntax unsyntax-splicing)
          (raise-compile-error s "~a is not inside a quasi form" name)]
@@ -551,7 +739,7 @@
                                  (raise-compile-error b "expected [name init] or [name type init]"))
                                (if (= (length bp) 2)
                                    (list (car bp) #f (cadr bp))
-                                   (list (car bp) (parse-type (cadr bp)) (caddr bp)))))
+                                   (list (car bp) (parse-type (cadr bp) phase) (caddr bp)))))
                            (or (stx->list (cadr parts)) (raise-compile-error s "bad bindings")))]
                [body (cddr parts)])
            (if (eq? name 'let)
@@ -592,7 +780,7 @@
          (list 'return (and (= (length parts) 2) (ex (cadr parts))))]
         [(call-indirect)
          (arity-check (>= (length parts) 3))
-         (let-values ([(params results) (parse-signature (cadr parts))])
+         (let-values ([(params results) (parse-signature (cadr parts) phase)])
            (list 'call-indirect params results (ex (caddr parts)) (map-lr ex (cdddr parts))))]
         [(func-index)
          (arity-check (and (= (length parts) 2) (id? (cadr parts))))
@@ -608,7 +796,10 @@
          (list 'drop (ex (cadr parts)))]
         [(unreachable) (arity-check (= (length parts) 1)) '(unreachable)]
         [(nop) (arity-check (= (length parts) 1)) '(nop)]
-        [else (raise-compile-error s "~a is only allowed at module level" name)])))
+        [else
+         (if (memq name gc-forms)
+             (expand-gc name parts phase)
+             (raise-compile-error s "~a is only allowed at module level" name))])))
 
   (define (bind-local! id phase)
     (let ([key (bind! id phase #f)])
@@ -654,8 +845,8 @@
               [(stx? e) (walk e depth)]
               [(and (= depth 0) (tagged? (car e) sname))
                (let ([v (expand-expr (cadr (stx->list (car e))) phase)])
-                 (expander-call 'append (if syntax? (expander-call 'splice-list v) v) (loop (cdr e))))]
-              [else (expander-call 'cons (walk (car e) depth) (loop (cdr e)))])))
+                 (syntax-call 'append (if syntax? (syntax-call 'splice-list v) v) (loop (cdr e))))]
+              [else (syntax-call 'cons (walk (car e) depth) (loop (cdr e)))])))
     (define (walk x depth)
       (cond [(not (changes? x depth)) (constant x)]
             [(and (tagged? x uname) (= depth 0)) (expand-expr (cadr (stx->list x)) phase)]
@@ -665,9 +856,9 @@
                                        [(tagged? x qname) (+ depth 1)]
                                        [else depth])]
                     [head (if (or (tagged? x uname) (tagged? x sname) (tagged? x qname))
-                              (expander-call 'cons (constant (car l)) (build-list x (cdr l) inner-depth))
+                              (syntax-call 'cons (constant (car l)) (build-list x (cdr l) inner-depth))
                               (build-list x l depth))])
-               (if syntax? (expander-call 'syntax-rewrap (constant x) head) head))]
+               (if syntax? (syntax-call 'syntax-rewrap (constant x) head) head))]
             [else (constant x)]))
     (walk t depth))
 
@@ -679,6 +870,7 @@
     (cond [(func-info? x) (func-info-name x)]
           [(global-info? x) (global-info-name x)]
           [(data-info? x) (data-info-name x)]
+          [(type-info? x) (type-info-name x)]
           [(stx? x) (list 'syntax (stx->datum x))]
           [(and (pair? x) (eq? (car x) 'at)) (strip-ast (caddr x))]
           [(pair? x) (cons (strip-ast (car x)) (strip-ast (cdr x)))]

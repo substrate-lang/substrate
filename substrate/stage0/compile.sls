@@ -2,34 +2,27 @@
 ;;
 ;; Expressions are compiled to symbolic instructions that mention info
 ;; records instead of indices; a final pass assigns indices once every
-;; import and synthesized global is known.
+;; import, type and synthesized global is known.
 ;;
-;; A module imports only what its code uses (spec 3.3). It owns its memory
+;; A module imports only what its code uses (spec 3.2). It owns its memory
 ;; and table: code that needs one must define it.
 (library (stage0 compile)
-  (export compile-module current-expander-infos immediate-word fixnum-min fixnum-max)
+  (export compile-module current-syntax-infos fixnum-min fixnum-max string-type)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 wasm))
 
-  ;; symbol -> func-info for the expander module's exports; #f while
-  ;; compiling the expander module itself.
-  (define current-expander-infos (make-parameter #f))
+  ;; symbol -> func-info for the syntax library's exports; #f while
+  ;; compiling the syntax library itself.
+  (define current-syntax-infos (make-parameter #f))
 
   (define fixnum-min (- (expt 2 30)))
   (define fixnum-max (- (expt 2 30) 1))
 
-  ;; The value word of an immediate datum, or #f if d lives in the heap.
-  ;; The compiler may emit these words directly because it is part of the
-  ;; expander (spec appendix A).
-  (define (immediate-word d)
-    (cond [(and (integer? d) (exact? d))
-           (unless (<= fixnum-min d fixnum-max)
-             (raise-compile-error (current-loc) "integer ~a is outside the fixnum range" d))
-           (+ (* 2 d) 1)]
-          [(eq? d #f) 0]
-          [(eq? d #t) 10]
-          [(null? d) 18]
-          [(char? d) (+ (* 8 (char->integer d)) 4)]
-          [else #f]))
+  ;; The syntax library's string type. Quoted strings are built with
+  ;; array.new_fixed of this type; wasm treats identical type definitions in
+  ;; different modules as the same type (spec appendix A).
+  (define string-type (make-type-info '%string 'array '(i8 #t)))
+
+  (define eqref (make-ref #t 'eq))
 
   ;; ---- error locations ------------------------------------------------------
 
@@ -41,18 +34,31 @@
   (define (type->string t)
     (cond [(eq? t 'bottom) "nothing (unreachable)"]
           [(null? t) "no value"]
-          [(null? (cdr t)) (symbol->string (car t))]
-          [else (format "~a" t)]))
+          [(null? (cdr t)) (valtype->string (car t))]
+          [else (format "(~a)" (apply string-append
+                                      (let loop ([ts t])
+                                        (if (null? ts) '()
+                                            (cons (valtype->string (car ts))
+                                                  (if (null? (cdr ts)) '() (cons " " (loop (cdr ts)))))))))]))
 
   (define (single? t) (and (pair? t) (null? (cdr t))))
 
   ;; Make code of type `type` fit `expected`: drop unused values, or fail.
+  ;; A subtype fits without any code.
   (define (coerce code type expected)
     (cond [(not expected) (values code type)]
           [(eq? type 'bottom) (values code expected)]
-          [(equal? type expected) (values code type)]
+          [(types<=? type expected) (values code expected)]
           [(null? expected) (values (append code (map-lr (lambda (_) '(drop)) type)) '())]
           [else (fail "type mismatch: expected ~a, got ~a" (type->string expected) (type->string type))]))
+
+  (define (join-types a b)
+    (cond [(eq? a 'bottom) b]
+          [(eq? b 'bottom) a]
+          [(and (= (length a) (length b)))
+           (let ([j (map valtype-join a b)])
+             (and (for-all values j) j))]
+          [else #f]))
 
   (define (s32 n)
     (unless (<= (- (expt 2 31)) n (- (expt 2 32) 1))
@@ -112,7 +118,8 @@
             (mutable synths)         ; synth records, reversed
             (mutable fidx)           ; alist func-info -> synth
             (mutable uses-memory)    ; where code first needs a memory, or #f
-            (mutable uses-table)))   ; where code first needs a table, or #f
+            (mutable uses-table)     ; where code first needs a table, or #f
+            (mutable uses-gc)))      ; does code allocate or inspect GC objects?
 
   (define (external? ms info-instance) (not (equal? info-instance (mstate-self ms))))
 
@@ -145,30 +152,118 @@
 
   ;; ---- expressions ------------------------------------------------------------
 
-  ;; A function of the expander module, by name. While compiling the
-  ;; expander module itself, its own functions are found with `local`.
-  (define (expander-func ms local name)
-    (let ([info (if (current-expander-infos)
-                    (hashtable-ref (current-expander-infos) name #f)
+  ;; A function of the syntax library, by name. While compiling the
+  ;; syntax library itself, its own functions are found with `local`.
+  (define (syntax-func ms local name)
+    (let ([info (if (current-syntax-infos)
+                    (hashtable-ref (current-syntax-infos) name #f)
                     (local name))])
-      (unless info (fail "internal: the expander module has no function ~a" name))
+      (unless info (fail "internal: the syntax library has no function ~a" name))
       (note-func! ms info)
       info))
+
+  (define (struct-field tinfo index) (list-ref (type-info-fields tinfo) index))
 
   ;; Compile e. expected: #f or a list of valtypes. tail?: e's value is the
   ;; function's return value. Returns (values code type).
   (define (cx ms fc labels e expected tail?)
     (define (sub e expected tail?) (cx ms fc labels e expected tail?))
     (define (sub-in labels e expected tail?) (cx ms fc labels e expected tail?))
+    (define (code-of e type) (let-values ([(c _) (sub e (list type) #f)]) c))
     (define (args-code args types)
       (unless (= (length args) (length types))
         (fail "expected ~a arguments, got ~a" (length types) (length args)))
-      (apply append (map-lr (lambda (a t) (let-values ([(c _) (sub a (list t) #f)]) c)) args types)))
+      (apply append (map-lr code-of args types)))
+    ;; Synthesize the type of a reference expression.
+    (define (ref-arg e who)
+      (let-values ([(c t) (sub e #f #f)])
+        (unless (and (single? t) (ref-type? (car t)))
+          (fail "~a needs a reference, got ~a" who (type->string t)))
+        (values c (car t))))
     (define (blocktype t)
       (cond [(null? t) '()]
             [(single? t) (car t)]
-            [else (list 'type (cons '() t))]))
+            [else (list 'type (list 'func '() t))]))
     (define (finish code type) (coerce code type expected))
+    ;; GC operations (spec 5.3). imms hold type-infos, field indices and
+    ;; reference types resolved by the expander.
+    (define (compile-gc op imms args)
+      (define (arg i type) (code-of (list-ref args i) type))
+      (define (tref t) (make-ref #t t))
+      (case op
+        [(struct.new)
+         (let ([t (car imms)])
+           (finish (append (args-code args (map (lambda (f) (unpacked (cadr f))) (type-info-fields t)))
+                           `((struct.new ,t)))
+                   (list (make-ref #f t))))]
+        [(struct.get struct.get_s struct.get_u)
+         (let* ([t (car imms)] [i (cadr imms)] [f (struct-field t i)] [packed? (memq (cadr f) '(i8 i16))])
+           (when (and packed? (eq? op 'struct.get))
+             (fail "field ~a is packed: use struct.get_s or struct.get_u" (car f)))
+           (when (and (not packed?) (not (eq? op 'struct.get)))
+             (fail "~a is only for packed fields" op))
+           (finish (append (arg 0 (tref t)) `((,op ,t ,i))) (list (unpacked (cadr f)))))]
+        [(struct.set)
+         (let* ([t (car imms)] [i (cadr imms)] [f (struct-field t i)])
+           (unless (caddr f) (fail "field ~a is not mutable" (car f)))
+           (finish (append (arg 0 (tref t)) (arg 1 (unpacked (cadr f))) `((struct.set ,t ,i))) '()))]
+        [(array.new)
+         (let ([t (car imms)])
+           (finish (append (arg 0 (unpacked (car (type-info-fields t)))) (arg 1 'i32) `((array.new ,t)))
+                   (list (make-ref #f t))))]
+        [(array.new_default)
+         (let ([t (car imms)])
+           (finish (append (arg 0 'i32) `((array.new_default ,t))) (list (make-ref #f t))))]
+        [(array.new_fixed)
+         (let ([t (car imms)])
+           (finish (append (apply append (map-lr (lambda (a) (code-of a (unpacked (car (type-info-fields t))))) args))
+                           `((array.new_fixed ,t ,(length args))))
+                   (list (make-ref #f t))))]
+        [(array.get array.get_s array.get_u)
+         (let* ([t (car imms)] [storage (car (type-info-fields t))] [packed? (memq storage '(i8 i16))])
+           (when (and packed? (eq? op 'array.get))
+             (fail "~a has packed elements: use array.get_s or array.get_u" (type-info-name t)))
+           (when (and (not packed?) (not (eq? op 'array.get)))
+             (fail "~a is only for packed elements" op))
+           (finish (append (arg 0 (tref t)) (arg 1 'i32) `((,op ,t))) (list (unpacked storage))))]
+        [(array.set)
+         (let ([t (car imms)])
+           (unless (cadr (type-info-fields t)) (fail "~a is not mutable" (type-info-name t)))
+           (finish (append (arg 0 (tref t)) (arg 1 'i32) (arg 2 (unpacked (car (type-info-fields t))))
+                           `((array.set ,t)))
+                   '()))]
+        [(array.len)
+         (finish (append (arg 0 (make-ref #t 'array)) '((array.len))) '(i32))]
+        [(array.fill)
+         (let ([t (car imms)])
+           (finish (append (arg 0 (tref t)) (arg 1 'i32) (arg 2 (unpacked (car (type-info-fields t)))) (arg 3 'i32)
+                           `((array.fill ,t)))
+                   '()))]
+        [(array.copy)
+         (let ([dst (car imms)] [src (cadr imms)])
+           (finish (append (arg 0 (tref dst)) (arg 1 'i32) (arg 2 (tref src)) (arg 3 'i32) (arg 4 'i32)
+                           `((array.copy ,dst ,src)))
+                   '()))]
+        [(ref.null)
+         (finish `((ref.null ,(car imms))) (list (make-ref #t (car imms))))]
+        [(ref.is_null)
+         (let-values ([(c t) (ref-arg (car args) "ref.is_null")])
+           (finish (append c '((ref.is_null))) '(i32)))]
+        [(ref.eq)
+         (finish (append (arg 0 eqref) (arg 1 eqref) '((ref.eq))) '(i32))]
+        [(ref.as_non_null)
+         (let-values ([(c t) (ref-arg (car args) "ref.as_non_null")])
+           (finish (append c '((ref.as_non_null))) (list (make-ref #f (ref-heap t)))))]
+        [(ref.test ref.cast)
+         (let ([target (car imms)])
+           (let-values ([(c t) (ref-arg (car args) (symbol->string op))])
+             (finish (append c `((,op ,(ref-nullable? target) ,(ref-heap target))))
+                     (if (eq? op 'ref.test) '(i32) (list target)))))]
+        [(ref.i31)
+         (finish (append (arg 0 'i32) '((ref.i31))) (list (make-ref #f 'i31)))]
+        [(i31.get_s i31.get_u)
+         (finish (append (arg 0 (make-ref #t 'i31)) `((,op))) '(i32))]
+        [else (fail "internal: unknown GC operation ~a" op)]))
     (record-case e
       [(at) (loc inner)
        (parameterize ([current-loc (or loc (current-loc))]) (sub inner expected tail?))]
@@ -194,15 +289,13 @@
          (finish `((local.get ,(car l))) (list (cdr l))))]
       [(lset) (key v)
        (let ([l (lookup-local fc key)])
-         (let-values ([(c _) (sub v (list (cdr l)) #f)])
-           (finish (append c `((local.set ,(car l)))) '())))]
+         (finish (append (code-of v (cdr l)) `((local.set ,(car l)))) '()))]
       [(gref) (info)
        (note-global! ms info)
        (finish `((global.get ,info)) (list (global-info-type info)))]
       [(gset) (info v)
        (note-global! ms info)
-       (let-values ([(c _) (sub v (list (global-info-type info)) #f)])
-         (finish (append c `((global.set ,info))) '()))]
+       (finish (append (code-of v (global-info-type info)) `((global.set ,info))) '())]
       [(let) (bindings body)
        (let ([init-code
               (apply append
@@ -233,20 +326,26 @@
                (let-values ([(c _) (sub-in lbls then '() #f)])
                  (finish (append tc `((if () ,c ()))) '()))
                (let*-values ([(c1 t1) (sub-in lbls then expected tail?)]
-                             [(c2 t2) (sub-in lbls els (if (eq? t1 'bottom) expected t1) tail?)])
-                 (let ([t (cond [(not (eq? t1 'bottom)) t1]
-                                [(not (eq? t2 'bottom)) t2]
-                                [expected expected]
-                                [else '()])])
-                   (values (append tc `((if ,(blocktype t) ,c1 ,c2))) t))))))]
+                             ;; Without an expected type, numeric literals in
+                             ;; the else branch take the then branch's type.
+                             [(c2 t2) (sub-in lbls els
+                                              (or expected
+                                                  (and (not (eq? t1 'bottom)) (for-all numeric-type? t1) t1))
+                                              tail?)])
+                 (let ([t (or expected
+                              (join-types t1 t2)
+                              (fail "the branches of if have different types: ~a and ~a"
+                                    (type->string t1) (type->string t2)))])
+                   (let ([t (if (eq? t 'bottom) '() t)])
+                     (values (append tc `((if ,(blocktype t) ,c1 ,c2))) t)))))))]
       [(block) (key body)
        (let* ([lbl (make-label key 'block expected)])
          (let-values ([(c t) (sub-in (cons lbl labels) body expected tail?)])
            (let ([t (cond [(not (eq? t 'bottom))
-                           (when (and (label-type lbl) (not (equal? (label-type lbl) t)))
+                           (when (and (label-type lbl) (not (types<=? t (label-type lbl))))
                              (fail "block result is ~a but a br carries ~a"
                                    (type->string t) (type->string (label-type lbl))))
-                           t]
+                           (or (label-type lbl) t)]
                           [(label-type lbl) (label-type lbl)]
                           [else '()])])
              (values `((block ,(blocktype t) ,c)) t))))]
@@ -263,7 +362,7 @@
                (values `((br ,depth)) 'bottom))
              (let-values ([(c t) (if v (sub v (label-type lbl) #f) (values '() '()))])
                (cond [(not (label-type lbl)) (label-type-set! lbl t)]
-                     [(not (equal? (label-type lbl) t))
+                     [(not (types<=? t (label-type lbl)))
                       (fail "br carries ~a but the block produces ~a"
                             (type->string t) (type->string (label-type lbl)))])
                (values (append c `((br ,depth))) 'bottom))))]
@@ -284,7 +383,7 @@
        (note-func! ms info)
        (let ([code (args-code args (func-info-params info))]
              [results (func-info-results info)])
-         (if (and tail? (equal? results (fctx-results fc)))
+         (if (and tail? (types<=? results (fctx-results fc)))
              (values (append code `((return_call ,info))) results)
              (finish (append code `((call ,info))) results)))]
       [(prim) (name offset args)
@@ -300,58 +399,62 @@
       [(call-indirect) (params results idx args)
        (note-table! ms)
        (let* ([code (args-code args params)]
-              [ic (let-values ([(c _) (sub idx '(i32) #f)]) c)]
-              [sig (cons params results)])
-         (if (and tail? (equal? results (fctx-results fc)))
+              [ic (code-of idx 'i32)]
+              [sig (list 'func params results)])
+         (if (and tail? (types<=? results (fctx-results fc)))
              (values (append code ic `((return_call_indirect ,sig 0))) results)
              (finish (append code ic `((call_indirect ,sig 0))) results)))]
       [(func-index) (info)
        (finish `((global.get ,(fidx-synth! ms info))) '(i32))]
+      [(gc) (op imms args)
+       (mstate-uses-gc-set! ms #t)
+       (compile-gc op imms args)]
       [(select) (a b test)
        (let*-values ([(ca ta) (sub a #f #f)])
          (unless (single? ta) (fail "select needs single values, got ~a" (type->string ta)))
          (let-values ([(cb _b) (sub b ta #f)] [(ct _t) (sub test '(i32) #f)])
-           (finish (append ca cb ct '((select))) ta)))]
+           (finish (append ca cb ct (if (ref-type? (car ta)) `((select-typed ,(car ta))) '((select)))) ta)))]
       [(drop) (v)
        (let-values ([(c t) (sub v #f #f)])
          (finish (if (eq? t 'bottom) c (append c (map-lr (lambda (_) '(drop)) t))) '()))]
       [(unreachable) () (values '((unreachable)) 'bottom)]
       [(nop) () (finish '((nop)) '())]
       [(quote) (d)
-       (let ([w (immediate-word d)])
-         (if w
-             (finish `((i32.const ,w)) '(i32))
-             (finish `((global.get ,(new-synth! ms 'const d))) '(i32))))]
+       (cond [(and (integer? d) (exact? d))
+              (unless (<= fixnum-min d fixnum-max)
+                (fail "integer ~a is outside the fixnum range" d))
+              (finish `((i32.const ,d) (ref.i31)) (list (make-ref #f 'i31)))]
+             [(eq? d #f) (finish '((ref.null eq)) (list eqref))]
+             [else (finish `((global.get ,(new-synth! ms 'const d))) (list eqref))])]
       [else (fail "internal: unknown kernel form ~s" (car e))]))
 
   ;; ---- quoted constants ---------------------------------------------------------
 
-  ;; Code that builds datum d with the expander module's functions and leaves
-  ;; its word on the stack. It never touches the expander's memory directly.
-  ;; tmp is a scratch local of the start function.
-  (define (build-datum d tmp ex)
+  ;; Code that builds datum d with the syntax library's functions and leaves
+  ;; it on the stack as an eqref. tmp is unused scratch kept for symmetry.
+  (define (build-datum d ex)
     (define (call name) `((call ,(ex name))))
-    (define (build d) (build-datum d tmp ex))
+    (define (build d) (build-datum d ex))
+    (define (i32 n) `((i32.const ,n)))
     (define (string-code s)
-      (let* ([bv (string->utf8 s)] [n (bytevector-length bv)])
-        (append `((i32.const ,n) ,@(call '%alloc-string) (local.set ,tmp))
-                (let loop ([i 0])
-                  (if (= i n)
-                      '()
-                      (append `((local.get ,tmp) (i32.const ,i) (i32.const ,(bytevector-u8-ref bv i))
-                                ,@(call '%string-set-byte!))
-                              (loop (+ i 1)))))
-                `((local.get ,tmp)))))
-    (let ([w (immediate-word d)])
-      (cond [w `((i32.const ,w))]
-            [(string? d) (string-code d)]
-            [(symbol? d) (append (string-code (symbol->string d)) (call 'intern))]
-            [(pair? d) (append (build (car d)) (build (cdr d)) (call 'cons))]
-            [(stx? d) (append (build (stx-e d)) (build (stx-scopes d))
-                              (build (stx-srcloc d)) (build (stx-props d)) (call '%make-syntax))]
-            [(srcloc? d) (append (build (srcloc-source d)) (build (srcloc-line d)) (build (srcloc-col d))
-                                 (build (srcloc-pos d)) (build (srcloc-span d)) (call '%make-srcloc))]
-            [else (fail "cannot quote ~s" d)])))
+      (let ([bv (string->utf8 s)])
+        (append (apply append (map i32 (bytevector->u8-list bv)))
+                `((array.new_fixed ,string-type ,(bytevector-length bv))))))
+    (cond [(and (integer? d) (exact? d))
+           (unless (<= fixnum-min d fixnum-max) (fail "integer ~a is outside the fixnum range" d))
+           `((i32.const ,d) (ref.i31))]
+          [(eq? d #f) '((ref.null eq))]
+          [(eq? d #t) (call '%the-true)]
+          [(null? d) (call '%the-nil)]
+          [(char? d) (append (i32 (char->integer d)) (call 'integer->char))]
+          [(string? d) (string-code d)]
+          [(symbol? d) (append (string-code (symbol->string d)) (call 'intern))]
+          [(pair? d) (append (build (car d)) (build (cdr d)) (call 'cons))]
+          [(stx? d) (append (build (stx-e d)) (build (stx-scopes d))
+                            (build (stx-srcloc d)) (build (stx-props d)) (call '%make-syntax))]
+          [(srcloc? d) (append (build (srcloc-source d)) (i32 (srcloc-line d)) (i32 (srcloc-col d))
+                               (i32 (srcloc-pos d)) (i32 (srcloc-span d)) (call '%make-srcloc))]
+          [else (fail "cannot quote ~s" d)]))
 
   ;; ---- module -------------------------------------------------------------------
 
@@ -363,21 +466,36 @@
              [(int) (cadr init)]
              [(float) (cadr init)]
              [(const) (caddr init)]
-             [(quote) (immediate-word (cadr init))]
              [else #f]))))
-
-  (define (valtype-zero t) (case t [(i32 i64) 0] [else 0.0]))
 
   (define (const-op t) (string->symbol (string-append (symbol->string t) ".const")))
 
+  ;; Every type-info mentioned anywhere in x, dependencies first.
+  (define (collect-types x)
+    (let ([found '()] [visiting '()])
+      (define (add! t)
+        (unless (or (memq t found) (memq t visiting))
+          (set! visiting (cons t visiting))
+          (walk (type-info-fields t))
+          (set! found (cons t found))))
+      (define (walk x)
+        (cond [(type-info? x) (add! x)]
+              [(pair? x) (walk (car x)) (walk (cdr x))]
+              [(vector? x) (vector-for-each walk x)]
+              [else (void)]))
+      (walk x)
+      (reverse found)))
+
   ;; forms: fully expanded module forms. self: this module's instance name.
   ;; Assigns instance and export names to the infos it defines. Returns the
-  ;; module bytes and the list of instance names it imports from.
+  ;; module bytes, the instance names it imports from, and whether its code
+  ;; uses GC objects.
   (define (compile-module forms self)
-    (define ms (make-mstate self '() '() '() '() #f #f))
+    (define ms (make-mstate self '() '() '() '() #f #f #f))
     (define func-forms (filter (lambda (f) (eq? (car f) 'func)) forms))
     (define global-forms (filter (lambda (f) (eq? (car f) 'global)) forms))
     (define data-forms (filter (lambda (f) (eq? (car f) 'data)) forms))
+    (define type-forms (filter (lambda (f) (eq? (car f) 'type)) forms))
     (define memory-form (find (lambda (f) (eq? (car f) 'memory)) forms))
     (define table-form (find (lambda (f) (eq? (car f) 'table)) forms))
     (define exported (make-hashtable string-hash string=?))
@@ -392,7 +510,7 @@
     (define (local name)
       (let ([f (find (lambda (f) (eq? (func-info-name (cadr f)) name)) func-forms)])
         (and f (cadr f))))
-    (define (ex name) (expander-func ms local name))
+    (define (ex name) (syntax-func ms local name))
 
     (define assigned-funcs
       (for-each (lambda (f)
@@ -403,6 +521,9 @@
     (define assigned-globals
       (for-each (lambda (f)
                   (let ([info (cadr f)])
+                    (unless (defaultable? (global-info-type info))
+                      (fail "global ~a: a global must have a numeric or nullable reference type"
+                            (global-info-name info)))
                     (global-info-instance-set! info self)
                     (global-info-export-set! info (export-name! (global-info-name info)))))
                 global-forms))
@@ -414,7 +535,7 @@
                        [fc (new-fctx params (func-info-results info))])
                   (parameterize ([current-loc #f])
                     (let-values ([(code _) (cx ms fc '() body (func-info-results info) #t)])
-                      (list info (cons (map cdr params) (func-info-results info))
+                      (list info (list 'func (map cdr params) (func-info-results info))
                             (reverse (fctx-extra fc)) code)))))
               func-forms))
 
@@ -427,7 +548,7 @@
                        (case (car f)
                          [(global)
                           (let ([info (cadr f)] [init (caddr f)])
-                            (if (or (not init) (literal-init init))
+                            (if (or (not init) (and (numeric-type? (global-info-type info)) (literal-init init)))
                                 '()
                                 (let-values ([(c _) (cx ms start-fc '() init (list (global-info-type info)) #f)])
                                   (append c `((global.set ,info))))))]
@@ -437,13 +558,12 @@
                      forms)))
     ;; Table registration for func-index and quoted constants, in the order
     ;; the code above met them.
-    (define tmp (temp-local! start-fc 'i32))
     (define setup-code
       (apply append
              (map-lr (lambda (s)
                        (if (eq? (synth-kind s) 'fidx)
                            `((ref.func ,(synth-datum s)) (i32.const 1) (table.grow 0) (global.set ,s))
-                           (append (build-datum (synth-datum s) tmp ex) `((global.set ,s)))))
+                           (append (build-datum (synth-datum s) ex) `((global.set ,s)))))
                      (reverse (mstate-synths ms)))))
     (define start-code (append setup-code init-code))
     (define has-start? (not (null? start-code)))
@@ -473,12 +593,30 @@
       (let loop ([gs (append global-imports (map cadr global-forms) synths)] [i 0])
         (if (null? gs) i (begin (hashtable-set! global-index (car gs) i) (loop (cdr gs) (+ i 1))))))
 
-    (define types '())
+    ;; GC types come first in the type section, dependencies first; function
+    ;; types follow as they are needed.
+    (define gc-types
+      (collect-types (list (map cadr type-forms)
+                           (map (lambda (cf) (list (cadr cf) (caddr cf) (cadddr cf))) compiled-funcs)
+                           (fctx-extra start-fc) start-code
+                           (map (lambda (info) (list (func-info-params info) (func-info-results info))) func-imports)
+                           (map (lambda (f) (global-info-type (cadr f))) global-forms))))
+    (define gc-index
+      (let ([table (make-eq-hashtable)])
+        (let loop ([ts gc-types] [i 0])
+          (unless (null? ts) (hashtable-set! table (car ts) i) (loop (cdr ts) (+ i 1))))
+        table))
+    (define (heap-index h) (if (type-info? h) (hashtable-ref gc-index h #f) h))
+    (define (rv t) (if (ref-type? t) (make-ref (ref-nullable? t) (heap-index (ref-heap t))) t))
+    (define (rstorage s) (if (memq s '(i8 i16)) s (rv s)))
+
+    (define func-types '())
     (define (type-index sig)
-      (let loop ([ts types] [i 0])
-        (cond [(null? ts) (set! types (append types (list sig))) i]
-              [(equal? (car ts) sig) i]
-              [else (loop (cdr ts) (+ i 1))])))
+      (let ([sig (list 'func (map rv (cadr sig)) (map rv (caddr sig)))])
+        (let loop ([ts func-types] [i (length gc-types)])
+          (cond [(null? ts) (set! func-types (append func-types (list sig))) i]
+                [(equal? (car ts) sig) i]
+                [else (loop (cdr ts) (+ i 1))]))))
 
     (define (fi info)
       (or (hashtable-ref func-index info #f)
@@ -486,6 +624,7 @@
     (define (gi g)
       (or (hashtable-ref global-index g #f)
           (fail "internal: global has no index")))
+    (define (ti t) (or (hashtable-ref gc-index t #f) (fail "internal: type has no index")))
 
     (define declared '())
     (define (resolve instrs)
@@ -499,42 +638,63 @@
                   [(call_indirect return_call_indirect) (list (car i) (type-index (cadr i)) (caddr i))]
                   [(block loop) (list (car i) (resolve-bt (cadr i)) (resolve (caddr i)))]
                   [(if) (list 'if (resolve-bt (cadr i)) (resolve (caddr i)) (resolve (cadddr i)))]
+                  [(select-typed) (list 'select-typed (rv (cadr i)))]
+                  [(ref.null) (list 'ref.null (heap-index (cadr i)))]
+                  [(ref.test ref.cast) (list (car i) (cadr i) (heap-index (caddr i)))]
+                  [(struct.new array.new array.new_default array.get array.get_s array.get_u array.set array.fill)
+                   (list (car i) (ti (cadr i)))]
+                  [(struct.get struct.get_s struct.get_u struct.set array.new_fixed)
+                   (list (car i) (ti (cadr i)) (caddr i))]
+                  [(array.copy) (list 'array.copy (ti (cadr i)) (ti (caddr i)))]
                   [else i]))
               instrs))
     (define (resolve-bt bt)
-      (if (and (pair? bt) (eq? (car bt) 'type)) (list 'type (type-index (cadr bt))) bt))
+      (cond [(and (pair? bt) (eq? (car bt) 'type)) (list 'type (type-index (cadr bt)))]
+            [(null? bt) bt]
+            [else (rv bt)]))
 
     (define imports
       (append
        (map-lr (lambda (info)
                  (list (func-info-instance info) (func-info-export info) 'func
-                       (type-index (cons (func-info-params info) (func-info-results info)))))
+                       (type-index (list 'func (func-info-params info) (func-info-results info)))))
                func-imports)
        (map-lr (lambda (g) (list (global-info-instance g) (global-info-export g) 'global
-                                 (list (global-info-type g) #t)))
+                                 (list (rv (global-info-type g)) #t)))
                global-imports)))
 
     (define wfuncs
       (append
        (map-lr (lambda (cf)
-                 (list (type-index (cadr cf)) (caddr cf) (resolve (cadddr cf))
+                 (list (type-index (cadr cf)) (map rv (caddr cf)) (resolve (cadddr cf))
                        (func-info-export (car cf))))
                compiled-funcs)
        (if has-start?
-           (list (list (type-index '(() . ())) (reverse (fctx-extra start-fc)) (resolve start-code) "__start"))
+           (list (list (type-index '(func () ())) (map rv (reverse (fctx-extra start-fc))) (resolve start-code) "__start"))
            '())))
+
+    (define (zero-init t)
+      (if (ref-type? t)
+          `((ref.null ,(heap-index (ref-heap t))))
+          `((,(const-op t) ,(if (memq t '(f32 f64)) 0.0 0)))))
 
     (define wglobals
       (append
        (map-lr (lambda (f)
-                 (let* ([info (cadr f)] [t (global-info-type info)] [lit (and (caddr f) (literal-init (caddr f)))])
-                   (list t #t (list (list (const-op t)
-                                          (cond [(not lit) (valtype-zero t)]
-                                                [(memq t '(f32 f64)) (inexact lit)]
-                                                [(eq? t 'i32) (s32 lit)]
-                                                [else (s64 lit)]))))))
+                 (let* ([info (cadr f)] [t (global-info-type info)]
+                        [lit (and (caddr f) (numeric-type? t) (literal-init (caddr f)))])
+                   (list (rv t) #t
+                         (if lit
+                             (list (list (const-op t)
+                                         (cond [(memq t '(f32 f64)) (inexact lit)]
+                                               [(eq? t 'i32) (s32 lit)]
+                                               [else (s64 lit)])))
+                             (zero-init t)))))
                global-forms)
-       (map-lr (lambda (s) (list 'i32 #t '((i32.const 0)))) synths)))
+       (map-lr (lambda (s) (if (eq? (synth-kind s) 'fidx)
+                               (list 'i32 #t '((i32.const 0)))
+                               (list (rv eqref) #t '((ref.null eq)))))
+               synths)))
 
     ;; A module's memory and table are exported as "memory" and "table":
     ;; host imports find the caller's memory that way (spec section 4).
@@ -552,9 +712,16 @@
        (let loop ([fs wfuncs] [i n-func-imports])
          (if (null? fs) '() (cons (cons i (cadddr (car fs))) (loop (cdr fs) (+ i 1)))))))
 
+    (define gc-type-entries
+      (map-lr (lambda (t)
+                (if (eq? (type-info-kind t) 'struct)
+                    (list 'struct (map (lambda (f) (list (rstorage (cadr f)) (caddr f))) (type-info-fields t)))
+                    (list 'array (list (rstorage (car (type-info-fields t))) (cadr (type-info-fields t))))))
+              gc-types))
+
     (define bytes
       (encode-module
-       (make-wmodule types imports
+       (make-wmodule (append gc-type-entries func-types) imports
                      (map-lr (lambda (f) (list (car f) (cadr f) (caddr f) (cadddr f))) wfuncs)
                      (if table-form (list (list (cadr table-form) #f)) '())
                      (if memory-form (list (list (cadr memory-form) #f)) '())
@@ -568,4 +735,5 @@
             (let loop ([is imports] [acc '()])
               (cond [(null? is) (reverse acc)]
                     [(member (caar is) acc) (loop (cdr is) acc)]
-                    [else (loop (cdr is) (cons (caar is) acc))])))))
+                    [else (loop (cdr is) (cons (caar is) acc))]))
+            (or (mstate-uses-gc ms) (not (null? gc-types))))))
