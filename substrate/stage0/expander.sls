@@ -86,6 +86,14 @@
 
   (define (new-scope!) (set! scope-counter (+ scope-counter 1)) scope-counter)
 
+  ;; The scopes of local binding forms: func, let, let*, block and loop.
+  ;; quote-syntax prunes them from its literal (spec 6.2).
+  (define local-scopes (make-eqv-hashtable))
+  (define (new-local-scope!)
+    (let ([sc (new-scope!)]) (hashtable-set! local-scopes sc #t) sc))
+  (define (prune-local-scopes x)
+    (filter-scopes x (lambda (sc) (not (hashtable-contains? local-scopes sc)))))
+
   (define core-scope 0)
 
   ;; ---- the syntax library ----
@@ -727,7 +735,7 @@
 
   (define (expand-func p phase)
     (let* ([info (list-ref p 1)] [params (list-ref p 2)] [body (list-ref p 3)] [f (list-ref p 4)]
-           [sc (new-scope!)]
+           [sc (new-local-scope!)]
            [keys (map-lr (lambda (pr) (bind-local! (add-scope (car pr) sc) phase)) params)])
       (list 'func info (map-lr (lambda (k pr) (cons k (cdr pr))) keys params)
             (expand-seq (map-lr (lambda (b) (add-scope b sc)) body) phase f))))
@@ -1059,8 +1067,9 @@
             [(3)                        ; free-identifier=?
              (let ([x (decode ms a)] [y (decode ms b)])
                (unless (and (id? x) (id? y)) (raise-compile-error api-where "free-identifier=?: expected identifiers"))
-               (let ([kx (resolve x api-phase 'value)] [ky (resolve y api-phase 'value)])
-                 (if (if (or kx ky) (eqv? kx ky) (eq? (stx-e x) (stx-e y))) 1 0)))]
+               ;; Same meaning, so an import and what it imports are equal.
+               (let ([mx (meaning-of x api-phase)] [my (meaning-of y api-phase)])
+                 (if (if (or mx my) (equal? mx my) (eq? (stx-e x) (stx-e y))) 1 0)))]
             [else (raise-compile-error api-where "unknown expander query ~a" op)])))))
 
   ;; ==== expressions ===================================================================
@@ -1197,7 +1206,7 @@
          (list 'quote (stx->datum (cadr parts)))]
         [(quote-syntax)
          (arity-check (= (length parts) 2))
-         (list 'quote (cadr parts))]
+         (list 'quote (prune-local-scopes (cadr parts)))]
         [(quasiquote)
          (arity-check (= (length parts) 2))
          (quasi (cadr parts) 0 phase 'quasiquote 'unquote 'unquote-splicing #f)]
@@ -1232,7 +1241,7 @@
                [body (cddr parts)])
            (if (eq? name 'let)
                (let* ([inits (map-lr (lambda (b) (ex (caddr b))) bs)]
-                      [sc (new-scope!)]
+                      [sc (new-local-scope!)]
                       [keys (map-lr (lambda (b) (bind-local! (add-scope (car b) sc) phase)) bs)])
                  (list 'let (map-lr (lambda (k b init) (list k (cadr b) init)) keys bs inits)
                        (expand-seq (map-lr (lambda (x) (add-scope x sc)) body) phase s)))
@@ -1242,7 +1251,7 @@
                      (list 'let (reverse acc) (expand-seq body phase s))
                      (let* ([b (car bs)]
                             [init (ex (caddr b))]
-                            [sc (new-scope!)]
+                            [sc (new-local-scope!)]
                             [key (bind-local! (add-scope (car b) sc) phase)]
                             [later (map-lr (lambda (b) (list (add-scope (car b) sc) (cadr b) (add-scope (caddr b) sc)))
                                            (cdr bs))])
@@ -1254,7 +1263,7 @@
          (list 'if (ex (cadr parts)) (ex (caddr parts)) (and (= (length parts) 4) (ex (cadddr parts))))]
         [(block loop)
          (arity-check (and (>= (length parts) 2) (id? (cadr parts))))
-         (let* ([sc (new-scope!)]
+         (let* ([sc (new-local-scope!)]
                 [key (fresh-label! (add-scope (cadr parts) sc) phase)])
            (list name key (expand-seq (map-lr (lambda (x) (add-scope x sc)) (cddr parts)) phase s)))]
         [(br)
@@ -1325,7 +1334,7 @@
                      [(stx? e) (changes? e depth)]
                      [else (or (changes? (car e) depth) (loop (cdr e)))]))]
             [else #f]))
-    (define (constant x) (list 'quote (if syntax? x (stx->datum x))))
+    (define (constant x) (list 'quote (if syntax? (prune-local-scopes x) (stx->datum x))))
     ;; Rebuild the pair chain e (elements of template x) as an expression.
     (define (build-list x e depth)
       (let loop ([e e])

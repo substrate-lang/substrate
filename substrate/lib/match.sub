@@ -1,0 +1,165 @@
+;; Lifecycle: permanent library, part of the language built on the kernel.
+;;
+;; match, over the static information lib/struct.sub defines:
+;;
+;;   (match e
+;;     [(circle r) body ...]
+;;     [(rect w _) body ...]
+;;     [else body ...])
+;;
+;; e must have the type the clauses' variants belong to: their enum, or the
+;; struct itself. The kernel's type checker checks this. A pattern names a
+;; struct or variant and binds its fields in order; _ skips one. Without
+;; else, the clauses must cover every variant. match's value is the value
+;; of the clause that runs. else is recognized by name.
+;;
+;; Compile-time errors: a pattern that names no struct or variant, the
+;; wrong number of fields, variants of different types, a variant matched
+;; twice, a missing variant, and else before the last clause.
+;;
+;; At run time, match reads the value's brand, compares it with each
+;; clause's brand in turn, and casts to that variant to read its fields.
+
+(provide match)
+
+(begin-for-syntax
+  (require s syntax)
+
+  ;; The static information of the struct or variant id names, as a list
+  ;; (variant name type brand (field ...)), or #f.
+  (func (variant-info [id eqref]) -> eqref
+    (if (i32.eqz (s:identifier? id)) (return '#f))
+    (let ([l (s:syntax->list (s:syntax-local-value id))])
+      (if (ref.is_null l) (return '#f))
+      (if (i32.ne (s:length l) 5) (return '#f))
+      (if (ref.eq (s:syntax-e (s:car l)) 'variant) l '#f)))
+
+  (func (info-name [info eqref]) -> eqref (s:cadr info))
+  (func (info-type [info eqref]) -> eqref (s:caddr info))
+  (func (info-brand [info eqref]) -> eqref (s:car (s:cdddr info)))
+  (func (info-fields [info eqref]) -> eqref (s:syntax->list (s:cadr (s:cdddr info))))
+
+  ;; The variants of type: an enum's variants, or the struct itself.
+  (func (variants-of [type eqref]) -> eqref
+    (let ([l (s:syntax->list (s:syntax-local-value type))])
+      (if (ref.eq (s:syntax-e (s:car l)) 'enum)
+          (s:syntax->list (s:caddr l))
+          (s:cons (s:cadr l) '()))))
+
+  (func (memq? [x eqref] [l eqref]) -> i32
+    (if (s:null? l) (return 0))
+    (if (ref.eq x (s:car l)) (return 1))
+    (memq? x (s:cdr l)))
+
+  (func (else-clause? [clause eqref]) -> i32
+    (let ([l (s:syntax->list clause)])
+      (if (ref.is_null l) (return 0))
+      (if (s:null? l) (return 0))
+      (if (i32.eqz (s:identifier? (s:car l))) (return 0))
+      (ref.eq (s:syntax-e (s:car l)) 'else)))
+
+  (func (wildcard? [id eqref]) -> i32 (ref.eq (s:syntax-e id) '_))
+
+  ;; The pattern of a non-else clause, as a list (variant field ...),
+  ;; checked, and the variant's static information.
+  (func (clause-pattern [clause eqref]) -> eqref
+    (let ([l (s:syntax->list clause)])
+      (if (i32.or (ref.is_null l) (s:null? l))
+          (s:syntax-error clause '"expected a clause [(variant field ...) body ...]"))
+      (let ([p (s:syntax->list (s:car l))])
+        (if (i32.or (ref.is_null p) (s:null? p))
+            (s:syntax-error (s:car l) '"expected a pattern (variant field ...)"))
+        p)))
+
+  ;; Check each field pattern: a name or _.
+  (func (check-field-patterns [ps eqref])
+    (if (i32.eqz (s:null? ps))
+        (begin
+          (if (i32.eqz (s:identifier? (s:car ps)))
+              (s:syntax-error (s:car ps) '"a field pattern is a name or _"))
+          (check-field-patterns (s:cdr ps)))))
+
+  ;; Check the clauses. type is the type of the first clause's variant.
+  ;; Returns the static values of the variants matched.
+  (func (check-clauses [clauses eqref] [type eqref] [seen eqref]) -> eqref
+    (if (s:null? clauses) (return seen))
+    (if (else-clause? (s:car clauses))
+        (begin
+          (if (i32.eqz (s:null? (s:cdr clauses)))
+              (s:syntax-error (s:car clauses) '"else must be the last clause"))
+          (return seen)))
+    (let* ([p (clause-pattern (s:car clauses))]
+           [head (s:car p)]
+           [info (variant-info head)])
+      (if (ref.is_null info)
+          (s:syntax-error head '"does not name a struct or enum variant"))
+      (let ([v (s:syntax-local-value head)])
+        (if (i32.eqz (ref.eq (s:syntax-local-value (info-type info)) (s:syntax-local-value type)))
+            (s:syntax-error head '"is not a variant of the same type as the first clause"))
+        (if (memq? v seen)
+            (s:syntax-error head '"is matched by an earlier clause"))
+        (if (i32.ne (s:length (s:cdr p)) (s:length (info-fields info)))
+            (s:syntax-error (s:car (s:syntax->list (s:car clauses))) '"wrong number of fields for this variant"))
+        (check-field-patterns (s:cdr p))
+        (check-clauses (s:cdr clauses) type (s:cons v seen)))))
+
+  ;; The variants in ids whose static values are not in seen.
+  (func (unmatched [ids eqref] [seen eqref]) -> eqref
+    (if (s:null? ids) (return '()))
+    (if (memq? (s:syntax-local-value (s:car ids)) seen)
+        (unmatched (s:cdr ids) seen)
+        (s:cons (s:car ids) (unmatched (s:cdr ids) seen))))
+
+  ;; msg followed by the names of ids.
+  (func (with-names [msg eqref] [ids eqref]) -> eqref
+    (if (s:null? ids) (return msg))
+    (with-names (s:string-append msg (s:string-append '" " (s:symbol->string (s:syntax-e (s:car ids)))))
+                (s:cdr ids)))
+
+  ;; [x (struct.get name field c)] for each field pattern x that is not _.
+  (func (field-bindings [name eqref] [fields eqref] [ps eqref]) -> eqref
+    (if (s:null? ps) (return '()))
+    (let ([rest (field-bindings name (s:cdr fields) (s:cdr ps))])
+      (if (wildcard? (s:car ps))
+          rest
+          (s:cons #`[#,(s:car ps) (struct.get #,name #,(s:car fields) c)] rest))))
+
+  ;; The dispatch on brand b of subject v, one clause at a time.
+  (func (dispatch [clauses eqref]) -> eqref
+    (if (s:null? clauses) (return #'(unreachable)))
+    (let ([c (s:syntax->list (s:car clauses))])
+      (if (else-clause? (s:car clauses))
+          (return #`(begin #,@(s:cdr c))))
+      (let* ([p (s:syntax->list (s:car c))]
+             [info (variant-info (s:car p))]
+             [name (info-name info)]
+             [bindings (field-bindings name (info-fields info) (s:cdr p))]
+             [body (if (s:null? bindings)
+                       #`(begin #,@(s:cdr c))
+                       #`(let ([c (ref.cast (ref #,name) v)])
+                           (let (#,@bindings) #,@(s:cdr c))))])
+        #`(if (ref.eq b #,(info-brand info)) #,body #,(dispatch (s:cdr clauses))))))
+
+  ;; (match e clause ...)
+  (func (match [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      (if (i32.lt_u (s:length parts) 3)
+          (s:syntax-error stx '"expected (match expr clause ...)"))
+      (let ([clauses (s:cddr parts)])
+        (if (else-clause? (s:car clauses))
+            (s:syntax-error (s:car parts) '"match needs a struct or variant clause before else"))
+        (let* ([head (s:car (clause-pattern (s:car clauses)))]
+               [info (variant-info head)])
+          (if (ref.is_null info)
+              (s:syntax-error head '"does not name a struct or enum variant"))
+          (let* ([type (info-type info)]
+                 [seen (check-clauses clauses type '())])
+            (if (i32.eqz (else-clause? (s:car (s:reverse clauses))))
+                (let ([missing (unmatched (variants-of type) seen)])
+                  (if (i32.eqz (s:null? missing))
+                      (s:syntax-error (s:car parts) (with-names '"missing variants:" missing)))))
+            #`(let ([v (ref #,type) #,(s:cadr parts)])
+                (let ([b (struct.get #,type brand v)])
+                  #,(dispatch clauses)))))))))
+
+(define-syntax match match)

@@ -20,8 +20,8 @@ line says the same.
 | `host/` | the host, in C over wasmtime: stores, linking, the `host` imports and the instantiate hook | permanent: after bootstrap it runs the compiler |
 | `compiler/` | the compiler, written in the language. Today only `syntax.sub`, the syntax library; the rest arrives as the compiler is rewritten for bootstrap | permanent, grows |
 | `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: frozen once the compiler compiles itself |
-| `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro` | permanent, grows |
-| `examples/` | demos meant to be read; checked by `make check` | grows |
+| `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match` | permanent, grows |
+| `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.links`) and any modules it requires in `NAME/`; checked by `make check` | grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.links` (what the compiled phase-0 part may import). `tests/fixtures/` holds modules the tests require | grows |
 | `bin/subc` | the entry point | permanent; runs stage0 until bootstrap |
 
@@ -56,7 +56,12 @@ qualified imports (`print:write-int`), at any phase:
 each phase of a module compiles to its own wasm part, and a program loads
 only the parts it reaches at run time (spec 3). Compiled programs import
 only what they use:
-`(runtime-free)` is checked by the compiler, and `tests/*.links` checks
-imports in the tests.
+`(runtime-free)` is checked by the compiler, and `.links` files check
+imports in the tests and examples.
+
+`lib/struct.sub` and `lib/match.sub` are the first libraries that work
+together: `struct` and `enum` define GC types and leave static
+information that `match` reads, checking patterns at compile time.
+`examples/shapes.sub` matches, in one module, types defined in another.
 
 Open questions are in `docs/spec.md` section 7.

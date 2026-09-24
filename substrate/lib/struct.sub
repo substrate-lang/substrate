@@ -1,0 +1,145 @@
+;; Lifecycle: permanent library, part of the language built on the kernel.
+;;
+;; Structs and enums, written with the kernel alone:
+;;
+;;   (struct point [x i32] [y i32])
+;;   (enum shape (circle [r i32]) (rect [w i32] [h i32]))
+;;
+;; (struct point [x i32] [y i32]) defines
+;;   point               a type: a point is a (ref point)
+;;   (make-point x y)    the constructor, -> (ref point)
+;;   (point-x p)         an accessor per field, taking a (ref point)
+;;   (point? v)          1 if the eqref v is a point, else 0
+;;   point               static information, for match (lib/match.sub)
+;;
+;; (enum shape (circle [r i32]) ...) defines the type shape and static
+;; information for it, and for each variant what struct defines. Each
+;; variant's type is a subtype of shape, so a (ref circle) is a
+;; (ref shape). Fields are immutable.
+;;
+;; Brands. Wasm tells types apart at run time by structure (spec 5.1), so
+;; ref.test cannot tell (celsius [t i32]) from (fahrenheit [t i32]). So each
+;; struct and variant has a brand: an object made once, when the defining
+;; module starts, and kept in a global that only the generated code can
+;; name. Every value holds its brand in its first field, and the predicates
+;; and match compare brands by identity. A brand costs one field per value.
+;;
+;; The static information is a syntax object:
+;;   (variant <name> <type> <brand> (<field> ...))
+;;       for a struct or a variant. <name> is its type. <type> is what a
+;;       match on it takes: the struct itself, or the variant's enum.
+;;       <brand> is the global holding its brand.
+;;   (enum <name> (<variant> ...))
+;;       for an enum.
+
+(provide struct enum)
+
+;; A brand: an object compared by identity.
+(type brand (struct))
+
+;; Every struct and enum type is a subtype of branded.
+(type branded (sub (struct (field brand (ref brand)))))
+
+(begin-for-syntax
+  (require s syntax)
+
+  ;; name followed by suffix, with the scopes of name.
+  (func (suffixed [name eqref] [suffix eqref]) -> eqref
+    (s:datum->syntax name (s:symbol-append (s:syntax-e name) suffix)))
+
+  ;; prefix followed by name, with the scopes of name.
+  (func (prefixed [prefix eqref] [name eqref]) -> eqref
+    (s:datum->syntax name (s:symbol-append prefix (s:syntax-e name))))
+
+  ;; An identifier with this library's scopes, so only the code this macro
+  ;; use generates can refer to it (spec 6.2).
+  (func (hidden [prefix eqref] [name eqref]) -> eqref
+    (s:datum->syntax #'here (s:symbol-append prefix (s:syntax-e name))))
+
+  ;; Is x a list of n or more elements whose first is an identifier?
+  (func (headed-list? [x eqref] [n i32]) -> i32
+    (let ([l (s:syntax->list x)])
+      (if (ref.is_null l) (return 0))
+      (if (i32.lt_u (s:length l) n) (return 0))
+      (s:identifier? (s:car l))))
+
+  ;; Check that each field is [name type].
+  (func (check-fields [fields eqref])
+    (if (i32.eqz (s:null? fields))
+        (begin
+          (if (i32.eqz (i32.and (headed-list? (s:car fields) 2)
+                                (i32.eq (s:length (s:syntax->list (s:car fields))) 2)))
+              (s:syntax-error (s:car fields) '"expected a field [name type]"))
+          (check-fields (s:cdr fields)))))
+
+  ;; (field name type) for each field.
+  (func (field-decls [fields eqref]) -> eqref
+    (if (s:null? fields)
+        '()
+        (let ([f (s:syntax->list (s:car fields))])
+          (s:cons #`(field #,(s:car f) #,(s:cadr f)) (field-decls (s:cdr fields))))))
+
+  ;; The first element of each list.
+  (func (heads [lists eqref]) -> eqref
+    (if (s:null? lists)
+        '()
+        (s:cons (s:car (s:syntax->list (s:car lists))) (heads (s:cdr lists)))))
+
+  ;; An accessor function for each field of type name.
+  (func (accessors [name eqref] [fields eqref]) -> eqref
+    (if (s:null? fields)
+        '()
+        (let* ([f (s:syntax->list (s:car fields))]
+               [field (s:car f)])
+          (s:cons #`(func (#,(suffixed (suffixed name '-) (s:syntax-e field)) [v (ref #,name)]) -> #,(s:cadr f)
+                      (struct.get #,name #,field v))
+                  (accessors name (s:cdr fields))))))
+
+  ;; The definitions for one struct or variant, as a list: its brand, type,
+  ;; constructor, accessors, predicate and static information. super is
+  ;; its supertype and type what a match on it takes.
+  (func (variant-forms [name eqref] [super eqref] [type eqref] [brand eqref] [fields eqref]) -> eqref
+    (check-fields fields)
+    (s:syntax->list
+     #`((global #,brand (ref null brand) (struct.new brand))
+        (type #,name (sub final #,super (struct (field brand (ref brand)) #,@(field-decls fields))))
+        (func (#,(prefixed 'make- name) #,@fields) -> (ref #,name)
+          (struct.new #,name (ref.as_non_null #,brand) #,@(heads fields)))
+        #,@(accessors name fields)
+        (func (#,(suffixed name '?) [v eqref]) -> i32
+          (if (ref.test (ref #,name) v)
+              (ref.eq (struct.get #,name brand (ref.cast (ref #,name) v)) #,brand)
+              0))
+        (define-static #,name (quote-syntax (variant #,name #,type #,brand (#,@(heads fields))))))))
+
+  ;; (struct name [field type] ...)
+  (func (struct [stx eqref]) -> eqref
+    (if (i32.eqz (headed-list? (s:cdr (s:syntax->list stx)) 1))
+        (s:syntax-error stx '"expected (struct name [field type] ...)"))
+    (let ([name (s:cadr (s:syntax->list stx))])
+      #`(begin #,@(variant-forms name #'branded name (hidden 'brand- name) (s:cddr (s:syntax->list stx))))))
+
+  ;; The forms for each variant of enum.
+  (func (variants-forms [enum eqref] [variants eqref]) -> eqref
+    (if (s:null? variants)
+        '()
+        (begin
+          (if (i32.eqz (headed-list? (s:car variants) 1))
+              (s:syntax-error (s:car variants) '"expected a variant (name [field type] ...)"))
+          (let ([v (s:syntax->list (s:car variants))])
+            (s:append (variant-forms (s:car v) enum enum (hidden 'brand- (s:car v)) (s:cdr v))
+                      (variants-forms enum (s:cdr variants)))))))
+
+  ;; (enum name (variant [field type] ...) ...)
+  (func (enum [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      (if (i32.or (i32.lt_u (s:length parts) 3) (i32.eqz (headed-list? (s:cdr parts) 1)))
+          (s:syntax-error stx '"expected (enum name (variant [field type] ...) ...)"))
+      (let ([name (s:cadr parts)] [variants (s:cddr parts)])
+        #`(begin
+            (type #,name (sub branded (struct (field brand (ref brand)))))
+            (define-static #,name (quote-syntax (enum #,name (#,@(heads variants)))))
+            #,@(variants-forms name variants))))))
+
+(define-syntax struct struct)
+(define-syntax enum enum)

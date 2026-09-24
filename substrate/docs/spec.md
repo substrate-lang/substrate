@@ -36,7 +36,7 @@ specified but not built yet.
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime) |
 | compiler | Reader, expander, kernel compiler, binary encoder. | stage0: `stage0/*.sls` (Chez Scheme) |
 | syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `compiler/syntax.sub` (kernel code) |
-| libraries | Ordinary modules: printing, `define-macro`. | `lib/*.sub` |
+| libraries | Ordinary modules: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
 | languages | Later libraries built on the kernel: structs, effects, a dynamic Lisp, ... | not yet |
 
 ### 1.3 What runs where
@@ -105,6 +105,10 @@ from the instance `"syntax"`. Parameters are `eqref` unless marked
   its scopes and source location. `quasisyntax` is built on it.
 - Accessors trap with a message ("expected a pair") when given the wrong
   kind of value.
+- `free-identifier=?` is 1 when `a` and `b` refer to the same binding, as
+  values at the running macro's phase. An imported name and the definition
+  it imports are the same binding. Two unbound identifiers are equal when
+  their names are.
 
 The queries only work while an expander is running. [v0] Stage0 answers
 them in Chez; in a run-time store they trap.
@@ -431,6 +435,16 @@ Local bindings cannot.
 
 A transformer can capture on purpose: `(datum->syntax stx 'it)` makes an
 identifier with the scopes of the use, as if the user had written it.
+
+**Literals drop local scopes.** `quote-syntax` and the constant parts of
+`quasisyntax` remove from their literal the scopes of local binding forms
+(`func`, `let`, `let*`, `block`, `loop`), keeping module, introduction and
+use-site scopes. So every template in a module has that module's scopes
+whatever function or `let` it is written in, and a macro can assemble its
+output from templates built by different helper functions: an `x` bound
+by one refers to the `x` in another. This is Racket's `quote-syntax`
+without `#:local`. The kernel has no local macros, so a literal never needs
+a local scope.
 
 ### 6.3 Compile-time bindings
 

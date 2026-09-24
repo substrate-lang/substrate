@@ -609,6 +609,7 @@
                            (map (lambda (cf) (list (cadr cf) (caddr cf) (cadddr cf))) compiled-funcs)
                            (fctx-extra start-fc) start-code
                            (map (lambda (info) (list (func-info-params info) (func-info-results info))) func-imports)
+                           (map global-info-type global-imports)
                            (map (lambda (f) (global-info-type (cadr f))) global-forms))))
     (define gc-index
       (let ([table (make-eq-hashtable)])
