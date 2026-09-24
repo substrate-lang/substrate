@@ -126,8 +126,7 @@ from the instance `"syntax"`. Parameters are `eqref` unless marked
   returns it as expanded code (6.4), so a macro can look at what its input
   becomes, and put the result in its output. As in Racket, the macro's
   introduction scope is flipped around the expansion, so code from the
-  macro's input expands as it would at the use site. [v0] Only
-  expressions, with no list of identifiers to stop at.
+  macro's input expands as it would at the use site.
 
 The queries only work while an expander is running. [v0] Stage0 answers
 them in Chez; in a run-time store they trap.
@@ -597,8 +596,6 @@ A library usually provides a macro that expands into the declaration.
   `local-expand` of the whole body. The kernel has no `#%module-begin`: a
   library that wants a module's body gets it by having the module wrap the
   body in one of its macros, and a pass works on the expanded result.
-- [v0] Only phase 0 has passes, and only the module that declares one is
-  rewritten by it.
 
 ## 7. Open questions and later milestones
 
@@ -611,14 +608,16 @@ A library usually provides a macro that expands into the declaration.
   `(memory from name)` there.
 - **More require and provide forms**: re-exporting, renaming on provide,
   requiring several phases up without nesting `begin-for-syntax`.
-- **Extension points still to come**: lifting definitions out of
-  expressions (a `lambda` must become a module-level function);
-  `local-expand` with identifiers to stop at, and in definition contexts;
-  passes at phase 1 and up. Expanded code has no inferred types (6.4). A
-  pass that creates wasm declarations from the code it rewrites, such as
-  CPS or closure conversion for a typed language, would need the checker
-  to write types into expanded code before the pass, and queries for the
-  types of imported definitions.
+- **Lifting definitions out of expressions**: wasm has no nested
+  functions, so a `lambda` must become a module-level function, which its
+  macro adds to the module. Needed for closures, which come after
+  bootstrap.
+- **Inferred types in expanded code**: expanded code carries only the
+  types the source wrote (6.4). A pass that creates wasm declarations from
+  the code it rewrites, such as CPS for general effect handlers or closure
+  conversion for a typed language, would need the checker to write types
+  into expanded code before the pass, and queries for the types of
+  imported definitions. Nothing planned before bootstrap needs this.
 - **Type identity at run time**: wasm treats identical type definitions as
   the same type (5.1). A program type with the same shape as one of the
   syntax library's (a struct of two immutable `eqref` fields, say) would
