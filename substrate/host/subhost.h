@@ -1,10 +1,11 @@
 /* Lifecycle: permanent. After bootstrap the host runs the compiler. */
 /* subhost: the substrate host over the wasmtime C API.
  *
- * One sub_host is one store: an engine and a linker. Instances are
- * registered by name and link to each other by name. The host owns no
- * memory: each of its imports reads pointers from the calling instance's
- * own memory (docs/spec.md section 4).
+ * One sub_host is one store and a linker. Instances are registered by name
+ * and link to each other by name. All hosts share one engine, so a wasm
+ * module is compiled once per process however many stores instantiate it.
+ * The host owns no memory: each of its imports reads pointers from the
+ * calling instance's own memory (docs/spec.md section 4).
  *
  * Rule for embedders (stage0 calls this from Chez): no function here keeps a
  * pointer argument past its own return, and none reads one after it has run

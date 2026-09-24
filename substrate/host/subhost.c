@@ -11,7 +11,6 @@
 #include <wasmtime.h>
 
 struct sub_host {
-  wasm_engine_t *engine;
   wasmtime_store_t *store;
   wasmtime_linker_t *linker;
   /* The context every call uses. Inside a host function it is the caller's
@@ -83,11 +82,78 @@ static bool caller_memory(wasmtime_caller_t *caller, wasmtime_memory_t *out) {
 }
 
 
+/* ---- compiled modules ------------------------------------------------- */
+
+/* The engine all hosts share. A compiled module belongs to an engine, and
+ * stage0 makes a store per module it compiles (docs/spec.md section 3.2),
+ * so sharing the engine lets those stores share compiled modules. */
+static wasm_engine_t *shared_engine;
+
+static wasm_engine_t *engine(void) {
+  if (!shared_engine) {
+    wasm_config_t *config = wasm_config_new();
+    wasmtime_config_wasm_tail_call_set(config, true);
+    wasmtime_config_wasm_multi_value_set(config, true);
+    wasmtime_config_wasm_bulk_memory_set(config, true);
+    wasmtime_config_wasm_reference_types_set(config, true);
+    wasmtime_config_wasm_function_references_set(config, true);
+    wasmtime_config_wasm_gc_set(config, true);
+    /* max_wasm_stack may not exceed async_stack_size, even without async. */
+    wasmtime_config_async_stack_size_set(config, (size_t)8 << 20);
+    wasmtime_config_max_wasm_stack_set(config, (size_t)4 << 20);
+    shared_engine = wasm_engine_new_with_config(config);
+  }
+  return shared_engine;
+}
+
+/* Every module compiled so far, by its bytes, for the life of the process. */
+typedef struct compiled {
+  uint64_t hash;
+  size_t len;
+  uint8_t *bytes;
+  wasmtime_module_t *module;
+  struct compiled *next;
+} compiled;
+
+enum { COMPILED_BUCKETS = 256 };
+static compiled *compiled_modules[COMPILED_BUCKETS];
+
+static uint64_t fnv1a(const uint8_t *p, size_t n) {
+  uint64_t x = 14695981039346656037ull;
+  for (size_t i = 0; i < n; i++) x = (x ^ p[i]) * 1099511628211ull;
+  return x;
+}
+
+/* The module compiled from bytes, compiling it if no module with the same
+ * bytes has been. The module stays in the table: callers do not delete it. */
+static wasmtime_error_t *compile(const uint8_t *bytes, size_t len, wasmtime_module_t **out) {
+  uint64_t hash = fnv1a(bytes, len);
+  compiled **bucket = &compiled_modules[hash % COMPILED_BUCKETS];
+  for (compiled *c = *bucket; c; c = c->next)
+    if (c->hash == hash && c->len == len && memcmp(c->bytes, bytes, len) == 0) {
+      *out = c->module;
+      return NULL;
+    }
+  wasmtime_module_t *module = NULL;
+  wasmtime_error_t *error = wasmtime_module_new(engine(), bytes, len, &module);
+  if (error) return error;
+  compiled *c = malloc(sizeof *c);
+  c->hash = hash;
+  c->len = len;
+  c->bytes = malloc(len ? len : 1);
+  memcpy(c->bytes, bytes, len);
+  c->module = module;
+  c->next = *bucket;
+  *bucket = c;
+  *out = module;
+  return NULL;
+}
+
 /* ---- instantiation ---------------------------------------------------- */
 
 static int instantiate(sub_host *h, const char *name, size_t name_len, const uint8_t *bytes, size_t len) {
   wasmtime_module_t *module = NULL;
-  wasmtime_error_t *error = wasmtime_module_new(h->engine, bytes, len, &module);
+  wasmtime_error_t *error = compile(bytes, len, &module);
   if (error) {
     take_failure(h, "compile", error, NULL);
     return 1;
@@ -95,7 +161,6 @@ static int instantiate(sub_host *h, const char *name, size_t name_len, const uin
   wasmtime_instance_t inst;
   wasm_trap_t *trap = NULL;
   error = wasmtime_linker_instantiate(h->linker, h->ctx, module, &inst, &trap);
-  wasmtime_module_delete(module);
   if (error || trap) {
     take_failure(h, "instantiate", error, trap);
     return 1;
@@ -148,7 +213,7 @@ int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes,
   wasmtime_module_t *module = NULL;
   wasm_importtype_vec_t imports = {0};
   wasmtime_extern_t *externs = NULL;
-  wasmtime_error_t *error = wasmtime_module_new(h->engine, copy, len, &module);
+  wasmtime_error_t *error = compile(copy, len, &module);
   if (error) {
     take_failure(h, "compile", error, NULL);
     goto done;
@@ -181,7 +246,6 @@ int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes,
 done:
   free(externs);
   wasm_importtype_vec_delete(&imports);
-  if (module) wasmtime_module_delete(module);
   free(copy);
   free(name_copy);
   return rc;
@@ -398,20 +462,9 @@ static int define(sub_host *h, const char *module, const char *name, int np, int
 
 sub_host *sub_host_new(void) {
   sub_host *h = calloc(1, sizeof *h);
-  wasm_config_t *config = wasm_config_new();
-  wasmtime_config_wasm_tail_call_set(config, true);
-  wasmtime_config_wasm_multi_value_set(config, true);
-  wasmtime_config_wasm_bulk_memory_set(config, true);
-  wasmtime_config_wasm_reference_types_set(config, true);
-  wasmtime_config_wasm_function_references_set(config, true);
-  wasmtime_config_wasm_gc_set(config, true);
-  /* max_wasm_stack may not exceed async_stack_size, even without async. */
-  wasmtime_config_async_stack_size_set(config, (size_t)8 << 20);
-  wasmtime_config_max_wasm_stack_set(config, (size_t)4 << 20);
-  h->engine = wasm_engine_new_with_config(config);
-  h->store = wasmtime_store_new(h->engine, h, NULL);
+  h->store = wasmtime_store_new(engine(), h, NULL);
   h->ctx = wasmtime_store_context(h->store);
-  h->linker = wasmtime_linker_new(h->engine);
+  h->linker = wasmtime_linker_new(engine());
   if (define(h, "host", "write", 3, 1, host_write, h) ||
       define(h, "host", "trap", 2, 0, host_trap, h) ||
       define(h, "host", "instantiate", 5, 1, host_instantiate, h) ||
@@ -433,7 +486,6 @@ void sub_host_free(sub_host *h) {
   if (!h) return;
   wasmtime_linker_delete(h->linker);
   wasmtime_store_delete(h->store);
-  wasm_engine_delete(h->engine);
   free(h->pending_trap);
   free(h);
 }

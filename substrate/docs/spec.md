@@ -199,7 +199,9 @@ them in Chez; in a run-time store they trap.
 - Each module is compiled with a fresh compile-time store. The module's
   own chunks, and the parts of the modules it requires, are instantiated
   there on demand. So no compile-time state is shared between the
-  compilations of two modules, as in Racket.
+  compilations of two modules, as in Racket. Compiled wasm code is not
+  state: the host compiles a part's bytes once and instantiates the result
+  in every store that needs it.
 - A part instantiated at shift *t* is registered as `<module>@<phase>+<t>`.
   A compiled part imports from other parts by names relative to its own
   module at shift 0. The host adds the shift when it instantiates the part
