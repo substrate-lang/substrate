@@ -492,7 +492,7 @@
     (let loop ([e e])
       (case (car e)
         [(at) (loop (caddr e))]
-        [(int float const) #t]
+        [(int float const ref-func) #t]
         [(gref) (let ([g (cadr e)])
                   (and (not (global-info-mutable? g))
                        (or (external? ms (global-info-instance g)) (memq g earlier) #f)))]

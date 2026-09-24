@@ -399,7 +399,7 @@ Globals follow wasm too. A global is immutable unless its type is written
 `(mut type)`, and `set!` of an immutable global is an error. An initializer
 that is a **constant expression** is compiled into the global itself, as
 wasm requires of an immutable global. The constant expressions are
-literals, `ref.null`, `ref.i31`, `struct.new`, `array.new`,
+literals, `ref.null`, `ref.i31`, `ref.func`, `struct.new`, `array.new`,
 `array.new_default` and `array.new_fixed`, `add`, `sub` and `mul` on `i32`
 and `i64`, and reads of immutable globals that are imported or defined
 earlier in the module, each with constant operands. Any other initializer

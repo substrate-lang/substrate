@@ -1,0 +1,552 @@
+;; Lifecycle: permanent library: the dynamic Lisp (seed plan), a language
+;; defined on the kernel, which the compiler will be written in. It grows
+;; as the compiler needs; this is its core, with closures.
+;;
+;; Values are the syntax library's data (spec 2.2) plus closures and
+;; boxes. Every value is an eqref, and #f is the only false value. A module
+;; written in this Lisp takes its forms with require-unqualified:
+;;
+;;   (define (f x ...) body ...)   a function, bound to a closure
+;;   (define x e)                   a variable
+;;   (lambda (x ...) body ...)      a closure; allowed inside a define
+;;   (f arg ...)                    a call: of a closure, or of a kernel
+;;                                  function, which is called directly
+;;   if, cond (with else), when, unless, and, or, let (also named let),
+;;   letrec; literals are values, so 42 is a fixnum
+;;   functions: cons car cdr pair? null? list? length append reverse
+;;   eq? not + - * quotient remainder < > <= >= = zero? display newline
+;;   error
+;;
+;; Integers are exact up to 64 bits; arithmetic beyond that is an error.
+;; A program's entry point is a kernel function: (func (main) (run)).
+;;
+;; Closures. A closure taking n arguments (n up to 8) is a struct of type
+;; closure<n>, whose first field is its code: a function of type code<n>,
+;; which takes the closure itself and the arguments. These types are
+;; declared here, once, so every module agrees on them (spec 5.1). A lambda
+;; that captures variables gets its own subtype of closure<n>, with a field
+;; per captured variable, used only by its own code.
+;;
+;; Closure conversion. define wraps its body in (convert (param ...) body
+;; ...), which expands the body (local-expand) and converts the expanded
+;; code (spec 6.4). A lambda expands to a marker, (lambda-marker (let ([x
+;; (param-marker)] ...) body ...)), which convert replaces: the body becomes
+;; a module-level function (lift-definition), and the lambda a struct.new of
+;; its closure, holding the values of the variables it captures. A variable
+;; that is captured and also assigned becomes a box, so the lambda and the
+;; code around it share it. This is done per definition, so it works at
+;; every phase. A lambda outside a define keeps its marker, which fails to
+;; type-check: its argument must be a (ref lambda-needs-define).
+
+(require s syntax)
+(require print "print.sub")
+(require wd "write-datum.sub" write-datum)
+(require mt "match.sub" else)
+
+(provide [define lisp-define] [lambda lisp-lambda] [#%app app] [#%datum datum]
+         [if lisp-if] cond else when unless and or [let lisp-let] letrec
+         cons car cdr pair? null? list? length append reverse eq? not
+         + - * quotient remainder < > <= >= = zero? display newline error)
+
+;; ---- values --------------------------------------------------------------------------
+
+(type box (struct (field value (mut eqref))))
+
+(rec (type closure0 (sub (struct (field code (ref code0)))))
+     (type code0 (func ((ref closure0) -> eqref))))
+(rec (type closure1 (sub (struct (field code (ref code1)))))
+     (type code1 (func ((ref closure1) eqref -> eqref))))
+(rec (type closure2 (sub (struct (field code (ref code2)))))
+     (type code2 (func ((ref closure2) eqref eqref -> eqref))))
+(rec (type closure3 (sub (struct (field code (ref code3)))))
+     (type code3 (func ((ref closure3) eqref eqref eqref -> eqref))))
+(rec (type closure4 (sub (struct (field code (ref code4)))))
+     (type code4 (func ((ref closure4) eqref eqref eqref eqref -> eqref))))
+(rec (type closure5 (sub (struct (field code (ref code5)))))
+     (type code5 (func ((ref closure5) eqref eqref eqref eqref eqref -> eqref))))
+(rec (type closure6 (sub (struct (field code (ref code6)))))
+     (type code6 (func ((ref closure6) eqref eqref eqref eqref eqref eqref -> eqref))))
+(rec (type closure7 (sub (struct (field code (ref code7)))))
+     (type code7 (func ((ref closure7) eqref eqref eqref eqref eqref eqref eqref -> eqref))))
+(rec (type closure8 (sub (struct (field code (ref code8)))))
+     (type code8 (func ((ref closure8) eqref eqref eqref eqref eqref eqref eqref eqref -> eqref))))
+
+;; The markers lambda leaves for convert (see the top).
+(type lambda-needs-define (struct))
+(func (lambda-marker [body (ref lambda-needs-define)]) -> eqref (ref.null eq))
+(func (param-marker) -> eqref (ref.null eq))
+
+;; ---- run-time errors ---------------------------------------------------------------
+
+(memory 1)
+(import host-trap "host" "trap" (i32 i32 ->))
+(data msg-not-a-function 0 "called a value that is not a function of that many arguments")
+(data msg-overflow 64 "integer overflow: integers are at most 64 bits")
+(data msg-divide 128 "division by zero")
+
+(func (fail [addr i32] [len i32]) (host-trap addr len) (unreachable))
+
+(func (not-a-function [f eqref]) -> eqref
+  (fail (data-address msg-not-a-function) (data-size msg-not-a-function))
+  (unreachable))
+
+;; Abort with the string msg, copied into bytes 1024.. of this memory.
+(func (fail-string [msg eqref])
+  (let ([n (s:string-length msg)] [i 0])
+    (if (i32.gt_u n 4096) (set! n 4096))
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (i32.store8 (i32.add 1024 i) (s:string-byte msg i))
+        (set! i (i32.add i 1))
+        (br next)))
+    (fail 1024 n)))
+
+;; ---- integers --------------------------------------------------------------------------
+
+(func (bool [x i32]) -> eqref (if x '#t '#f))
+
+;; An integer's value, which must fit in a signed i64.
+(func (int-value [v eqref]) -> i64
+  (let ([x (s:integer-value v)])
+    (if (i32.and (i32.eqz (s:integer-negative? v)) (i64.lt_s x 0))
+        (fail (data-address msg-overflow) (data-size msg-overflow)))
+    x))
+
+(func (overflow) (fail (data-address msg-overflow) (data-size msg-overflow)))
+
+(func (add [a eqref] [b eqref]) -> eqref
+  (let* ([x (int-value a)] [y (int-value b)] [r (i64.add x y)])
+    (if (i64.lt_s (i64.and (i64.xor x r) (i64.xor y r)) 0) (overflow))
+    (s:integer r)))
+
+(func (sub [a eqref] [b eqref]) -> eqref
+  (let* ([x (int-value a)] [y (int-value b)] [r (i64.sub x y)])
+    (if (i64.lt_s (i64.and (i64.xor x y) (i64.xor x r)) 0) (overflow))
+    (s:integer r)))
+
+(func (mul [a eqref] [b eqref]) -> eqref
+  (let* ([x (int-value a)] [y (int-value b)] [r (i64.mul x y)])
+    (if (i64.ne x 0)
+        (if (i32.and (i64.eq x -1) (i64.eq y -9223372036854775808))
+            (overflow)
+            (if (i64.ne (i64.div_s r x) y) (overflow))))
+    (s:integer r)))
+
+(func (divisor [b eqref]) -> i64
+  (let ([y (int-value b)])
+    (if (i64.eqz y) (fail (data-address msg-divide) (data-size msg-divide)))
+    y))
+
+(func (quo [a eqref] [b eqref]) -> eqref
+  (let* ([x (int-value a)] [y (divisor b)])
+    (if (i32.and (i64.eq x -9223372036854775808) (i64.eq y -1)) (overflow))
+    (s:integer (i64.div_s x y))))
+
+(func (rem [a eqref] [b eqref]) -> eqref
+  (let* ([x (int-value a)] [y (divisor b)])
+    (if (i64.eq y -1) (return (s:integer 0)))
+    (s:integer (i64.rem_s x y))))
+
+;; ---- forms -----------------------------------------------------------------------------
+
+(begin-for-syntax
+  (require s syntax)
+
+  (func (named? [x eqref] [name eqref]) -> i32
+    (if (s:identifier? x) (ref.eq (s:syntax-e x) name) 0))
+
+  (func (nth [l eqref] [i i32]) -> eqref
+    (if (i32.eqz i) (s:car l) (nth (s:cdr l) (i32.sub i 1))))
+
+  ;; Is x in l, by identity?
+  (func (member? [x eqref] [l eqref]) -> i32
+    (if (s:null? l) (return 0))
+    (if (ref.eq x (s:car l)) (return 1))
+    (member? x (s:cdr l)))
+
+  (func (take [l eqref] [n i32]) -> eqref
+    (if (i32.eqz n) '() (s:cons (s:car l) (take (s:cdr l) (i32.sub n 1)))))
+
+  (func (drop-n [l eqref] [n i32]) -> eqref
+    (if (i32.eqz n) l (drop-n (s:cdr l) (i32.sub n 1))))
+
+  (func (check-arity [n i32] [where eqref])
+    (if (i32.gt_u n 8) (s:syntax-error where '"a function takes at most 8 arguments")))
+
+  (func (closure-type [n i32]) -> eqref
+    (nth (s:syntax->list #'(closure0 closure1 closure2 closure3 closure4 closure5 closure6 closure7 closure8)) n))
+
+  (func (code-type [n i32]) -> eqref
+    (nth (s:syntax->list #'(code0 code1 code2 code3 code4 code5 code6 code7 code8)) n))
+
+  ;; ---- fresh names ----
+
+  (func (digits [n i32]) -> eqref
+    (let ([d (nth '("0" "1" "2" "3" "4" "5" "6" "7" "8" "9") (i32.rem_u n 10))])
+      (if (i32.lt_u n 10) d (s:string-append (digits (i32.div_u n 10)) d))))
+
+  (func (numbered [prefix eqref] [n i32]) -> eqref
+    (s:datum->syntax #'here (s:intern (s:string-append (s:symbol->string prefix) (digits n))) '#f))
+
+  ;; Lifted definitions are named lambda1, closure1, ... in each module.
+  (global counter (mut i32) 0)
+  (func (fresh-name [prefix eqref]) -> eqref
+    (set! counter (i32.add counter 1))
+    (numbered prefix counter))
+
+  ;; ---- define, lambda, calls, literals ----
+
+  ;; [x eqref] for each x.
+  (func (typed-params [ps eqref]) -> eqref
+    (if (s:null? ps) '() (s:cons #`[#,(s:car ps) eqref] (typed-params (s:cdr ps)))))
+
+  ;; (define (f x ...) body ...) or (define x e)
+  (func (lisp-define [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      (if (s:identifier? (s:cadr parts))
+          (return #`(global #,(s:cadr parts) (mut eqref) (convert () #,(s:caddr parts)))))
+      (let* ([head (s:syntax->list (s:cadr parts))]
+             [params (s:cdr head)])
+        (check-arity (s:length params) (s:cadr parts))
+        (let ([ct (closure-type (s:length params))])
+          #`(begin
+              (func (code [self (ref #,ct)] #,@(typed-params params)) -> eqref
+                (type #,(code-type (s:length params)))
+                (convert (#,@params) #,@(s:cddr parts)))
+              (global #,(s:car head) (ref #,ct) (struct.new #,ct (ref.func code))))))))
+
+  (func (param-bindings [ps eqref]) -> eqref
+    (if (s:null? ps) '() (s:cons #`[#,(s:car ps) (param-marker)] (param-bindings (s:cdr ps)))))
+
+  ;; (lambda (x ...) body ...)
+  (func (lisp-lambda [stx eqref]) -> eqref
+    (let* ([parts (s:syntax->list stx)] [params (s:syntax->list (s:cadr parts))])
+      (check-arity (s:length params) stx)
+      #`(lambda-marker (let (#,@(param-bindings params)) #,@(s:cddr parts)))))
+
+  ;; (#%app f arg ...): a kernel function is called directly; anything else
+  ;; must be a closure taking that many arguments.
+  (func (app [stx eqref]) -> eqref
+    (let* ([parts (s:cdr (s:syntax->list stx))]
+           [f (s:car parts)]
+           [args (s:cdr parts)]
+           [n (s:length args)])
+      (if (s:identifier? f)
+          (if (ref.eq (s:binding-kind f) 'function)
+              (return #`(#,f #,@args))))
+      (check-arity n stx)
+      (let ([ct (closure-type n)])
+        #`(let ([fv #,f])
+            (if (ref.test (ref #,ct) fv)
+                (let ([c (ref.cast (ref #,ct) fv)])
+                  (call-ref #,(code-type n) (struct.get #,ct code c) c #,@args))
+                (not-a-function fv))))))
+
+  ;; (#%datum literal) => 'literal
+  (func (datum [stx eqref]) -> eqref #`(quote #,(s:cadr (s:syntax->list stx))))
+
+  ;; ---- control ----
+
+  ;; (if test then [else]): only #f is false.
+  (func (lisp-if [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      #`(if (ref.is_null #,(s:cadr parts))
+            #,(if (i32.eq (s:length parts) 4) (s:car (s:cdddr parts)) #''#f)
+            #,(s:caddr parts))))
+
+  (func (when [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      #`(lisp-if #,(s:cadr parts) (begin #,@(s:cddr parts)))))
+
+  (func (unless [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      #`(lisp-if #,(s:cadr parts) '#f (begin #,@(s:cddr parts)))))
+
+  (func (and [stx eqref]) -> eqref
+    (let ([args (s:cdr (s:syntax->list stx))])
+      (if (s:null? args) (return #''#t))
+      (if (s:null? (s:cdr args)) (return (s:car args)))
+      #`(lisp-if #,(s:car args) (and #,@(s:cdr args)) '#f)))
+
+  (func (or [stx eqref]) -> eqref
+    (let ([args (s:cdr (s:syntax->list stx))])
+      (if (s:null? args) (return #''#f))
+      (if (s:null? (s:cdr args)) (return (s:car args)))
+      #`(let ([t #,(s:car args)]) (lisp-if t t (or #,@(s:cdr args))))))
+
+  ;; (cond [test body ...] ... [else body ...])
+  (func (cond [stx eqref]) -> eqref
+    (let ([clauses (s:cdr (s:syntax->list stx))])
+      (if (s:null? clauses) (return #''#f))
+      (let ([c (s:syntax->list (s:car clauses))])
+        (if (s:identifier? (s:car c))
+            (if (s:free-identifier=? (s:car c) #'else)
+                (return #`(begin #,@(s:cdr c)))))
+        #`(lisp-if #,(s:car c) (begin #,@(s:cdr c)) (cond #,@(s:cdr clauses))))))
+
+  (func (binding-names [bs eqref]) -> eqref
+    (if (s:null? bs) '() (s:cons (s:car (s:syntax->list (s:car bs))) (binding-names (s:cdr bs)))))
+
+  (func (binding-inits [bs eqref]) -> eqref
+    (if (s:null? bs) '() (s:cons (s:cadr (s:syntax->list (s:car bs))) (binding-inits (s:cdr bs)))))
+
+  ;; (let ([x e] ...) body ...), or (let name ([x e] ...) body ...), a loop.
+  (func (lisp-let [stx eqref]) -> eqref
+    (let ([parts (s:syntax->list stx)])
+      (if (s:identifier? (s:cadr parts))
+          (let ([bs (s:syntax->list (s:caddr parts))])
+            (return #`(letrec ([#,(s:cadr parts) (lisp-lambda (#,@(binding-names bs)) #,@(s:cdddr parts))])
+                        (app #,(s:cadr parts) #,@(binding-inits bs))))))
+      #`(let #,@(s:cdr parts))))
+
+  (func (false-bindings [xs eqref]) -> eqref
+    (if (s:null? xs) '() (s:cons #`[#,(s:car xs) '#f] (false-bindings (s:cdr xs)))))
+
+  (func (assignments [bs eqref]) -> eqref
+    (if (s:null? bs)
+        '()
+        (let ([b (s:syntax->list (s:car bs))])
+          (s:cons #`(set! #,(s:car b) #,(s:cadr b)) (assignments (s:cdr bs))))))
+
+  ;; (letrec ([x e] ...) body ...): each e can refer to every x.
+  (func (letrec [stx eqref]) -> eqref
+    (let* ([parts (s:syntax->list stx)] [bs (s:syntax->list (s:cadr parts))])
+      #`(let (#,@(false-bindings (binding-names bs)))
+          #,@(assignments bs)
+          (let () #,@(s:cddr parts)))))
+
+  ;; ---- closure conversion ----
+  ;;
+  ;; Two walks over expanded code (spec 6.4). env is the list of binders in
+  ;; scope, innermost first; a reference is found in it by binding
+  ;; (free-identifier=?), so a variable is its binder, compared by
+  ;; identity.
+
+  (global assigned (mut eqref) '())   ; binders set! assigns
+  (global captured (mut eqref) '())   ; binders some lambda captures
+  (global free (mut eqref) '())       ; the variables the current lambda captures
+
+  (func (lookup [x eqref] [env eqref]) -> eqref
+    (if (s:null? env) (return '#f))
+    (let ([b (s:car env)])
+      (if (i32.and (ref.eq (s:syntax-e b) (s:syntax-e x)) (s:free-identifier=? b x))
+          (return b)))
+    (lookup x (s:cdr env)))
+
+  (func (boxed? [b eqref]) -> i32 (i32.and (member? b assigned) (member? b captured)))
+
+  (func (lambda-marker? [l eqref]) -> i32
+    (if (i32.eqz (named? (s:car l) '#%app)) (return 0))
+    (s:free-identifier=? (s:cadr l) #'lambda-marker))
+
+  ;; Where a form's expressions start: after its head and the parts that
+  ;; name labels, functions, types and fields. -1 for a form with none.
+  (func (skip [head eqref]) -> i32
+    (if (member? head '(quote quote-syntax #%datum ref.func func-index data-address data-size
+                        unreachable nop))
+        (return -1))
+    (if (member? head '(#%app block loop br br-if call-indirect)) (return 2))
+    (if (member? head '(struct.new array.new array.new_default array.new_fixed array.get array.get_s
+                        array.get_u array.set array.fill ref.null ref.test ref.cast call-ref))
+        (return 2))
+    (if (member? head '(struct.get struct.get_s struct.get_u struct.set array.copy)) (return 3))
+    1)
+
+  (func (binders [bs eqref]) -> eqref
+    (if (s:null? bs) '() (s:cons (s:car (s:syntax->list (s:car bs))) (binders (s:cdr bs)))))
+
+  ;; The expression a binding binds: [x e] or [x type e].
+  (func (binding-init [b eqref]) -> eqref (s:car (s:reverse (s:syntax->list b))))
+
+  ;; Walk x. mode 0 finds captured and assigned variables; outside is env
+  ;; where the innermost enclosing lambda starts. mode 1 finds the
+  ;; variables one lambda captures: those in outside, which stays that
+  ;; lambda's even inside lambdas nested in it.
+  (func (scan [x eqref] [env eqref] [outside eqref] [mode i32])
+    (if (s:identifier? x)
+        (let ([b (lookup x env)])
+          (if (i32.and (i32.eqz (ref.is_null b)) (member? b outside))
+              (if (i32.eqz mode)
+                  (set! captured (s:cons b captured))
+                  (if (i32.eqz (member? b free)) (set! free (s:cons b free)))))
+          (return)))
+    (let ([l (s:syntax->list x)])
+      (if (i32.or (ref.is_null l) (s:null? l)) (return))
+      (if (lambda-marker? l)
+          (let* ([form (s:syntax->list (s:caddr l))]
+                 [params (binders (s:syntax->list (s:cadr form)))])
+            (return (scan-list (s:cddr form) (s:append params env) (if (i32.eqz mode) env outside) mode))))
+      (let ([head (s:syntax-e (s:car l))])
+        (if (ref.eq head 'let)
+            (let ([bs (s:syntax->list (s:cadr l))])
+              (scan-inits bs env outside mode)
+              (return (scan-list (s:cddr l) (s:append (binders bs) env) outside mode))))
+        (if (ref.eq head 'set!)
+            (begin
+              (if (i32.eqz mode)
+                  (let ([b (lookup (s:cadr l) env)])
+                    (if (i32.eqz (ref.is_null b)) (set! assigned (s:cons b assigned)))))
+              (return (scan-list (s:cdr l) env outside mode))))
+        (let ([k (skip head)])
+          (if (i32.ge_s k 0) (scan-list (drop-n l k) env outside mode))))))
+
+  (func (scan-list [xs eqref] [env eqref] [outside eqref] [mode i32])
+    (if (i32.eqz (s:null? xs))
+        (begin (scan (s:car xs) env outside mode) (scan-list (s:cdr xs) env outside mode))))
+
+  (func (scan-inits [bs eqref] [env eqref] [outside eqref] [mode i32])
+    (if (i32.eqz (s:null? bs))
+        (begin (scan (binding-init (s:car bs)) env outside mode) (scan-inits (s:cdr bs) env outside mode))))
+
+  ;; x with its lambdas converted and its boxed variables used through their
+  ;; boxes.
+  (func (convert-expr [x eqref] [env eqref]) -> eqref
+    (if (s:identifier? x)
+        (let ([b (lookup x env)])
+          (return (if (i32.and (i32.eqz (ref.is_null b)) (boxed? b)) #`(struct.get box value #,x) x))))
+    (let ([l (s:syntax->list x)])
+      (if (i32.or (ref.is_null l) (s:null? l)) (return x))
+      (if (lambda-marker? l) (return (convert-lambda l env)))
+      (let ([head (s:syntax-e (s:car l))])
+        (if (ref.eq head 'let)
+            (let ([bs (s:syntax->list (s:cadr l))])
+              (return (s:syntax-rewrap
+                       x (s:cons (s:car l)
+                                 (s:cons (s:syntax-rewrap (s:cadr l) (convert-bindings bs env))
+                                         (convert-list (s:cddr l) (s:append (binders bs) env))))))))
+        (if (ref.eq head 'set!)
+            (let* ([target (s:cadr l)]
+                   [b (lookup target env)]
+                   [v (convert-expr (s:caddr l) env)])
+              (return (if (i32.and (i32.eqz (ref.is_null b)) (boxed? b))
+                          #`(struct.set box value #,target #,v)
+                          (s:syntax-rewrap x (s:cons (s:car l) (s:cons target (s:cons v '()))))))))
+        (let ([k (skip head)])
+          (if (i32.lt_s k 0) (return x))
+          (s:syntax-rewrap x (s:append (take l k) (convert-list (drop-n l k) env)))))))
+
+  (func (convert-list [xs eqref] [env eqref]) -> eqref
+    (if (s:null? xs) '() (s:cons (convert-expr (s:car xs) env) (convert-list (s:cdr xs) env))))
+
+  ;; A let's bindings, converted; a boxed variable is bound to a new box.
+  (func (convert-bindings [bs eqref] [env eqref]) -> eqref
+    (if (s:null? bs) (return '()))
+    (let* ([b (s:syntax->list (s:car bs))]
+           [x (s:car b)]
+           [init (convert-expr (binding-init (s:car bs)) env)]
+           [rest (convert-bindings (s:cdr bs) env)])
+      (if (boxed? x)
+          (s:cons #`[#,x (struct.new box #,init)] rest)
+          (s:cons (s:syntax-rewrap (s:car bs) (s:append (take b (i32.sub (s:length b) 1)) (s:cons init '())))
+                  rest))))
+
+  ;; body, rebinding each boxed parameter to a box holding its value.
+  (func (box-params [ps eqref] [body eqref]) -> eqref
+    (let ([bs (boxed-bindings ps)])
+      (if (s:null? bs) body #`(let (#,@bs) #,body))))
+
+  (func (boxed-bindings [ps eqref]) -> eqref
+    (if (s:null? ps) (return '()))
+    (let ([rest (boxed-bindings (s:cdr ps))])
+      (if (boxed? (s:car ps))
+          (s:cons #`[#,(s:car ps) (struct.new box #,(s:car ps))] rest)
+          rest)))
+
+  (func (field-names [xs eqref] [i i32]) -> eqref
+    (if (s:null? xs) '() (s:cons (numbered 'v i) (field-names (s:cdr xs) (i32.add i 1)))))
+
+  ;; A field per captured variable: a box, for a boxed one, else a value.
+  (func (field-decls [fs eqref] [xs eqref]) -> eqref
+    (if (s:null? fs)
+        '()
+        (s:cons #`(field #,(s:car fs) #,(if (boxed? (s:car xs)) #'(ref box) #'eqref))
+                (field-decls (s:cdr fs) (s:cdr xs)))))
+
+  ;; [x (struct.get t f env)] for each captured variable x and its field f.
+  (func (env-bindings [xs eqref] [fs eqref] [t eqref]) -> eqref
+    (if (s:null? xs)
+        '()
+        (s:cons #`[#,(s:car xs) (struct.get #,t #,(s:car fs) env)] (env-bindings (s:cdr xs) (s:cdr fs) t))))
+
+  ;; A lambda marker, converted: its code is lifted to a module-level
+  ;; function, and the lambda becomes its closure.
+  (func (convert-lambda [l eqref] [env eqref]) -> eqref
+    (let* ([form (s:syntax->list (s:caddr l))]
+           [params (binders (s:syntax->list (s:cadr form)))]
+           [n (s:length params)]
+           [ct (closure-type n)]
+           [body-forms (s:cddr form)])
+      ;; The variables it captures, in the order they appear.
+      (set! free '())
+      (scan-list body-forms (s:append params env) env 1)
+      (let* ([captures (s:reverse free)]
+             [body (box-params params #`(begin #,@(convert-list body-forms (s:append params env))))]
+             [code (fresh-name 'lambda)]
+             [head #`(#,code [self (ref #,ct)] #,@(typed-params params))])
+        (if (s:null? captures)
+            (begin
+              (drop (s:lift-definition #`(func #,head -> eqref (type #,(code-type n)) #,body)))
+              #`(struct.new #,ct (ref.func #,code)))
+            (let ([t (fresh-name 'closure)] [fields (field-names captures 0)])
+              (drop (s:lift-definition
+                     #`(type #,t (sub final #,ct (struct (field code (ref #,(code-type n))) #,@(field-decls fields captures))))))
+              (drop (s:lift-definition
+                     #`(func #,head -> eqref (type #,(code-type n))
+                         (let ([env (ref.cast (ref #,t) self)])
+                           (let (#,@(env-bindings captures fields t)) #,body)))))
+              #`(struct.new #,t (ref.func #,code) #,@captures))))))
+
+  ;; (convert (param ...) body ...): body expanded and converted.
+  (func (convert [stx eqref]) -> eqref
+    (let* ([parts (s:syntax->list stx)]
+           [params (s:syntax->list (s:cadr parts))]
+           [body (s:local-expand #`(begin #,@(s:cddr parts)))])
+      (set! assigned '())
+      (set! captured '())
+      (scan body params '() 0)
+      (box-params params (convert-expr body params)))))
+
+(define-syntax lisp-define lisp-define)
+(define-syntax lisp-lambda lisp-lambda)
+(define-syntax app app)
+(define-syntax datum datum)
+(define-syntax lisp-if lisp-if)
+(define-syntax when when)
+(define-syntax unless unless)
+(define-syntax and and)
+(define-syntax or or)
+(define-syntax cond cond)
+(define-syntax lisp-let lisp-let)
+(define-syntax letrec letrec)
+(define-syntax convert convert)
+
+;; ---- functions -------------------------------------------------------------------------
+
+(lisp-define (cons a d) (s:cons a d))
+(lisp-define (car p) (s:car p))
+(lisp-define (cdr p) (s:cdr p))
+(lisp-define (pair? x) (bool (s:pair? x)))
+(lisp-define (null? x) (bool (s:null? x)))
+(lisp-define (list? x) (bool (s:list? x)))
+(lisp-define (length l) (s:fixnum (s:length l)))
+(lisp-define (append a b) (s:append a b))
+(lisp-define (reverse l) (s:reverse l))
+(lisp-define (eq? a b) (bool (ref.eq a b)))
+(lisp-define (not x) (bool (ref.is_null x)))
+
+(lisp-define (+ a b) (add a b))
+(lisp-define (- a b) (sub a b))
+(lisp-define (* a b) (mul a b))
+(lisp-define (quotient a b) (quo a b))
+(lisp-define (remainder a b) (rem a b))
+(lisp-define (< a b) (bool (i64.lt_s (int-value a) (int-value b))))
+(lisp-define (> a b) (bool (i64.gt_s (int-value a) (int-value b))))
+(lisp-define (<= a b) (bool (i64.le_s (int-value a) (int-value b))))
+(lisp-define (>= a b) (bool (i64.ge_s (int-value a) (int-value b))))
+(lisp-define (= a b) (bool (i64.eq (int-value a) (int-value b))))
+(lisp-define (zero? a) (bool (i64.eqz (int-value a))))
+
+(lisp-define (display x) (write-datum x) '#f)
+(lisp-define (newline) (print:newline) '#f)
+(lisp-define (error msg) (fail-string msg) '#f)

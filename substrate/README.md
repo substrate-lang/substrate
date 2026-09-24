@@ -20,7 +20,7 @@ line says the same.
 | `host/` | the host, in C over wasmtime: stores, linking, the `host` imports and the instantiate hook | permanent: after bootstrap it runs the compiler |
 | `compiler/` | the compiler, written in the language. Today only `syntax.sub`, the syntax library; the rest arrives as the compiler is rewritten for bootstrap | permanent, grows |
 | `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: frozen once the compiler compiles itself |
-| `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match` | permanent, grows |
+| `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match`, and the dynamic Lisp (`lisp.sub`) | permanent, grows |
 | `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.links`) and any modules it requires in `NAME/`; checked by `make check` | grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.links` (what the compiled phase-0 part may import). `tests/fixtures/` holds modules the tests require | grows |
 | `bin/subc` | the entry point | permanent; runs stage0 until bootstrap |
