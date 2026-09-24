@@ -44,9 +44,9 @@ compiler, binary wasm, then wasmtime. Macros work end to end: a
 transformer is a phase-1 function over GC syntax objects, compiled and
 instantiated in the compile-time store and called by the expander.
 `define-static`, `syntax-local-value`, `syntax-error` and
-`free-identifier=?` work too. Compiled programs import only what they use:
+`free-identifier=?` work too, and macros are hygienic (introduction and
+use-site scopes, spec 6.2). Compiled programs import only what they use:
 `(runtime-free)` is checked by the compiler, and `tests/*.links` checks
 imports in the tests.
 
-Next: hygiene (introduction and use-site scopes), then modules and phases.
-See `docs/spec.md` section 7.
+Next: modules and phases. See `docs/spec.md` section 7.

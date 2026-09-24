@@ -4,7 +4,7 @@
   (export make-stx stx? stx-e stx-scopes stx-srcloc stx-props
           make-srcloc srcloc? srcloc-source srcloc-line srcloc-col srcloc-pos srcloc-span
           id? stx->datum datum->stx stx->list stx-rewrap
-          scopes-add scopes-remove scopes-flip scopes-subset? add-scope flip-scope
+          scopes-add scopes-remove scopes-flip scopes-subset? add-scope flip-scope remove-scopes
           compile-error? compile-error-message compile-error-srcloc
           format-srcloc raise-compile-error map-lr)
   (import (chezscheme))
@@ -57,6 +57,7 @@
           [else x]))
 
   (define (add-scope x sc) (map-scopes x (lambda (s) (scopes-add s sc))))
+  (define (remove-scopes x scs) (map-scopes x (lambda (s) (fold-left scopes-remove s scs))))
   (define (flip-scope x sc) (map-scopes x (lambda (s) (scopes-flip s sc))))
 
   ;; ---- conversions --------------------------------------------------------

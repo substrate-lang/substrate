@@ -85,6 +85,7 @@
   (define current-module 'main)
   (define current-store #f)
   (define syntax-phases '())               ; phases where (require syntax) appeared
+  (define use-site-scopes '())             ; use-site scopes made in this module (spec 6.2)
   (define runtime-free-form #f)            ; the (runtime-free) form, if any
 
   ;; phase: an integer, or 'all
@@ -101,6 +102,7 @@
     (set! current-module module)
     (set! current-store st)
     (set! syntax-phases '())
+    (set! use-site-scopes '())
     (set! runtime-free-form #f)
     (reset-keys!))
 
@@ -115,6 +117,18 @@
       key))
 
   (define (bind! id phase meaning) (bind-raw! (stx-e id) (stx-scopes id) phase meaning))
+
+  ;; Bind a module-level definition. Use-site scopes come off the name, so
+  ;; a definition a macro makes from its input is visible to the rest of
+  ;; the module (spec 6.2). A second definition of the same name with the
+  ;; same scopes at the same phase is an error.
+  (define (bind-definition! id phase meaning)
+    (let ([id (remove-scopes id use-site-scopes)])
+      (for-each (lambda (b)
+                  (when (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id)))
+                    (raise-compile-error id "duplicate definition of ~a" (stx-e id))))
+                (hashtable-ref bindings (stx-e id) '()))
+      (bind! id phase meaning)))
 
   (define (phase-matches? b phase)
     (let ([p (binding-phase b)])
@@ -181,7 +195,7 @@
                       [else #f])])
       (let ([m (and head (meaning-of head phase))])
         (if (and m (eq? (car m) 'macro))
-            (head-expand (apply-macro head (cadr m) s phase) phase)
+            (head-expand (apply-macro head (cadr m) s phase #t) phase)
             s))))
 
   (define (expand-body forms phase)
@@ -276,7 +290,7 @@
         (unless (memq kind '(struct array))
           (raise-compile-error (caddr parts) "a type is (struct field ...) or (array type)"))
         (let ([info (make-type-info (stx-e (cadr parts)) kind #f)])
-          (bind! (cadr parts) phase (list 'type info))
+          (bind-definition! (cadr parts) phase (list 'type info))
           (type-info-fields-set!
            info
            (if (eq? kind 'struct)
@@ -345,7 +359,7 @@
                              (cdr hparts))])
         (let-values ([(results body) (parse-results (cddr parts) phase)])
           (let ([info (make-func-info (stx-e name) (map cdr params) results #f #f)])
-            (bind! name phase (list 'func info))
+            (bind-definition! name phase (list 'func info))
             (list 'func info params body f))))))
 
   (define (expand-func p phase)
@@ -361,7 +375,7 @@
       (unless (and (= (length parts) 4) (id? (cadr parts)))
         (raise-compile-error f "expected (global name type init)"))
       (let ([info (make-global-info (stx-e (cadr parts)) (parse-type (caddr parts) phase) #f #f)])
-        (bind! (cadr parts) phase (list 'global info))
+        (bind-definition! (cadr parts) phase (list 'global info))
         (list 'global info (cadddr parts)))))
 
   ;; (import name "module" "field" (t ... -> r ...))
@@ -371,7 +385,7 @@
                    (string? (stx-e (caddr parts))) (string? (stx-e (cadddr parts))))
         (raise-compile-error f "expected (import name \"module\" \"field\" (type ... -> type ...))"))
       (let-values ([(params results) (parse-signature (list-ref parts 4) phase)])
-        (bind! (cadr parts) phase
+        (bind-definition! (cadr parts) phase
                (list 'func (make-func-info (stx-e (cadr parts)) params results
                                            (stx-e (caddr parts)) (stx-e (cadddr parts))))))))
 
@@ -391,7 +405,7 @@
         (raise-compile-error f "expected (data name offset \"bytes\" ...)"))
       (let ([info (make-data-info (stx-e (cadr parts)) (stx-e (caddr parts))
                                   (string->utf8 (apply string-append (map stx-e (cdddr parts)))))])
-        (bind! (cadr parts) phase (list 'data info))
+        (bind-definition! (cadr parts) phase (list 'data info))
         (list 'data info))))
 
   ;; (require syntax): bind the syntax library's contract functions at this
@@ -425,7 +439,7 @@
     (set! runtime-free-form f))
 
   ;; (include "path"): the forms of another file, spliced in place, with the
-  ;; include form's scopes. The path is relative to the including file.
+  ;; include form's scopes. A relative path is relative to the including file.
   ;; Temporary: modules replace it (spec section 7).
   (define (read-include f)
     (let ([parts (stx-list-of f 'include)])
@@ -433,7 +447,10 @@
         (raise-compile-error f "expected (include \"path\")"))
       (let* ([loc (stx-srcloc f)]
              [dir (if loc (directory-of (symbol->string (srcloc-source loc))) "")]
-             [path (string-append dir (stx-e (cadr parts)))]
+             [given (stx-e (cadr parts))]
+             [path (if (and (> (string-length given) 0) (char=? (string-ref given 0) #\/))
+                       given
+                       (string-append dir given))]
              [scopes (stx-scopes (car parts))])
         (unless (file-exists? path) (raise-compile-error f "include: no file ~a" path))
         (map-lr (lambda (form) (fold-left add-scope form scopes)) (read-file path)))))
@@ -493,7 +510,7 @@
             (raise-compile-error (caddr parts) "~a must be defined by an earlier begin-for-syntax"
                                  (stx-e (caddr parts))))
           (let ([chunk (handle-chunk! #t (lambda (arg) (list 'call info (list arg))) (+ phase 1) f)])
-            (bind! (cadr parts) phase (list 'macro chunk)))))))
+            (bind-definition! (cadr parts) phase (list 'macro chunk)))))))
 
   ;; (define-static name expr): name is bound to the value of expr, computed
   ;; now at phase+1. Macros read it with syntax-local-value.
@@ -504,7 +521,7 @@
       (let* ([rhs (expand-expr (caddr parts) (+ phase 1))]
              [chunk (handle-chunk! #f (lambda (_) rhs) (+ phase 1) f)]
              [handle (call-in-store f (lambda (h) (host-call h chunk "__entry")))])
-        (bind! (cadr parts) phase (list 'static handle)))))
+        (bind-definition! (cadr parts) phase (list 'static handle)))))
 
   ;; (begin-for-syntax form ...)
   (define (begin-for-syntax! f phase)
@@ -527,8 +544,19 @@
       (flush-output-port (current-output-port))
       (proc (store-host current-store))))
 
-  (define (apply-macro head chunk s phase)
-    (let ([saved-phase api-phase] [saved-where api-where])
+  ;; Hygiene (spec 6.2): a fresh introduction scope is flipped on the input
+  ;; and on the output, so only what the transformer introduced carries it.
+  ;; In a definition context (use-site? is true) the input also gets a fresh
+  ;; use-site scope, which stays.
+  (define (apply-macro head chunk s phase use-site?)
+    (let* ([intro (new-scope!)]
+           [s (flip-scope s intro)]
+           [s (if use-site?
+                  (let ([use (new-scope!)])
+                    (set! use-site-scopes (cons use use-site-scopes))
+                    (add-scope s use))
+                  s)]
+           [saved-phase api-phase] [saved-where api-where])
       (dynamic-wind
         (lambda () (set! api-phase phase) (set! api-where s))
         (lambda ()
@@ -540,7 +568,7 @@
             (unless (stx? result)
               (raise-compile-error s "macro ~a returned a non-syntax value: ~s" (stx-e head)
                                    (if (wasm-value? result) '<object> (stx->datum result))))
-            result))
+            (flip-scope result intro)))
         (lambda () (set! api-phase saved-phase) (set! api-where saved-where)))))
 
   ;; Entry point for wasm calls to the expander queries. Arguments and results
@@ -597,7 +625,7 @@
            (case (and m (car m))
              [(local) (at s (list 'lref (cadr m)))]
              [(global) (at s (list 'gref (cadr m)))]
-             [(macro) (expand-expr (apply-macro s (cadr m) s phase) phase)]
+             [(macro) (expand-expr (apply-macro s (cadr m) s phase #f) phase)]
              [(static) (raise-compile-error s "~a is static information: read it with syntax-local-value" e)]
              [(func) (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e)]
              [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
@@ -612,7 +640,7 @@
            (let ([m (meaning-of head phase)])
              (case (and m (car m))
                [(core) (at s (expand-core (cadr m) s phase))]
-               [(macro) (expand-expr (apply-macro head (cadr m) s phase) phase)]
+               [(macro) (expand-expr (apply-macro head (cadr m) s phase #f) phase)]
                [(prim) (at s (expand-prim (cadr m) s phase))]
                [(func) (let ([args (or (stx->list (cdr e)) (raise-compile-error s "bad call syntax"))])
                          (at s (list 'call (cadr m) (map-lr (lambda (a) (expand-expr a phase)) args))))]

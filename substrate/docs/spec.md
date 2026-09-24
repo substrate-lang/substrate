@@ -321,12 +321,36 @@ error.
 
 - Core bindings have the scope set `{0}`, which every module body carries.
   A module's own definitions have more scopes, so they shadow core names.
+- A module-level definition of a name that is already defined with the same
+  scope set at the same phase is an error.
 - [v0] Bindings are recorded per phase. Scope sets are not yet per phase.
-- **[planned, next]** Hygiene: a fresh macro-introduction scope flipped on
-  the input and output of every transformer call, and use-site scopes in
-  definition contexts.
 
-### 6.2 Compile-time bindings
+### 6.2 Hygiene
+
+Each macro use gets a fresh **introduction scope**. The expander flips it
+on the syntax it passes to the transformer and again on the syntax that
+comes back. Parts of the result that came from the input lose it; parts the
+transformer introduced, such as template identifiers, keep it. So a binding
+the macro introduces cannot capture the user's identifiers, and the user's
+bindings cannot capture the macro's.
+
+A macro use in a **definition context** also gets a fresh **use-site
+scope**, added to its input and not removed. In v0 the definition contexts
+are module bodies, at any phase. At module level the use site and the
+macro's definition share the module's scopes, and the use-site scope keeps
+them apart. Without it, a local binding made from the macro's input could
+capture a reference the macro introduced. Use-site scopes are removed from
+the name of every module-level definition, so a definition a macro makes
+from its input is visible to the rest of the module.
+
+This is the same trade Racket makes: a module-level *definition* made from
+a macro's input can still capture the macro's own references to that name.
+Local bindings cannot.
+
+A transformer can capture on purpose: `(datum->syntax stx 'it)` makes an
+identifier with the scopes of the use, as if the user had written it.
+
+### 6.3 Compile-time bindings
 
 - `(define-syntax m f)`: `m` is a macro whose transformer is the phase+1
   function `f`, of type `(eqref) -> eqref`.
@@ -341,7 +365,6 @@ self-hosted expander will hold references directly and need no copy.
 
 ## 7. Open questions and later milestones
 
-- **Hygiene** (next): introduction and use-site scopes (6.1).
 - **Modules and phases**: `require` of modules, `for-syntax` imports,
   writing out phase-1 modules, per-phase scope sets as in Racket, scope ids
   that survive separate compilation, and importing a memory or table from
