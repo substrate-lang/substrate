@@ -1661,6 +1661,7 @@
              [(macro) (expand-expr (apply-macro id (cadr m) (stx-rewrap s (list id s)) phase #f) phase)]
              [else (raise-compile-error s "the literal ~s needs #%datum, which is ~a here" (stx->datum s)
                                         (if m "not a macro or the core form" "unbound"))]))]
+        [(keyword? e) (raise-compile-error s "~s: keyword misused as an expression" e)]
         [else (raise-compile-error s "~s is not an expression" (stx->datum s))])))
 
   (define (literal? e)

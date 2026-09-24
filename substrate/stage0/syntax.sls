@@ -7,6 +7,7 @@
   (export make-stx stx? stx-e stx-scopes stx-srcloc stx-props
           make-srcloc srcloc? srcloc-source srcloc-line srcloc-col srcloc-pos srcloc-span
           id? stx->datum datum->stx stx->list stx-rewrap
+          keyword? keyword-name string->keyword
           scopes-add scopes-remove scopes-flip scopes-subset? add-scope flip-scope remove-scopes
           filter-scopes
           compile-error? compile-error-message compile-error-srcloc
@@ -28,6 +29,19 @@
   (define-record-type srcloc (fields source line col pos span))
 
   (define (id? x) (and (stx? x) (symbol? (stx-e x))))
+
+  ;; Keywords, as in Racket: #:name reads as one, interned by name, so equal
+  ;; keywords are eq?. They print as they read.
+  (define-record-type (keyword new-keyword keyword?) (fields name))   ; name: a string
+  (define keywords (make-hashtable string-hash string=?))
+  (define (string->keyword s)
+    (or (hashtable-ref keywords s #f)
+        (let ([k (new-keyword (string->immutable-string s))])
+          (hashtable-set! keywords s k)
+          k)))
+  (define keyword-printing
+    (record-writer (record-type-descriptor keyword)
+                   (lambda (k port wr) (display "#:" port) (display (keyword-name k) port))))
 
   ;; ---- scope sets: sorted lists of fixnums --------------------------------
 

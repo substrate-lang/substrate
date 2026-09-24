@@ -65,6 +65,7 @@
            (object! (list 5 a b) (lambda () (put-u8 p 5) (uleb! p a) (uleb! p b))))]
         [(symbol? d) (object! (list 6 d) (lambda () (put-u8 p 6) (utf8! (symbol->string d))))]
         [(string? d) (object! (list 7 d) (lambda () (put-u8 p 7) (utf8! d)))]
+        [(keyword? d) (object! (list 13 (keyword-name d)) (lambda () (put-u8 p 13) (utf8! (keyword-name d))))]
         [(stx? d)
          (let* ([e (loop (stx-e d))] [sc (loop (stx-scopes d))]
                 [l (loop (stx-srcloc d))] [r (loop (stx-props d))])
@@ -130,5 +131,6 @@
                    (bytevector-u64-set! b 0 bits (endianness little))
                    (bytevector-ieee-double-ref b 0 (endianness little)))]
            [(12) (other (uleb))]
+           [(13) (string->keyword (utf8))]
            [else (error 'deserialize "unknown kind")])))
       (vector-ref objs (- n 1)))))

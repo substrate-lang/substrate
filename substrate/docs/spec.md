@@ -76,8 +76,8 @@ The syntax library represents data as **values** of wasm type `eqref`.
 The contract promises this about them:
 
 - `#f` is the null reference, so `(ref.is_null v)` tests for it.
-- `ref.eq` is identity. Symbols are interned, so two symbols with the same
-  name are `ref.eq`. Small integers (fixnums) are `ref.eq` when they are
+- `ref.eq` is identity. Symbols and keywords are interned, so two with the
+  same name are `ref.eq`. Small integers (fixnums) are `ref.eq` when they are
   equal. Characters, strings, larger integers and flonums are not
   guaranteed to be `ref.eq`; compare characters and strings with
   `char->integer` and `string=?`, and numbers by their values.
@@ -98,7 +98,7 @@ another type, such as `n:i32`.
 |---|---|
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
-| strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32` |
+| strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
 | queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, or `#f`), `(raise-syntax-error name message stx)` (aborts expansion; returns nothing), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
 
@@ -545,9 +545,11 @@ it (3.4).
 The unchanged parts of a `quasisyntax` template keep their lexical context,
 which is what macro templates need. The reader abbreviations are
 `'` `` ` `` `,` `,@` and `#'` `` #` `` `#,` `#,@`. The reader reads `#%name`
-as the symbol `#%name`. An integer literal must fit in 64 bits, from -2^63
-to 2^64 - 1, and a number literal is an integer or a decimal: the reader
-rejects others, such as `1/2`.
+as the symbol `#%name`, and `#:name` as a keyword, as Racket does: a kind
+of datum of its own, used for options in forms such as `#:mutable`. A
+keyword is not an expression, but quoted it is a value. An integer literal
+must fit in 64 bits, from -2^63 to 2^64 - 1, and a number literal is an
+integer or a decimal: the reader rejects others, such as `1/2`.
 
 ### 5.5 Base bindings
 
@@ -772,6 +774,7 @@ expander.
   | `%integer` | `(struct (field negative i32) (field magnitude i64))` | integers beyond the fixnum range |
   | `%flonum` | `(struct (field value f64))` | flonums |
   | `%builder` | `(struct (field bytes (mut (ref %string))) (field length (mut i32)))` | string builders |
+  | `%keyword` | `(struct (field name (ref %string)))` | keywords |
 
 - **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
   single `%atom` objects made at start. A linklet's quoted data is a
