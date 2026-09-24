@@ -31,7 +31,7 @@
   (define core-forms
     (append
      '(func global import memory table data type rec define-syntax define-static begin-for-syntax
-       begin require provide runtime-free module-pass set! let let* if block loop br br-if return
+       begin require require-unqualified provide runtime-free module-pass set! let let* if block loop br br-if return
        call-indirect func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
      (list app-sym datum-sym)
@@ -489,14 +489,15 @@
       (unit-provides-set!
        m
        (apply append
-              (map-lr (lambda (id)
-                        (let* ([value (let ([v (meaning-of id 0)])
+              (map-lr (lambda (item)
+                        (let* ([id (cdr item)]
+                               [value (let ([v (meaning-of id 0)])
                                         (and v (memq (car v) '(func global macro static data)) v))]
                                [found (filter values (list (type-meaning-of id 0) value))])
                           (when (null? found)
                             (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
                           (for-each (lambda (meaning) (check-not-removed (cadr meaning) id)) found)
-                          (map (lambda (meaning) (cons (stx-e id) meaning)) found)))
+                          (map (lambda (meaning) (cons (stx-e (car item)) meaning)) found)))
                       (reverse (comp-provide-ids c)))))
       (removed-definitions #f)
       (let ([phases (list-sort < (let-values ([(ks vs) (hashtable-entries (comp-phase-forms c))])
@@ -623,13 +624,14 @@
            [kind (core-head f phase)])
       (define (item! x) (body-items-set! b (cons x (body-items b))))
       (when (and only
-                 (memq kind '(require provide runtime-free module-pass memory table
+                 (memq kind '(require require-unqualified provide runtime-free module-pass memory table
                               define-syntax define-static begin-for-syntax)))
         (raise-compile-error f "~a (~a ...), but only func, global, import, type and data forms and expressions are allowed there"
                              only kind))
       (case kind
         [(begin) (for-each (lambda (g) (declare-form! g b only)) (cdr (stx-list-of f 'begin)))]
-        [(require) (require! f phase)]
+        [(require) (require! f phase #f)]
+        [(require-unqualified) (require! f phase #t)]
         [(provide) (provide! f phase)]
         [(runtime-free) (runtime-free! f phase)]
         [(module-pass) (module-pass! f phase)]
@@ -1053,17 +1055,26 @@
   ;; Each item also binds one thing unqualified: x as itself, or [new old]
   ;; as new. A require at phase p imports at phase p; inside
   ;; begin-for-syntax it imports for compile-time code (spec 3.1).
-  (define (require! f phase)
+  ;; (require-unqualified name source) is require with every name the
+  ;; source provides also bound unqualified, with the scopes of name. It is
+  ;; meant for a language's core forms, and little else (spec 3.1).
+  (define (require! f phase all?)
     (let ([parts (stx-list-of f 'require)])
       (unless (and (>= (length parts) 3) (id? (cadr parts))
-                   (or (string? (stx-e (caddr parts))) (core-name? (caddr parts) 'syntax)))
-        (raise-compile-error f "expected (require name \"path\" item ...) or (require name syntax item ...)"))
+                   (or (string? (stx-e (caddr parts))) (core-name? (caddr parts) 'syntax))
+                   (or (not all?) (= (length parts) 3)))
+        (raise-compile-error f (if all?
+                                   "expected (require-unqualified name \"path\") or (require-unqualified name syntax)"
+                                   "expected (require name \"path\" item ...) or (require name syntax item ...)")))
       (let* ([name (cadr parts)]
              [source (caddr parts)]
              [provided (if (string? (stx-e source))
                            (require-module! f name source phase)
                            (require-syntax! source phase))])
         (for-each (lambda (p) (bind-import! (qualified name (car p)) phase (cdr p))) provided)
+        (when all?
+          (for-each (lambda (p) (bind-import! (datum->stx name (car p) (stx-srcloc name)) phase (cdr p)))
+                    provided))
         (for-each (lambda (item)
                     (let* ([l (stx->list item)]
                            [new (cond [(id? item) item]
@@ -1132,11 +1143,24 @@
 
   ;; (provide id ...): the phase-0 bindings other modules get by requiring
   ;; this one.
+  ;; (provide item ...): x provides x, and [new old] provides old under the
+  ;; name new. Recorded as (name . id), resolved when the module is done.
   (define (provide! f phase)
     (unless (= phase 0) (raise-compile-error f "provide belongs at phase 0"))
-    (let ([ids (cdr (stx-list-of f 'provide))])
-      (for-each (lambda (id) (unless (id? id) (raise-compile-error id "provide takes identifiers"))) ids)
-      (comp-provide-ids-set! current (append (reverse ids) (comp-provide-ids current)))))
+    (let ([items (map-lr (lambda (item)
+                           (let ([l (stx->list item)])
+                             (cond [(id? item) (cons item item)]
+                                   [(and l (= (length l) 2) (id? (car l)) (id? (cadr l))) (cons (car l) (cadr l))]
+                                   [else (raise-compile-error item "provide takes names and [new-name name]")])))
+                         (cdr (stx-list-of f 'provide)))])
+      (for-each (lambda (item)
+                  (let ([earlier (assq (stx-e (car item)) (map (lambda (p) (cons (stx-e (car p)) p))
+                                                               (comp-provide-ids current)))])
+                    (when (and earlier (not (eq? (stx-e (cddr earlier)) (stx-e (cdr item)))))
+                      (raise-compile-error (car item) "~a is provided twice, for ~a and for ~a" (stx-e (car item))
+                                           (stx-e (cddr earlier)) (stx-e (cdr item))))
+                    (comp-provide-ids-set! current (cons item (comp-provide-ids current)))))
+                items)))
 
   ;; (memory pages) or (memory from name), and likewise (table ...): the
   ;; module's memory or table at this phase. name is a module required at

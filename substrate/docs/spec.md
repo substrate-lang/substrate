@@ -159,9 +159,12 @@ them in Chez; in a run-time store they trap.
   code runs while phase *n* is expanded, so a module's phase-1 part holds
   its transformers, its `define-static` values and its `begin-for-syntax`
   code.
-- `(provide id ...)` names the phase-0 bindings other modules get:
-  functions, globals, macros, static values, types and data. A name bound
-  both as a type and as a value provides both.
+- `(provide item ...)` names the phase-0 bindings other modules get:
+  functions, globals, macros, static values, types and data, whether the
+  module defines them or imported them. An item `x` provides `x`, and
+  `[new old]` provides `old` under the name `new`. A name bound both as a
+  type and as a value provides both. One name cannot be provided for two
+  different bindings.
 - `(require name source item ...)` imports what another module provides.
   `source` is `"path"` (relative to the requiring file) or `syntax` (the
   syntax library, section 2).
@@ -169,6 +172,12 @@ them in Chez; in a run-time store they trap.
     `name:thing`. Nothing is imported unqualified by default.
   - Each item also binds one thing unqualified: `x` binds `x`, and
     `[new old]` binds `new` to the source's `old`, in `let` order.
+  - `(require-unqualified name source)` is `require` with every name the
+    source provides bound unqualified too, with the scopes of `name`. It
+    is meant for the few forms a language's code is written in, such as
+    its `define` and `#%app`, and little else: unqualified names hide
+    where a binding comes from, and a later definition of one of them is
+    an error.
   - A require at phase *p* imports at phase *p*. To import for compile-time
     code, put the require inside `begin-for-syntax`. The required module's
     phase *q* is then phase *p* + *q* in the requiring module.
@@ -325,7 +334,8 @@ quotation and compile-time forms.
 (type name (sub [final] [super] def))          ; def: (struct ...) or (array ...)
 (rec (type name def) ...)                      ; types that refer to each other
 (require name source item ...)      ; source: "path" or syntax; item: x or [new old]
-(provide id ...)                    ; phase 0 only
+(require-unqualified name source)   ; every provided name unqualified too (3.1)
+(provide item ...)                  ; phase 0 only; item: x or [new old]
 (runtime-free)                      ; see 3.4
 (module-pass f)                     ; phase 0; f: a phase+1 function (6.5)
 (define-syntax name transformer)    ; transformer: a phase+1 function (2.1)
@@ -659,8 +669,6 @@ A library usually provides a macro that expands into the declaration.
 
 - **Memory and table definitions at phase ≥ 1**: v0 supports only
   `(memory from name)` there.
-- **More require and provide forms**: re-exporting, renaming on provide,
-  requiring several phases up without nesting `begin-for-syntax`.
 - **Type functions across modules**: a type function declares its type in
   each module that uses it, and declared types are compared by
   declaration (5.1), so `(tuple i32 3)` in two modules is two types to
