@@ -5,7 +5,7 @@
 ;; crossing this boundary is an i32: stage0 refers to GC objects in the
 ;; syntax library through integer handles (spec appendix A).
 (library (stage0 host)
-  (export host-new host-instantiate! host-instantiate-shifted! host-call host-set-callback! host-request-trap!
+  (export with-profile host-new host-instantiate! host-instantiate-shifted! host-call host-set-callback! host-request-trap!
           wasm-failure? wasm-failure-message)
   (import (chezscheme))
 
@@ -21,6 +21,19 @@
   (define c-result (foreign-procedure "sub_result" (uptr) int))
   (define c-set-callback (foreign-procedure "sub_set_callback" (uptr uptr) void))
   (define c-request-trap (foreign-procedure "sub_request_trap" (uptr string) void))
+  (define c-profile-push (foreign-procedure "sub_profile_push" (int) void))
+  (define c-profile-pop (foreign-procedure "sub_profile_pop" () void))
+
+  ;; Run thunk as stage0 work of the given category, for the host's profile
+  ;; (SUBHOST_PROFILE, host/subhost.h).
+  (define profiling? (and (getenv "SUBHOST_PROFILE") #t))
+  (define (with-profile category thunk)
+    (if profiling?
+        (dynamic-wind
+          (lambda () (c-profile-push (+ 4 (case category [(marshal) 0] [(codegen) 1] [(read) 2]))))
+          thunk
+          c-profile-pop)
+        (thunk)))
 
   (define-condition-type &wasm-failure &error make-wasm-failure wasm-failure?
     (text wasm-failure-message))

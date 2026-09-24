@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <wasm.h>
 #include <wasmtime.h>
 
@@ -64,6 +65,91 @@ static void take_failure(sub_host *h, const char *what, wasmtime_error_t *error,
 
 const char *sub_last_error(sub_host *h) { return h->err; }
 int32_t sub_result(sub_host *h) { return h->result; }
+
+/* ---- profile ---------------------------------------------------------- */
+
+/* With SUBHOST_PROFILE set in the environment, the host keeps the time
+ * spent in each category, excluding the categories nested in it, and
+ * prints the totals to stderr at exit. The embedder marks its own
+ * categories with sub_profile_push and sub_profile_pop. */
+enum { P_EMBEDDER, P_WASM, P_COMPILE, P_INSTANTIATE, P_COUNT = SUB_PROFILE_FIRST_EMBEDDER + 8 };
+
+static int profiling = -1;
+static double p_time[P_COUNT];
+static long p_entries[P_COUNT];
+static int p_stack[1024];
+static int p_depth;
+static double p_since;
+static long p_calls, p_callbacks[8], p_compiles, p_cache_hits;
+static size_t p_compiled_bytes;
+static const char *p_naming = "";  /* the instance being compiled, for the log */
+
+static double now(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+static const char *p_name(int c) {
+  static const char *names[] = {"embedder", "wasm", "cranelift", "instantiate"};
+  static const char *embedder[] = {"marshal", "codegen", "read"};
+  if (c < SUB_PROFILE_FIRST_EMBEDDER) return names[c];
+  if (c - SUB_PROFILE_FIRST_EMBEDDER < 3) return embedder[c - SUB_PROFILE_FIRST_EMBEDDER];
+  return "?";
+}
+
+static void p_report(void) {
+  double total = 0;
+  for (int c = 0; c < P_COUNT; c++) total += p_time[c];
+  fprintf(stderr, "subhost profile (seconds, exclusive):\n");
+  for (int c = 0; c < P_COUNT; c++)
+    if (p_entries[c] || p_time[c] > 0)
+      fprintf(stderr, "  %-12s %8.3f  %5.1f%%  %ld entries\n", p_name(c), p_time[c],
+              total > 0 ? 100 * p_time[c] / total : 0, p_entries[c]);
+  fprintf(stderr, "  %-12s %8.3f\n", "total", total);
+  fprintf(stderr, "  calls into wasm %ld; compiles %ld (%zu bytes), cache hits %ld\n", p_calls, p_compiles,
+          p_compiled_bytes, p_cache_hits);
+  fprintf(stderr, "  queries: local-value %ld, error %ld, free-id %ld, binding-kind %ld, local-expand %ld, lift %ld\n",
+          p_callbacks[1], p_callbacks[2], p_callbacks[3], p_callbacks[4], p_callbacks[5], p_callbacks[6]);
+}
+
+static bool p_on(void) {
+  if (profiling < 0) {
+    profiling = getenv("SUBHOST_PROFILE") != NULL;
+    if (profiling) {
+      p_since = now();
+      atexit(p_report);
+    }
+  }
+  return profiling;
+}
+
+static void p_switch(void) {
+  double t = now();
+  p_time[p_stack[p_depth]] += t - p_since;
+  p_since = t;
+}
+
+void sub_profile_push(int category) {
+  if (!p_on() || p_depth + 1 >= (int)(sizeof p_stack / sizeof p_stack[0])) return;
+  p_switch();
+  p_stack[++p_depth] = category;
+  p_entries[category]++;
+}
+
+void sub_profile_pop(void) {
+  if (!p_on() || p_depth == 0) return;
+  p_switch();
+  p_depth--;
+}
+
+/* A call into wasm from an embedder category counts as that category: the
+ * embedder's marshalling is mostly calls into the syntax library. */
+static void p_enter_wasm(void) {
+  if (!p_on()) return;
+  p_calls++;
+  sub_profile_push(p_stack[p_depth] == P_EMBEDDER ? P_WASM : p_stack[p_depth]);
+}
 
 /* ---- memory ----------------------------------------------------------- */
 
@@ -131,11 +217,21 @@ static wasmtime_error_t *compile(const uint8_t *bytes, size_t len, wasmtime_modu
   compiled **bucket = &compiled_modules[hash % COMPILED_BUCKETS];
   for (compiled *c = *bucket; c; c = c->next)
     if (c->hash == hash && c->len == len && memcmp(c->bytes, bytes, len) == 0) {
+      if (p_on()) p_cache_hits++;
       *out = c->module;
       return NULL;
     }
   wasmtime_module_t *module = NULL;
+  if (p_on()) {
+    p_compiles++;
+    p_compiled_bytes += len;
+  }
+  double started = profiling > 0 ? now() : 0;
+  sub_profile_push(P_COMPILE);
   wasmtime_error_t *error = wasmtime_module_new(engine(), bytes, len, &module);
+  sub_profile_pop();
+  if (profiling > 0 && getenv("SUBHOST_PROFILE")[0] == '2')
+    fprintf(stderr, "compile %7zu bytes %6.1f ms  %s\n", len, 1000 * (now() - started), p_naming);
   if (error) return error;
   compiled *c = malloc(sizeof *c);
   c->hash = hash;
@@ -153,6 +249,7 @@ static wasmtime_error_t *compile(const uint8_t *bytes, size_t len, wasmtime_modu
 
 static int instantiate(sub_host *h, const char *name, size_t name_len, const uint8_t *bytes, size_t len) {
   wasmtime_module_t *module = NULL;
+  p_naming = name;
   wasmtime_error_t *error = compile(bytes, len, &module);
   if (error) {
     take_failure(h, "compile", error, NULL);
@@ -160,7 +257,9 @@ static int instantiate(sub_host *h, const char *name, size_t name_len, const uin
   }
   wasmtime_instance_t inst;
   wasm_trap_t *trap = NULL;
+  sub_profile_push(P_INSTANTIATE);
   error = wasmtime_linker_instantiate(h->linker, h->ctx, module, &inst, &trap);
+  sub_profile_pop();
   if (error || trap) {
     take_failure(h, "instantiate", error, trap);
     return 1;
@@ -213,6 +312,7 @@ int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes,
   wasmtime_module_t *module = NULL;
   wasm_importtype_vec_t imports = {0};
   wasmtime_extern_t *externs = NULL;
+  p_naming = name_copy;
   wasmtime_error_t *error = compile(copy, len, &module);
   if (error) {
     take_failure(h, "compile", error, NULL);
@@ -232,7 +332,9 @@ int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes,
   }
   wasmtime_instance_t inst;
   wasm_trap_t *trap = NULL;
+  sub_profile_push(P_INSTANTIATE);
   error = wasmtime_instance_new(h->ctx, module, externs, imports.size, &inst, &trap);
+  sub_profile_pop();
   if (error || trap) {
     take_failure(h, "instantiate", error, trap);
     goto done;
@@ -253,8 +355,8 @@ done:
 
 /* ---- calls ------------------------------------------------------------ */
 
-int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
-             int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5) {
+static int call(sub_host *h, const char *inst, const char *fn, int nargs,
+                int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5) {
   int32_t args[6] = {a0, a1, a2, a3, a4, a5};
   if (nargs < 0 || nargs > 6) {
     set_err(h, "call: bad argument count %d", nargs);
@@ -289,6 +391,14 @@ int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
   }
   h->result = (nresults == 1 && res[0].kind == WASMTIME_I32) ? res[0].of.i32 : 0;
   return 0;
+}
+
+int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
+             int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5) {
+  p_enter_wasm();
+  int rc = call(h, inst, fn, nargs, a0, a1, a2, a3, a4, a5);
+  sub_profile_pop();
+  return rc;
 }
 
 /* ---- host imports ----------------------------------------------------- */
@@ -415,7 +525,10 @@ static wasm_trap_t *expander_call(void *env, wasmtime_caller_t *caller, const wa
   sub_host *h = wasmtime_context_get_data(wasmtime_caller_context(caller));
   if (!h->cb) return trap_msg("expander query used outside the expander");
   ENTER(h, caller);
+  if (p_on() && op >= 0 && op < 8) p_callbacks[op]++;
+  sub_profile_push(P_EMBEDDER);
   int32_t r = h->cb(op, nargs > 0 ? args[0].of.i32 : 0, nargs > 1 ? args[1].of.i32 : 0);
+  sub_profile_pop();
   LEAVE(h);
   if (h->pending_trap) {
     wasm_trap_t *t = trap_msg(h->pending_trap);

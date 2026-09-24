@@ -41,6 +41,8 @@ bin/subc expand FILE            # print fully expanded kernel forms
 bin/subc compile FILE -o OUT    # write FILE's parts (phase 0 to OUT)
 bin/subc syntax-library -o build/syntax.wasm      # write the syntax library
 wasm-tools print OUT            # inspect a module
+SUBHOST_PROFILE=1 bin/subc run FILE   # time per category, printed at exit
+SUBHOST_PROFILE=2 bin/subc run FILE   # also each wasm compile: size, time, instance
 ```
 
 ## Status

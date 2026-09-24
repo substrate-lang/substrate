@@ -59,4 +59,12 @@ int32_t sub_result(sub_host *h);
 void sub_set_callback(sub_host *h, sub_callback cb);
 void sub_request_trap(sub_host *h, const char *msg);
 
+/* Profiling, when SUBHOST_PROFILE is set: time is kept per category and
+ * printed at exit; SUBHOST_PROFILE=2 also logs each wasm compile. The
+ * embedder marks its own work with categories from
+ * SUB_PROFILE_FIRST_EMBEDDER on: marshal, codegen, read. */
+enum { SUB_PROFILE_FIRST_EMBEDDER = 4 };
+void sub_profile_push(int category);
+void sub_profile_pop(void);
+
 #endif

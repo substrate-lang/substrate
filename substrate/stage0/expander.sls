@@ -17,6 +17,10 @@
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 compile)
           (stage0 host) (stage0 marshal) (stage0 reader))
 
+  ;; Reading and code generation, marked for the host's profile.
+  (define (profiled-compile-module forms name) (with-profile 'codegen (lambda () (compile-module forms name))))
+  (define (profiled-read-file path) (with-profile 'read (lambda () (read-file path))))
+
   (define gc-forms
     '(struct.new struct.get struct.get_s struct.get_u struct.set
       array.new array.new_default array.new_fixed array.get array.get_s array.get_u array.set
@@ -121,12 +125,12 @@
         (with-comp c
           (lambda ()
             (parameterize ([current-syntax-infos #f])
-              (let* ([forms (lower-forms (expand-module-body (read-file library-path)) 0)]
+              (let* ([forms (lower-forms (expand-module-body (profiled-read-file library-path)) 0)]
                      [forms (append (storage-forms 0) forms)])
                 (for-each (lambda (f) (when (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) '%string))
                                         (set-string-type! (cadr f))))
                           forms)
-                (let-values ([(bytes imports gc?) (compile-module forms "syntax")])
+                (let-values ([(bytes imports gc?) (profiled-compile-module forms "syntax")])
                   (let ([table (make-eq-hashtable)])
                     (for-each (lambda (f)
                                 (case (car f)
@@ -460,7 +464,7 @@
            (with-comp c
              (lambda ()
                (parameterize ([current-syntax-infos (cdr syntax-lib)])
-                 (unit-expanded-set! m (expand-module-body (read-file source)))
+                 (unit-expanded-set! m (expand-module-body (profiled-read-file source)))
                  (finish-module! c))))
            m)])))
 
@@ -508,7 +512,7 @@
                                    (let ([ps (vector->list ks)]) (if (memv 0 ps) ps (cons 0 ps)))))])
         (for-each (lambda (p)
                     (let ([forms (append (storage-forms p) (reverse (hashtable-ref (comp-phase-forms c) p '())))])
-                      (let-values ([(bytes imports gc?) (compile-module forms (part-name m p 0))])
+                      (let-values ([(bytes imports gc?) (profiled-compile-module forms (part-name m p 0))])
                         (hashtable-set! (unit-parts m) p
                                         (make-part bytes imports gc? (literal-module-scopes forms))))))
                   phases))
@@ -1252,7 +1256,7 @@
 
   ;; Compile forms and instantiate them in store st, after what they import.
   (define (instantiate-chunk! st name forms where)
-    (let-values ([(bytes imports gc?) (compile-module forms name)])
+    (let-values ([(bytes imports gc?) (profiled-compile-module forms name)])
       (for-each (lambda (imp) (ensure-import! st imp 0)) imports)
       (guard (c [(wasm-failure? c)
                  (raise-compile-error where "compile-time code failed: ~a" (wasm-failure-message c))])
