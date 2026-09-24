@@ -66,6 +66,7 @@
 (provide [define lisp-define] [lambda lisp-lambda] [case-lambda lisp-case-lambda] [set! lisp-set!]
          [#%app app] [#%datum datum]
          [if lisp-if] cond else when unless and or [let lisp-let] letrec case do
+         define-record-type
          ;; equivalence and predicates
          eq? eqv? equal? not boolean? procedure?
          ;; pairs and lists
@@ -88,6 +89,10 @@
          list->vector vector-fill! vector-copy
          bytevector? bytevector make-bytevector bytevector-length bytevector-u8-ref
          bytevector-u8-set! bytevector-copy bytevector-copy! bytevector-append
+         ;; hash tables
+         make-eq-hashtable make-eqv-hashtable make-equal-hashtable hashtable? hashtable-count
+         hashtable-ref hashtable-contains? hashtable-set! hashtable-update! hashtable-delete!
+         hashtable-clear! hashtable-keys hashtable-values hashtable->alist
          ;; output and errors
          write display newline error)
 
@@ -95,13 +100,20 @@
 
 (type box (struct (field value (mut eqref))))
 
-;; Closures, vectors and bytevectors. One recursion group, so that no type
-;; declared elsewhere is the same wasm type as one of these (spec 5.2):
-;; otherwise another module's array of eqref would pass vector?.
+;; Closures, vectors, bytevectors, records and hash tables. One recursion
+;; group, so that no type declared elsewhere is the same wasm type as one
+;; of these (spec 5.2): otherwise another module's array of eqref would
+;; pass vector?.
 (rec (type closure (sub (struct (field code (ref code)))))
      (type code (func ((ref closure) i32 eqref eqref eqref eqref -> eqref)))
      (type vector (array (mut eqref)))
-     (type bytevector (array (mut i8))))
+     (type bytevector (array (mut i8)))
+     (type record-type (struct (field name eqref) (field fields eqref)))
+     (type record (sub (struct (field type (ref null record-type)) (field hash i32))))
+     (type hashtable (struct (field kind i32) (field count (mut i32)) (field buckets (mut (ref buckets)))))
+     (type buckets (array (mut (ref null entry))))
+     (type entry (struct (field key eqref) (field hash i32) (field value (mut eqref))
+                         (field next (mut (ref null entry))))))
 
 ;; The arguments after the first four, of the call being made.
 (type arguments (array (mut eqref)))
@@ -318,6 +330,12 @@
             (br next)))
         (return (out-byte 41))))
   (if (ref.test (ref closure) v) (return (out-string '"#<procedure>" 0)))
+  (if (ref.test (ref record) v)
+      (begin
+        (out-string '"#<" 0)
+        (out-datum (struct.get record-type name (ref.cast (ref record-type) (struct.get record type (ref.cast (ref record) v)))) 0)
+        (return (out-byte 62))))
+  (if (ref.test (ref hashtable) v) (return (out-string '"#<hashtable>" 0)))
   (if (s:syntax? v)
       (begin
         (out-string '"#<syntax " 0)
@@ -840,6 +858,66 @@
         (let ([spec (s:syntax->list (s:car specs))])
           (s:cons (if (s:null? (s:cddr spec)) (s:car spec) (s:caddr spec)) (do-steps (s:cdr specs))))))
 
+  ;; (define-record-type name (constructor field ...) predicate
+  ;;   (field accessor [modifier]) ...): see records, further on.
+  (func (define-record-type [stx eqref]) -> eqref
+    (let* ([parts (s:syntax->list stx)]
+           [name (s:cadr parts)]
+           [ctor (s:syntax->list (s:caddr parts))]
+           [pred (s:car (s:cdddr parts))]
+           [specs (s:cdr (s:cdddr parts))]
+           [fields (spec-fields specs)])
+      (if (ref.is_null ctor) (s:syntax-error (s:caddr parts) '"expected (constructor field ...)"))
+      #`(begin
+          (type T (sub final record (struct (field type (ref null record-type)) (field hash i32)
+                                            #,@(field-types fields))))
+          (global D (mut (ref null record-type)) (struct.new record-type '#,name '(#,@fields)))
+          (lisp-define (#,(s:car ctor) #,@(s:cdr ctor))
+            (struct.new T D (fresh-hash) #,@(field-inits fields (s:cdr ctor))))
+          (lisp-define (#,pred v) (bool (record-of? v D)))
+          #,@(accessors specs))))
+
+  (func (spec-fields [specs eqref]) -> eqref
+    (if (s:null? specs)
+        '()
+        (let ([spec (s:syntax->list (s:car specs))])
+          (if (i32.or (ref.is_null spec) (i32.lt_u (s:length spec) 2))
+              (s:syntax-error (s:car specs) '"expected (field accessor [modifier])"))
+          (s:cons (s:car spec) (spec-fields (s:cdr specs))))))
+
+  (func (field-types [fields eqref]) -> eqref
+    (if (s:null? fields) '() (s:cons #`(field #,(s:car fields) (mut eqref)) (field-types (s:cdr fields)))))
+
+  ;; Each field's value: the constructor's parameter of that name, or #f.
+  (func (field-inits [fields eqref] [params eqref]) -> eqref
+    (if (s:null? fields) (return '()))
+    (s:cons (param-named (s:car fields) params) (field-inits (s:cdr fields) params)))
+
+  (func (param-named [field eqref] [params eqref]) -> eqref
+    (if (s:null? params) (return #''#f))
+    (if (ref.eq (s:syntax-e (s:car params)) (s:syntax-e field)) (return (s:car params)))
+    (param-named field (s:cdr params)))
+
+  (func (name-string [id eqref]) -> eqref
+    (s:datum->syntax #'here (s:symbol->string (s:syntax-e id)) '#f))
+
+  (func (accessors [specs eqref]) -> eqref
+    (if (s:null? specs) (return '()))
+    (let* ([spec (s:syntax->list (s:car specs))]
+           [field (s:car spec)]
+           [get (s:cadr spec)]
+           [rest (accessors (s:cdr specs))]
+           [getter #`(lisp-define (#,get v)
+                       (struct.get T #,field (ref.cast (ref T) (record-arg v D '#,(name-string get)))))])
+      (if (s:null? (s:cddr spec))
+          (s:cons getter rest)
+          (let ([set (s:caddr spec)])
+            (s:cons getter
+                    (s:cons #`(lisp-define (#,set v x)
+                                (struct.set T #,field (ref.cast (ref T) (record-arg v D '#,(name-string set))) x)
+                                '#f)
+                            rest))))))
+
 
   ;; ---- closure conversion ----
   ;;
@@ -1079,6 +1157,7 @@
 (define-syntax letrec letrec)
 (define-syntax case case)
 (define-syntax do do)
+(define-syntax define-record-type define-record-type)
 (define-syntax convert convert)
 
 ;; ---- functions -------------------------------------------------------------------------
@@ -1901,6 +1980,251 @@
     [(to at from start) (bytevector-copy!* to at from start '#f)]
     [(to at from start end) (bytevector-copy!* to at from start end)]))
 (lisp-define (bytevector-append . vs) (bytevector-append-all vs))
+
+;; ---- records ----
+;;
+;; (define-record-type name (constructor field ...) predicate
+;;   (field accessor [modifier]) ...), as in R7RS. Each declaration makes a
+;; descriptor, a record-type naming the record and its fields, and its own
+;; struct type, a subtype of record. A record's kind is its descriptor, not
+;; its struct type: wasm compares struct types by structure, so two
+;; declarations with the same fields have the same one. Each record keeps a
+;; hash of its own, so it can be a key of an eq? hash table.
+
+(global hash-counter (mut i32) 0)
+
+;; The next record's hash: a count, spread over the i32s (Fibonacci
+;; hashing).
+(func (fresh-hash) -> i32
+  (set! hash-counter (i32.add hash-counter 1))
+  (i32.mul hash-counter -1640531535))
+
+(func (record-of? [v eqref] [d eqref]) -> i32
+  (if (i32.eqz (ref.test (ref record) v)) (return 0))
+  (ref.eq (struct.get record type (ref.cast (ref record) v)) d))
+
+;; v, which must be a record of descriptor d, for function who.
+(func (record-arg [v eqref] [d eqref] [who eqref]) -> (ref record)
+  (if (i32.eqz (record-of? v d))
+      (drop (wrong-type who
+                        (s:string-append '"a " (s:symbol->string (struct.get record-type name (ref.cast (ref record-type) d))))
+                        v)))
+  (ref.cast (ref record) v))
+
+;; ---- hash tables ----
+;;
+;; A hash table compares keys with eq? (kind 0), eqv? (1) or equal? (2).
+;; WasmGC gives no identity hash, so a key of an eq? or eqv? table must
+;; carry its own: symbols keep their name's, records one of their own, and
+;; numbers, characters, #t, #f and () hash by value. Other values can only
+;; be keys of equal? tables, which hash strings, pairs, vectors and
+;; bytevectors by their contents. Walks go through buckets in order, so
+;; they are deterministic.
+
+(func (mix [x i32]) -> i32
+  (let ([h (i32.mul (i32.xor x (i32.shr_u x 16)) -2048144789)])
+    (i32.xor h (i32.shr_u h 13))))
+
+(func (mix64 [x i64]) -> i32 (mix (i32.xor (i32.wrap_i64 x) (i32.wrap_i64 (i64.shr_u x 32)))))
+
+(func (key-hash [k eqref] [kind i32] [who eqref]) -> i32
+  (if (ref.is_null k) (return 0))
+  (if (s:fixnum? k) (return (mix (s:fixnum-value k))))
+  (if (s:symbol? k) (return (s:symbol-hash k)))
+  (if (ref.test (ref record) k) (return (struct.get record hash (ref.cast (ref record) k))))
+  (if (ref.eq k '#t) (return 1))
+  (if (s:null? k) (return 2))
+  (if (s:char? k) (return (mix (i32.add (s:char->integer k) 1114112))))
+  (if (s:integer? k) (return (mix64 (s:integer-value k))))
+  (if (s:flonum? k) (return (mix64 (i64.reinterpret_f64 (s:flonum-value k)))))
+  (if (i32.eq kind 2) (return (contents-hash k 16 who)))
+  (drop (wrong-type who '"a key with a hash (a symbol, record, number, character, boolean or ()); an equal? hash table takes others" k))
+  0)
+
+;; The hash of k by its contents, looking at up to limit parts of it.
+(func (contents-hash [k eqref] [limit i32] [who eqref]) -> i32
+  (if (s:string? k)
+      (let ([h -2128831035] [i 0] [n (s:string-length k)])
+        (block done
+          (loop next
+            (br-if done (i32.ge_u i n))
+            (set! h (i32.mul (i32.xor h (s:string-byte k i)) 16777619))
+            (set! i (i32.add i 1))
+            (br next)))
+        (return h)))
+  (if (s:pair? k)
+      (let ([h 3] [n 0])
+        (block done
+          (loop next
+            (br-if done (i32.eqz (s:pair? k)))
+            (br-if done (i32.ge_u n limit))
+            (set! h (i32.add (i32.mul h 31) (key-hash (s:car k) 2 who)))
+            (set! k (s:cdr k))
+            (set! n (i32.add n 1))
+            (br next)))
+        (return (mix h))))
+  (if (ref.test (ref vector) k)
+      (let ([a (ref.cast (ref vector) k)] [h 5] [i 0])
+        (block done
+          (loop next
+            (br-if done (i32.ge_u i (array.len a)))
+            (br-if done (i32.ge_u i limit))
+            (set! h (i32.add (i32.mul h 31) (key-hash (array.get vector a i) 2 who)))
+            (set! i (i32.add i 1))
+            (br next)))
+        (return (mix h))))
+  (if (ref.test (ref bytevector) k)
+      (let ([a (ref.cast (ref bytevector) k)] [h 7] [i 0])
+        (block done
+          (loop next
+            (br-if done (i32.ge_u i (array.len a)))
+            (set! h (i32.mul (i32.xor h (array.get_u bytevector a i)) 16777619))
+            (set! i (i32.add i 1))
+            (br next)))
+        (return h)))
+  (drop (wrong-type who '"a key with a hash or contents to hash" k))
+  0)
+
+(func (make-table [kind i32]) -> eqref
+  (struct.new hashtable kind 0 (array.new buckets (ref.null entry) 16)))
+
+(func (table-arg [t eqref] [who eqref]) -> (ref hashtable)
+  (if (i32.eqz (ref.test (ref hashtable) t)) (drop (wrong-type who '"a hash table" t)))
+  (ref.cast (ref hashtable) t))
+
+(func (bucket-of [t (ref hashtable)] [h i32]) -> i32
+  (i32.and h (i32.sub (array.len (struct.get hashtable buckets t)) 1)))
+
+;; The entry for key k, whose hash is h, or null.
+(func (find-entry [t (ref hashtable)] [k eqref] [h i32]) -> (ref null entry)
+  (let ([e (ref null entry) (array.get buckets (struct.get hashtable buckets t) (bucket-of t h))]
+        [kind (struct.get hashtable kind t)])
+    (block done
+      (loop next
+        (br-if done (ref.is_null e))
+        (if (i32.eq (struct.get entry hash e) h)
+            (if (same k (struct.get entry key e) kind) (return e)))
+        (set! e (struct.get entry next e))
+        (br next)))
+    (ref.null entry)))
+
+;; Add an entry, doubling the buckets when there are twice as many entries.
+(func (add-entry [t (ref hashtable)] [k eqref] [h i32] [v eqref])
+  (if (i32.ge_u (struct.get hashtable count t) (i32.shl (array.len (struct.get hashtable buckets t)) 1))
+      (rehash t (i32.shl (array.len (struct.get hashtable buckets t)) 1)))
+  (let* ([bs (struct.get hashtable buckets t)] [i (bucket-of t h)])
+    (array.set buckets bs i (struct.new entry k h v (array.get buckets bs i)))
+    (struct.set hashtable count t (i32.add (struct.get hashtable count t) 1))))
+
+(func (rehash [t (ref hashtable)] [n i32])
+  (let ([old (struct.get hashtable buckets t)] [new (array.new buckets (ref.null entry) n)] [i 0]
+        [e (ref null entry) (ref.null entry)] [next (ref null entry) (ref.null entry)] [j 0])
+    (block done
+      (loop buckets-loop
+        (br-if done (i32.ge_u i (array.len old)))
+        (set! e (array.get buckets old i))
+        (block chain-done
+          (loop chain
+            (br-if chain-done (ref.is_null e))
+            (set! next (struct.get entry next e))
+            (set! j (i32.and (struct.get entry hash e) (i32.sub n 1)))
+            (struct.set entry next e (array.get buckets new j))
+            (array.set buckets new j e)
+            (set! e next)
+            (br chain)))
+        (set! i (i32.add i 1))
+        (br buckets-loop)))
+    (struct.set hashtable buckets t new)))
+
+(func (remove-entry [t (ref hashtable)] [k eqref] [h i32])
+  (let* ([bs (struct.get hashtable buckets t)] [i (bucket-of t h)] [kind (struct.get hashtable kind t)]
+         [e (ref null entry) (array.get buckets bs i)] [prev (ref null entry) (ref.null entry)])
+    (block done
+      (loop next
+        (br-if done (ref.is_null e))
+        (if (i32.eq (struct.get entry hash e) h)
+            (if (same k (struct.get entry key e) kind)
+                (begin
+                  (if (ref.is_null prev)
+                      (array.set buckets bs i (struct.get entry next e))
+                      (struct.set entry next prev (struct.get entry next e)))
+                  (struct.set hashtable count t (i32.sub (struct.get hashtable count t) 1))
+                  (return))))
+        (set! prev e)
+        (set! e (struct.get entry next e))
+        (br next)))))
+
+;; The table's entries in order: each key (part 0), value (1), or both as a
+;; pair (2), in a list.
+(func (table-walk [t (ref hashtable)] [part i32]) -> eqref
+  (let ([bs (struct.get hashtable buckets t)] [i (array.len (struct.get hashtable buckets t))]
+        [e (ref null entry) (ref.null entry)] [acc '()] [chain '()])
+    (block done
+      (loop next
+        (br-if done (i32.eqz i))
+        (set! i (i32.sub i 1))
+        (set! e (array.get buckets bs i))
+        (set! chain '())
+        (block chain-done
+          (loop walk
+            (br-if chain-done (ref.is_null e))
+            (set! chain (s:cons (if (i32.eqz part) (struct.get entry key e)
+                                    (if (i32.eq part 1) (struct.get entry value e)
+                                        (s:cons (struct.get entry key e) (struct.get entry value e))))
+                                chain))
+            (set! e (struct.get entry next e))
+            (br walk)))
+        (set! acc (s:append (s:reverse chain) acc))
+        (br next)))
+    acc))
+
+(lisp-define (make-eq-hashtable) (make-table 0))
+(lisp-define (make-eqv-hashtable) (make-table 1))
+(lisp-define (make-equal-hashtable) (make-table 2))
+(lisp-define (hashtable? x) (bool (ref.test (ref hashtable) x)))
+(lisp-define (hashtable-count t) (s:fixnum (struct.get hashtable count (table-arg t '"hashtable-count"))))
+
+(lisp-define (hashtable-ref t k default)
+  (let* ([x (table-arg t '"hashtable-ref")]
+         [e (find-entry x k (key-hash k (struct.get hashtable kind x) '"hashtable-ref"))])
+    (if (ref.is_null e) default (struct.get entry value e))))
+
+(lisp-define (hashtable-contains? t k)
+  (let ([x (table-arg t '"hashtable-contains?")])
+    (bool (i32.eqz (ref.is_null (find-entry x k (key-hash k (struct.get hashtable kind x) '"hashtable-contains?")))))))
+
+(lisp-define (hashtable-set! t k v)
+  (let* ([x (table-arg t '"hashtable-set!")]
+         [h (key-hash k (struct.get hashtable kind x) '"hashtable-set!")]
+         [e (find-entry x k h)])
+    (if (ref.is_null e) (add-entry x k h v) (struct.set entry value e v))
+    '#f))
+
+;; Set k's value to (update value), value being k's value or default. update
+;; may change the table.
+(lisp-define (hashtable-update! t k update default)
+  (let* ([x (table-arg t '"hashtable-update!")]
+         [h (key-hash k (struct.get hashtable kind x) '"hashtable-update!")]
+         [e (find-entry x k h)]
+         [v (app update (if (ref.is_null e) default (struct.get entry value e)))])
+    (set! e (find-entry x k h))
+    (if (ref.is_null e) (add-entry x k h v) (struct.set entry value e v))
+    '#f))
+
+(lisp-define (hashtable-delete! t k)
+  (let ([x (table-arg t '"hashtable-delete!")])
+    (remove-entry x k (key-hash k (struct.get hashtable kind x) '"hashtable-delete!"))
+    '#f))
+
+(lisp-define (hashtable-clear! t)
+  (let ([x (table-arg t '"hashtable-clear!")])
+    (struct.set hashtable buckets x (array.new buckets (ref.null entry) 16))
+    (struct.set hashtable count x 0)
+    '#f))
+
+(lisp-define (hashtable-keys t) (list->vector* (table-walk (table-arg t '"hashtable-keys") 0) '"hashtable-keys"))
+(lisp-define (hashtable-values t) (list->vector* (table-walk (table-arg t '"hashtable-values") 1) '"hashtable-values"))
+(lisp-define (hashtable->alist t) (table-walk (table-arg t '"hashtable->alist") 2))
 
 ;; ---- output and errors ----
 
