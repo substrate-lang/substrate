@@ -37,7 +37,7 @@ specified but not built yet.
 | compiler | Reader, expander, kernel compiler, binary encoder. | stage0: `stage0/*.sls` (Chez Scheme) |
 | syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `compiler/syntax.sub` (kernel code) |
 | libraries | Ordinary modules: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
-| languages | Later libraries built on the kernel: structs, effects, a dynamic Lisp, ... | not yet |
+| languages | Libraries that together make a language, such as the planned dynamic Lisp. | not yet |
 
 ### 1.3 What runs where
 
@@ -217,15 +217,15 @@ macros can add dependencies the program never wrote.
 
 ### 3.5 Initialization
 
-Globals whose initializer is a numeric literal get it as their wasm
-constant initializer, and reference globals start as null. Then the part's
-start function runs:
+A global whose initializer is a constant expression (5.2) gets it as its
+wasm initializer. The others start at their type's default, zero or null.
+Then the part's start function runs:
 
 1. For each function whose table index the part takes (`func-index`),
    append it to the table and keep the index in a global. Build each quoted
    constant with the syntax library's functions and keep it in a global.
    These happen in the order the compiler meets them.
-2. The remaining global initializers and module-level expressions, in
+2. The other global initializers and module-level expressions, in
    source order.
 
 Quoted fixnums and `#f` need no global: they are the constant expressions
@@ -328,6 +328,18 @@ splices `begin`. The second pass expands function bodies and expressions. So
 functions may be mutually recursive, and a macro must be defined before it
 is used. A transformer must come from an earlier `begin-for-syntax`, or
 from a module required inside one.
+
+A macro used at module level runs in the first pass, so it sees only the
+definitions before it; `binding-kind` reports a later one as unbound. A
+macro that needs the whole module can expand into a core expression form,
+such as `let`, whose contents wait for the second pass. Module-level
+applications and literals are expressions: their implicit `#%app` and
+`#%datum` (5.3, 5.4) are applied in the second pass, when every
+definition is known. Racket applies `#%app` in the first pass, which is
+harmless there because its `#%app` does not depend on what the function
+is; here a language's `#%app` usually does (`binding-kind`). So an
+application cannot expand into a definition; a language provides a named
+form, such as `define`, for that.
 
 Type declarations follow wasm. A type without `sub` is final and has no
 supertype. `(sub super def)` declares a subtype of `super`, which must be
@@ -626,10 +638,6 @@ A library usually provides a macro that expands into the declaration.
 
 ## 7. Open questions and later milestones
 
-- **Reusing compiled modules across runs**: v0 compiles every required
-  module in each run, and a compiled part is valid only in the run that
-  produced it. Reuse needs a module's binding table written out with its
-  parts, and scope ids relative to the module.
 - **Memory and table definitions at phase ≥ 1**: v0 supports only
   `(memory from name)` there.
 - **More require and provide forms**: re-exporting, renaming on provide,
@@ -639,9 +647,12 @@ A library usually provides a macro that expands into the declaration.
   declaration (5.1), so `(tuple i32 3)` in two modules is two types to
   the checker, though one to wasm, and a value cannot pass between the
   modules at that type. Zig gives the same arguments the same type
-  everywhere. Dependent types, a rung after bootstrap, need that. One way
-  is declarations the checker compares by structure, as wasm does, for
-  type functions to use; nothing planned before bootstrap needs it.
+  everywhere, and dependent types, a rung after bootstrap, need that. One
+  way is to identify the types a type function declares by a hash of
+  their content. Done correctly, that hashes each strongly connected
+  component of the type graph as a unit, with a canonical order of its
+  members, which needs recursion groups, and it should agree with wasm's
+  own canonicalization of recursion groups.
 - **Inferred types in expanded code**: expanded code carries only the
   types the source wrote (6.4). A pass that creates wasm declarations from
   the code it rewrites, such as CPS for general effect handlers or closure
@@ -654,8 +665,6 @@ A library usually provides a macro that expands into the declaration.
   pass the library's type tests. Recursion groups can make types distinct
   when this matters, and would also allow mutually recursive types, which
   v0 lacks.
-- **Seed without an engine**: a Zig-style seed translated to native code
-  would need a GC implementation. Wastrel has one.
 - **More kinds of data**: bignums, floats and vectors as values are not in
   v0.
 
