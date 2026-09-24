@@ -28,6 +28,18 @@
   (let ([m (member flag args)])
     (if (and m (pair? (cdr m))) (cadr m) default)))
 
+;; Print an expanded form. Chez writes the symbol #%app as \x23;%app, since
+;; its own reader gives #% another meaning; print it as written.
+(define (print-expanded f)
+  (let ([s (with-output-to-string (lambda () (pretty-print (stx->datum f))))]
+        [from "\\x23;%"])
+    (let loop ([i 0])
+      (cond [(= i (string-length s)) (void)]
+            [(and (<= (+ i (string-length from)) (string-length s))
+                  (string=? (substring s i (+ i (string-length from))) from))
+             (display "#%") (loop (+ i (string-length from)))]
+            [else (write-char (string-ref s i)) (loop (+ i 1))]))))
+
 (define (die code fmt . args)
   (flush-output-port (current-output-port))
   (apply fprintf (current-error-port) fmt args)
@@ -56,7 +68,7 @@
                                  (cdr p)))
                    (module-part-list m)))]
       [(and (= (length args) 2) (string=? (car args) "expand"))
-       (for-each (lambda (f) (pretty-print (strip-ast f))) (module-expanded-forms (compile-module-file (cadr args))))]
+       (for-each print-expanded (module-expanded-forms (compile-module-file (cadr args))))]
       [(and (>= (length args) 1) (string=? (car args) "syntax-library"))
        (write-file (option args "-o" "build/syntax.wasm") (syntax-library-bytes))]
       [else (die 64 "usage: subc run FILE | compile FILE [-o OUT] | expand FILE | syntax-library [-o OUT]")])

@@ -53,7 +53,9 @@ instantiated in the compile-time store and called by the expander.
 `binding-kind` and syntax properties work too, and macros are hygienic
 (introduction and use-site scopes, spec 6.2). A module can change what
 application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
-5.4).
+5.4). Expansion produces expanded code, syntax in a fixed grammar (spec
+6.4): a macro can see its input's with `local-expand`, a module pass
+(spec 6.5) can rewrite a whole module's, and `subc expand` prints it.
 Modules `require` each other by name, with
 qualified imports (`print:write-int`), at any phase:
 each phase of a module compiles to its own wasm part, and a program loads

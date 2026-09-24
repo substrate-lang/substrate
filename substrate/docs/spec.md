@@ -95,7 +95,7 @@ from the instance `"syntax"`. Parameters are `eqref` unless marked
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(symbol? v) -> i32`, `(symbol->string s)`, `(intern s)`, `(symbol-append a b)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
-| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)` |
+| queries | `(syntax-local-value id)` (the value bound by `define-static`, or `#f`), `(syntax-error stx msg)` (aborts expansion, blamed on `stx`; returns nothing), `(free-identifier=? a b) -> i32`, `(binding-kind id)`, `(local-expand stx)` |
 
 - `syntax-e` of an identifier is a symbol, and of a literal it is the
   literal's value. Of a list it is a list whose elements are syntax.
@@ -122,6 +122,12 @@ from the instance `"syntax"`. Parameters are `eqref` unless marked
   global), `macro`, `static`, `data`, `label` or `core` (a core form or wasm
   operator), or `#f` if it is unbound. An implicit `#%app` (5.3) uses it to
   tell a call of a function from a call through a variable.
+- `local-expand` expands expression `stx` at the running macro's phase and
+  returns it as expanded code (6.4), so a macro can look at what its input
+  becomes, and put the result in its output. As in Racket, the macro's
+  introduction scope is flipped around the expansion, so code from the
+  macro's input expands as it would at the use site. [v0] Only
+  expressions, with no list of identifiers to stop at.
 
 The queries only work while an expander is running. [v0] Stage0 answers
 them in Chez; in a run-time store they trap.
@@ -289,6 +295,7 @@ quotation and compile-time forms.
 (require name source item ...)      ; source: "path" or syntax; item: x or [new old]
 (provide id ...)                    ; phase 0 only
 (runtime-free)                      ; see 3.4
+(module-pass f)                     ; phase 0; f: a phase+1 function (6.5)
 (define-syntax name transformer)    ; transformer: a phase+1 function (2.1)
 (define-static name expr)           ; expr is phase+1 code, run now
 (begin-for-syntax form ...)         ; forms at phase+1
@@ -516,6 +523,81 @@ a local scope.
 copy, through the syntax library's embedder functions (appendix A). The
 self-hosted expander will hold references directly and need no copy.
 
+### 6.4 Expanded code
+
+Expansion turns a module into **expanded code**: syntax in the grammar
+below, with every macro use expanded and every application and literal
+explicit. `local-expand` returns it, module passes receive and return it,
+`subc expand` prints it, and the compiler compiles it.
+
+```
+form ::= (func (id [id type] ...) [-> result] expr ...)
+       | (global id type expr) | (global id (mut type) expr)
+       | (import id "module" "field" (type ... -> type ...))
+       | (type id def) | (data id offset "bytes" ...)
+       | expr
+
+expr ::= id                                   ; a local or global variable
+       | (#%datum literal)                    ; a wasm number, typed by context
+       | (quote datum) | (quote-syntax datum)
+       | (#%app id expr ...)                  ; a direct call; id names a function
+       | (op expr ... [offset])               ; a wasm numeric or memory operator
+       | (gc-op immediate ... expr ...)       ; struct.new, ref.cast, ... (5.3)
+       | (let ([id expr] | [id type expr] ...) expr ...)
+       | (set! id expr) | (begin expr ...) | (if expr expr [expr])
+       | (block id expr ...) | (loop id expr ...)
+       | (br id [expr]) | (br-if id expr) | (return [expr])
+       | (call-indirect (type ... -> type ...) expr expr ...)
+       | (func-index id) | (data-address id) | (data-size id)
+       | (select expr expr expr) | (drop expr) | (unreachable) | (nop)
+```
+
+- The other module-level forms (`require`, `provide`, `memory`, `table`,
+  `runtime-free`, `module-pass`, `define-syntax`, `define-static`,
+  `begin-for-syntax`) take effect during expansion and leave nothing.
+  `let*` becomes nested `let`s. `quasiquote` and `quasisyntax` become
+  calls to the syntax library's functions, through identifiers with a
+  scope of their own that no module's code has, so user code cannot name
+  them.
+- Types appear where the source wrote them: parameters, results,
+  globals, and `let` bindings that give one. Expanded code carries no
+  inferred types; the kernel's checker infers them after the passes, as
+  it does for any code.
+- **The core forms in expanded code are named by identifiers with only the
+  core scope**, so they mean the core forms in any module, whatever it
+  binds, for example its own `let` or `#%app`. Every other identifier keeps
+  its scopes and resolves as before.
+- **Expanded code can be expanded again**, with the same meaning. Its
+  binding forms bind again under fresh scopes, which the references inside
+  them get too. So a macro can put `local-expand`'s result into its
+  output.
+
+### 6.5 Module passes
+
+`(module-pass f)` declares that once the module is expanded, the phase+1
+function `f`, of type `(eqref) -> eqref` like a transformer, rewrites the
+module's phase-0 expanded code. Passes run in the order they are declared.
+A library usually provides a macro that expands into the declaration.
+
+- A pass gets the module's forms as one syntax list and returns a list of
+  forms, as a syntax list or a plain list. It may add, remove and rewrite
+  forms, and write any code, not only expanded code.
+- What it returns is expanded again, then type-checked and compiled like
+  any code, so a pass's mistakes are compile errors. A definition it
+  returns with the same name and scopes as one of the module's replaces
+  that definition, so a pass can change a function's body or signature.
+  It may return only `func`, `global`, `import`, `type` and `data` forms
+  and expressions.
+- A pass has an introduction scope, as a macro use does (6.2): flipped on
+  its input and its output, so the names it introduces, such as a global
+  it adds, cannot capture the module's names or be named by them.
+- Racket reaches a module's expanded code through `#%module-begin` and
+  `local-expand` of the whole body. The kernel has no `#%module-begin`: a
+  library that wants a module's body gets it by having the module wrap the
+  body in one of its macros, and a pass works on the expanded result.
+- [v0] Only phase 0 has passes, and only the module that declares one is
+  rewritten by it.
+
 ## 7. Open questions and later milestones
 
 - **Reusing compiled modules across runs**: v0 compiles every required
@@ -527,14 +609,14 @@ self-hosted expander will hold references directly and need no copy.
   `(memory from name)` there.
 - **More require and provide forms**: re-exporting, renaming on provide,
   requiring several phases up without nesting `begin-for-syntax`.
-- **Extension points**: still to come are fully expanded code as syntax
-  (a grammar that becomes part of the macro contract), `local-expand` for
-  expressions, a hook for passes over a module's fully expanded code, and
-  lifting definitions out of expressions (a `lambda` must become a
-  module-level function). Racket's `#%module-begin` is not planned: a
-  library that wants a whole module body gets it by having the module
-  wrap its body in the library's macro, and the pass hook covers work on
-  the expanded result.
+- **Extension points still to come**: lifting definitions out of
+  expressions (a `lambda` must become a module-level function);
+  `local-expand` with identifiers to stop at, and in definition contexts;
+  passes at phase 1 and up. Expanded code has no inferred types (6.4). A
+  pass that creates wasm declarations from the code it rewrites, such as
+  CPS or closure conversion for a typed language, would need the checker
+  to write types into expanded code before the pass, and queries for the
+  types of imported definitions.
 - **Type identity at run time**: wasm treats identical type definitions as
   the same type (5.1). A program type with the same shape as one of the
   syntax library's (a struct of two immutable `eqref` fields, say) would
