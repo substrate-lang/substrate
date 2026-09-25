@@ -10,10 +10,16 @@
 #   NAME.imports  the instance names the compiled phase-0 linklet may import
 #                 from, one per line (checks that programs import only what
 #                 they use)
+#
+# COMPILER is the compiler to build with (default bin/subc, stage0; bin/sub
+# is the compiler written in Substrate), and OUT where builds go (default
+# build).
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+compiler="$root/${COMPILER:-bin/subc}"
+builds="${OUT:-build}"
 
 # Build the syntax library once first, so library compile notices stay out
 # of test output.
@@ -27,12 +33,12 @@ for t in tests/*.sub examples/*.sub; do
   dir="$(dirname "$t")"
   name="$(basename "$t" .sub)"
   base="$dir/$name"
-  out="build/$dir"
+  out="$builds/$dir"
   mkdir -p "$out"
   program="$out/$name"
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
-  actual="$(cd "$dir" && "$root/bin/subc" build "$name.sub" -o "$root/$program" 2>&1 &&
+  actual="$(cd "$dir" && "$compiler" build "$name.sub" -o "$root/$program" 2>&1 &&
             "$root/build/subhost" "$root/$program" "${args[@]}" 2>&1)"
   code=$?
   problem=""
