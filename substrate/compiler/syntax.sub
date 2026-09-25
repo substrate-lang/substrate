@@ -58,7 +58,8 @@
   (type %pair (struct (field car eqref) (field cdr eqref)))
   (type %symbol (struct (field name (ref %string)) (field hash i32)))
   (type %atom (struct (field kind i32) (field value i32)))    ; kind 0 char, 1 #t, 2 ()
-  (type %syntax (struct (field e eqref) (field scopes eqref) (field srcloc eqref) (field props eqref)))
+  (type %syntax (struct (field e (mut eqref)) (field scopes eqref) (field srcloc eqref) (field props eqref)
+                       (field pending (mut eqref))))
   (type %srcloc (struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32)))
   (type %table (array (mut eqref)))
   (type %integer (struct (field negative i32) (field magnitude i64)))
@@ -378,11 +379,18 @@
   (set! %scope-map (cons (cons (fixnum from) (fixnum to)) %scope-map)))
 (func (%scope-map-clear) (set! %scope-map %nil))
 
+;; A copy can be newer than scopes that came after the scope it replaces,
+;; so the shifted scopes are added one at a time, to keep the set in order.
 (func (%shift-scopes [scopes eqref]) -> eqref
-  (if (null? %scope-map) (return scopes))
-  (if (pair? scopes)
-      (cons (%shift-scope (car scopes) %scope-map) (%shift-scopes (cdr scopes)))
-      scopes))
+  (let ([out %nil])
+    (if (null? %scope-map) (return scopes))
+    (block done
+      (loop next
+        (br-if done (i32.eqz (pair? scopes)))
+        (set! out (%scopes-change out (fixnum-value (%shift-scope (car scopes) %scope-map)) 0))
+        (set! scopes (cdr scopes))
+        (br next)))
+    out))
 
 (func (%shift-scope [sc eqref] [m eqref]) -> eqref
   (if (null? m) (return sc))
@@ -392,7 +400,7 @@
 ;; A syntax literal, as compiled code builds it: its scopes are shifted by
 ;; %scope-map. Other syntax objects are made directly.
 (func (%make-syntax [e eqref] [scopes eqref] [srcloc eqref] [props eqref]) -> eqref
-  (struct.new %syntax e (%shift-scopes scopes) srcloc props))
+  (struct.new %syntax e (%shift-scopes scopes) srcloc props %nil))
 
 (func (%make-srcloc [source eqref] [line i32] [col i32] [pos i32] [span i32]) -> eqref
   (struct.new %srcloc source line col pos span))
@@ -403,15 +411,94 @@
   (if (i32.eqz (syntax? v)) (%fail (data-address %msg-syntax) (data-size %msg-syntax)))
   (ref.cast (ref %syntax) v))
 
-(func (syntax-e [s eqref]) -> eqref (struct.get %syntax e (%as-syntax s)))
-(func (identifier? [v eqref]) -> i32 (if (syntax? v) (symbol? (syntax-e v)) 0))
+(func (syntax-e [s eqref]) -> eqref
+  (let ([x (%as-syntax s)])
+    (if (pair? (struct.get %syntax pending x))
+        (begin
+          (struct.set %syntax e x (%push (struct.get %syntax e x) (struct.get %syntax pending x)))
+          (struct.set %syntax pending x %nil)))
+    (struct.get %syntax e x)))
+
+;; Changes pending for the syntax objects inside a syntax object do not
+;; change the shape of its datum, so these read it as it is.
+(func (%syntax-datum [s eqref]) -> eqref (struct.get %syntax e (%as-syntax s)))
+(func (identifier? [v eqref]) -> i32 (if (syntax? v) (symbol? (%syntax-datum v)) 0))
+
+;; ---- scope changes ----
+;;
+;; Adding, removing or flipping a scope on a syntax object makes the same
+;; change to every syntax object inside it (spec 6.1). Its own scopes change
+;; at once; the change to its datum is pending, and syntax-e makes it one
+;; level down when something looks inside. Pending changes are a list of
+;; (scope . change), change 0 to add, 1 to remove or 2 to flip, at most
+;; one per scope. Scope sets are lists of fixnums, newest (greatest)
+;; first, so a change to a new scope is made at the front.
+
+;; Scope set s with change made to scope sc.
+(func (%scopes-change [s eqref] [sc i32] [change i32]) -> eqref
+  (if (i32.eqz (pair? s)) (return (if (i32.eq change 1) s (cons (fixnum sc) %nil))))
+  (let ([first (fixnum-value (car s))] [rest %nil])
+    (if (i32.eq first sc) (return (if (i32.eqz change) s (cdr s))))
+    (if (i32.lt_s first sc) (return (if (i32.eq change 1) s (cons (fixnum sc) s))))
+    (set! rest (%scopes-change (cdr s) sc change))
+    (if (ref.eq rest (cdr s)) s (cons (car s) rest))))
+
+;; Scope set s with changes made.
+(func (%scopes-apply [s eqref] [changes eqref]) -> eqref
+  (block done
+    (loop next
+      (br-if done (i32.eqz (pair? changes)))
+      (set! s (%scopes-change s (fixnum-value (car (car changes))) (fixnum-value (cdr (car changes)))))
+      (set! changes (cdr changes))
+      (br next)))
+  s)
+
+;; Changes, then change to scope sc. An add or a remove replaces an earlier
+;; change to sc; a flip turns an add into a remove, a remove into an add,
+;; and undoes a flip.
+(func (%changes-add [changes eqref] [sc i32] [change i32]) -> eqref
+  (if (i32.eqz (pair? changes)) (return (cons (cons (fixnum sc) (fixnum change)) %nil)))
+  (if (i32.eq (fixnum-value (car (car changes))) sc)
+      (let ([before (fixnum-value (cdr (car changes)))])
+        (if (i32.ne change 2) (return (cons (cons (fixnum sc) (fixnum change)) (cdr changes))))
+        (if (i32.eq before 2) (return (cdr changes)))
+        (return (cons (cons (fixnum sc) (fixnum (i32.sub 1 before))) (cdr changes)))))
+  (cons (car changes) (%changes-add (cdr changes) sc change)))
+
+;; Changes, then later ones.
+(func (%changes-compose [changes eqref] [later eqref]) -> eqref
+  (if (null? changes) (return later))
+  (block done
+    (loop next
+      (br-if done (i32.eqz (pair? later)))
+      (set! changes (%changes-add changes (fixnum-value (car (car later))) (fixnum-value (cdr (car later)))))
+      (set! later (cdr later))
+      (br next)))
+  changes)
+
+;; Syntax object s with changes made to it and, pending, to its datum.
+(func (%syntax-change-all [s eqref] [changes eqref]) -> eqref
+  (let* ([x (%as-syntax s)] [e (struct.get %syntax e x)])
+    (struct.new %syntax e (%scopes-apply (struct.get %syntax scopes x) changes)
+                (struct.get %syntax srcloc x) (struct.get %syntax props x)
+                (if (i32.or (pair? e) (syntax? e))
+                    (%changes-compose (struct.get %syntax pending x) changes)
+                    %nil))))
+
+;; Datum d with changes made to the syntax objects in it, outside any
+;; syntax object.
+(func (%push [d eqref] [changes eqref]) -> eqref
+  (if (pair? d) (return (cons (%push (car d) changes) (%push (cdr d) changes))))
+  (if (syntax? d) (return (%syntax-change-all d changes)))
+  d)
+
 
 ;; A copy of s holding datum e: same scopes, srcloc and props. Used by
 ;; quasisyntax to rebuild a template around new parts.
 (func (syntax-rewrap [s eqref] [e eqref]) -> eqref
   (let ([x (%as-syntax s)])
     (struct.new %syntax e (struct.get %syntax scopes x) (struct.get %syntax srcloc x)
-                (struct.get %syntax props x))))
+                (struct.get %syntax props x) %nil)))
 
 ;; Properties: a syntax object's props are a list of (key . value) pairs.
 ;; Keys are compared with ref.eq, so symbols make good keys.
@@ -431,7 +518,8 @@
 (func (syntax-property-set [s eqref] [key eqref] [value eqref]) -> eqref
   (let ([x (%as-syntax s)])
     (struct.new %syntax (struct.get %syntax e x) (struct.get %syntax scopes x) (struct.get %syntax srcloc x)
-                (cons (cons key value) (%props-without (struct.get %syntax props x) key)))))
+                (cons (cons key value) (%props-without (struct.get %syntax props x) key))
+                (struct.get %syntax pending x))))
 
 (func (%props-without [ps eqref] [key eqref]) -> eqref
   (if (i32.eqz (pair? ps)) (return ps))
@@ -469,7 +557,7 @@
   (let ([e (splice-list x)]) (if (list? e) e (ref.null eq))))
 
 (func (syntax->datum [x eqref]) -> eqref
-  (if (syntax? x) (return (syntax->datum (syntax-e x))))
+  (if (syntax? x) (return (syntax->datum (%syntax-datum x))))
   (if (pair? x) (return (cons (syntax->datum (car x)) (syntax->datum (cdr x)))))
   x)
 
@@ -483,8 +571,8 @@
 
 (func (%wrap [d eqref] [scopes eqref] [loc eqref]) -> eqref
   (if (syntax? d) (return d))
-  (if (pair? d) (return (struct.new %syntax (%wrap-list d scopes loc) scopes loc %nil)))
-  (struct.new %syntax d scopes loc %nil))
+  (if (pair? d) (return (struct.new %syntax (%wrap-list d scopes loc) scopes loc %nil %nil)))
+  (struct.new %syntax d scopes loc %nil %nil))
 
 (func (%wrap-list [d eqref] [scopes eqref] [loc eqref]) -> eqref
   (if (pair? d) (return (cons (%wrap (car d) scopes loc) (%wrap-list (cdr d) scopes loc))))
@@ -694,6 +782,11 @@
 ;; functions above.
 
 (func (%syntax-scopes [s eqref]) -> eqref (struct.get %syntax scopes (%as-syntax s)))
+
+;; Syntax object s with scope sc added (change 0), removed (1) or flipped
+;; (2), in it and in every syntax object inside it.
+(func (%syntax-change [s eqref] [sc eqref] [change eqref]) -> eqref
+  (%syntax-change-all s (cons (cons sc change) %nil)))
 (func (%syntax-srcloc [s eqref]) -> eqref (struct.get %syntax srcloc (%as-syntax s)))
 (func (%syntax-props [s eqref]) -> eqref (struct.get %syntax props (%as-syntax s)))
 
@@ -878,7 +971,7 @@
   (if (keyword? v) (let ([i (%out-new 13)]) (%out-string (%as-string (keyword->string v))) (return i)))
   (if (syntax? v)
       (let* ([x (%as-syntax v)]
-             [e (%out (struct.get %syntax e x))] [s (%out (struct.get %syntax scopes x))]
+             [e (%out (syntax-e x))] [s (%out (struct.get %syntax scopes x))]
              [l (%out (struct.get %syntax srcloc x))] [p (%out (struct.get %syntax props x))]
              [i (%out-new 8)])
         (%out-uleb e) (%out-uleb s) (%out-uleb l) (%out-uleb p)

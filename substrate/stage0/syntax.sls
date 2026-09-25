@@ -25,10 +25,25 @@
               (reverse acc)
               (loop (map cdr lists) (cons (apply f (map car lists)) acc))))))
 
-  (define-record-type stx (fields e scopes srcloc props))
+  ;; pending: the scope changes still to be made to the syntax objects in
+  ;; e (see change-scope).
+  (define-record-type (stx new-stx stx?)
+    (fields (mutable e stx-datum stx-datum-set!) scopes srcloc props (mutable pending)))
+  (define (make-stx e scopes srcloc props) (new-stx e scopes srcloc props '()))
+
+  (define (stx-e x)
+    (let ([p (stx-pending x)])
+      (unless (null? p)
+        (stx-datum-set! x (push (stx-datum x) p))
+        (stx-pending-set! x '()))
+      (stx-datum x)))
+
   (define-record-type srcloc (fields source line col pos span))
 
-  (define (id? x) (and (stx? x) (symbol? (stx-e x))))
+  ;; Pending changes do not change the shape of a datum, so this reads it
+  ;; as it is.
+  (define (id? x) (and (stx? x) (symbol? (stx-datum x))))
+
 
   ;; Keywords: #:name reads as one, interned by name, so equal keywords are
   ;; eq?. They print as they read.
@@ -43,12 +58,12 @@
     (record-writer (record-type-descriptor keyword)
                    (lambda (k port wr) (display "#:" port) (display (keyword-name k) port))))
 
-  ;; ---- scope sets: sorted lists of fixnums --------------------------------
+  ;; ---- scope sets: lists of fixnums, newest (greatest) first -------------
 
   (define (scopes-add set sc)
     (cond [(null? set) (list sc)]
           [(= (car set) sc) set]
-          [(< sc (car set)) (cons sc set)]
+          [(> sc (car set)) (cons sc set)]
           [else (cons (car set) (scopes-add (cdr set) sc))]))
 
   (define (scopes-remove set sc)
@@ -63,10 +78,71 @@
     (cond [(null? a) #t]
           [(null? b) #f]
           [(= (car a) (car b)) (scopes-subset? (cdr a) (cdr b))]
-          [(> (car a) (car b)) (scopes-subset? a (cdr b))]
+          [(< (car a) (car b)) (scopes-subset? a (cdr b))]
           [else #f]))
 
-  ;; Apply op to the scopes of every syntax object inside x.
+  ;; ---- scope changes ------------------------------------------------------
+  ;;
+  ;; Adding, removing or flipping a scope on a syntax object makes the same
+  ;; change to every syntax object inside it (spec 6.1). Its own scopes
+  ;; change at once; the change to its datum is pending, and stx-e makes it
+  ;; one level down when something looks inside. Pending changes are a list
+  ;; of (scope . change), change 0 to add, 1 to remove or 2 to flip, at most
+  ;; one per scope.
+
+  (define (scopes-change s sc change)
+    (case change
+      [(0) (scopes-add s sc)]
+      [(1) (scopes-remove s sc)]
+      [else (scopes-flip s sc)]))
+
+  (define (scopes-apply s changes)
+    (fold-left (lambda (s c) (scopes-change s (car c) (cdr c))) s changes))
+
+  ;; Changes, then change to scope sc. An add or a remove replaces an
+  ;; earlier change to sc; a flip turns an add into a remove, a remove into
+  ;; an add, and undoes a flip.
+  (define (changes-add changes sc change)
+    (cond [(null? changes) (list (cons sc change))]
+          [(eqv? (caar changes) sc)
+           (let ([before (cdar changes)])
+             (cond [(not (eqv? change 2)) (cons (cons sc change) (cdr changes))]
+                   [(eqv? before 2) (cdr changes)]
+                   [else (cons (cons sc (- 1 before)) (cdr changes))]))]
+          [else (cons (car changes) (changes-add (cdr changes) sc change))]))
+
+  (define (changes-compose changes later)
+    (if (null? changes)
+        later
+        (fold-left (lambda (changes c) (changes-add changes (car c) (cdr c))) changes later)))
+
+  ;; Syntax object x with changes made to it and, pending, to its datum.
+  (define (stx-change-all x changes)
+    (let ([e (stx-datum x)])
+      (new-stx e (scopes-apply (stx-scopes x) changes) (stx-srcloc x) (stx-props x)
+               (if (or (pair? e) (vector? e) (stx? e)) (changes-compose (stx-pending x) changes) '()))))
+
+  ;; Datum d with changes made to the syntax objects in it, outside any
+  ;; syntax object.
+  (define (push d changes)
+    (cond [(pair? d) (cons (push (car d) changes) (push (cdr d) changes))]
+          [(vector? d) (vector-map (lambda (y) (push y changes)) d)]
+          [(stx? d) (stx-change-all d changes)]
+          [else d]))
+
+  ;; Add scope sc (change 0), remove it (1) or flip it (2) in every syntax
+  ;; object inside x.
+  (define (change-scope x sc change)
+    (cond [(stx? x) (stx-change-all x (list (cons sc change)))]
+          [(pair? x) (cons (change-scope (car x) sc change) (change-scope (cdr x) sc change))]
+          [(vector? x) (vector-map (lambda (y) (change-scope y sc change)) x)]
+          [else x]))
+
+  (define (add-scope x sc) (change-scope x sc 0))
+  (define (remove-scopes x scs) (fold-left (lambda (x sc) (change-scope x sc 1)) x scs))
+  (define (flip-scope x sc) (change-scope x sc 2))
+
+  ;; Apply op to the scopes of every syntax object inside x, now.
   (define (map-scopes x op)
     (cond [(stx? x)
            (make-stx (map-scopes (stx-e x) op) (op (stx-scopes x)) (stx-srcloc x) (stx-props x))]
@@ -74,15 +150,12 @@
           [(vector? x) (vector-map (lambda (y) (map-scopes y op)) x)]
           [else x]))
 
-  (define (add-scope x sc) (map-scopes x (lambda (s) (scopes-add s sc))))
-  (define (remove-scopes x scs) (map-scopes x (lambda (s) (fold-left scopes-remove s scs))))
-  (define (flip-scope x sc) (map-scopes x (lambda (s) (scopes-flip s sc))))
   (define (filter-scopes x keep?) (map-scopes x (lambda (s) (filter keep? s))))
 
   ;; ---- conversions --------------------------------------------------------
 
   (define (stx->datum x)
-    (cond [(stx? x) (stx->datum (stx-e x))]
+    (cond [(stx? x) (stx->datum (stx-datum x))]
           [(pair? x) (cons (stx->datum (car x)) (stx->datum (cdr x)))]
           [(vector? x) (vector-map stx->datum x)]
           [else x]))

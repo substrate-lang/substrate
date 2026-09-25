@@ -223,7 +223,7 @@
   ;; ---- bindings ----
 
   ;; The scope a binding with these scopes is kept under.
-  (define (binding-slot scopes) (if (null? scopes) -1 (car (last-pair scopes))))
+  (define (binding-slot scopes) (if (null? scopes) -1 (car scopes)))
 
   ;; The bindings of sym kept under scope sc.
   (define (bindings-under sym sc)
@@ -554,7 +554,7 @@
     (let ([m (comp-module c)])
       (unit-expanded-set! m (apply-module-passes c (unit-expanded m)))
       (unit-expanded-set! m (apply-linklet-hook 'module (unit-expanded m)
-                                                (make-stx 'module (list core-scope (unit-scope m)) #f '()) 0))
+                                                (make-stx 'module (list (unit-scope m) core-scope) #f '()) 0))
       (removed-definitions (definitions-removed c (unit-expanded m)))
       (add-phase-forms! 0 (lower-forms (unit-expanded m) 0))
       ;; A provided name exports its binding in each namespace it has one.

@@ -123,7 +123,7 @@
            [(5) (let* ([a (obj)] [d (obj)]) (cons a d))]
            [(6) (string->symbol (utf8))]
            [(7) (utf8)]
-           [(8) (let* ([e (obj)] [sc (obj)] [l (obj)] [r (obj)]) (make-stx e (list-sort < sc) l r))]
+           [(8) (let* ([e (obj)] [sc (obj)] [l (obj)] [r (obj)]) (make-stx e (list-sort > sc) l r))]
            [(9) (let* ([src (obj)] [line (sleb)] [col (sleb)] [pos (sleb)] [span (sleb)])
                   (make-srcloc src line col pos span))]
            [(10) (let* ([negative (byte!)] [m (u64)]) (if (= negative 1) (- m) m))]

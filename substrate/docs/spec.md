@@ -639,6 +639,13 @@ reference is an error.
   recently made) scope of its set. An identifier can refer to a binding
   only if it has that scope too, so resolving an identifier looks only
   under its own scopes, not at every binding of its symbol.
+- **Propagation.** Adding, removing or flipping a scope on a syntax object
+  makes the same change to every syntax object inside it. The object's own
+  scopes change at once. The change to its datum is recorded as pending,
+  and made one level down the first time something looks inside
+  (`syntax-e`), so the syntax objects nothing looks inside are never
+  rebuilt, and changes that cancel, like the two flips of a macro's
+  introduction scope, are never made.
 - **Phases.** Bindings are recorded per phase, and a syntax object has one
   scope set. A module required at phase shift *s* ≠ 0 has its bindings
   installed at their phase + *s*, with its module scope replaced by a copy
@@ -878,7 +885,7 @@ expander.
   | `%pair` | `(struct (field car eqref) (field cdr eqref))` | pairs |
   | `%symbol` | `(struct (field name (ref %string)) (field hash i32))` | symbols, with their name's hash |
   | `%atom` | `(struct (field kind i32) (field value i32))` | characters (kind 0), `#t` (1), `()` (2) |
-  | `%syntax` | `(struct (field e eqref) (field scopes eqref) (field srcloc eqref) (field props eqref))` | syntax objects |
+  | `%syntax` | `(struct (field e (mut eqref)) (field scopes eqref) (field srcloc eqref) (field props eqref) (field pending (mut eqref)))` | syntax objects |
   | `%srcloc` | `(struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32))` | source locations |
   | `%table` | `(array (mut eqref))` | the symbol table, the handle table and a linklet's quoted data |
   | `%integer` | `(struct (field negative i32) (field magnitude i64))` | integers beyond the fixnum range |
@@ -897,8 +904,12 @@ expander.
   `compiler/syntax.sub`). The compiler declares these types in the linklet;
   wasm makes them the same types as the library's.
 - **Syntax objects** are wrapped eagerly: the datum of a list is a list
-  whose elements are syntax objects. Scopes are a list of fixnum scope ids
-  in ascending order; scope 0 is the core scope. The source of a srcloc is
+  whose elements are syntax objects. Scopes are a list of fixnum scope ids,
+  newest (greatest) first, so a change to a new scope is made at the
+  front; scope 0 is the core scope. The pending scope changes (6.1) are a
+  list of `(scope . change)`, change 0 to add, 1 to remove or 2 to flip, at
+  most one per scope; `syntax-e` makes them on the syntax objects in `e`,
+  stores the result in `e` and empties `pending`. The source of a srcloc is
   a symbol naming the file. Line is 1-based, column and position 0-based.
   Properties are a list of `(key . value)` pairs, newest first, with each
   key at most once. The expander records a local variable's binding in
