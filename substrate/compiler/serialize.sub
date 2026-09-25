@@ -1,0 +1,85 @@
+;; Lifecycle: permanent. Part of the compiler, ported from the writing half
+;; of stage0/serialize.sls.
+;;
+;; The byte format of syntax-library data (compiler/syntax.sub, "quoted
+;; data"). The compiler writes a linklet's quoted data in it (spec 3.5).
+(require-unqualified substrate "../lib/substrate.sub")
+(require stx "stx.sub" stx? stx-e stx-scopes stx-srcloc stx-props
+         srcloc? srcloc-source srcloc-line srcloc-col srcloc-pos srcloc-span)
+(require buf "buffer.sub" make-buffer buffer->bytes put-byte! put-bytes! uleb! sleb! with-output)
+(require num "numbers.sub" flonum-bits integer-negative integer-magnitude-byte)
+
+(provide make-serializer serialize! serializer-bytes)
+
+;; Objects are written as they are met, each after the objects it is made
+;; of. Equal objects, all immutable, are written once and shared, as Scheme
+;; allows of literals.
+(struct serializer (out [count #:mutable] shared))
+
+(define (make-serializer) (serializer (make-buffer) 0 (make-hash)))
+
+;; Write an object with write!, unless one with the same key was; a key of
+;; #f is never shared. Returns its index.
+(define (object! s key write!)
+  (or (and key (hash-ref (serializer-shared s) key #f))
+      (let ([i (serializer-count s)])
+        (write!)
+        (set-serializer-count! s (+ i 1))
+        (when key (hash-set! (serializer-shared s) key i))
+        i)))
+
+(define (utf8! p str)
+  (let ([bs (string->bytes/utf-8 str)])
+    (uleb! p (bytes-length bs))
+    (put-bytes! p bs)))
+
+;; The index of datum d, writing it if need be.
+(define (serialize! s d)
+  (let ([p (serializer-out s)])
+    (let loop ([d d])
+      (cond
+        [(eq? d #f) (object! s '(0) (lambda () (put-byte! p 0)))]
+        [(fixnum? d) (object! s (list 1 d) (lambda () (put-byte! p 1) (sleb! p d)))]
+        [(integer? d)
+         ;; Beyond the fixnum range: a sign and a 64-bit magnitude.
+         (let ([sign (if (integer-negative d) 1 0)]
+               [magnitude (map (lambda (i) (integer-magnitude-byte d i)) (range 8))])
+           (object! s (cons 10 (cons sign magnitude))
+                    (lambda ()
+                      (put-byte! p 10)
+                      (put-byte! p sign)
+                      (for-each (lambda (b) (put-byte! p b)) magnitude))))]
+        [(eq? d #t) (object! s '(2) (lambda () (put-byte! p 2)))]
+        [(null? d) (object! s '(3) (lambda () (put-byte! p 3)))]
+        [(char? d) (object! s (list 4 d) (lambda () (put-byte! p 4) (uleb! p (char->integer d))))]
+        [(pair? d)
+         (let* ([a (loop (car d))] [b (loop (cdr d))])
+           (object! s (list 5 a b) (lambda () (put-byte! p 5) (uleb! p a) (uleb! p b))))]
+        [(symbol? d) (object! s (list 6 d) (lambda () (put-byte! p 6) (utf8! p (symbol->string d))))]
+        [(string? d) (object! s (list 7 d) (lambda () (put-byte! p 7) (utf8! p d)))]
+        [(keyword? d) (object! s (list 13 d) (lambda () (put-byte! p 13) (utf8! p (keyword->string d))))]
+        [(stx? d)
+         (let* ([e (loop (stx-e d))] [sc (loop (stx-scopes d))]
+                [l (loop (stx-srcloc d))] [r (loop (stx-props d))])
+           (object! s (list 8 e sc l r)
+                    (lambda () (put-byte! p 8) (for-each (lambda (i) (uleb! p i)) (list e sc l r)))))]
+        [(srcloc? d)
+         (let ([src (loop (srcloc-source d))]
+               [fields (list (srcloc-line d) (srcloc-col d) (srcloc-pos d) (srcloc-span d))])
+           (object! s (cons 9 (cons src fields))
+                    (lambda () (put-byte! p 9) (uleb! p src) (for-each (lambda (n) (sleb! p n)) fields))))]
+        [(number? d)
+         (let ([bits (flonum-bits d)])
+           (object! s (list 11 bits)
+                    (lambda ()
+                      (put-byte! p 11)
+                      (for-each (lambda (i) (put-byte! p (bitwise-and (arithmetic-shift bits (* -8 i)) 255)))
+                                (range 8)))))]
+        [else (error 'serialize "cannot quote ~s" d)]))))
+
+;; The bytes: the number of objects, then the objects.
+(define (serializer-bytes s)
+  (with-output
+   (lambda (p)
+     (uleb! p (serializer-count s))
+     (put-bytes! p (buffer->bytes (serializer-out s))))))

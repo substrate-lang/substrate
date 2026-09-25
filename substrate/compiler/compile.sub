@@ -1,0 +1,868 @@
+;; Lifecycle: permanent. Part of the compiler, ported from stage0/compile.sls.
+;;
+;; Compiler: fully expanded kernel forms (see core.sub) -> wasm module bytes.
+;;
+;; Expressions are compiled to symbolic instructions that mention info
+;; records instead of indices; a final pass assigns indices once every
+;; import, type and synthesized global is known. Compiling an expression
+;; gives (code . type).
+;;
+;; A module imports only what its code uses (spec 3.3). Code that needs a
+;; memory or table must be given one: defined, or imported from a module.
+(require-unqualified substrate "../lib/substrate.sub")
+(require stx "stx.sub" raise-compile-error srcloc?)
+(require core "core.sub"
+         func-info? func-info-name func-info-params func-info-results func-info-instance
+         set-func-info-instance! func-info-export set-func-info-export! func-info-type
+         global-info? global-info-name global-info-type global-info-mutable? global-info-instance
+         set-global-info-instance! global-info-export set-global-info-export!
+         data-info-offset data-info-bytes
+         type-info? type-info-name type-info-kind type-info-fields type-info-super type-info-final?
+         type-info-group func-type?
+         ref-type? make-ref ref-nullable? ref-heap numeric-type?
+         valtype<=? types<=? valtype-join valtype->string unpacked defaultable?)
+(require ops "ops.sub" lookup-prim prim-op-kind prim-op-params prim-op-results prim-op-align)
+(require w "wasm.sub" wmodule encode-module)
+(require ser "serialize.sub" make-serializer serialize! serializer-bytes)
+(require num "numbers.sub" integer->flonum i32-bits i64-bits)
+
+(provide compile-module set-current-syntax-infos! set-syntax-types!)
+
+;; symbol -> func-info or global-info for the syntax library's exports; #f
+;; while compiling the syntax library itself.
+(define current-syntax-infos #f)
+(define (set-current-syntax-infos! infos) (set! current-syntax-infos infos))
+
+;; The syntax library's string and table types, set once the library is
+;; compiled. A module's quoted data is a string of bytes that the library
+;; turns into a table of objects (spec 3.5), so a module that quotes data
+;; declares the library's recursion group, and wasm makes these the
+;; library's types (spec appendix A).
+(define string-type #f)
+(define table-type #f)
+(define (set-syntax-types! string table) (set! string-type string) (set! table-type table))
+
+(define eqref (make-ref #t 'eq))
+
+;; ---- error locations ----
+
+(define current-loc #f)
+(define (fail form . args) (apply raise-compile-error current-loc form args))
+
+;; ---- types ----
+
+(define (type->string t)
+  (cond [(eq? t 'bottom) "nothing (unreachable)"]
+        [(null? t) "no value"]
+        [(null? (cdr t)) (valtype->string (car t))]
+        [else (format "(~a)" (apply string-append
+                                    (let loop ([ts t])
+                                      (if (null? ts) '()
+                                          (cons (valtype->string (car ts))
+                                                (if (null? (cdr ts)) '() (cons " " (loop (cdr ts)))))))))]))
+
+(define (single? t) (and (pair? t) (null? (cdr t))))
+
+;; Make code of type `type` fit `expected`: drop unused values, or fail. A
+;; subtype fits without any code.
+(define (coerce code type expected)
+  (cond [(not expected) (cons code type)]
+        [(eq? type 'bottom) (cons code expected)]
+        [(types<=? type expected) (cons code expected)]
+        [(null? expected) (cons (append code (map (lambda (_) '(drop)) type)) '())]
+        [else
+         (let ([e (type->string expected)] [g (type->string type)])
+           ;; Two declarations can have the same name, for example one in
+           ;; each module (spec 5.1).
+           (fail "type mismatch: expected ~a, got ~a~a" e g
+                 (if (string=? e g) ", a different type declared with the same name" "")))]))
+
+(define (join-types a b)
+  (cond [(eq? a 'bottom) b]
+        [(eq? b 'bottom) a]
+        [(= (length a) (length b))
+         (let ([j (map valtype-join a b)])
+           (and (andmap (lambda (x) x) j) j))]
+        [else #f]))
+
+(define (s32 n) (or (i32-bits n) (fail "integer ~a does not fit in i32" n)))
+(define (s64 n) (i64-bits n))
+
+;; ---- per-function state ----
+
+(struct fctx (locals              ; hasheqv: key -> (index . type)
+              [extra #:mutable]   ; types of locals after the params, reversed
+              [next #:mutable]    ; next local index
+              results))           ; the function's result types
+
+(define (new-fctx params results)
+  (let ([fc (fctx (make-hasheqv) '() 0 results)])
+    (for-each (lambda (p) (add-local! fc (car p) (cdr p))) params)
+    (set-fctx-extra! fc '())
+    fc))
+
+(define (add-local! fc key type)
+  (let ([i (fctx-next fc)])
+    (hash-set! (fctx-locals fc) key (cons i type))
+    (set-fctx-extra! fc (cons type (fctx-extra fc)))
+    (set-fctx-next! fc (+ i 1))
+    i))
+
+;; Keys of locals the compiler makes: negative, unlike the expander's.
+(define temp-counter 0)
+(define (temp-local! fc type)
+  (set! temp-counter (- temp-counter 1))
+  (add-local! fc temp-counter type))
+
+(define (lookup-local fc key)
+  (or (hash-ref (fctx-locals fc) key #f)
+      (fail "internal: unknown local ~a" key)))
+
+;; kind: block | loop | if. type: the block's result type once known.
+(struct label (key kind [type #:mutable]))
+
+;; (depth . label) of the label with key.
+(define (label-depth labels key)
+  (let loop ([ls labels] [d 0])
+    (cond [(null? ls) (fail "internal: unknown label ~a" key)]
+          [(eqv? (label-key (car ls)) key) (cons d (car ls))]
+          [else (loop (cdr ls) (+ d 1))])))
+
+;; ---- module state ----
+
+;; A synthesized global: a function's table index (kind fidx), or the
+;; table of quoted data (kind literals).
+(struct synth (kind datum))
+
+(struct mstate (self
+                [func-imports #:mutable]   ; external func-infos, reversed
+                [global-imports #:mutable] ; external global-infos, reversed
+                [synths #:mutable]         ; synth records, reversed
+                [fidx #:mutable]           ; alist func-info -> synth
+                [uses-memory #:mutable]    ; where code first needs a memory, or #f
+                [uses-table #:mutable]     ; where code first needs a table, or #f
+                [uses-gc #:mutable]        ; does code allocate or inspect GC objects?
+                [literals #:mutable]))     ; the quoted data, or #f
+
+(define (external? ms info-instance) (not (equal? info-instance (mstate-self ms))))
+
+(define (note-func! ms info)
+  (when (and (external? ms (func-info-instance info))
+             (not (memq info (mstate-func-imports ms))))
+    (set-mstate-func-imports! ms (cons info (mstate-func-imports ms)))))
+
+(define (note-global! ms info)
+  (when (and (global-info? info)
+             (external? ms (global-info-instance info))
+             (not (memq info (mstate-global-imports ms))))
+    (set-mstate-global-imports! ms (cons info (mstate-global-imports ms)))))
+
+(define (note-memory! ms) (unless (mstate-uses-memory ms) (set-mstate-uses-memory! ms (or current-loc #t))))
+(define (note-table! ms) (unless (mstate-uses-table ms) (set-mstate-uses-table! ms (or current-loc #t))))
+
+(define (new-synth! ms kind datum)
+  (let ([s (synth kind datum)])
+    (set-mstate-synths! ms (cons s (mstate-synths ms)))
+    s))
+
+(define (fidx-synth! ms info)
+  (note-table! ms)
+  (let ([found (assq info (mstate-fidx ms))])
+    (if found
+        (cdr found)
+        (let ([s (new-synth! ms 'fidx info)])
+          (note-func! ms info)
+          (set-mstate-fidx! ms (cons (cons info s) (mstate-fidx ms)))
+          s))))
+
+;; ---- expressions ----
+
+;; A function of the syntax library, by name. While compiling the syntax
+;; library itself, its own functions are found with `local`.
+(define (syntax-func ms local name)
+  (let ([info (if current-syntax-infos (hash-ref current-syntax-infos name #f) (local name))])
+    (unless info (fail "internal: the syntax library has no function ~a" name))
+    (note-func! ms info)
+    info))
+
+;; The syntax library's immutable global holding datum d, when d is '() or
+;; #t and another module is being compiled; else #f. Reading it is a
+;; constant expression.
+(define (datum-global d)
+  (and current-syntax-infos
+       (or (null? d) (eq? d #t))
+       (let ([info (hash-ref current-syntax-infos (if (null? d) '%nil '%true) #f)])
+         (unless (global-info? info) (fail "internal: the syntax library has no global for ~s" d))
+         info)))
+
+(define (struct-field tinfo index) (list-ref (type-info-fields tinfo) index))
+
+(define (finish code type expected) (coerce code type expected))
+
+(define (code-of ms fc labels e type) (car (cx ms fc labels e (list type) #f)))
+
+(define (args-code ms fc labels args types)
+  (unless (= (length args) (length types))
+    (fail "expected ~a arguments, got ~a" (length types) (length args)))
+  (apply append (map (lambda (a t) (code-of ms fc labels a t)) args types)))
+
+;; Synthesize the type of a reference expression: (code . reftype).
+(define (ref-arg ms fc labels e who)
+  (let* ([r (cx ms fc labels e #f #f)] [t (cdr r)])
+    (unless (and (single? t) (ref-type? (car t)))
+      (fail "~a needs a reference, got ~a" who (type->string t)))
+    (cons (car r) (car t))))
+
+(define (blocktype t)
+  (cond [(null? t) '()]
+        [(single? t) (car t)]
+        [else (list 'type (list 'func '() t))]))
+
+;; GC operations (spec 5.3). imms hold type-infos, field indices and
+;; reference types resolved by the expander.
+(define (compile-gc ms fc labels op imms args expected)
+  (let ([arg (lambda (i type) (code-of ms fc labels (list-ref args i) type))]
+        [tref (lambda (t) (make-ref #t t))])
+    (case op
+      [(struct.new)
+       (let ([t (car imms)])
+         (finish (append (args-code ms fc labels args (map (lambda (f) (unpacked (cadr f))) (type-info-fields t)))
+                         `((struct.new ,t)))
+                 (list (make-ref #f t)) expected))]
+      [(struct.get struct.get_s struct.get_u)
+       (let* ([t (car imms)] [i (cadr imms)] [f (struct-field t i)] [packed? (memq (cadr f) '(i8 i16))])
+         (when (and packed? (eq? op 'struct.get))
+           (fail "field ~a is packed: use struct.get_s or struct.get_u" (car f)))
+         (when (and (not packed?) (not (eq? op 'struct.get)))
+           (fail "~a is only for packed fields" op))
+         (finish (append (arg 0 (tref t)) `((,op ,t ,i))) (list (unpacked (cadr f))) expected))]
+      [(struct.set)
+       (let* ([t (car imms)] [i (cadr imms)] [f (struct-field t i)])
+         (unless (caddr f) (fail "field ~a is not mutable" (car f)))
+         (finish (append (arg 0 (tref t)) (arg 1 (unpacked (cadr f))) `((struct.set ,t ,i))) '() expected))]
+      [(array.new)
+       (let ([t (car imms)])
+         (finish (append (arg 0 (unpacked (car (type-info-fields t)))) (arg 1 'i32) `((array.new ,t)))
+                 (list (make-ref #f t)) expected))]
+      [(array.new_default)
+       (let ([t (car imms)])
+         (finish (append (arg 0 'i32) `((array.new_default ,t))) (list (make-ref #f t)) expected))]
+      [(array.new_fixed)
+       (let ([t (car imms)])
+         (finish (append (apply append (map (lambda (a) (code-of ms fc labels a (unpacked (car (type-info-fields t)))))
+                                            args))
+                         `((array.new_fixed ,t ,(length args))))
+                 (list (make-ref #f t)) expected))]
+      [(array.get array.get_s array.get_u)
+       (let* ([t (car imms)] [storage (car (type-info-fields t))] [packed? (memq storage '(i8 i16))])
+         (when (and packed? (eq? op 'array.get))
+           (fail "~a has packed elements: use array.get_s or array.get_u" (type-info-name t)))
+         (when (and (not packed?) (not (eq? op 'array.get)))
+           (fail "~a is only for packed elements" op))
+         (finish (append (arg 0 (tref t)) (arg 1 'i32) `((,op ,t))) (list (unpacked storage)) expected))]
+      [(array.set)
+       (let ([t (car imms)])
+         (unless (cadr (type-info-fields t)) (fail "~a is not mutable" (type-info-name t)))
+         (finish (append (arg 0 (tref t)) (arg 1 'i32) (arg 2 (unpacked (car (type-info-fields t))))
+                         `((array.set ,t)))
+                 '() expected))]
+      [(array.len)
+       (finish (append (arg 0 (make-ref #t 'array)) '((array.len))) '(i32) expected)]
+      [(array.fill)
+       (let ([t (car imms)])
+         (finish (append (arg 0 (tref t)) (arg 1 'i32) (arg 2 (unpacked (car (type-info-fields t)))) (arg 3 'i32)
+                         `((array.fill ,t)))
+                 '() expected))]
+      [(array.copy)
+       (let ([dst (car imms)] [src (cadr imms)])
+         (finish (append (arg 0 (tref dst)) (arg 1 'i32) (arg 2 (tref src)) (arg 3 'i32) (arg 4 'i32)
+                         `((array.copy ,dst ,src)))
+                 '() expected))]
+      [(ref.null)
+       (finish `((ref.null ,(car imms))) (list (make-ref #t (car imms))) expected)]
+      [(ref.is_null)
+       (let ([r (ref-arg ms fc labels (car args) "ref.is_null")])
+         (finish (append (car r) '((ref.is_null))) '(i32) expected))]
+      [(ref.eq)
+       (finish (append (arg 0 eqref) (arg 1 eqref) '((ref.eq))) '(i32) expected)]
+      [(ref.as_non_null)
+       (let ([r (ref-arg ms fc labels (car args) "ref.as_non_null")])
+         (finish (append (car r) '((ref.as_non_null))) (list (make-ref #f (ref-heap (cdr r)))) expected))]
+      [(ref.test ref.cast)
+       (let* ([target (car imms)] [r (ref-arg ms fc labels (car args) (symbol->string op))])
+         (finish (append (car r) `((,op ,(ref-nullable? target) ,(ref-heap target))))
+                 (if (eq? op 'ref.test) '(i32) (list target))
+                 expected))]
+      [(ref.i31)
+       (finish (append (arg 0 'i32) '((ref.i31))) (list (make-ref #f 'i31)) expected)]
+      [(i31.get_s i31.get_u)
+       (finish (append (arg 0 (make-ref #t 'i31)) `((,op))) '(i32) expected)]
+      [else (fail "internal: unknown GC operation ~a" op)])))
+
+;; Compile e. expected: #f or a list of valtypes. tail?: e's value is the
+;; function's return value. Returns (code . type).
+(define (cx ms fc labels e expected tail?)
+  (let ([sub (lambda (e expected tail?) (cx ms fc labels e expected tail?))]
+        [sub-in (lambda (labels e expected tail?) (cx ms fc labels e expected tail?))]
+        [code-of (lambda (e type) (code-of ms fc labels e type))]
+        [args (cdr e)])
+    (case (car e)
+      [(at)
+       (let ([saved current-loc] [loc (car args)])
+         (set! current-loc (or loc current-loc))
+         (let ([r (sub (cadr args) expected tail?)])
+           (set! current-loc saved)
+           r))]
+      [(int)
+       (let ([n (car args)] [t (if (single? expected) (car expected) 'i32)])
+         (case t
+           [(i64) (finish `((i64.const ,(s64 n))) '(i64) expected)]
+           [(f32) (finish `((f32.const ,(integer->flonum n))) '(f32) expected)]
+           [(f64) (finish `((f64.const ,(integer->flonum n))) '(f64) expected)]
+           [else (finish `((i32.const ,(s32 n))) '(i32) expected)]))]
+      [(float)
+       (if (equal? expected '(f32))
+           (finish `((f32.const ,(car args))) '(f32) expected)
+           (finish `((f64.const ,(car args))) '(f64) expected))]
+      [(const)
+       (let ([t (car args)] [n (cadr args)])
+         (finish (case t
+                   [(i32) `((i32.const ,(s32 n)))]
+                   [(i64) `((i64.const ,(s64 n)))]
+                   [else `((,(const-op t) ,n))])
+                 (list t) expected))]
+      [(lref)
+       (let ([l (lookup-local fc (car args))])
+         (finish `((local.get ,(car l))) (list (cdr l)) expected))]
+      [(lset)
+       (let ([l (lookup-local fc (car args))])
+         (finish (append (code-of (cadr args) (cdr l)) `((local.set ,(car l)))) '() expected))]
+      [(gref)
+       (let ([info (car args)])
+         (note-global! ms info)
+         (finish `((global.get ,info)) (list (global-info-type info)) expected))]
+      [(gset)
+       (let ([info (car args)])
+         (unless (global-info-mutable? info)
+           (fail "~a is immutable: declare it (global ~a (mut type) init) to set it"
+                 (global-info-name info) (global-info-name info)))
+         (note-global! ms info)
+         (finish (append (code-of (cadr args) (global-info-type info)) `((global.set ,info))) '() expected))]
+      [(let)
+       (let ([init-code
+              (apply append
+                     (map (lambda (b)
+                            (let* ([key (car b)] [declared (cadr b)] [init (caddr b)]
+                                   [r (sub init (and declared (list declared)) #f)] [t (cdr r)])
+                              (unless (single? t)
+                                (fail "a let binding needs a single value, got ~a~a" (type->string t)
+                                      (if (eq? t 'bottom) "; give it a type" "")))
+                              (let ([i (add-local! fc key (car t))])
+                                (append (car r) `((local.set ,i))))))
+                          (car args)))])
+         (let ([r (sub (cadr args) expected tail?)])
+           (cons (append init-code (car r)) (cdr r))))]
+      [(seq)
+       (if (null? args)
+           (finish '() '() expected)
+           (let loop ([es args] [acc '()])
+             (if (null? (cdr es))
+                 (let ([r (sub (car es) expected tail?)])
+                   (cons (apply append (reverse (cons (car r) acc))) (cdr r)))
+                 (loop (cdr es) (cons (car (sub (car es) '() #f)) acc)))))]
+      [(if)
+       (let* ([test (car args)] [then (cadr args)] [els (caddr args)]
+              [tc (car (sub test '(i32) #f))]
+              [lbls (cons (label #f 'if #f) labels)])
+         (if (not els)
+             (let ([c (car (sub-in lbls then '() #f))])
+               (finish (append tc `((if () ,c ()))) '() expected))
+             (let* ([r1 (sub-in lbls then expected tail?)] [t1 (cdr r1)]
+                    ;; Without an expected type, numeric literals in the else
+                    ;; branch take the then branch's type.
+                    [r2 (sub-in lbls els
+                                (or expected (and (not (eq? t1 'bottom)) (andmap numeric-type? t1) t1))
+                                tail?)]
+                    [t2 (cdr r2)]
+                    [t (or expected
+                           (join-types t1 t2)
+                           (fail "the branches of if have different types: ~a and ~a"
+                                 (type->string t1) (type->string t2)))]
+                    [t (if (eq? t 'bottom) '() t)])
+               (cons (append tc `((if ,(blocktype t) ,(car r1) ,(car r2)))) t))))]
+      [(block)
+       (let* ([lbl (label (car args) 'block expected)]
+              [r (sub-in (cons lbl labels) (cadr args) expected tail?)]
+              [t (cdr r)]
+              [t (cond [(not (eq? t 'bottom))
+                        (when (and (label-type lbl) (not (types<=? t (label-type lbl))))
+                          (fail "block result is ~a but a br carries ~a"
+                                (type->string t) (type->string (label-type lbl))))
+                        (or (label-type lbl) t)]
+                       [(label-type lbl) (label-type lbl)]
+                       [else '()])])
+         (cons `((block ,(blocktype t) ,(car r))) t))]
+      [(loop)
+       (let* ([lbl (label (car args) 'loop '())]
+              [r (sub-in (cons lbl labels) (cadr args) expected tail?)]
+              [t (if (eq? (cdr r) 'bottom) (or expected '()) (cdr r))])
+         (cons `((loop ,(blocktype t) ,(car r))) t))]
+      [(br)
+       (let* ([dl (label-depth labels (car args))] [depth (car dl)] [lbl (cdr dl)] [v (cadr args)])
+         (if (eq? (label-kind lbl) 'loop)
+             (begin
+               (when v (fail "br to a loop label cannot carry a value"))
+               (cons `((br ,depth)) 'bottom))
+             (let* ([r (if v (sub v (label-type lbl) #f) (cons '() '()))] [t (cdr r)])
+               (cond [(not (label-type lbl)) (set-label-type! lbl t)]
+                     [(not (types<=? t (label-type lbl)))
+                      (fail "br carries ~a but the block produces ~a"
+                            (type->string t) (type->string (label-type lbl)))])
+               (cons (append (car r) `((br ,depth))) 'bottom))))]
+      [(br-if)
+       (let* ([dl (label-depth labels (car args))] [depth (car dl)] [lbl (cdr dl)]
+              [tc (car (sub (cadr args) '(i32) #f))])
+         (unless (eq? (label-kind lbl) 'loop)
+           (cond [(not (label-type lbl)) (set-label-type! lbl '())]
+                 [(not (null? (label-type lbl)))
+                  (fail "br-if cannot exit a block that produces ~a" (type->string (label-type lbl)))]))
+         (finish (append tc `((br_if ,depth))) '() expected))]
+      [(return)
+       (let* ([v (car args)] [c (if v (car (sub v (fctx-results fc) #t)) '())])
+         (unless (or v (null? (fctx-results fc)))
+           (fail "return needs a value of type ~a" (type->string (fctx-results fc))))
+         (cons (append c '((return))) 'bottom))]
+      [(call)
+       (let* ([info (car args)]
+              [code (begin (note-func! ms info) (args-code ms fc labels (cadr args) (func-info-params info)))]
+              [results (func-info-results info)])
+         (if (and tail? (types<=? results (fctx-results fc)))
+             (cons (append code `((return_call ,info))) results)
+             (finish (append code `((call ,info))) results expected)))]
+      [(prim)
+       (let* ([name (car args)] [offset (cadr args)] [p (lookup-prim name)])
+         (when (or (eq? (prim-op-kind p) 'mem) (memq name '(memory.size memory.grow memory.copy memory.fill)))
+           (note-memory! ms))
+         (let ([code (args-code ms fc labels (caddr args) (prim-op-params p))])
+           (finish (append code
+                           (if (eq? (prim-op-kind p) 'mem)
+                               `((,name ,(prim-op-align p) ,(or offset 0)))
+                               `((,name))))
+                   (prim-op-results p)
+                   expected)))]
+      [(call-indirect)
+       (note-table! ms)
+       (let* ([params (car args)] [results (cadr args)]
+              [code (args-code ms fc labels (cadddr args) params)]
+              [ic (code-of (caddr args) 'i32)]
+              [sig (list 'func params results)])
+         (if (and tail? (types<=? results (fctx-results fc)))
+             (cons (append code ic `((return_call_indirect ,sig 0))) results)
+             (finish (append code ic `((call_indirect ,sig 0))) results expected)))]
+      [(func-index)
+       (finish `((global.get ,(fidx-synth! ms (car args)))) '(i32) expected)]
+      [(ref-func)
+       (let ([info (car args)])
+         (note-func! ms info)
+         (unless (func-info-type info)
+           (fail "internal: ref.func of ~a, which has no declared function type" (func-info-name info)))
+         (finish `((ref.func ,info)) (list (make-ref #f (func-info-type info))) expected))]
+      [(call-ref)
+       (let* ([t (car args)]
+              [code (args-code ms fc labels (caddr args) (car (type-info-fields t)))]
+              [fcode (code-of (cadr args) (make-ref #t t))]
+              [results (cadr (type-info-fields t))])
+         (if (and tail? (types<=? results (fctx-results fc)))
+             (cons (append code fcode `((return_call_ref ,t))) results)
+             (finish (append code fcode `((call_ref ,t))) results expected)))]
+      [(gc)
+       (set-mstate-uses-gc! ms #t)
+       (compile-gc ms fc labels (car args) (cadr args) (caddr args) expected)]
+      [(select)
+       (let* ([ra (sub (car args) #f #f)] [ta (cdr ra)])
+         (unless (single? ta) (fail "select needs single values, got ~a" (type->string ta)))
+         (let ([cb (car (sub (cadr args) ta #f))] [ct (car (sub (caddr args) '(i32) #f))])
+           (finish (append (car ra) cb ct (if (ref-type? (car ta)) `((select-typed ,(car ta))) '((select))))
+                   ta expected)))]
+      [(drop)
+       (let* ([r (sub (car args) #f #f)] [t (cdr r)])
+         (finish (if (eq? t 'bottom) (car r) (append (car r) (map (lambda (_) '(drop)) t))) '() expected))]
+      [(unreachable) (cons '((unreachable)) 'bottom)]
+      [(nop) (finish '((nop)) '() expected)]
+      [(quote)
+       ;; A quoted fixnum or #f is a constant, and so are '() and #t, which
+       ;; are globals of the syntax library. Other data is an entry in the
+       ;; module's table of quoted data.
+       (let* ([d (car args)] [g (datum-global d)])
+         (cond [(fixnum? d) (finish `((i32.const ,d) (ref.i31)) (list (make-ref #f 'i31)) expected)]
+               [(eq? d #f) (finish '((ref.null eq)) (list eqref) expected)]
+               [g (sub `(gref ,g) expected tail?)]
+               [else
+                (let* ([lits (module-literals ms)] [i (serialize! (literals-serializer lits) d)])
+                  (set-mstate-uses-gc! ms #t)
+                  (finish `((global.get ,(literals-table lits)) (i32.const ,i) (array.get ,table-type))
+                          (list eqref) expected))]))]
+      [else (fail "internal: unknown kernel form ~s" (car e))])))
+
+;; ---- quoted data ----
+
+;; A module's quoted data, other than the constants, is serialized as it is
+;; met (compiler/serialize.sub) into one passive data segment, which the
+;; syntax library's %deserialize turns into a table of objects when the
+;; module starts (spec 3.5). table: the synth holding the table.
+(struct literals (serializer table))
+
+(define (module-literals ms)
+  (or (mstate-literals ms)
+      (let ([lits (literals (make-serializer) (new-synth! ms 'literals #f))])
+        (set-mstate-literals! ms lits)
+        lits)))
+
+;; ---- module ----
+
+;; Is e a constant expression in wasm's sense (spec 5.2)? It may read
+;; immutable globals that are imported or among `earlier`, this module's
+;; globals defined before the one e initializes.
+(define (constant-expr? ms e earlier)
+  (let loop ([e e])
+    (case (car e)
+      [(at) (loop (caddr e))]
+      [(int float const ref-func) #t]
+      [(quote) (let ([d (cadr e)])
+                 (or (fixnum? d) (eq? d #f) (and (datum-global d) #t)))]
+      [(gref) (let ([g (cadr e)])
+                (and (not (global-info-mutable? g))
+                     (or (external? ms (global-info-instance g)) (and (memq g earlier) #t))))]
+      [(prim) (and (memq (cadr e) '(i32.add i32.sub i32.mul i64.add i64.sub i64.mul))
+                   (andmap loop (cadddr e)))]
+      [(gc) (and (memq (cadr e) '(struct.new array.new array.new_default array.new_fixed ref.null ref.i31))
+                 (andmap loop (cadddr e)))]
+      [else #f])))
+
+(define (loc-of e) (and (pair? e) (eq? (car e) 'at) (cadr e)))
+
+(define (const-op t) (string->symbol (string-append (symbol->string t) ".const")))
+
+;; Every type-info mentioned anywhere in x, dependencies first: its
+;; supertype, then the types its fields mention. A recursion group comes as
+;; a unit: the types its members mention outside the group first, then the
+;; members in order. Outside a group a type may mention itself, but not a
+;; later type.
+(define (collect-types x)
+  (let ([found '()] [visiting '()])
+    (letrec ([add! (lambda (t)
+                     (unless (or (memq t found) (memq t visiting))
+                       (let ([members (or (type-info-group t) (list t))])
+                         (set! visiting (append members visiting))
+                         (for-each (lambda (m) (walk (type-info-super m)) (walk (type-info-fields m))) members)
+                         (for-each (lambda (m) (set! found (cons m found))) members))))]
+             [walk (lambda (x)
+                     (cond [(type-info? x) (add! x)]
+                           [(pair? x) (walk (car x)) (walk (cdr x))]
+                           [else #f]))])
+      (walk x)
+      (reverse found))))
+
+;; The instance names imports come from, in order, each once.
+(define (import-instances imports)
+  (let loop ([is imports] [acc '()])
+    (cond [(null? is) (reverse acc)]
+          [(member (caar is) acc) (loop (cdr is) acc)]
+          [else (loop (cdr is) (cons (caar is) acc))])))
+
+(define (export-namer)
+  (let ([exported (make-hash)])
+    (lambda (name)
+      (let loop ([n 0])
+        (let ([s (if (= n 0) (symbol->string name) (format "~a.~a" name n))])
+          (if (hash-ref exported s #f)
+              (loop (+ n 1))
+              (begin (hash-set! exported s #t) s)))))))
+
+;; Global initializers (spec 5.2). A constant expression is compiled into
+;; the global itself: an alist info -> code, in definition order. Any other
+;; initializer runs in the start function, so its global must be mutable
+;; and start with a default value.
+(define (constant-inits ms global-forms)
+  (let loop ([fs global-forms] [earlier '()] [acc '()])
+    (if (null? fs)
+        (reverse acc)
+        (let* ([info (cadr (car fs))] [init (caddr (car fs))] [t (global-info-type info)])
+          (set! current-loc (loc-of init))
+          (cond
+            [(and init (constant-expr? ms init earlier))
+             (let ([c (car (cx ms (new-fctx '() '()) '() init (list t) #f))])
+               (loop (cdr fs) (cons info earlier) (cons (cons info c) acc)))]
+            [(not (global-info-mutable? info))
+             (fail "global ~a is immutable, so its initializer must be a constant expression; declare it (mut ~a) to compute it when the module starts"
+                   (global-info-name info) (valtype->string t))]
+            [(not (defaultable? t))
+             (fail "global ~a: a global computed when the module starts must have a numeric or nullable reference type"
+                   (global-info-name info))]
+            [else (loop (cdr fs) (cons info earlier) acc)])))))
+
+;; forms: fully expanded module forms. self: this module's instance name.
+;; Assigns instance and export names to the infos it defines. Returns
+;; (bytes imported-instance-names uses-gc?).
+(define (compile-module forms self)
+  (set! current-loc #f)
+  (let* ([ms (mstate self '() '() '() '() #f #f #f #f)]
+         [kind? (lambda (k) (lambda (f) (eq? (car f) k)))]
+         [func-forms (filter (kind? 'func) forms)]
+         [global-forms (filter (kind? 'global) forms)]
+         [data-forms (filter (kind? 'data) forms)]
+         [type-forms (filter (kind? 'type) forms)]
+         ;; (memory pages) defines memory 0; (memory-import instance)
+         ;; imports the memory another instance exports. Tables likewise.
+         [memory-form (findf (lambda (f) (memq (car f) '(memory memory-import))) forms)]
+         [table-form (findf (lambda (f) (memq (car f) '(table table-import))) forms)]
+         [imported? (lambda (form) (and form (memq (car form) '(memory-import table-import)) #t))]
+         [export-name! (export-namer)]
+         [local (lambda (name)
+                  (let ([f (findf (lambda (f) (eq? (func-info-name (cadr f)) name)) func-forms)])
+                    (and f (cadr f))))]
+         [ex (lambda (name) (syntax-func ms local name))]
+         [assigned
+          (begin
+            (for-each (lambda (f)
+                        (let ([info (cadr f)])
+                          (set-func-info-instance! info self)
+                          (set-func-info-export! info (export-name! (func-info-name info)))))
+                      func-forms)
+            (for-each (lambda (f)
+                        (let ([info (cadr f)])
+                          (set-global-info-instance! info self)
+                          (set-global-info-export! info (export-name! (global-info-name info)))))
+                      global-forms))]
+         [constant-inits (constant-inits ms global-forms)]
+         ;; Function bodies.
+         [compiled-funcs
+          (map (lambda (f)
+                 (let* ([info (cadr f)] [params (caddr f)] [body (cadddr f)]
+                        [fc (new-fctx params (func-info-results info))])
+                   (set! current-loc #f)
+                   (let ([code (car (cx ms fc '() body (func-info-results info) #t))])
+                     (list info (list 'func (map cdr params) (func-info-results info))
+                           (reverse (fctx-extra fc)) code))))
+               func-forms)]
+         ;; Start function: run-time global inits and module-level
+         ;; expressions, in source order.
+         [start-fc (new-fctx '() '())]
+         [init-code
+          (apply append
+                 (map (lambda (f)
+                        (case (car f)
+                          [(global)
+                           (let ([info (cadr f)] [init (caddr f)])
+                             (if (or (not init) (assq info constant-inits))
+                                 '()
+                                 (append (car (cx ms start-fc '() init (list (global-info-type info)) #f))
+                                         `((global.set ,info)))))]
+                          [(expr) (car (cx ms start-fc '() (cadr f) '() #f))]
+                          [else '()]))
+                      forms))]
+         ;; The quoted data, complete now that all code is compiled. Its
+         ;; segment follows the module's own data segments.
+         [literal-segment (and (mstate-literals ms) (serializer-bytes (literals-serializer (mstate-literals ms))))]
+         ;; Table registration for func-index and quoted constants, in the
+         ;; order the code above met them.
+         [setup-code
+          (apply append
+                 (map (lambda (s)
+                        (if (eq? (synth-kind s) 'fidx)
+                            `((ref.func ,(synth-datum s)) (i32.const 1) (table.grow 0) (global.set ,s))
+                            `((i32.const 0) (i32.const ,(bytes-length literal-segment))
+                              (array.new_data ,string-type ,(length data-forms))
+                              (call ,(ex '%deserialize)) (global.set ,s))))
+                      (reverse (mstate-synths ms))))]
+         [start-code (append setup-code init-code)]
+         [has-start? (not (null? start-code))]
+         [checked
+          (begin
+            (when (and (mstate-uses-memory ms) (not memory-form))
+              (raise-compile-error (and (srcloc? (mstate-uses-memory ms)) (mstate-uses-memory ms))
+                                   "this code uses memory, but the module defines none: add (memory pages)"))
+            (when (and (not (null? data-forms)) (not memory-form))
+              (fail "data needs a memory: add (memory pages)"))
+            (when (and (mstate-uses-table ms) (not table-form))
+              (raise-compile-error (and (srcloc? (mstate-uses-table ms)) (mstate-uses-table ms))
+                                   "this code uses a table, but the module defines none: add (table size)")))]
+
+         ;; ---- index assignment ----
+         [func-imports (reverse (mstate-func-imports ms))]
+         [global-imports (reverse (mstate-global-imports ms))]
+         [synths (reverse (mstate-synths ms))]
+         [n-func-imports (length func-imports)]
+         [func-index (make-hasheq)]
+         [global-index (make-hasheq)]
+         [start-index
+          (let loop ([fs (append func-imports (map car compiled-funcs))] [i 0])
+            (if (null? fs) i (begin (hash-set! func-index (car fs) i) (loop (cdr fs) (+ i 1)))))]
+         [n-globals
+          (let loop ([gs (append global-imports (map cadr global-forms) synths)] [i 0])
+            (if (null? gs) i (begin (hash-set! global-index (car gs) i) (loop (cdr gs) (+ i 1)))))]
+
+         ;; GC types come first in the type section, dependencies first;
+         ;; function types follow as they are needed.
+         [gc-types
+          (collect-types (list (map cadr type-forms)
+                               (map (lambda (cf) (list (cadr cf) (caddr cf) (cadddr cf))) compiled-funcs)
+                               (fctx-extra start-fc) start-code
+                               (map (lambda (info) (list (func-info-params info) (func-info-results info)
+                                                         (func-info-type info)))
+                                    func-imports)
+                               (map (lambda (cf) (func-info-type (car cf))) compiled-funcs)
+                               (map global-info-type global-imports) (map cdr constant-inits)
+                               (map (lambda (f) (global-info-type (cadr f))) global-forms)))]
+         [gc-index
+          (let ([table (make-hasheq)])
+            (let loop ([ts gc-types] [i 0])
+              (unless (null? ts) (hash-set! table (car ts) i) (loop (cdr ts) (+ i 1))))
+            table)]
+         [heap-index (lambda (h) (if (type-info? h) (hash-ref gc-index h #f) h))]
+         [rv (lambda (t) (if (ref-type? t) (make-ref (ref-nullable? t) (heap-index (ref-heap t))) t))]
+         [rstorage (lambda (s) (if (memq s '(i8 i16)) s (rv s)))]
+
+         [func-types '()]
+         [type-index
+          (lambda (sig)
+            (let ([sig (list 'func (map rv (cadr sig)) (map rv (caddr sig)))])
+              (let loop ([ts func-types] [i (length gc-types)])
+                (cond [(null? ts) (set! func-types (append func-types (list sig))) i]
+                      [(equal? (car ts) sig) i]
+                      [else (loop (cdr ts) (+ i 1))]))))]
+         [fi (lambda (info)
+               (or (hash-ref func-index info #f)
+                   (fail "internal: function ~a has no index" (func-info-name info))))]
+         [gi (lambda (g) (or (hash-ref global-index g #f) (fail "internal: global has no index")))]
+         [ti (lambda (t) (or (hash-ref gc-index t #f) (fail "internal: type has no index")))]
+         ;; A function's type index: its declared function type's, or else
+         ;; its signature's.
+         [func-type-index (lambda (info sig) (if (func-info-type info) (ti (func-info-type info)) (type-index sig)))]
+
+         [declared '()]
+         [resolve-bt (lambda (bt)
+                       (cond [(and (pair? bt) (eq? (car bt) 'type)) (list 'type (type-index (cadr bt)))]
+                             [(null? bt) bt]
+                             [else (rv bt)]))]
+         [resolve
+          (letrec ([resolve
+                    (lambda (instrs)
+                      (map (lambda (i)
+                             (case (car i)
+                               [(call return_call) (list (car i) (fi (cadr i)))]
+                               [(ref.func) (let ([n (fi (cadr i))])
+                                             (unless (memv n declared) (set! declared (cons n declared)))
+                                             (list 'ref.func n))]
+                               [(global.get global.set) (list (car i) (gi (cadr i)))]
+                               [(call_indirect return_call_indirect) (list (car i) (type-index (cadr i)) (caddr i))]
+                               [(call_ref return_call_ref) (list (car i) (ti (cadr i)))]
+                               [(block loop) (list (car i) (resolve-bt (cadr i)) (resolve (caddr i)))]
+                               [(if) (list 'if (resolve-bt (cadr i)) (resolve (caddr i)) (resolve (cadddr i)))]
+                               [(select-typed) (list 'select-typed (rv (cadr i)))]
+                               [(ref.null) (list 'ref.null (heap-index (cadr i)))]
+                               [(ref.test ref.cast) (list (car i) (cadr i) (heap-index (caddr i)))]
+                               [(struct.new array.new array.new_default array.get array.get_s array.get_u
+                                 array.set array.fill)
+                                (list (car i) (ti (cadr i)))]
+                               [(struct.get struct.get_s struct.get_u struct.set array.new_fixed)
+                                (list (car i) (ti (cadr i)) (caddr i))]
+                               [(array.copy) (list 'array.copy (ti (cadr i)) (ti (caddr i)))]
+                               [(array.new_data) (list 'array.new_data (ti (cadr i)) (caddr i))]
+                               [else i]))
+                           instrs))])
+            resolve)]
+
+         [imports
+          (append
+           (map (lambda (info)
+                  (list (func-info-instance info) (func-info-export info) 'func
+                        (func-type-index info (list 'func (func-info-params info) (func-info-results info)))))
+                func-imports)
+           (map (lambda (g) (list (global-info-instance g) (global-info-export g) 'global
+                                  (list (rv (global-info-type g)) (global-info-mutable? g))))
+                global-imports)
+           (if (imported? memory-form) (list (list (cadr memory-form) "memory" 'memory '(0 #f))) '())
+           (if (imported? table-form) (list (list (cadr table-form) "table" 'table '(0 #f))) '()))]
+
+         [wfuncs
+          (append
+           (map (lambda (cf)
+                  (list (func-type-index (car cf) (cadr cf)) (map rv (caddr cf)) (resolve (cadddr cf))
+                        (func-info-export (car cf))))
+                compiled-funcs)
+           (if has-start?
+               (list (list (type-index '(func () ())) (map rv (reverse (fctx-extra start-fc))) (resolve start-code)
+                           "__start"))
+               '()))]
+
+         [zero-init (lambda (t)
+                      (if (ref-type? t)
+                          `((ref.null ,(heap-index (ref-heap t))))
+                          (case t
+                            [(f32) `((f32.const ,(integer->flonum 0)))]
+                            [(f64) `((f64.const ,(integer->flonum 0)))]
+                            [else `((,(const-op t) 0))])))]
+
+         [wglobals
+          (append
+           (map (lambda (f)
+                  (let* ([info (cadr f)] [t (global-info-type info)] [init (assq info constant-inits)])
+                    (list (rv t) (global-info-mutable? info) (if init (resolve (cdr init)) (zero-init t)))))
+                global-forms)
+           (map (lambda (s) (if (eq? (synth-kind s) 'fidx)
+                                (list 'i32 #t '((i32.const 0)))
+                                (list (rv (make-ref #t table-type)) #t `((ref.null ,(heap-index table-type))))))
+                synths))]
+
+         ;; A module's memory and table are exported as "memory" and
+         ;; "table": host imports find the caller's memory that way (spec
+         ;; section 4).
+         [exports
+          (append
+           (map (lambda (cf) (list (func-info-export (car cf)) 'func (fi (car cf)))) compiled-funcs)
+           (map (lambda (f) (list (global-info-export (cadr f)) 'global (gi (cadr f)))) global-forms)
+           (if memory-form '(("memory" memory 0)) '())
+           (if table-form '(("table" table 0)) '()))]
+
+         [names
+          (append
+           (map (lambda (info) (cons (fi info) (format "~a.~a" (func-info-instance info) (func-info-export info))))
+                func-imports)
+           (let loop ([fs wfuncs] [i n-func-imports])
+             (if (null? fs) '() (cons (cons i (cadddr (car fs))) (loop (cdr fs) (+ i 1))))))]
+
+         [type-entry
+          (lambda (t)
+            (list 'sub (type-info-final? t)
+                  (if (type-info-super t) (list (heap-index (type-info-super t))) '())
+                  (case (type-info-kind t)
+                    [(struct) (list 'struct (map (lambda (f) (list (rstorage (cadr f)) (caddr f))) (type-info-fields t)))]
+                    [(array) (list 'array (list (rstorage (car (type-info-fields t))) (cadr (type-info-fields t))))]
+                    [(func) (list 'func (map rv (car (type-info-fields t))) (map rv (cadr (type-info-fields t))))])))]
+
+         ;; One entry per recursion group: collect-types keeps a group's
+         ;; members together and in order.
+         [gc-type-entries
+          (let loop ([ts gc-types] [acc '()])
+            (cond [(null? ts) (reverse acc)]
+                  [(type-info-group (car ts))
+                   (let ([n (length (type-info-group (car ts)))])
+                     (loop (list-tail ts n) (cons (cons 'rec (map type-entry (take ts n))) acc)))]
+                  [else (loop (cdr ts) (cons (type-entry (car ts)) acc))]))]
+
+         [module-bytes
+          (encode-module
+           (wmodule (append gc-type-entries func-types) imports
+                    (map (lambda (f) (list (car f) (cadr f) (caddr f) (cadddr f))) wfuncs)
+                    (if (and table-form (not (imported? table-form))) (list (list (cadr table-form) #f)) '())
+                    (if (and memory-form (not (imported? memory-form))) (list (list (cadr memory-form) #f)) '())
+                    wglobals exports
+                    (and has-start? start-index)
+                    (reverse declared)
+                    (append (map (lambda (f) (cons (data-info-offset (cadr f)) (data-info-bytes (cadr f)))) data-forms)
+                            (if literal-segment (list (cons #f literal-segment)) '()))
+                    (cons self names)))])
+    (list module-bytes
+          (import-instances imports)
+          (or (mstate-uses-gc ms) (ormap (lambda (t) (not (func-type? t))) gc-types)))))
