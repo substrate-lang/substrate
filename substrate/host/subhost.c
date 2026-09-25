@@ -191,15 +191,11 @@ static void take_failure(sub_host *h, const char *what, wasmtime_error_t *error,
   if (error) wasmtime_error_wasm_trace(error, &frames);
   else if (trap) wasm_trap_trace(trap, &frames);
   if (frames.size > 0) {
-    /* The cause, then the backtrace, with source locations. */
+    /* The cause, then the backtrace, with source locations. The frames
+     * borrow from the error or trap, which is deleted after them. */
     wasm_byte_vec_t msg = {0};
-    if (error) {
-      wasmtime_error_message(error, &msg);
-      wasmtime_error_delete(error);
-    } else {
-      wasm_trap_message(trap, &msg);
-      wasm_trap_delete(trap);
-    }
+    if (error) wasmtime_error_message(error, &msg);
+    else wasm_trap_message(trap, &msg);
     int n = (int)msg.size;
     while (n > 0 && msg.data[n - 1] == '\0') n--;
     char *text = strndup(msg.data ? msg.data : "", (size_t)n);
@@ -212,6 +208,8 @@ static void take_failure(sub_host *h, const char *what, wasmtime_error_t *error,
     char trace[sizeof h->err];
     backtrace_of(frames, trace, sizeof trace);
     wasm_frame_vec_delete(&frames);
+    if (error) wasmtime_error_delete(error);
+    else wasm_trap_delete(trap);
     set_err(h, "%s: %s\n%s", what, cause, trace);
     free(text);
     return;
