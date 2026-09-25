@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Lifecycle: test harness.
 #
-# Run every tests/*.sub and examples/*.sub. Next to each file:
+# Build every tests/*.sub and examples/*.sub with subc build and run it
+# with build/subhost; the output checked is the build's, then the run's.
+# Next to each file:
 #   NAME.out      expected output of a successful run
 #   NAME.err      a line that must appear in the output of a failing run
+#   NAME.args     the run's command-line arguments, on one line
 #   NAME.imports  the instance names the compiled phase-0 linklet may import
 #                 from, one per line (checks that programs import only what
 #                 they use)
@@ -26,18 +29,22 @@ for t in tests/*.sub examples/*.sub; do
   base="$dir/$name"
   out="build/$dir"
   mkdir -p "$out"
-  actual="$(cd "$dir" && "$root/bin/subc" run "$name.sub" 2>&1)"
+  program="$out/$name"
+  args=()
+  if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
+  actual="$(cd "$dir" && "$root/bin/subc" build "$name.sub" -o "$root/$program" 2>&1 &&
+            "$root/build/subhost" "$root/$program" "${args[@]}" 2>&1)"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then
     if [ $code -ne 0 ] || [ "$actual" != "$(cat "$base.out")" ]; then
       problem="output differs (exit $code)"
-    elif ! (cd "$dir" && "$root/bin/subc" compile "$name.sub" -o "$root/$out/$name.wasm" > /dev/null) ||
-         ! for linklet in "$out/$name.wasm" "$out/$name".phase*.wasm; do
-             wasm-tools validate "$linklet" || exit 1; done; then
+    elif ! while read -r linklet; do
+             wasm-tools validate "$program/$linklet.wasm" || exit 1; done < "$program/program"; then
       problem="a compiled linklet does not validate"
     elif [ -f "$base.imports" ]; then
-      imports="$(wasm-tools print "$out/$name.wasm" | sed -n 's/^ *(import "\([^"]*\)".*/\1/p' | sort -u)"
+      entry="$(tail -n 1 "$program/program")"
+      imports="$(wasm-tools print "$program/$entry.wasm" | sed -n 's/^ *(import "\([^"]*\)".*/\1/p' | sort -u)"
       if [ "$imports" != "$(sort -u "$base.imports")" ]; then
         problem="imports from: $(echo $imports), expected: $(echo $(cat "$base.imports"))"
       fi

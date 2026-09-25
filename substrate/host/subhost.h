@@ -61,6 +61,9 @@ int32_t sub_result(sub_host *h);
 int sub_memory_write(sub_host *h, const char *inst, uint32_t addr, const uint8_t *bytes, size_t len);
 int sub_memory_read(sub_host *h, const char *inst, uint32_t addr, uint8_t *out, size_t len);
 
+/* Add a command-line argument for the program (host.arg_count, host.arg). */
+void sub_add_arg(sub_host *h, const char *arg);
+
 void sub_set_callback(sub_host *h, sub_callback cb);
 void sub_request_trap(sub_host *h, const char *msg);
 

@@ -13,7 +13,7 @@
 ;; (compiler/syntax.sub), which every compile-time store instantiates.
 (library (stage0 expander)
   (export set-syntax-library-path! compile-module-file run-module module-linklet-list module-expanded-forms
-          syntax-library-bytes)
+          syntax-library-bytes program-linklets)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 compile)
           (stage0 host) (stage0 marshal) (stage0 reader))
 
@@ -580,14 +580,41 @@
   (define (module-expanded-forms m) (unit-expanded m))
 
   ;; (phase . bytes) for each linklet of m.
+  ;; The linklets m's program instantiates at run time, each after those it
+  ;; imports from, as (instance-name . bytes): phase-0 linklets at phase
+  ;; shift 0, and the syntax library if they use it. m's own comes last.
+  (define (program-linklets m)
+    (let ([seen (make-hashtable string-hash string=?)] [out '()])
+      (let visit ([m m])
+        (let ([name (linklet-name m 0 0)])
+          (unless (hashtable-contains? seen name)
+            (hashtable-set! seen name #t)
+            (let ([p (hashtable-ref (unit-linklets m) 0 #f)])
+              (for-each (lambda (imp)
+                          (cond [(string=? imp "syntax")
+                                 (unless (hashtable-contains? seen imp)
+                                   (hashtable-set! seen imp #t)
+                                   (set! out (cons (cons imp (car syntax-lib)) out)))]
+                                [(parse-linklet-name imp)
+                                 => (lambda (l)
+                                      (unless (and (= (cadr l) 0) (= (caddr l) 0))
+                                        (raise-compile-error #f "internal: a program imports from ~a" imp))
+                                      (visit (hashtable-ref modules-by-name (car l) #f)))]
+                                [else (void)]))
+                        (linklet-imports p))
+              (set! out (cons (cons name (linklet-bytes p)) out))))))
+      (reverse out)))
+
   (define (module-linklet-list m)
     (list-sort (lambda (a b) (< (car a) (car b)))
                (let-values ([(ks vs) (hashtable-entries (unit-linklets m))])
                  (map (lambda (k v) (cons k (linklet-bytes v))) (vector->list ks) (vector->list vs)))))
 
-  ;; Instantiate m's program in a fresh run-time store and call its main.
-  (define (run-module m)
+  ;; Instantiate m's program in a fresh run-time store and call its main,
+  ;; with command-line arguments args (strings).
+  (define (run-module m args)
     (let ([st (new-cstore #f)])
+      (for-each (lambda (a) (host-add-arg! (cstore-host st) a)) args)
       (ensure-linklet! st m 0 0)
       (guard (c [(and (wasm-failure? c)
                       (let ([msg (wasm-failure-message c)])

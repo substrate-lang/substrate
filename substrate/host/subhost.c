@@ -2,6 +2,7 @@
 /* subhost: see subhost.h and docs/spec.md section 4. */
 #include "subhost.h"
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -20,6 +21,8 @@ struct sub_host {
   int32_t result;
   sub_callback cb;
   char *pending_trap;
+  char **args; /* the program's command-line arguments */
+  int nargs;
   char err[8192];
 };
 
@@ -542,6 +545,128 @@ static wasm_trap_t *host_error_message(void *env, wasmtime_caller_t *caller, con
   return NULL;
 }
 
+void sub_add_arg(sub_host *h, const char *arg) {
+  h->args = realloc(h->args, (size_t)(h->nargs + 1) * sizeof *h->args);
+  h->args[h->nargs++] = strdup(arg);
+}
+
+static wasm_trap_t *host_arg_count(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
+                                   size_t nargs, wasmtime_val_t *results, size_t nresults) {
+  sub_host *h = env;
+  results[0].kind = WASMTIME_I32;
+  results[0].of.i32 = h->nargs;
+  return NULL;
+}
+
+/* Copy at most cap bytes of argument i to buf. Returns its length, or -1
+ * if there is no argument i. */
+static wasm_trap_t *host_arg(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
+                             size_t nargs, wasmtime_val_t *results, size_t nresults) {
+  sub_host *h = env;
+  int32_t i = args[0].of.i32;
+  uint32_t bp = (uint32_t)args[1].of.i32, cap = (uint32_t)args[2].of.i32;
+  results[0].kind = WASMTIME_I32;
+  results[0].of.i32 = -1;
+  if (i < 0 || i >= h->nargs) return NULL;
+  wasmtime_memory_t mem;
+  if (!caller_memory(caller, &mem)) return trap_msg("host.arg: caller exports no memory");
+  size_t n = strlen(h->args[i]);
+  uint32_t k = n < cap ? (uint32_t)n : cap;
+  uint8_t *buf = range(wasmtime_caller_context(caller), &mem, bp, k);
+  if (!buf) return trap_msg("host.arg: out of bounds");
+  memcpy(buf, h->args[i], k);
+  results[0].of.i32 = (int32_t)n;
+  return NULL;
+}
+
+/* The len bytes at ptr in the caller's memory as a C string, which the
+ * caller frees, or NULL if they are out of bounds. */
+static char *caller_string(wasmtime_caller_t *caller, const wasmtime_memory_t *mem, uint32_t ptr, uint32_t len) {
+  uint8_t *p = range(wasmtime_caller_context(caller), mem, ptr, len);
+  if (!p) return NULL;
+  char *s = malloc((size_t)len + 1);
+  memcpy(s, p, len);
+  s[len] = '\0';
+  return s;
+}
+
+/* Read the file named by the path at (path, path-len): copy at most cap of
+ * its bytes to buf and return its size, or -1, with error_message saying
+ * why. */
+static wasm_trap_t *host_read_file(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
+                                   size_t nargs, wasmtime_val_t *results, size_t nresults) {
+  sub_host *h = env;
+  uint32_t pp = (uint32_t)args[0].of.i32, pl = (uint32_t)args[1].of.i32;
+  uint32_t bp = (uint32_t)args[2].of.i32, cap = (uint32_t)args[3].of.i32;
+  wasmtime_memory_t mem;
+  if (!caller_memory(caller, &mem)) return trap_msg("host.read_file: caller exports no memory");
+  char *path = caller_string(caller, &mem, pp, pl);
+  if (!path) return trap_msg("host.read_file: out of bounds");
+  results[0].kind = WASMTIME_I32;
+  results[0].of.i32 = -1;
+  FILE *f = fopen(path, "rb");
+  long size = -1;
+  if (f && fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+  if (!f || size < 0) {
+    set_err(h, "%s: %s", path, strerror(errno));
+  } else if (size > INT32_MAX) {
+    set_err(h, "%s: the file is larger than 2 GiB", path);
+  } else {
+    uint32_t k = (uint32_t)size < cap ? (uint32_t)size : cap;
+    uint8_t *buf = range(wasmtime_caller_context(caller), &mem, bp, k);
+    if (!buf) {
+      fclose(f);
+      free(path);
+      return trap_msg("host.read_file: out of bounds");
+    }
+    rewind(f);
+    if (fread(buf, 1, k, f) == k)
+      results[0].of.i32 = (int32_t)size;
+    else
+      set_err(h, "%s: %s", path, strerror(errno));
+  }
+  if (f) fclose(f);
+  free(path);
+  return NULL;
+}
+
+/* Write the len bytes at buf to the file named by the path at (path,
+ * path-len), creating or replacing it. Returns 0, or -1 with error_message
+ * saying why. */
+static wasm_trap_t *host_write_file(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
+                                    size_t nargs, wasmtime_val_t *results, size_t nresults) {
+  sub_host *h = env;
+  uint32_t pp = (uint32_t)args[0].of.i32, pl = (uint32_t)args[1].of.i32;
+  uint32_t bp = (uint32_t)args[2].of.i32, len = (uint32_t)args[3].of.i32;
+  wasmtime_memory_t mem;
+  if (!caller_memory(caller, &mem)) return trap_msg("host.write_file: caller exports no memory");
+  char *path = caller_string(caller, &mem, pp, pl);
+  uint8_t *buf = range(wasmtime_caller_context(caller), &mem, bp, len);
+  if (!path || !buf) {
+    free(path);
+    return trap_msg("host.write_file: out of bounds");
+  }
+  results[0].kind = WASMTIME_I32;
+  results[0].of.i32 = -1;
+  FILE *f = fopen(path, "wb");
+  if (!f)
+    set_err(h, "%s: %s", path, strerror(errno));
+  else if (fwrite(buf, 1, len, f) != len || fclose(f) != 0)
+    set_err(h, "%s: %s", path, strerror(errno));
+  else
+    results[0].of.i32 = 0;
+  free(path);
+  return NULL;
+}
+
+/* End the process with status code. */
+static wasm_trap_t *host_exit(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
+                              size_t nargs, wasmtime_val_t *results, size_t nresults) {
+  fflush(stdout);
+  fflush(stderr);
+  exit(args[0].of.i32);
+}
+
 /* Expander queries (stage0 only): forward to the embedder's callback. env
  * points at an op code; the host is found through the store's data. */
 static const int32_t op_codes[] = {SUB_OP_SYNTAX_LOCAL_VALUE, SUB_OP_RAISE_SYNTAX_ERROR, SUB_OP_FREE_IDENTIFIER_EQ,
@@ -612,6 +737,11 @@ sub_host *sub_host_new(void) {
       define(h, "host", "instantiate", 5, 1, host_instantiate, h) ||
       define(h, "host", "export_index", 4, 1, host_export_index, h) ||
       define(h, "host", "error_message", 2, 1, host_error_message, h) ||
+      define(h, "host", "arg_count", 0, 1, host_arg_count, h) ||
+      define(h, "host", "arg", 3, 1, host_arg, h) ||
+      define(h, "host", "read_file", 4, 1, host_read_file, h) ||
+      define(h, "host", "write_file", 4, 1, host_write_file, h) ||
+      define(h, "host", "exit", 1, 0, host_exit, h) ||
       define(h, "expander", "syntax-local-value", 1, 1, expander_call, (void *)&op_codes[0]) ||
       define(h, "expander", "raise-syntax-error", 2, 1, expander_call, (void *)&op_codes[1]) ||
       define(h, "expander", "free-identifier=?", 2, 1, expander_call, (void *)&op_codes[2]) ||
@@ -629,5 +759,7 @@ void sub_host_free(sub_host *h) {
   wasmtime_linker_delete(h->linker);
   wasmtime_store_delete(h->store);
   free(h->pending_trap);
+  for (int i = 0; i < h->nargs; i++) free(h->args[i]);
+  free(h->args);
   free(h);
 }

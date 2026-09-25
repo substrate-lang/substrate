@@ -113,7 +113,9 @@
          syntax-property free-identifier=? syntax-local-value identifier-binding-kind
          local-expand syntax-local-lift-definition raise-syntax-error
          ;; output and errors
-         write display newline printf format error)
+         write display newline printf format error
+         ;; files and the command line
+         file->bytes file->string display-to-file current-command-line-arguments exit)
 
 ;; ---- values --------------------------------------------------------------------------
 
@@ -344,7 +346,8 @@
             (set! i (i32.add i 1))
             (br next)))
         (return (out-byte 41))))
-  (if (ref.test (ref bytes) v) (return (out-bytes (ref.cast (ref bytes) v))))
+  (if (ref.test (ref bytes) v)
+      (return (if display (out-raw-bytes (ref.cast (ref bytes) v)) (out-bytes (ref.cast (ref bytes) v)))))
   (if (ref.test (ref closure) v) (return (out-string '"#<procedure>" 0)))
   (if (ref.test (ref structure) v)
       (begin
@@ -359,8 +362,18 @@
         (return (out-byte 62))))
   (out-string '"#<other>" 0))
 
-;; A byte string, written #"...", with printable ASCII as itself, \" and \\
-;; escaped, and other bytes in three octal digits.
+;; A byte string's bytes, as display writes it.
+(func (out-raw-bytes [a (ref bytes)])
+  (let ([i 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i (array.len a)))
+        (out-byte (array.get_u bytes a i))
+        (set! i (i32.add i 1))
+        (br next)))))
+
+;; A byte string as write writes it: #"...", with printable ASCII as
+;; itself, \" and \\ escaped, and other bytes in three octal digits.
 (func (out-bytes [a (ref bytes)])
   (let ([i 0] [b 0])
     (out-string '"#\"" 0)
@@ -2636,3 +2649,131 @@
                 (set! rest (s:cdr rest))
                 (br next))))))
   (fail-out))
+
+;; ---- files and the command line ----------------------------------------------------
+;;
+;; Paths and file contents cross to the host (spec 4) through this memory,
+;; from scratch up, grown as needed.
+
+(import host-arg-count "host" "arg_count" (-> i32))
+(import host-arg "host" "arg" (i32 i32 i32 -> i32))
+(import host-read-file "host" "read_file" (i32 i32 i32 i32 -> i32))
+(import host-write-file "host" "write_file" (i32 i32 i32 i32 -> i32))
+(import host-exit "host" "exit" (i32 ->))
+(import host-error-message "host" "error_message" (i32 i32 -> i32))
+
+(global scratch i32 65536)
+
+;; Room for n bytes at scratch.
+(func (scratch-reserve [n i32])
+  (let ([have (i32.mul (memory.size) 65536)] [end (i32.add scratch n)])
+    (if (i32.gt_u end have)
+        (drop (memory.grow (i32.div_u (i32.add (i32.sub end have) 65535) 65536))))))
+
+;; String s's bytes, at address at.
+(func (store-string [s eqref] [at i32])
+  (let ([n (s:string-length s)] [i 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (i32.store8 (i32.add at i) (s:string-byte s i))
+        (set! i (i32.add i 1))
+        (br next)))))
+
+;; Stop with "who: " and the host's message for its last failure.
+(func (host-error [who eqref]) -> eqref
+  (scratch-reserve 4096)
+  (let ([n (host-error-message scratch 4096)] [i 0])
+    (set! out-length 0)
+    (out-string who 0)
+    (out-string '": " 0)
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (out-byte (i32.load8_u (i32.add scratch i)))
+        (set! i (i32.add i 1))
+        (br next)))
+    (fail-out)))
+
+;; The bytes of the file path names, for function who.
+(func (read-file [path eqref] [who eqref]) -> (ref bytes)
+  (let* ([p (string-arg path who)] [pl (s:string-length p)] [at (i32.add scratch pl)] [n 0])
+    (scratch-reserve pl)
+    (store-string p scratch)
+    (set! n (host-read-file scratch pl at 0))
+    (if (i32.lt_s n 0) (drop (host-error who)))
+    (scratch-reserve (i32.add pl n))
+    (if (i32.ne (host-read-file scratch pl at n) n) (drop (host-error who)))
+    (let ([a (array.new bytes 0 n)] [i 0])
+      (block done
+        (loop next
+          (br-if done (i32.ge_u i n))
+          (array.set bytes a i (i32.load8_u (i32.add at i)))
+          (set! i (i32.add i 1))
+          (br next)))
+      a)))
+
+(substrate-define (file->bytes path) (read-file path '"file->bytes"))
+
+;; The file's bytes as a string; it is an error if they are not UTF-8.
+(substrate-define (file->string path)
+  (bytes->string* (read-file path '"file->string") '#f '#f '#f '"file->string"))
+
+;; (display-to-file v path): write v, as display does, to the file path
+;; names, creating or replacing it.
+(substrate-define (display-to-file v path)
+  (let* ([p (string-arg path '"display-to-file")] [pl (s:string-length p)] [at (i32.add scratch pl)]
+         [n 0] [i 0])
+    (set! out-length 0)
+    (out-datum v 1)
+    (set! n out-length)
+    (set! out-length 0)
+    (scratch-reserve (i32.add pl n))
+    (store-string p scratch)
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (i32.store8 (i32.add at i) (array.get_u bytes out i))
+        (set! i (i32.add i 1))
+        (br next)))
+    (if (i32.lt_s (host-write-file scratch pl at n) 0) (drop (host-error '"display-to-file")))
+    '#f))
+
+;; The len bytes at scratch as a string, for function who.
+(func (scratch-string [len i32] [who eqref]) -> eqref
+  (let ([b (s:make-string-builder)] [i 0] [s eqref '#f])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i len))
+        (s:string-builder-add-byte! b (i32.load8_u (i32.add scratch i)))
+        (set! i (i32.add i 1))
+        (br next)))
+    (set! s (s:string-builder->string b))
+    (if (ref.is_null s) (drop (format-error who '"a command-line argument is not UTF-8")))
+    s))
+
+;; The program's command-line arguments, as a vector of strings.
+(substrate-define (current-command-line-arguments)
+  (let* ([n (host-arg-count)] [v (array.new vector (ref.null eq) n)] [i 0] [len 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (set! len (host-arg i scratch 0))
+        (scratch-reserve len)
+        (drop (host-arg i scratch len))
+        (array.set vector v i (scratch-string len '"current-command-line-arguments"))
+        (set! i (i32.add i 1))
+        (br next)))
+    v))
+
+;; The status (exit v) ends the program with: v if it is an integer from 1
+;; to 255, and otherwise 0.
+(func (exit-status [v eqref]) -> i32
+  (if (i32.eqz (s:fixnum? v)) (return 0))
+  (let ([n (s:fixnum-value v)])
+    (if (i32.and (i32.ge_s n 1) (i32.le_s n 255)) n 0)))
+
+(substrate-define exit
+  (substrate-case-lambda
+    [() (host-exit 0) '#f]
+    [(v) (host-exit (exit-status v)) '#f]))

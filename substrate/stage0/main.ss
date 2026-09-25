@@ -3,7 +3,12 @@
 ;;
 ;; subc: the stage0 driver.
 ;;
-;;   subc run FILE                 compile FILE (and what it requires), run its main
+;;   subc run FILE [ARG ...]       compile FILE (and what it requires), run its main
+;;                                 with the arguments
+;;   subc build FILE [-o DIR]      write FILE's program to DIR, for build/subhost:
+;;                                 each linklet it instantiates at run time, as
+;;                                 DIR/<name>.wasm, and DIR/program, their names in
+;;                                 the order they are instantiated (spec 4)
 ;;   subc compile FILE [-o OUT]    write FILE's linklets: phase 0 to OUT, phase p
 ;;                                 to OUT with .phase<p>.wasm
 ;;   subc expand FILE              print FILE's fully expanded phase-0 forms
@@ -51,8 +56,15 @@
              (newline (current-error-port))
              (exit 3)])
     (cond
-      [(and (= (length args) 2) (string=? (car args) "run"))
-       (run-module (compile-module-file (cadr args)))]
+      [(and (>= (length args) 2) (string=? (car args) "run"))
+       (run-module (compile-module-file (cadr args)) (cddr args))]
+      [(and (>= (length args) 2) (string=? (car args) "build"))
+       (let* ([linklets (program-linklets (compile-module-file (cadr args)))]
+              [dir (option args "-o" (strip-extension (cadr args)))])
+         (unless (file-directory? dir) (mkdir dir))
+         (for-each (lambda (l) (write-file (format "~a/~a.wasm" dir (car l)) (cdr l))) linklets)
+         (write-file (format "~a/program" dir)
+                     (string->utf8 (apply string-append (map (lambda (l) (string-append (car l) "\n")) linklets)))))]
       [(and (>= (length args) 2) (string=? (car args) "compile"))
        (let* ([m (compile-module-file (cadr args))]
               [out (option args "-o" (string-append (strip-extension (cadr args)) ".wasm"))])
@@ -66,7 +78,7 @@
        (for-each print-expanded (module-expanded-forms (compile-module-file (cadr args))))]
       [(and (>= (length args) 1) (string=? (car args) "syntax-library"))
        (write-file (option args "-o" "build/syntax.wasm") (syntax-library-bytes))]
-      [else (die 64 "usage: subc run FILE | compile FILE [-o OUT] | expand FILE | syntax-library [-o OUT]")])
+      [else (die 64 "usage: subc run FILE [ARG ...] | build FILE [-o DIR] | compile FILE [-o OUT] | expand FILE | syntax-library [-o OUT]")])
     (flush-output-port (current-output-port))))
 
 (main (command-line-arguments))

@@ -6,7 +6,7 @@
 ;; syntax library through integer handles (spec appendix A).
 (library (stage0 host)
   (export with-profile host-new host-instantiate! host-instantiate-shifted! host-call host-memory-write! host-memory-read
-          host-set-callback! host-request-trap!
+          host-set-callback! host-request-trap! host-add-arg!
           wasm-failure? wasm-failure-message)
   (import (chezscheme))
 
@@ -24,6 +24,7 @@
   (define c-memory-read (foreign-procedure "sub_memory_read" (uptr string unsigned-32 u8* size_t) int))
   (define c-set-callback (foreign-procedure "sub_set_callback" (uptr uptr) void))
   (define c-request-trap (foreign-procedure "sub_request_trap" (uptr string) void))
+  (define c-add-arg (foreign-procedure "sub_add_arg" (uptr string) void))
   (define c-profile-push (foreign-procedure "sub_profile_push" (int) void))
   (define c-profile-pop (foreign-procedure "sub_profile_pop" () void))
 
@@ -46,6 +47,9 @@
       (raise (condition (make-wasm-failure (c-last-error h))))))
 
   (define (host-new) (c-host-new))
+
+  ;; Give the program run in h a command-line argument (spec 4).
+  (define (host-add-arg! h arg) (c-add-arg h arg))
 
   (define (host-instantiate! h name bytes)
     (check h (c-instantiate h name bytes (bytevector-length bytes))))

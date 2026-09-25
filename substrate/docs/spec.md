@@ -308,7 +308,8 @@ Imports from the instance `"host"`. Every pointer is into the **caller's
 own memory**, the one the calling instance exports as `"memory"`. The host
 provides no clocks, randomness or other nondeterminism, so compile-time
 execution is reproducible, which the bootstrap fixpoint (stage2 = stage3)
-depends on.
+depends on. The files a program reads and its arguments are its input,
+like the source a compiler reads.
 
 | Import | Type | Meaning |
 |---|---|---|
@@ -316,13 +317,32 @@ depends on.
 | `trap` | `(ptr len) -> ()` | abort with the UTF-8 message at `ptr` |
 | `instantiate` | `(name name-len bytes bytes-len shift) -> i32` | compile and instantiate the wasm module in `bytes`, link its imports by name, and register it as `name`. At a phase shift `shift` > 0, each import from a linklet `<module>@<phase>+<t>` links to `<module>@<phase>+<t + shift>` instead (3.2). 0 on success. |
 | `export_index` | `(inst inst-len field field-len) -> i32` | append the function `inst.field` to the caller's table (exported as `"table"`) and return its index, or -1 |
-| `error_message` | `(buf cap) -> i32` | copy the last `instantiate` error into `buf`; returns its length |
+| `error_message` | `(buf cap) -> i32` | copy the last error of `instantiate`, `read_file` or `write_file` into `buf`; returns its length |
+| `arg_count` | `() -> i32` | the number of the program's command-line arguments |
+| `arg` | `(i buf cap) -> i32` | copy at most `cap` bytes of argument `i` into `buf`; returns its length, or -1 if there is no argument `i` |
+| `read_file` | `(path path-len buf cap) -> i32` | copy at most `cap` bytes of the file named by the UTF-8 path into `buf`; returns the file's size, or -1 |
+| `write_file` | `(path path-len buf len) -> i32` | write the `len` bytes at `buf` to the file named by the path, creating or replacing it; 0, or -1 |
+| `exit` | `(code) -> ()` | end the process with status `code` |
 
 `instantiate` is **the hook**: wasm cannot make new code executable by
 itself, and this is how it does. The self-hosted compiler will use it the
 way stage0 uses the equivalent C functions. An instantiated module can reach
 exactly what its imports name, so compile-time code runs sandboxed.
-[v0: all five, tested from kernel code in `tests/hook.sub`.]
+[v0: the first five are tested from kernel code in `tests/hook.sub`, and
+the rest through Substrate (`lib/substrate.sub`).] A path is relative to
+the process's working directory.
+
+**Running a program.** `subc build FILE -o DIR` writes the program
+`FILE` is the entry of: each linklet it instantiates at run time, as
+`DIR/<instance name>.wasm`, and `DIR/program`, their instance names one per
+line, each after the linklets it imports from, the entry's own last.
+`build/subhost DIR arg ...` runs it without stage0: in one store, it
+instantiates each linklet under its name, gives the program the arguments,
+and calls the entry's `main`. It exits with status 0 when `main` returns,
+1 if the program cannot be loaded, 2 when it traps, with the message on
+stderr, or the status the program passes to `exit`. Wasm is the program's
+form on disk; wasmtime compiles it to machine code each time it is loaded.
+After bootstrap the compiler is such a program.
 
 ## 5. The kernel language
 
