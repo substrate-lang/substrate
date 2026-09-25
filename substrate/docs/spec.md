@@ -635,6 +635,7 @@ id                                  ; local or global variable
 (call-ref T f arg ...)              ; call f, a (ref null T)
 (func-index f)                      ; i32 index of f in the module's table
 (data-address name)  (data-size name)
+(i32.const n)  (i64.const n)  (f32.const x)  (f64.const x)   ; a constant of that type
 (select a b test)  (drop expr)  (unreachable)  (nop)
 (quote d)  (quasiquote d)           ; syntax-library data (values)
 (quote-syntax d)  (quasisyntax d)   ; syntax objects
@@ -654,7 +655,11 @@ GC instructions take their type and field immediates by name:
 
 - Types are checked bidirectionally. An integer literal takes the type its
   context expects (`i32` if none), and a decimal literal `f64` unless the
-  context says `f32`. A mismatch is a compile error before any wasm is
+  context says `f32`. The constant forms, wasm's own, give a literal its
+  type whatever `#%datum` means where they are written (5.4), so kernel
+  code means the same in any module: in a module whose language makes
+  literals values, `(i32.const 0)` is still an `i32`. Their literal is an
+  integer, or for `f32.const` and `f64.const` a number. A mismatch is a compile error before any wasm is
   emitted.
 - Non-final expressions in a body are dropped. An `if` without an else,
   and any expression whose value is unused, has no value. The branches of
@@ -794,14 +799,18 @@ transformer introduced, such as template identifiers, keep it. So a binding
 the macro introduces cannot capture the user's identifiers, and the user's
 bindings cannot capture the macro's.
 
-A macro use in a **definition context** also gets a fresh **use-site
-scope**, added to its input and not removed. In v0 the definition contexts
-are module bodies, at any phase. At module level the use site and the
-macro's definition share the module's scopes, and the use-site scope keeps
-them apart. Without it, a local binding made from the macro's input could
-capture a reference the macro introduced. Use-site scopes are removed from
-the name of every module-level definition, so a definition a macro makes
-from its input is visible to the rest of the module.
+A use in a **definition context** of a macro defined in that same context
+also gets a fresh **use-site scope**, added to its input and not removed.
+In v0 the definition contexts are module bodies, at any phase. There the
+use site and the macro's definition share the module's scopes, and the
+use-site scope keeps them apart: without it, a local binding made from
+the macro's input could capture a reference the macro introduced. A macro
+from another module needs none, since its introduction scope keeps what
+it introduces apart; so the templates of a module share its scopes
+whatever macro, such as a language's `define`, they are written in (see
+the literals below). Use-site scopes are removed from the name of every
+module-level definition, so a definition a macro makes from its input is
+visible to the rest of the module.
 
 This is the same trade Racket makes: a module-level *definition* made from
 a macro's input can still capture the macro's own references to that name.
@@ -882,6 +891,7 @@ expr ::= id                                   ; a local or global variable, or a
        | (call-indirect (type ... -> type ...) expr expr ...)
        | (ref.func id) | (call-ref id expr expr ...)
        | (func-index id) | (data-address id) | (data-size id)
+       | (i32.const n) | (i64.const n) | (f32.const x) | (f64.const x)
        | (select expr expr expr) | (drop expr) | (unreachable) | (nop)
 ```
 

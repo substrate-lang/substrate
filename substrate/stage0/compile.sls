@@ -519,7 +519,7 @@
   (define (constant-expr? ms e earlier)
     (let loop ([e e])
       (case (car e)
-        [(at) (loop (caddr e))]
+        [(at as) (loop (caddr e))]
         [(int float const ref-func) #t]
         [(quote) (let ([d (cadr e)])
                    (or (and (integer? d) (exact? d) (<= fixnum-min d fixnum-max))

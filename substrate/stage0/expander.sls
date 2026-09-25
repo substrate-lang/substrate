@@ -38,6 +38,7 @@
        begin require require-unqualified provide freestanding set! let let* lambda if block loop br br-if
        return
        call-indirect call-ref ref.func func-index data-address data-size select drop unreachable nop
+       i32.const i64.const f32.const f64.const
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
      (list app-sym datum-sym linklet-sym)
      gc-forms))
@@ -1514,6 +1515,7 @@
                                            (list (list 'global global init)
                                                  (list 'func getter '() (list 'gref global))))
                                    (+ phase 1) f)
+        (hashtable-set! macro-modules getter (comp-module current))
         (bind-definition! (cadr parts) phase (list 'compile-time-value getter)))))
 
   ;; The func form of transformer code named name, of the syntax library's
@@ -1607,11 +1609,20 @@
       (flush-output-port (current-output-port))
       (proc (cstore-host st))))
 
+  ;; The define-syntax getter of each macro -> the module that defines it.
+  (define macro-modules (make-eq-hashtable))
+
+  ;; Is head bound to a macro the module being expanded defines?
+  (define (defined-here? head phase)
+    (let ([m (meaning-of head phase)])
+      (and m (eq? (car m) 'compile-time-value)
+           (eq? (hashtable-ref macro-modules (cadr m) #f) (comp-module current)))))
+
   ;; Hygiene (spec 6.2): a fresh introduction scope is flipped on the input
   ;; and on the output, so only what the transformer introduced carries it.
-  ;; In a definition context (use-site? is true) the input also gets a fresh
-  ;; use-site scope, which stays.
-  ;; transformer is the handle of a transformer value.
+  ;; In a definition context (use-site? is true), a macro the module being
+  ;; expanded defines also gets a fresh use-site scope on its input, which
+  ;; stays. transformer is the handle of a transformer value.
   (define (apply-macro head transformer s0 phase use-site?)
     (when hook-output?
       (raise-compile-error head "#%linklet returned code that uses the macro ~a, but it must return fully expanded code"
@@ -1619,7 +1630,7 @@
     (note-macro-use! head phase)
     (let* ([intro (new-scope!)]
            [s (flip-scope s0 intro)]
-           [s (if use-site?
+           [s (if (and use-site? (defined-here? head phase))
                   (let ([use (new-scope!)])
                     (comp-use-site-scopes-set! current (cons use (comp-use-site-scopes current)))
                     (add-scope s use))
@@ -2028,6 +2039,12 @@
             (arity-check (= (length parts) 2))
             (data-info-of (cadr parts) phase)
             (o (cadr parts))]
+           ;; wasm's constants: a literal of that type, whatever #%datum means
+           ;; here (spec 5.3).
+           [(i32.const i64.const f32.const f64.const)
+            (arity-check (= (length parts) 2))
+            (const-literal name (cadr parts))
+            (o (cadr parts))]
            [(set!)
             (arity-check (and (= (length parts) 3) (id? (cadr parts))))
             (let ([m (meaning-of (cadr parts) phase)])
@@ -2138,6 +2155,17 @@
             (if (memq name gc-forms)
                 (expand-gc name s parts phase)
                 (raise-compile-error s "~a is only allowed at module level" name))])])))
+
+  ;; The literal n of constant form (name n): a number, and an integer for
+  ;; i32.const and i64.const.
+  (define (const-literal name s)
+    (let ([n (stx-e s)] [integer (memq name '(i32.const i64.const))])
+      (unless (if integer (and (integer? n) (exact? n)) (number? n))
+        (raise-compile-error s "~a takes a literal ~a" name (if integer "integer" "number")))
+      n))
+
+  (define (const-type name)
+    (case name [(i32.const) 'i32] [(i64.const) 'i64] [(f32.const) 'f32] [else 'f64]))
 
   ;; A let binding [x init] or [x type init].
   (define (binding-init bp) (if (= (length bp) 3) (caddr bp) (cadr bp)))
@@ -2530,6 +2558,9 @@
        (case name
          [(quote) (list 'quote (stx->datum (cadr parts)))]
          [(quote-syntax) (list 'quote (cadr parts))]
+         [(i32.const i64.const f32.const f64.const)
+          (let ([n (const-literal name (cadr parts))])
+            (list 'as (list (const-type name)) (if (and (integer? n) (exact? n)) (list 'int n) (list 'float n))))]
          [(data-address) (list 'const 'i32 (data-info-offset (lowered-data-info (cadr parts) phase)))]
          [(data-size) (list 'const 'i32 (bytevector-length (data-info-bytes (lowered-data-info (cadr parts) phase))))]
          [(set!)
