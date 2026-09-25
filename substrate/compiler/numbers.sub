@@ -27,24 +27,200 @@
         (if (i64.lt_s n 0) (%make-integer 0 n) (s:integer n))
         (if (i64.gt_u n 9223372036854775808) (ref.null eq) (s:integer (i64.sub 0 n))))))
 
-;; d × 10^e, negated if negative is not #f, as a flonum: d a non-negative
-;; integer, e a fixnum. Exact, so correctly rounded, when d ≤ 2^53 and
-;; |e| ≤ 22, since then d and 10^|e| are exact f64s and one multiplication
-;; or division rounds once; otherwise #f.
-(func (decimal->flonum [d eqref] [e eqref] [negative eqref]) -> eqref
-  (let ([n (s:integer-value d)] [k (s:fixnum-value e)] [p f64 1] [i 0] [x f64 0])
-    (if (i64.gt_u n 9007199254740992) (return (ref.null eq)))
-    (if (i32.gt_s k 22) (return (ref.null eq)))
-    (if (i32.lt_s k -22) (return (ref.null eq)))
+;; D × 10^e as a flonum, negated if negative is not #f: D the integer with
+;; decimal digits ds, a list of fixnums, and e a fixnum. The result is the
+;; f64 nearest the exact value, ties to even (spec 5.4): infinity above the
+;; largest, zero below half the smallest.
+(func (decimal->flonum [ds eqref] [e eqref] [negative eqref]) -> eqref
+  (let ([k (s:fixnum-value e)] [nd (s:length ds)] [bits i64 0] [x f64 0])
+    ;; Leading zeros add nothing.
+    (block done
+      (loop next
+        (br-if done (i32.eqz (s:pair? ds)))
+        (br-if done (i32.ne (s:fixnum-value (s:car ds)) 0))
+        (set! ds (s:cdr ds))
+        (set! nd (i32.sub nd 1))
+        (br next)))
+    (set! bits
+          (if (i32.eqz nd)
+              0
+              ;; D × 10^k is at least 10^(nd + k - 1) and below 10^(nd + k).
+              (if (i32.gt_s (i32.add nd k) 310)
+                  9218868437227405312
+                  (if (i32.lt_s (i32.add nd k) -330)
+                      0
+                      (if (i32.and (i32.le_s nd 15) (i32.le_u (i32.add k 22) 44))
+                          (i64.reinterpret_f64 (small-decimal ds k))
+                          (big-decimal ds nd k))))))
+    (set! x (f64.reinterpret_i64 bits))
+    (s:flonum (if (ref.is_null negative) x (f64.neg x)))))
+
+;; D × 10^k for D below 10^15, so below 2^53, and |k| ≤ 22: D and 10^|k|
+;; are exact f64s, and one multiplication or division rounds once.
+(func (small-decimal [ds eqref] [k i32]) -> f64
+  (let ([n i64 0] [p f64 1] [i 0])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (s:pair? ds)))
+        (set! n (i64.add (i64.mul n 10) (i64.extend_i32_u (s:fixnum-value (s:car ds)))))
+        (set! ds (s:cdr ds))
+        (br next)))
     (block done
       (loop next
         (br-if done (i32.ge_s i (select k (i32.sub 0 k) (i32.ge_s k 0))))
         (set! p (f64.mul p 10))
         (set! i (i32.add i 1))
         (br next)))
-    (set! x (f64.convert_i64_u n))
-    (set! x (if (i32.ge_s k 0) (f64.mul x p) (f64.div x p)))
-    (s:flonum (if (ref.is_null negative) x (f64.neg x)))))
+    (if (i32.ge_s k 0) (f64.mul (f64.convert_i64_u n) p) (f64.div (f64.convert_i64_u n) p))))
+
+;; ---- big integers ----
+;;
+;; The other decimals are converted exactly, with integers of any size:
+;; arrays of 32-bit limbs, least significant first, each in an i64. The
+;; arrays of one conversion have one length, room for its largest number.
+(type limbs (array (mut i64)))
+
+;; The bits of the f64 nearest D × 10^k, D ≠ 0 the nd digits ds: as the
+;; quotient of integers N / M, D × 10^k / 1 or D / 10^-k, shifted by s
+;; bits so that q = N 2^s / M has 54 bits, 53 and a rounding bit, or fewer
+;; for a subnormal (s at most 1075, the smallest f64 being 2^-1074).
+(func (big-decimal [ds eqref] [nd i32] [k i32]) -> i64
+  (let* ([len (i32.add (i32.div_u (i32.add (i32.mul (i32.add nd (select k (i32.sub 0 k) (i32.ge_s k 0))) 4) 1400) 32) 4)]
+         [n (array.new limbs 0 len)] [m (array.new limbs 0 len)] [i 0] [s 0] [q i64 0] [r (array.new limbs 0 len)]
+         [mant i64 0] [e2 0])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (s:pair? ds)))
+        (big-mul-add! n 10 (i64.extend_i32_u (s:fixnum-value (s:car ds))))
+        (set! ds (s:cdr ds))
+        (br next)))
+    (array.set limbs m 0 1)
+    (block done
+      (loop next
+        (br-if done (i32.ge_s i (select k (i32.sub 0 k) (i32.ge_s k 0))))
+        (big-mul-add! (if (i32.ge_s k 0) n m) 10 0)
+        (set! i (i32.add i 1))
+        (br next)))
+    (set! s (i32.sub 54 (i32.sub (big-bit-length n) (big-bit-length m))))
+    (if (i32.gt_s s 1075) (set! s 1075))
+    ;; The estimate is off by at most one: q has 53 to 55 bits.
+    (block done
+      (loop next
+        (set! q (big-quotient n m s r))
+        (if (i64.ge_u q 18014398509481984) (begin (set! s (i32.sub s 1)) (br next)))
+        (br-if done (i64.ge_u q 9007199254740992))
+        (br-if done (i32.eq s 1075))
+        (set! s (i32.add s 1))
+        (br next)))
+    ;; Round to nearest, ties to even, what the rounding bit and the
+    ;; remainder leave.
+    (set! mant (i64.shr_u q 1))
+    (if (i32.wrap_i64 (i64.and q 1))
+        (if (i32.or (i32.eqz (big-zero? r)) (i32.wrap_i64 (i64.and mant 1)))
+            (set! mant (i64.add mant 1))))
+    (set! e2 (i32.sub 1 s))
+    (if (i64.eq mant 9007199254740992) (begin (set! mant 4503599627370496) (set! e2 (i32.add e2 1))))
+    (if (i64.lt_u mant 4503599627370496) (return mant))
+    (if (i32.gt_s (i32.add e2 1075) 2046) (return 9218868437227405312))
+    (i64.or (i64.shl (i64.extend_i32_u (i32.add e2 1075)) 52) (i64.sub mant 4503599627370496))))
+
+;; a := a × k + c, for k and c below 2^32.
+(func (big-mul-add! [a (ref limbs)] [k i64] [c i64])
+  (let ([i 0] [v i64 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i (array.len a)))
+        (set! v (i64.add (i64.mul (array.get limbs a i) k) c))
+        (array.set limbs a i (i64.and v 4294967295))
+        (set! c (i64.shr_u v 32))
+        (set! i (i32.add i 1))
+        (br next)))))
+
+(func (big-bit-length [a (ref limbs)]) -> i32
+  (let ([i (array.len a)] [v i64 0])
+    (block done
+      (loop next
+        (br-if done (i32.eqz i))
+        (set! i (i32.sub i 1))
+        (set! v (array.get limbs a i))
+        (if (i64.ne v 0) (return (i32.add (i32.mul i 32) (i32.sub 64 (i32.wrap_i64 (i64.clz v))))))
+        (br next)))
+    0))
+
+(func (big-zero? [a (ref limbs)]) -> i32 (i32.eqz (big-bit-length a)))
+
+;; a shifted left by b bits, as a new array.
+(func (big-shl [a (ref limbs)] [b i32]) -> (ref limbs)
+  (let ([r (array.new limbs 0 (array.len a))] [w (i32.div_u b 32)] [t (i64.extend_i32_u (i32.rem_u b 32))]
+        [i 0] [v i64 0])
+    (set! i w)
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i (array.len a)))
+        (set! v (i64.shl (array.get limbs a (i32.sub i w)) t))
+        (if (i32.and (i64.ne t 0) (i32.gt_u i w))
+            (set! v (i64.or v (i64.shr_u (array.get limbs a (i32.sub (i32.sub i w) 1)) (i64.sub 32 t)))))
+        (array.set limbs r i (i64.and v 4294967295))
+        (set! i (i32.add i 1))
+        (br next)))
+    r))
+
+;; a := a / 2.
+(func (big-shr1! [a (ref limbs)])
+  (let ([i 0] [v i64 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i (array.len a)))
+        (set! v (i64.shr_u (array.get limbs a i) 1))
+        (if (i32.lt_u (i32.add i 1) (array.len a))
+            (set! v (i64.or v (i64.shl (i64.and (array.get limbs a (i32.add i 1)) 1) 31))))
+        (array.set limbs a i v)
+        (set! i (i32.add i 1))
+        (br next)))))
+
+;; -1, 0 or 1 as a is below, equal to or above b.
+(func (big-compare [a (ref limbs)] [b (ref limbs)]) -> i32
+  (let ([i (array.len a)] [x i64 0] [y i64 0])
+    (block done
+      (loop next
+        (br-if done (i32.eqz i))
+        (set! i (i32.sub i 1))
+        (set! x (array.get limbs a i))
+        (set! y (array.get limbs b i))
+        (if (i64.lt_u x y) (return -1))
+        (if (i64.gt_u x y) (return 1))
+        (br next)))
+    0))
+
+;; a := a - b, for a ≥ b.
+(func (big-sub! [a (ref limbs)] [b (ref limbs)])
+  (let ([i 0] [v i64 0] [borrow i64 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i (array.len a)))
+        (set! v (i64.sub (i64.sub (array.get limbs a i) (array.get limbs b i)) borrow))
+        (set! borrow (i64.extend_i32_u (i64.lt_s v 0)))
+        (array.set limbs a i (i64.and v 4294967295))
+        (set! i (i32.add i 1))
+        (br next)))))
+
+;; The quotient of n 2^s / m, below 2^56, by long division; the remainder
+;; goes to r.
+(func (big-quotient [n (ref limbs)] [m (ref limbs)] [s i32] [r (ref limbs)]) -> i64
+  (let ([a (if (i32.ge_s s 0) (big-shl n s) (big-shl n 0))]
+        [t (big-shl (if (i32.ge_s s 0) m (big-shl m (i32.sub 0 s))) 55)]
+        [q i64 0] [i 0])
+    (block done
+      (loop next
+        (br-if done (i32.gt_s i 55))
+        (set! q (i64.shl q 1))
+        (if (i32.ge_s (big-compare a t) 0)
+            (begin (big-sub! a t) (set! q (i64.or q 1))))
+        (big-shr1! t)
+        (set! i (i32.add i 1))
+        (br next)))
+    (array.copy limbs limbs r 0 a 0 (array.len a))
+    q))
 
 ;; +inf.0 (kind 0), -inf.0 (1) or +nan.0 (2).
 (func (flonum-special [kind eqref]) -> eqref

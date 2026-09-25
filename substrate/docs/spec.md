@@ -676,7 +676,9 @@ as the symbol `#%name`, and `#:name` as a keyword, as Racket does: a kind
 of datum of its own, used for options in forms such as `#:mutable`. A
 keyword is not an expression, but quoted it is a value. An integer literal
 must fit in 64 bits, from -2^63 to 2^64 - 1, and a number literal is an
-integer or a decimal: the reader rejects others, such as `1/2`.
+integer or a decimal: the reader rejects others, such as `1/2`. A decimal
+is the f64 nearest its exact value, ties to even: infinity above the
+largest f64, and zero below half the smallest.
 
 ### 5.5 Base bindings
 
