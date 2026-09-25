@@ -391,18 +391,18 @@ like the source a compiler reads.
 | `exit` | `(code) -> ()` | end the process with status `code` |
 
 `instantiate` is **the hook**: wasm cannot make new code executable by
-itself, and this is how it does. The self-hosted compiler will use it the
-way stage0 uses the equivalent C functions. An instantiated module can reach
+itself, and this is how it does. The compiler runs compile-time code with
+it; stage0 uses the equivalent C functions. An instantiated module can reach
 exactly what its imports name, so compile-time code runs sandboxed.
 [v0: the first five are tested from kernel code in `tests/hook.sub`, and
 the rest through Substrate (`lib/substrate.sub`).] A path is relative to
 the process's working directory.
 
-**Running a program.** `subc build FILE -o DIR` writes the program
+**Running a program.** `sub build FILE -o DIR` writes the program
 `FILE` is the entry of: each linklet it instantiates at run time, as
 `DIR/<instance name>.wasm`, and `DIR/program`, their instance names one per
 line, each after the linklets it imports from, the entry's own last.
-`build/subhost DIR arg ...` runs it without stage0: in one store, it
+`build/subhost DIR arg ...` runs it: in one store, it
 instantiates each linklet under its name, gives the program the arguments,
 and calls the entry's `main`. It exits with status 0 when `main` returns,
 1 if the program cannot be loaded, 2 when it traps, with the message on
@@ -416,14 +416,14 @@ trap's message is its cause and then its backtrace, a frame a line, each
 with its source location when the frame's linklet has one (3.6).
 Wasm is the program's
 form on disk; the engine compiles it to machine code each time it is
-loaded. After bootstrap the compiler is such a program.
+loaded. The compiler is such a program.
 
 `host/subhost.mjs DIR arg ...` is the same host over Node's V8. V8's
 JavaScript API does not tell a host import which instance called it, so
 this host finds the caller's memory and table through the caller's
 exports, and runs a module's start function just after instantiating it
 rather than during instantiation, when the exports do not exist yet.
-`bin/sub` runs the compiler on V8: today it runs it about five times
+`bin/sub` runs the compiler on V8: today it runs it about eight times
 faster than wasmtime, whose support for GC is younger (a collector that
 counts references and frees objects one at a time, and a call into the
 runtime for each allocation and for each cast to anything but the
@@ -852,7 +852,7 @@ syntax in the grammar
 below, with every macro use expanded and every application and literal
 explicit. `local-expand` returns it, module passes and `#%linklet` (6.5)
 receive and return it,
-`subc expand` prints it, and the compiler compiles it once no `lambda`
+`sub expand` prints it, and the compiler compiles it once no `lambda`
 remains (5.3).
 
 ```
@@ -990,7 +990,8 @@ A library usually provides a macro that expands into the declaration.
   queries for the types of imported definitions. Substrate's `#%linklet`
   gives a captured variable the type it is written with, or `eqref`, so a
   lambda that captures a kernel local whose inferred type is another fails
-  to type-check. Nothing planned before bootstrap needs more.
+  to type-check. Nothing needs more yet; the typed layer, a rung after
+bootstrap, will.
 - **Structs after the typed layer**: declared types are identified by
   structure (5.1), so `lib/struct.sub`'s accessors check brands at run
   time: passing a `fahrenheit` to `celsius-t` is a run-time error, where

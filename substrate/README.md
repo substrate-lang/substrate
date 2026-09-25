@@ -18,7 +18,7 @@ line says the same.
 | Directory | What it holds | Lifecycle |
 |---|---|---|
 | `docs/` | the kernel specification | permanent |
-| `host/` | the host, in C over wasmtime: stores, linking, the `host` imports and the instantiate hook | permanent: after bootstrap it runs the compiler |
+| `host/` | the hosts, in C over wasmtime (`subhost.c`) and in JavaScript over Node's V8 (`subhost.mjs`): stores, linking, the `host` imports and the instantiate hook | permanent: they run programs, the compiler among them |
 | `compiler/` | the compiler, written in Substrate: reader, expander, kernel compiler, wasm encoder, and the syntax library (`syntax.sub`). It compiles itself (spec 1.4) | permanent, grows |
 | `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: builds stage1, and checks the compiler, until it is retired |
 | `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match`, and Substrate itself (`substrate.sub`), the language built on the kernel | permanent, grows |
@@ -38,21 +38,27 @@ Everything runs in the flake's dev shell:
 
 ```sh
 nix develop
-make check                      # run the tests: built by build/sub, run on build/subhost
-make check-stage0               # run the tests, built by stage0
-bin/subc run tests/macros.sub   # compile and run a program's main
-bin/subc expand FILE            # print fully expanded kernel forms
-bin/subc compile FILE -o OUT    # write FILE's linklets (phase 0 to OUT)
-bin/subc syntax-library -o build/syntax.wasm      # write the syntax library
+make check                      # the tests: built by bin/sub, run on build/subhost
+bin/sub build FILE -o DIR       # write FILE's program to DIR
+build/subhost DIR [ARG ...]     # run it on wasmtime
+host/subhost.mjs DIR [ARG ...]  # run it on V8
+bin/sub expand FILE             # print FILE's fully expanded phase-0 forms
+bin/sub compile FILE -o OUT     # write FILE's linklets (phase 0 to OUT)
+bin/sub syntax-library -o build/syntax.wasm      # write the syntax library
 wasm-tools print OUT            # inspect a module
+HOST=build/subhost bin/sub ...  # run the compiler on wasmtime rather than V8
+HOST=host/subhost.mjs tests/run.sh   # run the tests' programs on V8
+SUBHOST_PERFMAP=1 HOST=build/subhost perf record -g bin/sub ...   # wasmtime samples, named by wasm function
+```
+
+bin/sub runs the compiler, `build/sub`, on V8. While stage0 is kept,
+`bin/subc` runs it, with the same commands and `run`:
+
+```sh
+make check-stage0               # the tests, built by stage0
+bin/subc run tests/macros.sub   # compile and run a program's main
 SUBHOST_PROFILE=1 bin/subc run FILE   # time per category, printed at exit
 SUBHOST_PROFILE=2 bin/subc run FILE   # also each wasm compile: size, time, instance
-SUBHOST_PERFMAP=1 HOST=build/subhost perf record -g bin/sub ...   # wasmtime samples, named by wasm function
-bin/sub build FILE -o DIR       # the compiler written in Substrate (build/sub), on V8
-build/subhost DIR               # run a built program on wasmtime
-host/subhost.mjs DIR            # run it on V8
-COMPILER=bin/sub tests/run.sh   # the tests, built by the compiler in Substrate
-HOST=host/subhost.mjs tests/run.sh   # run programs, and bin/sub, on that host
 ```
 
 `make build/sub` builds the compiler bin/sub runs from the checked-in seed
@@ -66,11 +72,15 @@ twice (stage2, stage3), and checks that stage2 = stage3, that stage0 agrees
 
 The compiler is written in Substrate (`compiler/`) and compiles itself:
 built by stage0, then by itself, it reaches its fixpoint, and stage0 and it
-write the same bytes (`make bootstrap`, spec 1.4). On V8 it builds itself
-in under a second.
+write the same bytes (`make bootstrap`, spec 1.4). It is built from a
+checked-in seed, and on V8 it builds itself in under a second. Stage0 is
+kept for now, as a second compiler to check it against.
 
-Stage0 goes from source to a running program: reader, expander, kernel
-compiler, binary wasm, then wasmtime. Macros work end to end: a
+The compiler goes from source to a program: reader, expander, kernel
+compiler, binary wasm, which a host runs on wasmtime or V8. Errors and
+traps name the source: a backtrace gives each frame's file, line and
+column, and a trap in a macro is reported where the macro was used (spec
+3.6, 4). Macros work end to end: a
 transformer is a phase-1 function over GC syntax objects, compiled and
 instantiated in the compile-time store and called by the expander.
 Compile-time values (`define-syntax`, `syntax-local-value`),
@@ -80,7 +90,8 @@ syntax properties work too, and macros are hygienic
 application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
 5.4). Expansion produces fully expanded code, syntax in a fixed grammar (spec
 6.4): a macro can see its input's with `local-expand`, a module pass
-(spec 6.5) can rewrite a whole module's, and `subc expand` prints it.
+(spec 6.6) or a language's `#%linklet` (spec 6.5) can rewrite a whole
+module's, and `bin/sub expand` prints it.
 Modules `require` each other by name, with
 qualified imports (`print:write-int`), at any phase:
 each phase of a module compiles to its own wasm module, a linklet, and a

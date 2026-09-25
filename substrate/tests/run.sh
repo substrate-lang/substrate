@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lifecycle: test harness.
 #
-# Build every tests/*.sub and examples/*.sub with subc build and run it
+# Build every tests/*.sub and examples/*.sub with COMPILER build and run it
 # with a host, build/subhost unless HOST names another (host/subhost.mjs
 # runs programs on Node's V8); the output checked is the build's, then the
 # run's.
