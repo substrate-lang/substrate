@@ -227,12 +227,15 @@ them in Chez; in a run-time store they trap.
 
 ### 3.2 Stores and instance names
 
-- Each module is compiled with a fresh compile-time store. The linklets of
-  the module's compile-time code, and those of the modules it requires, are
-  instantiated there on demand. So no compile-time state is shared between the
-  compilations of two modules, as in Racket. Compiled wasm code is not
-  state: the host compiles a linklet's bytes once and instantiates the result
-  in every store that needs it.
+- The compilation of each module has compile-time instances of its own.
+  The linklets of the module's compile-time code, and those of the modules
+  it requires, are instantiated for it on demand. So no compile-time state
+  is shared between the compilations of two modules, as in Racket.
+  Compiled wasm code is not state: the host compiles a linklet's bytes once
+  and instantiates the result wherever it is needed. [v0] Stage0 gives
+  each compilation a fresh store. The self-hosted compiler runs in a store
+  of its own and gives each compilation a namespace in it (below), since
+  macros share syntax objects with the compiler by reference.
 - A module's linklet instantiated at phase shift *t* is registered as
   `<module>@<phase>+<t>`. A compiled linklet imports from other linklets by
   names relative to its own module at phase shift 0. The host adds the
@@ -244,6 +247,10 @@ them in Chez; in a run-time store they trap.
 - The other instance names are `syntax`, `host`, `expander`, the linklets
   of compile-time code (`<module>@<phase>#<n>`) and per-store entry
   linklets (`entry#<n>`).
+- **Namespaces**: an instance registered as `<ns>/<name>` imports from
+  linklets, the instances with an `@` in their names, in namespace `ns`:
+  the host looks up `<ns>/<linklet>`, after the phase shift. Its other
+  imports, such as `syntax` and `host`, are the store's.
 
 ### 3.3 Linking
 

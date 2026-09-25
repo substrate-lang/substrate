@@ -335,6 +335,23 @@ static void shift_name(const char *name, size_t len, int32_t shift, char *out, s
   snprintf(out, cap, "%.*s+%ld", (int)plus, name, t + shift);
 }
 
+/* The instance an import from mod (len bytes) links to, for the instance
+ * named name at phase shift shift. A linklet name, one with an @ in it, is
+ * shifted, and if name is "<ns>/<rest>" it is looked up in namespace ns
+ * too: a linklet registered in a namespace imports from linklets in it
+ * (spec 3.2). Other names, such as "syntax" and "host", are unchanged. */
+static void map_import(const char *name, const char *mod, size_t len, int32_t shift, char *out, size_t cap) {
+  if (!memchr(mod, '@', len)) {
+    snprintf(out, cap, "%.*s", (int)len, mod);
+    return;
+  }
+  const char *slash = strrchr(name, '/');
+  int ns = slash ? (int)(slash - name) + 1 : 0;
+  snprintf(out, cap, "%.*s", ns, name);
+  size_t used = strlen(out);
+  shift_name(mod, len, shift, out + used, cap - used);
+}
+
 int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes, size_t len, int32_t shift) {
   char *name_copy = strdup(name);
   uint8_t *copy = malloc(len ? len : 1);
@@ -355,7 +372,7 @@ int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes,
     const wasm_name_t *mod = wasm_importtype_module(imports.data[i]);
     const wasm_name_t *field = wasm_importtype_name(imports.data[i]);
     char mapped[512];
-    shift_name(mod->data, mod->size, shift, mapped, sizeof mapped);
+    map_import(name_copy, mod->data, mod->size, shift, mapped, sizeof mapped);
     if (!wasmtime_linker_get(h->linker, h->ctx, mapped, strlen(mapped), field->data, field->size, &externs[i])) {
       set_err(h, "instantiate %s: no import %s.%.*s", name_copy, mapped, (int)field->size, field->data);
       goto done;
@@ -487,9 +504,10 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   uint8_t *copy = malloc(bl ? bl : 1);
   memcpy(copy, bytes, bl);
   ENTER(h, caller);
-  /* At a phase shift, linklet names in the module's imports are shifted (spec 3.2). */
-  int rc = shift == 0 ? instantiate(h, name_copy, nl, copy, bl)
-                      : sub_instantiate_shifted(h, name_copy, copy, bl, shift);
+  /* At a phase shift, and in a namespace, linklet names in the module's
+   * imports are mapped (spec 3.2). */
+  int rc = shift == 0 && !strchr(name_copy, '/') ? instantiate(h, name_copy, nl, copy, bl)
+                                                 : sub_instantiate_shifted(h, name_copy, copy, bl, shift);
   LEAVE(h);
   free(copy);
   free(name_copy);
