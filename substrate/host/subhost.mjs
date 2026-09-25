@@ -248,11 +248,23 @@ function instantiate(name, bytes, shift) {
 }
 
 // A trap in main, reported as build/subhost reports it: what happened,
-// then where.
-function fail(e) {
+// then where. The program's on-trap, if it has one, reports it instead
+// (spec 4), reading the message with host.error_message.
+function fail(e, exports) {
   if (e instanceof Trap || e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
-    const where = (e.stack || '').split('\n').slice(1).join('\n');
-    process.stderr.write(`error: trap: ${e.message}\n${where}\n`);
+    // The wasm frames: the host's own are not the program's.
+    const where = (e.stack || '').split('\n').filter((l) => l.includes('wasm://')).join('\n');
+    lastError = `trap: ${e.message}\n${where}`;
+    const onTrap = exports['on-trap'];
+    if (typeof onTrap === 'function') {
+      try {
+        onTrap();
+        process.exit(2);
+      } catch (e2) {
+        // It trapped too: report the first trap.
+      }
+    }
+    process.stderr.write(`error: ${lastError}\n`);
     process.exit(2);
   }
   throw e;
@@ -279,11 +291,11 @@ for (const name of names) {
   }
 }
 // A program without a main function has nothing to run.
-const main = names.length > 0 && registry.get(names[names.length - 1]).main;
-if (typeof main === 'function') {
+const entry = names.length > 0 ? registry.get(names[names.length - 1]) : {};
+if (typeof entry.main === 'function') {
   try {
-    main();
+    entry.main();
   } catch (e) {
-    fail(e);
+    fail(e, entry);
   }
 }

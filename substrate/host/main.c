@@ -6,8 +6,9 @@
  * under its name, then the last one's main is called with the arguments.
  *
  * Exit status: 0 when main returns, 1 when the program cannot be loaded, 2
- * when it traps (the message goes to stderr, as subc run writes it), and
- * whatever the program passes to host.exit. */
+ * when it traps (the message goes to stderr, as subc run writes it, unless
+ * the program's on-trap reports it), and whatever the program passes to
+ * host.exit. */
 #include "subhost.h"
 
 #include <stdio.h>
@@ -75,7 +76,14 @@ int main(int argc, char **argv) {
     const char *err = sub_last_error(h);
     /* A program without main has nothing to run, as for subc run. */
     if (strncmp(err, "call: no function", 17) == 0) return 0;
-    fprintf(stderr, "error: %s\n", err);
+    /* A program's on-trap, if it has one, reports the trap (spec 4): the
+     * trap's message is the host's last error message, which it reads with
+     * host.error_message. If it has none, or traps too, the host reports
+     * the trap itself. */
+    char *trap = strdup(err);
+    if (sub_call(h, last, "on-trap", 0, 0, 0, 0, 0, 0, 0))
+      fprintf(stderr, "error: %s\n", trap);
+    free(trap);
     return 2;
   }
   return 0;

@@ -367,7 +367,13 @@ line, each after the linklets it imports from, the entry's own last.
 instantiates each linklet under its name, gives the program the arguments,
 and calls the entry's `main`. It exits with status 0 when `main` returns,
 1 if the program cannot be loaded, 2 when it traps, with the message on
-stderr, or the status the program passes to `exit`. Wasm is the program's
+stderr, or the status the program passes to `exit`. Wasm code cannot catch
+a trap, but the store stays usable after one: if the entry exports a
+function `on-trap`, the host calls it after a trap in `main`, with the
+trap's message as its last error message (`error_message`), and it reports
+the trap instead of the host. The compiler's `on-trap` writes the message
+where the macro or other compile-time function that trapped was used.
+Wasm is the program's
 form on disk; the engine compiles it to machine code each time it is
 loaded. After bootstrap the compiler is such a program.
 
