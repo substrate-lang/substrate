@@ -2359,7 +2359,19 @@
           [(gc) (for-each check (cadddr e))]
           [(select drop) (for-each check (cdr e))]
           [else (raise-compile-error id "internal: lowered form ~a" (car e))]))
-      (hashtable-set! inline-bodies info (list params (func-info-results info) body returns?))))
+      (hashtable-set! inline-bodies info
+                      (list params (func-info-results info) body returns?
+                            (filter (lambda (p) (assigns? body (car p))) params)))))
+
+  ;; Whether lowered form e sets local key.
+  (define (assigns? e key)
+    (cond [(not (pair? e)) #f]
+          [(eq? (car e) 'quote) #f]
+          [(and (eq? (car e) 'lset) (eqv? (cadr e) key)) #t]
+          [else (exists (lambda (x) (assigns? x key)) (cdr e))]))
+
+  ;; e without the source locations around it.
+  (define (unlocated e) (if (eq? (car e) 'at) (unlocated (caddr e)) e))
 
   ;; A call of info with args, lowered, as info's body if it is inline and
   ;; takes that many arguments; #f otherwise. A shifted info's body is its
@@ -2370,15 +2382,32 @@
       (and b (= (length args) (length (car b)))
            (let* ([keys (make-eqv-hashtable)] [labels (make-eqv-hashtable)]
                   [ret (and (cadddr b) (fresh-key!))]
-                  [bindings (map-lr (lambda (p a)
-                                      (let ([k (fresh-key!)]) (hashtable-set! keys (car p) k) (list k (cdr p) a)))
-                                    (car b) args)]
+                  [bindings (inline-bindings (car b) args (list-ref b 4) keys)]
                   [body (copy-inline (caddr b) keys labels (if origin (cdr origin) 0) ret)])
              (list 'as (cadr b)
                    (let ([e (list 'let bindings body)]) (if ret (list 'block ret e) e)))))))
 
+  ;; The let bindings of an inlined call's parameters params to its
+  ;; arguments args, recording each parameter's local in keys. A parameter
+  ;; the body does not set, given a local that no later argument sets, is
+  ;; that local, at the parameter's type, and needs no binding.
+  (define (inline-bindings params args assigned keys)
+    (if (null? params)
+        '()
+        (let* ([p (car params)] [a (unlocated (car args))])
+          (if (and (eq? (car a) 'lref) (not (memq p assigned))
+                   (not (exists (lambda (later) (assigns? later (cadr a))) (cdr args))))
+              (begin
+                (hashtable-set! keys (car p) (list 'as (list (cdr p)) a))
+                (inline-bindings (cdr params) (cdr args) assigned keys))
+              (let ([k (fresh-key!)])
+                (hashtable-set! keys (car p) k)
+                (let ([binding (list k (cdr p) (car args))])
+                  (cons binding (inline-bindings (cdr params) (cdr args) assigned keys))))))))
+
   ;; Lowered form e of an inline body, for one inlined call: its locals and
-  ;; labels new, its infos shifted by k, and a return a br to label ret.
+  ;; labels new, its infos shifted by k, and a return a br to label ret. A
+  ;; local that keys maps to a form, a parameter given a local, reads that.
   (define (copy-inline e keys labels k ret)
     (let* ([copy (lambda (x) (copy-inline x keys labels k ret))]
            [copy? (lambda (x) (and x (copy x)))]
@@ -2391,7 +2420,7 @@
         [(at) (list 'at (cadr e) (copy (caddr e)))]
         [(as) (list 'as (cadr e) (copy (caddr e)))]
         [(int float const quote unreachable nop) e]
-        [(lref) (list 'lref (local (cadr e)))]
+        [(lref) (let ([m (local (cadr e))]) (if (pair? m) m (list 'lref m)))]
         [(lset) (let* ([key (local (cadr e))] [v (copy (caddr e))]) (list 'lset key v))]
         [(gref) (list 'gref (shift (cadr e)))]
         [(gset) (let* ([info (shift (cadr e))] [v (copy (caddr e))]) (list 'gset info v))]
