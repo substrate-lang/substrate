@@ -12,22 +12,23 @@
 #   NAME.imports  the instance names the compiled phase-0 linklet may import
 #                 from, one per line (checks that programs import only what
 #                 they use)
+#   NAME.stage0.err  with stage0, what NAME.err says, where stage0 differs
 #
-# COMPILER is the compiler to build with (default bin/subc, stage0; bin/sub
-# is the compiler written in Substrate), and OUT where builds go (default
-# build).
+# COMPILER is the compiler to build with (default bin/sub, the compiler
+# written in Substrate; bin/subc is stage0), and OUT where builds go
+# (default build).
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-compiler="$root/${COMPILER:-bin/subc}"
+compiler="$root/${COMPILER:-bin/sub}"
 builds="${OUT:-build}"
 host="$root/${HOST:-build/subhost}"
 
 # Build the syntax library once first, so library compile notices stay out
 # of test output.
 mkdir -p build
-bin/subc syntax-library -o build/syntax.wasm > /dev/null
+"$compiler" syntax-library -o build/syntax.wasm > /dev/null
 wasm-tools validate build/syntax.wasm || { echo "FAIL syntax.wasm does not validate"; exit 1; }
 
 pass=0
@@ -45,7 +46,11 @@ for t in tests/*.sub examples/*.sub; do
             "$host" "$root/$program" "${args[@]}" 2>&1)"
   code=$?
   problem=""
-  if [ -f "$base.out" ]; then
+  if [ "$compiler" = "$root/bin/subc" ] && [ -f "$base.stage0.err" ]; then
+    if [ $code -eq 0 ] || ! grep -qF -- "$(cat "$base.stage0.err")" <<< "$actual"; then
+      problem="expected an error containing: $(cat "$base.stage0.err")"
+    fi
+  elif [ -f "$base.out" ]; then
     if [ $code -ne 0 ] || [ "$actual" != "$(cat "$base.out")" ]; then
       problem="output differs (exit $code)"
     elif ! while read -r linklet; do

@@ -11,23 +11,33 @@ build/subhost: host/main.c host/subhost.c host/subhost.h
 	$(CC) $(CFLAGS) -I$(WASMTIME_INCLUDE) -o $@ host/main.c host/subhost.c \
 	  -L$(WASMTIME_LIB) -lwasmtime -Wl,-rpath,$(WASMTIME_LIB)
 
-# The compiler written in Substrate, which bin/sub runs, built by stage0.
-COMPILER_SOURCES := $(wildcard compiler/*.sub lib/*.sub stage0/*.sls stage0/*.ss)
+# The compiler bin/sub runs (spec 1.4). The seed, a build of the compiler
+# by itself, checked in, builds the compiler's source (build/sub-1), which
+# builds it again: build/sub is the source compiled by itself.
+COMPILER_SOURCES := $(wildcard compiler/*.sub lib/*.sub)
 
-build/sub: $(COMPILER_SOURCES) build/libsubhost.so
-	bin/subc build compiler/main.sub -o $@
+build/sub: $(COMPILER_SOURCES) seed/program
+	rm -rf build/sub-1 build/sub
+	mkdir -p build/sub-1 build/sub
+	host/subhost.mjs seed $(CURDIR) build compiler/main.sub -o build/sub-1
+	host/subhost.mjs build/sub-1 $(CURDIR) build compiler/main.sub -o build/sub
 
-check: build/libsubhost.so build/subhost
+# The tests, built by build/sub and run on build/subhost.
+check: build/subhost build/sub
 	tests/run.sh
 
-# Bootstrap (spec 1.4): stage0 builds the compiler written in Substrate
-# (stage1), which builds itself (stage2), which builds itself again
-# (stage3). The fixpoint is stage2 = stage3, with the syntax library each
-# writes the same. While stage0 is kept, stage1 = stage2 too: two
-# independent compilers agree.
+# The tests, built by stage0, while it is kept.
+check-stage0: build/libsubhost.so build/subhost
+	COMPILER=bin/subc tests/run.sh
+
+# Bootstrap from stage0 (spec 1.4): stage0 builds the compiler (stage1),
+# which builds itself (stage2), which builds itself again (stage3). The
+# fixpoint is stage2 = stage3, with the syntax library each writes the
+# same. Stage0 agrees if stage1 = stage2, and the seed if build/sub =
+# stage3.
 STAGES := build/stage1 build/stage2 build/stage3
 
-bootstrap: build/libsubhost.so
+bootstrap: build/libsubhost.so build/sub
 	rm -rf $(STAGES) build/stage*-syntax.wasm
 	mkdir -p $(STAGES)
 	bin/subc build compiler/main.sub -o build/stage1
@@ -40,9 +50,19 @@ bootstrap: build/libsubhost.so
 	cmp build/stage2-syntax.wasm build/stage3-syntax.wasm
 	diff -r build/stage1 build/stage2
 	cmp build/stage1-syntax.wasm build/stage2-syntax.wasm
-	@echo "bootstrap: stage2 = stage3, and stage0 agrees (stage1 = stage2)"
+	diff -r build/stage3 build/sub
+	@echo "bootstrap: stage2 = stage3; stage0 agrees (stage1 = stage2), and so does the seed (build/sub = stage3)"
+
+# Make build/sub the seed, once it builds itself.
+seed: build/sub
+	rm -rf build/sub-check
+	mkdir -p build/sub-check
+	host/subhost.mjs build/sub $(CURDIR) build compiler/main.sub -o build/sub-check
+	diff -r build/sub build/sub-check
+	rm -rf seed
+	cp -r build/sub seed
 
 clean:
 	rm -rf build stage0/*.so
 
-.PHONY: check bootstrap clean
+.PHONY: check check-stage0 bootstrap seed clean

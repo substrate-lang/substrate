@@ -74,6 +74,16 @@ While stage0 is kept, stage1 = stage2 too: two compilers written apart, in
 different languages, write the same bytes. `make bootstrap` builds the
 stages and checks both.
 
+The **seed** is a build of the compiler by itself, checked in (`seed/`).
+The compiler bin/sub runs, `build/sub`, is the compiler's source built by
+the seed, then by that build: the source compiled by itself, even when the
+seed is older than the source. For the compiler's source to use something
+the seed does not know, the feature is added first, then the seed is
+replaced by the new build (`make seed`, which checks that the build
+reproduces itself). Earlier seeds stay in the repository's history. While
+stage0 is kept, `make bootstrap` also checks that the seed's way and
+stage0's give the same compiler.
+
 ## 2. The macro contract
 
 ### 2.1 Transformers

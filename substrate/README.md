@@ -24,6 +24,7 @@ line says the same.
 | `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match`, and Substrate itself (`substrate.sub`), the language built on the kernel | permanent, grows |
 | `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.imports`) and any modules it requires in `NAME/`; checked by `make check` | grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.imports` (what the compiled phase-0 linklet may import). `tests/fixtures/` holds modules the tests require | grows |
+| `seed/` | the compiler, built by itself: what builds the compiler's source (spec 1.4) | permanent, replaced as the compiler grows |
 | `bin/subc` | runs stage0 | temporary, as stage0 |
 | `bin/sub` | runs the compiler written in Substrate (`build/sub`) | permanent |
 
@@ -37,7 +38,8 @@ Everything runs in the flake's dev shell:
 
 ```sh
 nix develop
-make check                      # build the host library, run the tests
+make check                      # run the tests: built by build/sub, run on build/subhost
+make check-stage0               # run the tests, built by stage0
 bin/subc run tests/macros.sub   # compile and run a program's main
 bin/subc expand FILE            # print fully expanded kernel forms
 bin/subc compile FILE -o OUT    # write FILE's linklets (phase 0 to OUT)
@@ -53,9 +55,12 @@ COMPILER=bin/sub tests/run.sh   # the tests, built by the compiler in Substrate
 HOST=host/subhost.mjs tests/run.sh   # run programs, and bin/sub, on that host
 ```
 
-`make build/sub` builds `build/sub` with stage0. `make bootstrap` builds the
-compiler with stage0 (stage1), then with itself twice (stage2, stage3), and
-checks that stage2 = stage3 and stage1 = stage2 (spec 1.4).
+`make build/sub` builds the compiler bin/sub runs from the checked-in seed
+(`seed/`): the seed builds the source, and that build builds it again.
+`make bootstrap` builds the compiler with stage0 (stage1), then with itself
+twice (stage2, stage3), and checks that stage2 = stage3, that stage0 agrees
+(stage1 = stage2) and that the seed does (spec 1.4). `make seed` makes
+`build/sub` the seed, once it reproduces itself.
 
 ## Status
 
