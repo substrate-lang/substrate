@@ -288,6 +288,10 @@
     (record-case e
       [(at) (loc inner)
        (parameterize ([current-loc (or loc (current-loc))]) (sub inner expected tail?))]
+      ;; (as types e): e at types, which it must fit: an inlined call's body
+      ;; at the function's result types (spec 5.2).
+      [(as) (types inner)
+       (let-values ([(c t) (sub inner types tail?)]) (finish c t))]
       [(int) (n)
        (let ([t (if (single? expected) (car expected) 'i32)])
          (case t

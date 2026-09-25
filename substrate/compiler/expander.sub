@@ -441,7 +441,14 @@
                                            (shift-instance (global-info-instance info) k) (global-info-export info))]
                              [else info])])
               (hash-set! shifted-infos info (cons (cons k new) cache))
+              (hash-set! shift-origins new
+                         (let ([o (hash-ref shift-origins info #f)])
+                           (if o (cons (car o) (+ (cdr o) k)) (cons info k))))
               new)))))
+
+;; A shifted info -> (info . k): the unshifted info it is a copy of, at
+;; phase shift k.
+(define shift-origins (make-hasheq))
 
 (define (shift-meaning meaning k)
   (if (and meaning (memq (car meaning) '(func global compile-time-value)))
@@ -1111,7 +1118,10 @@
     (cons (map (lambda (t) (parse-type t phase)) (take parts arrow))
           (map (lambda (t) (parse-type t phase)) (list-tail parts (+ arrow 1))))))
 
-;; (func (name [p t] ...) [-> r] body ...)
+;; #:inline, first after a func's head (spec 5.2).
+(define (inline-marker? s) (eq? (stx-e s) '#:inline))
+
+;; (func (name [p t] ...) [#:inline] [-> r] body ...)
 (define (declare-func f phase)
   (let* ([parts (stx-list-of f 'func)]
          [head (if (>= (length parts) 2) (cadr parts) (raise-compile-error f "func needs a name and parameters"))]
@@ -1121,7 +1131,8 @@
     (let* ([name (car hparts)]
            [params (map (lambda (p) (param-of p phase)) (cdr hparts))]
            [types (map (lambda (pp) (parse-type (cadr pp) phase)) params)]
-           [rest (cddr parts)]
+           [inline (and (pair? (cddr parts)) (inline-marker? (caddr parts)) (caddr parts))]
+           [rest (if inline (cdddr parts) (cddr parts))]
            [arrow (if (and (pair? rest) (core-name? (car rest) '->))
                       (begin
                         (when (null? (cdr rest)) (raise-compile-error (car rest) "expected a type after ->"))
@@ -1133,7 +1144,7 @@
            [clause (car ct)] [ftype (cadr ct)] [body (caddr ct)]
            [info (func-info (stx-e name) types results #f #f ftype)])
       (bind-definition! name phase (list 'func info))
-      (list 'func name params arrow body f clause))))
+      (list 'func name params arrow body f clause inline))))
 
 ;; A parameter [name type], as (name type) with the type expanded.
 (define (param-of p phase)
@@ -1164,7 +1175,7 @@
 ;; (func (name [p t] ...) [-> r] body ...), expanded.
 (define (expand-func p phase)
   (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
-         [f (list-ref p 5)] [clause (list-ref p 6)]
+         [f (list-ref p 5)] [clause (list-ref p 6)] [inline (list-ref p 7)]
          [sc (new-local-scope!)]
          [xs (map (lambda (pp) (bound-local (add-scope (car pp) sc) phase)) params)]
          [saved current-function])
@@ -1172,7 +1183,7 @@
     (let ([r (apply out f 'func
                     (out-list (cadr (stx->list f))
                               (cons name (map (lambda (x pp) (out-list x (list x (cadr pp)))) xs params)))
-                    (append arrow (if clause (list (core-headed clause 'type)) '())
+                    (append (if inline (list inline) '()) arrow (if clause (list (core-headed clause 'type)) '())
                             (map (lambda (b) (expand-expr (add-scope b sc) phase)) body)))])
       (set! current-function saved)
       r)))
@@ -2199,12 +2210,14 @@
       [(func)
        (let* ([head (stx->list (cadr parts))]
               [info (func-info-of (car head) phase)]
-              [body (cdr (parse-results (cddr parts) phase))])
-         (list (list 'func info
-                     (map (lambda (p t) (cons (local-key-of (car (stx->list p)) phase) t))
-                          (cdr head) (func-info-params info))
-                     ;; A (type T) clause first is in the info already.
-                     (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase))))]
+              [inline? (and (pair? (cddr parts)) (inline-marker? (caddr parts)))]
+              [body (cdr (parse-results (if inline? (cdddr parts) (cddr parts)) phase))]
+              [params (map (lambda (p t) (cons (local-key-of (car (stx->list p)) phase) t))
+                           (cdr head) (func-info-params info))]
+              ;; A (type T) clause first is in the info already.
+              [code (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase)])
+         (when inline? (record-inline! info params code (car head)))
+         (list (list 'func info params code)))]
       [(global)
        (let ([m (meaning-of (cadr parts) phase)])
          (list (list 'global (cadr m) (lower-expr (cadddr parts) phase))))]
@@ -2222,6 +2235,92 @@
     (unless (and m (eq? (car m) 'func)) (not-expanded id))
     (check-not-removed (cadr m) id)
     (cadr m)))
+
+;; ---- inline functions (spec 5.2) ----
+
+;; An inline function's info -> (params results body returns?): its
+;; parameters as (key . type), its result types, its lowered body, and
+;; whether the body has a return.
+(define inline-bodies (make-hasheq))
+
+;; Check that the lowered body of inline function info, named by id, does
+;; not depend on which module it is compiled in, and keep it.
+(define (record-inline! info params body id)
+  (let* ([returns? #f]
+         [fail (lambda (what) (raise-compile-error id "~a is inline, so it may not ~a" (stx-e id) what))])
+    (let check ([e body])
+      (case (car e)
+        [(at as lset gset) (check (caddr e))]
+        [(int float const lref gref ref-func unreachable nop) #f]
+        [(quote)
+         (let ([d (cadr e)])
+           (unless (or (fixnum? d) (boolean? d) (null? d) (symbol? d) (keyword? d))
+             (fail "quote data other than fixnums, booleans, (), symbols and keywords")))]
+        [(let) (for-each (lambda (b) (check (caddr b))) (cadr e)) (check (caddr e))]
+        [(seq) (for-each check (cdr e))]
+        [(if) (check (cadr e)) (check (caddr e)) (when (cadddr e) (check (cadddr e)))]
+        [(block loop br-if) (check (caddr e))]
+        [(br) (when (caddr e) (check (caddr e)))]
+        [(return) (set! returns? #t) (when (cadr e) (check (cadr e)))]
+        [(call) (for-each check (caddr e))]
+        [(prim)
+         (when (or (eq? (prim-op-kind (lookup-prim (cadr e))) 'mem)
+                   (memq (cadr e) '(memory.size memory.grow memory.copy memory.fill)))
+           (fail "use memory"))
+         (for-each check (cadddr e))]
+        [(call-indirect func-index) (fail "use a table")]
+        [(call-ref) (check (caddr e)) (for-each check (cadddr e))]
+        [(gc) (for-each check (cadddr e))]
+        [(select drop) (for-each check (cdr e))]
+        [else (raise-compile-error id "internal: lowered form ~a" (car e))]))
+    (hash-set! inline-bodies info (list params (func-info-results info) body returns?))))
+
+;; A call of info with args, lowered, as info's body if it is inline and
+;; takes that many arguments; #f otherwise. A shifted info's body is its
+;; original's, shifted alike.
+(define (inline-call info args)
+  (let* ([origin (hash-ref shift-origins info #f)]
+         [b (hash-ref inline-bodies (if origin (car origin) info) #f)])
+    (and b (= (length args) (length (car b)))
+         (let* ([keys (make-hasheqv)] [labels (make-hasheqv)]
+                [ret (and (cadddr b) (fresh-key!))]
+                [bindings (map (lambda (p a)
+                                 (let ([k (fresh-key!)]) (hash-set! keys (car p) k) (list k (cdr p) a)))
+                               (car b) args)]
+                [body (copy-inline (caddr b) keys labels (if origin (cdr origin) 0) ret)])
+           (list 'as (cadr b)
+                 (let ([e (list 'let bindings body)]) (if ret (list 'block ret e) e)))))))
+
+;; Lowered form e of an inline body, for one inlined call: its locals and
+;; labels new, its infos shifted by k, and a return a br to label ret.
+(define (copy-inline e keys labels k ret)
+  (let* ([copy (lambda (x) (copy-inline x keys labels k ret))]
+         [copy? (lambda (x) (and x (copy x)))]
+         [local (lambda (key) (or (hash-ref keys key #f) (let ([n (fresh-key!)]) (hash-set! keys key n) n)))]
+         [label (lambda (key) (or (hash-ref labels key #f) (let ([n (fresh-key!)]) (hash-set! labels key n) n)))]
+         [shift (lambda (info) (shift-info info k))])
+    (case (car e)
+      [(at) (list 'at (cadr e) (copy (caddr e)))]
+      [(as) (list 'as (cadr e) (copy (caddr e)))]
+      [(int float const quote unreachable nop) e]
+      [(lref) (list 'lref (local (cadr e)))]
+      [(lset) (list 'lset (local (cadr e)) (copy (caddr e)))]
+      [(gref) (list 'gref (shift (cadr e)))]
+      [(gset) (list 'gset (shift (cadr e)) (copy (caddr e)))]
+      [(let) (let ([bs (map (lambda (b) (list (local (car b)) (cadr b) (copy (caddr b)))) (cadr e))])
+               (list 'let bs (copy (caddr e))))]
+      [(seq select drop) (cons (car e) (map copy (cdr e)))]
+      [(if) (list 'if (copy (cadr e)) (copy (caddr e)) (copy? (cadddr e)))]
+      [(block loop) (list (car e) (label (cadr e)) (copy (caddr e)))]
+      [(br) (list 'br (label (cadr e)) (copy? (caddr e)))]
+      [(br-if) (list 'br-if (label (cadr e)) (copy (caddr e)))]
+      [(return) (list 'br ret (copy? (cadr e)))]
+      [(call) (list 'call (shift (cadr e)) (map copy (caddr e)))]
+      [(ref-func) (list 'ref-func (shift (cadr e)))]
+      [(prim) (list 'prim (cadr e) (caddr e) (map copy (cadddr e)))]
+      [(call-ref) (list 'call-ref (cadr e) (copy (caddr e)) (map copy (cadddr e)))]
+      [(gc) (list 'gc (cadr e) (caddr e) (map copy (cadddr e)))]
+      [else (raise-compile-error #f "internal: lowered form ~a" (car e))])))
 
 (define (lowered-data-info id phase)
   (let ([info (data-info-of id phase)])
@@ -2284,7 +2383,9 @@
 (define (lower-core name s parts phase)
   (let ([lo (lambda (x) (lower-expr x phase))])
     (cond
-      [(eq? name app-sym) (list 'call (func-info-of (cadr parts) phase) (map lo (cddr parts)))]
+      [(eq? name app-sym)
+       (let ([info (func-info-of (cadr parts) phase)] [args (map lo (cddr parts))])
+         (or (inline-call info args) (list 'call info args)))]
       [(eq? name datum-sym) (core-datum (cadr parts))]
       [else
        (case name

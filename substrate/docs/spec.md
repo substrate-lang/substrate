@@ -416,7 +416,7 @@ quotation and compile-time forms.
 ### 5.2 Module-level forms
 
 ```
-(func (name [param type] ...) [-> result] [(type T)] body ...)   ; T: a function type
+(func (name [param type] ...) [#:inline] [-> result] [(type T)] body ...)   ; T: a function type
 (global name type init)             ; immutable; init is a constant expression
 (global name (mut type) init)       ; mutable
 (import name "module" "field" (type ... -> type ...))   ; or a function type name
@@ -487,6 +487,33 @@ function type in place of the signature. `(call-ref T f arg ...)` calls
 `f`, a `(ref null T)`, and is emitted as `return_call_ref` in tail
 position. A closure is the usual case: its struct and its code's function
 type refer to each other, so they are one `rec` group.
+
+**Inline functions.** `#:inline` after a function's head makes it an
+inline function: a direct call of it, in any module, is compiled as its
+body, with the arguments bound to new locals in order and the result at
+the function's declared result types; a `return` in the body leaves only
+the body. A wasm engine cannot inline a call of another module's function,
+because modules are compiled apart and linked when they are instantiated,
+so this is how a library's small functions, such as the syntax library's
+`car`, are inlined into the code that uses them. A call is compiled so
+only if the function's body has been compiled before it: a function's
+calls of itself, and calls before its definition in its own module, stay
+calls. So that an inlined call does what the call would, the body must
+not depend on which module it is compiled in:
+
+- It may not use memory or a table, or `call-indirect`, `func-index`, or
+  an instruction that names a data or element segment, since in another
+  module they would be that module's. `data-address` and `data-size` are
+  constants, so a body may pass them to its own module's functions.
+- It may quote only fixnums, booleans, `()`, symbols and keywords: quoted
+  data is made by the module that holds the code, and only these are the
+  same values whichever module makes them.
+- It may call its own module's functions, use its globals and take
+  `ref.func` of its functions: every definition is exported (3.3), and a
+  module that inlines the body imports what it uses.
+
+A call in an inline function's body to an inline function compiled
+before it is inlined there too.
 
 Globals follow wasm too. A global is immutable unless its type is written
 `(mut type)`, and `set!` of an immutable global is an error. An initializer
