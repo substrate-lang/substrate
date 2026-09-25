@@ -37,9 +37,9 @@ specified but not built yet.
 | Component | What it is | Where |
 |---|---|---|
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime), `host/subhost.mjs` (JavaScript, over Node's V8) |
-| compiler | Reader, expander, kernel compiler, binary encoder. | `compiler/*.sub` (Substrate); stage0, the bootstrap compiler: `stage0/*.sls` (Chez Scheme) |
-| syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `compiler/syntax.sub` (kernel code) |
-| libraries | Ordinary modules: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
+| compiler | Reader, expander, kernel compiler, binary encoder: what only compiling needs. | `compiler/*.sub` (Substrate); stage0, the bootstrap compiler: `stage0/*.sls` (Chez Scheme) |
+| syntax library | The data of every language built on the kernel, as wasm GC objects, syntax objects among them, and the functions of section 2. The compiler links to its own instance. | `lib/syntax.sub` (kernel code) |
+| libraries | Ordinary modules, what programs in the languages built on the kernel use: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
 | languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub` |
 
 ### 1.3 What runs where
@@ -62,14 +62,17 @@ GC types or requires the syntax library.
 
 ### 1.4 Bootstrap
 
-The compiler is written in Substrate (`compiler/*.sub`, the syntax library
-among them). Stage0, a compiler of the same language written in Chez
+The compiler is written in Substrate (`compiler/*.sub`), and requires the
+syntax library (`lib/syntax.sub`) and Substrate (`lib/substrate.sub`). Stage0, a compiler of the same language written in Chez
 Scheme (`stage0/`), builds it: that build is **stage1**. Stage1 builds the
 compiler from the same source (**stage2**), and stage2 builds it again
 (**stage3**). The bootstrap reaches its **fixpoint** when stage2 and stage3
 are the same bytes, and so is the syntax library each writes: the compiler
 reproduces itself exactly. That needs compilation to be deterministic,
 which is why the host gives programs no clocks or randomness (section 4).
+Nor does a build depend on where the repository is: the syntax library's
+source locations (3.6) name it `lib/syntax.sub`, as other files are named
+by the paths the build gives, relative to the repository.
 While stage0 is kept, stage1 = stage2 too: two compilers written apart, in
 different languages, write the same bytes. `make bootstrap` builds the
 stages and checks both.
@@ -1001,7 +1004,7 @@ bootstrap, will.
 
 ## Appendix A: stage0's syntax library representation (not part of the contract)
 
-This describes `compiler/syntax.sub` and `stage0/marshal.sls` as they are.
+This describes `lib/syntax.sub` and `stage0/marshal.sls` as they are.
 Macros must not depend on it; the compiler may, because it is part of the
 expander.
 
@@ -1030,7 +1033,7 @@ expander.
   single `%atom` objects made at start. A linklet's quoted data is a
   `%string` made with `array.new_data` from its data segment, which
   `%deserialize` turns into a `%table` of objects (the format is in
-  `compiler/syntax.sub`). The compiler declares these types in the linklet;
+  `lib/syntax.sub`). The compiler declares these types in the linklet;
   wasm makes them the same types as the library's.
 - **Syntax objects** are wrapped eagerly: the datum of a list is a list
   whose elements are syntax objects. Scopes are a list of fixnum scope ids,

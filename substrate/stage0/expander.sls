@@ -10,9 +10,9 @@
 ;; expanded, each begin-for-syntax is compiled into a linklet and run in that
 ;; module's compile-time store. A macro is a phase-1 function from syntax to
 ;; syntax (spec 2.1). Syntax objects are GC objects of the syntax library
-;; (compiler/syntax.sub), which every compile-time store instantiates.
+;; (lib/syntax.sub), which every compile-time store instantiates.
 (library (stage0 expander)
-  (export set-syntax-library-path! compile-module-file run-module module-linklet-list module-expanded-forms
+  (export set-syntax-library-root! compile-module-file run-module module-linklet-list module-expanded-forms
           syntax-library-bytes program-linklets)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 compile)
           (stage0 host) (stage0 marshal) (stage0 reader))
@@ -125,24 +125,32 @@
 
   ;; ---- the syntax library ----
 
-  (define library-path #f)
+  ;; The source is lib/syntax.sub under the repository's root, and its
+  ;; source locations name it so, whatever the root is (spec 1.4).
+  (define library-name "lib/syntax.sub")
+  (define library-root #f)
   (define syntax-lib #f)                      ; (bytes . infos)
-  (define (set-syntax-library-path! p) (set! library-path p))
+  (define (set-syntax-library-root! root) (set! library-root root))
 
   (define (ensure-library!)
     (unless syntax-lib
-      (let* ([m (make-unit library-path library-path "syntax" 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
+      (let* ([m (make-unit library-name library-name "syntax" 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
              [c (make-comp m #f 0 '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '() '())])
         (with-comp c
           (lambda ()
             (parameterize ([current-syntax-infos #f])
-              (let* ([forms (lower-forms (expand-module-body (profiled-read-file library-path)) 0)]
+              (let* ([forms (lower-forms (expand-module-body
+                             (with-profile 'read
+                               (lambda ()
+                                 (read-string-all
+                                  (call-with-input-file (string-append library-root "/" library-name) get-string-all)
+                                  (string->symbol library-name))))) 0)]
                      [forms (append (storage-forms 0) forms)])
                 (let ([type (lambda (name)
                               (cadr (find (lambda (f) (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) name)))
                                           forms)))])
                   (set-syntax-types! (type '%string) (type '%table)))
-                (set-current-source! (string->symbol library-path))
+                (set-current-source! (string->symbol library-name))
                 (let-values ([(bytes imports gc?) (profiled-compile-module forms "syntax")])
                   (let ([table (make-eq-hashtable)])
                     (for-each (lambda (f)

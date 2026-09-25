@@ -1,7 +1,7 @@
 ;; Lifecycle: stage0. Part of the bootstrap compiler, frozen once the
 ;; compiler compiles itself.
 ;;
-;; The byte format of syntax-library data (compiler/syntax.sub, "quoted
+;; The byte format of syntax-library data (lib/syntax.sub, "quoted
 ;; data"). The compiler writes a linklet's quoted data in it (spec 3.5), and
 ;; stage0 copies syntax between Chez and the wasm heap in it (marshal.sls).
 (library (stage0 serialize)

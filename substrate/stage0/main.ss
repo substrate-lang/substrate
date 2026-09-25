@@ -18,7 +18,7 @@
 (import (chezscheme) (stage0 syntax) (stage0 expander) (stage0 host) (stage0 reader))
 
 (define root (or (getenv "SUBSTRATE_ROOT") "."))
-(set-syntax-library-path! (string-append root "/compiler/syntax.sub"))
+(set-syntax-library-root! root)
 
 (define (write-file path bv)
   (call-with-port (open-file-output-port path (file-options no-fail))
