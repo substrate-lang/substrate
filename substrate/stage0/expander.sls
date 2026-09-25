@@ -52,7 +52,11 @@
   ;; template identifiers keep resolving to its own module's bindings when
   ;; another module expands it, because those bindings stay in the table.
 
-  (define bindings (make-eq-hashtable))    ; symbol -> list of binding
+  ;; symbol -> scope -> list of binding, the latest first. A binding is
+  ;; kept under the greatest scope of its set, or -1 if the set is empty:
+  ;; an identifier can refer to it only if the identifier has that scope
+  ;; too.
+  (define bindings (make-eq-hashtable))
   (define meanings (make-eqv-hashtable))   ; key -> meaning
   ;; The keys of bindings require-unqualified made, each -> whether a macro
   ;; use has relied on it: a definition of the same name may shadow one it
@@ -218,11 +222,23 @@
 
   ;; ---- bindings ----
 
+  ;; The scope a binding with these scopes is kept under.
+  (define (binding-slot scopes) (if (null? scopes) -1 (car (last-pair scopes))))
+
+  ;; The bindings of sym kept under scope sc.
+  (define (bindings-under sym sc)
+    (let ([t (hashtable-ref bindings sym #f)])
+      (if t (hashtable-ref t sc '()) '())))
+
+  (define (update-bindings-under! sym sc f)
+    (let ([t (or (hashtable-ref bindings sym #f)
+                 (let ([t (make-eqv-hashtable)]) (hashtable-set! bindings sym t) t))])
+      (hashtable-set! t sc (f (hashtable-ref t sc '())))))
+
   (define (bind-raw! sym scopes phase meaning)
     (let ([key (fresh-key!)])
-      (hashtable-update! bindings sym
-                         (lambda (l) (cons (make-binding scopes phase (meaning-namespace meaning) key) l))
-                         '())
+      (update-bindings-under! sym (binding-slot scopes)
+                              (lambda (l) (cons (make-binding scopes phase (meaning-namespace meaning) key) l)))
       (hashtable-set! meanings key meaning)
       key))
 
@@ -244,7 +260,7 @@
                            (not (equal? (hashtable-ref meanings (binding-key b) #f) meaning)))
                   (raise-compile-error id "~a is already bound~a" (stx-e id)
                                        (if (> phase 0) (format " at phase ~a" phase) ""))))
-              (hashtable-ref bindings (stx-e id) '())))
+              (bindings-under (stx-e id) (binding-slot (stx-scopes id)))))
 
   ;; Bind a module-level definition. Use-site scopes come off the name, so
   ;; a definition a macro makes from its input is visible to the rest of
@@ -271,13 +287,13 @@
                      (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
                           (eq? (binding-namespace b) (meaning-namespace meaning))
                           (hashtable-contains? unqualified-imports (binding-key b))))
-                   (hashtable-ref bindings (stx-e id) '()))])
+                   (bindings-under (stx-e id) (binding-slot (stx-scopes id))))])
       (when b
         (when (hashtable-ref unqualified-imports (binding-key b) #f)
           (raise-compile-error id "~a is defined here, but a macro use before this definition used the ~a it imports"
                                (stx-e id) (stx-e id)))
         (hashtable-delete! unqualified-imports (binding-key b))
-        (hashtable-update! bindings (stx-e id) (lambda (l) (remq b l)) '())
+        (update-bindings-under! (stx-e id) (binding-slot (binding-scopes b)) (lambda (l) (remq b l)))
         (let ([m (comp-module current)])
           (unit-entries-set! m (filter (lambda (e) (not (eqv? (cadddr e) (binding-key b)))) (unit-entries m)))))))
 
@@ -302,12 +318,20 @@
     (let ([p (binding-phase b)])
       (or (eq? p 'all) (eqv? p phase))))
 
-  ;; The key id refers to at phase in namespace ns, or #f if unbound.
+  ;; The key id refers to at phase in namespace ns, or #f if unbound. A
+  ;; binding whose scopes are a subset of id's is kept under one of id's
+  ;; scopes, or -1, so only those are candidates.
   (define (resolve id phase ns)
     (let* ([scopes (stx-scopes id)]
-           [cands (filter (lambda (b) (and (phase-matches? b phase) (eq? (binding-namespace b) ns)
-                                           (scopes-subset? (binding-scopes b) scopes)))
-                          (hashtable-ref bindings (stx-e id) '()))])
+           [table (hashtable-ref bindings (stx-e id) #f)]
+           [cands (if table
+                      (apply append
+                             (map-lr (lambda (sc)
+                                       (filter (lambda (b) (and (phase-matches? b phase) (eq? (binding-namespace b) ns)
+                                                                (scopes-subset? (binding-scopes b) scopes)))
+                                               (hashtable-ref table sc '())))
+                                     (cons -1 scopes)))
+                      '())])
       (if (null? cands)
           #f
           (let ([best (fold-left (lambda (best b)

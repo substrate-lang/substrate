@@ -635,6 +635,10 @@ reference is an error.
   ids last for the whole compiler run. A macro's template identifiers carry
   its module's scopes, so they keep resolving to its module's bindings,
   including ones it does not provide, when another module expands them.
+- **Lookup.** The table keeps each binding under the greatest (most
+  recently made) scope of its set. An identifier can refer to a binding
+  only if it has that scope too, so resolving an identifier looks only
+  under its own scopes, not at every binding of its symbol.
 - **Phases.** Bindings are recorded per phase, and a syntax object has one
   scope set. A module required at phase shift *s* ≠ 0 has its bindings
   installed at their phase + *s*, with its module scope replaced by a copy
