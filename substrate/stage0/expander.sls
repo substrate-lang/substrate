@@ -1340,12 +1340,7 @@
   ;; name new. Recorded as (name . id), resolved when the module is done.
   (define (provide! f phase)
     (unless (= phase 0) (raise-compile-error f "provide belongs at phase 0"))
-    (let ([items (map-lr (lambda (item)
-                           (let ([l (stx->list item)])
-                             (cond [(id? item) (cons item item)]
-                                   [(and l (= (length l) 2) (id? (car l)) (id? (cadr l))) (cons (car l) (cadr l))]
-                                   [else (raise-compile-error item "provide takes names and [new-name name]")])))
-                         (cdr (stx-list-of f 'provide)))])
+    (let ([items (apply append (map-lr provide-items (cdr (stx-list-of f 'provide))))])
       (for-each (lambda (item)
                   (let ([earlier (assq (stx-e (car item)) (map (lambda (p) (cons (stx-e (car p)) p))
                                                                (comp-provide-ids current)))])
@@ -1354,6 +1349,31 @@
                                            (stx-e (cddr earlier)) (stx-e (cdr item))))
                     (comp-provide-ids-set! current (cons item (comp-provide-ids current)))))
                 items)))
+
+  ;; A provide item as a list of (name . id): x, [new old], (all-from-out m)
+  ;; for what module m, required at phase 0, provides, and (except-out
+  ;; (all-from-out m) x ...) for all that but the names x ... (spec 3.1).
+  (define (provide-items item)
+    (let* ([l (stx->list item)]
+           [all-from (lambda (x) (let ([p (stx->list x)]) (and p (= (length p) 2) (core-name? (car p) 'all-from-out) (cadr p))))])
+      (cond [(id? item) (list (cons item item))]
+            [(all-from item) (all-from-items (all-from item) '())]
+            [(and l (>= (length l) 2) (core-name? (car l) 'except-out) (all-from (cadr l)))
+             (all-from-items (all-from (cadr l)) (cddr l))]
+            [(and l (= (length l) 2) (id? (car l)) (id? (cadr l))) (list (cons (car l) (cadr l)))]
+            [else (raise-compile-error item "provide takes names, [new-name name], (all-from-out name) and (except-out (all-from-out name) name ...)")])))
+
+  ;; What the module required as name provides, but the names excluded, as
+  ;; provide items: each one's qualified binding, name:thing.
+  (define (all-from-items name excluded)
+    (let* ([m (required-module name 0)]
+           [out (map-lr (lambda (x) (if (id? x) (stx-e x) (raise-compile-error x "expected a name"))) excluded)]
+           [syms (fold-left (lambda (acc p) (if (memq (car p) acc) acc (cons (car p) acc))) '() (unit-provides m))])
+      (for-each (lambda (x)
+                  (unless (memq (stx-e x) syms) (raise-compile-error x "~a does not provide ~a" (stx-e name) (stx-e x))))
+                excluded)
+      (map-lr (lambda (sym) (cons (datum->stx name sym (stx-srcloc name)) (qualified name sym)))
+              (filter (lambda (sym) (not (memq sym out))) (reverse syms)))))
 
   ;; (memory pages) or (memory from name), and likewise (table ...): the
   ;; module's memory or table at this phase. name is a module required at

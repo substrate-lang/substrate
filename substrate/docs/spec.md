@@ -222,9 +222,12 @@ them in Chez; in a run-time store they trap.
 - `(provide item ...)` names the phase-0 bindings other modules get:
   functions, globals, macros, compile-time values, types and data, whether the
   module defines them or imported them. An item `x` provides `x`, and
-  `[new old]` provides `old` under the name `new`. A name bound both as a
-  type and as a value provides both. One name cannot be provided for two
-  different bindings.
+  `[new old]` provides `old` under the name `new`. `(all-from-out name)`
+  provides everything the module required as `name` at phase 0 provides,
+  and `(except-out (all-from-out name) x ...)` all that but `x ...`: how a
+  language built on another provides it with its own additions. A name
+  bound both as a type and as a value provides both. One name cannot be
+  provided for two different bindings.
 - `(require name source item ...)` imports what another module provides.
   `source` is `"path"` (relative to the requiring file) or `syntax` (the
   syntax library, section 2).
@@ -947,18 +950,11 @@ right-hand side's.
   transformers. Substrate's `#%linklet` converts the closures of every
   unit, and makes the value of a `define-syntax` unit a transformer when
   it is a procedure. A language built on another provides that one's
-  `#%linklet`, or its own that runs it.
+  `#%linklet`, or its own that runs it, with `(except-out (all-from-out
+  name) #%linklet)` for the rest (3.1).
 
 ## 7. Open questions and later milestones
 
-- **Extending a language's hook**: a library that adds a stage to a
-  language's `#%linklet`, such as CPS for general effect handlers, provides
-  its own `#%linklet` that runs the language's. A module that takes both
-  the language and the library with `require-unqualified` then binds
-  `#%linklet` twice, which is an error, so the library must provide the
-  whole language itself. `provide` lists names one by one; that wants a
-  form for everything a module provides except some names. Nothing needs
-  it until a library adds a stage.
 - **Controlling expansion**: `#%linklet` rewrites a unit after it is
   expanded (6.5). A language cannot change how a module body expands, as
   Racket's `#%module-begin` can. Nothing planned needs that.
