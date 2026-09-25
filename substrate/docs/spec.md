@@ -39,7 +39,7 @@ specified but not built yet.
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime), `host/subhost.mjs` (JavaScript, over Node's V8) |
 | compiler | Reader, expander, kernel compiler, binary encoder: what only compiling needs. | `compiler/*.sub` (Substrate); stage0, the bootstrap compiler: `stage0/*.sls` (Chez Scheme) |
 | syntax library | The data of every language built on the kernel, as wasm GC objects, syntax objects among them, and the functions of section 2. The compiler links to its own instance. | `lib/syntax.sub` (kernel code) |
-| libraries | Ordinary modules, what programs in the languages built on the kernel use: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
+| libraries | Ordinary modules, what programs in the languages built on the kernel use, such as printing for programs without GC. | `lib/*.sub` |
 | languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub`, written in Substrate on its core in kernel code, `lib/substrate-core.sub` |
 
 ### 1.3 What runs where
@@ -472,8 +472,8 @@ quotation and compile-time forms.
   types, such as a type function, should declare each strongly connected
   set of them as one group, in a canonical order. Code that must tell
   values of the same structure apart stores the difference in the value,
-  as `lib/struct.sub` does with a brand per variant and Substrate's records
-  with a descriptor.
+  as `examples/shapes/struct.sub` does with a brand per variant and
+  Substrate's records with a descriptor.
 - **Type functions.** In a type position, a form whose head is a macro is
   expanded until it is not, so a compile-time function can compute a
   type: `(ref (tuple i32 3))`, as in Zig. Such a macro usually declares the
@@ -969,11 +969,12 @@ right-hand side's.
   to type-check. Nothing needs more yet; the typed layer, a rung after
 bootstrap, will.
 - **Structs after the typed layer**: declared types are identified by
-  structure (5.1), so `lib/struct.sub`'s accessors check brands at run
-  time: passing a `fahrenheit` to `celsius-t` is a run-time error, where
-  under nominal types it was a compile-time one. With the typed layer, a
-  rung after bootstrap, revisit `struct.sub`, `match` and
-  `examples/shapes.sub` so that it is a compile-time error again.
+  structure (5.1), so the accessors of `examples/shapes/struct.sub` check
+  brands at run time: passing a `fahrenheit` to `celsius-t` is a run-time
+  error, where under nominal types it was a compile-time one. With the typed layer, a
+  rung after bootstrap, revisit `examples/shapes/` (`struct`, `enum` and
+  `match`) so that it is a compile-time error again, as a library of the
+  typed language.
 
 ## Appendix A: stage0's syntax library representation (not part of the contract)
 
