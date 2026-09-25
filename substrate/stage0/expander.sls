@@ -703,13 +703,21 @@
   ;; A module body -> its fully expanded code: func, global, import, type and
   ;; data forms and expressions (spec 6.4). Other module-level forms take
   ;; effect during expansion and leave nothing.
+  ;; A form in a body that is already expanded, and bound: a form
+  ;; #%linklet returned unchanged (spec 6.5). Both passes keep it as it is.
+  (define-record-type expanded (fields form))
+
   (define (expand-body forms phase)
     (let ([b (make-body phase '() #f '())] [saved current-body])
       (dynamic-wind
         (lambda () (set! current-body b))
         (lambda ()
           ;; Pass 1: find definitions, run compile-time forms, splice begins.
-          (for-each (lambda (f) (declare-form! f b redefining?)) forms)
+          (for-each (lambda (f)
+                      (if (expanded? f)
+                          (body-items-set! b (cons (list 'done (expanded-form f)) (body-items b)))
+                          (declare-form! f b redefining?)))
+                    forms)
           ;; Pass 2: expand bodies and expressions. What an item lifts goes
           ;; before it.
           (body-pass2?-set! b #t)
@@ -758,7 +766,7 @@
     (case (car item)
       [(func) (expand-func item phase)]
       [(global) (expand-global item phase)]
-      [(plain) (cadr item)]
+      [(plain done) (cadr item)]
       [(expr) (expand-expr (cadr item) phase)]))
 
   ;; Lift form, from a macro, to the module level of the body being
@@ -1554,13 +1562,20 @@
         [t
          (let* ([intro (new-scope!)]
                 [in (flip-scope (out-list ctx (cons id (cons (datum->stx ctx kind #f) forms))) intro)]
-                [result (flip-scope (call-syntax-function "#%linklet"
-                                                          (lambda (host in)
-                                                            (host-call host "syntax" "%h-call-transformer" t in))
-                                                          in phase intro #t)
-                                    intro)]
-                [new (or (stx->list result)
-                         (raise-compile-error ctx "#%linklet returned something other than a list of forms"))])
+                [same '()]
+                [result (call-syntax-function "#%linklet"
+                                              (lambda (host in)
+                                                (host-call host "syntax" "%h-call-transformer" t in))
+                                              in phase intro #t
+                                              (lambda (positions) (set! same positions)))]
+                [returned (or (stx->list result)
+                              (raise-compile-error ctx "#%linklet returned something other than a list of forms"))]
+                ;; A form returned unchanged is one of the forms the hook
+                ;; was given: it stays the unit's form, and is not expanded
+                ;; again. The syntax library finds them (%h-same-positions).
+                [fv (list->vector forms)]
+                [new (map-lr (lambda (r p) (if (>= p 0) (make-expanded (vector-ref fv p)) (flip-scope r intro)))
+                             returned same)])
            (fluid-let ([redefining? "#%linklet returned"] [hook-output? #t])
              (expand-body new phase)))]
         [(or (not m) (eq? (car m) 'core)) forms]
@@ -1615,7 +1630,9 @@
   ;; expander queries answer for phase, blame s, and local-expand uses
   ;; intro, its introduction scope. Calls nest: a query can expand code,
   ;; which calls more macros.
-  (define (call-syntax-function who call s phase intro list-ok?)
+  ;; same, if given, receives the forms the call returned unchanged, as
+  ;; %h-same-positions gives them.
+  (define (call-syntax-function who call s phase intro list-ok? . same)
     (let* ([st (comp-store current)]
            [saved-phase api-phase] [saved-where api-where] [saved-intro api-intro])
       (dynamic-wind
@@ -1626,6 +1643,8 @@
                  [in (encode ms s)]
                  [out (call-in-store st s (lambda (h) (call h in)))]
                  [result (decode ms out)])
+            (unless (null? same)
+              ((car same) (decode ms (host-call (cstore-host st) "syntax" "%h-same-positions" in out))))
             (handle-release! ms mark)
             (unless (or (stx? result) (and list-ok? (list? result)))
               (raise-compile-error s "~a returned a non-syntax value: ~s" who

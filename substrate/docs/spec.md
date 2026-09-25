@@ -862,8 +862,11 @@ right-hand side's.
   definitions it needs.
 - What it returns must be fully expanded. It is expanded again only to
   bind the names it introduces: a macro use there is an error, and a
-  definition there replaces the unit's own of the same name and scopes. The
-  transformer has an introduction scope, as a macro use does (6.2).
+  definition there replaces the unit's own of the same name and scopes. A
+  form it returns unchanged, the same object as a form it was given, and
+  in the same order among those, introduces nothing, so it is not expanded
+  again. The transformer has an introduction scope, as a macro use does
+  (6.2).
 - `#%linklet` is resolved per phase, so a module's phase-1 code gets the
   hook of the language it takes at phase 1, which may differ from its
   phase-0 language. A module whose phase-1 code is kernel code gets the
