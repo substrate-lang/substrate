@@ -1,6 +1,7 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --stack-size=4000
 // Lifecycle: permanent. The host of spec section 4 over Node's V8; bin/sub
-// runs the compiler on it.
+// runs the compiler on it. The stack limit, in KiB, is build/subhost's: 4 MiB
+// (V8's default is under 1 MiB).
 //
 // host/subhost.mjs DIR [arg ...]: run the program subc build wrote to DIR,
 // as build/subhost does. The stage0-only expander imports trap.
