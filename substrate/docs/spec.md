@@ -40,7 +40,7 @@ specified but not built yet.
 | compiler | Reader, expander, kernel compiler, binary encoder: what only compiling needs. | `compiler/*.sub` (Substrate); stage0, the bootstrap compiler: `stage0/*.sls` (Chez Scheme) |
 | syntax library | The data of every language built on the kernel, as wasm GC objects, syntax objects among them, and the functions of section 2. The compiler links to its own instance. | `lib/syntax.sub` (kernel code) |
 | libraries | Ordinary modules, what programs in the languages built on the kernel use: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
-| languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub` |
+| languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub`, written in Substrate on its core in kernel code, `lib/substrate-core.sub` |
 
 ### 1.3 What runs where
 
