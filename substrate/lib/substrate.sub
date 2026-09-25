@@ -135,9 +135,10 @@
          syntax-property free-identifier=? syntax-local-value identifier-binding-kind
          local-expand syntax-local-lift-definition raise-syntax-error
          ;; output and errors
-         write display newline printf eprintf format error
-         ;; files and the command line
-         file->bytes file->string file-exists? display-to-file current-command-line-arguments exit)
+         write display newline write-byte write-bytes open-output-bytes get-output-bytes
+         call-with-output-bytes file-position printf eprintf format error
+         ;; the host: files, the command line, instantiating code
+         file->bytes file->string file-exists? display-to-file current-command-line-arguments instantiate exit)
 
 ;; ---- values --------------------------------------------------------------------------
 
@@ -156,7 +157,10 @@
      (type hashtable (struct (field kind i32) (field count (mut i32)) (field buckets (mut (ref buckets)))))
      (type buckets (array (mut (ref null entry))))
      (type entry (struct (field key eqref) (field hash i32) (field value (mut eqref))
-                         (field next (mut (ref null entry))))))
+                         (field next (mut (ref null entry)))))
+     ;; An output port: the bytes written to it, and the file descriptor
+     ;; the host writes them to, 1 or 2, or -1 for a port that keeps them.
+     (type port (struct (field bytes (mut (ref bytes))) (field length (mut i32)) (field fd i32))))
 
 ;; The arguments after the first four, of the call being made.
 (type arguments (array (mut eqref)))
@@ -191,25 +195,25 @@
 ;; A function named name (a symbol, or #f for a lambda), taking n arguments
 ;; or, if rest, at least n, was called with nargs.
 (func (arity-error [name eqref] [n i32] [rest i32] [nargs i32]) -> eqref
-  (set! out-length 0)
-  (out-function-name name)
-  (out-string (if rest '": expected at least " '": expected ") 0)
-  (out-u64 (i64.extend_i32_u n))
-  (out-string (if (i32.eq n 1) '" argument, got " '" arguments, got ") 0)
-  (out-u64 (i64.extend_i32_u nargs))
-  (fail-out))
+  (let ([p (new-port -1)])
+    (out-function-name p name)
+    (out-string p (if rest '": expected at least " '": expected ") 0)
+    (out-u64 p (i64.extend_i32_u n))
+    (out-string p (if (i32.eq n 1) '" argument, got " '" arguments, got ") 0)
+    (out-u64 p (i64.extend_i32_u nargs))
+    (fail-with p)))
 
 ;; A case-lambda named name has no clause that takes nargs arguments.
 (func (no-clause-error [name eqref] [nargs i32]) -> eqref
-  (set! out-length 0)
-  (out-function-name name)
-  (out-string '": no clause takes " 0)
-  (out-u64 (i64.extend_i32_u nargs))
-  (out-string (if (i32.eq nargs 1) '" argument" '" arguments") 0)
-  (fail-out))
+  (let ([p (new-port -1)])
+    (out-function-name p name)
+    (out-string p '": no clause takes " 0)
+    (out-u64 p (i64.extend_i32_u nargs))
+    (out-string p (if (i32.eq nargs 1) '" argument" '" arguments") 0)
+    (fail-with p)))
 
-(func (out-function-name [name eqref])
-  (if (ref.is_null name) (out-string '"lambda" 0) (out-datum name 0)))
+(func (out-function-name [p (ref port)] [name eqref])
+  (if (ref.is_null name) (out-string p '"lambda" 0) (out-datum p name 0)))
 
 ;; ---- calls -----------------------------------------------------------------------------
 
@@ -264,151 +268,209 @@
 
 ;; ---- output ----------------------------------------------------------------------------
 ;;
-;; Text is built in the byte buffer out, then written to stdout, or made an
-;; error message.
+;; Output goes to ports (the port type, above). The standard output and
+;; error ports pass what is written to them to the host; a bytes port
+;; (open-output-bytes) keeps it. Text is built in a port too, then made a
+;; string or an error message.
 
 (import host-write "host" "write" (i32 i32 i32 -> i32))
-(global out (mut (ref bytes)) (array.new bytes 0 256))
-(global out-length (mut i32) 0)
+(global stdout (ref port) (struct.new port (array.new bytes 0 256) 0 1))
+(global stderr (ref port) (struct.new port (array.new bytes 0 256) 0 2))
 
-(func (out-byte [b i32])
-  (if (i32.ge_u out-length (array.len out))
-      (let ([bigger (array.new bytes 0 (i32.mul 2 (array.len out)))])
-        (array.copy bytes bytes bigger 0 out 0 out-length)
-        (set! out bigger)))
-  (array.set bytes out out-length b)
-  (set! out-length (i32.add out-length 1)))
+;; A new port for file descriptor fd, or -1 to keep its bytes.
+(func (new-port [fd i32]) -> (ref port) (struct.new port (array.new bytes 0 64) 0 fd))
+
+;; Room in port p for n more bytes; returns its bytes.
+(func (port-room [p (ref port)] [n i32]) -> (ref bytes)
+  (let ([a (struct.get port bytes p)] [need (i32.add (struct.get port length p) n)])
+    (if (i32.gt_u need (array.len a))
+        (let ([bigger (array.new bytes 0 (i32.add need (array.len a)))])
+          (array.copy bytes bytes bigger 0 a 0 (struct.get port length p))
+          (struct.set port bytes p bigger)
+          (return bigger)))
+    a))
+
+(func (out-byte [p (ref port)] [b i32])
+  (let ([n (struct.get port length p)])
+    (array.set bytes (port-room p 1) n b)
+    (struct.set port length p (i32.add n 1))))
+
+;; Bytes start to end of a.
+(func (out-byte-range [p (ref port)] [a (ref bytes)] [start i32] [end i32])
+  (let ([n (struct.get port length p)])
+    (array.copy bytes bytes (port-room p (i32.sub end start)) n a start (i32.sub end start))
+    (struct.set port length p (i32.add n (i32.sub end start)))))
+
+;; The bytes written to p, as a new byte string.
+(func (port-bytes [p (ref port)]) -> (ref bytes)
+  (let* ([n (struct.get port length p)] [r (array.new bytes 0 n)])
+    (array.copy bytes bytes r 0 (struct.get port bytes p) 0 n)
+    r))
+
+;; The bytes written to p, as a new string, or #f if they are not UTF-8.
+(func (port-string [p (ref port)]) -> eqref
+  (let ([b (s:make-string-builder)] [a (struct.get port bytes p)] [i 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i (struct.get port length p)))
+        (s:string-builder-add-byte! b (array.get_u bytes a i))
+        (set! i (i32.add i 1))
+        (br next)))
+    (s:string-builder->string b)))
+
+;; Pass what was written to p to the host, through bytes 8192.. of this
+;; memory, and empty p; nothing for a port that keeps its bytes.
+(func (flush [p (ref port)])
+  (let ([fd (struct.get port fd p)] [a (struct.get port bytes p)] [n (struct.get port length p)] [i 0] [k 0])
+    (if (i32.lt_s fd 0) (return))
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (set! k 0)
+        (block full
+          (loop copy
+            (br-if full (i32.ge_u k 4096))
+            (br-if full (i32.ge_u (i32.add i k) n))
+            (i32.store8 (i32.add 8192 k) (array.get_u bytes a (i32.add i k)))
+            (set! k (i32.add k 1))
+            (br copy)))
+        (drop (host-write fd 8192 k))
+        (set! i (i32.add i k))
+        (br next)))
+    (struct.set port length p 0)))
 
 ;; The name of the function an error is about: a string, or a symbol.
-(func (out-who [who eqref])
-  (out-string (if (s:symbol? who) (s:symbol->string who) who) 0))
+(func (out-who [p (ref port)] [who eqref])
+  (out-string p (if (s:symbol? who) (s:symbol->string who) who) 0))
 
 ;; String s's bytes; if escape, as write writes them, for the reader: " and
 ;; \ escaped, \n, \t and \r, and \xH; for the other control characters.
-(func (out-string [s eqref] [escape i32])
+(func (out-string [p (ref port)] [s eqref] [escape i32])
   (let ([n (s:string-length s)] [i 0] [b 0])
     (block done
       (loop next
         (br-if done (i32.ge_u i n))
         (set! b (s:string-byte s i))
         (set! i (i32.add i 1))
-        (if (i32.eqz escape) (begin (out-byte b) (br next)))
-        (if (i32.or (i32.eq b 34) (i32.eq b 92)) (begin (out-byte 92) (out-byte b) (br next)))
-        (if (i32.eq b 10) (begin (out-byte 92) (out-byte 110) (br next)))
-        (if (i32.eq b 9) (begin (out-byte 92) (out-byte 116) (br next)))
-        (if (i32.eq b 13) (begin (out-byte 92) (out-byte 114) (br next)))
+        (if (i32.eqz escape) (begin (out-byte p b) (br next)))
+        (if (i32.or (i32.eq b 34) (i32.eq b 92)) (begin (out-byte p 92) (out-byte p b) (br next)))
+        (if (i32.eq b 10) (begin (out-byte p 92) (out-byte p 110) (br next)))
+        (if (i32.eq b 9) (begin (out-byte p 92) (out-byte p 116) (br next)))
+        (if (i32.eq b 13) (begin (out-byte p 92) (out-byte p 114) (br next)))
         (if (i32.or (i32.lt_u b 32) (i32.eq b 127))
-            (begin (out-byte 92) (out-byte 120) (out-hex b) (out-byte 59) (br next)))
-        (out-byte b)
+            (begin (out-byte p 92) (out-byte p 120) (out-hex p b) (out-byte p 59) (br next)))
+        (out-byte p b)
         (br next)))))
 
 ;; n in hexadecimal, lower case.
-(func (out-hex [n i32])
-  (if (i32.ge_u n 16) (out-hex (i32.shr_u n 4)))
+(func (out-hex [p (ref port)] [n i32])
+  (if (i32.ge_u n 16) (out-hex p (i32.shr_u n 4)))
   (let ([d (i32.and n 15)])
-    (out-byte (if (i32.lt_u d 10) (i32.add 48 d) (i32.add 87 d)))))
+    (out-byte p (if (i32.lt_u d 10) (i32.add 48 d) (i32.add 87 d)))))
 
 ;; A code point as UTF-8.
-(func (out-char [cp i32])
-  (if (i32.lt_u cp 128) (return (out-byte cp)))
+(func (out-char [p (ref port)] [cp i32])
+  (if (i32.lt_u cp 128) (return (out-byte p cp)))
   (if (i32.lt_u cp 2048)
       (begin
-        (out-byte (i32.or 192 (i32.shr_u cp 6)))
-        (return (out-byte (i32.or 128 (i32.and cp 63))))))
+        (out-byte p (i32.or 192 (i32.shr_u cp 6)))
+        (return (out-byte p (i32.or 128 (i32.and cp 63))))))
   (if (i32.lt_u cp 65536)
       (begin
-        (out-byte (i32.or 224 (i32.shr_u cp 12)))
-        (out-byte (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
-        (return (out-byte (i32.or 128 (i32.and cp 63))))))
-  (out-byte (i32.or 240 (i32.shr_u cp 18)))
-  (out-byte (i32.or 128 (i32.and (i32.shr_u cp 12) 63)))
-  (out-byte (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
-  (out-byte (i32.or 128 (i32.and cp 63))))
+        (out-byte p (i32.or 224 (i32.shr_u cp 12)))
+        (out-byte p (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
+        (return (out-byte p (i32.or 128 (i32.and cp 63))))))
+  (out-byte p (i32.or 240 (i32.shr_u cp 18)))
+  (out-byte p (i32.or 128 (i32.and (i32.shr_u cp 12) 63)))
+  (out-byte p (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
+  (out-byte p (i32.or 128 (i32.and cp 63))))
 
-(func (out-u64 [n i64])
-  (if (i64.ge_u n 10) (out-u64 (i64.div_u n 10)))
-  (out-byte (i32.add 48 (i32.wrap_i64 (i64.rem_u n 10)))))
+(func (out-u64 [p (ref port)] [n i64])
+  (if (i64.ge_u n 10) (out-u64 p (i64.div_u n 10)))
+  (out-byte p (i32.add 48 (i32.wrap_i64 (i64.rem_u n 10)))))
 
 ;; v as display (if display) or write writes it.
-(func (out-datum [v eqref] [display i32])
-  (if (ref.is_null v) (return (out-string '"#f" 0)))
+(func (out-datum [p (ref port)] [v eqref] [display i32])
+  (if (ref.is_null v) (return (out-string p '"#f" 0)))
   (if (s:integer? v)
       (begin
         (if (s:integer-negative? v)
-            (begin (out-byte 45) (out-u64 (i64.sub 0 (s:integer-value v))))
-            (out-u64 (s:integer-value v)))
+            (begin (out-byte p 45) (out-u64 p (i64.sub 0 (s:integer-value v))))
+            (out-u64 p (s:integer-value v)))
         (return)))
-  (if (s:flonum? v) (return (out-flonum (s:flonum-value v))))
-  (if (ref.eq v '#t) (return (out-string '"#t" 0)))
-  (if (s:null? v) (return (out-string '"()" 0)))
+  (if (s:flonum? v) (return (out-flonum p (s:flonum-value v))))
+  (if (ref.eq v '#t) (return (out-string p '"#t" 0)))
+  (if (s:null? v) (return (out-string p '"()" 0)))
   (if (s:char? v)
       (let ([cp (s:char->integer v)])
-        (if display (return (out-char cp)))
-        (out-string '"#\\" 0)
-        (if (i32.eq cp 32) (return (out-string '"space" 0)))
-        (if (i32.eq cp 10) (return (out-string '"newline" 0)))
-        (if (i32.eq cp 9) (return (out-string '"tab" 0)))
-        (if (i32.eq cp 13) (return (out-string '"return" 0)))
-        (if (i32.eqz cp) (return (out-string '"nul" 0)))
-        (if (i32.eq cp 7) (return (out-string '"alarm" 0)))
-        (if (i32.eq cp 8) (return (out-string '"backspace" 0)))
-        (if (i32.eq cp 27) (return (out-string '"escape" 0)))
-        (if (i32.eq cp 127) (return (out-string '"delete" 0)))
-        (if (i32.lt_u cp 32) (begin (out-byte 120) (return (out-hex cp))))
-        (return (out-char cp))))
-  (if (s:symbol? v) (return (out-string (s:symbol->string v) 0)))
-  (if (s:keyword? v) (begin (out-string '"#:" 0) (return (out-string (s:keyword->string v) 0))))
+        (if display (return (out-char p cp)))
+        (out-string p '"#\\" 0)
+        (if (i32.eq cp 32) (return (out-string p '"space" 0)))
+        (if (i32.eq cp 10) (return (out-string p '"newline" 0)))
+        (if (i32.eq cp 9) (return (out-string p '"tab" 0)))
+        (if (i32.eq cp 13) (return (out-string p '"return" 0)))
+        (if (i32.eqz cp) (return (out-string p '"nul" 0)))
+        (if (i32.eq cp 7) (return (out-string p '"alarm" 0)))
+        (if (i32.eq cp 8) (return (out-string p '"backspace" 0)))
+        (if (i32.eq cp 27) (return (out-string p '"escape" 0)))
+        (if (i32.eq cp 127) (return (out-string p '"delete" 0)))
+        (if (i32.lt_u cp 32) (begin (out-byte p 120) (return (out-hex p cp))))
+        (return (out-char p cp))))
+  (if (s:symbol? v) (return (out-string p (s:symbol->string v) 0)))
+  (if (s:keyword? v) (begin (out-string p '"#:" 0) (return (out-string p (s:keyword->string v) 0))))
   (if (s:string? v)
       (begin
-        (if display (return (out-string v 0)))
-        (out-byte 34)
-        (out-string v 1)
-        (return (out-byte 34))))
+        (if display (return (out-string p v 0)))
+        (out-byte p 34)
+        (out-string p v 1)
+        (return (out-byte p 34))))
   (if (s:pair? v)
       (let ([prefix (abbreviation v)])
         (if (i32.eqz (ref.is_null prefix))
             (begin
-              (out-string prefix 0)
-              (return (out-datum (s:cadr v) display))))
-        (out-byte 40)
-        (out-datum (s:car v) display)
+              (out-string p prefix 0)
+              (return (out-datum p (s:cadr v) display))))
+        (out-byte p 40)
+        (out-datum p (s:car v) display)
         (set! v (s:cdr v))
         (block done
           (loop next
             (br-if done (i32.eqz (s:pair? v)))
-            (out-byte 32)
-            (out-datum (s:car v) display)
+            (out-byte p 32)
+            (out-datum p (s:car v) display)
             (set! v (s:cdr v))
             (br next)))
         (if (i32.eqz (s:null? v))
-            (begin (out-string '" . " 0) (out-datum v display)))
-        (return (out-byte 41))))
+            (begin (out-string p '" . " 0) (out-datum p v display)))
+        (return (out-byte p 41))))
   (if (ref.test (ref vector) v)
       (let ([a (ref.cast (ref vector) v)] [i 0])
-        (out-string '"#(" 0)
+        (out-string p '"#(" 0)
         (block done
           (loop next
             (br-if done (i32.ge_u i (array.len a)))
-            (if i (out-byte 32))
-            (out-datum (array.get vector a i) display)
+            (if i (out-byte p 32))
+            (out-datum p (array.get vector a i) display)
             (set! i (i32.add i 1))
             (br next)))
-        (return (out-byte 41))))
+        (return (out-byte p 41))))
   (if (ref.test (ref bytes) v)
-      (return (if display (out-raw-bytes (ref.cast (ref bytes) v)) (out-bytes (ref.cast (ref bytes) v)))))
-  (if (ref.test (ref closure) v) (return (out-string '"#<procedure>" 0)))
+      (let ([a (ref.cast (ref bytes) v)])
+        (return (if display (out-byte-range p a 0 (array.len a)) (out-bytes p a)))))
+  (if (ref.test (ref closure) v) (return (out-string p '"#<procedure>" 0)))
   (if (ref.test (ref structure) v)
       (begin
-        (out-string '"#<" 0)
-        (out-datum (struct.get struct-type name (ref.cast (ref struct-type) (struct.get structure type (ref.cast (ref structure) v)))) 0)
-        (return (out-byte 62))))
-  (if (ref.test (ref hashtable) v) (return (out-table (ref.cast (ref hashtable) v) display)))
+        (out-string p '"#<" 0)
+        (out-datum p (struct.get struct-type name (ref.cast (ref struct-type) (struct.get structure type (ref.cast (ref structure) v)))) 0)
+        (return (out-byte p 62))))
+  (if (ref.test (ref hashtable) v) (return (out-table p (ref.cast (ref hashtable) v) display)))
+  (if (ref.test (ref port) v) (return (out-string p '"#<port>" 0)))
   (if (s:syntax? v)
       (begin
-        (out-string '"#<syntax " 0)
-        (out-datum (s:syntax->datum v) 0)
-        (return (out-byte 62))))
-  (out-string '"#<other>" 0))
+        (out-string p '"#<syntax " 0)
+        (out-datum p (s:syntax->datum v) 0)
+        (return (out-byte p 62))))
+  (out-string p '"#<other>" 0))
 
 ;; The prefix a two-element list (quote x) and its kin are written with,
 ;; as they read: 'x, `x, ,x, ,@x, #'x, #`x, #,x and #,@x; else #f.
@@ -426,107 +488,74 @@
     (if (ref.eq head 'unsyntax-splicing) (return '"#,@"))
     '#f))
 
-;; A byte string's bytes, as display writes it.
-(func (out-raw-bytes [a (ref bytes)])
-  (let ([i 0])
-    (block done
-      (loop next
-        (br-if done (i32.ge_u i (array.len a)))
-        (out-byte (array.get_u bytes a i))
-        (set! i (i32.add i 1))
-        (br next)))))
-
 ;; A byte string as write writes it: #"...", with printable ASCII as
 ;; itself, \" and \\ escaped, and other bytes in three octal digits.
-(func (out-bytes [a (ref bytes)])
+(func (out-bytes [p (ref port)] [a (ref bytes)])
   (let ([i 0] [b 0])
-    (out-string '"#\"" 0)
+    (out-string p '"#\"" 0)
     (block done
       (loop next
         (br-if done (i32.ge_u i (array.len a)))
         (set! b (array.get_u bytes a i))
         (if (i32.or (i32.eq b 34) (i32.eq b 92))
-            (begin (out-byte 92) (out-byte b))
+            (begin (out-byte p 92) (out-byte p b))
             (if (i32.and (i32.ge_u b 32) (i32.lt_u b 127))
-                (out-byte b)
+                (out-byte p b)
                 (begin
-                  (out-byte 92)
-                  (out-byte (i32.add 48 (i32.shr_u b 6)))
-                  (out-byte (i32.add 48 (i32.and (i32.shr_u b 3) 7)))
-                  (out-byte (i32.add 48 (i32.and b 7))))))
+                  (out-byte p 92)
+                  (out-byte p (i32.add 48 (i32.shr_u b 6)))
+                  (out-byte p (i32.add 48 (i32.and (i32.shr_u b 3) 7)))
+                  (out-byte p (i32.add 48 (i32.and b 7))))))
         (set! i (i32.add i 1))
         (br next)))
-    (out-byte 34)))
+    (out-byte p 34)))
 
 ;; A hash table, written #hash((key . value) ...), or #hasheq or #hasheqv
 ;; by its kind, in the table's order.
-(func (out-table [t (ref hashtable)] [display i32])
+(func (out-table [p (ref port)] [t (ref hashtable)] [display i32])
   (let ([kind (struct.get hashtable kind t)] [l (table-walk t 2)])
-    (out-string (if (i32.eqz kind) '"#hasheq(" (if (i32.eq kind 1) '"#hasheqv(" '"#hash(")) 0)
+    (out-string p (if (i32.eqz kind) '"#hasheq(" (if (i32.eq kind 1) '"#hasheqv(" '"#hash(")) 0)
     (block done
       (loop next
         (br-if done (i32.eqz (s:pair? l)))
-        (out-datum (s:car l) display)
+        (out-datum p (s:car l) display)
         (set! l (s:cdr l))
-        (if (s:pair? l) (out-byte 32))
+        (if (s:pair? l) (out-byte p 32))
         (br next)))
-    (out-byte 41)))
-
-;; Write out to stdout, through bytes 8192.. of this memory, and empty it.
-(func (flush-out) (flush-out-to 1))
-
-;; Write out to file descriptor fd, 1 for stdout or 2 for stderr, and empty
-;; it.
-(func (flush-out-to [fd i32])
-  (let ([i 0] [k 0])
-    (block done
-      (loop next
-        (br-if done (i32.ge_u i out-length))
-        (set! k 0)
-        (block full
-          (loop copy
-            (br-if full (i32.ge_u k 4096))
-            (br-if full (i32.ge_u (i32.add i k) out-length))
-            (i32.store8 (i32.add 8192 k) (array.get_u bytes out (i32.add i k)))
-            (set! k (i32.add k 1))
-            (br copy)))
-        (drop (host-write fd 8192 k))
-        (set! i (i32.add i k))
-        (br next)))
-    (set! out-length 0)))
+    (out-byte p 41)))
 
 ;; ---- run-time errors, continued -----------------------------------------------------------
 
-;; Abort with out as the message, copied into bytes 1024.. of this memory.
-(func (fail-out) -> eqref
-  (let ([n (select out-length 4096 (i32.lt_u out-length 4096))] [i 0])
+;; Abort with what was written to p as the message, copied into bytes
+;; 1024.. of this memory.
+(func (fail-with [p (ref port)]) -> eqref
+  (let* ([n (struct.get port length p)] [n (select n 4096 (i32.lt_u n 4096))] [a (struct.get port bytes p)] [i 0])
     (block done
       (loop next
         (br-if done (i32.ge_u i n))
-        (i32.store8 (i32.add 1024 i) (array.get_u bytes out i))
+        (i32.store8 (i32.add 1024 i) (array.get_u bytes a i))
         (set! i (i32.add i 1))
         (br next)))
-    (set! out-length 0)
     (fail 1024 n))
   (unreachable))
 
 ;; Function who (a string) needs what (a string) where it was given v.
 (func (wrong-type [who eqref] [what eqref] [v eqref]) -> eqref
-  (set! out-length 0)
-  (out-who who)
-  (out-string '": expected " 0)
-  (out-string what 0)
-  (out-string '", got " 0)
-  (out-datum v 0)
-  (fail-out))
+  (let ([p (new-port -1)])
+    (out-who p who)
+    (out-string p '": expected " 0)
+    (out-string p what 0)
+    (out-string p '", got " 0)
+    (out-datum p v 0)
+    (fail-with p)))
 
 (func (index-error [who eqref] [k eqref]) -> eqref
-  (set! out-length 0)
-  (out-who who)
-  (out-string '": index " 0)
-  (out-datum k 0)
-  (out-string '" is out of range" 0)
-  (fail-out))
+  (let ([p (new-port -1)])
+    (out-who p who)
+    (out-string p '": index " 0)
+    (out-datum p k 0)
+    (out-string p '" is out of range" 0)
+    (fail-with p)))
 
 ;; ---- integers --------------------------------------------------------------------------
 
@@ -775,11 +804,11 @@
 ;; radix 10.
 (func (number-string-of [n eqref] [radix eqref]) -> eqref
   (if (s:flonum? n)
-      (let ([start out-length])
+      (let ([p (new-port -1)])
         (if (i64.ne (radix-value radix '"number->string") 10)
             (drop (wrong-type '"number->string" '"radix 10 for a flonum" radix)))
-        (out-flonum (s:flonum-value n))
-        (return (take-out-string start))))
+        (out-flonum p (s:flonum-value n))
+        (return (port-string p))))
   (number-string (int-value n '"number->string") (radix-value radix '"number->string")))
 
 ;; ---- flonums ---------------------------------------------------------------------------
@@ -948,13 +977,13 @@
 ;; x as write writes it: +inf.0, -inf.0 or +nan.0; otherwise its shortest
 ;; digits, in fixed-point notation from 10^-3 up to 10^10, else in
 ;; scientific notation, 1.5e10.
-(func (out-flonum [x f64])
+(func (out-flonum [p (ref port)] [x f64])
   (let ([ds (array.new bytes 0 24)] [n 0] [k 0] [i 0])
-    (if (f64.ne x x) (return (out-string '"+nan.0" 0)))
-    (if (f64.eq x (f64.div 1 0)) (return (out-string '"+inf.0" 0)))
-    (if (f64.eq x (f64.div -1 0)) (return (out-string '"-inf.0" 0)))
-    (if (i64.lt_s (i64.reinterpret_f64 x) 0) (out-byte 45))
-    (if (f64.eq x 0) (return (out-string '"0.0" 0)))
+    (if (f64.ne x x) (return (out-string p '"+nan.0" 0)))
+    (if (f64.eq x (f64.div 1 0)) (return (out-string p '"+inf.0" 0)))
+    (if (f64.eq x (f64.div -1 0)) (return (out-string p '"-inf.0" 0)))
+    (if (i64.lt_s (i64.reinterpret_f64 x) 0) (out-byte p 45))
+    (if (f64.eq x 0) (return (out-string p '"0.0" 0)))
     ;; x is 0.d1...dn × 10^k.
     (set! k (flonum-digits (f64.abs x) ds))
     (block counted
@@ -967,29 +996,20 @@
         (begin
           (if (i32.le_s k 0)
               (begin
-                (out-string '"0." 0)
-                (loop zeros (if (i32.lt_s i (i32.sub 0 k)) (begin (out-byte 48) (set! i (i32.add i 1)) (br zeros))))
-                (return (out-digits ds 0 n))))
+                (out-string p '"0." 0)
+                (loop zeros (if (i32.lt_s i (i32.sub 0 k)) (begin (out-byte p 48) (set! i (i32.add i 1)) (br zeros))))
+                (return (out-byte-range p ds 0 n))))
           (if (i32.lt_s k n)
-              (begin (out-digits ds 0 k) (out-byte 46) (return (out-digits ds k n))))
-          (out-digits ds 0 n)
+              (begin (out-byte-range p ds 0 k) (out-byte p 46) (return (out-byte-range p ds k n))))
+          (out-byte-range p ds 0 n)
           (set! i n)
-          (loop zeros (if (i32.lt_s i k) (begin (out-byte 48) (set! i (i32.add i 1)) (br zeros))))
-          (return (out-string '".0" 0))))
-    (out-digits ds 0 1)
-    (if (i32.gt_s n 1) (begin (out-byte 46) (out-digits ds 1 n)))
-    (out-byte 101)
-    (if (i32.lt_s k 1) (out-byte 45))
-    (out-u64 (i64.extend_i32_u (select (i32.sub k 1) (i32.sub 1 k) (i32.ge_s k 1))))))
-
-;; Bytes from up to to of ds, digit characters.
-(func (out-digits [ds (ref bytes)] [from i32] [to i32])
-  (block done
-    (loop next
-      (br-if done (i32.ge_s from to))
-      (out-byte (array.get_u bytes ds from))
-      (set! from (i32.add from 1))
-      (br next))))
+          (loop zeros (if (i32.lt_s i k) (begin (out-byte p 48) (set! i (i32.add i 1)) (br zeros))))
+          (return (out-string p '".0" 0))))
+    (out-byte-range p ds 0 1)
+    (if (i32.gt_s n 1) (begin (out-byte p 46) (out-byte-range p ds 1 n)))
+    (out-byte p 101)
+    (if (i32.lt_s k 1) (out-byte p 45))
+    (out-u64 p (i64.extend_i32_u (select (i32.sub k 1) (i32.sub 1 k) (i32.ge_s k 1))))))
 
 ;; The shortest digits of x > 0, as characters into ds, followed by zero
 ;; bytes; returns k, where x is 0.d1d2... × 10^k. Burger and Dybvig's
@@ -2343,10 +2363,10 @@
     n))
 
 (func (same-size-error [who eqref]) -> eqref
-  (set! out-length 0)
-  (out-who who)
-  (out-string '": all lists must have the same size" 0)
-  (fail-out))
+  (let ([p (new-port -1)])
+    (out-who p who)
+    (out-string p '": all lists must have the same size" 0)
+    (fail-with p)))
 
 (func (cars [ls eqref]) -> eqref
   (if (s:null? ls) '() (s:cons (s:car (s:car ls)) (cars (s:cdr ls)))))
@@ -2689,12 +2709,12 @@
   (i32.eqz (continuation-byte? (s:string-byte s i))))
 
 (func (inside-char-error [who eqref] [k eqref]) -> eqref
-  (set! out-length 0)
-  (out-who who)
-  (out-string '": byte " 0)
-  (out-datum k 0)
-  (out-string '" is inside a character" 0)
-  (fail-out))
+  (let ([p (new-port -1)])
+    (out-who p who)
+    (out-string p '": byte " 0)
+    (out-datum p k 0)
+    (out-string p '" is inside a character" 0)
+    (fail-with p)))
 
 ;; Byte offset k of string s, for function who: from 0 to its length, where
 ;; a character starts.
@@ -2723,23 +2743,6 @@
   (if (i32.lt_u cp 65536) (return 3))
   4)
 
-;; Add code point cp to string builder b, as UTF-8.
-(func (add-char [b eqref] [cp i32])
-  (if (i32.lt_u cp 128) (return (s:string-builder-add-byte! b cp)))
-  (if (i32.lt_u cp 2048)
-      (begin
-        (s:string-builder-add-byte! b (i32.or 192 (i32.shr_u cp 6)))
-        (return (s:string-builder-add-byte! b (i32.or 128 (i32.and cp 63))))))
-  (if (i32.lt_u cp 65536)
-      (begin
-        (s:string-builder-add-byte! b (i32.or 224 (i32.shr_u cp 12)))
-        (s:string-builder-add-byte! b (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
-        (return (s:string-builder-add-byte! b (i32.or 128 (i32.and cp 63))))))
-  (s:string-builder-add-byte! b (i32.or 240 (i32.shr_u cp 18)))
-  (s:string-builder-add-byte! b (i32.or 128 (i32.and (i32.shr_u cp 12) 63)))
-  (s:string-builder-add-byte! b (i32.or 128 (i32.and (i32.shr_u cp 6) 63)))
-  (s:string-builder-add-byte! b (i32.or 128 (i32.and cp 63))))
-
 ;; The byte offsets of string x from start to end (#f: its start, its end),
 ;; for function who, as (start . end) fixnums.
 (func (string-range [x eqref] [start eqref] [end eqref] [who eqref]) -> eqref
@@ -2766,14 +2769,14 @@
     (s:reverse acc)))
 
 (func (list->string* [chars eqref] [who eqref]) -> eqref
-  (let ([b (s:make-string-builder)] [l (list-arg chars who)])
+  (let ([p (new-port -1)] [l (list-arg chars who)])
     (block done
       (loop next
         (br-if done (i32.eqz (s:pair? l)))
-        (add-char b (char-arg (s:car l) who))
+        (out-char p (char-arg (s:car l) who))
         (set! l (s:cdr l))
         (br next)))
-    (s:string-builder->string b)))
+    (port-string p)))
 
 ;; The length of the UTF-8 sequence for one character at index i of a,
 ;; before index e: 1 to 4, or 0 if the bytes there are not one.
@@ -2813,7 +2816,7 @@
   (let* ([a (bytes-arg v who)]
          [e (if (ref.is_null end) (array.len a) (bound end (array.len a) who))]
          [i (if (ref.is_null start) 0 (bound start e who))]
-         [b (s:make-string-builder)]
+         [p (new-port -1)]
          [n 0]
          [replacement (if (ref.is_null err) 0 (char-arg err who))])
     (block done
@@ -2823,17 +2826,13 @@
         (if (i32.eqz n)
             (begin
               (if (ref.is_null err) (return (wrong-type who '"UTF-8 bytes" v)))
-              (add-char b replacement)
+              (out-char p replacement)
               (set! i (i32.add i 1)))
-            (block copied
-              (loop copy
-                (br-if copied (i32.eqz n))
-                (s:string-builder-add-byte! b (array.get_u bytes a i))
-                (set! i (i32.add i 1))
-                (set! n (i32.sub n 1))
-                (br copy))))
+            (begin
+              (out-byte-range p a i (i32.add i n))
+              (set! i (i32.add i n))))
         (br next)))
-    (s:string-builder->string b)))
+    (port-string p)))
 
 (func (string->bytes* [s eqref] [who eqref]) -> eqref
   (let* ([x (string-arg s who)] [n (s:string-length x)] [b (array.new bytes 0 n)] [i 0])
@@ -3269,11 +3268,11 @@
   failure)
 
 (func (no-key-error [who eqref] [k eqref]) -> eqref
-  (set! out-length 0)
-  (out-who who)
-  (out-string '": no value found for key " 0)
-  (out-datum k 0)
-  (fail-out))
+  (let ([p (new-port -1)])
+    (out-who p who)
+    (out-string p '": no value found for key " 0)
+    (out-datum p k 0)
+    (fail-with p)))
 
 (func (hash-ref* [t eqref] [k eqref] [failure eqref] [has-failure i32] [who eqref]) -> eqref
   (let* ([x (table-arg t who)]
@@ -3376,100 +3375,141 @@
     [(name message x) (s:raise-syntax-error name message x) '#f]))
 
 ;; ---- output and errors ----
+;;
+;; write, display, newline, write-byte and write-bytes write to the
+;; standard output, or to the port they are given: a bytes port, from
+;; open-output-bytes, keeps what is written to it, for get-output-bytes.
 
-(substrate-define (write x) (out-datum x 0) (flush-out) '#f)
-(substrate-define (display x) (out-datum x 1) (flush-out) '#f)
-(substrate-define (newline) (out-byte 10) (flush-out) '#f)
+(func (port-arg [v eqref] [who eqref]) -> (ref port)
+  (if (i32.eqz (ref.test (ref port) v)) (drop (wrong-type who '"an output port" v)))
+  (ref.cast (ref port) v))
+
+(func (write* [x eqref] [p (ref port)] [display i32]) -> eqref
+  (out-datum p x display)
+  (flush p)
+  '#f)
+
+(substrate-define write
+  (substrate-case-lambda
+    [(x) (write* x stdout 0)]
+    [(x p) (write* x (port-arg p '"write") 0)]))
+(substrate-define display
+  (substrate-case-lambda
+    [(x) (write* x stdout 1)]
+    [(x p) (write* x (port-arg p '"display") 1)]))
+(substrate-define newline
+  (substrate-case-lambda
+    [() (write* '#\newline stdout 1)]
+    [(p) (write* '#\newline (port-arg p '"newline") 1)]))
+
+(func (write-byte* [b eqref] [p (ref port)]) -> eqref
+  (out-byte p (byte-arg b '"write-byte"))
+  (flush p)
+  '#f)
+
+(func (write-bytes* [v eqref] [p (ref port)]) -> eqref
+  (let ([a (bytes-arg v '"write-bytes")])
+    (out-byte-range p a 0 (array.len a))
+    (flush p)
+    '#f))
+
+(substrate-define write-byte
+  (substrate-case-lambda
+    [(b) (write-byte* b stdout)]
+    [(b p) (write-byte* b (port-arg p '"write-byte"))]))
+(substrate-define write-bytes
+  (substrate-case-lambda
+    [(v) (write-bytes* v stdout)]
+    [(v p) (write-bytes* v (port-arg p '"write-bytes"))]))
+
+(substrate-define (open-output-bytes) (new-port -1))
+(substrate-define (get-output-bytes p) (port-bytes (port-arg p '"get-output-bytes")))
+;; The number of bytes written to bytes port p.
+(substrate-define (file-position p) (s:fixnum (struct.get port length (port-arg p '"file-position"))))
+;; (proc port) with a new bytes port; what it writes there, as bytes.
+(substrate-define (call-with-output-bytes proc)
+  (let ([p (new-port -1)])
+    (drop (app proc p))
+    (port-bytes p)))
 
 (func (format-error [who eqref] [what eqref]) -> eqref
-  (set! out-length 0)
-  (out-who who)
-  (out-string '": " 0)
-  (out-string what 0)
-  (fail-out))
+  (let ([p (new-port -1)])
+    (out-who p who)
+    (out-string p '": " 0)
+    (out-string p what 0)
+    (fail-with p)))
 
-;; Write format string form with args: ~a displays the next argument, ~s,
-;; ~v and ~e write it, ~% and ~n are newlines, and ~~ is ~.
-(func (out-format [who eqref] [form eqref] [args eqref])
+;; Write format string form with args to p: ~a displays the next argument,
+;; ~s, ~v and ~e write it, ~% and ~n are newlines, and ~~ is ~.
+(func (out-format [p (ref port)] [who eqref] [form eqref] [args eqref])
   (let ([n (s:string-length (string-arg form who))] [i 0] [b 0])
     (block done
       (loop next
         (br-if done (i32.ge_u i n))
         (set! b (s:string-byte form i))
         (if (i32.ne b 126)
-            (begin (out-byte b) (set! i (i32.add i 1)) (br next)))
+            (begin (out-byte p b) (set! i (i32.add i 1)) (br next)))
         (if (i32.ge_u (i32.add i 1) n) (drop (format-error who '"the format string ends in ~")))
         (set! b (s:string-byte form (i32.add i 1)))
         (if (i32.or (i32.eq b 126) (i32.or (i32.eq b 37) (i32.or (i32.eq b 110) (i32.eq b 78))))
-            (out-byte (if (i32.eq b 126) 126 10))
+            (out-byte p (if (i32.eq b 126) 126 10))
             (begin
               (if (i32.eqz (s:pair? args))
                   (drop (format-error who '"the format string takes more arguments than it was given")))
               (if (i32.or (i32.eq b 97) (i32.eq b 65))
-                  (out-datum (s:car args) 1)
+                  (out-datum p (s:car args) 1)
                   (if (i32.or (i32.or (i32.eq b 115) (i32.eq b 83))
                               (i32.or (i32.or (i32.eq b 118) (i32.eq b 86)) (i32.or (i32.eq b 101) (i32.eq b 69))))
-                      (out-datum (s:car args) 0)
+                      (out-datum p (s:car args) 0)
                       (drop (format-error who '"the format string has an unknown directive"))))
               (set! args (s:cdr args))))
         (set! i (i32.add i 2))
         (br next)))
     (if (s:pair? args) (drop (format-error who '"the format string takes fewer arguments than it was given")))))
 
-;; Bytes start.. of out as a string, taken off out.
-(func (take-out-string [start i32]) -> eqref
-  (let ([b (s:make-string-builder)] [i start])
-    (block done
-      (loop next
-        (br-if done (i32.ge_u i out-length))
-        (s:string-builder-add-byte! b (array.get_u bytes out i))
-        (set! i (i32.add i 1))
-        (br next)))
-    (set! out-length start)
-    (s:string-builder->string b)))
-
 (substrate-define (format form . args)
-  (let ([start out-length])
-    (out-format '"format" form args)
-    (take-out-string start)))
+  (let ([p (new-port -1)])
+    (out-format p '"format" form args)
+    (port-string p)))
 
-(substrate-define (printf form . args) (out-format '"printf" form args) (flush-out) '#f)
+(substrate-define (printf form . args) (out-format stdout '"printf" form args) (flush stdout) '#f)
 
 ;; printf to stderr.
-(substrate-define (eprintf form . args) (out-format '"eprintf" form args) (flush-out-to 2) '#f)
+(substrate-define (eprintf form . args) (out-format stderr '"eprintf" form args) (flush stderr) '#f)
 
 ;; (error 'sym) stops with "error: sym"; (error "message" v ...) with the
 ;; message, then each v written; (error 'who "format" v ...) with "who: "
 ;; and the format string filled in, as format does.
 (substrate-define (error first . rest)
-  (set! out-length 0)
-  (if (i32.and (s:symbol? first) (s:null? rest))
-      (begin (out-string '"error: " 0) (out-datum first 1))
-      (if (s:symbol? first)
-          (begin
-            (out-datum first 1)
-            (out-string '": " 0)
-            (out-format '"error" (s:car rest) (s:cdr rest)))
-          (begin
-            (out-datum first 1)
-            (block done
-              (loop next
-                (br-if done (i32.eqz (s:pair? rest)))
-                (out-byte 32)
-                (out-datum (s:car rest) 0)
-                (set! rest (s:cdr rest))
-                (br next))))))
-  (fail-out))
+  (let ([p (new-port -1)])
+    (if (i32.and (s:symbol? first) (s:null? rest))
+        (begin (out-string p '"error: " 0) (out-datum p first 1))
+        (if (s:symbol? first)
+            (begin
+              (out-datum p first 1)
+              (out-string p '": " 0)
+              (out-format p '"error" (s:car rest) (s:cdr rest)))
+            (begin
+              (out-datum p first 1)
+              (block done
+                (loop next
+                  (br-if done (i32.eqz (s:pair? rest)))
+                  (out-byte p 32)
+                  (out-datum p (s:car rest) 0)
+                  (set! rest (s:cdr rest))
+                  (br next))))))
+    (fail-with p)))
 
-;; ---- files and the command line ----------------------------------------------------
+;; ---- the host: files, the command line, instantiating code -------------------------
 ;;
-;; Paths and file contents cross to the host (spec 4) through this memory,
-;; from scratch up, grown as needed.
+;; Paths, file contents and code cross to the host (spec 4) through this
+;; memory, from scratch up, grown as needed.
 
 (import host-arg-count "host" "arg_count" (-> i32))
 (import host-arg "host" "arg" (i32 i32 i32 -> i32))
 (import host-read-file "host" "read_file" (i32 i32 i32 i32 -> i32))
 (import host-write-file "host" "write_file" (i32 i32 i32 i32 -> i32))
+(import host-instantiate "host" "instantiate" (i32 i32 i32 i32 i32 -> i32))
 (import host-exit "host" "exit" (i32 ->))
 (import host-error-message "host" "error_message" (i32 i32 -> i32))
 
@@ -3491,38 +3531,50 @@
         (set! i (i32.add i 1))
         (br next)))))
 
-;; Stop with "who: " and the host's message for its last failure.
-(func (host-error [who eqref]) -> eqref
-  (scratch-reserve 4096)
-  (let ([n (host-error-message scratch 4096)] [i 0])
-    (set! out-length 0)
-    (out-who who)
-    (out-string '": " 0)
+;; The first n bytes of a, at address at.
+(func (store-bytes [a (ref bytes)] [n i32] [at i32])
+  (let ([i 0])
     (block done
       (loop next
         (br-if done (i32.ge_u i n))
-        (out-byte (i32.load8_u (i32.add scratch i)))
+        (i32.store8 (i32.add at i) (array.get_u bytes a i))
         (set! i (i32.add i 1))
-        (br next)))
-    (fail-out)))
+        (br next)))))
+
+;; The n bytes of memory at address at, written to p.
+(func (out-memory [p (ref port)] [at i32] [n i32])
+  (let ([i 0])
+    (block done
+      (loop next
+        (br-if done (i32.ge_u i n))
+        (out-byte p (i32.load8_u (i32.add at i)))
+        (set! i (i32.add i 1))
+        (br next)))))
+
+;; The host's message for its last failure, written to p.
+(func (host-message [p (ref port)])
+  (scratch-reserve 4096)
+  (out-memory p scratch (host-error-message scratch 4096)))
+
+;; Stop with "who: " and the host's message for its last failure.
+(func (host-error [who eqref]) -> eqref
+  (let ([p (new-port -1)])
+    (out-who p who)
+    (out-string p '": " 0)
+    (host-message p)
+    (fail-with p)))
 
 ;; The bytes of the file path names, for function who.
 (func (read-file [path eqref] [who eqref]) -> (ref bytes)
-  (let* ([p (string-arg path who)] [pl (s:string-length p)] [at (i32.add scratch pl)] [n 0])
+  (let* ([s (string-arg path who)] [pl (s:string-length s)] [at (i32.add scratch pl)] [n 0] [p (new-port -1)])
     (scratch-reserve pl)
-    (store-string p scratch)
+    (store-string s scratch)
     (set! n (host-read-file scratch pl at 0))
     (if (i32.lt_s n 0) (drop (host-error who)))
     (scratch-reserve (i32.add pl n))
     (if (i32.ne (host-read-file scratch pl at n) n) (drop (host-error who)))
-    (let ([a (array.new bytes 0 n)] [i 0])
-      (block done
-        (loop next
-          (br-if done (i32.ge_u i n))
-          (array.set bytes a i (i32.load8_u (i32.add at i)))
-          (set! i (i32.add i 1))
-          (br next)))
-      a)))
+    (out-memory p at n)
+    (port-bytes p)))
 
 (substrate-define (file->bytes path) (read-file path '"file->bytes"))
 
@@ -3540,49 +3592,52 @@
 ;; (display-to-file v path): write v, as display does, to the file path
 ;; names, creating or replacing it.
 (substrate-define (display-to-file v path)
-  (let* ([p (string-arg path '"display-to-file")] [pl (s:string-length p)] [at (i32.add scratch pl)]
-         [n 0] [i 0])
-    (set! out-length 0)
-    (out-datum v 1)
-    (set! n out-length)
-    (set! out-length 0)
+  (let* ([s (string-arg path '"display-to-file")] [pl (s:string-length s)] [p (new-port -1)] [n 0])
+    (out-datum p v 1)
+    (set! n (struct.get port length p))
     (scratch-reserve (i32.add pl n))
-    (store-string p scratch)
-    (block done
-      (loop next
-        (br-if done (i32.ge_u i n))
-        (i32.store8 (i32.add at i) (array.get_u bytes out i))
-        (set! i (i32.add i 1))
-        (br next)))
-    (if (i32.lt_s (host-write-file scratch pl at n) 0) (drop (host-error '"display-to-file")))
+    (store-string s scratch)
+    (store-bytes (struct.get port bytes p) n (i32.add scratch pl))
+    (if (i32.lt_s (host-write-file scratch pl (i32.add scratch pl) n) 0) (drop (host-error '"display-to-file")))
     '#f))
-
-;; The len bytes at scratch as a string, for function who.
-(func (scratch-string [len i32] [who eqref]) -> eqref
-  (let ([b (s:make-string-builder)] [i 0] [s eqref '#f])
-    (block done
-      (loop next
-        (br-if done (i32.ge_u i len))
-        (s:string-builder-add-byte! b (i32.load8_u (i32.add scratch i)))
-        (set! i (i32.add i 1))
-        (br next)))
-    (set! s (s:string-builder->string b))
-    (if (ref.is_null s) (drop (format-error who '"a command-line argument is not UTF-8")))
-    s))
 
 ;; The program's command-line arguments, as a vector of strings.
 (substrate-define (current-command-line-arguments)
-  (let* ([n (host-arg-count)] [v (array.new vector (ref.null eq) n)] [i 0] [len 0])
+  (let* ([n (host-arg-count)] [v (array.new vector (ref.null eq) n)] [i 0] [len 0] [p (new-port -1)]
+         [s eqref '#f])
     (block done
       (loop next
         (br-if done (i32.ge_u i n))
         (set! len (host-arg i scratch 0))
         (scratch-reserve len)
         (drop (host-arg i scratch len))
-        (array.set vector v i (scratch-string len '"current-command-line-arguments"))
+        (struct.set port length p 0)
+        (out-memory p scratch len)
+        (set! s (port-string p))
+        (if (ref.is_null s) (drop (format-error '"current-command-line-arguments" '"a command-line argument is not UTF-8")))
+        (array.set vector v i s)
         (set! i (i32.add i 1))
         (br next)))
     v))
+
+;; (instantiate name code [shift]): compile and instantiate the wasm module
+;; in byte string code as the instance named name, linking its imports by
+;; name, at phase shift shift, 0 if it is not given: the host's instantiate
+;; hook (spec 4). #f, or the host's message if it fails.
+(func (instantiate* [name eqref] [code eqref] [shift i32]) -> eqref
+  (let* ([s (string-arg name '"instantiate")] [nl (s:string-length s)] [a (bytes-arg code '"instantiate")]
+         [p (new-port -1)])
+    (scratch-reserve (i32.add nl (array.len a)))
+    (store-string s scratch)
+    (store-bytes a (array.len a) (i32.add scratch nl))
+    (if (i32.eqz (host-instantiate scratch nl (i32.add scratch nl) (array.len a) shift)) (return '#f))
+    (host-message p)
+    (port-string p)))
+
+(substrate-define instantiate
+  (substrate-case-lambda
+    [(name code) (instantiate* name code 0)]
+    [(name code shift) (instantiate* name code (count shift '"instantiate"))]))
 
 ;; The status (exit v) ends the program with: v if it is an integer from 1
 ;; to 255, and otherwise 0.
