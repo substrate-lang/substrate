@@ -2,7 +2,9 @@
 # Lifecycle: test harness.
 #
 # Build every tests/*.sub and examples/*.sub with subc build and run it
-# with build/subhost; the output checked is the build's, then the run's.
+# with a host, build/subhost unless HOST names another (host/subhost.mjs
+# runs programs on Node's V8); the output checked is the build's, then the
+# run's.
 # Next to each file:
 #   NAME.out      expected output of a successful run
 #   NAME.err      a line that must appear in the output of a failing run
@@ -20,6 +22,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 compiler="$root/${COMPILER:-bin/subc}"
 builds="${OUT:-build}"
+host="$root/${HOST:-build/subhost}"
 
 # Build the syntax library once first, so library compile notices stay out
 # of test output.
@@ -39,7 +42,7 @@ for t in tests/*.sub examples/*.sub; do
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
   actual="$(cd "$dir" && "$compiler" build "$name.sub" -o "$root/$program" 2>&1 &&
-            "$root/build/subhost" "$root/$program" "${args[@]}" 2>&1)"
+            "$host" "$root/$program" "${args[@]}" 2>&1)"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then

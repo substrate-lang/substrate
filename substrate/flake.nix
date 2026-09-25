@@ -19,6 +19,7 @@
             pkgs.gcc
             pkgs.gnumake
             pkgs.perf      # profile compiled wasm (SUBHOST_PERFMAP)
+            pkgs.nodejs    # V8, to compare engines (host/subhost.mjs)
           ];
           WASMTIME_INCLUDE = "${pkgs.wasmtime.dev}/include";
           WASMTIME_LIB = "${pkgs.wasmtime.lib}/lib";

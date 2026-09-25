@@ -36,7 +36,7 @@ specified but not built yet.
 
 | Component | What it is | Where |
 |---|---|---|
-| host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime) |
+| host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime), `host/subhost.mjs` (JavaScript, over Node's V8) |
 | compiler | Reader, expander, kernel compiler, binary encoder. | stage0: `stage0/*.sls` (Chez Scheme) |
 | syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `compiler/syntax.sub` (kernel code) |
 | libraries | Ordinary modules: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
@@ -348,8 +348,19 @@ instantiates each linklet under its name, gives the program the arguments,
 and calls the entry's `main`. It exits with status 0 when `main` returns,
 1 if the program cannot be loaded, 2 when it traps, with the message on
 stderr, or the status the program passes to `exit`. Wasm is the program's
-form on disk; wasmtime compiles it to machine code each time it is loaded.
-After bootstrap the compiler is such a program.
+form on disk; the engine compiles it to machine code each time it is
+loaded. After bootstrap the compiler is such a program.
+
+`host/subhost.mjs DIR arg ...` is the same host over Node's V8. V8's
+JavaScript API does not tell a host import which instance called it, so
+this host finds the caller's memory and table through the caller's
+exports, and runs a module's start function just after instantiating it
+rather than during instantiation, when the exports do not exist yet.
+`bin/sub` runs the compiler on V8: today it runs it about five times
+faster than wasmtime, whose support for GC is younger (a collector that
+counts references and frees objects one at a time, and a call into the
+runtime for each allocation and for each cast to anything but the
+object's own type). The test suite runs on either host.
 
 ## 5. The kernel language
 

@@ -44,8 +44,15 @@ bin/subc syntax-library -o build/syntax.wasm      # write the syntax library
 wasm-tools print OUT            # inspect a module
 SUBHOST_PROFILE=1 bin/subc run FILE   # time per category, printed at exit
 SUBHOST_PROFILE=2 bin/subc run FILE   # also each wasm compile: size, time, instance
-SUBHOST_PERFMAP=1 perf record -g bin/sub ...   # samples named by wasm function
+SUBHOST_PERFMAP=1 HOST=build/subhost perf record -g bin/sub ...   # wasmtime samples, named by wasm function
+bin/sub build FILE -o DIR       # the compiler written in Substrate (build/sub), on V8
+build/subhost DIR               # run a built program on wasmtime
+host/subhost.mjs DIR            # run it on V8
+COMPILER=bin/sub tests/run.sh   # the tests, built by the compiler in Substrate
+HOST=host/subhost.mjs tests/run.sh   # run programs, and bin/sub, on that host
 ```
+
+`build/sub` is built by stage0 with `bin/subc build compiler/main.sub -o build/sub`.
 
 ## Status
 

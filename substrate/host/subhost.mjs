@@ -1,0 +1,288 @@
+#!/usr/bin/env node
+// Lifecycle: permanent. The host of spec section 4 over Node's V8; bin/sub
+// runs the compiler on it.
+//
+// host/subhost.mjs DIR [arg ...]: run the program subc build wrote to DIR,
+// as build/subhost does. The stage0-only expander imports trap.
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import util from 'node:util';
+
+const [dir, ...programArgs] = process.argv.slice(2);
+if (!dir) {
+  process.stderr.write('usage: node host/subhost.mjs DIR [arg ...]\n');
+  process.exit(64);
+}
+
+const utf8 = new TextEncoder();
+const text = new TextDecoder();
+
+// Every instance so far, by name: its exports.
+const registry = new Map();
+// Every module compiled so far, by the hash of its bytes.
+const modules = new Map();
+// The message of the last failure, for host.error_message.
+let lastError = '';
+
+class Trap extends Error {}
+
+// The system's message for a failed file operation, worded as C's
+// strerror words it, as build/subhost reports it.
+function systemMessage(e) {
+  if (typeof e.errno !== 'number') return e.message;
+  const m = util.getSystemErrorMessage(e.errno);
+  return m.charAt(0).toUpperCase() + m.slice(1);
+}
+
+function compile(bytes) {
+  const key = crypto.createHash('sha256').update(bytes).digest('hex');
+  let module = modules.get(key);
+  if (!module) {
+    module = new WebAssembly.Module(bytes);
+    modules.set(key, module);
+  }
+  return module;
+}
+
+// A linklet name "<module>@<phase>+<t>" at phase shift shift names
+// "<module>@<phase>+<t + shift>"; other names are unchanged (spec 3.2).
+function shiftName(name, shift) {
+  const plus = name.lastIndexOf('+');
+  if (shift === 0 || plus < 0 || !name.slice(0, plus).includes('@')) return name;
+  const digits = name.slice(plus + 1);
+  if (!/^[0-9]+$/.test(digits)) return name;
+  return `${name.slice(0, plus)}+${Number(digits) + shift}`;
+}
+
+// The instance an import from mod links to, for the instance named name
+// at phase shift shift: a linklet name is shifted, and looked up in the
+// namespace of name if it has one, "<ns>/<rest>".
+function mapImport(name, mod, shift) {
+  if (!mod.includes('@')) return mod;
+  const slash = name.lastIndexOf('/');
+  return (slash >= 0 ? name.slice(0, slash + 1) : '') + shiftName(mod, shift);
+}
+
+// The host imports for one instance, self.exports once it exists. Every
+// pointer is into that instance's memory.
+function hostImports(self) {
+  const memory = () => {
+    const m = self.exports && self.exports.memory;
+    if (!m) throw new Trap('host: the caller exports no memory, or is still starting');
+    return new Uint8Array(m.buffer);
+  };
+  const string = (ptr, len) => text.decode(memory().slice(ptr, ptr + len));
+  return {
+    write(fd, ptr, len) {
+      fs.writeSync(fd === 2 ? 2 : 1, memory().subarray(ptr, ptr + len));
+      return len;
+    },
+    trap(ptr, len) {
+      throw new Trap(string(ptr, len));
+    },
+    instantiate(np, nl, bp, bl, shift) {
+      if (shift < 0) throw new Trap('host.instantiate: negative phase shift');
+      const name = string(np, nl);
+      const bytes = memory().slice(bp, bp + bl);
+      return instantiate(name, bytes, shift) ? 0 : 1;
+    },
+    export_index(ip, il, fp, fl) {
+      const table = self.exports.table;
+      if (!table) throw new Trap('host.export_index: the caller exports no table');
+      const exports = registry.get(string(ip, il));
+      const f = exports && exports[string(fp, fl)];
+      return typeof f === 'function' ? table.grow(1, f) : -1;
+    },
+    error_message(bp, cap) {
+      const b = utf8.encode(lastError).subarray(0, cap);
+      memory().set(b, bp);
+      return b.length;
+    },
+    arg_count() {
+      return programArgs.length;
+    },
+    arg(i, bp, cap) {
+      if (i < 0 || i >= programArgs.length) return -1;
+      const b = utf8.encode(programArgs[i]);
+      memory().set(b.subarray(0, cap), bp);
+      return b.length;
+    },
+    read_file(pp, pl, bp, cap) {
+      const path = string(pp, pl);
+      let b;
+      try {
+        b = fs.readFileSync(path);
+      } catch (e) {
+        lastError = `${path}: ${systemMessage(e)}`;
+        return -1;
+      }
+      memory().set(b.subarray(0, cap), bp);
+      return b.length;
+    },
+    write_file(pp, pl, bp, len) {
+      const path = string(pp, pl);
+      try {
+        fs.writeFileSync(path, memory().slice(bp, bp + len));
+      } catch (e) {
+        lastError = `${path}: ${systemMessage(e)}`;
+        return -1;
+      }
+      return 0;
+    },
+    exit(code) {
+      process.exit(code);
+    },
+  };
+}
+
+function expanderQuery() {
+  throw new Trap('expander query used outside the expander');
+}
+
+// ---- start functions ----
+//
+// A host import gets no reference to the instance calling it, so the host
+// finds that instance's memory and table through its exports, which exist
+// only once instantiation returns. Wasm runs a module's start function
+// during instantiation, so the host takes out the start section, exports
+// the start function under this name instead, and calls it after.
+const START_EXPORT = '__subhost_start';
+
+function readU32(bytes, pos) {
+  let n = 0;
+  let shift = 0;
+  let b;
+  do {
+    b = bytes[pos++];
+    n |= (b & 0x7f) << shift;
+    shift += 7;
+  } while (b & 0x80);
+  return [n >>> 0, pos];
+}
+
+function u32(n) {
+  const out = [];
+  do {
+    let b = n & 0x7f;
+    n >>>= 7;
+    if (n) b |= 0x80;
+    out.push(b);
+  } while (n);
+  return out;
+}
+
+// Module bytes with the start section, if any, replaced by an export.
+function deferStart(bytes) {
+  const sections = [];
+  for (let pos = 8; pos < bytes.length; ) {
+    const [size, body] = readU32(bytes, pos + 1);
+    sections.push({ id: bytes[pos], start: pos, body, end: body + size });
+    pos = body + size;
+  }
+  const start = sections.find((s) => s.id === 8);
+  if (!start) return bytes;
+  const [func] = readU32(bytes, start.body);
+  const name = utf8.encode(START_EXPORT);
+  const entry = [...u32(name.length), ...name, 0, ...u32(func)];
+  // The export section comes just before the start section; without one,
+  // the new one takes the start section's place.
+  const old = sections.find((s) => s.id === 7);
+  let body = [...u32(1), ...entry];
+  if (old) {
+    const [count, rest] = readU32(bytes, old.body);
+    body = [...u32(count + 1), ...bytes.subarray(rest, old.end), ...entry];
+  }
+  const exports = Uint8Array.from([7, ...u32(body.length), ...body]);
+  const parts = [bytes.subarray(0, 8)];
+  for (const s of sections) {
+    if (s === old || (s === start && !old)) parts.push(exports);
+    else if (s !== start) parts.push(bytes.subarray(s.start, s.end));
+  }
+  return Buffer.concat(parts);
+}
+
+// Compile and instantiate bytes as instance name at phase shift shift,
+// linking its imports by name. False, with lastError set, on failure.
+function instantiate(name, bytes, shift) {
+  let module;
+  try {
+    module = compile(deferStart(bytes));
+  } catch (e) {
+    lastError = `compile: ${e.message}`;
+    return false;
+  }
+  const self = {};
+  let host = null;
+  const imports = {};
+  for (const imp of WebAssembly.Module.imports(module)) {
+    let value;
+    if (imp.module === 'host') {
+      host = host || hostImports(self);
+      value = host[imp.name];
+    } else if (imp.module === 'expander') {
+      value = expanderQuery;
+    } else {
+      const mapped = mapImport(name, imp.module, shift);
+      const exports = registry.get(mapped);
+      value = exports && exports[imp.name];
+    }
+    if (value === undefined) {
+      lastError = `instantiate ${name}: no import ${mapImport(name, imp.module, shift)}.${imp.name}`;
+      return false;
+    }
+    (imports[imp.module] ||= {})[imp.name] = value;
+  }
+  try {
+    self.exports = new WebAssembly.Instance(module, imports).exports;
+    const start = self.exports[START_EXPORT];
+    if (start) start();
+  } catch (e) {
+    if (!(e instanceof Trap || e instanceof WebAssembly.RuntimeError || e instanceof RangeError ||
+          e instanceof WebAssembly.LinkError)) throw e;
+    lastError = `instantiate: ${e.message}`;
+    return false;
+  }
+  registry.set(name, self.exports);
+  return true;
+}
+
+// A trap in main, reported as build/subhost reports it: what happened,
+// then where.
+function fail(e) {
+  if (e instanceof Trap || e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
+    const where = (e.stack || '').split('\n').slice(1).join('\n');
+    process.stderr.write(`error: trap: ${e.message}\n${where}\n`);
+    process.exit(2);
+  }
+  throw e;
+}
+
+let names;
+try {
+  names = fs.readFileSync(`${dir}/program`, 'utf8').split('\n').filter((n) => n !== '');
+} catch (e) {
+  process.stderr.write(`subhost: cannot read ${dir}/program\n`);
+  process.exit(1);
+}
+for (const name of names) {
+  let bytes;
+  try {
+    bytes = fs.readFileSync(`${dir}/${name}.wasm`);
+  } catch (e) {
+    process.stderr.write(`subhost: cannot read ${dir}/${name}.wasm\n`);
+    process.exit(1);
+  }
+  if (!instantiate(name, bytes, 0)) {
+    process.stderr.write(`error: ${lastError}\n`);
+    process.exit(2);
+  }
+}
+// A program without a main function has nothing to run.
+const main = names.length > 0 && registry.get(names[names.length - 1]).main;
+if (typeof main === 'function') {
+  try {
+    main();
+  } catch (e) {
+    fail(e);
+  }
+}
