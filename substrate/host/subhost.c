@@ -33,8 +33,190 @@ static void set_err(sub_host *h, const char *fmt, ...) {
   va_end(ap);
 }
 
+/* ---- source locations ------------------------------------------------- */
+
+/* A module's source-locations section (docs/spec.md section 3.6) maps code
+ * offsets to where the code comes from. A trap's frames name their module
+ * by the module name its name section gives, so the tables are kept by
+ * that name. */
+typedef struct location_table {
+  char *module;
+  size_t n, nfiles, nfuncs;
+  uint32_t *at, *file, *line, *col;
+  char **files;
+  char **funcs;                 /* function names, by index, from the name section */
+  struct location_table *next;
+} location_table;
+
+static location_table *location_tables;
+
+static uint32_t read_u32(const uint8_t *p, size_t end, size_t *pos) {
+  uint32_t n = 0;
+  for (int shift = 0; *pos < end && shift < 35; shift += 7) {
+    uint8_t b = p[(*pos)++];
+    n |= (uint32_t)(b & 0x7f) << shift;
+    if (!(b & 0x80)) break;
+  }
+  return n;
+}
+
+static char *read_name(const uint8_t *p, size_t end, size_t *pos) {
+  uint32_t n = read_u32(p, end, pos);
+  if (*pos + n > end) n = (uint32_t)(end - *pos);
+  char *s = strndup((const char *)p + *pos, n);
+  *pos += n;
+  return s;
+}
+
+static void note_locations(const uint8_t *bytes, size_t len) {
+  const uint8_t *sec = NULL;
+  size_t sec_end = 0, sec_pos = 0, funcs_pos = 0, funcs_end = 0;
+  char *module = NULL;
+  for (size_t pos = 8; pos < len;) {
+    uint8_t id = bytes[pos++];
+    size_t size = read_u32(bytes, len, &pos), end = pos + size;
+    if (end > len) break;
+    if (id == 0) {
+      size_t q = pos;
+      char *name = read_name(bytes, end, &q);
+      if (strcmp(name, "name") == 0) {
+        while (q < end) {
+          uint8_t sub = bytes[q++];
+          size_t sub_end = read_u32(bytes, end, &q);
+          sub_end += q;
+          if (sub == 0 && !module) module = read_name(bytes, sub_end, &q);
+          if (sub == 1) {
+            funcs_pos = q;
+            funcs_end = sub_end;
+          }
+          q = sub_end;
+        }
+      } else if (strcmp(name, "source-locations") == 0) {
+        sec = bytes;
+        sec_pos = q;
+        sec_end = end;
+      }
+      free(name);
+    }
+    pos = end;
+  }
+  if (!module) return;
+  location_table *t = calloc(1, sizeof *t);
+  t->module = module;
+  if (!sec) {
+    sec = bytes;
+    sec_pos = sec_end = 0;
+  }
+  t->nfiles = read_u32(sec, sec_end, &sec_pos);
+  t->files = calloc(t->nfiles ? t->nfiles : 1, sizeof *t->files);
+  for (size_t i = 0; i < t->nfiles; i++) t->files[i] = read_name(sec, sec_end, &sec_pos);
+  t->n = read_u32(sec, sec_end, &sec_pos);
+  t->at = calloc(t->n ? t->n : 1, sizeof *t->at);
+  t->file = calloc(t->n ? t->n : 1, sizeof *t->file);
+  t->line = calloc(t->n ? t->n : 1, sizeof *t->line);
+  t->col = calloc(t->n ? t->n : 1, sizeof *t->col);
+  uint32_t at = 0;
+  for (size_t i = 0; i < t->n; i++) {
+    at += read_u32(sec, sec_end, &sec_pos);
+    t->at[i] = at;
+    t->file[i] = read_u32(sec, sec_end, &sec_pos);
+    t->line[i] = read_u32(sec, sec_end, &sec_pos);
+    t->col[i] = read_u32(sec, sec_end, &sec_pos);
+  }
+  if (funcs_end > funcs_pos) {
+    uint32_t count = read_u32(bytes, funcs_end, &funcs_pos);
+    for (uint32_t i = 0; i < count && funcs_pos < funcs_end; i++) {
+      uint32_t index = read_u32(bytes, funcs_end, &funcs_pos);
+      char *name = read_name(bytes, funcs_end, &funcs_pos);
+      if (index >= t->nfuncs) {
+        size_t n = index + 1;
+        t->funcs = realloc(t->funcs, n * sizeof *t->funcs);
+        for (size_t j = t->nfuncs; j < n; j++) t->funcs[j] = NULL;
+        t->nfuncs = n;
+      }
+      t->funcs[index] = name;
+    }
+  }
+  t->next = location_tables;
+  location_tables = t;
+}
+
+static location_table *table_of(const char *module, size_t module_len) {
+  for (location_table *t = location_tables; t; t = t->next)
+    if (strlen(t->module) == module_len && memcmp(t->module, module, module_len) == 0) return t;
+  return NULL;
+}
+
+/* "file:line:col" for the code at offset in the module named module, or
+ * "" if its table has no location for it. */
+static const char *location_of(const char *module, size_t module_len, size_t offset, char *buf, size_t cap) {
+  location_table *t = table_of(module, module_len);
+  if (t) {
+    size_t lo = 0, hi = t->n;
+    while (lo < hi) {
+      size_t mid = (lo + hi) / 2;
+      if (t->at[mid] <= offset) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo == 0 || t->line[lo - 1] == 0 || t->file[lo - 1] >= t->nfiles) return "";
+    snprintf(buf, cap, "  %s:%u:%u", t->files[t->file[lo - 1]], t->line[lo - 1], t->col[lo - 1] + 1);
+    return buf;
+  }
+  return "";
+}
+
+/* A backtrace, a line per frame, with each frame's source location. */
+static void backtrace_of(wasm_frame_vec_t frames, char *out, size_t cap) {
+  size_t used = 0;
+  out[0] = '\0';
+  for (size_t i = 0; i < frames.size && used < cap; i++) {
+    const wasm_frame_t *f = frames.data[i];
+    /* Each name is copied at once: the next call may reuse its memory. */
+    const wasm_name_t *name = wasmtime_frame_module_name(f);
+    char *m = name ? strndup(name->data, name->size) : strdup("?");
+    location_table *t = table_of(m, strlen(m));
+    uint32_t index = wasm_frame_func_index(f);
+    const char *fn = t && index < t->nfuncs && t->funcs[index] ? t->funcs[index] : "?";
+    size_t offset = wasm_frame_module_offset(f);
+    char where[512];
+    used += (size_t)snprintf(out + used, cap - used, "%s    %zu: 0x%zx - %s!%s%s", i ? "\n" : "", i, offset, m, fn,
+                             location_of(m, strlen(m), offset, where, sizeof where));
+    free(m);
+  }
+}
+
 /* Record a wasmtime error or trap as the last error; consumes it. */
 static void take_failure(sub_host *h, const char *what, wasmtime_error_t *error, wasm_trap_t *trap) {
+  wasm_frame_vec_t frames = {0};
+  if (error) wasmtime_error_wasm_trace(error, &frames);
+  else if (trap) wasm_trap_trace(trap, &frames);
+  if (frames.size > 0) {
+    /* The cause, then the backtrace, with source locations. */
+    wasm_byte_vec_t msg = {0};
+    if (error) {
+      wasmtime_error_message(error, &msg);
+      wasmtime_error_delete(error);
+    } else {
+      wasm_trap_message(trap, &msg);
+      wasm_trap_delete(trap);
+    }
+    int n = (int)msg.size;
+    while (n > 0 && msg.data[n - 1] == '\0') n--;
+    char *text = strndup(msg.data ? msg.data : "", (size_t)n);
+    wasm_byte_vec_delete(&msg);
+    const char *marker = "\n\nCaused by:\n";
+    char *caused = strstr(text, marker);
+    const char *cause = caused ? caused + strlen(marker) : text;
+    while (*cause == ' ') cause++;
+    for (size_t k = strlen(text); k > 0 && (text[k - 1] == '\n' || text[k - 1] == ' '); k--) text[k - 1] = '\0';
+    char trace[sizeof h->err];
+    backtrace_of(frames, trace, sizeof trace);
+    wasm_frame_vec_delete(&frames);
+    set_err(h, "%s: %s\n%s", what, cause, trace);
+    free(text);
+    return;
+  }
+  wasm_frame_vec_delete(&frames);
   wasm_byte_vec_t msg = {0};
   if (error) {
     wasmtime_error_message(error, &msg);
@@ -267,6 +449,7 @@ static wasmtime_error_t *compile(const uint8_t *bytes, size_t len, wasmtime_modu
   if (profiling > 0 && getenv("SUBHOST_PROFILE")[0] == '2')
     fprintf(stderr, "compile %7zu bytes %6.1f ms  %s\n", len, 1000 * (now() - started), p_naming);
   if (error) return error;
+  note_locations(bytes, len);
   compiled *c = malloc(sizeof *c);
   c->hash = hash;
   c->len = len;

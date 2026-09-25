@@ -10,7 +10,7 @@
 ;; A module imports only what its code uses (spec 3.3). Code that needs a
 ;; memory or table must be given one: defined, or imported from a module.
 (library (stage0 compile)
-  (export compile-module current-syntax-infos fixnum-min fixnum-max set-syntax-types!)
+  (export compile-module current-syntax-infos fixnum-min fixnum-max set-syntax-types! set-current-source!)
   (import (chezscheme) (stage0 syntax) (stage0 core) (stage0 ops) (stage0 wasm) (stage0 serialize))
 
   ;; symbol -> func-info or global-info for the syntax library's exports;
@@ -31,6 +31,13 @@
   ;; ---- error locations ------------------------------------------------------
 
   (define current-loc (make-parameter #f))
+
+  ;; The file of the module being compiled, as its source locations name it
+  ;; (a symbol), or #f. A location in another file, in what a macro from
+  ;; another module introduced, gives way to an enclosing one in this file,
+  ;; if there is one (spec 3.6).
+  (define current-source #f)
+  (define (set-current-source! s) (set! current-source s))
   (define (fail fmt . args) (apply raise-compile-error (current-loc) fmt args))
 
   ;; ---- types ------------------------------------------------------------------
@@ -49,6 +56,12 @@
 
   ;; Make code of type `type` fit `expected`: drop unused values, or fail.
   ;; A subtype fits without any code.
+  ;; The location pseudo-instruction for srcloc loc, or for no location.
+  (define (location-marker loc)
+    (list (if (srcloc? loc)
+              (list 'location (symbol->string (srcloc-source loc)) (srcloc-line loc) (srcloc-col loc))
+              (list 'location #f 0 0))))
+
   (define (coerce code type expected)
     (cond [(not expected) (values code type)]
           [(eq? type 'bottom) (values code expected)]
@@ -286,8 +299,18 @@
          (finish (append (arg 0 (make-ref #t 'i31)) `((,op))) '(i32))]
         [else (fail "internal: unknown GC operation ~a" op)]))
     (record-case e
+      ;; (at loc e): e's code, at source location loc. The pseudo-instruction
+      ;; (location file line col) says where the code after it comes from,
+      ;; and after e's code the enclosing location resumes (spec 3.6).
       [(at) (loc inner)
-       (parameterize ([current-loc (or loc (current-loc))]) (sub inner expected tail?))]
+       (let* ([saved (current-loc)]
+              [loc (cond [(not loc) saved]
+                         [(eq? (srcloc-source loc) current-source) loc]
+                         [else (or saved loc)])])
+         (let-values ([(c t) (parameterize ([current-loc loc]) (sub inner expected tail?))])
+           (if (eq? loc saved)
+               (values c t)
+               (values (append (location-marker loc) c (location-marker saved)) t))))]
       ;; (as types e): e at types, which it must fit: an inlined call's body
       ;; at the function's result types (spec 5.2).
       [(as) (types inner)

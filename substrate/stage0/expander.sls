@@ -142,6 +142,7 @@
                               (cadr (find (lambda (f) (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) name)))
                                           forms)))])
                   (set-syntax-types! (type '%string) (type '%table)))
+                (set-current-source! (string->symbol library-path))
                 (let-values ([(bytes imports gc?) (profiled-compile-module forms "syntax")])
                   (let ([table (make-eq-hashtable)])
                     (for-each (lambda (f)
@@ -583,6 +584,7 @@
                                    (let ([ps (vector->list ks)]) (if (memv 0 ps) ps (cons 0 ps)))))])
         (for-each (lambda (p)
                     (let ([forms (append (storage-forms p) (reverse (hashtable-ref (comp-phase-forms c) p '())))])
+                      (set-current-source! (string->symbol (unit-source m)))
                       (let-values ([(bytes imports gc?) (profiled-compile-module forms (linklet-name m p 0))])
                         (hashtable-set! (unit-linklets m) p
                                         (make-linklet bytes imports gc? (literal-module-scopes forms))))))
@@ -1386,6 +1388,7 @@
 
   ;; Compile forms and instantiate them in store st, after what they import.
   (define (instantiate-linklet! st name forms where)
+    (set-current-source! (and current (string->symbol (unit-source (comp-module current)))))
     (let-values ([(bytes imports gc?) (profiled-compile-module forms name)])
       (for-each (lambda (imp) (ensure-import! st imp 0)) imports)
       (guard (c [(wasm-failure? c)
@@ -1606,22 +1609,31 @@
   ;; In a definition context (use-site? is true) the input also gets a fresh
   ;; use-site scope, which stays.
   ;; transformer is the handle of a transformer value.
-  (define (apply-macro head transformer s phase use-site?)
+  (define (apply-macro head transformer s0 phase use-site?)
     (when hook-output?
       (raise-compile-error head "#%linklet returned code that uses the macro ~a, but it must return fully expanded code"
                            (stx-e head)))
     (note-macro-use! head phase)
     (let* ([intro (new-scope!)]
-           [s (flip-scope s intro)]
+           [s (flip-scope s0 intro)]
            [s (if use-site?
                   (let ([use (new-scope!)])
                     (comp-use-site-scopes-set! current (cons use (comp-use-site-scopes current)))
                     (add-scope s use))
                   s)])
-      (flip-scope (call-syntax-function (format "macro ~a" (stx-e head))
-                                        (lambda (host in) (host-call host "syntax" "%h-call-transformer" transformer in))
-                                        s phase intro #f)
-                  intro)))
+      (at-use s0 (flip-scope (call-syntax-function (format "macro ~a" (stx-e head))
+                                                   (lambda (host in) (host-call host "syntax" "%h-call-transformer" transformer in))
+                                                   s phase intro #f)
+                             intro))))
+
+  ;; A macro's output, located at its use if the output comes from another
+  ;; file, as a library macro's template does (spec 6.2): what the macro
+  ;; introduced then has the use's location (spec 3.6).
+  (define (at-use use out)
+    (let ([u (and (stx? use) (stx-srcloc use))] [o (and (stx? out) (stx-srcloc out))])
+      (if (and u (stx? out) (not (and o (eq? (srcloc-source o) (srcloc-source u)))))
+          (make-stx (stx-e out) (stx-scopes out) u (stx-props out))
+          out)))
 
   ;; Call a phase-1 function from syntax to syntax on s in the current
   ;; compile-time store: a transformer, or a module pass, which may also
@@ -2427,6 +2439,7 @@
   ;; Lowered form e of an inline body, for one inlined call: its locals and
   ;; labels new, its infos shifted by k, and a return a br to label ret. A
   ;; local that keys maps to a form, a parameter given a local, reads that.
+  ;; Its source locations go: the code is at the call's (spec 3.6).
   (define (copy-inline e keys labels k ret)
     (let* ([copy (lambda (x) (copy-inline x keys labels k ret))]
            [copy? (lambda (x) (and x (copy x)))]
@@ -2436,7 +2449,7 @@
                     (or (hashtable-ref labels key #f) (let ([n (fresh-key!)]) (hashtable-set! labels key n) n)))]
            [shift (lambda (info) (shift-info info k))])
       (case (car e)
-        [(at) (list 'at (cadr e) (copy (caddr e)))]
+        [(at) (copy (caddr e))]
         [(as) (list 'as (cadr e) (copy (caddr e)))]
         [(int float const quote unreachable nop) e]
         [(lref) (let ([m (local (cadr e))]) (if (pair? m) m (list 'lref m)))]

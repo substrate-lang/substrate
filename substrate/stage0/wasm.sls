@@ -115,6 +115,59 @@
           [(and (pair? bt) (eq? (car bt) 'type)) (sleb! port (cadr bt))]
           [else (valtype! port bt)]))
 
+  ;; ---- source locations ---------------------------------------------------
+  ;;
+  ;; Code carries the pseudo-instruction (location file line col), file #f
+  ;; for none, which says where the instructions after it come from. The
+  ;; encoder records a location where an instruction that can call or trap
+  ;; starts at a new one, and at each function's first instruction: those
+  ;; are where a backtrace's frames are. The module's source-locations
+  ;; section lists them (spec 3.6).
+  (define location-none (list #f 0 0))
+  (define location-pending location-none)   ; (file line col) of the code now
+  (define location-current #f)              ; the last one recorded
+  (define function-start? #f)
+  (define body-locations '())               ; (offset file line col), in the body, reversed
+  (define code-locations '())               ; (offset file line col), in the code section, reversed
+
+  (define (records-location? op)
+    (or (and (memq op '(unreachable call call_indirect return_call return_call_indirect call_ref return_call_ref
+                        ref.cast ref.as_non_null struct.get struct.get_s struct.get_u struct.set
+                        array.new array.new_default array.new_data array.get array.get_s array.get_u array.set
+                        array.len array.fill array.copy i31.get_s i31.get_u
+                        i32.div_s i32.div_u i32.rem_s i32.rem_u i64.div_s i64.div_u i64.rem_s i64.rem_u
+                        i32.trunc_f32_s i32.trunc_f32_u i32.trunc_f64_s i32.trunc_f64_u
+                        i64.trunc_f32_s i64.trunc_f32_u i64.trunc_f64_s i64.trunc_f64_u
+                        memory.copy memory.fill))
+             #t)
+        (let ([p (lookup-prim op)]) (and p (eq? (prim-op-kind p) 'mem)))))
+
+  (define (note-location! port op)
+    (when (and (or function-start? (records-location? op)) (not (equal? location-pending location-current)))
+      (set! body-locations (cons (cons (port-position port) location-pending) body-locations))
+      (set! location-current location-pending))
+    (set! function-start? #f))
+
+  ;; The bytes of n as unsigned LEB128.
+  (define (uleb-length n) (if (< n 128) 1 (+ 1 (uleb-length (bitwise-arithmetic-shift-right n 7)))))
+
+  (define (source-locations! p entries)
+    (let ([files (let loop ([es entries] [acc '()])
+                   (cond [(null? es) (reverse acc)]
+                         [(or (not (cadar es)) (member (cadar es) acc)) (loop (cdr es) acc)]
+                         [else (loop (cdr es) (cons (cadar es) acc))]))])
+      (name! p "source-locations")
+      (vec! p files name!)
+      (uleb! p (length entries))
+      (let loop ([es entries] [at 0])
+        (unless (null? es)
+          (let ([e (car es)])
+            (uleb! p (- (car e) at))
+            (uleb! p (if (cadr e) (- (length files) (length (member (cadr e) files))) 0))
+            (uleb! p (caddr e))
+            (uleb! p (cadddr e))
+            (loop (cdr es) (car e)))))))
+
   ;; ---- instructions -------------------------------------------------------
 
   (define (instrs! port instrs) (for-each (lambda (i) (instr! port i)) instrs))
@@ -124,7 +177,9 @@
       (define (u n) (uleb! port n))
       (define (b n) (out-byte! port n))
       (define (gc n) (b #xFB) (u n))
+      (unless (eq? op 'location) (note-location! port op))
       (case op
+        [(location) (set! location-pending args)]
         [(unreachable) (b #x00)]
         [(nop) (b #x01)]
         [(block) (b #x02) (blocktype! port (car args)) (instrs! port (cadr args)) (b #x0B)]
@@ -283,21 +338,37 @@
        (let ([datas (wmodule-datas m)])
          (unless (null? datas)
            (section! port 12 (lambda (p) (uleb! p (length datas))))))
-       (let ([funcs (wmodule-funcs m)])
+       ;; The code section, written here to know where each body is: the
+       ;; source locations give offsets in the module.
+       (set! location-current #f)
+       (set! code-locations '())
+       (let* ([funcs (wmodule-funcs m)]
+              [code (with-output
+                     (lambda (p)
+                       (vec! p funcs
+                             (lambda (p f)
+                               (set! location-pending location-none)
+                               (set! body-locations '())
+                               (let ([body (with-output
+                                            (lambda (q)
+                                              (let ([groups (group-locals (cadr f))])
+                                                (vec! q groups
+                                                      (lambda (q g) (uleb! q (cdr g)) (valtype! q (car g)))))
+                                              (set! function-start? #t)
+                                              (instrs! q (caddr f))
+                                              (out-byte! q #x0B)))])
+                                 (uleb! p (bytevector-length body))
+                                 (let ([base (port-position p)])
+                                   (for-each (lambda (l)
+                                               (set! code-locations (cons (cons (+ base (car l)) (cdr l)) code-locations)))
+                                             (reverse body-locations)))
+                                 (bytes! p body))))))]
+              [start (+ (port-position port) 1 (uleb-length (bytevector-length code)))])
          (unless (null? funcs)
-           (section! port 10
-             (lambda (p)
-               (vec! p funcs
-                     (lambda (p f)
-                       (let ([body (with-output
-                                    (lambda (q)
-                                      (let ([groups (group-locals (cadr f))])
-                                        (vec! q groups
-                                              (lambda (q g) (uleb! q (cdr g)) (valtype! q (car g)))))
-                                      (instrs! q (caddr f))
-                                      (out-byte! q #x0B)))])
-                         (uleb! p (bytevector-length body))
-                         (bytes! p body))))))))
+           (out-byte! port 10)
+           (uleb! port (bytevector-length code))
+           (bytes! port code))
+         (set! code-locations (map (lambda (l) (cons (+ start (car l)) (cdr l))) (reverse code-locations))))
        (let ([datas (wmodule-datas m)])
          (unless (null? datas)
            (section! port 11
@@ -323,7 +394,9 @@
                (let ([sub (with-output (lambda (q) (vec! q (cdr names) (lambda (q n) (uleb! q (car n)) (name! q (cdr n))))))])
                  (out-byte! p 1)
                  (uleb! p (bytevector-length sub))
-                 (bytes! p sub)))))))))
+                 (bytes! p sub))))))
+       (unless (null? code-locations)
+         (section! port 0 (lambda (p) (source-locations! p code-locations)))))))
 
   ;; Run-length group consecutive equal local types: ((type . count) ...)
   (define (group-locals types)

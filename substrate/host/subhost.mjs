@@ -39,10 +39,101 @@ function compile(bytes) {
   const key = crypto.createHash('sha256').update(bytes).digest('hex');
   let module = modules.get(key);
   if (!module) {
-    module = new WebAssembly.Module(bytes);
+    const deferred = deferStart(bytes);
+    module = new WebAssembly.Module(deferred);
     modules.set(key, module);
+    // Moving the start function moves the code after it.
+    noteLocations(module, deferred.length - bytes.length);
   }
   return module;
+}
+
+// ---- source locations ----
+//
+// A module's source-locations section maps code offsets to where the code
+// comes from (spec 3.6). A backtrace names each frame's module, by the
+// module name its name section gives, and the frame's offset in it.
+const locations = new Map();
+
+function reader(buffer) {
+  const b = new Uint8Array(buffer);
+  let pos = 0;
+  const r = {
+    done: () => pos >= b.length,
+    u32() {
+      let n = 0;
+      let shift = 0;
+      let x;
+      do {
+        x = b[pos++];
+        n += (x & 0x7f) * 2 ** shift;
+        shift += 7;
+      } while (x & 0x80);
+      return n;
+    },
+    name() {
+      const n = r.u32();
+      const s = text.decode(b.subarray(pos, pos + n));
+      pos += n;
+      return s;
+    },
+    bytes(n) {
+      const s = b.subarray(pos, pos + n);
+      pos += n;
+      return s;
+    },
+  };
+  return r;
+}
+
+// The locations in module, whose code is shift bytes after where the
+// compiler put it.
+function noteLocations(module, shift) {
+  const [section] = WebAssembly.Module.customSections(module, 'source-locations');
+  const [names] = WebAssembly.Module.customSections(module, 'name');
+  if (!section || !names) return;
+  let moduleName = null;
+  const n = reader(names);
+  while (!n.done() && moduleName === null) {
+    const id = n.u32();
+    const size = n.u32();
+    if (id === 0) moduleName = n.name();
+    else n.bytes(size);
+  }
+  if (moduleName === null) return;
+  const r = reader(section);
+  const files = [];
+  for (let i = r.u32(); i > 0; i--) files.push(r.name());
+  const entries = [];
+  let at = 0;
+  for (let i = r.u32(); i > 0; i--) {
+    at += r.u32();
+    const file = r.u32();
+    const line = r.u32();
+    const col = r.u32();
+    entries.push({ at: at + shift, where: line === 0 ? null : `${files[file]}:${line}:${col + 1}` });
+  }
+  locations.set(moduleName, entries);
+}
+
+// A backtrace line of V8's, "at f (wasm://wasm/MODULE-HASH:wasm-function[i]:0xOFFSET)",
+// with the source location of the frame added.
+function located(line) {
+  const m = /wasm:\/\/wasm\/(.*)-[0-9a-f]+:wasm-function\[\d+\]:0x([0-9a-f]+)/.exec(line);
+  const entries = m && locations.get(m[1]);
+  if (!entries) return line;
+  const offset = parseInt(m[2], 16);
+  let lo = 0;
+  let hi = entries.length - 1;
+  let found = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (entries[mid].at <= offset) {
+      found = entries[mid];
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return found && found.where ? `${line} ${found.where}` : line;
 }
 
 // A linklet name "<module>@<phase>+<t>" at phase shift shift names
@@ -207,7 +298,7 @@ function deferStart(bytes) {
 function instantiate(name, bytes, shift) {
   let module;
   try {
-    module = compile(deferStart(bytes));
+    module = compile(bytes);
   } catch (e) {
     lastError = `compile: ${e.message}`;
     return false;
@@ -253,7 +344,7 @@ function instantiate(name, bytes, shift) {
 function fail(e, exports) {
   if (e instanceof Trap || e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
     // The wasm frames: the host's own are not the program's.
-    const where = (e.stack || '').split('\n').filter((l) => l.includes('wasm://')).join('\n');
+    const where = (e.stack || '').split('\n').filter((l) => l.includes('wasm://')).map(located).join('\n');
     lastError = `trap: ${e.message}\n${where}`;
     const onTrap = exports['on-trap'];
     if (typeof onTrap === 'function') {

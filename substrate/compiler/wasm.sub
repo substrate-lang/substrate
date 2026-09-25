@@ -11,7 +11,7 @@
 ;; heap is an abstract heap type symbol or a type index.
 (require-unqualified substrate "../lib/substrate.sub")
 (require ops "ops.sub" lookup-prim prim-op-code prim-op-kind)
-(require buf "buffer.sub" put-byte! put-bytes! uleb! sleb! with-output)
+(require buf "buffer.sub" buffer-size put-byte! put-bytes! uleb! sleb! with-output)
 (require num "numbers.sub" flonum-bits flonum32-bits)
 
 (provide wmodule encode-module)
@@ -97,6 +97,59 @@
         [(and (pair? bt) (eq? (car bt) 'type)) (sleb! p (cadr bt))]
         [else (valtype! p bt)]))
 
+;; ---- source locations ----
+;;
+;; Code carries the pseudo-instruction (location file line col), file #f
+;; for none, which says where the instructions after it come from. The
+;; encoder records a location where an instruction that can call or trap
+;; starts at a new one, and at each function's first instruction: those are
+;; where a backtrace's frames are. The module's source-locations section
+;; lists them (spec 3.6).
+(define location-none (list #f 0 0))
+(define location-pending location-none)   ; (file line col) of the code now
+(define location-current #f)              ; the last one recorded
+(define function-start? #f)
+(define body-locations '())               ; (offset file line col), in the body, reversed
+(define code-locations '())               ; (offset file line col), in the code section, reversed
+
+(define (records-location? op)
+  (or (and (memq op '(unreachable call call_indirect return_call return_call_indirect call_ref return_call_ref
+                      ref.cast ref.as_non_null struct.get struct.get_s struct.get_u struct.set
+                      array.new array.new_default array.new_data array.get array.get_s array.get_u array.set
+                      array.len array.fill array.copy i31.get_s i31.get_u
+                      i32.div_s i32.div_u i32.rem_s i32.rem_u i64.div_s i64.div_u i64.rem_s i64.rem_u
+                      i32.trunc_f32_s i32.trunc_f32_u i32.trunc_f64_s i32.trunc_f64_u
+                      i64.trunc_f32_s i64.trunc_f32_u i64.trunc_f64_s i64.trunc_f64_u
+                      memory.copy memory.fill))
+           #t)
+      (let ([p (lookup-prim op)]) (and p (eq? (prim-op-kind p) 'mem)))))
+
+(define (note-location! p op)
+  (when (and (or function-start? (records-location? op)) (not (equal? location-pending location-current)))
+    (set! body-locations (cons (cons (buffer-size p) location-pending) body-locations))
+    (set! location-current location-pending))
+  (set! function-start? #f))
+
+;; The bytes of n as unsigned LEB128.
+(define (uleb-length n) (if (< n 128) 1 (+ 1 (uleb-length (arithmetic-shift n -7)))))
+
+(define (source-locations! p entries)
+  (let ([files (let loop ([es entries] [acc '()])
+                 (cond [(null? es) (reverse acc)]
+                       [(or (not (cadr (car es))) (member (cadr (car es)) acc)) (loop (cdr es) acc)]
+                       [else (loop (cdr es) (cons (cadr (car es)) acc))]))])
+    (name! p "source-locations")
+    (vec! p files name!)
+    (uleb! p (length entries))
+    (let loop ([es entries] [at 0])
+      (unless (null? es)
+        (let ([e (car es)])
+          (uleb! p (- (car e) at))
+          (uleb! p (if (cadr e) (- (length files) (length (member (cadr e) files))) 0))
+          (uleb! p (caddr e))
+          (uleb! p (cadddr e))
+          (loop (cdr es) (car e)))))))
+
 ;; ---- instructions ----
 
 (define (instrs! p instrs) (for-each (lambda (i) (instr! p i)) instrs))
@@ -105,7 +158,9 @@
 
 (define (instr! p i)
   (let ([op (car i)] [args (cdr i)])
+    (unless (eq? op 'location) (note-location! p op))
     (case op
+      [(location) (set! location-pending args)]
       [(unreachable) (put-byte! p #x00)]
       [(nop) (put-byte! p #x01)]
       [(block) (put-byte! p #x02) (blocktype! p (car args)) (instrs! p (cadr args)) (put-byte! p #x0B)]
@@ -212,12 +267,18 @@
   (uleb! p (caddr e)))
 
 (define (code! p f)
+  (set! location-pending location-none)
+  (set! body-locations '())
   (let ([body (with-output
                (lambda (q)
                  (vec! q (group-locals (cadr f)) (lambda (q g) (uleb! q (cdr g)) (valtype! q (car g))))
+                 (set! function-start? #t)
                  (instrs! q (caddr f))
                  (put-byte! q #x0B)))])
     (uleb! p (bytes-length body))
+    (let ([base (buffer-size p)])
+      (for-each (lambda (l) (set! code-locations (cons (cons (+ base (car l)) (cdr l)) code-locations)))
+                (reverse body-locations)))
     (put-bytes! p body)))
 
 (define (data! p d)
@@ -267,8 +328,18 @@
      ;; The data count, which code referring to segments needs.
      (let ([datas (wmodule-datas m)])
        (unless (null? datas) (section! p 12 (lambda (p) (uleb! p (length datas))))))
-     (let ([funcs (wmodule-funcs m)])
-       (unless (null? funcs) (section! p 10 (lambda (p) (vec! p funcs code!)))))
+     ;; The code section, written here to know where each body is: the
+     ;; source locations give offsets in the module.
+     (set! location-current #f)
+     (set! code-locations '())
+     (let* ([funcs (wmodule-funcs m)]
+            [code (with-output (lambda (q) (vec! q funcs code!)))]
+            [start (+ (buffer-size p) 1 (uleb-length (bytes-length code)))])
+       (unless (null? funcs)
+         (put-byte! p 10)
+         (uleb! p (bytes-length code))
+         (put-bytes! p code))
+       (set! code-locations (map (lambda (l) (cons (+ start (car l)) (cdr l))) (reverse code-locations))))
      (let ([datas (wmodule-datas m)])
        (unless (null? datas) (section! p 11 (lambda (p) (vec! p datas data!)))))
      (let ([names (wmodule-names m)])
@@ -277,7 +348,9 @@
            (lambda (p)
              (name! p "name")
              (subsection! p 0 (lambda (q) (name! q (car names))))
-             (subsection! p 1 (lambda (q) (vec! q (cdr names) (lambda (q n) (uleb! q (car n)) (name! q (cdr n)))))))))))))
+             (subsection! p 1 (lambda (q) (vec! q (cdr names) (lambda (q n) (uleb! q (car n)) (name! q (cdr n))))))))))
+     (unless (null? code-locations)
+       (section! p 0 (lambda (p) (source-locations! p code-locations)))))))
 
 ;; Run-length group consecutive equal local types: ((type . count) ...)
 (define (group-locals types)

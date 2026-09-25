@@ -329,6 +329,35 @@ or parts of them, are the same reference is unspecified.
 A phase-1 linklet's module-level expressions run each time the linklet is
 instantiated, which is once per compilation that needs it.
 
+### 3.6 Source locations
+
+A linklet says where its code comes from in a custom section,
+`source-locations`, so a host can put a source location on each frame of
+a backtrace:
+
+```
+vec(name)                      the files, as the locations name them
+vec(entry)                     by offset; entry: offset file line col
+```
+
+Each field is an unsigned LEB128: `offset` is the entry's offset in the
+module less the previous entry's (the first's, less 0), `file` an index
+into the files, `line` from 1, `col` from 0, and a `line` of 0 means no
+location. An instruction's location is the last entry's at or before its
+offset. Entries are made only where an instruction that can call or trap
+starts at a new location, and at each function's first instruction, since
+those are where a backtrace's frames are. A function that made a tail call
+has no frame left to show.
+
+The location of code is that of the syntax it was compiled from, with two
+exceptions for code a macro from another file introduced, whose own
+location is in that macro's file. Such code takes the location of the
+nearest enclosing code of the linklet's own file, if there is one; and a
+macro's output whose outermost syntax object comes from another file than
+the use takes the use's location (6.2). So what a library's macro expands
+to is located where the macro was used. The code of an inline function
+(5.2) takes the location of the call it is inlined at.
+
 ## 4. Host interface
 
 Imports from the instance `"host"`. Every pointer is into the **caller's
@@ -372,7 +401,9 @@ a trap, but the store stays usable after one: if the entry exports a
 function `on-trap`, the host calls it after a trap in `main`, with the
 trap's message as its last error message (`error_message`), and it reports
 the trap instead of the host. The compiler's `on-trap` writes the message
-where the macro or other compile-time function that trapped was used.
+where the macro or other compile-time function that trapped was used. A
+trap's message is its cause and then its backtrace, a frame a line, each
+with its source location when the frame's linklet has one (3.6).
 Wasm is the program's
 form on disk; the engine compiles it to machine code each time it is
 loaded. After bootstrap the compiler is such a program.
@@ -763,6 +794,11 @@ Local bindings cannot.
 
 A transformer can capture on purpose: `(datum->syntax stx 'it stx)` makes an
 identifier with the scopes of the use, as if the user had written it.
+
+**Output takes the use's location.** If the outermost syntax object of a
+macro's output comes from another file than the use, as a library macro's
+template does, it takes the use's source location, so errors in it and
+code compiled from it are located where the macro was used (3.6).
 
 **Literals drop local scopes.** `quote-syntax` and the constant parts of
 `quasisyntax` remove from their literal the scopes of local binding forms
