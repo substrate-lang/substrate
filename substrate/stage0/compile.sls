@@ -717,8 +717,10 @@
                   [(global.get global.set) (list (car i) (gi (cadr i)))]
                   [(call_indirect return_call_indirect) (list (car i) (type-index (cadr i)) (caddr i))]
                   [(call_ref return_call_ref) (list (car i) (ti (cadr i)))]
-                  [(block loop) (list (car i) (resolve-bt (cadr i)) (resolve (caddr i)))]
-                  [(if) (list 'if (resolve-bt (cadr i)) (resolve (caddr i)) (resolve (cadddr i)))]
+                  [(block loop) (let* ([bt (resolve-bt (cadr i))] [body (resolve (caddr i))])
+                                  (list (car i) bt body))]
+                  [(if) (let* ([bt (resolve-bt (cadr i))] [then-code (resolve (caddr i))] [else-code (resolve (cadddr i))])
+                          (list 'if bt then-code else-code))]
                   [(select-typed) (list 'select-typed (rv (cadr i)))]
                   [(ref.null) (list 'ref.null (heap-index (cadr i)))]
                   [(ref.test ref.cast) (list (car i) (cadr i) (heap-index (caddr i)))]
@@ -747,15 +749,18 @@
        (if (imported? memory-form) (list (list (cadr memory-form) "memory" 'memory '(0 #f))) '())
        (if (imported? table-form) (list (list (cadr table-form) "table" 'table '(0 #f))) '())))
 
+    ;; Function types are numbered as they are met, so each function's type
+    ;; comes before those its code uses, and the start function's last.
     (define wfuncs
-      (append
-       (map-lr (lambda (cf)
-                 (list (func-type-index (car cf) (cadr cf)) (map rv (caddr cf)) (resolve (cadddr cf))
-                       (func-info-export (car cf))))
-               compiled-funcs)
-       (if has-start?
-           (list (list (type-index '(func () ())) (map rv (reverse (fctx-extra start-fc))) (resolve start-code) "__start"))
-           '())))
+      (let* ([fs (map-lr (lambda (cf)
+                           (let* ([t (func-type-index (car cf) (cadr cf))] [code (resolve (cadddr cf))])
+                             (list t (map rv (caddr cf)) code (func-info-export (car cf)))))
+                         compiled-funcs)]
+             [start (if has-start?
+                        (let* ([t (type-index '(func () ()))] [code (resolve start-code)])
+                          (list (list t (map rv (reverse (fctx-extra start-fc))) code "__start")))
+                        '())])
+        (append fs start)))
 
     (define (zero-init t)
       (if (ref-type? t)
