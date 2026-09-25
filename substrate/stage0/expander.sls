@@ -1094,11 +1094,22 @@
       (values (map-lr (lambda (t) (parse-type t phase)) (list-head parts arrow))
               (map-lr (lambda (t) (parse-type t phase)) (list-tail parts (+ arrow 1))))))
 
-  ;; #:inline, first after a func's head (spec 5.2).
+  ;; The options after a func's head, [#:inline] [#:value g] (spec 5.2), as
+  ;; (inline value rest): the #:inline keyword or #f, the list (#:value g)
+  ;; or #f, and what follows them.
   (define inline-keyword (string->keyword "inline"))
-  (define (inline-marker? s) (eq? (stx-e s) inline-keyword))
+  (define value-keyword (string->keyword "value"))
+  (define (func-options rest)
+    (let* ([inline (and (pair? rest) (eq? (stx-e (car rest)) inline-keyword) (car rest))]
+           [rest (if inline (cdr rest) rest)]
+           [value (and (pair? rest) (eq? (stx-e (car rest)) value-keyword)
+                       (begin
+                         (unless (and (pair? (cdr rest)) (id? (cadr rest)))
+                           (raise-compile-error (car rest) "#:value needs the name of a global"))
+                         (list (car rest) (cadr rest))))])
+      (list inline value (if value (cddr rest) rest))))
 
-  ;; (func (name [p t] ...) [#:inline] [-> r] body ...)
+  ;; (func (name [p t] ...) [#:inline] [#:value g] [-> r] body ...)
   (define (declare-func f phase)
     (let* ([parts (stx-list-of f 'func)]
            [head (if (>= (length parts) 2) (cadr parts) (raise-compile-error f "func needs a name and parameters"))]
@@ -1108,8 +1119,8 @@
       (let* ([name (car hparts)]
              [params (map-lr (lambda (p) (param-of p phase)) (cdr hparts))]
              [types (map-lr (lambda (pp) (parse-type (cadr pp) phase)) params)]
-             [inline (and (pair? (cddr parts)) (inline-marker? (caddr parts)) (caddr parts))]
-             [rest (if inline (cdddr parts) (cddr parts))]
+             [options (func-options (cddr parts))]
+             [inline (car options)] [value (cadr options)] [rest (caddr options)]
              [arrow (if (and (pair? rest) (core-name? (car rest) '->))
                         (begin
                           (when (null? (cdr rest)) (raise-compile-error (car rest) "expected a type after ->"))
@@ -1119,7 +1130,8 @@
                       [(clause ftype body) (func-type-clause body0 types results phase)])
           (let ([info (make-func-info (stx-e name) types results #f #f ftype)])
             (bind-definition! name phase (list 'func info))
-            (list 'func name params arrow body f clause inline))))))
+            (when value (hashtable-set! function-values info (cons (cadr value) phase)))
+            (list 'func name params arrow body f clause inline value))))))
 
   ;; A parameter [name type], as (name type) with the type expanded.
   (define (param-of p phase)
@@ -1151,14 +1163,15 @@
   ;; (func (name [p t] ...) [-> r] body ...), expanded.
   (define (expand-func p phase)
     (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
-           [f (list-ref p 5)] [clause (list-ref p 6)] [inline (list-ref p 7)]
+           [f (list-ref p 5)] [clause (list-ref p 6)] [inline (list-ref p 7)] [value (list-ref p 8)]
            [sc (new-local-scope!)]
            [xs (map-lr (lambda (pp) (bound-local (add-scope (car pp) sc) phase)) params)])
       (fluid-let ([current-function (list name)])
         (apply out f 'func
                (out-list (cadr (stx->list f))
                          (cons name (map-lr (lambda (x pp) (out-list x (list x (cadr pp)))) xs params)))
-               (append (if inline (list inline) '()) arrow (if clause (list (core-headed clause 'type)) '())
+               (append (if inline (list inline) '()) (or value '()) arrow
+                       (if clause (list (core-headed clause 'type)) '())
                        (map-lr (lambda (b) (expand-expr (add-scope b sc) phase)) body))))))
 
   ;; (global name type init) or (global name (mut type) init), as in wasm.
@@ -1726,7 +1739,25 @@
                (let ([introduced (flip-scope form api-intro)])
                  (lift! introduced api-where api-phase)
                  (encode ms introduced)))]
+            [(7)                        ; identifier-function-signature
+             ;; The function's signature, (t ... -> r ...), each type
+             ;; written as in the kernel: a numeric type's name, or (ref T)
+             ;; or (ref null T) with T a heap type's name.
+             (let ([id (decode ms a)])
+               (unless (id? id)
+                 (raise-compile-error api-where "identifier-function-signature: expected an identifier"))
+               (let ([m (meaning-of id api-phase)])
+                 (encode ms (and m (eq? (car m) 'func)
+                                 (let ([info (cadr m)])
+                                   (append (map-lr type->datum (func-info-params info)) '(->)
+                                           (map-lr type->datum (func-info-results info))))))))]
             [else (raise-compile-error api-where "unknown expander query ~a" op)])))))
+
+  (define (type->datum t)
+    (if (ref-type? t)
+        (let* ([h (ref-heap t)] [name (if (type-info? h) (type-info-name h) h)])
+          (if (ref-nullable? t) (list 'ref 'null name) (list 'ref name)))
+        t))
 
   ;; ==== fully expanded code =================================================
   ;;
@@ -1787,7 +1818,10 @@
                 (if t
                     (expand-expr (apply-macro s t s phase #f) phase)
                     (raise-compile-error s "~a is bound to a compile-time value: read it with syntax-local-value" e)))]
-             [(func) (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e)]
+             [(func)
+              (if (has-value? (cadr m))
+                  s
+                  (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e))]
              [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
              [(core prim) (raise-compile-error s "bad use of ~a" e)]
              [(label) (raise-compile-error s "~a is a label" e)]
@@ -2230,13 +2264,15 @@
         [(func)
          (let* ([head (stx->list (cadr parts))]
                 [info (func-info-of (car head) phase)]
-                [inline? (and (pair? (cddr parts)) (inline-marker? (caddr parts)))])
-           (let-values ([(results body) (parse-results (if inline? (cdddr parts) (cddr parts)) phase)])
+                [options (func-options (cddr parts))]
+                [inline? (car options)])
+           (let-values ([(results body) (parse-results (caddr options) phase)])
              (let* ([params (map-lr (lambda (p t) (cons (local-key-of (car (stx->list p)) phase) t))
                                     (cdr head) (func-info-params info))]
                     ;; A (type T) clause first is in the info already.
                     [code (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase)])
                (when inline? (record-inline! info params code (car head)))
+               (when (cadr options) (function-value info))
                (list (list 'func info params code)))))]
         [(global)
          (let ([m (meaning-of (cadr parts) phase)])
@@ -2255,6 +2291,35 @@
       (unless (and m (eq? (car m) 'func)) (not-expanded id))
       (check-not-removed (cadr m) id)
       (cadr m)))
+
+  ;; ---- function values (spec 5.2) ----
+
+  ;; A function declared with #:value g -> (g . phase), then g's info once
+  ;; it is resolved. In fully expanded code a function's name stays a
+  ;; name, and lowering reads its value then: a linklet hook's output may
+  ;; redefine the global (6.5).
+  (define function-values (make-eq-hashtable))
+
+  (define (value-base info)
+    (let ([origin (hashtable-ref shift-origins info #f)]) (if origin (car origin) info)))
+
+  (define (has-value? info) (hashtable-contains? function-values (value-base info)))
+
+  ;; The info of the global that is func info's value, shifted as info is,
+  ;; or #f if info has none.
+  (define (function-value info)
+    (let* ([origin (hashtable-ref shift-origins info #f)]
+           [base (value-base info)]
+           [v (hashtable-ref function-values base #f)])
+      (and v
+           (let ([g (if (pair? v)
+                        (let ([m (meaning-of (car v) (cdr v))])
+                          (unless (and m (eq? (car m) 'global))
+                            (raise-compile-error (car v) "#:value names ~a, which is not a global" (stx-e (car v))))
+                          (hashtable-set! function-values base (cadr m))
+                          (cadr m))
+                        v)])
+             (shift-info g (if origin (cdr origin) 0))))))
 
   ;; ---- inline functions (spec 5.2) ----
 
@@ -2396,6 +2461,12 @@
                (case (and m (car m))
                  [(local) (list 'lref (cadr m))]
                  [(global) (check-not-removed (cadr m) s) (list 'gref (cadr m))]
+                 ;; A function's name as an expression is its value (5.2).
+                 [(func)
+                  (let ([g (function-value (cadr m))])
+                    (unless g (not-expanded s))
+                    (check-not-removed g s)
+                    (list 'gref g))]
                  [else (not-expanded s)]))]
             [(pair? e)
              (let* ([parts (stx->list s)]

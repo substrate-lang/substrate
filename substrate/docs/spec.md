@@ -106,7 +106,7 @@ another type, such as `n:i32`.
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)` |
-| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(raise-syntax-error name message stx)` (aborts expansion; returns nothing), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
+| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(raise-syntax-error name message stx)` (aborts expansion; returns nothing), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
   otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
@@ -163,6 +163,12 @@ another type, such as `n:i32`.
   `core` (a core form or wasm operator); `type` if it is bound only as a
   type; or `#f` if it is unbound. An implicit `#%app` (5.3) uses it to tell
   a call of a function from a call through a variable.
+- `identifier-function-signature` gives the signature of the function
+  `id` is bound to at the running macro's phase, as the datum
+  `(t ... -> r ...)`, each type written as in the kernel: a numeric type's
+  name, or `(ref T)` or `(ref null T)` with `T` a heap type's name. It is
+  `#f` if `id` is not bound to a function. An implicit `#%app` uses it to
+  tell whether a call gives a function the arguments it takes.
 - `local-expand` expands expression `stx` at the running macro's phase and
   returns it as fully expanded code (6.4), so a macro can look at what its input
   becomes, and put the result in its output. As in Racket, the macro's
@@ -416,7 +422,7 @@ quotation and compile-time forms.
 ### 5.2 Module-level forms
 
 ```
-(func (name [param type] ...) [#:inline] [-> result] [(type T)] body ...)   ; T: a function type
+(func (name [param type] ...) [#:inline] [#:value g] [-> result] [(type T)] body ...)   ; T: a function type
 (global name type init)             ; immutable; init is a constant expression
 (global name (mut type) init)       ; mutable
 (import name "module" "field" (type ... -> type ...))   ; or a function type name
@@ -514,6 +520,18 @@ not depend on which module it is compiled in:
 
 A call in an inline function's body to an inline function compiled
 before it is inlined there too.
+
+**Function values.** `#:value g` after a function's head, where `g` is a
+global, makes `g` the function's value: the function's name used as an
+expression, in any module and at any phase, means `g`, while a call of it
+stays a call. Without `#:value`, a function's name is not an expression
+(use it with `func-index` or `ref.func`). The kernel does not choose how
+a function is represented as a value: a language with first-class
+functions defines its own, typically a closure made once in a global, so
+that every use of the name is the same value, and records it with
+`#:value`. Substrate's `define` does so, and its `#%app` calls the
+function directly when it gets the arguments the function takes
+(`identifier-function-signature`, 2.3).
 
 Globals follow wasm too. A global is immutable unless its type is written
 `(mut type)`, and `set!` of an immutable global is an error. An initializer
@@ -770,13 +788,14 @@ receive and return it,
 remains (5.3).
 
 ```
-form ::= (func (id [id type] ...) [-> result] [(type id)] expr ...)
+form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)] expr ...)
        | (global id type expr) | (global id (mut type) expr)
        | (import id "module" "field" (type ... -> type ...)) | (import id "module" "field" id)
        | (type id def) | (rec (type id def) ...) | (data id offset "bytes" ...)
        | expr
 
-expr ::= id                                   ; a local or global variable
+expr ::= id                                   ; a local or global variable, or a function
+                                              ; with a value (5.2), which means its value
        | (#%datum literal)                    ; a wasm number, typed by context
        | (quote datum) | (quote-syntax datum)
        | (#%app id expr ...)                  ; a direct call; id names a function

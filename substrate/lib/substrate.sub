@@ -8,12 +8,14 @@
 ;; and #f is the only false value. A module written in Substrate takes its
 ;; forms with require-unqualified:
 ;;
-;;   (define (f x ...) body ...)   a function, bound to a closure
+;;   (define (f x ...) body ...)   a known function (below)
 ;;   (define (f x ... . rest) body ...)
 ;;                                  a function whose rest is a list of the
-;;                                  arguments after the x ...
+;;                                  arguments after the x ..., bound to a
+;;                                  closure
+;;   (define f (lambda (x ...) ...)) a known function too
 ;;   (define f (lambda ...)), (define f (case-lambda ...))
-;;                                  a function too
+;;                                  a function bound to a closure
 ;;   (define x e)                   a variable
 ;;   (lambda params body ...)       a closure, with params (x ...),
 ;;                                  (x ... . rest) or rest
@@ -22,7 +24,9 @@
 ;;                                  taking the arguments it is given
 ;;   (set! x e)                     assign x; the value is #f
 ;;   (f arg ...)                    a call: of a closure, or of a kernel
-;;                                  function, which is called directly
+;;                                  function, such as a known function,
+;;                                  which is called directly if it takes
+;;                                  that many arguments
 ;;   if, cond (with else), case (with else), when, unless, and, or, let
 ;;   (also named let), letrec, do; quasiquote and let* are the kernel's;
 ;;   literals are values, so 42 is a fixnum
@@ -49,7 +53,8 @@
 ;; functions that take byte indexes say UTF-8 in their names.
 ;;
 ;; Integers are exact up to 64 bits; arithmetic beyond that is an error.
-;; A program's entry point is a kernel function: (func (main) (run)).
+;; A program's entry point is its function main: (define (main) ...), or a
+;; kernel (func (main) ...).
 ;;
 ;; Closures. Every function is a closure: a struct of type closure, whose
 ;; first field is its code. All code has one type, code: it takes the
@@ -62,6 +67,13 @@
 ;; every module agrees on them (spec 5.1). A lambda that captures variables
 ;; gets its own subtype of closure, with a field per captured variable, used
 ;; only by its own code.
+;;
+;; Known functions. A define with fixed parameters makes a kernel function
+;; taking them, so a call with that many arguments is a direct call, with
+;; no closure. Its value (spec 5.2, #:value) is a closure made once, in a
+;; global, whose code checks the number of arguments and calls the
+;; function: every use of the name is the same procedure, and a call with
+;; another number of arguments goes through it and stops with the error.
 ;;
 ;; Closure conversion. A lambda or case-lambda expands to a kernel lambda
 ;; (spec 5.3) taking the number of arguments and the first four, whose body
@@ -783,19 +795,67 @@
           (return (kernel-lambda (case-lambda-clauses (s:cdr parts)) name 0 e)))
       '#f))
 
-  ;; (define (f . params) body ...), (define f (lambda ...)), (define f
-  ;; (case-lambda ...)): a function, a closure in an immutable global,
-  ;; whose code is named after f. (define x e): a variable.
+  ;; (define (f x ...) body ...) or (define f (lambda (x ...) body ...)): a
+  ;; known function, which a call with that many arguments calls directly
+  ;; (known-function). (define (f x ... . rest) body ...) and (define f
+  ;; (case-lambda ...)): a closure in an immutable global, whose code is
+  ;; named after f. (define x e): a variable.
   (func (substrate-define [stx eqref]) -> eqref
     (let ([parts (s:syntax->list stx)])
       (if (s:identifier? (s:cadr parts))
-          (let ([f (kernel-lambda-of (s:caddr parts) (s:cadr parts))])
-            (return (if (ref.is_null f)
-                        #`(global #,(s:cadr parts) (mut eqref) #,(s:caddr parts))
-                        #`(global #,(s:cadr parts) (ref closure) #,f)))))
-      (let* ([head (s:splice-list (s:cadr parts))] [name (s:car head)])
+          (let* ([name (s:cadr parts)] [e (s:caddr parts)] [fixed (fixed-lambda e)])
+            (if (i32.eqz (ref.is_null fixed)) (return (known-function name (s:car fixed) (s:cdr fixed))))
+            (let ([f (kernel-lambda-of e name)])
+              (return (if (ref.is_null f)
+                          #`(global #,name (mut eqref) #,e)
+                          #`(global #,name (ref closure) #,f))))))
+      (let* ([head (s:splice-list (s:cadr parts))] [name (s:car head)] [p (parse-params (s:cdr head))])
+        (if (ref.is_null (s:cdr p)) (return (known-function name (s:car p) (s:cddr parts))))
         #`(global #,name (ref closure)
                   #,(kernel-lambda (s:cons (s:cons (s:cdr head) (s:cddr parts)) '()) name 1 stx)))))
+
+  ;; (params . body) of e if it is (lambda (x ...) body ...), with no rest
+  ;; parameter; #f otherwise.
+  (func (fixed-lambda [e eqref]) -> eqref
+    (let ([parts (s:syntax->list e)] [p '#f])
+      (if (ref.is_null parts) (return '#f))
+      (if (s:null? parts) (return '#f))
+      (if (i32.eqz (s:identifier? (s:car parts))) (return '#f))
+      (if (i32.eqz (s:free-identifier=? (s:car parts) #'substrate-lambda)) (return '#f))
+      (if (s:null? (s:cdr parts)) (return '#f))
+      (set! p (parse-params (s:cadr parts)))
+      (if (ref.is_null (s:cdr p)) (s:cons (s:car p) (s:cddr parts)) '#f)))
+
+  ;; Known function name, taking params and running body: a kernel function
+  ;; whose value (spec 5.2, #:value) is a closure made once, in a global,
+  ;; whose code checks the number of arguments and calls the function.
+  (func (known-function [name eqref] [params eqref] [body eqref]) -> eqref
+    (let ([n (s:length params)] [value (hidden-name name '".value")] [code (hidden-name name '".code")])
+      #`(begin
+          (func (#,name #,@(eqref-params params)) #:value #,value -> eqref #,@body)
+          (func (#,code [c (ref closure)] [nargs i32] [a0 eqref] [a1 eqref] [a2 eqref] [a3 eqref]) -> eqref
+            (type code)
+            (if (i32.eq nargs #,(number n))
+                (#,name #,@(arguments-from 0 n))
+                (arity-error '#,name #,(number n) 0 nargs)))
+          (global #,value (ref closure) (struct.new closure (ref.func #,code))))))
+
+  ;; The name of id with suffix, as an identifier of this macro's, so no
+  ;; other code can refer to it.
+  (func (hidden-name [id eqref] [suffix eqref]) -> eqref
+    (s:datum->syntax #'here (s:string->symbol (s:string-append (s:symbol->string (s:syntax-e id)) suffix)) id))
+
+  (func (eqref-params [ps eqref]) -> eqref
+    (if (s:null? ps) '() (s:cons #`[#,(s:car ps) eqref] (eqref-params (s:cdr ps)))))
+
+  ;; Arguments i ... n - 1 of the call being made: each one of the first
+  ;; four, or an extra one.
+  (func (arguments-from [i i32] [n i32]) -> eqref
+    (if (i32.ge_u i n) (return '()))
+    (s:cons (if (i32.lt_u i 4)
+                (nth (s:syntax->list #'(a0 a1 a2 a3)) i)
+                #`(array.get arguments extra-args #,(number (i32.sub i 4))))
+            (arguments-from (i32.add i 1) n)))
 
   ;; (lambda params body ...)
   (func (substrate-lambda [stx eqref]) -> eqref
@@ -843,7 +903,7 @@
            [n (s:length args)])
       (if (s:identifier? f)
           (if (ref.eq (s:identifier-binding-kind f) 'function)
-              (return #`(#,f #,@args))))
+              (if (takes? f n) (return #`(#,f #,@args)))))
       (if (i32.le_u n 4)
           (return #`(let ([fv #,f])
                       (if (ref.test (ref closure) fv)
@@ -857,6 +917,18 @@
                   #,@(extra-stores (drop-n ts 4) 0)
                   (call-ref code (struct.get closure code c) c #,(number n) #,@(take ts 4)))
                 (not-a-function fv))))))
+
+  ;; Whether function f takes n arguments. A call that gives it another
+  ;; number calls its value, whose code reports the error when it runs.
+  (func (takes? [f eqref] [n i32]) -> i32
+    (let ([sig (s:identifier-function-signature f)] [k 0])
+      (block done
+        (loop next
+          (br-if done (ref.eq (s:car sig) '->))
+          (set! k (i32.add k 1))
+          (set! sig (s:cdr sig))
+          (br next)))
+      (i32.eq k n)))
 
   ;; (#%datum literal) => 'literal
   (func (datum [stx eqref]) -> eqref #`(quote #,(s:cadr (s:syntax->list stx))))
@@ -1336,11 +1408,12 @@
               (if (lambda? l) (return (convert-lambda l '() name)))))
       (convert-expr e '())))
 
-  ;; Where a func form's body starts: after its head, its #:inline, its ->
-  ;; and result, and its (type T) clause.
+  ;; Where a func form's body starts: after its head, its #:inline and
+  ;; #:value, its -> and result, and its (type T) clause.
   (func (func-body-start [l eqref]) -> i32
     (let ([i 2])
       (if (i32.lt_u i (s:length l)) (if (ref.eq (s:syntax-e (nth l i)) '#:inline) (set! i (i32.add i 1))))
+      (if (i32.lt_u i (s:length l)) (if (ref.eq (s:syntax-e (nth l i)) '#:value) (set! i (i32.add i 2))))
       (if (i32.lt_u i (s:length l)) (if (named? (nth l i) '->) (set! i (i32.add i 2))))
       (if (i32.lt_u i (s:length l))
           (let ([c (s:syntax->list (nth l i))])

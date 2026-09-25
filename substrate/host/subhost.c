@@ -112,8 +112,8 @@ static void p_report(void) {
   fprintf(stderr, "  %-12s %8.3f\n", "total", total);
   fprintf(stderr, "  calls into wasm %ld; compiles %ld (%zu bytes), cache hits %ld\n", p_calls, p_compiles,
           p_compiled_bytes, p_cache_hits);
-  fprintf(stderr, "  queries: syntax-local-value %ld, raise-syntax-error %ld, free-identifier=? %ld, identifier-binding-kind %ld, local-expand %ld, syntax-local-lift-definition %ld\n",
-          p_callbacks[1], p_callbacks[2], p_callbacks[3], p_callbacks[4], p_callbacks[5], p_callbacks[6]);
+  fprintf(stderr, "  queries: syntax-local-value %ld, raise-syntax-error %ld, free-identifier=? %ld, identifier-binding-kind %ld, local-expand %ld, syntax-local-lift-definition %ld, identifier-function-signature %ld\n",
+          p_callbacks[1], p_callbacks[2], p_callbacks[3], p_callbacks[4], p_callbacks[5], p_callbacks[6], p_callbacks[7]);
 }
 
 static bool p_on(void) {
@@ -693,7 +693,7 @@ static wasm_trap_t *host_exit(void *env, wasmtime_caller_t *caller, const wasmti
  * points at an op code; the host is found through the store's data. */
 static const int32_t op_codes[] = {SUB_OP_SYNTAX_LOCAL_VALUE, SUB_OP_RAISE_SYNTAX_ERROR, SUB_OP_FREE_IDENTIFIER_EQ,
                                    SUB_OP_IDENTIFIER_BINDING_KIND, SUB_OP_LOCAL_EXPAND,
-                                   SUB_OP_SYNTAX_LOCAL_LIFT_DEFINITION};
+                                   SUB_OP_SYNTAX_LOCAL_LIFT_DEFINITION, SUB_OP_IDENTIFIER_FUNCTION_SIGNATURE};
 
 static wasm_trap_t *expander_call(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                   size_t nargs, wasmtime_val_t *results, size_t nresults) {
@@ -769,7 +769,8 @@ sub_host *sub_host_new(void) {
       define(h, "expander", "free-identifier=?", 2, 1, expander_call, (void *)&op_codes[2]) ||
       define(h, "expander", "identifier-binding-kind", 1, 1, expander_call, (void *)&op_codes[3]) ||
       define(h, "expander", "local-expand", 1, 1, expander_call, (void *)&op_codes[4]) ||
-      define(h, "expander", "syntax-local-lift-definition", 1, 1, expander_call, (void *)&op_codes[5])) {
+      define(h, "expander", "syntax-local-lift-definition", 1, 1, expander_call, (void *)&op_codes[5]) ||
+      define(h, "expander", "identifier-function-signature", 1, 1, expander_call, (void *)&op_codes[6])) {
     fprintf(stderr, "subhost: %s\n", h->err);
     abort();
   }

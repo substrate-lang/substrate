@@ -28,7 +28,7 @@
          data-info data-info-offset data-info-bytes
          make-type-info type-info-name type-info-kind type-info-fields set-type-info-fields!
          type-info-super type-info-final? set-type-info-group! identify-group! func-type?
-         make-ref ref-type? ref-heap abstract-heaps valtype<=? types<=? fresh-key!)
+         make-ref ref-type? ref-nullable? ref-heap type-info? abstract-heaps valtype<=? types<=? fresh-key!)
 (require ops "ops.sub" lookup-prim prim-op-params prim-op-kind prim-names)
 (require cmp "compile.sub" compile-module set-current-syntax-infos! set-syntax-types!)
 (require rd "reader.sub" read-file)
@@ -1118,10 +1118,20 @@
     (cons (map (lambda (t) (parse-type t phase)) (take parts arrow))
           (map (lambda (t) (parse-type t phase)) (list-tail parts (+ arrow 1))))))
 
-;; #:inline, first after a func's head (spec 5.2).
-(define (inline-marker? s) (eq? (stx-e s) '#:inline))
+;; The options after a func's head, [#:inline] [#:value g] (spec 5.2), as
+;; (inline value rest): the #:inline keyword or #f, the list (#:value g)
+;; or #f, and what follows them.
+(define (func-options rest)
+  (let* ([inline (and (pair? rest) (eq? (stx-e (car rest)) '#:inline) (car rest))]
+         [rest (if inline (cdr rest) rest)]
+         [value (and (pair? rest) (eq? (stx-e (car rest)) '#:value)
+                     (begin
+                       (unless (and (pair? (cdr rest)) (id? (cadr rest)))
+                         (raise-compile-error (car rest) "#:value needs the name of a global"))
+                       (list (car rest) (cadr rest))))])
+    (list inline value (if value (cddr rest) rest))))
 
-;; (func (name [p t] ...) [#:inline] [-> r] body ...)
+;; (func (name [p t] ...) [#:inline] [#:value g] [-> r] body ...)
 (define (declare-func f phase)
   (let* ([parts (stx-list-of f 'func)]
          [head (if (>= (length parts) 2) (cadr parts) (raise-compile-error f "func needs a name and parameters"))]
@@ -1131,8 +1141,8 @@
     (let* ([name (car hparts)]
            [params (map (lambda (p) (param-of p phase)) (cdr hparts))]
            [types (map (lambda (pp) (parse-type (cadr pp) phase)) params)]
-           [inline (and (pair? (cddr parts)) (inline-marker? (caddr parts)) (caddr parts))]
-           [rest (if inline (cdddr parts) (cddr parts))]
+           [options (func-options (cddr parts))]
+           [inline (car options)] [value (cadr options)] [rest (caddr options)]
            [arrow (if (and (pair? rest) (core-name? (car rest) '->))
                       (begin
                         (when (null? (cdr rest)) (raise-compile-error (car rest) "expected a type after ->"))
@@ -1144,7 +1154,8 @@
            [clause (car ct)] [ftype (cadr ct)] [body (caddr ct)]
            [info (func-info (stx-e name) types results #f #f ftype)])
       (bind-definition! name phase (list 'func info))
-      (list 'func name params arrow body f clause inline))))
+      (when value (hash-set! function-values info (cons (cadr value) phase)))
+      (list 'func name params arrow body f clause inline value))))
 
 ;; A parameter [name type], as (name type) with the type expanded.
 (define (param-of p phase)
@@ -1175,7 +1186,7 @@
 ;; (func (name [p t] ...) [-> r] body ...), expanded.
 (define (expand-func p phase)
   (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
-         [f (list-ref p 5)] [clause (list-ref p 6)] [inline (list-ref p 7)]
+         [f (list-ref p 5)] [clause (list-ref p 6)] [inline (list-ref p 7)] [value (list-ref p 8)]
          [sc (new-local-scope!)]
          [xs (map (lambda (pp) (bound-local (add-scope (car pp) sc) phase)) params)]
          [saved current-function])
@@ -1183,7 +1194,8 @@
     (let ([r (apply out f 'func
                     (out-list (cadr (stx->list f))
                               (cons name (map (lambda (x pp) (out-list x (list x (cadr pp)))) xs params)))
-                    (append (if inline (list inline) '()) arrow (if clause (list (core-headed clause 'type)) '())
+                    (append (if inline (list inline) '()) (or value '()) arrow
+                            (if clause (list (core-headed clause 'type)) '())
                             (map (lambda (b) (expand-expr (add-scope b sc) phase)) body)))])
       (set! current-function saved)
       r)))
@@ -1677,6 +1689,22 @@
       [(core prim) 'core]
       [else (and (type-meaning-of id api-phase) 'type)])))
 
+;; The signature of the function id is bound to, (t ... -> r ...), each
+;; type written as in the kernel: a numeric type's name, or (ref T) or
+;; (ref null T) with T a heap type's name; #f if id is not a function.
+(define (query-function-signature id)
+  (unless (id? id) (raise-compile-error api-where "identifier-function-signature: expected an identifier"))
+  (let ([m (meaning-of id api-phase)])
+    (and m (eq? (car m) 'func)
+         (let ([info (cadr m)])
+           (append (map type->datum (func-info-params info)) '(->) (map type->datum (func-info-results info)))))))
+
+(define (type->datum t)
+  (if (ref-type? t)
+      (let* ([h (ref-heap t)] [name (if (type-info? h) (type-info-name h) h)])
+        (if (ref-nullable? t) (list 'ref 'null name) (list 'ref name)))
+      t))
+
 ;; The running macro's introduction scope is flipped around the expansion,
 ;; so code from the macro's input expands as it would at the use site.
 (define (query-local-expand s)
@@ -1699,13 +1727,15 @@
 (func (q-binding-kind [id eqref]) -> eqref (type query1) (query-binding-kind id))
 (func (q-local-expand [s eqref]) -> eqref (type query1) (query-local-expand s))
 (func (q-lift [form eqref]) -> eqref (type query1) (query-lift form))
+(func (q-signature [id eqref]) -> eqref (type query1) (query-function-signature id))
 (import %set-queries "syntax" "%set-queries"
-        ((ref null query1) (ref null query2) (ref null query2) (ref null query1) (ref null query1) (ref null query1) ->))
+        ((ref null query1) (ref null query2) (ref null query2) (ref null query1) (ref null query1) (ref null query1)
+         (ref null query1) ->))
 
 ;; Answer the syntax library's queries from here from now on.
 (func (register-queries!) -> eqref
   (%set-queries (ref.func q-local-value) (ref.func q-error) (ref.func q-free-identifier=?)
-                (ref.func q-binding-kind) (ref.func q-local-expand) (ref.func q-lift))
+                (ref.func q-binding-kind) (ref.func q-local-expand) (ref.func q-lift) (ref.func q-signature))
   (ref.null eq))
 
 ;; ==== fully expanded code ====
@@ -1767,7 +1797,10 @@
               (if t
                   (expand-expr (apply-macro s t s phase #f) phase)
                   (raise-compile-error s "~a is bound to a compile-time value: read it with syntax-local-value" e)))]
-           [(func) (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e)]
+           [(func)
+            (if (has-value? (cadr m))
+                s
+                (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e))]
            [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
            [(core prim) (raise-compile-error s "bad use of ~a" e)]
            [(label) (raise-compile-error s "~a is a label" e)]
@@ -2210,13 +2243,15 @@
       [(func)
        (let* ([head (stx->list (cadr parts))]
               [info (func-info-of (car head) phase)]
-              [inline? (and (pair? (cddr parts)) (inline-marker? (caddr parts)))]
-              [body (cdr (parse-results (if inline? (cdddr parts) (cddr parts)) phase))]
+              [options (func-options (cddr parts))]
+              [inline? (car options)]
+              [body (cdr (parse-results (caddr options) phase))]
               [params (map (lambda (p t) (cons (local-key-of (car (stx->list p)) phase) t))
                            (cdr head) (func-info-params info))]
               ;; A (type T) clause first is in the info already.
               [code (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase)])
          (when inline? (record-inline! info params code (car head)))
+         (when (cadr options) (function-value info))
          (list (list 'func info params code)))]
       [(global)
        (let ([m (meaning-of (cadr parts) phase)])
@@ -2235,6 +2270,35 @@
     (unless (and m (eq? (car m) 'func)) (not-expanded id))
     (check-not-removed (cadr m) id)
     (cadr m)))
+
+;; ---- function values (spec 5.2) ----
+
+;; A function declared with #:value g -> (g . phase), then g's info once
+;; it is resolved. In fully expanded code a function's name stays a name,
+;; and lowering reads its value then: a linklet hook's output may
+;; redefine the global (6.5).
+(define function-values (make-hasheq))
+
+(define (value-base info)
+  (let ([origin (hash-ref shift-origins info #f)]) (if origin (car origin) info)))
+
+(define (has-value? info) (hash-has-key? function-values (value-base info)))
+
+;; The info of the global that is func info's value, shifted as info is,
+;; or #f if info has none.
+(define (function-value info)
+  (let* ([origin (hash-ref shift-origins info #f)]
+         [base (value-base info)]
+         [v (hash-ref function-values base #f)])
+    (and v
+         (let ([g (if (pair? v)
+                      (let ([m (meaning-of (car v) (cdr v))])
+                        (unless (and m (eq? (car m) 'global))
+                          (raise-compile-error (car v) "#:value names ~a, which is not a global" (stx-e (car v))))
+                        (hash-set! function-values base (cadr m))
+                        (cadr m))
+                      v)])
+           (shift-info g (if origin (cdr origin) 0))))))
 
 ;; ---- inline functions (spec 5.2) ----
 
@@ -2367,6 +2431,12 @@
              (case (and m (car m))
                [(local) (list 'lref (cadr m))]
                [(global) (check-not-removed (cadr m) s) (list 'gref (cadr m))]
+               ;; A function's name as an expression is its value (5.2).
+               [(func)
+                (let ([g (function-value (cadr m))])
+                  (unless g (not-expanded s))
+                  (check-not-removed g s)
+                  (list 'gref g))]
                [else (not-expanded s)]))]
           [(pair? e)
            (let* ([parts (stx->list s)]
