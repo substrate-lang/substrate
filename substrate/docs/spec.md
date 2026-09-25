@@ -64,11 +64,16 @@ GC types or requires the syntax library.
 
 ### 2.1 Transformers
 
-A **transformer** is a phase-1 function of type `(eqref) -> eqref`. The
-expander calls it with the syntax object for a macro use (the whole form,
-or the identifier alone) and expands the syntax object it returns.
-`(define-syntax m f)` makes `m` a macro whose transformer is `f`; given
-any other expression, `define-syntax` binds a compile-time value (6.3).
+A **transformer** is a value the expander calls with the syntax object for
+a macro use (the whole form, or the identifier alone); it expands the
+syntax object the call returns. `(make-transformer code env)` makes one:
+`code` is a function reference of type `(func (eqref eqref -> eqref))`,
+called with `env` and the syntax. Types are identified by structure
+(5.1), so a module that makes transformers declares that function type
+itself and gives its code function the type with a `(type T)` clause. A
+name that `define-syntax` binds to a transformer is a **macro** (6.3).
+`(define-syntax m f)`, where `f` names a phase-1 function of type
+`(eqref) -> eqref`, binds `m` to a transformer that calls `f`.
 
 ### 2.2 Values
 
@@ -100,7 +105,8 @@ another type, such as `n:i32`.
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
-| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, or `#f`), `(raise-syntax-error name message stx)` (aborts expansion; returns nothing), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
+| transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)` |
+| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(raise-syntax-error name message stx)` (aborts expansion; returns nothing), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
   otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
@@ -145,7 +151,8 @@ another type, such as `n:i32`.
   passes its own name.
 - `identifier-binding-kind` says what identifier `id` is bound to as a
   value at the running macro's phase: the symbol `function`, `variable` (a
-  local or global), `macro`, `compile-time-value`, `data`, `label` or
+  local or global), `macro` (a compile-time value that is a
+  transformer), `compile-time-value` (any other), `data`, `label` or
   `core` (a core form or wasm operator); `type` if it is bound only as a
   type; or `#f` if it is unbound. An implicit `#%app` (5.3) uses it to tell
   a call of a function from a call through a variable.
@@ -205,8 +212,8 @@ them in Chez; in a run-time store they trap.
     by definition or import, is an error.
 - Expansion must run phase-1 code before the module is finished: a macro
   works on the line after its definition. So while a module is expanded,
-  each `begin-for-syntax`, and each `define-syntax` of a compile-time
-  value, is compiled into a linklet of its own and instantiated at once, in
+  each `begin-for-syntax` and each `define-syntax` is compiled into a
+  linklet of its own and instantiated at once, in
   source order, as Racket evaluates them. When the module is done, each
   phase's code is compiled again as a whole, into the module's linklet for
   that phase. Other modules only ever use those.
@@ -381,8 +388,8 @@ quotation and compile-time forms.
 (provide item ...)                  ; phase 0 only; item: x or [new old]
 (freestanding)                      ; see 3.4
 (module-pass f)                     ; phase 0; f: a phase+1 function (6.5)
-(define-syntax name transformer)    ; transformer: a phase+1 function (2.1)
-(define-syntax name expr)           ; a compile-time value, run at phase+1 (6.3)
+(define-syntax name expr)           ; name bound to expr's value at phase+1 (6.3)
+(define-syntax name f)              ; f: a phase+1 function; a transformer (2.1)
 (begin-for-syntax form ...)         ; forms at phase+1
 (begin form ...)                    ; spliced
 expr                                ; runs at instantiation
@@ -390,11 +397,12 @@ expr                                ; runs at instantiation
 
 A module body is expanded in two passes, as in Racket. The first pass
 expands macro uses at the head of each form, registers definitions, runs
-`begin-for-syntax` and the expressions of compile-time values at once,
+`begin-for-syntax` and the right-hand sides of `define-syntax` at once,
 processes `require`, and splices `begin`. The second pass expands function
 bodies and expressions. So functions may be mutually recursive, and a
-macro must be defined before it is used. A transformer must come from an
-earlier `begin-for-syntax`, or from a module required inside one.
+macro must be defined before it is used. A function named in
+`(define-syntax name f)` must come from an earlier `begin-for-syntax`, or
+from a module required inside one.
 
 A macro used at module level runs in the first pass, so it sees only the
 definitions before it; `identifier-binding-kind` reports a later one as
@@ -635,20 +643,22 @@ a local scope.
 
 ### 6.3 Compile-time bindings
 
-`define-syntax` binds a name at compile time, as in Racket:
+`(define-syntax s expr)` binds `s` at compile time: `expr` is compiled and
+run at phase+1 now, and `s` is bound to its value, an `eqref`, a
+**compile-time value**.
 
-- `(define-syntax m f)`, where `f` names a phase+1 function, of type
-  `(eqref) -> eqref`: `m` is a macro whose transformer is `f`. `f` may come
-  from a module required inside `begin-for-syntax`.
-- `(define-syntax s expr)`, for any other `expr`: `expr` is compiled and
-  run at phase+1 now, and `s` is bound to its value, an `eqref`, a
-  **compile-time value**. The value lives in a global of the phase+1
-  linklet, so another module that requires this one computes it again in
-  its own compile-time store. Using `s` as an expression is an error, but
-  macros read the value with `syntax-local-value`. This is how extensions
-  share information, for example a struct form and a match form. Racket
-  makes a transformer of any procedure value; the kernel has no procedure
-  values, so a transformer is named instead.
+- If the value is a transformer (2.1), `s` is a macro. The expander checks
+  when `s` is used, since only then is the value known to it.
+- Otherwise using `s` as an expression is an error, but macros read the
+  value with `syntax-local-value`. This is how extensions share
+  information, for example a struct form and a match form.
+- `(define-syntax m f)`, where `f` names a phase+1 function of type
+  `(eqref) -> eqref`, binds `m` to a transformer that calls `f`. A
+  function name is not an expression, so this is a form of its own. `f`
+  may come from a module required inside `begin-for-syntax`.
+
+The value lives in a global of the phase+1 linklet, so another module that
+requires this one computes it again in its own compile-time store.
 
 [v0] Stage0 expands in Chez, so syntax crosses between Chez and wasm by
 copy, through the syntax library's embedder functions (appendix A). The
@@ -713,7 +723,7 @@ expr ::= id                                   ; a local or global variable
 ### 6.5 Module passes
 
 `(module-pass f)` declares that once the module is expanded, the phase+1
-function `f`, of type `(eqref) -> eqref` like a transformer, rewrites the
+function `f`, of type `(eqref) -> eqref`, rewrites the
 module's phase-0 fully expanded code. Passes run in the order they are declared.
 A library usually provides a macro that expands into the declaration.
 
@@ -774,6 +784,10 @@ expander.
   | `%flonum` | `(struct (field value f64))` | flonums |
   | `%builder` | `(struct (field bytes (mut (ref %string))) (field length (mut i32)))` | string builders |
   | `%keyword` | `(struct (field name (ref %string)))` | keywords |
+  | `%transformer` | `(struct (field code (ref %transformer-code)) (field env eqref))` | transformers |
+
+  `%transformer-code`, `(func (eqref eqref -> eqref))`, is declared
+  before the group, alone, so other modules can declare it too.
 
 - **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
   single `%atom` objects made at start. A linklet's quoted data is a
@@ -796,9 +810,12 @@ expander.
   `%h-deserialize` builds the objects, or `%h-serialize` writes a value
   and stage0 reads the bytes. A value the format has no kind for crosses
   as a handle. Handles made while a macro runs are released when it
-  returns. Each store gets a small entry linklet per transformer and per
-  compile-time value it uses, which converts between handles and
-  references.
+  returns. A compile-time value is fetched the first time it is needed,
+  perhaps while a macro runs, so its handle is pinned: pinned handles are
+  negative, index a second table, and are never released. Each store gets
+  a small entry linklet per compile-time value and per module pass it
+  uses, which converts between handles and references. Transformers are
+  called through `%h-call-transformer`.
   After bootstrap this section goes away.
 - **Shifted literals**: `%scope-map-add` tells `%make-syntax` to replace
   one scope id with another. Stage0 records which module and phase shift

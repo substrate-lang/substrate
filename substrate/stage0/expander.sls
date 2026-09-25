@@ -66,8 +66,8 @@
   (define-record-type binding (fields scopes phase namespace key))
 
   ;; meaning: (core name) (prim name) (func info) (global info) (data info)
-  ;;          (type info) (local key) (label key) (macro transformer-info)
-  ;;          (compile-time-value getter-info)
+  ;;          (type info) (local key) (label key) (compile-time-value getter-info)
+  ;; A name bound to a compile-time value that is a transformer is a macro.
   ;; A type meaning is in the type namespace, every other one in the value
   ;; namespace. Locals and labels are bound before their meaning is set, so
   ;; #f counts as a value.
@@ -88,8 +88,9 @@
   (define-record-type linklet (fields bytes imports gc? scopes))
 
   ;; One wasm store: a compile-time store (one per module compilation) or a
-  ;; run-time store. instances: names instantiated in it. wrappers and
-  ;; values: per-store handles of compile-time values.
+  ;; run-time store. instances: names instantiated in it. wrappers: the
+  ;; entry linklets calling module passes. values: getter -> (handle .
+  ;; transformer?) of each compile-time value fetched so far.
   (define-record-type cstore
     (fields host marshal instances wrappers values (mutable counter)))
 
@@ -373,7 +374,7 @@
                 new)))))
 
   (define (shift-meaning meaning k)
-    (if (and meaning (memq (car meaning) '(func global macro compile-time-value)))
+    (if (and meaning (memq (car meaning) '(func global compile-time-value)))
         (list (car meaning) (shift-info (cadr meaning) k))
         meaning))
 
@@ -421,22 +422,6 @@
                                    (shift-meaning (hashtable-ref meanings (cadddr e) #f) s)))
                       (reverse (unit-entries m)))))
         (for-each (lambda (r) (install-module-bindings! (car r) (+ s (cdr r)))) (unit-requires m)))))
-
-  ;; Compute, in the current store, every compile-time value m binds and
-  ;; its requires make visible at phase shift s. Done eagerly, outside any macro
-  ;; call, so the handles outlive it.
-  (define (prepare-compile-time-values! m s)
-    (let ([seen (make-hashtable string-hash string=?)])
-      (let walk ([m m] [s s])
-        (let ([key (format "~a|~a" (unit-path m) s)])
-          (unless (hashtable-contains? seen key)
-            (hashtable-set! seen key #t)
-            (for-each (lambda (e)
-                        (let ([meaning (hashtable-ref meanings (cadddr e) #f)])
-                          (when (and meaning (eq? (car meaning) 'compile-time-value))
-                            (compile-time-value-handle (comp-store current) (shift-info (cadr meaning) s)))))
-                      (unit-entries m))
-            (for-each (lambda (r) (walk (car r) (+ s (cdr r)))) (unit-requires m)))))))
 
   ;; ==== modules ====================================================================
 
@@ -535,7 +520,7 @@
               (map-lr (lambda (item)
                         (let* ([id (cdr item)]
                                [value (let ([v (meaning-of id 0)])
-                                        (and v (memq (car v) '(func global macro compile-time-value data)) v))]
+                                        (and v (memq (car v) '(func global compile-time-value data)) v))]
                                [found (filter values (list (type-meaning-of id 0) value))])
                           (when (null? found)
                             (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
@@ -621,9 +606,9 @@
     (let ([head (cond [(id? s) s]
                       [(and (pair? (stx-e s)) (id? (car (stx-e s)))) (car (stx-e s))]
                       [else #f])])
-      (let ([m (and head (meaning-of head phase))])
-        (if (and m (eq? (car m) 'macro))
-            (head-expand (apply-macro head (cadr m) s phase #t) phase)
+      (let ([t (and head (transformer-of (meaning-of head phase)))])
+        (if t
+            (head-expand (apply-macro head t s phase #t) phase)
             s))))
 
   ;; True while expanding the forms a module pass returned (spec 6.5).
@@ -784,16 +769,15 @@
   ;; syntax with every such use expanded, which is what fully expanded code
   ;; holds; the parse- functions then read it.
 
-  ;; The macro meaning of s's head if s is (macro ...), else #f.
+  ;; The transformer of s's head if s is (macro ...), else #f.
   (define (type-macro-use s phase)
     (and (stx? s) (pair? (stx-e s)) (id? (car (stx-e s)))
-         (let ([m (meaning-of (car (stx-e s)) phase)])
-           (and m (eq? (car m) 'macro) m))))
+         (transformer-of (meaning-of (car (stx-e s)) phase))))
 
   ;; A type name or heap type: macro uses at its head expanded.
   (define (expand-type-name s phase)
-    (let ([m (type-macro-use s phase)])
-      (if m (expand-type-name (apply-macro (car (stx-e s)) (cadr m) s phase #f) phase) s)))
+    (let ([t (type-macro-use s phase)])
+      (if t (expand-type-name (apply-macro (car (stx-e s)) t s phase #f) phase) s)))
 
   ;; A value type.
   (define (expand-type s phase)
@@ -1227,8 +1211,7 @@
         (comp-require-names-set! current (cons (cons key m) (comp-require-names current))))
       (unless (member req (unit-requires me))
         (unit-requires-set! me (append (unit-requires me) (list req)))
-        (install-module-bindings! m phase)
-        (prepare-compile-time-values! m phase))
+        (install-module-bindings! m phase))
       (map (lambda (p) (cons (car p) (shift-meaning (cdr p) phase))) (unit-provides m))))
 
   ;; The module a require named at this phase.
@@ -1331,53 +1314,80 @@
                     (list (comp-memories current) (comp-tables current)))))
 
   ;; A one-function linklet in st giving Chez an i32 entry point: it turns
-  ;; handles into references around `body`, which returns an eqref.
-  (define (entry-linklet! st param? body)
+  ;; handles into references around `body`, which returns an eqref, and
+  ;; makes the result a handle with `result`, %handle or %pin.
+  (define (entry-linklet! st param? body result)
     (let* ([key (and param? (fresh-key!))]
            [entry (make-func-info '__entry (if param? '(i32) '()) '(i32) #f #f #f)]
            [body (body (and param? (list 'call (syntax-info '%deref) (list (list 'lref key)))))])
       (cstore-counter-set! st (+ (cstore-counter st) 1))
       (instantiate-linklet! st (format "entry#~a" (cstore-counter st))
                           (list (list 'func entry (if param? (list (cons key 'i32)) '())
-                                      (list 'call (syntax-info '%handle) (list body))))
+                                      (list 'call (syntax-info result) (list body))))
                           #f)))
 
-  ;; The entry linklet that calls transformer f, in st.
-  (define (macro-entry st f)
+  ;; The entry linklet that calls module pass f, in st.
+  (define (pass-entry st f)
     (or (hashtable-ref (cstore-wrappers st) f #f)
-        (let ([entry (entry-linklet! st #t (lambda (arg) (list 'call f (list arg))))])
+        (let ([entry (entry-linklet! st #t (lambda (arg) (list 'call f (list arg))) '%handle)])
           (hashtable-set! (cstore-wrappers st) f entry)
           entry)))
 
-  ;; The handle of a compile-time value in st, from its getter function.
-  (define (compile-time-value-handle st getter)
+  ;; A compile-time value in st, from its getter function, as (handle .
+  ;; transformer?). Fetched when first needed, perhaps while a macro runs,
+  ;; so the handle is pinned.
+  (define (compile-time-value st getter)
     (or (hashtable-ref (cstore-values st) getter #f)
-        (let* ([entry (entry-linklet! st #f (lambda (_) (list 'call getter '())))]
-               [h (call-in-store st #f (lambda (host) (host-call host entry "__entry")))])
-          (hashtable-set! (cstore-values st) getter h)
-          h)))
+        (let* ([entry (entry-linklet! st #f (lambda (_) (list 'call getter '())) '%pin)]
+               [h (call-in-store st #f (lambda (host) (host-call host entry "__entry")))]
+               [v (cons h (= 1 (host-call (cstore-host st) "syntax" "%h-transformer?" h)))])
+          (hashtable-set! (cstore-values st) getter v)
+          v)))
 
-  ;; (define-syntax name expr): if expr names a phase+1 function, name is a
-  ;; macro with that transformer; otherwise name is bound to expr's value
-  ;; at phase+1, a compile-time value, which macros read with
-  ;; syntax-local-value. The value lives in a global of the phase+1 linklet,
-  ;; computed when the linklet is instantiated.
+  ;; The handle of the transformer meaning m is bound to, if m is a
+  ;; compile-time value that is a transformer; otherwise #f.
+  (define (transformer-of m)
+    (and m (eq? (car m) 'compile-time-value)
+         (let ([v (compile-time-value (comp-store current) (cadr m))])
+           (and (cdr v) (car v)))))
+
+  ;; (define-syntax name expr): name is bound to expr's value at phase+1, a
+  ;; compile-time value, which macros read with syntax-local-value; if the
+  ;; value is a transformer, name is a macro. In (define-syntax name f),
+  ;; where f names a phase+1 function of type (eqref) -> eqref, the value is
+  ;; a transformer that calls f. The value lives in a global of the phase+1
+  ;; linklet, computed when the linklet is instantiated.
   (define (define-syntax! f phase)
     (let ([parts (stx-list-of f 'define-syntax)])
       (unless (and (= (length parts) 3) (id? (cadr parts)))
-        (raise-compile-error f "expected (define-syntax name transformer-function) or (define-syntax name expr)"))
-      (let* ([rhs (caddr parts)] [m (and (id? rhs) (meaning-of rhs (+ phase 1)))])
-        (if (and m (eq? (car m) 'func))
-            (bind-definition! (cadr parts) phase
-                              (list 'macro (syntax-function-of rhs phase "a transformer")))
-            (let* ([name (string->symbol (string-append "__value." (symbol->string (stx-e (cadr parts)))))]
-                   [rhs (lower-expr (expand-expr rhs (+ phase 1)) (+ phase 1))]
-                   [global (make-global-info name eqref #t #f #f)]
-                   [getter (make-func-info name '() (list eqref) #f #f #f)])
-              (run-compile-time-linklet! (list (list 'global global rhs) (list 'func getter '() (list 'gref global)))
-                          (+ phase 1) f)
-              (compile-time-value-handle (comp-store current) getter)
-              (bind-definition! (cadr parts) phase (list 'compile-time-value getter)))))))
+        (raise-compile-error f "expected (define-syntax name expr)"))
+      (let* ([rhs (caddr parts)]
+             [m (and (id? rhs) (meaning-of rhs (+ phase 1)))]
+             [base (symbol->string (stx-e (cadr parts)))]
+             [name (string->symbol (string-append "__value." base))]
+             [adapter (and m (eq? (car m) 'func)
+                           (transformer-adapter (string->symbol (string-append "__transformer." base))
+                                                (syntax-function-of rhs phase "a transformer")))]
+             [init (if adapter
+                       (list 'call (syntax-info 'make-transformer)
+                             (list (list 'ref-func (cadr adapter)) (list 'quote #f)))
+                       (lower-expr (expand-expr rhs (+ phase 1)) (+ phase 1)))]
+             [global (make-global-info name eqref #t #f #f)]
+             [getter (make-func-info name '() (list eqref) #f #f #f)])
+        (run-compile-time-linklet! (append (if adapter (list adapter) '())
+                                           (list (list 'global global init)
+                                                 (list 'func getter '() (list 'gref global))))
+                                   (+ phase 1) f)
+        (bind-definition! (cadr parts) phase (list 'compile-time-value getter)))))
+
+  ;; The func form of transformer code named name, of the syntax library's
+  ;; type for it, that calls function info on the syntax.
+  (define (transformer-adapter name info)
+    (let ([code-type (ref-heap (car (func-info-params (syntax-info 'make-transformer))))]
+          [env (fresh-key!)] [s (fresh-key!)])
+      (list 'func (make-func-info name (list eqref eqref) (list eqref) #f #f code-type)
+            (list (cons env eqref) (cons s eqref))
+            (list 'call info (list (list 'lref s))))))
 
   ;; The phase+1 function id names, checked to take and return syntax and
   ;; to be defined already: a transformer or a module pass.
@@ -1431,6 +1441,7 @@
   ;; and on the output, so only what the transformer introduced carries it.
   ;; In a definition context (use-site? is true) the input also gets a fresh
   ;; use-site scope, which stays.
+  ;; transformer is the handle of a transformer value.
   (define (apply-macro head transformer s phase use-site?)
     (note-macro-use! head phase)
     (let* ([intro (new-scope!)]
@@ -1440,17 +1451,20 @@
                     (comp-use-site-scopes-set! current (cons use (comp-use-site-scopes current)))
                     (add-scope s use))
                   s)])
-      (flip-scope (call-syntax-function (format "macro ~a" (stx-e head)) transformer s phase intro #f) intro)))
+      (flip-scope (call-syntax-function (format "macro ~a" (stx-e head))
+                                        (lambda (host in) (host-call host "syntax" "%h-call-transformer" transformer in))
+                                        s phase intro #f)
+                  intro)))
 
-  ;; Call phase-1 function info, from syntax to syntax, on s in the current
+  ;; Call a phase-1 function from syntax to syntax on s in the current
   ;; compile-time store: a transformer, or a module pass, which may also
-  ;; return a plain list (list-ok?). While it runs, the
+  ;; return a plain list (list-ok?). (call host in) calls it on handle in
+  ;; and returns the result's handle. While it runs, the
   ;; expander queries answer for phase, blame s, and local-expand uses
   ;; intro, its introduction scope. Calls nest: a query can expand code,
   ;; which calls more macros.
-  (define (call-syntax-function who info s phase intro list-ok?)
+  (define (call-syntax-function who call s phase intro list-ok?)
     (let* ([st (comp-store current)]
-           [entry (macro-entry st info)]
            [saved-phase api-phase] [saved-where api-where] [saved-intro api-intro])
       (dynamic-wind
         (lambda () (set! api-phase phase) (set! api-where s) (set! api-intro intro))
@@ -1458,7 +1472,7 @@
           (let* ([ms (cstore-marshal st)]
                  [mark (handle-mark ms)]
                  [in (encode ms s)]
-                 [out (call-in-store st s (lambda (h) (host-call h entry "__entry" in)))]
+                 [out (call-in-store st s (lambda (h) (call h in)))]
                  [result (decode ms out)])
             (handle-release! ms mark)
             (unless (or (stx? result) (and list-ok? (list? result)))
@@ -1483,7 +1497,9 @@
      (lambda (forms pass)
        (let* ([intro (new-scope!)]
               [where (cdr pass)]
-              [result (flip-scope (call-syntax-function "the module pass" (car pass)
+              [entry (pass-entry (comp-store current) (car pass))]
+              [result (flip-scope (call-syntax-function "the module pass"
+                                                        (lambda (host in) (host-call host entry "__entry" in))
                                                         (flip-scope (out-list where forms) intro) 0 intro #t)
                                   intro)]
               [new (or (stx->list result)
@@ -1524,8 +1540,7 @@
              (let ([id (decode ms a)])
                (let ([m (and (id? id) (meaning-of id api-phase))])
                  (if (and m (eq? (car m) 'compile-time-value))
-                     (or (hashtable-ref (cstore-values st) (cadr m) #f)
-                         (raise-compile-error api-where "internal: compile-time value of ~a not prepared" (stx-e id)))
+                     (car (compile-time-value st (cadr m)))
                      0)))]
             [(2)                        ; raise-syntax-error
              (let ([s (decode ms a)] [msg (decode ms b)])
@@ -1550,8 +1565,7 @@
                  (encode ms (case (and m (car m))
                               [(func) 'function]
                               [(local global) 'variable]
-                              [(macro) 'macro]
-                              [(compile-time-value) 'compile-time-value]
+                              [(compile-time-value) (if (transformer-of m) 'macro 'compile-time-value)]
                               [(data) 'data]
                               [(label) 'label]
                               [(core prim) 'core]
@@ -1628,8 +1642,11 @@
          (let ([m (meaning-of s phase)])
            (case (and m (car m))
              [(local global) s]
-             [(macro) (expand-expr (apply-macro s (cadr m) s phase #f) phase)]
-             [(compile-time-value) (raise-compile-error s "~a is bound to a compile-time value: read it with syntax-local-value" e)]
+             [(compile-time-value)
+              (let ([t (transformer-of m)])
+                (if t
+                    (expand-expr (apply-macro s t s phase #f) phase)
+                    (raise-compile-error s "~a is bound to a compile-time value: read it with syntax-local-value" e)))]
              [(func) (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e)]
              [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
              [(core prim) (raise-compile-error s "bad use of ~a" e)]
@@ -1637,28 +1654,31 @@
              [else (unbound s e phase)]))]
         [(pair? e)
          (let* ([head (car e)]
-                [m (and (id? head) (meaning-of head phase))])
-           (case (and m (car m))
-             [(core) (expand-core (cadr m) s phase)]
-             [(macro) (expand-expr (apply-macro head (cadr m) s phase #f) phase)]
-             [(prim) (expand-prim (cadr m) s phase)]
-             [else
-              ;; Any other form is an application: (#%app f arg ...), where
-              ;; #%app has the scopes of the form (spec 5.3).
-              (when (and (id? head) (eq? (stx-e head) app-sym))
-                (if m
-                    (raise-compile-error s "#%app is bound here, but not to a macro or the core form")
-                    (unbound head app-sym phase)))
-              (expand-expr (stx-rewrap s (cons (implicit-id s app-sym) e)) phase)]))]
+                [m (and (id? head) (meaning-of head phase))]
+                [t (transformer-of m)])
+           (if t
+               (expand-expr (apply-macro head t s phase #f) phase)
+               (case (and m (car m))
+                 [(core) (expand-core (cadr m) s phase)]
+                 [(prim) (expand-prim (cadr m) s phase)]
+                 [else
+                  ;; Any other form is an application: (#%app f arg ...), where
+                  ;; #%app has the scopes of the form (spec 5.3).
+                  (when (and (id? head) (eq? (stx-e head) app-sym))
+                    (if m
+                        (raise-compile-error s "#%app is bound here, but not to a macro or the core form")
+                        (unbound head app-sym phase)))
+                  (expand-expr (stx-rewrap s (cons (implicit-id s app-sym) e)) phase)])))]
         [(null? e) (raise-compile-error s "empty form ()")]
         [(literal? e)
          ;; A literal is (#%datum literal), where #%datum has the scopes of
          ;; the literal (spec 5.4).
          (let* ([id (implicit-id s datum-sym)]
-                [m (meaning-of id phase)])
-           (case (and m (car m))
-             [(core) (core-datum s) (out s datum-sym s)]
-             [(macro) (expand-expr (apply-macro id (cadr m) (stx-rewrap s (list id s)) phase #f) phase)]
+                [m (meaning-of id phase)]
+                [t (transformer-of m)])
+           (cond
+             [t (expand-expr (apply-macro id t (stx-rewrap s (list id s)) phase #f) phase)]
+             [(and m (eq? (car m) 'core)) (core-datum s) (out s datum-sym s)]
              [else (raise-compile-error s "the literal ~s needs #%datum, which is ~a here" (stx->datum s)
                                         (if m "not a macro or the core form" "unbound"))]))]
         [(keyword? e) (raise-compile-error s "~s: keyword misused as an expression" e)]
@@ -1691,7 +1711,7 @@
       (case (and m (car m))
         [(func) (apply out s app-sym f (map-lr (lambda (a) (expand-expr a phase)) (cddr parts)))]
         [(local global) (raise-compile-error s "~a is a variable, not a function" (stx-e f))]
-        [(compile-time-value data label core prim macro)
+        [(compile-time-value data label core prim)
          (raise-compile-error s "~a is not a function" (stx-e f))]
         [else (if (id? f)
                   (unbound f (stx-e f) phase)

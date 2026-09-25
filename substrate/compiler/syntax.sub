@@ -43,6 +43,11 @@
 (data %msg-builder 288 "expected a string builder")
 (data %msg-keyword 320 "expected a keyword")
 
+;; A transformer's code (spec 2.1): called with the transformer's
+;; environment and the syntax. It is a group of its own, so a module that
+;; makes transformers can declare it too, and give its functions this type.
+(type %transformer-code (func (eqref eqref -> eqref)))
+
 ;; One recursion group, so that no type declared elsewhere is the same wasm
 ;; type as one of these, unless it copies this whole group: wasm compares
 ;; types group by group (spec 5.2). Otherwise a program's struct of two
@@ -58,7 +63,8 @@
   (type %integer (struct (field negative i32) (field magnitude i64)))
   (type %flonum (struct (field value f64)))
   (type %builder (struct (field bytes (mut (ref %string))) (field length (mut i32))))
-  (type %keyword (struct (field name (ref %string)))))
+  (type %keyword (struct (field name (ref %string))))
+  (type %transformer (struct (field code (ref %transformer-code)) (field env eqref))))
 
 (global %true eqref (struct.new %atom 1 0))
 (global %nil eqref (struct.new %atom 2 0))
@@ -560,6 +566,13 @@
     (set! %in (ref.null %string))
     objs))
 
+;; ---- transformers -----------------------------------------------------------------
+
+;; A transformer (spec 2.1): the expander calls code with env and the syntax
+;; of a macro use.
+(func (make-transformer [code (ref %transformer-code)] [env eqref]) -> eqref
+  (struct.new %transformer code env))
+
 ;; ---- expander queries -------------------------------------------------------------
 
 ;; The compile-time value define-syntax bound id to, or #f.
@@ -621,28 +634,54 @@
 ;; Stage0 is Chez Scheme and cannot hold GC references, so it names objects
 ;; by handles: indexes into %handles. Handle 0 is #f. Handles made while a
 ;; macro runs are released when it returns (%handle-mark, %handle-release).
+;; Pinned handles, -1, -2 and so on, index %pinned and are never released:
+;; stage0 keeps compile-time values by them.
 ;; After bootstrap the compiler holds references directly and this section
 ;; goes away.
 
 (global %handles (mut (ref null %table)) (array.new %table (ref.null eq) 256))
 (global %handle-count (mut i32) 1)
+(global %pinned (mut (ref null %table)) (array.new %table (ref.null eq) 64))
+(global %pinned-count (mut i32) 0)
+
+;; Table t, or if index i is past its end a copy twice its size.
+(func (%room [t (ref null %table)] [i i32]) -> (ref null %table)
+  (if (i32.lt_u i (array.len t)) (return t))
+  (let ([bigger (array.new %table (ref.null eq) (i32.shl (array.len t) 1))])
+    (array.copy %table %table bigger 0 t 0 (array.len t))
+    bigger))
 
 (func (%handle [v eqref]) -> i32
   (if (ref.is_null v) (return 0))
-  (if (i32.ge_u %handle-count (array.len %handles))
-      (let ([bigger (array.new %table (ref.null eq) (i32.shl (array.len %handles) 1))])
-        (array.copy %table %table bigger 0 %handles 0 (array.len %handles))
-        (set! %handles bigger)))
+  (set! %handles (%room %handles %handle-count))
   (array.set %table %handles %handle-count v)
   (set! %handle-count (i32.add %handle-count 1))
   (i32.sub %handle-count 1))
 
-(func (%deref [h i32]) -> eqref (array.get %table %handles h))
+(func (%pin [v eqref]) -> i32
+  (if (ref.is_null v) (return 0))
+  (set! %pinned (%room %pinned %pinned-count))
+  (array.set %table %pinned %pinned-count v)
+  (set! %pinned-count (i32.add %pinned-count 1))
+  (i32.sub 0 %pinned-count))
+
+(func (%deref [h i32]) -> eqref
+  (if (i32.lt_s h 0)
+      (array.get %table %pinned (i32.sub (i32.sub 0 h) 1))
+      (array.get %table %handles h)))
 (func (%handle-mark) -> i32 %handle-count)
 
 (func (%handle-release [mark i32])
   (array.fill %table %handles mark (ref.null eq) (i32.sub %handle-count mark))
   (set! %handle-count mark))
+
+;; Is handle h's value a transformer? Call transformer h on syntax stx.
+(func (%h-transformer? [h i32]) -> i32 (ref.test (ref %transformer) (%deref h)))
+
+(func (%h-call-transformer [h i32] [stx i32]) -> i32
+  (let ([t (ref.cast (ref %transformer) (%deref h))])
+    (%handle (call-ref %transformer-code (struct.get %transformer code t) (struct.get %transformer env t)
+                       (%deref stx)))))
 
 ;; Copying in bulk. Stage0 writes and reads values in the format of quoted
 ;; data, at the buffer in this library's memory, so a value crosses in a
