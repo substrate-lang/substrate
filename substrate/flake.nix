@@ -18,6 +18,7 @@
             pkgs.wasm-tools    # validate / print emitted modules
             pkgs.gcc
             pkgs.gnumake
+            pkgs.perf      # profile compiled wasm (SUBHOST_PERFMAP)
           ];
           WASMTIME_INCLUDE = "${pkgs.wasmtime.dev}/include";
           WASMTIME_LIB = "${pkgs.wasmtime.lib}/lib";

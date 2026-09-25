@@ -44,6 +44,7 @@ bin/subc syntax-library -o build/syntax.wasm      # write the syntax library
 wasm-tools print OUT            # inspect a module
 SUBHOST_PROFILE=1 bin/subc run FILE   # time per category, printed at exit
 SUBHOST_PROFILE=2 bin/subc run FILE   # also each wasm compile: size, time, instance
+SUBHOST_PERFMAP=1 perf record -g bin/sub ...   # samples named by wasm function
 ```
 
 ## Status

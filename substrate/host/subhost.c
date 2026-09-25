@@ -214,6 +214,10 @@ static wasm_engine_t *engine(void) {
     wasmtime_config_wasm_reference_types_set(config, true);
     wasmtime_config_wasm_function_references_set(config, true);
     wasmtime_config_wasm_gc_set(config, true);
+    /* With SUBHOST_PERFMAP set, wasmtime writes /tmp/perf-PID.map, which
+     * names compiled wasm functions in perf's samples. */
+    if (getenv("SUBHOST_PERFMAP"))
+      wasmtime_config_profiler_set(config, WASMTIME_PROFILING_STRATEGY_PERFMAP);
     /* max_wasm_stack may not exceed async_stack_size, even without async. */
     wasmtime_config_async_stack_size_set(config, (size_t)8 << 20);
     wasmtime_config_max_wasm_stack_set(config, (size_t)4 << 20);
