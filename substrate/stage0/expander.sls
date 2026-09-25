@@ -35,7 +35,8 @@
   (define core-forms
     (append
      '(func global import memory table data type rec define-syntax begin-for-syntax
-       begin require require-unqualified provide freestanding module-pass set! let let* if block loop br br-if return
+       begin require require-unqualified provide freestanding module-pass set! let let* lambda if block loop br br-if
+       return
        call-indirect call-ref ref.func func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
      (list app-sym datum-sym)
@@ -1023,12 +1024,7 @@
       (unless (and (pair? hparts) (id? (car hparts)))
         (raise-compile-error head "expected (name [param type] ...)"))
       (let* ([name (car hparts)]
-             [params (map-lr (lambda (p)
-                               (let ([pp (stx->list p)])
-                                 (unless (and pp (= (length pp) 2) (id? (car pp)))
-                                   (raise-compile-error p "expected [name type]"))
-                                 (list (car pp) (expand-type (cadr pp) phase))))
-                             (cdr hparts))]
+             [params (map-lr (lambda (p) (param-of p phase)) (cdr hparts))]
              [types (map-lr (lambda (pp) (parse-type (cadr pp) phase)) params)]
              [rest (cddr parts)]
              [arrow (if (and (pair? rest) (core-name? (car rest) '->))
@@ -1041,6 +1037,13 @@
           (let ([info (make-func-info (stx-e name) types results #f #f ftype)])
             (bind-definition! name phase (list 'func info))
             (list 'func name params arrow body f clause))))))
+
+  ;; A parameter [name type], as (name type) with the type expanded.
+  (define (param-of p phase)
+    (let ([pp (stx->list p)])
+      (unless (and pp (= (length pp) 2) (id? (car pp)))
+        (raise-compile-error p "expected [name type]"))
+      (list (car pp) (expand-type (cadr pp) phase))))
 
   (define (type-clause? s)
     (let ([l (stx->list s)]) (and l (= (length l) 2) (core-name? (car l) 'type))))
@@ -1068,11 +1071,12 @@
            [f (list-ref p 5)] [clause (list-ref p 6)]
            [sc (new-local-scope!)]
            [xs (map-lr (lambda (pp) (let ([x (add-scope (car pp) sc)]) (bind-local! x phase) x)) params)])
-      (apply out f 'func
-             (out-list (cadr (stx->list f))
-                       (cons name (map-lr (lambda (x pp) (out-list x (list x (cadr pp)))) xs params)))
-             (append arrow (if clause (list (core-headed clause 'type)) '())
-                     (map-lr (lambda (b) (expand-expr (add-scope b sc) phase)) body)))))
+      (fluid-let ([current-function (list name)])
+        (apply out f 'func
+               (out-list (cadr (stx->list f))
+                         (cons name (map-lr (lambda (x pp) (out-list x (list x (cadr pp)))) xs params)))
+               (append arrow (if clause (list (core-headed clause 'type)) '())
+                       (map-lr (lambda (b) (expand-expr (add-scope b sc) phase)) body))))))
 
   ;; (global name type init) or (global name (mut type) init), as in wasm.
   (define (declare-global f phase)
@@ -1871,6 +1875,26 @@
                     (apply o (out-list (cadr parts) (map-lr binding-out bs xs inits))
                            (map-lr (lambda (x) (ex (add-scope x sc))) body)))
                   (expand-let* s bs body phase)))]
+           ;; (lambda ([x t] ...) [-> r] body ...): a function that uses
+           ;; the locals around it (spec 5.3). It cannot branch to the
+           ;; labels around it.
+           [(lambda)
+            (arity-check (and (>= (length parts) 2) (stx->list (cadr parts))))
+            (let* ([params (map-lr (lambda (p) (param-of p phase)) (stx->list (cadr parts)))]
+                   [rest (cddr parts)]
+                   [arrow (if (and (pair? rest) (core-name? (car rest) '->))
+                              (begin
+                                (when (null? (cdr rest)) (raise-compile-error (car rest) "expected a type after ->"))
+                                (expand-arrow (list-head rest 2) phase))
+                              '())]
+                   [body (list-tail rest (length arrow))]
+                   [sc (new-local-scope!)]
+                   [xs (map-lr (lambda (pp) (let ([x (add-scope (car pp) sc)]) (bind-local! x phase) x)) params)])
+              (for-each (lambda (pp) (parse-type (cadr pp) phase)) params)
+              (let-values ([(results rest) (parse-results arrow phase)]) (void))
+              (fluid-let ([current-function (list s)])
+                (apply o (out-list (cadr parts) (map-lr (lambda (x pp) (out-list x (list x (cadr pp)))) xs params))
+                       (append arrow (map-lr (lambda (b) (ex (add-scope b sc))) body)))))]
            [(begin) (apply o (map-lr ex (cdr parts)))]
            [(if)
             (arity-check (memv (length parts) '(3 4)))
@@ -1883,11 +1907,11 @@
               (apply o label (map-lr (lambda (x) (ex (add-scope x sc))) (cddr parts))))]
            [(br)
             (arity-check (memv (length parts) '(2 3)))
-            (label-key-of (cadr parts) phase)
+            (check-label-here (cadr parts) phase)
             (apply o (cadr parts) (map-lr ex (cddr parts)))]
            [(br-if)
             (arity-check (= (length parts) 3))
-            (label-key-of (cadr parts) phase)
+            (check-label-here (cadr parts) phase)
             (o (cadr parts) (ex (caddr parts)))]
            [(return)
             (arity-check (memv (length parts) '(1 2)))
@@ -1960,10 +1984,22 @@
       (hashtable-set! meanings key (list 'local key))
       key))
 
+  ;; The function or lambda whose body is being expanded, as a unique
+  ;; list, or #f; and label key -> the one it was bound in. A branch must
+  ;; stay in its function.
+  (define current-function #f)
+  (define label-functions (make-eqv-hashtable))
+
   (define (fresh-label! id phase)
     (let ([key (bind! id phase #f)])
       (hashtable-set! meanings key (list 'label key))
+      (hashtable-set! label-functions key current-function)
       key))
+
+  (define (check-label-here id phase)
+    (unless (eq? (hashtable-ref label-functions (label-key-of id phase) #f) current-function)
+      (raise-compile-error id "~a is a label of the function around this lambda, which a lambda cannot branch to"
+                           (stx-e id))))
 
   (define (label-key-of id phase)
     (let ([m (and (id? id) (meaning-of id phase))])
@@ -2153,6 +2189,8 @@
                                   (lo (binding-init bp)))))
                         (stx->list (cadr parts)))
                 (lower-seq (cddr parts) s phase))]
+         [(lambda)
+          (raise-compile-error s "lambda: a lambda must be lowered to other kernel code before it is compiled (spec 5.3)")]
          [(begin) (cons 'seq (map-lr lo (cdr parts)))]
          [(if) (list 'if (lo (cadr parts)) (lo (caddr parts)) (and (= (length parts) 4) (lo (cadddr parts))))]
          [(block loop) (list name (label-key-of (cadr parts) phase) (lower-seq (cddr parts) s phase))]

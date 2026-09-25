@@ -465,6 +465,7 @@ id                                  ; local or global variable
 (set! id expr)
 (let ([id expr] | [id type expr] ...) body ...)    ; parallel scope
 (let* ([id expr] | [id type expr] ...) body ...)   ; sequential scope
+(lambda ([id type] ...) [-> r] body ...)           ; a function over the locals around it
 (begin expr ...)
 (if test then [else])
 (block label body ...)              ; br to label exits the block
@@ -509,6 +510,16 @@ GC instructions take their type and field immediates by name:
 - Loads and stores take an optional trailing literal offset:
   `(i32.load p 8)`, `(i32.store p v 8)`.
 - Labels are bindings and obey scope like variables.
+- **`lambda`** is a function that uses the locals around it: its body
+  reads and assigns them, and each side sees the other's assignments. Its
+  parameters and result are written as a `func`'s. Its body cannot branch
+  to the labels around it, and `return` in it returns from the `lambda`.
+  The kernel gives `lambda` a meaning but no representation: a language
+  lowers each `lambda` to other kernel code, usually a struct holding the
+  captured values and a reference to a module-level function, and chooses
+  how. The compiler rejects a `lambda` that has not been lowered. [v0] A
+  language lowers its lambdas in a macro, which sees the code it expands;
+  Substrate lowers those in each `define`'s value.
 - **Application is an implicit form**, as in Racket. A form whose head is
   not bound to a macro, a core form or a wasm operator, including one
   whose head is not an identifier, is expanded as `(#%app head arg ...)`.
@@ -670,7 +681,8 @@ Expansion turns a module into **fully expanded code**, as Racket calls it:
 syntax in the grammar
 below, with every macro use expanded and every application and literal
 explicit. `local-expand` returns it, module passes receive and return it,
-`subc expand` prints it, and the compiler compiles it.
+`subc expand` prints it, and the compiler compiles it once no `lambda`
+remains (5.3).
 
 ```
 form ::= (func (id [id type] ...) [-> result] [(type id)] expr ...)
@@ -686,6 +698,7 @@ expr ::= id                                   ; a local or global variable
        | (op expr ... [offset])               ; a wasm numeric or memory operator
        | (gc-op immediate ... expr ...)       ; struct.new, ref.cast, ... (5.3)
        | (let ([id expr] | [id type expr] ...) expr ...)
+       | (lambda ([id type] ...) [-> result] expr ...)
        | (set! id expr) | (begin expr ...) | (if expr expr [expr])
        | (block id expr ...) | (loop id expr ...)
        | (br id [expr]) | (br-if id expr) | (return [expr])

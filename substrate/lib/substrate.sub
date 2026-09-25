@@ -61,18 +61,17 @@
 ;; gets its own subtype of closure, with a field per captured variable, used
 ;; only by its own code.
 ;;
-;; Closure conversion. define's value is converted: (convert e) expands e
-;; (local-expand) and converts the fully expanded code (spec 6.4). A lambda or
-;; case-lambda expands to a marker, (lambda-marker (begin clause ...)
-;; 'name), with a clause (let ([x (param-marker)] ... [rest (rest-marker)])
-;; body ...) for each parameter list, which convert replaces: the code
-;; becomes a module-level function (syntax-local-lift-definition), which runs the first
-;; clause taking its arguments, and the lambda a struct.new of its closure,
-;; holding the values of the variables it captures. A variable that is
-;; captured and also assigned becomes a box, so the lambda and the code
-;; around it share it. This is done per definition, so it works at every
-;; phase. A lambda outside a define keeps its marker, which fails to
-;; type-check: its argument must be a (ref lambda-needs-define).
+;; Closure conversion. A lambda or case-lambda expands to a kernel lambda
+;; (spec 5.3) taking the number of arguments and the first four, whose body
+;; runs the first clause that takes them. The kernel compiles a lambda only
+;; once it is lowered. define's value is converted: (convert e) expands e
+;; (local-expand) and converts the fully expanded code (spec 6.4), in which
+;; each lambda becomes a struct.new of its closure, holding the values of
+;; the variables it captures, and its code a module-level function
+;; (syntax-local-lift-definition). A variable that is captured and also
+;; assigned becomes a box, so the lambda and the code around it share it.
+;; This is done per definition, so it works at every phase. A lambda
+;; outside a define is not converted, and the kernel reports it.
 
 (require s syntax)
 (require mt "match.sub" else)
@@ -137,12 +136,6 @@
 ;; The arguments after the first four, of the call being made.
 (type arguments (array (mut eqref)))
 (global extra-args (mut (ref arguments)) (array.new arguments (ref.null eq) 8))
-
-;; The markers lambda leaves for convert (see the top).
-(type lambda-needs-define (struct))
-(func (lambda-marker [body (ref lambda-needs-define)] [name eqref]) -> eqref (ref.null eq))
-(func (param-marker) -> eqref (ref.null eq))
-(func (rest-marker) -> eqref (ref.null eq))
 
 ;; ---- run-time errors ---------------------------------------------------------------
 
@@ -683,40 +676,61 @@
       (if (i32.eqz (s:identifier? l)) (s:raise-syntax-error '#f '"expected a parameter name after the dot" ps))
       (s:cons (s:reverse required) l)))
 
-  (func (param-bindings [ps eqref]) -> eqref
-    (if (s:null? ps) '() (s:cons #`[#,(s:car ps) (param-marker)] (param-bindings (s:cdr ps)))))
+  ;; Bindings of parameters ps to arguments i, i + 1, ...: each one of the
+  ;; first four, or an extra one.
+  (func (param-inits [ps eqref] [i i32]) -> eqref
+    (if (s:null? ps) (return '()))
+    (s:cons #`[#,(s:car ps) #,(if (i32.lt_u i 4)
+                                  (nth (s:syntax->list #'(a0 a1 a2 a3)) i)
+                                  #`(array.get arguments extra-args #,(number (i32.sub i 4))))]
+            (param-inits (s:cdr ps) (i32.add i 1))))
 
-  ;; A clause's parameters and body as a let: (let ([x (param-marker)] ...
-  ;; [rest (rest-marker)]) body ...).
-  (func (clause-let [params eqref] [body eqref]) -> eqref
-    (let* ([p (parse-params params)] [rest (s:cdr p)])
-      #`(let (#,@(param-bindings (s:car p))
-              #,@(if (ref.is_null rest) '() (s:cons #`[#,rest (rest-marker)] '())))
-          #,@body)))
+  ;; The first of clauses cs, each (params body ...), that takes nargs
+  ;; arguments, or an error naming name. single: there is one clause, whose
+  ;; error says what it takes.
+  (func (dispatch [cs eqref] [name eqref] [single i32]) -> eqref
+    (if (s:null? cs) (return #`(no-clause-error '#,name nargs)))
+    (let* ([c (s:car cs)]
+           [p (parse-params (s:car c))]
+           [rest (s:cdr p)]
+           [n (s:length (s:car p))]
+           [inits (s:append (param-inits (s:car p) 0)
+                            (if (ref.is_null rest)
+                                '()
+                                (s:cons #`[#,rest (rest-arguments #,(number n) nargs a0 a1 a2 a3)] '())))])
+      #`(if #,(if (ref.is_null rest) #`(i32.eq nargs #,(number n)) #`(i32.ge_u nargs #,(number n)))
+            (let (#,@inits) #,@(s:cdr c))
+            #,(if single
+                  #`(arity-error '#,name #,(number n) #,(number (i32.eqz (ref.is_null rest))) nargs)
+                  (dispatch (s:cdr cs) name 0)))))
 
-  (func (clause-lets [clauses eqref]) -> eqref
+  ;; The kernel lambda of a function with clauses cs, named name (an
+  ;; identifier, or #f) in its errors, located at the form where.
+  (func (kernel-lambda [cs eqref] [name eqref] [single i32] [where eqref]) -> eqref
+    (s:syntax-rewrap
+     where
+     (s:syntax-e #`(lambda ([nargs i32] [a0 eqref] [a1 eqref] [a2 eqref] [a3 eqref]) -> eqref
+                     #,(dispatch cs (if (ref.is_null name) #'#f name) single)))))
+
+  (func (case-lambda-clauses [clauses eqref]) -> eqref
     (if (s:null? clauses)
         '()
         (let ([c (s:syntax->list (s:car clauses))])
-          (if (ref.is_null c) (s:raise-syntax-error 'case-lambda '"expected a clause: [params body ...]" (s:car clauses)))
-          (s:cons (clause-let (s:car c) (s:cdr c)) (clause-lets (s:cdr clauses))))))
+          (if (i32.or (ref.is_null c) (s:null? c))
+              (s:raise-syntax-error 'case-lambda '"expected a clause: [params body ...]" (s:car clauses)))
+          (s:cons c (case-lambda-clauses (s:cdr clauses))))))
 
-  ;; The marker for a lambda with these clause lets, named name (an
-  ;; identifier, or #f).
-  (func (marker [lets eqref] [name eqref]) -> eqref
-    #`(lambda-marker (begin #,@lets) '#,(if (ref.is_null name) #'#f name)))
-
-  ;; The marker for (lambda params body ...) or (case-lambda clause ...),
-  ;; named name; #f if e is neither.
-  (func (lambda-marker-of [e eqref] [name eqref]) -> eqref
+  ;; The kernel lambda for (lambda params body ...) or (case-lambda clause
+  ;; ...) e, named name; #f if e is neither.
+  (func (kernel-lambda-of [e eqref] [name eqref]) -> eqref
     (let ([parts (s:syntax->list e)])
       (if (ref.is_null parts) (return '#f))
       (if (s:null? parts) (return '#f))
       (if (i32.eqz (s:identifier? (s:car parts))) (return '#f))
       (if (s:free-identifier=? (s:car parts) #'substrate-lambda)
-          (return (marker (s:cons (clause-let (s:cadr parts) (s:cddr parts)) '()) name)))
+          (return (kernel-lambda (s:cons (s:cdr parts) '()) name 1 e)))
       (if (s:free-identifier=? (s:car parts) #'substrate-case-lambda)
-          (return (marker (clause-lets (s:cdr parts)) name)))
+          (return (kernel-lambda (case-lambda-clauses (s:cdr parts)) name 0 e)))
       '#f))
 
   ;; (define (f . params) body ...), (define f (lambda ...)), (define f
@@ -725,22 +739,23 @@
   (func (substrate-define [stx eqref]) -> eqref
     (let ([parts (s:syntax->list stx)])
       (if (s:identifier? (s:cadr parts))
-          (let ([f (lambda-marker-of (s:caddr parts) (s:cadr parts))])
+          (let ([f (kernel-lambda-of (s:caddr parts) (s:cadr parts))])
             (return (if (ref.is_null f)
                         #`(global #,(s:cadr parts) (mut eqref) (convert #,(s:caddr parts)))
-                        #`(global #,(s:cadr parts) (ref closure) (convert #,f))))))
+                        #`(global #,(s:cadr parts) (ref closure) (convert #,f #,(s:cadr parts)))))))
       (let* ([head (s:splice-list (s:cadr parts))] [name (s:car head)])
         #`(global #,name (ref closure)
-                  (convert #,(marker (s:cons (clause-let (s:cdr head) (s:cddr parts)) '()) name))))))
+                  (convert #,(kernel-lambda (s:cons (s:cons (s:cdr head) (s:cddr parts)) '()) name 1 stx)
+                           #,name)))))
 
   ;; (lambda params body ...)
   (func (substrate-lambda [stx eqref]) -> eqref
-    (lambda-marker-of stx '#f))
+    (kernel-lambda-of stx '#f))
 
   ;; (case-lambda [params body ...] ...): a function with a clause per
   ;; number of arguments; a call runs the first clause that takes them.
   (func (substrate-case-lambda [stx eqref]) -> eqref
-    (lambda-marker-of stx '#f))
+    (kernel-lambda-of stx '#f))
 
   ;; (set! x e): the kernel's set!, which has no value, then #f.
   (func (substrate-set! [stx eqref]) -> eqref
@@ -1040,9 +1055,14 @@
 
   (func (boxed? [b eqref]) -> i32 (i32.and (member? b assigned) (member? b captured)))
 
-  (func (lambda-marker? [l eqref]) -> i32
-    (if (i32.eqz (named? (s:car l) '#%app)) (return 0))
-    (s:free-identifier=? (s:cadr l) #'lambda-marker))
+  ;; A fully expanded kernel lambda (spec 6.4): is l one? Its parameters'
+  ;; binders, its -> and result if it has them, and its body.
+  (func (lambda? [l eqref]) -> i32 (named? (s:car l) 'lambda))
+  (func (lambda-params [l eqref]) -> eqref (binders (s:syntax->list (s:cadr l))))
+  (func (lambda-arrow [l eqref]) -> eqref
+    (if (s:null? (s:cddr l)) (return '()))
+    (if (named? (s:caddr l) '->) (take (s:cddr l) 2) '()))
+  (func (lambda-body [l eqref]) -> eqref (drop-n (s:cddr l) (s:length (lambda-arrow l))))
 
   ;; Where a form's expressions start: after its head and the parts that
   ;; name labels, functions, types and fields. -1 for a form with none.
@@ -1077,8 +1097,9 @@
           (return)))
     (let ([l (s:syntax->list x)])
       (if (i32.or (ref.is_null l) (s:null? l)) (return))
-      (if (lambda-marker? l)
-          (return (scan-clauses (marker-clauses l) env (if (i32.eqz mode) env outside) mode)))
+      (if (lambda? l)
+          (return (scan-list (lambda-body l) (s:append (lambda-params l) env)
+                             (if (i32.eqz mode) env outside) mode)))
       (let ([head (s:syntax-e (s:car l))])
         (if (ref.eq head 'let)
             (let ([bs (s:syntax->list (s:cadr l))])
@@ -1109,7 +1130,7 @@
           (return (if (i32.and (i32.eqz (ref.is_null b)) (boxed? b)) #`(struct.get box value #,x) x))))
     (let ([l (s:syntax->list x)])
       (if (i32.or (ref.is_null l) (s:null? l)) (return x))
-      (if (lambda-marker? l) (return (convert-lambda l env)))
+      (if (lambda? l) (return (convert-lambda l env '#f)))
       (let ([head (s:syntax-e (s:car l))])
         (if (ref.eq head 'let)
             (let ([bs (s:syntax->list (s:cadr l))])
@@ -1159,87 +1180,54 @@
         '()
         (s:cons #`[#,(s:car xs) (struct.get #,t #,(s:car fs) env)] (env-bindings (s:cdr xs) (s:cdr fs) t))))
 
-  ;; The clause lets of a lambda marker.
-  (func (marker-clauses [l eqref]) -> eqref
-    (let ([form (s:syntax->list (s:caddr l))])
-      (if (named? (s:car form) 'begin) (s:cdr form) (s:cons (s:caddr l) '()))))
-
-  ;; Scan each clause's body, with its parameters in scope.
-  (func (scan-clauses [cs eqref] [env eqref] [outside eqref] [mode i32])
-    (if (i32.eqz (s:null? cs))
-        (let* ([form (s:syntax->list (s:car cs))]
-               [params (binders (s:syntax->list (s:cadr form)))])
-          (scan-list (s:cddr form) (s:append params env) outside mode)
-          (scan-clauses (s:cdr cs) env outside mode))))
-
-  ;; The binding [x (rest-marker)], among a lambda marker's bindings?
-  (func (rest-binding? [b eqref]) -> i32
-    (let ([init (s:syntax->list (binding-init b))])
-      (if (ref.is_null init) (return 0))
-      (if (i32.ne (s:length init) 2) (return 0))
-      (if (named? (s:car init) '#%app) (s:free-identifier=? (s:cadr init) #'rest-marker) 0)))
-
-  ;; The bindings of a clause's parameters, given n of them required: each
-  ;; takes its argument, and rest, if there is one, the list of the others.
-  ;; A boxed parameter is bound to a box.
-  (func (param-inits [ps eqref] [i i32] [n i32]) -> eqref
+  ;; [p (struct.new box p)] for each boxed parameter p.
+  (func (param-boxes [ps eqref]) -> eqref
     (if (s:null? ps) (return '()))
-    (let* ([p (s:car ps)]
-           [init (if (i32.ge_u i n)
-                     #`(rest-arguments #,(number n) nargs a0 a1 a2 a3)
-                     (if (i32.lt_u i 4)
-                         (nth (s:syntax->list #'(a0 a1 a2 a3)) i)
-                         #`(array.get arguments extra-args #,(number (i32.sub i 4)))))])
-      (s:cons (if (boxed? p) #`[#,p (struct.new box #,init)] #`[#,p #,init])
-              (param-inits (s:cdr ps) (i32.add i 1) n))))
+    (if (boxed? (s:car ps))
+        (s:cons #`[#,(s:car ps) (struct.new box #,(s:car ps))] (param-boxes (s:cdr ps)))
+        (param-boxes (s:cdr ps))))
 
-  ;; The code's body: the first clause that takes nargs arguments, converted,
-  ;; or an error. single: there is one clause, whose error says what it takes.
-  (func (dispatch [cs eqref] [env eqref] [name eqref] [single i32]) -> eqref
-    (if (s:null? cs) (return #`(no-clause-error '#,name nargs)))
-    (let* ([form (s:syntax->list (s:car cs))]
-           [bindings (s:syntax->list (s:cadr form))]
-           [params (binders bindings)]
-           [rest (if (s:null? bindings) 0 (rest-binding? (s:car (s:reverse bindings))))]
-           [n (i32.sub (s:length params) rest)])
-      #`(if #,(if rest #`(i32.ge_u nargs #,(number n)) #`(i32.eq nargs #,(number n)))
-            (let (#,@(param-inits params 0 n))
-              #,@(convert-list (s:cddr form) (s:append params env)))
-            #,(if single
-                  #`(arity-error '#,name #,(number n) #,(number rest) nargs)
-                  (dispatch (s:cdr cs) env name 0)))))
-
-  ;; A lambda marker, converted: its code is lifted to a module-level
-  ;; function, and the lambda becomes its closure.
-  (func (convert-lambda [l eqref] [env eqref]) -> eqref
-    (let* ([clauses (marker-clauses l)]
-           [name (s:cadr (s:syntax->list (s:car (s:cdddr l))))])
+  ;; A lambda, converted: its code is lifted to a module-level function,
+  ;; named after name (an identifier, or #f), and the lambda becomes its
+  ;; closure.
+  (func (convert-lambda [l eqref] [env eqref] [name eqref]) -> eqref
+    (let* ([params (lambda-params l)] [inner (s:append params env)])
       ;; The variables it captures, in the order they appear.
       (set! free '())
-      (scan-clauses clauses env env 1)
+      (scan-list (lambda-body l) inner env 1)
       (let* ([captures (s:reverse free)]
-             [body (dispatch clauses env name (i32.eq (s:length clauses) 1))]
+             [boxes (param-boxes params)]
+             [body (convert-list (lambda-body l) inner)]
+             [body (if (s:null? boxes) body (s:cons #`(let (#,@boxes) #,@body) '()))]
              [code (fresh-name (if (s:identifier? name) (s:syntax-e name) 'lambda))]
-             [head #`(#,code [self (ref closure)] [nargs i32] [a0 eqref] [a1 eqref] [a2 eqref] [a3 eqref])])
+             [head #`(#,code [self (ref closure)] #,@(s:syntax->list (s:cadr l)))]
+             [arrow (lambda-arrow l)])
         (if (s:null? captures)
             (begin
-              (drop (s:syntax-local-lift-definition #`(func #,head -> eqref (type code) #,body)))
+              (drop (s:syntax-local-lift-definition #`(func #,head #,@arrow (type code) #,@body)))
               #`(struct.new closure (ref.func #,code)))
             (let ([t (fresh-name 'closure)] [fields (field-names captures 0)])
               (drop (s:syntax-local-lift-definition
                      #`(type #,t (sub final closure (struct (field code (ref code)) #,@(field-decls fields captures))))))
               (drop (s:syntax-local-lift-definition
-                     #`(func #,head -> eqref (type code)
+                     #`(func #,head #,@arrow (type code)
                          (let ([env (ref.cast (ref #,t) self)])
-                           (let (#,@(env-bindings captures fields t)) #,body)))))
+                           (let (#,@(env-bindings captures fields t)) #,@body)))))
               #`(struct.new #,t (ref.func #,code) #,@captures))))))
 
-  ;; (convert e): e expanded and converted.
+  ;; (convert e) or (convert e name): e expanded and converted. If e is a
+  ;; lambda, its code is named after name.
   (func (convert [stx eqref]) -> eqref
-    (let ([e (s:local-expand (s:cadr (s:syntax->list stx)))])
+    (let* ([parts (s:syntax->list stx)]
+           [e (s:local-expand (s:cadr parts))]
+           [l (s:syntax->list e)])
       (set! assigned '())
       (set! captured '())
       (scan e '() '() 0)
+      (if (i32.eqz (s:null? (s:cddr parts)))
+          (if (i32.eqz (ref.is_null l))
+              (if (i32.eqz (s:null? l))
+                  (if (lambda? l) (return (convert-lambda l '() (s:caddr parts)))))))
       (convert-expr e '()))))
 
 (define-syntax substrate-define substrate-define)
