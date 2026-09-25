@@ -89,9 +89,8 @@ syntax properties work too, and macros are hygienic
 (introduction and use-site scopes, spec 6.2). A module can change what
 application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
 5.4). Expansion produces fully expanded code, syntax in a fixed grammar (spec
-6.4): a macro can see its input's with `local-expand`, a module pass
-(spec 6.6) or a language's `#%linklet` (spec 6.5) can rewrite a whole
-module's, and `bin/sub expand` prints it.
+6.4): a macro can see its input's with `local-expand`, a language's
+`#%linklet` (spec 6.5) can rewrite each unit's, and `bin/sub expand` prints it.
 Modules `require` each other by name, with
 qualified imports (`print:write-int`), at any phase:
 each phase of a module compiles to its own wasm module, a linklet, and a

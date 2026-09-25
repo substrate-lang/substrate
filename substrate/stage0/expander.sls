@@ -2,8 +2,7 @@
 ;; compiler compiles itself.
 ;;
 ;; Expander: syntax objects -> fully expanded code, which is syntax too (spec
-;; 6.4) -> after the module passes (spec 6.6) and #%linklet (spec 6.5),
-;; lowered to the compiler's input (core.sls).
+;; 6.4) -> after #%linklet (spec 6.5), lowered to the compiler's input (core.sls).
 ;;
 ;; Binding is by sets of scopes (spec 6.1). A module is a file; each of its
 ;; phases compiles to one wasm module, a linklet (spec 3.1). While a module is
@@ -36,7 +35,7 @@
   (define core-forms
     (append
      '(func global import memory table data type rec define-syntax begin-for-syntax
-       begin require require-unqualified provide freestanding module-pass set! let let* lambda if block loop br br-if
+       begin require require-unqualified provide freestanding set! let let* lambda if block loop br br-if
        return
        call-indirect call-ref ref.func func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
@@ -94,18 +93,16 @@
   (define-record-type linklet (fields bytes imports gc? scopes))
 
   ;; One wasm store: a compile-time store (one per module compilation) or a
-  ;; run-time store. instances: names instantiated in it. wrappers: the
-  ;; entry linklets calling module passes. values: getter -> (handle .
-  ;; transformer?) of each compile-time value fetched so far.
+  ;; run-time store. instances: names instantiated in it. values: getter ->
+  ;; (handle . transformer?) of each compile-time value fetched so far.
   (define-record-type cstore
-    (fields host marshal instances wrappers values (mutable counter)))
+    (fields host marshal instances values (mutable counter)))
 
   ;; The state of one module's compilation.
   (define-record-type comp
     (fields module store (mutable linklet-counter) (mutable use-site-scopes)
             (mutable freestanding-form) phase-forms memories tables (mutable provide-ids)
             (mutable require-names)            ; ((name . phase) . module)
-            (mutable passes)                   ; ((function-info . form) ...), in order
             (mutable definition-keys)          ; keys of its phase-0 definitions
             (mutable storage-linklets)))         ; ((memory-or-table . phase) . linklet that defines it)
 
@@ -135,7 +132,7 @@
   (define (ensure-library!)
     (unless syntax-lib
       (let* ([m (make-unit library-name library-name "syntax" 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
-             [c (make-comp m #f 0 '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '() '())])
+             [c (make-comp m #f 0 '() #f (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '())])
         (with-comp c
           (lambda ()
             (parameterize ([current-syntax-infos #f])
@@ -172,7 +169,7 @@
     (ensure-library!)
     (let* ([h (host-new)]
            [st (make-cstore h (make-store h) (make-hashtable string-hash string=?)
-                            (make-eq-hashtable) (make-eq-hashtable) 0)])
+                            (make-eq-hashtable) 0)])
       (host-set-callback! h expander-callback)
       (when compile-time? (ensure-import! st "syntax" 0))
       st))
@@ -275,9 +272,8 @@
   ;; a definition a macro makes from its input is visible to the rest of
   ;; the module (spec 6.2). A second binding of the same name with the same
   ;; scopes at the same phase is an error, except that a definition shadows
-  ;; what require-unqualified imports (spec 3.1), and in what a module pass
-  ;; or #%linklet returns, where it replaces this module's definition (spec
-  ;; 6.5, 6.6).
+  ;; what require-unqualified imports (spec 3.1), and in what #%linklet
+  ;; returns, where it replaces this module's definition (spec 6.5).
   (define (bind-definition! id phase meaning)
     (let ([id (remove-scopes id (comp-use-site-scopes current))])
       (unless (and redefining? (redefine! id phase meaning))
@@ -536,7 +532,7 @@
          (let* ([name (fresh-unit-name path)]
                 [m (make-unit path source name 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
                 [c (make-comp m (new-cstore #t) 0 '() #f
-                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '() '())])
+                              (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '())])
            (hashtable-set! registry path m)
            (hashtable-set! modules-by-name name m)
            (with-comp c
@@ -564,11 +560,10 @@
           [tbl (hashtable-ref (comp-tables current) phase #f)])
       (append (if mem (list mem) '()) (if tbl (list tbl) '()))))
 
-  ;; Run the module passes over the expanded phase-0 code, resolve provides,
+  ;; Run #%linklet over the expanded phase-0 code, resolve provides,
   ;; compile each phase's linklet, check (freestanding).
   (define (finish-module! c)
     (let ([m (comp-module c)])
-      (unit-expanded-set! m (apply-module-passes c (unit-expanded m)))
       (unit-expanded-set! m (apply-linklet-hook 'module (unit-expanded m)
                                                 (make-stx 'module (list (unit-scope m) core-scope) #f '()) 0))
       (removed-definitions (definitions-removed c (unit-expanded m)))
@@ -699,8 +694,8 @@
             (head-expand (apply-macro head t s phase #t) phase)
             s))))
 
-  ;; While expanding the forms a module pass or #%linklet returned, what
-  ;; returned them (spec 6.5, 6.6); otherwise #f.
+  ;; While expanding the forms #%linklet returned, what returned them (spec
+  ;; 6.5); otherwise #f.
   (define redefining? #f)
 
   ;; A module body being expanded: its phase, the items pass 1 found
@@ -742,14 +737,14 @@
   ;; Pass 1 for module-level form f0 of body b: expand macro uses at its
   ;; head, then declare it, run it, or keep it for pass 2. only is #f, or
   ;; says where the form came from if it may only be a definition or an
-  ;; expression (what a module pass returns, or what a macro lifts).
+  ;; expression (what #%linklet returns, or what a macro lifts).
   (define (declare-form! f0 b only)
     (let* ([phase (body-phase b)]
            [f (head-expand f0 phase)]
            [kind (core-head f phase)])
       (define (item! x) (body-items-set! b (cons x (body-items b))))
       (when (and only
-                 (memq kind '(require require-unqualified provide freestanding module-pass memory table
+                 (memq kind '(require require-unqualified provide freestanding memory table
                               define-syntax begin-for-syntax)))
         (raise-compile-error f "~a (~a ...), but only func, global, import, type and data forms and expressions are allowed there"
                              only kind))
@@ -759,7 +754,6 @@
         [(require-unqualified) (require! f phase #t)]
         [(provide) (provide! f phase)]
         [(freestanding) (freestanding! f phase)]
-        [(module-pass) (module-pass! f phase)]
         [(func) (item! (declare-func f phase))]
         [(global) (item! (declare-global f phase))]
         [(import) (item! (declare-import f phase))]
@@ -1445,13 +1439,6 @@
                                       (list 'call (syntax-info result) (list body))))
                           #f)))
 
-  ;; The entry linklet that calls module pass f, in st.
-  (define (pass-entry st f)
-    (or (hashtable-ref (cstore-wrappers st) f #f)
-        (let ([entry (entry-linklet! st #t (lambda (arg) (list 'call f (list arg))) '%handle)])
-          (hashtable-set! (cstore-wrappers st) f entry)
-          entry)))
-
   ;; A compile-time value in st, from its getter function, as (handle .
   ;; transformer?). Fetched when first needed, perhaps while a macro runs,
   ;; so the handle is pinned.
@@ -1519,7 +1506,7 @@
             (list 'call info (list (list 'lref s))))))
 
   ;; The phase+1 function id names, checked to take and return syntax and
-  ;; to be defined already: a transformer or a module pass.
+  ;; to be defined already: a transformer.
   (define (syntax-function-of id phase what)
     (let ([m (meaning-of id (+ phase 1))])
       (unless (and m (eq? (car m) 'func))
@@ -1531,18 +1518,6 @@
         (unless (func-info-instance info)
           (raise-compile-error id "~a must be defined by an earlier begin-for-syntax" (stx-e id)))
         info)))
-
-  ;; (module-pass f): once the module is expanded, the phase+1 function f
-  ;; rewrites its expanded phase-0 code (spec 6.6). Passes run in the order
-  ;; they are declared.
-  (define (module-pass! f phase)
-    (let ([parts (stx-list-of f 'module-pass)])
-      (unless (and (= (length parts) 2) (id? (cadr parts)))
-        (raise-compile-error f "expected (module-pass function)"))
-      (unless (= phase 0)
-        (raise-compile-error f "module-pass belongs at phase 0"))
-      (comp-passes-set! current (append (comp-passes current)
-                                        (list (cons (syntax-function-of (cadr parts) phase "a module pass") f))))))
 
   ;; (begin-for-syntax form ...): a unit for #%linklet.
   (define (begin-for-syntax! f phase)
@@ -1644,7 +1619,7 @@
           out)))
 
   ;; Call a phase-1 function from syntax to syntax on s in the current
-  ;; compile-time store: a transformer, or a module pass, which may also
+  ;; compile-time store: a transformer, or #%linklet, which may also
   ;; return a plain list (list-ok?). (call host in) calls it on handle in
   ;; and returns the result's handle. While it runs, the
   ;; expander queries answer for phase, blame s, and local-expand uses
@@ -1676,31 +1651,6 @@
                                    who))
             result))
         (lambda () (set! api-phase saved-phase) (set! api-where saved-where) (set! api-intro saved-intro)))))
-
-  ;; Run the module passes over forms, this module's expanded phase-0 code,
-  ;; in order (spec 6.6). A pass gets the forms as one syntax list and
-  ;; returns a list of forms, which are expanded again: a definition there
-  ;; replaces this module's definition of the same name. Each pass has an
-  ;; introduction scope, as a macro does, so the names it introduces cannot
-  ;; capture the module's.
-  (define (apply-module-passes c forms)
-    (fold-left
-     (lambda (forms pass)
-       (let* ([intro (new-scope!)]
-              [where (cdr pass)]
-              [entry (pass-entry (comp-store current) (car pass))]
-              [result (flip-scope (call-syntax-function "the module pass"
-                                                        (lambda (host in) (host-call host entry "__entry" in))
-                                                        (flip-scope (out-list where forms) intro) 0 intro #t)
-                                  intro)]
-              [new (or (stx->list result)
-                       (raise-compile-error where "the module pass returned something other than a list of forms"))])
-         (dynamic-wind
-           (lambda () (set! redefining? "a module pass returned"))
-           (lambda () (expand-body new 0))
-           (lambda () (set! redefining? #f)))))
-     forms
-     (comp-passes c)))
 
   ;; An object inside syntax x (its datum or its properties) with no Chez
   ;; counterpart, or #f.
@@ -1808,8 +1758,8 @@
   ;; The core forms in fully expanded code are named by identifiers with only
   ;; the core scope, so they mean the core forms in any module, whatever it
   ;; binds. Everything else keeps its scopes. So fully expanded code can be
-  ;; expanded again: macros can embed the result of local-expand, and a
-  ;; module pass returns fully expanded code.
+  ;; expanded again: macros can embed the result of local-expand, and
+  ;; #%linklet returns fully expanded code.
 
   ;; The identifier for core form `name` in fully expanded code.
   (define (core-id name where) (make-stx name (list core-scope) (and where (stx-srcloc where)) '()))
@@ -2490,16 +2440,16 @@
       info))
 
   ;; While lowering a module's phase-0 code: the infos of its definitions
-  ;; that its module passes removed, which its code must not use.
+  ;; that #%linklet removed, which its code must not use.
   (define removed-definitions (make-parameter #f))
 
   (define (check-not-removed info id)
     (let ([removed (removed-definitions)])
       (when (and removed (hashtable-contains? removed info))
-        (raise-compile-error id "~a is used, but a module pass removed its definition" (stx-e id)))))
+        (raise-compile-error id "~a is used, but #%linklet removed its definition" (stx-e id)))))
 
   ;; The infos of c's phase-0 definitions (functions, imports, globals,
-  ;; data) that forms, its code after the module passes, no longer defines.
+  ;; data) that forms, its code after #%linklet, no longer defines.
   (define (definitions-removed c forms)
     (let ([kept (make-eq-hashtable)] [removed (make-eq-hashtable)])
       (for-each (lambda (f)

@@ -502,7 +502,6 @@ quotation and compile-time forms.
 (require-unqualified name source)   ; every provided name unqualified too (3.1)
 (provide item ...)                  ; phase 0 only; item: x or [new old]
 (freestanding)                      ; see 3.4
-(module-pass f)                     ; phase 0; f: a phase+1 function (6.6)
 (define-syntax name expr)           ; name bound to expr's value at phase+1 (6.3)
 (define-syntax name f)              ; f: a phase+1 function; a transformer (2.1)
 (begin-for-syntax form ...)         ; forms at phase+1
@@ -853,8 +852,8 @@ self-hosted expander will hold references directly and need no copy.
 Expansion turns a module into **fully expanded code**, as Racket calls it:
 syntax in the grammar
 below, with every macro use expanded and every application and literal
-explicit. `local-expand` returns it, module passes and `#%linklet` (6.5)
-receive and return it,
+explicit. `local-expand` returns it, `#%linklet` (6.5) receives and returns
+it,
 `sub expand` prints it, and the compiler compiles it once no `lambda`
 remains (5.3).
 
@@ -884,7 +883,7 @@ expr ::= id                                   ; a local or global variable, or a
 ```
 
 - The other module-level forms (`require`, `provide`, `memory`, `table`,
-  `freestanding`, `module-pass`, `define-syntax`, `begin-for-syntax`)
+  `freestanding`, `define-syntax`, `begin-for-syntax`)
   take effect during expansion and leave nothing.
   `let*` becomes nested `let`s. `quasiquote` and `quasisyntax` become
   calls to the syntax library's functions, through identifiers with a
@@ -894,7 +893,7 @@ expr ::= id                                   ; a local or global variable, or a
   binding, which `local-binding` reads (2.3).
 - Types appear where the source wrote them: parameters, results,
   globals, and `let` bindings that give one. Fully expanded code carries no
-  inferred types; the kernel's checker infers them after the passes, as
+  inferred types; the kernel's checker infers them after `#%linklet`, as
   it does for any code. Type functions (5.1) are expanded: types in fully
   expanded code contain no macro uses.
 - **The core forms in fully expanded code are named by identifiers with
@@ -914,8 +913,7 @@ expr ::= id                                   ; a local or global variable, or a
 
 A **unit** is code that becomes a linklet or part of one (3.1): a module's
 phase-0 code, a `begin-for-syntax`, or the right-hand side of a
-`define-syntax`. Once a unit is expanded, and for a module's phase-0 code
-once its module passes have run (6.6), the kernel resolves the identifier
+`define-syntax`. Once a unit is expanded, the kernel resolves the identifier
 `#%linklet` at the unit's phase, with the scopes of where the unit's code
 was written: the module's own, the `begin-for-syntax` form's, or the
 right-hand side's.
@@ -933,8 +931,11 @@ right-hand side's.
   definitions it needs.
 - What it returns must be fully expanded. It is expanded again only to
   bind the names it introduces: a macro use there is an error, and a
-  definition there replaces the unit's own of the same name and scopes. A
-  form it returns unchanged, the same object as a form it was given, and
+  definition there replaces the unit's own of the same name and scopes, so
+  the hook can change a function's body or signature. A definition it
+  leaves out is removed, and code that still uses it, or a `provide` of
+  it, is an error. It may return only `func`, `global`, `import`, `type`,
+  `rec` and `data` forms and expressions. A form it returns unchanged, the same object as a form it was given, and
   in the same order among those, introduces nothing, so it is not expanded
   again. The transformer has an introduction scope, as a macro use does
   (6.2).
@@ -947,30 +948,6 @@ right-hand side's.
   unit, and makes the value of a `define-syntax` unit a transformer when
   it is a procedure. A language built on another provides that one's
   `#%linklet`, or its own that runs it.
-
-### 6.6 Module passes
-
-`(module-pass f)` declares that once the module is expanded, the phase+1
-function `f`, of type `(eqref) -> eqref`, rewrites the
-module's phase-0 fully expanded code. Passes run in the order they are declared.
-A library usually provides a macro that expands into the declaration.
-
-- A pass gets the module's forms as one syntax list and returns a list of
-  forms, as a syntax list or a plain list. It may add, remove and rewrite
-  forms, and write any code, not only fully expanded code.
-- What it returns is expanded again, then type-checked and compiled like
-  any code, so a pass's mistakes are compile errors. A definition it
-  returns with the same name and scopes as one of the module's replaces
-  that definition, so a pass can change a function's body or signature.
-  A definition it leaves out is removed, and code that still uses it, or
-  a `provide` of it, is an error.
-  It may return only `func`, `global`, `import`, `type` and `data` forms
-  and expressions.
-- A pass has an introduction scope, as a macro use does (6.2): flipped on
-  its input and its output, so the names it introduces, such as a global
-  it adds, cannot capture the module's names or be named by them.
-- A module's passes run before its `#%linklet` (6.5), the hook with which a
-  language rewrites every unit of the modules that take it.
 
 ## 7. Open questions and later milestones
 
@@ -1058,8 +1035,7 @@ expander.
   returns. A compile-time value is fetched the first time it is needed,
   perhaps while a macro runs, so its handle is pinned: pinned handles are
   negative, index a second table, and are never released. Each store gets
-  a small entry linklet per compile-time value and per module pass it
-  uses, which converts between handles and references. Transformers are
+  a small entry linklet per compile-time value it uses, which converts between handles and references. Transformers are
   called through `%h-call-transformer`.
   After bootstrap this section goes away.
 - **Shifted literals**: `%scope-map-add` tells `%make-syntax` to replace
