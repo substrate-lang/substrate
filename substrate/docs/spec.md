@@ -195,7 +195,7 @@ them in Chez; in a run-time store they trap.
   - `(require-unqualified name source)` is `require` with every name the
     source provides bound unqualified too, with the scopes of `name`. It
     is meant for a language: the forms and functions its code is written
-    in, such as its `define` and `#%app`, and little else, since
+    in, such as its `define`, `#%app` and `#%linklet` (6.5), and little else, since
     unqualified names hide where a binding comes from. As in Racket, where
     a module's definitions shadow its language's bindings, a module-level
     definition of one of these names shadows the import throughout the
@@ -387,7 +387,7 @@ quotation and compile-time forms.
 (require-unqualified name source)   ; every provided name unqualified too (3.1)
 (provide item ...)                  ; phase 0 only; item: x or [new old]
 (freestanding)                      ; see 3.4
-(module-pass f)                     ; phase 0; f: a phase+1 function (6.5)
+(module-pass f)                     ; phase 0; f: a phase+1 function (6.6)
 (define-syntax name expr)           ; name bound to expr's value at phase+1 (6.3)
 (define-syntax name f)              ; f: a phase+1 function; a transformer (2.1)
 (begin-for-syntax form ...)         ; forms at phase+1
@@ -517,9 +517,8 @@ GC instructions take their type and field immediates by name:
   The kernel gives `lambda` a meaning but no representation: a language
   lowers each `lambda` to other kernel code, usually a struct holding the
   captured values and a reference to a module-level function, and chooses
-  how. The compiler rejects a `lambda` that has not been lowered. [v0] A
-  language lowers its lambdas in a macro, which sees the code it expands;
-  Substrate lowers those in each `define`'s value.
+  how. The compiler rejects a `lambda` that has not been lowered. A
+  language lowers its lambdas in its `#%linklet` (6.5).
 - **Application is an implicit form**, as in Racket. A form whose head is
   not bound to a macro, a core form or a wasm operator, including one
   whose head is not an identifier, is expanded as `(#%app head arg ...)`.
@@ -669,7 +668,9 @@ run at phase+1 now, and `s` is bound to its value, an `eqref`, a
   may come from a module required inside `begin-for-syntax`.
 
 The value lives in a global of the phase+1 linklet, so another module that
-requires this one computes it again in its own compile-time store.
+requires this one computes it again in its own compile-time store. The
+right-hand side is a unit for `#%linklet` (6.5), which may make its value a
+transformer: Substrate's makes a procedure one.
 
 [v0] Stage0 expands in Chez, so syntax crosses between Chez and wasm by
 copy, through the syntax library's embedder functions (appendix A). The
@@ -680,7 +681,8 @@ self-hosted expander will hold references directly and need no copy.
 Expansion turns a module into **fully expanded code**, as Racket calls it:
 syntax in the grammar
 below, with every macro use expanded and every application and literal
-explicit. `local-expand` returns it, module passes receive and return it,
+explicit. `local-expand` returns it, module passes and `#%linklet` (6.5)
+receive and return it,
 `subc expand` prints it, and the compiler compiles it once no `lambda`
 remains (5.3).
 
@@ -733,7 +735,42 @@ expr ::= id                                   ; a local or global variable
   fully expanded code goes before the module-level form whose expansion
   lifted them.
 
-### 6.5 Module passes
+### 6.5 The linklet hook
+
+A **unit** is code that becomes a linklet or part of one (3.1): a module's
+phase-0 code, a `begin-for-syntax`, or the right-hand side of a
+`define-syntax`. Once a unit is expanded, and for a module's phase-0 code
+once its module passes have run (6.6), the kernel resolves the identifier
+`#%linklet` at the unit's phase, with the scopes of where the unit's code
+was written: the module's own, the `begin-for-syntax` form's, or the
+right-hand side's.
+
+- The core `#%linklet` leaves the unit as it is. A language binds
+  `#%linklet` to a transformer (2.1) and provides it; a module that takes
+  the language with `require-unqualified` gets it. The kernel calls the
+  transformer with `(#%linklet kind form ...)`, where `kind` is the symbol
+  `module`, `begin-for-syntax` or `define-syntax`, and the forms are the
+  unit's fully expanded code (6.4). A `define-syntax` unit has one form,
+  the right-hand side.
+- The transformer returns the unit's forms as a list. It may rewrite
+  forms and add definitions. For a `define-syntax` unit the last form is
+  the expression whose value `define-syntax` binds, and the others are
+  definitions it needs.
+- What it returns must be fully expanded. It is expanded again only to
+  bind the names it introduces: a macro use there is an error, and a
+  definition there replaces the unit's own of the same name and scopes. The
+  transformer has an introduction scope, as a macro use does (6.2).
+- `#%linklet` is resolved per phase, so a module's phase-1 code gets the
+  hook of the language it takes at phase 1, which may differ from its
+  phase-0 language. A module whose phase-1 code is kernel code gets the
+  core hook.
+- This is where a language lowers `lambda` (5.3) and makes its values
+  transformers. Substrate's `#%linklet` converts the closures of every
+  unit, and makes the value of a `define-syntax` unit a transformer when
+  it is a procedure. A language built on another provides that one's
+  `#%linklet`, or its own that runs it.
+
+### 6.6 Module passes
 
 `(module-pass f)` declares that once the module is expanded, the phase+1
 function `f`, of type `(eqref) -> eqref`, rewrites the
@@ -754,20 +791,31 @@ A library usually provides a macro that expands into the declaration.
 - A pass has an introduction scope, as a macro use does (6.2): flipped on
   its input and its output, so the names it introduces, such as a global
   it adds, cannot capture the module's names or be named by them.
-- Racket reaches a module's fully expanded code through `#%module-begin` and
-  `local-expand` of the whole body. The kernel has no `#%module-begin`: a
-  library that wants a module's body gets it by having the module wrap the
-  body in one of its macros, and a pass works on the expanded result.
+- A module's passes run before its `#%linklet` (6.5), the hook with which a
+  language rewrites every unit of the modules that take it.
 
 ## 7. Open questions and later milestones
 
+- **Extending a language's hook**: a library that adds a stage to a
+  language's `#%linklet`, such as CPS for general effect handlers, provides
+  its own `#%linklet` that runs the language's. A module that takes both
+  the language and the library with `require-unqualified` then binds
+  `#%linklet` twice, which is an error, so the library must provide the
+  whole language itself. `provide` lists names one by one; that wants a
+  form for everything a module provides except some names. Nothing needs
+  it until a library adds a stage.
+- **Controlling expansion**: `#%linklet` rewrites a unit after it is
+  expanded (6.5). A language cannot change how a module body expands, as
+  Racket's `#%module-begin` can. Nothing planned needs that.
 - **Inferred types in fully expanded code**: fully expanded code carries
   only the types the source wrote (6.4). A pass that creates wasm
   declarations from the code it rewrites, such as CPS for general effect
   handlers or closure conversion for a typed language, would need the
   checker to write types into fully expanded code before the pass, and
-  queries for the types of imported definitions. Nothing planned before
-  bootstrap needs this.
+  queries for the types of imported definitions. Substrate's `#%linklet`
+  gives a captured variable the type it is written with, or `eqref`, so a
+  lambda that captures a kernel local whose inferred type is another fails
+  to type-check. Nothing planned before bootstrap needs more.
 - **Structs after the typed layer**: declared types are identified by
   structure (5.1), so `lib/struct.sub`'s accessors check brands at run
   time: passing a `fahrenheit` to `celsius-t` is a run-time error, where

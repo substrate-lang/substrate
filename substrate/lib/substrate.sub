@@ -16,8 +16,7 @@
 ;;                                  a function too
 ;;   (define x e)                   a variable
 ;;   (lambda params body ...)       a closure, with params (x ...),
-;;                                  (x ... . rest) or rest; allowed inside
-;;                                  a define
+;;                                  (x ... . rest) or rest
 ;;   (case-lambda [params body ...] ...)
 ;;                                  a closure that runs the first clause
 ;;                                  taking the arguments it is given
@@ -36,9 +35,12 @@
 ;;                                  the option #:mutable makes them all
 ;;                                  mutable
 ;;   (define-syntax (name stx) body ...), (define-syntax name expr)
-;;                                  a macro whose transformer is a
-;;                                  Substrate procedure; the module must
-;;                                  also take Substrate at phase 1
+;;                                  a macro, if the value is a procedure,
+;;                                  which becomes its transformer; the
+;;                                  module must also take Substrate at
+;;                                  phase 1
+;;   #%linklet                      the hook that lowers every lambda
+;;                                  (spec 6.5)
 ;;
 ;; and the functions the provide below lists, grouped as they are defined
 ;; at the end. A function given an argument of the wrong type, or the wrong
@@ -64,14 +66,13 @@
 ;; Closure conversion. A lambda or case-lambda expands to a kernel lambda
 ;; (spec 5.3) taking the number of arguments and the first four, whose body
 ;; runs the first clause that takes them. The kernel compiles a lambda only
-;; once it is lowered. define's value is converted: (convert e) expands e
-;; (local-expand) and converts the fully expanded code (spec 6.4), in which
+;; once it is lowered, and Substrate's #%linklet (spec 6.5) lowers every
+;; lambda of each unit a module that takes Substrate compiles, at any phase:
 ;; each lambda becomes a struct.new of its closure, holding the values of
-;; the variables it captures, and its code a module-level function
-;; (syntax-local-lift-definition). A variable that is captured and also
-;; assigned becomes a box, so the lambda and the code around it share it.
-;; This is done per definition, so it works at every phase. A lambda
-;; outside a define is not converted, and the kernel reports it.
+;; the variables it captures, and its code a module-level function. A
+;; variable that is captured and also assigned becomes a box, so the lambda
+;; and the code around it share it. A module that builds a language on
+;; Substrate provides Substrate's #%linklet, or its own that runs it.
 
 (require s syntax)
 (require mt "match.sub" else)
@@ -79,7 +80,7 @@
 (provide [define substrate-define] [lambda substrate-lambda] [case-lambda substrate-case-lambda]
          [set! substrate-set!] [#%app app] [#%datum datum]
          [if substrate-if] cond else when unless and or [let substrate-let] letrec case do
-         [struct substrate-struct] [define-syntax substrate-define-syntax]
+         [struct substrate-struct] [define-syntax substrate-define-syntax] #%linklet
          ;; equivalence and predicates
          eq? eqv? equal? not boolean? procedure?
          ;; pairs and lists
@@ -136,6 +137,18 @@
 ;; The arguments after the first four, of the call being made.
 (type arguments (array (mut eqref)))
 (global extra-args (mut (ref arguments)) (array.new arguments (ref.null eq) 8))
+
+;; A procedure as a transformer (spec 2.1), for a define-syntax at phase 1:
+;; the transformer's code calls the procedure with the syntax.
+(type transformer-code (func (eqref eqref -> eqref)))
+
+(func (call-procedure [p eqref] [stx eqref]) -> eqref (type transformer-code)
+  (let ([c (ref.cast (ref closure) p)])
+    (call-ref code (struct.get closure code c) c 1 stx (ref.null eq) (ref.null eq) (ref.null eq))))
+
+;; v as a transformer if it is a procedure, else v itself.
+(func (transformer-or-value [v eqref]) -> eqref
+  (if (ref.test (ref closure) v) (s:make-transformer (ref.func call-procedure) v) v))
 
 ;; ---- run-time errors ---------------------------------------------------------------
 
@@ -741,12 +754,11 @@
       (if (s:identifier? (s:cadr parts))
           (let ([f (kernel-lambda-of (s:caddr parts) (s:cadr parts))])
             (return (if (ref.is_null f)
-                        #`(global #,(s:cadr parts) (mut eqref) (convert #,(s:caddr parts)))
-                        #`(global #,(s:cadr parts) (ref closure) (convert #,f #,(s:cadr parts)))))))
+                        #`(global #,(s:cadr parts) (mut eqref) #,(s:caddr parts))
+                        #`(global #,(s:cadr parts) (ref closure) #,f)))))
       (let* ([head (s:splice-list (s:cadr parts))] [name (s:car head)])
         #`(global #,name (ref closure)
-                  (convert #,(kernel-lambda (s:cons (s:cons (s:cdr head) (s:cddr parts)) '()) name 1 stx)
-                           #,name)))))
+                  #,(kernel-lambda (s:cons (s:cons (s:cdr head) (s:cddr parts)) '()) name 1 stx)))))
 
   ;; (lambda params body ...)
   (func (substrate-lambda [stx eqref]) -> eqref
@@ -919,47 +931,19 @@
         (let ([spec (s:syntax->list (s:car specs))])
           (s:cons (if (s:null? (s:cddr spec)) (s:car spec) (s:caddr spec)) (do-steps (s:cdr specs))))))
 
-  ;; (define-syntax (name stx) body ...), or (define-syntax name expr) where
-  ;; expr is a lambda or case-lambda: a macro whose transformer is a
-  ;; Substrate procedure, defined at phase 1 in the using module, which must
-  ;; take Substrate there too:
+  ;; (define-syntax (name stx) body ...) is (define-syntax name (lambda (stx)
+  ;; body ...)), with lambda taken from where the form was written, so that
+  ;; it means Substrate's lambda at phase 1 there: the module must take
+  ;; Substrate at phase 1 too, with
   ;; (begin-for-syntax (require-unqualified substrate ".../substrate.sub")).
-  ;; Their names come from this macro's templates, so each use makes its
-  ;; own; the define and the call are made with the use site's scopes, so
-  ;; they mean Substrate's define and call there. Any other (define-syntax
-  ;; name expr) is the kernel's: a kernel transformer function, or a
-  ;; compile-time value. A transformer must be written as one of these
-  ;; forms.
-  ;; Is e a lambda or case-lambda form?
-  (func (procedure-form? [e eqref]) -> i32
-    (let ([l (s:syntax->list e)])
-      (if (ref.is_null l) (return 0))
-      (if (s:null? l) (return 0))
-      (if (i32.eqz (s:identifier? (s:car l))) (return 0))
-      (if (s:free-identifier=? (s:car l) #'substrate-lambda) (return 1))
-      (s:free-identifier=? (s:car l) #'substrate-case-lambda)))
-
+  ;; Every other define-syntax is the kernel's. Substrate's #%linklet at
+  ;; phase 1 makes a procedure value a transformer.
   (func (substrate-define-syntax [stx eqref]) -> eqref
     (let* ([parts (s:syntax->list stx)] [head (s:cadr parts)])
-      (if (s:identifier? head)
-          (if (i32.eqz (procedure-form? (s:caddr parts)))
-              (return #`(define-syntax #,head #,(s:caddr parts)))))
-      (let* ([name (if (s:identifier? head) head (s:car (s:splice-list head)))]
-             [expr (if (s:identifier? head)
-                       (s:caddr parts)
-                       (s:datum->syntax head (s:cons 'lambda (s:cons (s:cdr (s:splice-list head)) (s:cddr parts))) head))]
-             [procedure #'transformer]
-             [kernel #'kernel-transformer]
-             [x #'stx])
-        #`(begin
-            (begin-for-syntax
-              #,(s:datum->syntax name (s:cons 'define (s:cons procedure (s:cons expr '()))) name))
-            (begin-for-syntax
-              #,(s:datum->syntax name
-                                 (s:cons 'func (s:cons (s:cons kernel (s:cons (s:cons x (s:cons 'eqref '())) '()))
-                                                       (s:cons '-> (s:cons 'eqref (s:cons (s:cons procedure (s:cons x '())) '())))))
-                                 name))
-            (define-syntax #,name #,kernel)))))
+      (if (s:identifier? head) (return #`(define-syntax #,@(s:cdr parts))))
+      (let ([h (s:splice-list head)])
+        #`(define-syntax #,(s:car h)
+            #,(s:datum->syntax head (s:cons 'lambda (s:cons (s:cdr h) (s:cddr parts))) head)))))
 
   ;; (struct name (field ...) option ...): a field is an id or
   ;; [id #:mutable], and the option #:mutable makes every field mutable.
@@ -1037,14 +1021,18 @@
 
   ;; ---- closure conversion ----
   ;;
-  ;; Two walks over fully expanded code (spec 6.4). env is the list of
-  ;; binders in scope, innermost first; a reference is found in it by binding
-  ;; (free-identifier=?), so a variable is its binder, compared by
-  ;; identity.
+  ;; Substrate's #%linklet (spec 6.5) lowers the lambdas of a unit. Two
+  ;; walks over each form of its fully expanded code (spec 6.4) that has a
+  ;; lambda: the first finds the variables lambdas capture and those set!
+  ;; assigns, the second rewrites. env is the list of binders in scope,
+  ;; innermost first; a reference is found in it by binding
+  ;; (free-identifier=?), so a variable is its binder, compared by identity.
 
   (global assigned (mut eqref) '())   ; binders set! assigns
   (global captured (mut eqref) '())   ; binders some lambda captures
+  (global typed (mut eqref) '())      ; (binder . type) for binders written with a type
   (global free (mut eqref) '())       ; the variables the current lambda captures
+  (global lifted (mut eqref) '())     ; the definitions conversion made, newest first
 
   (func (lookup [x eqref] [env eqref]) -> eqref
     (if (s:null? env) (return '#f))
@@ -1063,6 +1051,20 @@
     (if (s:null? (s:cddr l)) (return '()))
     (if (named? (s:caddr l) '->) (take (s:cddr l) 2) '()))
   (func (lambda-body [l eqref]) -> eqref (drop-n (s:cddr l) (s:length (lambda-arrow l))))
+
+  ;; Does x have a lambda in it?
+  (func (has-lambda? [x eqref]) -> i32
+    (let ([l (s:syntax->list x)])
+      (if (i32.or (ref.is_null l) (s:null? l)) (return 0))
+      (if (i32.or (named? (s:car l) 'quote) (named? (s:car l) 'quote-syntax)) (return 0))
+      (if (lambda? l) (return 1))
+      (block done
+        (loop next
+          (br-if done (s:null? l))
+          (if (has-lambda? (s:car l)) (return 1))
+          (set! l (s:cdr l))
+          (br next)))
+      0))
 
   ;; Where a form's expressions start: after its head and the parts that
   ;; name labels, functions, types and fields. -1 for a form with none.
@@ -1083,10 +1085,30 @@
   ;; The expression a binding binds: [x e] or [x type e].
   (func (binding-init [b eqref]) -> eqref (s:car (s:reverse (s:syntax->list b))))
 
-  ;; Walk x. mode 0 finds captured and assigned variables; outside is env
-  ;; where the innermost enclosing lambda starts. mode 1 finds the
-  ;; variables one lambda captures: those in outside, which stays that
-  ;; lambda's even inside lambdas nested in it.
+  ;; Note the types bindings bs are written with: each is [x type] if they
+  ;; are parameters, else [x e] or [x type e].
+  (func (note-types [bs eqref] [params i32])
+    (if (i32.eqz (s:null? bs))
+        (let ([b (s:syntax->list (s:car bs))])
+          (if (i32.or params (i32.eq (s:length b) 3))
+              (set! typed (s:cons (s:cons (s:car b) (s:cadr b)) typed)))
+          (note-types (s:cdr bs) params))))
+
+  ;; The type binder b is written with, or #f.
+  (func (written-type [b eqref]) -> eqref
+    (let ([l typed])
+      (block done
+        (loop next
+          (br-if done (s:null? l))
+          (if (ref.eq (s:car (s:car l)) b) (return (s:cdr (s:car l))))
+          (set! l (s:cdr l))
+          (br next)))
+      '#f))
+
+  ;; Walk x. mode 0 finds captured and assigned variables, and notes written
+  ;; types; outside is env where the innermost enclosing lambda starts.
+  ;; mode 1 finds the variables one lambda captures: those in outside,
+  ;; which stays that lambda's even inside lambdas nested in it.
   (func (scan [x eqref] [env eqref] [outside eqref] [mode i32])
     (if (s:identifier? x)
         (let ([b (lookup x env)])
@@ -1098,11 +1120,14 @@
     (let ([l (s:syntax->list x)])
       (if (i32.or (ref.is_null l) (s:null? l)) (return))
       (if (lambda? l)
-          (return (scan-list (lambda-body l) (s:append (lambda-params l) env)
-                             (if (i32.eqz mode) env outside) mode)))
+          (let ([ps (s:syntax->list (s:cadr l))])
+            (if (i32.eqz mode) (note-types ps 1))
+            (return (scan-list (lambda-body l) (s:append (binders ps) env)
+                               (if (i32.eqz mode) env outside) mode))))
       (let ([head (s:syntax-e (s:car l))])
         (if (ref.eq head 'let)
             (let ([bs (s:syntax->list (s:cadr l))])
+              (if (i32.eqz mode) (note-types bs 0))
               (scan-inits bs env outside mode)
               (return (scan-list (s:cddr l) (s:append (binders bs) env) outside mode))))
         (if (ref.eq head 'set!)
@@ -1167,12 +1192,24 @@
   (func (field-names [xs eqref] [i i32]) -> eqref
     (if (s:null? xs) '() (s:cons (numbered 'v i) (field-names (s:cdr xs) (i32.add i 1)))))
 
-  ;; A field per captured variable: a box, for a boxed one, else a value.
+  ;; The type of the field for captured variable x: a box if x is boxed,
+  ;; else the type x is written with, or eqref. A box holds an eqref.
+  (func (field-type [x eqref]) -> eqref
+    (let ([t (written-type x)])
+      (if (boxed? x)
+          (begin
+            (if (i32.eqz (ref.is_null t))
+                (if (i32.eqz (named? t 'eqref))
+                    (s:raise-syntax-error
+                     'lambda '"a lambda can capture a variable that is also assigned only if it is an eqref" x)))
+            (return #'(ref box))))
+      (if (ref.is_null t) #'eqref t)))
+
+  ;; A field per captured variable.
   (func (field-decls [fs eqref] [xs eqref]) -> eqref
     (if (s:null? fs)
         '()
-        (s:cons #`(field #,(s:car fs) #,(if (boxed? (s:car xs)) #'(ref box) #'eqref))
-                (field-decls (s:cdr fs) (s:cdr xs)))))
+        (s:cons #`(field #,(s:car fs) #,(field-type (s:car xs))) (field-decls (s:cdr fs) (s:cdr xs)))))
 
   ;; [x (struct.get t f env)] for each captured variable x and its field f.
   (func (env-bindings [xs eqref] [fs eqref] [t eqref]) -> eqref
@@ -1187,48 +1224,111 @@
         (s:cons #`[#,(s:car ps) (struct.new box #,(s:car ps))] (param-boxes (s:cdr ps)))
         (param-boxes (s:cdr ps))))
 
-  ;; A lambda, converted: its code is lifted to a module-level function,
-  ;; named after name (an identifier, or #f), and the lambda becomes its
-  ;; closure.
+  ;; body, with boxed parameters ps put in boxes first.
+  (func (boxing-params [ps eqref] [body eqref]) -> eqref
+    (let ([boxes (param-boxes ps)])
+      (if (s:null? boxes) body (s:cons #`(let (#,@boxes) #,@body) '()))))
+
+  ;; A lambda, converted: its code becomes a module-level function, named
+  ;; after name (an identifier, or #f), and the lambda its closure.
   (func (convert-lambda [l eqref] [env eqref] [name eqref]) -> eqref
     (let* ([params (lambda-params l)] [inner (s:append params env)])
       ;; The variables it captures, in the order they appear.
       (set! free '())
       (scan-list (lambda-body l) inner env 1)
       (let* ([captures (s:reverse free)]
-             [boxes (param-boxes params)]
-             [body (convert-list (lambda-body l) inner)]
-             [body (if (s:null? boxes) body (s:cons #`(let (#,@boxes) #,@body) '()))]
+             [body (boxing-params params (convert-list (lambda-body l) inner))]
              [code (fresh-name (if (s:identifier? name) (s:syntax-e name) 'lambda))]
              [head #`(#,code [self (ref closure)] #,@(s:syntax->list (s:cadr l)))]
              [arrow (lambda-arrow l)])
         (if (s:null? captures)
             (begin
-              (drop (s:syntax-local-lift-definition #`(func #,head #,@arrow (type code) #,@body)))
+              (set! lifted (s:cons #`(func #,head #,@arrow (type code) #,@body) lifted))
               #`(struct.new closure (ref.func #,code)))
             (let ([t (fresh-name 'closure)] [fields (field-names captures 0)])
-              (drop (s:syntax-local-lift-definition
-                     #`(type #,t (sub final closure (struct (field code (ref code)) #,@(field-decls fields captures))))))
-              (drop (s:syntax-local-lift-definition
-                     #`(func #,head #,@arrow (type code)
-                         (let ([env (ref.cast (ref #,t) self)])
-                           (let (#,@(env-bindings captures fields t)) #,@body)))))
+              (set! lifted
+                    (s:cons #`(type #,t (sub final closure (struct (field code (ref code)) #,@(field-decls fields captures))))
+                            lifted))
+              (set! lifted
+                    (s:cons #`(func #,head #,@arrow (type code)
+                                (let ([env (ref.cast (ref #,t) self)])
+                                  (let (#,@(env-bindings captures fields t)) #,@body)))
+                            lifted))
               #`(struct.new #,t (ref.func #,code) #,@captures))))))
 
-  ;; (convert e) or (convert e name): e expanded and converted. If e is a
-  ;; lambda, its code is named after name.
-  (func (convert [stx eqref]) -> eqref
-    (let* ([parts (s:syntax->list stx)]
-           [e (s:local-expand (s:cadr parts))]
-           [l (s:syntax->list e)])
+  ;; Expression e converted; a lambda there is named name.
+  (func (convert-named [e eqref] [name eqref]) -> eqref
+    (let ([l (s:syntax->list e)])
+      (if (i32.eqz (ref.is_null l))
+          (if (i32.eqz (s:null? l))
+              (if (lambda? l) (return (convert-lambda l '() name)))))
+      (convert-expr e '())))
+
+  ;; Where a func form's body starts: after its head, its -> and result,
+  ;; and its (type T) clause.
+  (func (func-body-start [l eqref]) -> i32
+    (let ([i 2])
+      (if (i32.lt_u i (s:length l)) (if (named? (nth l i) '->) (set! i (i32.add i 2))))
+      (if (i32.lt_u i (s:length l))
+          (let ([c (s:syntax->list (nth l i))])
+            (if (i32.eqz (ref.is_null c))
+                (if (i32.eqz (s:null? c))
+                    (if (named? (s:car c) 'type) (set! i (i32.add i 1)))))))
+      i))
+
+  (func (func-params [l eqref]) -> eqref (s:cdr (s:syntax->list (s:cadr l))))
+
+  ;; The first walk, over a module-level form: func, global, import, type,
+  ;; rec, data, or an expression.
+  (func (scan-form [f eqref])
+    (if (i32.eqz (has-lambda? f)) (return))
+    (let* ([l (s:syntax->list f)] [head (s:syntax-e (s:car l))])
+      (if (ref.eq head 'func)
+          (let ([ps (func-params l)])
+            (note-types ps 1)
+            (return (scan-list (drop-n l (func-body-start l)) (binders ps) '() 0))))
+      (if (ref.eq head 'global) (return (scan (nth l 3) '() '() 0)))
+      (scan f '() '() 0)))
+
+  ;; The second walk, over a module-level form.
+  (func (convert-form [f eqref]) -> eqref
+    (if (i32.eqz (has-lambda? f)) (return f))
+    (let* ([l (s:syntax->list f)] [head (s:syntax-e (s:car l))])
+      (if (ref.eq head 'func)
+          (let* ([k (func-body-start l)] [ps (binders (func-params l))])
+            (return (s:syntax-rewrap f (s:append (take l k)
+                                                 (boxing-params ps (convert-list (drop-n l k) ps)))))))
+      (if (ref.eq head 'global)
+          (return (s:syntax-rewrap f (s:append (take l 3) (s:cons (convert-named (nth l 3) (s:cadr l)) '())))))
+      (convert-expr f '())))
+
+  (func (convert-forms [fs eqref]) -> eqref
+    (if (s:null? fs) '() (s:cons (convert-form (s:car fs)) (convert-forms (s:cdr fs)))))
+
+  ;; Substrate's #%linklet, given (#%linklet kind form ...): the unit's forms
+  ;; with their lambdas converted, then the definitions conversion made. The
+  ;; value of a define-syntax unit, its one form, stays last, and is made a
+  ;; transformer if it is a procedure (transformer-or-value).
+  (func (substrate-linklet [stx eqref]) -> eqref
+    (let* ([parts (s:cdr (s:syntax->list stx))]
+           [kind (s:syntax-e (s:car parts))]
+           [forms (s:cdr parts)]
+           [l forms])
       (set! assigned '())
       (set! captured '())
-      (scan e '() '() 0)
-      (if (i32.eqz (s:null? (s:cddr parts)))
-          (if (i32.eqz (ref.is_null l))
-              (if (i32.eqz (s:null? l))
-                  (if (lambda? l) (return (convert-lambda l '() (s:caddr parts)))))))
-      (convert-expr e '()))))
+      (set! typed '())
+      (set! lifted '())
+      (block done
+        (loop next
+          (br-if done (s:null? l))
+          (scan-form (s:car l))
+          (set! l (s:cdr l))
+          (br next)))
+      (if (ref.eq kind 'define-syntax)
+          (let ([value (convert-named (s:car forms) '#f)])
+            (return (s:append (s:reverse lifted) (s:cons #`(transformer-or-value #,value) '())))))
+      (let ([out (convert-forms forms)])
+        (s:append out (s:reverse lifted))))))
 
 (define-syntax substrate-define substrate-define)
 (define-syntax substrate-lambda substrate-lambda)
@@ -1248,7 +1348,7 @@
 (define-syntax do do)
 (define-syntax substrate-struct substrate-struct)
 (define-syntax substrate-define-syntax substrate-define-syntax)
-(define-syntax convert convert)
+(define-syntax #%linklet substrate-linklet)
 
 ;; ---- functions -------------------------------------------------------------------------
 ;;

@@ -2,8 +2,8 @@
 ;; compiler compiles itself.
 ;;
 ;; Expander: syntax objects -> fully expanded code, which is syntax too (spec
-;; 6.4) -> after the module passes (spec 6.5), lowered to the compiler's
-;; input (core.sls).
+;; 6.4) -> after the module passes (spec 6.6) and #%linklet (spec 6.5),
+;; lowered to the compiler's input (core.sls).
 ;;
 ;; Binding is by sets of scopes (spec 6.1). A module is a file; each of its
 ;; phases compiles to one wasm module, a linklet (spec 3.1). While a module is
@@ -31,6 +31,7 @@
   ;; reference, so these are built from strings.
   (define app-sym (string->symbol "#%app"))
   (define datum-sym (string->symbol "#%datum"))
+  (define linklet-sym (string->symbol "#%linklet"))
 
   (define core-forms
     (append
@@ -39,7 +40,7 @@
        return
        call-indirect call-ref ref.func func-index data-address data-size select drop unreachable nop
        quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
-     (list app-sym datum-sym)
+     (list app-sym datum-sym linklet-sym)
      gc-forms))
 
   (define eqref (make-ref #t 'eq))
@@ -250,7 +251,8 @@
   ;; the module (spec 6.2). A second binding of the same name with the same
   ;; scopes at the same phase is an error, except that a definition shadows
   ;; what require-unqualified imports (spec 3.1), and in what a module pass
-  ;; returns, where it replaces this module's definition (spec 6.5).
+  ;; or #%linklet returns, where it replaces this module's definition (spec
+  ;; 6.5, 6.6).
   (define (bind-definition! id phase meaning)
     (let ([id (remove-scopes id (comp-use-site-scopes current))])
       (unless (and redefining? (redefine! id phase meaning))
@@ -512,6 +514,8 @@
   (define (finish-module! c)
     (let ([m (comp-module c)])
       (unit-expanded-set! m (apply-module-passes c (unit-expanded m)))
+      (unit-expanded-set! m (apply-linklet-hook 'module (unit-expanded m)
+                                                (make-stx 'module (list core-scope (unit-scope m)) #f '()) 0))
       (removed-definitions (definitions-removed c (unit-expanded m)))
       (add-phase-forms! 0 (lower-forms (unit-expanded m) 0))
       ;; A provided name exports its binding in each namespace it has one.
@@ -612,7 +616,8 @@
             (head-expand (apply-macro head t s phase #t) phase)
             s))))
 
-  ;; True while expanding the forms a module pass returned (spec 6.5).
+  ;; While expanding the forms a module pass or #%linklet returned, what
+  ;; returned them (spec 6.5, 6.6); otherwise #f.
   (define redefining? #f)
 
   ;; A module body being expanded: its phase, the items pass 1 found
@@ -631,7 +636,7 @@
         (lambda () (set! current-body b))
         (lambda ()
           ;; Pass 1: find definitions, run compile-time forms, splice begins.
-          (for-each (lambda (f) (declare-form! f b (and redefining? "a module pass returned"))) forms)
+          (for-each (lambda (f) (declare-form! f b redefining?)) forms)
           ;; Pass 2: expand bodies and expressions. What an item lifts goes
           ;; before it.
           (body-pass2?-set! b #t)
@@ -1357,10 +1362,11 @@
 
   ;; (define-syntax name expr): name is bound to expr's value at phase+1, a
   ;; compile-time value, which macros read with syntax-local-value; if the
-  ;; value is a transformer, name is a macro. In (define-syntax name f),
-  ;; where f names a phase+1 function of type (eqref) -> eqref, the value is
-  ;; a transformer that calls f. The value lives in a global of the phase+1
-  ;; linklet, computed when the linklet is instantiated.
+  ;; value is a transformer, name is a macro. expr is a unit for #%linklet.
+  ;; In (define-syntax name f), where f names a phase+1 function of type
+  ;; (eqref) -> eqref, the value is a transformer that calls f. The value
+  ;; lives in a global of the phase+1 linklet, computed when the linklet is
+  ;; instantiated.
   (define (define-syntax! f phase)
     (let ([parts (stx-list-of f 'define-syntax)])
       (unless (and (= (length parts) 3) (id? (cadr parts)))
@@ -1372,13 +1378,22 @@
              [adapter (and m (eq? (car m) 'func)
                            (transformer-adapter (string->symbol (string-append "__transformer." base))
                                                 (syntax-function-of rhs phase "a transformer")))]
+             [unit (if adapter
+                       (list adapter)
+                       (let* ([out (apply-linklet-hook 'define-syntax (list (expand-expr rhs (+ phase 1)))
+                                                       rhs (+ phase 1))]
+                              [value (car (last-pair out))])
+                         (when (memq (core-head value (+ phase 1)) '(func global import type rec data))
+                           (raise-compile-error f "#%linklet returned a define-syntax unit that does not end with an expression"))
+                         (append (lower-forms (list-head out (- (length out) 1)) (+ phase 1))
+                                 (list (list 'expr (lower-expr value (+ phase 1)))))))]
              [init (if adapter
                        (list 'call (syntax-info 'make-transformer)
                              (list (list 'ref-func (cadr adapter)) (list 'quote #f)))
-                       (lower-expr (expand-expr rhs (+ phase 1)) (+ phase 1)))]
+                       (cadr (car (last-pair unit))))]
              [global (make-global-info name eqref #t #f #f)]
              [getter (make-func-info name '() (list eqref) #f #f #f)])
-        (run-compile-time-linklet! (append (if adapter (list adapter) '())
+        (run-compile-time-linklet! (append (if adapter unit (list-head unit (- (length unit) 1)))
                                            (list (list 'global global init)
                                                  (list 'func getter '() (list 'gref global))))
                                    (+ phase 1) f)
@@ -1408,7 +1423,7 @@
         info)))
 
   ;; (module-pass f): once the module is expanded, the phase+1 function f
-  ;; rewrites its expanded phase-0 code (spec 6.5). Passes run in the order
+  ;; rewrites its expanded phase-0 code (spec 6.6). Passes run in the order
   ;; they are declared.
   (define (module-pass! f phase)
     (let ([parts (stx-list-of f 'module-pass)])
@@ -1419,10 +1434,49 @@
       (comp-passes-set! current (append (comp-passes current)
                                         (list (cons (syntax-function-of (cadr parts) phase "a module pass") f))))))
 
-  ;; (begin-for-syntax form ...)
+  ;; (begin-for-syntax form ...): a unit for #%linklet.
   (define (begin-for-syntax! f phase)
-    (let ([forms (expand-body (cdr (stx-list-of f 'begin-for-syntax)) (+ phase 1))])
+    (let* ([forms (expand-body (cdr (stx-list-of f 'begin-for-syntax)) (+ phase 1))]
+           [forms (apply-linklet-hook 'begin-for-syntax forms f (+ phase 1))])
       (run-compile-time-linklet! (lower-forms forms (+ phase 1)) (+ phase 1) f)))
+
+  ;; ==== the linklet hook ============================================================
+  ;;
+  ;; A unit is code that becomes a linklet or part of one (spec 6.5): a
+  ;; module's phase-0 code, a begin-for-syntax, or the right-hand side of a
+  ;; define-syntax. Once a unit is expanded, the transformer #%linklet is
+  ;; bound to where the unit's code was written, at the unit's phase,
+  ;; rewrites it; the core #%linklet leaves it as it is. That is where the
+  ;; module was, for its phase-0 code; where the begin-for-syntax form was;
+  ;; and where the right-hand side was, for a define-syntax. What the
+  ;; transformer returns is expanded again, only to bind the names it
+  ;; introduces: it must be fully expanded, so a macro use in it is an
+  ;; error, and its definitions replace the unit's own.
+
+  ;; The unit forms of kind (module, begin-for-syntax or define-syntax) at
+  ;; phase, written where ctx was, after #%linklet.
+  (define (apply-linklet-hook kind forms ctx phase)
+    (let* ([id (make-stx linklet-sym (stx-scopes ctx) (stx-srcloc ctx) '())]
+           [m (meaning-of id phase)]
+           [t (transformer-of m)])
+      (cond
+        [t
+         (let* ([intro (new-scope!)]
+                [in (flip-scope (out-list ctx (cons id (cons (datum->stx ctx kind #f) forms))) intro)]
+                [result (flip-scope (call-syntax-function "#%linklet"
+                                                          (lambda (host in)
+                                                            (host-call host "syntax" "%h-call-transformer" t in))
+                                                          in phase intro #t)
+                                    intro)]
+                [new (or (stx->list result)
+                         (raise-compile-error ctx "#%linklet returned something other than a list of forms"))])
+           (fluid-let ([redefining? "#%linklet returned"] [hook-output? #t])
+             (expand-body new phase)))]
+        [(or (not m) (eq? (car m) 'core)) forms]
+        [else (raise-compile-error ctx "#%linklet is bound here, but not to a transformer")])))
+
+  ;; True while expanding what #%linklet returned.
+  (define hook-output? #f)
 
   ;; ==== macros ======================================================================
 
@@ -1447,6 +1501,9 @@
   ;; use-site scope, which stays.
   ;; transformer is the handle of a transformer value.
   (define (apply-macro head transformer s phase use-site?)
+    (when hook-output?
+      (raise-compile-error head "#%linklet returned code that uses the macro ~a, but it must return fully expanded code"
+                           (stx-e head)))
     (note-macro-use! head phase)
     (let* ([intro (new-scope!)]
            [s (flip-scope s intro)]
@@ -1491,7 +1548,7 @@
         (lambda () (set! api-phase saved-phase) (set! api-where saved-where) (set! api-intro saved-intro)))))
 
   ;; Run the module passes over forms, this module's expanded phase-0 code,
-  ;; in order (spec 6.5). A pass gets the forms as one syntax list and
+  ;; in order (spec 6.6). A pass gets the forms as one syntax list and
   ;; returns a list of forms, which are expanded again: a definition there
   ;; replaces this module's definition of the same name. Each pass has an
   ;; introduction scope, as a macro does, so the names it introduces cannot
@@ -1509,7 +1566,7 @@
               [new (or (stx->list result)
                        (raise-compile-error where "the module pass returned something other than a list of forms"))])
          (dynamic-wind
-           (lambda () (set! redefining? #t))
+           (lambda () (set! redefining? "a module pass returned"))
            (lambda () (expand-body new 0))
            (lambda () (set! redefining? #f)))))
      forms
@@ -1827,6 +1884,8 @@
          (arity-check (= (length parts) 2))
          (core-datum (cadr parts))
          (o (cadr parts))]
+        [(eq? name linklet-sym)
+         (raise-compile-error s "#%linklet is not a form: it names the hook for a unit's code (spec 6.5)")]
         [else
          (case name
            [(quote)
