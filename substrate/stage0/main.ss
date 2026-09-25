@@ -12,8 +12,10 @@
 ;;   subc compile FILE [-o OUT]    write FILE's linklets: phase 0 to OUT, phase p
 ;;                                 to OUT with .phase<p>.wasm
 ;;   subc expand FILE              print FILE's fully expanded phase-0 forms
+;;   subc read FILE                print what the reader reads from FILE, to compare
+;;                                 readers
 ;;   subc syntax-library [-o OUT]  write the compiled syntax library
-(import (chezscheme) (stage0 syntax) (stage0 expander) (stage0 host))
+(import (chezscheme) (stage0 syntax) (stage0 expander) (stage0 host) (stage0 reader))
 
 (define root (or (getenv "SUBSTRATE_ROOT") "."))
 (set-syntax-library-path! (string-append root "/compiler/syntax.sub"))
@@ -39,6 +41,44 @@
 (print-extended-identifiers #t)
 
 (define (print-expanded f) (pretty-print (stx->datum f)))
+
+;; A datum as subc read writes it, for comparing readers: each syntax
+;; object as [line:col:pos:span datum], symbols as Sname, keywords as
+;; Kname, characters as C<code>, strings as their code points, flonums as
+;; F<signed bits>.
+(define (dump x)
+  (cond [(stx? x)
+         (let ([l (stx-srcloc x)])
+           (printf "[~a:~a:~a:~a " (srcloc-line l) (srcloc-col l) (srcloc-pos l) (srcloc-span l))
+           (dump (stx-e x))
+           (display "]"))]
+        [(pair? x)
+         (display "(")
+         (dump (car x))
+         (let loop ([t (cdr x)])
+           (cond [(pair? t) (display " ") (dump (car t)) (loop (cdr t))]
+                 [(null? t) (void)]
+                 [else (display " . ") (dump t)]))
+         (display ")")]
+        [(null? x) (display "()")]
+        [(symbol? x) (display "S") (display (symbol->string x))]
+        [(keyword? x) (display "K") (display (keyword-name x))]
+        [(string? x)
+         (display "\"")
+         (let loop ([cs (string->list x)] [first #t])
+           (unless (null? cs)
+             (unless first (display ","))
+             (display (char->integer (car cs)))
+             (loop (cdr cs) #f)))
+         (display "\"")]
+        [(char? x) (printf "C~a" (char->integer x))]
+        [(and (integer? x) (exact? x)) (display x)]
+        [(flonum? x)
+         (let ([bv (make-bytevector 8)])
+           (bytevector-ieee-double-set! bv 0 x (endianness little))
+           (printf "F~a" (bytevector-s64-ref bv 0 (endianness little))))]
+        [(boolean? x) (display (if x "#t" "#f"))]
+        [else (display "?")]))
 
 (define (die code fmt . args)
   (flush-output-port (current-output-port))
@@ -74,6 +114,8 @@
                                      (format "~a.phase~a.wasm" (strip-extension out) (car p)))
                                  (cdr p)))
                    (module-linklet-list m)))]
+      [(and (= (length args) 2) (string=? (car args) "read"))
+       (for-each (lambda (d) (dump d) (newline)) (read-file (cadr args)))]
       [(and (= (length args) 2) (string=? (car args) "expand"))
        (for-each print-expanded (module-expanded-forms (compile-module-file (cadr args))))]
       [(and (>= (length args) 1) (string=? (car args) "syntax-library"))
