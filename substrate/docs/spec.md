@@ -104,7 +104,7 @@ another type, such as `n:i32`.
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
-| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)` |
+| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)` |
 | queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(raise-syntax-error name message stx)` (aborts expansion; returns nothing), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
 
@@ -138,6 +138,13 @@ another type, such as `n:i32`.
   does not copy the properties of a macro use onto the macro's result.
   [v0] Stage0 can keep only syntax-library data in properties; a macro that
   returns syntax holding another GC object is an error.
+- `local-binding` identifies the local variable that identifier `id`
+  binds or refers to in fully expanded code (6.4): a fixnum, the same at
+  the variable's binder and at each use and different for every local
+  variable in the compilation. It is `#f` for anything else, such as a
+  global, or an identifier that is not in fully expanded code. A pass uses
+  it to tell which binder a variable refers to, as `free-identifier=?`
+  would, but without asking the expander.
 - Accessors trap with a message ("expected a pair") when given the wrong
   kind of value.
 - `free-identifier=?` is 1 when `a` and `b` refer to the same bindings at
@@ -717,6 +724,8 @@ expr ::= id                                   ; a local or global variable
   calls to the syntax library's functions, through identifiers with a
   scope of their own that no module's code has, so user code cannot name
   them.
+- Each local variable, at its binder and at each use, records its
+  binding, which `local-binding` reads (2.3).
 - Types appear where the source wrote them: parameters, results,
   globals, and `let` bindings that give one. Fully expanded code carries no
   inferred types; the kernel's checker infers them after the passes, as
@@ -861,7 +870,8 @@ expander.
   in ascending order; scope 0 is the core scope. The source of a srcloc is
   a symbol naming the file. Line is 1-based, column and position 0-based.
   Properties are a list of `(key . value)` pairs, newest first, with each
-  key at most once.
+  key at most once. The expander records a local variable's binding in
+  the property `%local-binding`.
 - **Memory**: the library's memory holds its error messages, and from
   address 1024 the buffer stage0 copies values through.
 - **Embedder interface (stage0 only)**: Chez cannot hold GC references, so

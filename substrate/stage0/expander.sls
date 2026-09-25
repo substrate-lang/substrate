@@ -1075,7 +1075,7 @@
     (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
            [f (list-ref p 5)] [clause (list-ref p 6)]
            [sc (new-local-scope!)]
-           [xs (map-lr (lambda (pp) (let ([x (add-scope (car pp) sc)]) (bind-local! x phase) x)) params)])
+           [xs (map-lr (lambda (pp) (bound-local (add-scope (car pp) sc) phase)) params)])
       (fluid-let ([current-function (list name)])
         (apply out f 'func
                (out-list (cadr (stx->list f))
@@ -1702,7 +1702,8 @@
         [(symbol? e)
          (let ([m (meaning-of s phase)])
            (case (and m (car m))
-             [(local global) s]
+             [(local) (with-local-binding s (cadr m))]
+             [(global) s]
              [(compile-time-value)
               (let ([t (transformer-of m)])
                 (if t
@@ -1910,8 +1911,9 @@
             (arity-check (and (= (length parts) 3) (id? (cadr parts))))
             (let ([m (meaning-of (cadr parts) phase)])
               (unless (and m (memq (car m) '(local global)))
-                (raise-compile-error (cadr parts) "set!: ~a is not a variable" (stx-e (cadr parts)))))
-            (o (cadr parts) (ex (caddr parts)))]
+                (raise-compile-error (cadr parts) "set!: ~a is not a variable" (stx-e (cadr parts))))
+              (o (if (eq? (car m) 'local) (with-local-binding (cadr parts) (cadr m)) (cadr parts))
+                 (ex (caddr parts))))]
            [(let let*)
             (arity-check (>= (length parts) 2))
             (let ([bs (map-lr (lambda (b)
@@ -1929,7 +1931,7 @@
                   (let* ([inits (map-lr (lambda (bp) (ex (binding-init bp))) bs)]
                          [sc (new-local-scope!)]
                          [xs (map-lr (lambda (bp)
-                                       (let ([x (add-scope (car bp) sc)]) (bind-local! x phase) x))
+                                       (bound-local (add-scope (car bp) sc) phase))
                                      bs)])
                     (apply o (out-list (cadr parts) (map-lr binding-out bs xs inits))
                            (map-lr (lambda (x) (ex (add-scope x sc))) body)))
@@ -1948,7 +1950,7 @@
                               '())]
                    [body (list-tail rest (length arrow))]
                    [sc (new-local-scope!)]
-                   [xs (map-lr (lambda (pp) (let ([x (add-scope (car pp) sc)]) (bind-local! x phase) x)) params)])
+                   [xs (map-lr (lambda (pp) (bound-local (add-scope (car pp) sc) phase)) params)])
               (for-each (lambda (pp) (parse-type (cadr pp) phase)) params)
               (let-values ([(results rest) (parse-results arrow phase)]) (void))
               (fluid-let ([current-function (list s)])
@@ -2029,8 +2031,7 @@
         (let* ([bp (car bs)]
                [init (ex (binding-init bp))]
                [sc (new-local-scope!)]
-               [x (add-scope (car bp) sc)])
-          (bind-local! x phase)
+               [x (bound-local (add-scope (car bp) sc) phase)])
           (let ([later (map-lr (lambda (bp) (map-lr (lambda (y) (add-scope y sc)) bp)) (cdr bs))]
                 [body (map-lr (lambda (y) (add-scope y sc)) body)])
             (apply out s 'let (out-list s (list (binding-out bp x init)))
@@ -2042,6 +2043,18 @@
     (let ([key (bind! id phase #f)])
       (hashtable-set! meanings key (list 'local key))
       key))
+
+  ;; Local variable id, bound, as fully expanded code holds it: recording
+  ;; its binding for local-binding (spec 2.3).
+  (define (bound-local id phase) (with-local-binding id (bind-local! id phase)))
+
+  ;; id, recording that it binds or refers to the local variable with key.
+  ;; The property's key is private to the syntax library (appendix A).
+  (define local-binding-sym (string->symbol "%local-binding"))
+  (define (with-local-binding id key)
+    (make-stx (stx-e id) (stx-scopes id) (stx-srcloc id)
+              (cons (cons local-binding-sym key)
+                    (remp (lambda (p) (eq? (car p) local-binding-sym)) (stx-props id)))))
 
   ;; The function or lambda whose body is being expanded, as a unique
   ;; list, or #f; and label key -> the one it was bound in. A branch must
