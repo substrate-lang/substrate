@@ -37,7 +37,7 @@ specified but not built yet.
 | Component | What it is | Where |
 |---|---|---|
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime), `host/subhost.mjs` (JavaScript, over Node's V8) |
-| compiler | Reader, expander, kernel compiler, binary encoder. | stage0: `stage0/*.sls` (Chez Scheme) |
+| compiler | Reader, expander, kernel compiler, binary encoder. | `compiler/*.sub` (Substrate); stage0, the bootstrap compiler: `stage0/*.sls` (Chez Scheme) |
 | syntax library | Syntax objects and the data inside them, as wasm GC objects, and the functions of section 2. After bootstrap it is part of the self-hosted compiler. | `compiler/syntax.sub` (kernel code) |
 | libraries | Ordinary modules: printing, `define-macro`, structs and `match`. | `lib/*.sub` |
 | languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub` |
@@ -59,6 +59,20 @@ requires (3.2). A **run-time store** holds the linklets a program loads.
 The compile-time environment is garbage collected: syntax objects are GC
 objects. A compiled program is garbage collected only if its own code uses
 GC types or requires the syntax library.
+
+### 1.4 Bootstrap
+
+The compiler is written in Substrate (`compiler/*.sub`, the syntax library
+among them). Stage0, a compiler of the same language written in Chez
+Scheme (`stage0/`), builds it: that build is **stage1**. Stage1 builds the
+compiler from the same source (**stage2**), and stage2 builds it again
+(**stage3**). The bootstrap reaches its **fixpoint** when stage2 and stage3
+are the same bytes, and so is the syntax library each writes: the compiler
+reproduces itself exactly. That needs compilation to be deterministic,
+which is why the host gives programs no clocks or randomness (section 4).
+While stage0 is kept, stage1 = stage2 too: two compilers written apart, in
+different languages, write the same bytes. `make bootstrap` builds the
+stages and checks both.
 
 ## 2. The macro contract
 

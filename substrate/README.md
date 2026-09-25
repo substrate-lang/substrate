@@ -19,12 +19,13 @@ line says the same.
 |---|---|---|
 | `docs/` | the kernel specification | permanent |
 | `host/` | the host, in C over wasmtime: stores, linking, the `host` imports and the instantiate hook | permanent: after bootstrap it runs the compiler |
-| `compiler/` | the compiler, written in the language. Today only `syntax.sub`, the syntax library; the rest arrives as the compiler is rewritten for bootstrap | permanent, grows |
-| `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: frozen once the compiler compiles itself |
+| `compiler/` | the compiler, written in Substrate: reader, expander, kernel compiler, wasm encoder, and the syntax library (`syntax.sub`). It compiles itself (spec 1.4) | permanent, grows |
+| `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: builds stage1, and checks the compiler, until it is retired |
 | `lib/` | libraries in the language that we build on: printing, `write-datum`, `define-macro`, `struct` and `enum`, `match`, and Substrate itself (`substrate.sub`), the language built on the kernel | permanent, grows |
 | `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.imports`) and any modules it requires in `NAME/`; checked by `make check` | grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.imports` (what the compiled phase-0 linklet may import). `tests/fixtures/` holds modules the tests require | grows |
-| `bin/subc` | the entry point | permanent; runs stage0 until bootstrap |
+| `bin/subc` | runs stage0 | temporary, as stage0 |
+| `bin/sub` | runs the compiler written in Substrate (`build/sub`) | permanent |
 
 A library in `lib/` is one we intend to build on, not the only way to do
 what it does: languages on the kernel can bring their own. If one turns out
@@ -52,9 +53,16 @@ COMPILER=bin/sub tests/run.sh   # the tests, built by the compiler in Substrate
 HOST=host/subhost.mjs tests/run.sh   # run programs, and bin/sub, on that host
 ```
 
-`build/sub` is built by stage0 with `bin/subc build compiler/main.sub -o build/sub`.
+`make build/sub` builds `build/sub` with stage0. `make bootstrap` builds the
+compiler with stage0 (stage1), then with itself twice (stage2, stage3), and
+checks that stage2 = stage3 and stage1 = stage2 (spec 1.4).
 
 ## Status
+
+The compiler is written in Substrate (`compiler/`) and compiles itself:
+built by stage0, then by itself, it reaches its fixpoint, and stage0 and it
+write the same bytes (`make bootstrap`, spec 1.4). On V8 it builds itself
+in under a second.
 
 Stage0 goes from source to a running program: reader, expander, kernel
 compiler, binary wasm, then wasmtime. Macros work end to end: a
@@ -80,10 +88,10 @@ imports in the tests and examples.
 together: `struct` and `enum` define GC types and leave compile-time
 values that `match` reads, checking patterns at compile time.
 `examples/shapes.sub` matches, in one module, types defined in another.
-`lib/substrate.sub` is Substrate, the language the compiler will be
-written in, on the Substrate kernel: every value is an `eqref`, and
-closure and assignment conversion run per definition, on fully expanded
-code. `examples/effects.sub` is an effect language on Substrate (`examples/effects/handlers.sub`): declared effects, handlers
+`lib/substrate.sub` is Substrate, the language the compiler is written
+in, on the Substrate kernel: every value is an `eqref`, and closure and
+assignment conversion run per unit, on fully expanded code, in
+Substrate's `#%linklet` (spec 6.5). `examples/effects.sub` is an effect language on Substrate (`examples/effects/handlers.sub`): declared effects, handlers
 with a clause per operation, and Koka's evidence passing, built from
 `#%app`, `local-expand` and compile-time values.
 
