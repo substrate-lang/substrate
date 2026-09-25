@@ -30,8 +30,8 @@
 
   (define (id? x) (and (stx? x) (symbol? (stx-e x))))
 
-  ;; Keywords, as in Racket: #:name reads as one, interned by name, so equal
-  ;; keywords are eq?. They print as they read.
+  ;; Keywords: #:name reads as one, interned by name, so equal keywords are
+  ;; eq?. They print as they read.
   (define-record-type (keyword new-keyword keyword?) (fields name))   ; name: a string
   (define keywords (make-hashtable string-hash string=?))
   (define (string->keyword s)

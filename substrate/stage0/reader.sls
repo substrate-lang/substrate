@@ -150,7 +150,7 @@
                    (begin (next!) (prefix-form start 'unsyntax-splicing))
                    (prefix-form start 'unsyntax))]
               [(char=? c #\\) (next!) (read-char-lit start)]
-              ;; #:name is a keyword, as in Racket.
+              ;; #:name is a keyword.
               [(char=? c #\:) (next!) (wrap start (string->keyword (read-token)))]
               ;; #%name is a symbol, used for implicit forms like #%app.
               [(char=? c #\%) (wrap start (string->symbol (string-append "#" (read-token))))]

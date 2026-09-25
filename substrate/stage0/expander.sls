@@ -1357,11 +1357,11 @@
           (hashtable-set! (cstore-values st) getter h)
           h)))
 
-  ;; (define-syntax name expr), as in Racket: if expr names a phase+1
-  ;; function, name is a macro with that transformer; otherwise name is
-  ;; bound to expr's value at phase+1, a compile-time value, which macros
-  ;; read with syntax-local-value. The value lives in a global of the
-  ;; phase+1 linklet, computed when the linklet is instantiated.
+  ;; (define-syntax name expr): if expr names a phase+1 function, name is a
+  ;; macro with that transformer; otherwise name is bound to expr's value
+  ;; at phase+1, a compile-time value, which macros read with
+  ;; syntax-local-value. The value lives in a global of the phase+1 linklet,
+  ;; computed when the linklet is instantiated.
   (define (define-syntax! f phase)
     (let ([parts (stx-list-of f 'define-syntax)])
       (unless (and (= (length parts) 3) (id? (cadr parts)))
@@ -1557,9 +1557,9 @@
                               [(core prim) 'core]
                               [else (and (type-meaning-of id api-phase) 'type)]))))]
             [(5)                        ; local-expand
-             ;; As in Racket, the running macro's introduction scope is
-             ;; flipped around the expansion, so code from the macro's input
-             ;; expands as it would at the use site.
+             ;; The running macro's introduction scope is flipped around the
+             ;; expansion, so code from the macro's input expands as it
+             ;; would at the use site.
              (let ([s (decode ms a)])
                (unless (and (stx? s) (not (find-opaque s)))
                  (raise-compile-error api-where "local-expand: expected syntax"))
