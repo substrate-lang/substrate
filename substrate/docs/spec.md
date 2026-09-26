@@ -151,8 +151,8 @@ at the phase where it appears, plus any it lists to bind unqualified
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(unsafe-car p)`, `(unsafe-cdr p)`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
-| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`) |
-| transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)` |
+| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`), `(syntax-id s) -> i32` |
+| transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)`, `(transformer-env t)` |
 | exceptions | the tag `exn`, whose exceptions carry one `eqref`; `(raise-syntax-error name message stx)` (throws a syntax error), `(syntax-error? v) -> i32`, `(syntax-error-message e)`, `(syntax-error-syntax e)` (the syntax it blames, or `#f`) |
 | queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)` |
 
@@ -191,6 +191,14 @@ at the phase where it appears, plus any it lists to bind unqualified
   global, or an identifier that is not in fully expanded code. A pass uses
   it to tell which binder a variable refers to, as `free-identifier=?`
   would, but without asking the expander.
+- `syntax-id` is a number that tells syntax object `s` from every other
+  made in the run: a copy with other scopes, properties or datum is
+  another object. Two identifiers with the same name and scopes have
+  different ids. It is what a table keyed by syntax objects hashes, as
+  Substrate's `hasheq` does.
+- `transformer-env` gives the `env` a transformer was made with: where a
+  language keeps what goes with a binding, such as a struct's fields for
+  its `match`, and reads it with `syntax-local-value`.
 - Accessors trap with a message ("expected a pair") when given the wrong
   kind of value.
 - `unsafe-car` and `unsafe-cdr` are for code that has tested `pair?`
@@ -1100,7 +1108,7 @@ the compiler may, because it is part of the expander.
   | `%pair` | `(struct (field car eqref) (field cdr eqref))` | pairs |
   | `%symbol` | `(struct (field name (ref %string)) (field hash i32))` | symbols, with their name's hash |
   | `%atom` | `(struct (field kind i32) (field value i32))` | characters (kind 0), `#t` (1), `()` (2) |
-  | `%syntax` | `(struct (field e (mut eqref)) (field scopes eqref) (field srcloc eqref) (field props eqref) (field pending (mut eqref)))` | syntax objects |
+  | `%syntax` | `(struct (field e (mut eqref)) (field scopes eqref) (field srcloc eqref) (field props eqref) (field pending (mut eqref)) (field id i32))` | syntax objects |
   | `%srcloc` | `(struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32))` | source locations |
   | `%table` | `(array (mut eqref))` | the symbol and keyword tables and a linklet's quoted data |
   | `%integer` | `(struct (field negative i32) (field magnitude i64))` | integers beyond the fixnum range |
@@ -1129,7 +1137,9 @@ the compiler may, because it is part of the expander.
   a symbol naming the file. Line is 1-based, column and position 0-based.
   Properties are a list of `(key . value)` pairs, newest first, with each
   key at most once. The expander records a local variable's binding in
-  the property `%local-binding`.
+  the property `%local-binding`. The id counts the syntax objects made
+  in the run, and is never serialized: a literal gets a new one when it
+  is built.
 - **Memory**: the kernel module's memory holds its error messages.
 - **Queries**: the compiler registers the functions that answer the
   queries (2.3) with `%set-queries`. Until it does, each query traps.
