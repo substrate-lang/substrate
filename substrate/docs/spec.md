@@ -1095,6 +1095,60 @@ right-hand side's.
   `match`) so that it is a compile-time error again, as a library of the
   typed language.
 
+### 7.1 Caching compiled modules (planned)
+
+Every run compiles the kernel module and every module a program requires
+from source, so a build of a program pays for its libraries each time. A
+cache of compiled modules would make a build cost the modules that
+changed. The design that fits the rest of this specification:
+
+- **Key.** A module's content name (3.2) is its cache key, and the
+  compiler's own build is part of it: a linklet another compiler compiled
+  is not reused. An entry records the module's dependencies, by path and
+  content name, since a macro can introduce a `require`; to look a module
+  up, the compiler hashes its source, looks up or recomputes the names of
+  the recorded dependencies, and takes the entry if every name matches.
+- **What an entry holds.** The module's linklets per phase, its program
+  linklet, and its interface: what it provides, its module-level bindings
+  (its entries, with their scope sets and phases), its requires with their
+  shifts, and what compiled code refers to in it: its functions with their
+  signatures, declared types and values, its globals, tags, data and
+  types, as canonical structural forms, the getters of its compile-time
+  values, and the lowered bodies of its inline functions.
+- **Names that belong to a run.** Scope ids and local binding keys are
+  counters of one run. A linklet's literals carry scope ids as the run
+  that compiled it assigned them, which the bootstrap tolerates only
+  because a full build does the same work in the same order every time;
+  with a cache the work differs, so ids must not reach the bytes. Hence:
+  a linklet's literals name scopes relative to the linklet. Each linklet
+  lists the scopes its literals hold, which the serializer records today,
+  and a literal holds an index into that list; the compiler maps the
+  indexes to the run's ids when it instantiates the linklet, always, as it
+  maps module scopes at a phase shift today (`%scope-map`, appendix A,
+  with a vector for the map). The interface's scope sets are relative the
+  same way, mapped when the interface is loaded, with a run id allocated
+  for each of the module's scopes once. Local binding keys in inline
+  bodies are renamed at every inlining already; a key in a quoted literal
+  is relative to its linklet in the same way.
+- **What stays as it is.** Instance names are content names, so imports
+  link unchanged. Type identities are structural (5.1), so they are
+  recomputed on load. Compile-time values are computed per compilation
+  as before (6.3): the cache holds code and interfaces, no compile-time
+  state.
+- **Determinism.** With relative scopes, a program's bytes do not depend
+  on which of its modules were compiled and which were loaded: `make
+  bootstrap` holds with a warm cache or a cold one, and a module loaded
+  from the cache is byte for byte what a fresh compile of it would be,
+  which is the property to test first.
+- **Where.** `build/cache/<compiler build>/<content name>/`, written by
+  `sub build` and `sub compile` and read by both; `sub expand` compiles
+  from source, since it prints the expansion.
+
+The relative scopes are the real work, and they are worth doing first on
+their own: they make the compiler's output independent of the order in
+which modules are compiled, which is a stronger form of the determinism
+1.4 asks for.
+
 ## Appendix A: the kernel module's representation (not part of the contract)
 
 This describes `compiler/kernel.sub` as it is. Macros must not depend on it;
