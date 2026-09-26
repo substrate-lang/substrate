@@ -77,7 +77,10 @@ syntax properties work too, and macros are hygienic
 exception handling (tags, `throw`, `try`), and Substrate has `raise` and
 `with-handlers`; errors are exceptions, and one that nothing handles
 stops the program where it happened, with its backtrace. Syntax errors
-are exceptions too, so a macro can handle one from `local-expand`. A module can change what
+are exceptions too, so a macro can handle one from `local-expand`. Substrate's
+`syntax-match` takes syntax apart with patterns written in its shape;
+the expander parses the kernel's forms with it, and its errors are written
+from the patterns. A module can change what
 application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
 5.4). Expansion produces fully expanded code, syntax in a fixed grammar (spec
 6.4): a macro can see its input's with `local-expand`, a language's
