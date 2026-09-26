@@ -29,7 +29,7 @@
          type-info-super type-info-final? type-info-group set-type-info-group! identify-group! func-type?
          make-ref ref-type? ref-nullable? ref-heap type-info? abstract-heaps valtype<=? types<=? types=? fresh-key!)
 (require ops "ops.sub" lookup-prim prim-op-params prim-op-kind prim-names)
-(require cmp "compile.sub" compile-module set-current-syntax-infos! set-syntax-types! set-current-source!)
+(require cmp "compile.sub" compile-module set-syntax-lookup! set-syntax-types! set-current-source!)
 (require rd "reader.sub" read-file read-string-all)
 (require num "numbers.sub" content-hash)
 (require host "host.sub" export-index call-getter scope-map-new scope-map-add scope-map-clear error-string read-data)
@@ -204,12 +204,21 @@
                  stx))
 (define running-kernel-text (running-kernel-source))
 
-;; A build of the kernel module: its bytes; its definitions (func-,
-;; global- and tag-infos) by name; its string and table types, which
-;; quoted data is read with (spec 3.5); and the lowered bodies of the
-;; inline functions that code compiled against it inlines, its own and
-;; those of the modules compiled against it; and its hash, of its source.
-(struct kernel ([bytes #:mutable] [infos #:mutable] [string-type #:mutable] [table-type #:mutable] inlines types hash))
+;; A build of the kernel module: its unit, whose one linklet it is and
+;; whose hash is of its source; the lowered bodies of the inline
+;; functions that code compiled against it inlines, its own and those of
+;; the modules compiled against it; and its string and table types, which
+;; quoted data is read with (spec 3.5).
+(struct kernel (unit inlines [string-type #:mutable] [table-type #:mutable]))
+
+(define (kernel-hash k) (unit-hash (kernel-unit k)))
+(define (kernel-bytes k) (linklet-bytes (unit-program (kernel-unit k))))
+
+;; Kernel k's definition of kind named name, or #f; and its function
+;; named name, which it must have.
+(define (kernel-definition k kind name) (unit-definition (kernel-unit k) "kernel" kind (symbol->string name)))
+(define (kernel-function k name)
+  (or (kernel-definition k 'func name) (raise-compile-error #f "internal: the kernel module has no ~a" name)))
 
 (define running-kernel #f)
 (define target-kernel #f)
@@ -221,7 +230,7 @@
 
 (define (set-lowering-kernel! k)
   (set! lowering-kernel k)
-  (set-current-syntax-infos! (kernel-infos k))
+  (set-syntax-lookup! (and (eq? (unit-state (kernel-unit k)) 'done) (lambda (kind name) (kernel-definition k kind name))))
   (set-syntax-types! (kernel-string-type k) (kernel-table-type k)))
 
 ;; (thunk), with code lowered and compiled against kernel k.
@@ -239,11 +248,14 @@
       (set! running-kernel (if (string=? text running-kernel-text) target-kernel (compile-kernel running-kernel-text)))
       (set-lowering-kernel! running-kernel))))
 
-;; The kernel module whose source is text, compiled.
+;; The kernel module whose source is text, compiled: a unit whose one
+;; linklet is the kernel, its instance named kernel.
 (define (compile-kernel text)
-  (let* ([k (kernel #f #f #f #f (make-hasheq) (make-hasheq) (content-hash (list text)))]
-         [m (new-unit kernel-path "kernel")]
+  (let* ([m (new-unit kernel-path "kernel")]
+         [k (kernel m (make-hasheq) #f #f)]
          [c (comp m #f 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '() #f)])
+    (set-unit-hash! m (content-hash (list text)))
+    (hash-set! units-by-hash (unit-hash m) m)
     (with-comp c
       (lambda ()
         (with-kernel k
@@ -257,39 +269,24 @@
               (set-kernel-table-type! k (type '%table))
               (set-syntax-types! (type '%string) (type '%table))
               (set-current-source! (string->symbol kernel-path))
-              (let ([compiled (compile-module forms "kernel")] [table (make-hasheq)])
-                (for-each (lambda (f)
-                            (case (car f)
-                              [(func) (hash-set! table (func-info-name (cadr f)) (cadr f))]
-                              [(global) (hash-set! table (global-info-name (cadr f)) (cadr f))]
-                              [(tag) (hash-set! table (tag-info-name (cadr f)) (cadr f))]
-                              [(type) (hash-set! (kernel-types k) (type-info-name (cadr f)) (cadr f))]
-                              [else #f]))
-                          forms)
-                (set-kernel-bytes! k (car compiled))
-                (set-kernel-infos! k table)))))))
+              (hash-set! (unit-linklets m) 0 (compiled-linklet (compile-module forms "kernel")))
+              (set-unit-program! m (hash-ref (unit-linklets m) 0))
+              (note-definitions! m forms)
+              (set-unit-state! m 'done))))))
     k))
 
 (define (target-kernel-bytes) (ensure-kernels!) (kernel-bytes target-kernel))
-
-;; The definition of name in kernel k.
-(define (kernel-info k name)
-  (or (hash-ref (kernel-infos k) name #f)
-      (raise-compile-error #f "internal: the kernel module has no ~a" name)))
 
 ;; info, a definition that code names, as the kernel the code is lowered
 ;; against has it: if info is the target kernel's, and code is lowered
 ;; against the running kernel, the running kernel's definition of the same
 ;; name. id is where it is named.
 (define (in-lowering-kernel info id)
-  (if (or (eq? lowering-kernel target-kernel) (not (kernel-infos lowering-kernel)))
+  (if (or (not target-kernel) (eq? lowering-kernel target-kernel) (data-info? info))
       info
-      (let ([name (cond [(func-info? info) (func-info-name info)]
-                        [(global-info? info) (global-info-name info)]
-                        [(tag-info? info) (tag-info-name info)]
-                        [else #f])])
-        (if (and name (eq? (hash-ref (kernel-infos target-kernel) name #f) info))
-            (or (hash-ref (kernel-infos lowering-kernel) name #f)
+      (let ([name (info-name info)] [kind (info-kind info)])
+        (if (eq? (kernel-definition target-kernel kind name) info)
+            (or (kernel-definition lowering-kernel kind name)
                 (raise-compile-error id "~a is not in the kernel this compiler runs with: compile-time code can use it once the compiler that compiles it has it (spec 1.4)"
                                      name))
             info))))
@@ -308,7 +305,7 @@
 (define cache-directory #f)
 (define (set-cache-directory! dir) (set! cache-directory dir))
 
-(define interface-format 1)
+(define interface-format 2)
 
 ;; The kernel the cache is for, by hash: the run's one kernel, when there
 ;; is a cache directory; else #f.
@@ -368,11 +365,11 @@
 ;; An interface names what belongs to a run relative to modules, by hash:
 ;; a scope is core, kernel-ids, (m hash shift), a module scope's copy for
 ;; a phase shift, or (s hash index), the index-th scope a module's
-;; expansion made; a type is (type i), the module's own, (kernel-type
-;; name) or (foreign-type hash i); a definition is (own i), an entry of
-;; the interface's table, (kernel name), (foreign instance kind export)
-;; or (shifted ref k). Its sections are an alist of quoted data, the
-;; first four saying what it is of.
+;; expansion made; a type is (type i), the module's own, or (foreign-type
+;; hash i); a definition is (own i), an entry of the interface's table,
+;; (foreign instance kind export), the kernel module's among them, or
+;; (shifted ref k). Its sections are an alist of quoted data, the first
+;; four saying what it is of.
 
 (define (write-interface m)
   (let ([own (make-hasheq)] [own-list '()] [type-index (make-hasheq)] [types (unit-types m)])
@@ -381,8 +378,6 @@
         ([tref (lambda (t)
                  (let ([i (hash-ref type-index t #f)] [o (hash-ref type-owners t #f)])
                    (cond [i (list 'type i)]
-                         [(eq? (hash-ref (kernel-types target-kernel) (type-info-name t) #f) t)
-                          (list 'kernel-type (type-info-name t))]
                          [o (list 'foreign-type (unit-hash (car o)) (cdr o))]
                          [else (raise-compile-error #f "internal: the type ~a belongs to no module" (type-info-name t))])))]
          [vref (lambda (v)
@@ -401,11 +396,8 @@
                        [instance (info-instance info)])
                    (cond [origin (list 'shifted (iref (car origin)) (cdr origin))]
                          [(data-info? info) (own-ref info)]
-                         [(eq? (hash-ref (kernel-infos target-kernel) (info-name info) #f) info)
-                          (list 'kernel (info-name info))]
-                         [(and instance (linklet-ref instance) (not (own-instance? m instance)))
-                          (list 'foreign instance (cond [(func-info? info) 'func] [(global-info? info) 'global] [else 'tag])
-                                (info-export info))]
+                         [(and instance (instance-unit instance) (not (own-instance? m instance)))
+                          (list 'foreign instance (info-kind info) (info-export info))]
                          [else (own-ref info)])))]
          [mref (lambda (meaning) (list (car meaning) (if (eq? (car meaning) 'type) (tref (cadr meaning)) (iref (cadr meaning)))))]
          [sref (lambda (sc)
@@ -493,7 +485,6 @@
           ([tres (lambda (r)
                    (case (car r)
                      [(type) (vector-ref shells (cadr r))]
-                     [(kernel-type) (hash-ref (kernel-types target-kernel) (cadr r))]
                      [else (list-ref (unit-types (unit-with-hash (cadr r))) (caddr r))]))]
            [vres (lambda (v)
                    (if (and (pair? v) (eq? (car v) 'ref))
@@ -503,7 +494,6 @@
            [ires (lambda (r)
                    (case (car r)
                      [(own) (vector-ref infos (cadr r))]
-                     [(kernel) (kernel-info target-kernel (cadr r))]
                      [(shifted) (shift-info (ires (cadr r)) (caddr r))]
                      [else (or (find-info (cadr r) (caddr r) (cadddr r))
                                (raise-compile-error #f "the cache is inconsistent: no ~a ~a in ~a" (caddr r) (cadddr r) (cadr r)))]))]
@@ -617,11 +607,18 @@
   (let ([r (hash-ref instance-refs name #f)])
     (and r (pair? (cddr r)) r)))
 
+;; The module whose linklet the instance named name is, or #f: the
+;; kernel module's instance is named kernel.
+(define (instance-unit name)
+  (if (string=? name "kernel")
+      (kernel-unit target-kernel)
+      (let ([r (linklet-ref name)]) (and r (car r)))))
+
 ;; Is instance one of module m's linklets? Two files that are one module
 ;; (spec 3.2) have one set of instance names, so m is known by its hash.
 (define (own-instance? m instance)
-  (let ([r (and instance (linklet-ref instance))])
-    (and r (string=? (unit-hash (car r)) (unit-hash m)))))
+  (let ([u (and instance (instance-unit instance))])
+    (and u (string=? (unit-hash u) (unit-hash m)))))
 
 ;; What linklet p's imports link to in st when it is instantiated at phase
 ;; shift t: an alist from each module name its code imports from to the
@@ -1133,24 +1130,25 @@
 (define (note-info! m info) (set-unit-infos! m (cons info (unit-infos m))))
 
 ;; The definition of kind with export name export in the instance named
-;; instance, one of a module's linklets, or #f. A module's definitions are
+;; instance, one of module m's linklets, or #f. A module's definitions are
 ;; indexed at the first search.
 (define definition-indexes (make-hasheq))    ; unit -> "instance kind export" -> info
+(define (unit-definition m instance kind export)
+  (hash-ref (or (hash-ref definition-indexes m #f)
+                (let ([index (make-hash)])
+                  (for-each (lambda (info) (hash-set! index (info-key info) info)) (unit-infos m))
+                  (hash-set! definition-indexes m index)
+                  index))
+            (string-append instance " " (symbol->string kind) " " export) #f))
+
 (define (find-info instance kind export)
-  (let* ([r (linklet-ref instance)] [m (and r (car r))])
-    (and m
-         (hash-ref (or (hash-ref definition-indexes m #f)
-                       (let ([index (make-hash)])
-                         (for-each (lambda (info) (hash-set! index (info-key info) info)) (unit-infos m))
-                         (hash-set! definition-indexes m index)
-                         index))
-                   (string-append instance " " (symbol->string kind) " " export) #f))))
+  (let ([m (instance-unit instance)]) (and m (unit-definition m instance kind export))))
 
 ;; "instance kind export" of a function, global or tag.
 (define (info-key info)
-  (string-append (or (info-instance info) "") " "
-                 (cond [(func-info? info) "func"] [(global-info? info) "global"] [else "tag"]) " "
-                 (info-export info)))
+  (string-append (or (info-instance info) "") " " (symbol->string (info-kind info)) " " (info-export info)))
+
+(define (info-kind info) (cond [(func-info? info) 'func] [(global-info? info) 'global] [else 'tag]))
 
 (define (info-instance info)
   (cond [(func-info? info) (func-info-instance info)]
@@ -1827,7 +1825,7 @@
 ;; The kernel module's contract (spec 2.3), its functions and its tag, as
 ;; (symbol . meaning), sorted by name for deterministic keys.
 (define (require-kernel! source phase)
-  (unless (kernel-infos lowering-kernel)
+  (unless (eq? (unit-state (kernel-unit lowering-kernel)) 'done)
     (raise-compile-error source "the kernel module cannot require itself"))
   (sort (filter (lambda (p) (not (internal-name? (car p))))
                 (filter (lambda (x) x)
@@ -1835,7 +1833,7 @@
                                (cond [(func-info? info) (cons (func-info-name info) (list 'func info))]
                                      [(tag-info? info) (cons (tag-info-name info) (list 'tag info))]
                                      [else #f]))
-                             (hash-values (kernel-infos target-kernel)))))
+                             (unit-infos (kernel-unit target-kernel)))))
         (lambda (a b) (symbol<? (car a) (car b)))))
 
 (define (module-path-of f spec)
@@ -2047,7 +2045,7 @@
                         (append (lower-forms (take out (- (length out) 1)) (+ phase 1))
                                 (list (list 'expr (lower-expr value (+ phase 1)))))))]
             [init (if adapter
-                      (list 'call (kernel-info lowering-kernel 'make-transformer)
+                      (list 'call (kernel-function lowering-kernel 'make-transformer)
                             (list (list 'ref-func (cadr adapter)) (list 'quote #f)))
                       (cadr (last unit)))]
             [global (global-info name eqref #t #f #f)]
@@ -2062,7 +2060,7 @@
 ;; The func form of transformer code named name, of the kernel module's
 ;; type for it, that calls function info on the syntax.
 (define (transformer-adapter name info)
-  (let ([code-type (ref-heap (car (func-info-params (kernel-info lowering-kernel 'make-transformer))))]
+  (let ([code-type (ref-heap (car (func-info-params (kernel-function lowering-kernel 'make-transformer))))]
         [env (fresh-key!)] [s (fresh-key!)])
     (list 'func (func-info name (list eqref eqref) (list eqref) #f #f code-type)
           (list (cons env eqref) (cons s eqref))
@@ -2352,7 +2350,7 @@
   (kernel-id-scope!)
   (or (hash-ref kernel-ids name #f)
       (let ([id (make-stx name (list kernel-id-scope) #f '())])
-        (bind-raw! name (list kernel-id-scope) 'all (list 'func (kernel-info target-kernel name)))
+        (bind-raw! name (list kernel-id-scope) 'all (list 'func (kernel-function target-kernel name)))
         (hash-set! kernel-ids name id)
         id)))
 

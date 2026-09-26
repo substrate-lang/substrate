@@ -481,8 +481,8 @@ quoted data in the kernel's format (3.5).
   tables. Scopes and definitions belong to a run, so the interface names
   them relative to modules: a scope is the core scope, a module scope's
   copy for a phase shift, or the *n*-th scope a module's expansion made;
-  a definition is the module's own, the kernel module's, or another
-  module's by instance and export name. Loaded, a module binds its
+  a definition is the module's own, or another module's by instance and
+  export name, the kernel module's among them. Loaded, a module binds its
   entries under scopes made for it, installs its requires at their
   shifts, and registers its linklets, types and definitions as a
   compiled one would; its compile-time values are computed per
