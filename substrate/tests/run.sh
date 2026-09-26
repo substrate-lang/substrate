@@ -73,5 +73,14 @@ for t in tests/*.sub examples/*.sub; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
+# A module compiles to the same bytes whatever the run compiled before it
+# (spec 3.5): order-a and order-b require the same two modules in either
+# order.
+for f in "$builds"/tests/order-a/order-[mn].*.wasm; do
+  if ! cmp -s "$f" "$builds/tests/order-b/$(basename "$f")"; then
+    fail=$((fail + 1))
+    echo "FAIL tests/order-b: $(basename "$f") differs from tests/order-a's"
+  fi
+done
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

@@ -404,6 +404,15 @@ not grow with its literals, and each is built once per instance. As in
 Scheme, equal quoted data may share structure: whether two quoted data,
 or parts of them, are the same reference is unspecified.
 
+A syntax object in the quoted data names its scopes by index into the
+linklet's **scope table**, the scopes of its literals in the order the
+compiler met them, which the compiler keeps with the linklet: a scope is
+a number of the run that made it, and this way the bytes do not depend
+on that run. When the compiler instantiates a linklet in a compile-time
+store, it gives the kernel module the run's scope for each index first
+(appendix A). A linklet a program runs gets no map, and its literals keep
+the indexes, which nothing reads at run time (2.3).
+
 A phase-1 linklet's module-level expressions run each time the linklet is
 instantiated, which is once per compilation that needs it.
 
@@ -895,7 +904,9 @@ reference is an error.
   for example when another module's macro wrote part of its code. Only
   module scopes shift; introduction and use-site scopes, and the core
   scope, mean the same at every phase. This is Racket's per-phase module
-  scopes, applied eagerly per phase shift.
+  scopes, applied eagerly per phase shift. The shift is made through the
+  linklet's scope table (3.5): the compiler maps each module scope in it
+  to the copy for the phase shift, and every other scope to itself.
 
 ### 6.2 Hygiene
 
@@ -1198,9 +1209,10 @@ the compiler may, because it is part of the expander.
 - **Memory**: the kernel module's memory holds its error messages.
 - **Queries**: the compiler registers the functions that answer the
   queries (2.3) with `%set-queries`. Until it does, each query traps.
-- **Shifted literals**: `%scope-map-add` tells `%make-syntax` to replace
-  one scope id with another. The compiler records which module and phase
-  shift each module scope stands for, and each linklet lists the module
-  scopes in its literals. Around the instantiation of a linklet at phase
-  shift *t* ≠ 0 it maps each of them to its copy for its phase shift + *t*
-  (6.1), and clears the map after (`%scope-map-clear`).
+- **Literal scopes**: a linklet's literals hold scope indexes (3.5), and
+  `%make-syntax` maps them through `%scope-map`, a table the compiler
+  fills before it instantiates a linklet in a compile-time store
+  (`%scope-map-new`, `%scope-map-add`) and clears after
+  (`%scope-map-clear`): the run's scope for each index, a module scope's
+  copy for the phase shift among them (6.1). Without a map, the indexes
+  stay.
