@@ -36,7 +36,7 @@
 (require ser "serialize.sub" make-serializer serialize! serializer-bytes)
 
 (provide report-trap set-repository-root! set-cache-directory! compile-module-file module-linklet-list
-         module-expanded-forms keep-expanded-forms! target-kernel-bytes program-linklets register-queries!)
+         module-expanded-forms keep-expanded-forms! target-kernel-bytes target-kernel-interface program-linklets register-queries!)
 
 (import %call-transformer "kernel" "%call-transformer" (eqref eqref -> eqref))
 
@@ -183,8 +183,8 @@
 ;; instance it shares with its macros, and the target kernel,
 ;; compiler/kernel.sub, which the programs it writes link to. Compile-time
 ;; code is compiled against the running kernel, and programs against the
-;; target kernel. The compiler carries the running kernel's text; when
-;; compiler/kernel.sub is that text, the two are one. Names are bound to
+;; target kernel. The compiler carries the running kernel, compiled; when
+;; compiler/kernel.sub hashes to it, the two are one. Names are bound to
 ;; the target kernel's definitions, and code compiled against the running
 ;; kernel uses its definitions of the same names. The source locations of
 ;; both name them compiler/kernel.sub, whatever the root is: the
@@ -195,14 +195,31 @@
 (define repository-root #f)
 (define (set-repository-root! root) (set! repository-root root))
 
-;; The running kernel's text: the target kernel of the compiler that
-;; compiled this one, compiler/kernel.sub under the root that compiler was
-;; given, which it compiled for this compiler to run with.
-(begin-for-syntax (require-unqualified substrate "../lib/substrate.sub"))
-(define-syntax (running-kernel-source stx)
-  (datum->syntax stx (file->string (string-append (vector-ref (current-command-line-arguments) 0) "/compiler/kernel.sub"))
-                 stx))
-(define running-kernel-text (running-kernel-source))
+;; The kernel this compiler runs with, compiled: the interface (spec 3.7)
+;; and bytes in build/kernel.interface and build/kernel.wasm under the
+;; root when this compiler was compiled, which the compiler compiling it
+;; wrote from its target kernel (sub kernel), the kernel it gives this
+;; compiler to run with; or #f when there were none. The bytes are a
+;; string of their values as characters, since quoted data has strings.
+(begin-for-syntax
+  (require-unqualified substrate "../lib/substrate.sub")
+  (require host "host.sub" read-data)
+  (require num "numbers.sub" content-hash))
+(define-syntax (compiled-kernel stx)
+  (let* ([root (vector-ref (current-command-line-arguments) 0)]
+         [d (read-data (string-append root "/build/kernel.interface"))])
+    (cond [(not d) (datum->syntax stx #f stx)]
+          [(not (equal? (cdr (assq 'hash d)) (content-hash (list (file->string (string-append root "/compiler/kernel.sub"))))))
+           (error 'compiled-kernel "build/kernel.interface is not of compiler/kernel.sub: write it again with sub kernel")]
+          [else
+           (datum->syntax
+            stx
+            (list 'quote (list d (list->string (map integer->char (bytes->list (file->bytes (string-append root "/build/kernel.wasm")))))))
+            stx)])))
+(define embedded-kernel (compiled-kernel))
+
+;; The bytes a string of their values as characters holds.
+(define (string-bytes s) (list->bytes (map char->integer (string->list s))))
 
 ;; A build of the kernel module: its unit, whose one linklet it is and
 ;; whose hash is of its source; the lowered bodies of the inline
@@ -243,9 +260,17 @@
 
 (define (ensure-kernels!)
   (unless target-kernel
-    (let ([text (file->string (string-append repository-root "/" kernel-path))])
-      (set! target-kernel (compile-kernel text))
-      (set! running-kernel (if (string=? text running-kernel-text) target-kernel (compile-kernel running-kernel-text)))
+    (let* ([text (file->string (string-append repository-root "/" kernel-path))]
+           [d (and embedded-kernel (car embedded-kernel))])
+      ;; The running kernel is the embedded one, unless there is none or
+      ;; its interface is of a format this compiler does not read: then
+      ;; compiler/kernel.sub is its source.
+      (set! running-kernel
+            (if (and d (eqv? (section d 'format) interface-format))
+                (load-kernel d (string-bytes (cadr embedded-kernel)))
+                (compile-kernel text)))
+      (set! target-kernel
+            (if (string=? (kernel-hash running-kernel) (content-hash (list text))) running-kernel (compile-kernel text)))
       (set-lowering-kernel! running-kernel))))
 
 ;; The kernel module whose source is text, compiled: a unit whose one
@@ -261,21 +286,37 @@
         (with-kernel k
           (lambda ()
             (let* ([forms (lower-forms (expand-module-body (read-string-all text (string->symbol kernel-path))) 0)]
-                   [forms (append (storage-forms 0) forms)]
-                   [type (lambda (name)
-                           (cadr (findf (lambda (f) (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) name)))
-                                        forms)))])
-              (set-kernel-string-type! k (type '%string))
-              (set-kernel-table-type! k (type '%table))
-              (set-syntax-types! (type '%string) (type '%table))
+                   [forms (append (storage-forms 0) forms)])
+              (note-definitions! m forms)
+              (take-kernel-types! k)
               (set-current-source! (string->symbol kernel-path))
               (hash-set! (unit-linklets m) 0 (compiled-linklet (compile-module forms "kernel")))
               (set-unit-program! m (hash-ref (unit-linklets m) 0))
-              (note-definitions! m forms)
               (set-unit-state! m 'done))))))
     k))
 
+;; The kernel module whose compiled form is interface d and bytes.
+(define (load-kernel d bytes)
+  (let* ([m (new-unit kernel-path "kernel")] [k (kernel m (make-hasheq) #f #f)])
+    (with-kernel k (lambda () (load-module! m d (lambda (p) bytes))))
+    (take-kernel-types! k)
+    k))
+
+;; Kernel k's string and table types, from its unit: quoted data is read
+;; with them (spec 3.5).
+(define (take-kernel-types! k)
+  (let ([type (lambda (name) (findf (lambda (t) (eq? (type-info-name t) name)) (unit-types (kernel-unit k))))])
+    (set-kernel-string-type! k (type '%string))
+    (set-kernel-table-type! k (type '%table))
+    (set-syntax-types! (kernel-string-type k) (kernel-table-type k))))
+
 (define (target-kernel-bytes) (ensure-kernels!) (kernel-bytes target-kernel))
+
+;; The target kernel's interface (spec 3.7), in the kernel's data format:
+;; with its bytes, what the compiler compiled next embeds.
+(define (target-kernel-interface)
+  (ensure-kernels!)
+  (data-bytes (with-kernel target-kernel (lambda () (write-interface (kernel-unit target-kernel))))))
 
 ;; info, a definition that code names, as the kernel the code is lowered
 ;; against has it: if info is the target kernel's, and code is lowered
@@ -530,7 +571,6 @@
                             [(eq? t (car g)) (identify-group! g)]
                             [else #f])))
                   (range (length type-forms)))
-        (set-unit-types! m (vector->list shells))
         (for-each (lambda (t) (own-type! m t)) (vector->list shells))
         ;; Definitions.
         (for-each (lambda (f i)

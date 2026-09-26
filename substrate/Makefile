@@ -8,14 +8,20 @@ build/subhost: host/subhost.c
 
 # The compiler bin/sub runs (spec 1.4). The seed, a build of the compiler
 # by itself, checked in, builds the compiler's source (build/sub-1), which
-# builds it again: build/sub is the source compiled by itself. A new
-# compiler starts its cache (spec 3.7) over.
+# builds it again: build/sub is the source compiled by itself. Each
+# stage first writes the kernel it compiles, bytes and interface, for the
+# compiler it builds to embed and run with. A new compiler starts its
+# cache (spec 3.7) over.
 COMPILER_SOURCES := $(wildcard compiler/*.sub lib/*.sub)
 
 build/sub: $(COMPILER_SOURCES) seed/program
 	rm -rf build/sub-1 build/sub build/cache
 	mkdir -p build/sub-1 build/sub
+	rm -f build/kernel.wasm build/kernel.interface
+	host/subhost.mjs seed $(CURDIR) kernel -o build/kernel.wasm
 	host/subhost.mjs seed $(CURDIR) build compiler/main.sub -o build/sub-1
+	rm -f build/kernel.wasm build/kernel.interface
+	host/subhost.mjs build/sub-1 $(CURDIR) kernel -o build/kernel.wasm
 	host/subhost.mjs build/sub-1 $(CURDIR) build compiler/main.sub -o build/sub
 
 # The tests, built by build/sub and run on build/subhost.
@@ -27,6 +33,8 @@ check: build/subhost build/sub
 bootstrap: build/sub
 	rm -rf build/sub-2
 	mkdir -p build/sub-2
+	rm -f build/kernel.wasm build/kernel.interface
+	host/subhost.mjs build/sub $(CURDIR) kernel -o build/kernel.wasm
 	host/subhost.mjs build/sub $(CURDIR) build compiler/main.sub -o build/sub-2
 	diff -r build/sub build/sub-2
 	@echo "bootstrap: build/sub builds itself"

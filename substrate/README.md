@@ -43,7 +43,7 @@ build/subhost DIR [ARG ...]     # run it on wasmtime
 host/subhost.mjs DIR [ARG ...]  # run it on V8
 bin/sub expand FILE             # print FILE's fully expanded phase-0 forms
 bin/sub compile FILE -o OUT     # write FILE's linklets (phase 0 to OUT)
-bin/sub kernel -o build/kernel.wasm      # write the kernel module
+bin/sub kernel -o build/kernel.wasm      # write the kernel module, and its interface beside it
 wasm-tools print OUT            # inspect a module
 HOST=build/subhost bin/sub ...  # run the compiler on wasmtime rather than V8
 HOST=host/subhost.mjs tests/run.sh   # run the tests' programs on V8

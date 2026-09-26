@@ -90,11 +90,16 @@ repository's history.
 A compiler runs with a build of the kernel module, whose instance its
 macros share with it, and builds programs with `compiler/kernel.sub`. The
 two are one, except while a compiler builds a new one whose kernel module
-has changed. So the compiler carries the text of the **running kernel**,
-the build it runs with: `compiler/kernel.sub` as it was when the compiler
-was compiled. It compiles compile-time code against the running kernel,
-and programs against `compiler/kernel.sub`, the **target kernel**. When
-they differ, a module's phase-0 linklet, which both runs at compile time
+has changed. So the compiler carries the **running kernel**, the build it
+runs with, compiled: the interface (3.7) and bytes that `sub kernel` wrote
+from the target kernel of the compiler that compiled it, embedded when it
+was compiled, so that nothing is compiled at startup. A compiler carrying
+none, or an interface of a format it does not read, compiles
+`compiler/kernel.sub` as its running kernel, which is then its source. It
+compiles compile-time code against the running kernel, and programs
+against `compiler/kernel.sub`, the **target kernel**, which is the running
+kernel when it hashes to the running kernel's source. When they differ, a
+module's phase-0 linklet, which both runs at compile time
 and goes into programs, is compiled for each. So a change to the kernel
 module, even to its representation, takes effect in one build.
 Compile-time code can call a function the running kernel does not have
@@ -461,7 +466,9 @@ With a cache directory (`sub build -c DIR`; `bin/sub` gives
 from the cache while its source and its requires are as they were: its
 linklets, one per phase, named as their instances are, and its
 **interface**, what the expander keeps of a module it compiled, as
-quoted data in the kernel's format (3.5).
+quoted data in the kernel's format (3.5). The kernel module has one too:
+`sub kernel` writes it beside the kernel's bytes, for the compiler built
+next to embed (1.4).
 
 - An interface begins with what it is of: the interface format's
   version, the kernel by hash, the module's hash (3.2), and its
