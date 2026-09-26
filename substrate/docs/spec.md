@@ -1052,8 +1052,8 @@ right-hand side's.
   core hook.
 - This is where a language lowers `lambda` and applications of function
   values (5.3), and makes its values
-  transformers. Substrate's `#%linklet` converts the closures of every
-  unit, and makes the value of a `define-syntax` unit a transformer when
+  transformers. Substrate's `#%linklet` converts the closures and applications of
+  function values of every unit, and makes the value of a `define-syntax` unit a transformer when
   it is a procedure. A language built on another provides that one's
   `#%linklet`, or its own that runs it, with `(except-out (all-from-out
   name) #%linklet)` for the rest (3.1).
