@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "subhost: cannot read %s\n", path);
       return 1;
     }
-    int rc = sub_instantiate(h, name, (const uint8_t *)bytes, len);
+    int rc = sub_instantiate(h, name, (const uint8_t *)bytes, len, "", 0);
     free(bytes);
     if (rc) {
       fprintf(stderr, "error: %s\n", sub_last_error(h));

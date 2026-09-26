@@ -82,7 +82,6 @@
 (define scope-counter 0)
 (define base-installed? #f)
 (define registry (make-hash))                ; normalized path -> module
-(define modules-by-name (make-hash))         ; instance name stem -> module
 (define installed (make-hash))               ; "path|shift" -> #t
 
 ;; phase: an integer, or 'all. namespace: type or value (spec 6.1).
@@ -199,32 +198,42 @@
 ;; Instance name, in st's namespace.
 (define (ns-name st name) (string-append (cstore-ns st) "/" name))
 
-;; Instance names of module linklets: "<module>@<phase>+<shift>" (spec 3.2).
-(define (linklet-name m q t) (format "~a@~a+~a" (unit-name m) q t))
+;; Instance names (spec 3.2): "<module>@<phase>+<shift>" for a module's
+;; linklet at a phase shift, and "<module>@<phase>#<n>" for the n-th
+;; compile-time linklet of a module being compiled. The compiler reads a
+;; name back only through this table: name -> (module phase shift), or
+;; (module phase) for a compile-time linklet.
+(define instance-refs (make-hash))
 
-;; The byte index of the first (or, if last?, the last) byte b in string s,
-;; or #f.
-(define (byte-index s b last?)
-  (let ([n (string-utf-8-length s)])
-    (let loop ([i (if last? (- n 1) 0)])
-      (cond [(or (< i 0) (>= i n)) #f]
-            [(= (string-utf-8-byte s i) b) i]
-            [else (loop (if last? (- i 1) (+ i 1)))]))))
+(define (linklet-name m q t)
+  (let ([name (format "~a@~a+~a" (unit-name m) q t)])
+    (unless (hash-has-key? instance-refs name) (hash-set! instance-refs name (list m q t)))
+    name))
 
-(define (parse-linklet-name s)
-  (let ([at (byte-index s 64 #f)] [plus (byte-index s 43 #t)])
-    (and at plus (< at plus)
-         (let ([q (string->number (substring/utf-8 s (+ at 1) plus))]
-               [t (string->number (substring/utf-8 s (+ plus 1) (string-utf-8-length s)))])
-           (and q t (list (substring/utf-8 s 0 at) q t))))))
+;; The module linklet an instance name names, as (module phase shift), or #f.
+(define (linklet-ref name)
+  (let ([r (hash-ref instance-refs name #f)])
+    (and r (pair? (cddr r)) r)))
+
+;; What linklet p's imports link to in st when it is instantiated at phase
+;; shift t: an alist from each module name its code imports from to the
+;; instance that is. A module linklet's name, relative to shift 0, moves
+;; by t; a compile-time linklet is in st; the syntax library and the host
+;; keep their names.
+(define (import-map st imports t)
+  (foldl (lambda (imp acc)
+           (let ([r (hash-ref instance-refs imp #f)])
+             (cond [(not r) acc]
+                   [(pair? (cddr r)) (cons (cons imp (ns-name st (linklet-name (car r) (cadr r) (+ (caddr r) t)))) acc)]
+                   [else (cons (cons imp (ns-name st imp)) acc)])))
+         '() imports))
 
 ;; Make sure the instance an import names exists in st. imp is relative to
 ;; a module instantiated at phase shift `shift`. The syntax library is the
 ;; store's own.
 (define (ensure-import! st imp shift)
-  (let ([p (and (not (member imp '("host" "expander" "syntax"))) (parse-linklet-name imp))])
-    (when p
-      (ensure-linklet! st (hash-ref modules-by-name (car p) #f) (cadr p) (+ (caddr p) shift)))))
+  (let ([r (linklet-ref imp)])
+    (when r (ensure-linklet! st (car r) (cadr r) (+ (caddr r) shift)))))
 
 ;; Instantiate module m's phase-q linklet at phase shift t in st,
 ;; dependencies first.
@@ -244,12 +253,13 @@
                         (let ([origin (hash-ref module-scope-origins sc #f)])
                           (scope-map-add sc (module-scope-at (car origin) (+ (cdr origin) t)))))
                       (linklet-scopes p)))
-          (let ([err (instantiate (ns-name st name) (linklet-bytes p) t)])
+          (let ([err (instantiate (ns-name st name) (linklet-bytes p) (import-map st (linklet-imports p) t))])
             (when shifted? (scope-map-clear))
             (when err
               (eprintf "error: ~a~n" err)
               (exit 2))))
         (hash-set! (cstore-instances st) name #t)))))
+
 
 ;; ---- bindings ----
 
@@ -425,8 +435,8 @@
 (define shifted-infos (make-hasheq))   ; info -> alist shift -> info
 
 (define (shift-instance inst k)
-  (let ([p (and (string? inst) (parse-linklet-name inst))])
-    (if p (format "~a@~a+~a" (car p) (cadr p) (+ (caddr p) k)) inst)))
+  (let ([r (and (string? inst) (linklet-ref inst))])
+    (if r (linklet-name (car r) (cadr r) (+ (caddr r) k)) inst)))
 
 (define (shift-info info k)
   (if (= k 0)
@@ -539,21 +549,31 @@
                            [(null? (cdr segs)) (car segs)]
                            [else (string-append (car segs) "/" (loop (cdr segs)))])))))
 
+;; The byte index of the last byte b in string s, or #f.
+(define (last-byte-index s b)
+  (let loop ([i (- (string-utf-8-length s) 1)])
+    (cond [(< i 0) #f]
+          [(= (string-utf-8-byte s i) b) i]
+          [else (loop (- i 1))])))
+
 (define (directory-of path)
-  (let ([slash (byte-index path 47 #t)])
+  (let ([slash (last-byte-index path 47)])
     (if slash (substring/utf-8 path 0 (+ slash 1)) "")))
+
+;; The names of the modules compiled so far.
+(define unit-names (make-hash))
 
 ;; An instance-name stem from the file name: letters, digits, - and _.
 (define (fresh-unit-name path)
-  (let* ([slash (byte-index path 47 #t)]
+  (let* ([slash (last-byte-index path 47)]
          [base (if slash (substring/utf-8 path (+ slash 1) (string-utf-8-length path)) path)]
-         [dot (byte-index base 46 #t)]
+         [dot (last-byte-index base 46)]
          [stem (if dot (substring/utf-8 base 0 dot) base)]
          [clean (list->string (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_))) c #\_))
                                    (string->list stem)))])
     (let loop ([n 1])
       (let ([name (if (= n 1) clean (format "~a-~a" clean n))])
-        (if (hash-has-key? modules-by-name name) (loop (+ n 1)) name)))))
+        (if (hash-has-key? unit-names name) (loop (+ n 1)) (begin (hash-set! unit-names name #t) name))))))
 
 ;; Compile the module in file `source` (and, first, what it requires).
 ;; Returns the module. Each module is compiled once per run.
@@ -571,7 +591,6 @@
               [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())]
               [saved-infos current-syntax-infos])
          (hash-set! registry path m)
-         (hash-set! modules-by-name name m)
          (with-comp c
            (lambda ()
              (set-syntax-infos! (cdr syntax-lib))
@@ -644,9 +663,8 @@
            (let* ([p (hash-ref (unit-linklets (car todo)) 0 #f)]
                   [deps (filter (lambda (x) x)
                                 (map (lambda (imp)
-                                       (let ([pp (parse-linklet-name imp)])
-                                         (and pp (= (cadr pp) 0) (= (caddr pp) 0)
-                                              (hash-ref modules-by-name (car pp) #f))))
+                                       (let ([r (linklet-ref imp)])
+                                         (and r (= (cadr r) 0) (= (caddr r) 0) (car r))))
                                      (linklet-imports p)))])
              (loop (append (cdr todo) deps) (cons (car todo) seen)))])))
 
@@ -655,7 +673,7 @@
 (define (check-freestanding! m form)
   (for-each (lambda (mm)
               (let* ([p (hash-ref (unit-linklets mm) 0 #f)]
-                     [extra (filter (lambda (imp) (not (or (string=? imp "host") (parse-linklet-name imp))))
+                     [extra (filter (lambda (imp) (not (or (string=? imp "host") (linklet-ref imp))))
                                     (linklet-imports p))])
                 (unless (and (null? extra) (not (linklet-gc? p)))
                   (raise-compile-error form
@@ -678,7 +696,7 @@
           (hash-set! seen name #t)
           (let ([p (hash-ref (unit-linklets m) 0 #f)])
             (for-each (lambda (imp)
-                        (let ([l (parse-linklet-name imp)])
+                        (let ([l (linklet-ref imp)])
                           (cond [(string=? imp "syntax")
                                  (unless (hash-has-key? seen imp)
                                    (hash-set! seen imp #t)
@@ -686,7 +704,7 @@
                                 [l
                                  (unless (and (= (cadr l) 0) (= (caddr l) 0))
                                    (raise-compile-error #f "internal: a program imports from ~a" imp))
-                                 (visit (hash-ref modules-by-name (car l) #f))]
+                                 (visit (car l))]
                                 [else #f])))
                       (linklet-imports p))
             (set! out (cons (cons name (linklet-bytes p)) out))))))
@@ -1421,17 +1439,19 @@
 
 ;; ==== compile-time evaluation ====
 
-(define (next-linklet-name! prefix)
-  (let ([n (comp-linklet-counter current)])
+;; The name of the next compile-time linklet of module m's phase q.
+(define (next-linklet-name! m q)
+  (let* ([n (comp-linklet-counter current)] [name (format "~a@~a#~a" (unit-name m) q n)])
     (set-comp-linklet-counter! current (+ n 1))
-    (format "~a#~a" prefix n)))
+    (hash-set! instance-refs name (list m q))
+    name))
 
 ;; Compile forms and instantiate them in st, after what they import.
 (define (instantiate-linklet! st name forms where)
   (set-current-source! (and current (string->symbol (unit-source (comp-module current)))))
   (let ([compiled (compile-module forms name)])
     (for-each (lambda (imp) (ensure-import! st imp 0)) (cadr compiled))
-    (let ([err (instantiate (ns-name st name) (car compiled))])
+    (let ([err (instantiate (ns-name st name) (car compiled) (import-map st (cadr compiled) 0))])
       (when err (raise-compile-error where "compile-time code failed: ~a" err)))
     (hash-set! (cstore-instances st) name #t)
     name))
@@ -1441,7 +1461,7 @@
 ;; linklet.
 (define (run-compile-time-linklet! forms phase where)
   (add-phase-forms! phase forms)
-  (let ([name (next-linklet-name! (format "~a@~a" (unit-name (comp-module current)) phase))])
+  (let ([name (next-linklet-name! (comp-module current) phase)])
     (instantiate-linklet! (comp-store current) name (append (linklet-storage-forms phase name) forms) where)))
 
 ;; The memory and table forms for a linklet at phase, named name (spec

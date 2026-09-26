@@ -5,7 +5,7 @@
 ;; crossing this boundary is an i32: stage0 refers to GC objects in the
 ;; syntax library through integer handles (spec appendix A).
 (library (stage0 host)
-  (export with-profile host-new host-instantiate! host-instantiate-shifted! host-call host-memory-write! host-memory-read
+  (export with-profile host-new host-instantiate! host-call host-memory-write! host-memory-read
           host-set-callback! host-request-trap! host-add-arg!
           wasm-failure? wasm-failure-message)
   (import (chezscheme))
@@ -16,8 +16,7 @@
 
   (define c-host-new (foreign-procedure "sub_host_new" () uptr))
   (define c-last-error (foreign-procedure "sub_last_error" (uptr) string))
-  (define c-instantiate (foreign-procedure "sub_instantiate" (uptr string u8* size_t) int))
-  (define c-instantiate-shifted (foreign-procedure "sub_instantiate_shifted" (uptr string u8* size_t int) int))
+  (define c-instantiate (foreign-procedure "sub_instantiate" (uptr string u8* size_t u8* size_t) int))
   (define c-call (foreign-procedure "sub_call" (uptr string string int int int int int int int) int))
   (define c-result (foreign-procedure "sub_result" (uptr) int))
   (define c-memory-write (foreign-procedure "sub_memory_write" (uptr string unsigned-32 u8* size_t) int))
@@ -51,11 +50,13 @@
   ;; Give the program run in h a command-line argument (spec 4).
   (define (host-add-arg! h arg) (c-add-arg h arg))
 
-  (define (host-instantiate! h name bytes)
-    (check h (c-instantiate h name bytes (bytevector-length bytes))))
-
-  (define (host-instantiate-shifted! h name bytes shift)
-    (check h (c-instantiate-shifted h name bytes (bytevector-length bytes) shift)))
+  ;; Instantiate bytes as instance name, linking an import from a module
+  ;; that the alist imports names to its instance there (spec 4).
+  (define (host-instantiate! h name bytes . imports)
+    (let ([m (string->utf8 (apply string-append
+                                  (map (lambda (p) (string-append (car p) "\x0;" (cdr p) "\x0;"))
+                                       (if (null? imports) '() (car imports)))))])
+      (check h (c-instantiate h name bytes (bytevector-length bytes) m (bytevector-length m)))))
 
   (define (pad args n)
     (let loop ([args args] [n n])

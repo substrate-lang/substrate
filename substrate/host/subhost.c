@@ -462,91 +462,33 @@ static wasmtime_error_t *compile(const uint8_t *bytes, size_t len, wasmtime_modu
 
 /* ---- instantiation ---------------------------------------------------- */
 
-static int instantiate(sub_host *h, const char *name, size_t name_len, const uint8_t *bytes, size_t len) {
-  wasmtime_module_t *module = NULL;
-  p_naming = name;
-  wasmtime_error_t *error = compile(bytes, len, &module);
-  if (error) {
-    take_failure(h, "compile", error, NULL);
-    return 1;
+/* The instance an import from module mod (len bytes) links to: the one
+ * map names for mod, or mod itself. map is pairs of names, a module's then
+ * its instance's, each followed by a zero byte (spec 4). */
+static void mapped_import(const char *map, size_t map_len, const char *mod, size_t len, char *out, size_t cap) {
+  for (size_t i = 0; i < map_len;) {
+    const char *from = map + i;
+    size_t fl = strnlen(from, map_len - i);
+    if (i + fl + 1 >= map_len) break;
+    const char *to = from + fl + 1;
+    size_t tl = strnlen(to, map_len - i - fl - 1);
+    if (fl == len && memcmp(from, mod, len) == 0) {
+      snprintf(out, cap, "%.*s", (int)tl, to);
+      return;
+    }
+    i += fl + 1 + tl + 1;
   }
-  wasmtime_instance_t inst;
-  wasm_trap_t *trap = NULL;
-  sub_profile_push(P_INSTANTIATE);
-  error = wasmtime_linker_instantiate(h->linker, h->ctx, module, &inst, &trap);
-  sub_profile_pop();
-  if (error || trap) {
-    take_failure(h, "instantiate", error, trap);
-    return 1;
-  }
-  error = wasmtime_linker_define_instance(h->linker, h->ctx, name, name_len, &inst);
-  if (error) {
-    take_failure(h, "register", error, NULL);
-    return 1;
-  }
-  return 0;
+  snprintf(out, cap, "%.*s", (int)len, mod);
 }
 
-int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t len) {
-  /* Copy both arguments first: instantiation runs start functions. */
-  char *name_copy = strdup(name);
-  uint8_t *copy = malloc(len ? len : 1);
-  memcpy(copy, bytes, len);
-  int rc = instantiate(h, name_copy, strlen(name_copy), copy, len);
-  free(copy);
-  free(name_copy);
-  return rc;
-}
-
-/* A module linklet's instance name is "<module>@<phase>+<shift>" (spec 3.2).
- * Compiled linklets import from other linklets by names relative to their
- * own module at phase shift 0; instantiating at phase shift s adds s to each
- * such name.
- * Writes the mapped name to out; other names are copied unchanged. */
-static void shift_name(const char *name, size_t len, int32_t shift, char *out, size_t cap) {
-  size_t plus = len;
-  for (size_t i = len; i > 0; i--)
-    if (name[i - 1] == '+') { plus = i - 1; break; }
-  bool linklet = plus < len && memchr(name, '@', plus) != NULL && plus + 1 < len;
-  for (size_t i = plus + 1; linklet && i < len; i++)
-    if (name[i] < '0' || name[i] > '9') linklet = false;
-  if (!linklet || shift == 0) {
-    snprintf(out, cap, "%.*s", (int)len, name);
-    return;
-  }
-  /* Parse the digits within len: an import name is not NUL-terminated. */
-  long t = 0;
-  for (size_t i = plus + 1; i < len; i++) t = t * 10 + (name[i] - '0');
-  snprintf(out, cap, "%.*s+%ld", (int)plus, name, t + shift);
-}
-
-/* The instance an import from mod (len bytes) links to, for the instance
- * named name at phase shift shift. A linklet name, one with an @ in it, is
- * shifted, and if name is "<ns>/<rest>" it is looked up in namespace ns
- * too: a linklet registered in a namespace imports from linklets in it
- * (spec 3.2). Other names, such as "syntax" and "host", are unchanged. */
-static void map_import(const char *name, const char *mod, size_t len, int32_t shift, char *out, size_t cap) {
-  if (!memchr(mod, '@', len)) {
-    snprintf(out, cap, "%.*s", (int)len, mod);
-    return;
-  }
-  const char *slash = strrchr(name, '/');
-  int ns = slash ? (int)(slash - name) + 1 : 0;
-  snprintf(out, cap, "%.*s", ns, name);
-  size_t used = strlen(out);
-  shift_name(mod, len, shift, out + used, cap - used);
-}
-
-int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes, size_t len, int32_t shift) {
-  char *name_copy = strdup(name);
-  uint8_t *copy = malloc(len ? len : 1);
-  memcpy(copy, bytes, len);
+static int instantiate(sub_host *h, const char *name, size_t name_len, const uint8_t *bytes, size_t len,
+                       const char *map, size_t map_len) {
   int rc = 1;
   wasmtime_module_t *module = NULL;
   wasm_importtype_vec_t imports = {0};
   wasmtime_extern_t *externs = NULL;
-  p_naming = name_copy;
-  wasmtime_error_t *error = compile(copy, len, &module);
+  p_naming = name;
+  wasmtime_error_t *error = compile(bytes, len, &module);
   if (error) {
     take_failure(h, "compile", error, NULL);
     goto done;
@@ -556,10 +498,10 @@ int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes,
   for (size_t i = 0; i < imports.size; i++) {
     const wasm_name_t *mod = wasm_importtype_module(imports.data[i]);
     const wasm_name_t *field = wasm_importtype_name(imports.data[i]);
-    char mapped[512];
-    map_import(name_copy, mod->data, mod->size, shift, mapped, sizeof mapped);
-    if (!wasmtime_linker_get(h->linker, h->ctx, mapped, strlen(mapped), field->data, field->size, &externs[i])) {
-      set_err(h, "instantiate %s: no import %s.%.*s", name_copy, mapped, (int)field->size, field->data);
+    char linked[512];
+    mapped_import(map, map_len, mod->data, mod->size, linked, sizeof linked);
+    if (!wasmtime_linker_get(h->linker, h->ctx, linked, strlen(linked), field->data, field->size, &externs[i])) {
+      set_err(h, "instantiate %.*s: no import %s.%.*s", (int)name_len, name, linked, (int)field->size, field->data);
       goto done;
     }
   }
@@ -572,7 +514,7 @@ int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes,
     take_failure(h, "instantiate", error, trap);
     goto done;
   }
-  error = wasmtime_linker_define_instance(h->linker, h->ctx, name_copy, strlen(name_copy), &inst);
+  error = wasmtime_linker_define_instance(h->linker, h->ctx, name, name_len, &inst);
   if (error) {
     take_failure(h, "register", error, NULL);
     goto done;
@@ -581,6 +523,18 @@ int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes,
 done:
   free(externs);
   wasm_importtype_vec_delete(&imports);
+  return rc;
+}
+
+int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t len, const char *map, size_t map_len) {
+  /* Copy the arguments first: instantiation runs start functions. */
+  char *name_copy = strdup(name);
+  uint8_t *copy = malloc(len ? len : 1);
+  memcpy(copy, bytes, len);
+  char *map_copy = malloc(map_len ? map_len : 1);
+  memcpy(map_copy, map, map_len);
+  int rc = instantiate(h, name_copy, strlen(name_copy), copy, len, map_copy, map_len);
+  free(map_copy);
   free(copy);
   free(name_copy);
   return rc;
@@ -674,13 +628,12 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   sub_host *h = env;
   uint32_t np = (uint32_t)args[0].of.i32, nl = (uint32_t)args[1].of.i32;
   uint32_t bp = (uint32_t)args[2].of.i32, bl = (uint32_t)args[3].of.i32;
-  int32_t shift = args[4].of.i32;
-  if (shift < 0) return trap_msg("host.instantiate: negative phase shift");
+  uint32_t mp = (uint32_t)args[4].of.i32, ml = (uint32_t)args[5].of.i32;
   wasmtime_memory_t mem;
   if (!caller_memory(caller, &mem)) return trap_msg("host.instantiate: caller exports no memory");
   wasmtime_context_t *cctx = wasmtime_caller_context(caller);
-  uint8_t *name = range(cctx, &mem, np, nl), *bytes = range(cctx, &mem, bp, bl);
-  if (!name || !bytes) return trap_msg("host.instantiate: out of bounds");
+  uint8_t *name = range(cctx, &mem, np, nl), *bytes = range(cctx, &mem, bp, bl), *map = range(cctx, &mem, mp, ml);
+  if (!name || !bytes || !map) return trap_msg("host.instantiate: out of bounds");
   /* Copy out before instantiating: the new module's start function may
    * grow the caller's memory and move it. */
   char *name_copy = malloc(nl + 1);
@@ -688,12 +641,12 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   name_copy[nl] = '\0';
   uint8_t *copy = malloc(bl ? bl : 1);
   memcpy(copy, bytes, bl);
+  char *map_copy = malloc(ml ? ml : 1);
+  memcpy(map_copy, map, ml);
   ENTER(h, caller);
-  /* At a phase shift, and in a namespace, linklet names in the module's
-   * imports are mapped (spec 3.2). */
-  int rc = shift == 0 && !strchr(name_copy, '/') ? instantiate(h, name_copy, nl, copy, bl)
-                                                 : sub_instantiate_shifted(h, name_copy, copy, bl, shift);
+  int rc = instantiate(h, name_copy, nl, copy, bl, map_copy, ml);
   LEAVE(h);
+  free(map_copy);
   free(copy);
   free(name_copy);
   results[0].kind = WASMTIME_I32;
@@ -937,7 +890,7 @@ sub_host *sub_host_new(void) {
   h->linker = wasmtime_linker_new(engine());
   if (define(h, "host", "write", 3, 1, host_write, h) ||
       define(h, "host", "trap", 2, 0, host_trap, h) ||
-      define(h, "host", "instantiate", 5, 1, host_instantiate, h) ||
+      define(h, "host", "instantiate", 6, 1, host_instantiate, h) ||
       define(h, "host", "export_index", 4, 1, host_export_index, h) ||
       define(h, "host", "error_message", 2, 1, host_error_message, h) ||
       define(h, "host", "arg_count", 0, 1, host_arg_count, h) ||

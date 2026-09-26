@@ -274,19 +274,22 @@ them in Chez; in a run-time store they trap.
   macros share syntax objects with the compiler by reference.
 - A module's linklet instantiated at phase shift *t* is registered as
   `<module>@<phase>+<t>`. A compiled linklet imports from other linklets by
-  names relative to its own module at phase shift 0. The host adds the
-  phase shift when it instantiates the linklet (section 4), so one compiled
-  linklet serves at any phase.
+  names relative to its own module at phase shift 0, so one compiled
+  linklet serves at any phase: when it instantiates the linklet at phase
+  shift *t*, the compiler maps each such import to the linklet at shift
+  *t* higher, with `instantiate`'s import map (section 4).
 - A program runs in a fresh run-time store holding exactly the linklets
   reached from its phase-0 linklet at phase shift 0. A module required
   only inside `begin-for-syntax` is never loaded at run time.
 - The other instance names are `syntax`, `host`, `expander`, the linklets
   of compile-time code (`<module>@<phase>#<n>`) and per-store entry
   linklets (`entry#<n>`).
-- **Namespaces**: an instance registered as `<ns>/<name>` imports from
-  linklets, the instances with an `@` in their names, in namespace `ns`:
-  the host looks up `<ns>/<linklet>`, after the phase shift. Its other
-  imports, such as `syntax` and `host`, are the store's.
+- **Namespaces**: the compiler registers a compilation's instances as
+  `<ns>/<name>`, and maps the imports of each from linklets to
+  `<ns>/<linklet>`, after the phase shift. Its other imports, such as
+  `syntax` and `host`, are the store's. These names mean something only to
+  the compiler: the host links each import to the instance the map
+  names, or to the instance its module name names.
 
 ### 3.3 Linking
 
@@ -387,7 +390,7 @@ like the source a compiler reads.
 |---|---|---|
 | `write` | `(fd ptr len) -> i32` | write bytes to fd 1 or 2; returns `len` |
 | `trap` | `(ptr len) -> ()` | abort with the UTF-8 message at `ptr` |
-| `instantiate` | `(name name-len bytes bytes-len shift) -> i32` | compile and instantiate the wasm module in `bytes`, link its imports by name, and register it as `name`. At a phase shift `shift` > 0, each import from a linklet `<module>@<phase>+<t>` links to `<module>@<phase>+<t + shift>` instead (3.2). 0 on success. |
+| `instantiate` | `(name name-len bytes bytes-len map map-len) -> i32` | compile and instantiate the wasm module in `bytes`, and register it as `name`. The map is pairs of names, a module's then an instance's, each followed by a zero byte: an import from a module the map names links to that instance, and any other import to the instance its module name names (3.2). 0 on success. |
 | `export_index` | `(inst inst-len field field-len) -> i32` | append the function `inst.field` to the caller's table (exported as `"table"`) and return its index, or -1 |
 | `error_message` | `(buf cap) -> i32` | copy the last error of `instantiate`, `read_file` or `write_file` into `buf`; returns its length |
 | `arg_count` | `() -> i32` | the number of the program's command-line arguments |

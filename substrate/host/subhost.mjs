@@ -136,23 +136,14 @@ function located(line) {
   return found && found.where ? `${line} ${found.where}` : line;
 }
 
-// A linklet name "<module>@<phase>+<t>" at phase shift shift names
-// "<module>@<phase>+<t + shift>"; other names are unchanged (spec 3.2).
-function shiftName(name, shift) {
-  const plus = name.lastIndexOf('+');
-  if (shift === 0 || plus < 0 || !name.slice(0, plus).includes('@')) return name;
-  const digits = name.slice(plus + 1);
-  if (!/^[0-9]+$/.test(digits)) return name;
-  return `${name.slice(0, plus)}+${Number(digits) + shift}`;
-}
-
-// The instance an import from mod links to, for the instance named name
-// at phase shift shift: a linklet name is shifted, and looked up in the
-// namespace of name if it has one, "<ns>/<rest>".
-function mapImport(name, mod, shift) {
-  if (!mod.includes('@')) return mod;
-  const slash = name.lastIndexOf('/');
-  return (slash >= 0 ? name.slice(0, slash + 1) : '') + shiftName(mod, shift);
+// The import map a module is instantiated with (spec 4), from its bytes:
+// pairs of names, a module's then its instance's, each followed by a zero
+// byte.
+function importMap(bytes) {
+  const parts = text.decode(bytes).split('\0');
+  const map = new Map();
+  for (let i = 0; i + 1 < parts.length; i += 2) map.set(parts[i], parts[i + 1]);
+  return map;
 }
 
 // The host imports for one instance, self.exports once it exists. Every
@@ -172,11 +163,11 @@ function hostImports(self) {
     trap(ptr, len) {
       throw new Trap(string(ptr, len));
     },
-    instantiate(np, nl, bp, bl, shift) {
-      if (shift < 0) throw new Trap('host.instantiate: negative phase shift');
+    instantiate(np, nl, bp, bl, mp, ml) {
       const name = string(np, nl);
       const bytes = memory().slice(bp, bp + bl);
-      return instantiate(name, bytes, shift) ? 0 : 1;
+      const map = importMap(memory().slice(mp, mp + ml));
+      return instantiate(name, bytes, map) ? 0 : 1;
     },
     export_index(ip, il, fp, fl) {
       const table = self.exports.table;
@@ -295,7 +286,9 @@ function deferStart(bytes) {
 
 // Compile and instantiate bytes as instance name at phase shift shift,
 // linking its imports by name. False, with lastError set, on failure.
-function instantiate(name, bytes, shift) {
+// Instantiate bytes as instance name, linking each import to the instance
+// map names for its module, or to the instance of that name.
+function instantiate(name, bytes, map) {
   let module;
   try {
     module = compile(bytes);
@@ -314,12 +307,11 @@ function instantiate(name, bytes, shift) {
     } else if (imp.module === 'expander') {
       value = expanderQuery;
     } else {
-      const mapped = mapImport(name, imp.module, shift);
-      const exports = registry.get(mapped);
+      const exports = registry.get(map.get(imp.module) ?? imp.module);
       value = exports && exports[imp.name];
     }
     if (value === undefined) {
-      lastError = `instantiate ${name}: no import ${mapImport(name, imp.module, shift)}.${imp.name}`;
+      lastError = `instantiate ${name}: no import ${map.get(imp.module) ?? imp.module}.${imp.name}`;
       return false;
     }
     (imports[imp.module] ||= {})[imp.name] = value;
@@ -376,7 +368,7 @@ for (const name of names) {
     process.stderr.write(`subhost: cannot read ${dir}/${name}.wasm\n`);
     process.exit(1);
   }
-  if (!instantiate(name, bytes, 0)) {
+  if (!instantiate(name, bytes, new Map())) {
     process.stderr.write(`error: ${lastError}\n`);
     process.exit(2);
   }

@@ -202,6 +202,16 @@
            => (lambda (p) (ensure-linklet! st (hashtable-ref modules-by-name (car p) #f) (cadr p) (+ (caddr p) shift)))]
           [else (void)]))                  ; a begin-for-syntax linklet, already instantiated
 
+  ;; What linklet p's imports link to when it is instantiated at phase
+  ;; shift t (spec 3.2): a module linklet's name, relative to shift 0,
+  ;; moves by t.
+  (define (shifted-imports p t)
+    (filter (lambda (x) x)
+            (map (lambda (imp)
+                   (let ([r (parse-linklet-name imp)])
+                     (and r (not (= t 0)) (cons imp (format "~a@~a+~a" (car r) (cadr r) (+ (caddr r) t))))))
+                 (linklet-imports p))))
+
   ;; Instantiate module m's phase-q linklet at phase shift t in st,
   ;; dependencies first.
   (define (ensure-linklet! st m q t)
@@ -222,7 +232,7 @@
                             (host-call (cstore-host st) "syntax" "%scope-map-add"
                                        sc (module-scope-at (car origin) (+ (cdr origin) t)))))
                         (linklet-scopes p)))
-            (host-instantiate-shifted! (cstore-host st) name (linklet-bytes p) t)
+            (host-instantiate! (cstore-host st) name (linklet-bytes p) (shifted-imports p t))
             (when shifted?
               (host-call (cstore-host st) "syntax" "%scope-map-clear")))
           (hashtable-set! (cstore-instances st) name #t)))))

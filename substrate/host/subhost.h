@@ -42,14 +42,11 @@ void sub_host_free(sub_host *h);
  * message is then available from sub_last_error. */
 const char *sub_last_error(sub_host *h);
 
-/* Compile and instantiate a module, link its imports by name, and register
- * it under `name`. */
-int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t len);
-
-/* Like sub_instantiate, for a module's linklet compiled at phase shift 0
- * and instantiated at phase shift `shift`: imports from "<module>@<phase>+<t>" resolve to
- * "<module>@<phase>+<t + shift>" (spec 3.2). */
-int sub_instantiate_shifted(sub_host *h, const char *name, const uint8_t *bytes, size_t len, int32_t shift);
+/* Compile and instantiate a module, link each import to the instance map
+ * names for its module, or to the instance of that name, and register it
+ * under `name`. map is map_len bytes: pairs of names, a module's then its
+ * instance's, each followed by a zero byte (spec 4). */
+int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t len, const char *map, size_t map_len);
 
 /* Call inst.fn with up to 6 i32 arguments. A single i32 result is left in
  * sub_result. */
