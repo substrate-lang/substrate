@@ -40,7 +40,7 @@ for t in tests/*.sub examples/*.sub; do
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
   actual="$(cd "$dir" && "$compiler" build "$name.sub" -o "$root/$program" 2>&1 &&
-            "$host" "$root/$program" "${args[@]}" 2>&1)"
+            "$host" "$root/$program" ${args[@]+"${args[@]}"} 2>&1)"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then

@@ -76,7 +76,6 @@
 ;; under the greatest scope of its set, or -1 if the set is empty: an
 ;; identifier can refer to it only if the identifier has that scope too.
 (define bindings (make-hasheq))
-(define meanings (make-hasheqv))             ; key -> meaning
 ;; The keys of bindings require-unqualified made, each -> whether a macro
 ;; use has relied on it: a definition of the same name may shadow one it
 ;; has not (spec 3.1).
@@ -86,8 +85,9 @@
 (define registry (make-hash))                ; normalized path -> module
 (define installed (make-hash))               ; "path|shift" -> #t
 
-;; phase: an integer, or 'all. namespace: type or value (spec 6.1).
-(struct binding (scopes phase namespace key))
+;; phase: an integer, or 'all. namespace: type or value (spec 6.1). key
+;; identifies the binding to compiled code (local-binding, spec 2.3).
+(struct binding (scopes phase namespace key [meaning #:mutable]))
 
 ;; meaning: (core name) (prim name) (func info) (global info) (data info)
 ;;          (type info) (tag info) (local key) (label key) (compile-time-value getter-info)
@@ -102,7 +102,7 @@
 ;; against the running kernel, for compile time. program: its phase-0
 ;; linklet compiled against the target kernel, for programs. requires:
 ;; list of (module . shift). provides: list of (symbol . meaning). entries:
-;; its module-level bindings, as (symbol scopes phase key). scope: its
+;; its module-level bindings, as (symbol scopes phase binding). scope: its
 ;; module scope. name: what its instance names start with (spec 3.2).
 (struct unit (path source [name #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
               [entries #:mutable] [expanded #:mutable] [scope #:mutable] [program #:mutable]))
@@ -121,8 +121,9 @@
 (struct comp (module store [linklet-counter #:mutable] [use-site-scopes #:mutable]
               [freestanding-form #:mutable] phase-forms memories tables [provide-ids #:mutable]
               [require-names #:mutable]            ; ((name . phase) . module)
-              [definition-keys #:mutable]          ; keys of its phase-0 definitions
-              [storage-linklets #:mutable]))       ; ((memory-or-table . phase) . linklet that defines it)
+              [definitions #:mutable]              ; the bindings of its phase-0 definitions
+              [storage-linklets #:mutable]         ; ((memory-or-table . phase) . linklet that defines it)
+              [pending #:mutable]))                ; define-syntax units not yet run: (phase where . forms), newest first
 
 (define current #f)                      ; the comp being expanded
 
@@ -207,7 +208,7 @@
 (define (compile-kernel text)
   (let* ([k (kernel #f #f #f #f (make-hasheq))]
          [m (unit kernel-path kernel-path "kernel" 'compiling (make-hasheqv) '() '() '() #f #f #f)]
-         [c (comp m #f 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())])
+         [c (comp m #f 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '() #f)])
     (with-comp c
       (lambda ()
         (with-kernel k
@@ -347,21 +348,20 @@
                (let ([t (make-hasheqv)]) (hash-set! bindings sym t) t))])
     (hash-set! t sc (f (hash-ref t sc '())))))
 
+;; Bind sym with these scopes at phase to meaning: the binding.
 (define (bind-raw! sym scopes phase meaning)
-  (let ([key (fresh-key!)])
-    (update-bindings-under! sym (binding-slot scopes)
-                            (lambda (l) (cons (binding scopes phase (meaning-namespace meaning) key) l)))
-    (hash-set! meanings key meaning)
-    key))
+  (let ([b (binding scopes phase (meaning-namespace meaning) (fresh-key!) meaning)])
+    (update-bindings-under! sym (binding-slot scopes) (lambda (l) (cons b l)))
+    b))
 
 ;; A module-level binding of the current module: recorded, so that a
 ;; module requiring this one at a phase shift can install a shifted copy.
 (define (bind-module-level! sym scopes phase meaning)
-  (let ([key (bind-raw! sym scopes phase meaning)])
+  (let ([b (bind-raw! sym scopes phase meaning)])
     (when current
       (let ([m (comp-module current)])
-        (set-unit-entries! m (cons (list sym scopes phase key) (unit-entries m)))))
-    key))
+        (set-unit-entries! m (cons (list sym scopes phase b) (unit-entries m)))))
+    b))
 
 (define (bind! id phase meaning) (bind-raw! (stx-e id) (stx-scopes id) phase meaning))
 
@@ -369,7 +369,7 @@
   (for-each (lambda (b)
               (when (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
                          (eq? (binding-namespace b) (meaning-namespace meaning))
-                         (not (equal? (hash-ref meanings (binding-key b) #f) meaning)))
+                         (not (equal? (binding-meaning b) meaning)))
                 (raise-compile-error id "~a is already bound~a" (stx-e id)
                                      (if (> phase 0) (format " at phase ~a" phase) ""))))
             (bindings-under (stx-e id) (binding-slot (stx-scopes id)))))
@@ -385,9 +385,9 @@
     (unless (and redefining? (redefine! id phase meaning))
       (shadow-import! id phase meaning)
       (check-unbound! id phase meaning)
-      (let ([key (bind-module-level! (stx-e id) (stx-scopes id) phase meaning)])
+      (let ([b (bind-module-level! (stx-e id) (stx-scopes id) phase meaning)])
         (when (eqv? phase 0)
-          (set-comp-definition-keys! current (cons key (comp-definition-keys current))))))))
+          (set-comp-definitions! current (cons b (comp-definitions current))))))))
 
 ;; A definition shadows a binding require-unqualified made with the same
 ;; name, scopes, phase and namespace: that binding goes, here and in the
@@ -397,24 +397,24 @@
   (let ([b (findf (lambda (b)
                     (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
                          (eq? (binding-namespace b) (meaning-namespace meaning))
-                         (hash-has-key? unqualified-imports (binding-key b))))
+                         (hash-has-key? unqualified-imports b)))
                   (bindings-under (stx-e id) (binding-slot (stx-scopes id))))])
     (when b
-      (when (hash-ref unqualified-imports (binding-key b) #f)
+      (when (hash-ref unqualified-imports b #f)
         (raise-compile-error id "~a is defined here, but a macro use before this definition used the ~a it imports"
                              (stx-e id) (stx-e id)))
-      (hash-remove! unqualified-imports (binding-key b))
+      (hash-remove! unqualified-imports b)
       (update-bindings-under! (stx-e id) (binding-slot (binding-scopes b))
                               (lambda (l) (filter (lambda (x) (not (eq? x b))) l)))
       (let ([m (comp-module current)])
-        (set-unit-entries! m (filter (lambda (e) (not (eqv? (cadddr e) (binding-key b)))) (unit-entries m)))))))
+        (set-unit-entries! m (filter (lambda (e) (not (eq? (cadddr e) b))) (unit-entries m)))))))
 
 ;; A macro use relied on id's binding: if require-unqualified made it, no
 ;; definition may shadow it now.
 (define (note-macro-use! id phase)
-  (let ([key (resolve id phase 'value)])
-    (when (and key (hash-has-key? unqualified-imports key))
-      (hash-set! unqualified-imports key #t))))
+  (let ([b (resolve id phase 'value)])
+    (when (and b (hash-has-key? unqualified-imports b))
+      (hash-set! unqualified-imports b #t))))
 
 ;; Give this module's definition of id, if it has one in the namespace of
 ;; meaning, the new meaning: the binding with id's name, scopes and phase,
@@ -424,7 +424,7 @@
                     (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
                          (eq? (binding-namespace b) (meaning-namespace meaning))))
                   (bindings-under (stx-e id) (binding-slot (stx-scopes id))))])
-    (and b (begin (hash-set! meanings (binding-key b) meaning) #t))))
+    (and b (begin (set-binding-meaning! b meaning) #t))))
 
 (define (phase-matches? b phase)
   (let ([p (binding-phase b)])
@@ -447,7 +447,7 @@
       (candidates (hash-ref table (car scs) '()) phase ns scopes
                   (candidates-under table (cdr scs) phase ns scopes))))
 
-;; The key id refers to at phase in namespace ns, or #f if unbound. A
+;; The binding id refers to at phase in namespace ns, or #f if unbound. A
 ;; binding whose scopes are a subset of id's is kept under one of id's
 ;; scopes, or -1, so only those are candidates.
 (define (resolve id phase ns)
@@ -459,7 +459,7 @@
                     '())])
     (cond
       [(null? cands) #f]
-      [(null? (cdr cands)) (binding-key (car cands))]
+      [(null? (cdr cands)) (car cands)]
       [else
         (let ([best (foldl (lambda (b best)
                              (if (> (length (binding-scopes b)) (length (binding-scopes best))) b best))
@@ -467,21 +467,20 @@
           (for-each (lambda (b)
                       (when (or (not (scopes-subset? (binding-scopes b) (binding-scopes best)))
                                 (and (not (eq? b best)) (equal? (binding-scopes b) (binding-scopes best))
-                                     (not (equal? (hash-ref meanings (binding-key b) #f)
-                                                  (hash-ref meanings (binding-key best) #f)))))
+                                     (not (equal? (binding-meaning b) (binding-meaning best)))))
                         (raise-compile-error id "identifier ~a is ambiguous" (stx-e id))))
                     cands)
-          (binding-key best))])))
+          best)])))
 
 ;; What id means at phase in the value namespace. Only type positions
 ;; (parse-heap, type-of) look in the type namespace, with type-meaning-of.
 (define (meaning-of id phase)
-  (let ([key (resolve id phase 'value)])
-    (and key (hash-ref meanings key #f))))
+  (let ([b (resolve id phase 'value)])
+    (and b (binding-meaning b))))
 
 (define (type-meaning-of id phase)
-  (let ([key (resolve id phase 'type)])
-    (and key (hash-ref meanings key #f))))
+  (let ([b (resolve id phase 'type)])
+    (and b (binding-meaning b))))
 
 ;; Is id bound to the core form `name`?
 (define (core-id? id name phase)
@@ -560,17 +559,12 @@
 ;; Every module scope, and its copies, as scope -> (module . shift).
 (define module-scope-origins (make-hasheqv))
 
-;; The module scopes in syntax literals of lowered forms x (spec 6.1).
-(define (literal-module-scopes x)
-  (let ([found (make-hasheqv)])
-    (let walk ([x x])
-      (cond [(stx? x)
-             (for-each (lambda (sc) (when (hash-has-key? module-scope-origins sc) (hash-set! found sc #t)))
-                       (stx-scopes x))
-             (walk (stx-e x))]
-            [(pair? x) (walk (car x)) (walk (cdr x))]
-            [else #f]))
-    (sort (hash-keys found) <)))
+;; The linklet compile-module compiled: its bytes, imports, whether it uses
+;; GC, and the module scopes in its syntax literals (spec 6.1), which the
+;; serializer noted.
+(define (compiled-linklet compiled)
+  (linklet (car compiled) (cadr compiled) (caddr compiled)
+           (sort (filter (lambda (sc) (hash-has-key? module-scope-origins sc)) (cadddr compiled)) <)))
 
 ;; Make module m's bindings resolvable at phase shift s, and those of the
 ;; modules it requires. Needed for m's macros: their templates carry m's
@@ -583,7 +577,7 @@
         (let ([from (unit-scope m)] [to (module-scope-at m s)])
           (for-each (lambda (e)
                       (bind-raw! (car e) (scopes-add (scopes-remove (cadr e) from) to) (+ (caddr e) s)
-                                 (shift-meaning (hash-ref meanings (cadddr e) #f) s)))
+                                 (shift-meaning (binding-meaning (cadddr e)) s)))
                     (reverse (unit-entries m)))))
       (for-each (lambda (r) (install-module-bindings! (car r) (+ s (cdr r)))) (unit-requires m)))))
 
@@ -676,7 +670,7 @@
        (ensure-kernels!)
        (let* ([text (file->string source)]
               [m (unit path source (provisional-name path) 'compiling (make-hasheqv) '() '() '() #f #f #f)]
-              [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())])
+              [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '() #f)])
          (hash-set! registry path m)
          (with-comp c
            (lambda ()
@@ -690,7 +684,9 @@
   (let ([msc (new-scope!)])
     (set-unit-scope! (comp-module current) msc)
     (hash-set! module-scope-origins msc (cons (comp-module current) 0))
-    (expand-body (map (lambda (f) (add-scope (add-scope f core-scope) msc)) forms) 0)))
+    (let ([out (expand-body (map (lambda (f) (add-scope (add-scope f core-scope) msc)) forms) 0)])
+      (run-pending!)
+      out)))
 
 (define (add-phase-forms! phase forms)
   (let ([t (comp-phase-forms current)])
@@ -732,8 +728,7 @@
                   (let* ([forms (append (storage-forms p) (reverse (hash-ref (comp-phase-forms c) p '())))]
                          [compiled (begin (set-current-source! (string->symbol (unit-source m)))
                                           (compile-module forms (linklet-name m p 0)))])
-                    (hash-set! (unit-linklets m) p
-                               (linklet (car compiled) (cadr compiled) (caddr compiled) (literal-module-scopes forms)))))
+                    (hash-set! (unit-linklets m) p (compiled-linklet compiled))))
                 phases))
     ;; Programs link to the target kernel: when it is not the host,
     ;; the phase-0 code is lowered and compiled again, against it.
@@ -743,9 +738,8 @@
          (hash-ref (unit-linklets m) 0)
          (with-kernel target-kernel
            (lambda ()
-             (let* ([forms (append (storage-forms 0) (lower-forms (unit-expanded m) 0))]
-                    [compiled (compile-module forms (linklet-name m 0 0))])
-               (linklet (car compiled) (cadr compiled) (caddr compiled) (literal-module-scopes forms)))))))
+             (compiled-linklet (compile-module (append (storage-forms 0) (lower-forms (unit-expanded m) 0))
+                                               (linklet-name m 0 0)))))))
     (hash-set! installed (format "~a|0" (unit-path m)) #t)
     (set-unit-state! m 'done)
     (let ([form (comp-freestanding-form c)])
@@ -1530,9 +1524,29 @@
 ;; begin-for-syntax is. Its code also goes into the module's phase-`phase`
 ;; linklet.
 (define (run-compile-time-linklet! forms phase where)
+  (run-pending!)
   (add-phase-forms! phase forms)
   (let ([name (next-linklet-name! (comp-module current) phase)])
     (instantiate-linklet! (comp-store current) name (append (linklet-storage-forms phase name) forms) where)))
+
+;; A define-syntax unit's forms, kept to be run with the other units
+;; waiting, as one linklet, before anything can see their values: at the
+;; first use of one of them, before a begin-for-syntax runs, and at the
+;; end of the module. where is the first unit's form.
+(define (defer-unit! forms phase where)
+  (let ([p (comp-pending current)])
+    (unless (and p (eqv? (car p) phase)) (run-pending!))
+    (add-phase-forms! phase forms)
+    (let ([p (comp-pending current)])
+      (set-comp-pending! current (if p (cons (car p) (cons (cadr p) (cons forms (cddr p)))) (list phase where forms))))))
+
+(define (run-pending!)
+  (let ([p (comp-pending current)])
+    (when p
+      (set-comp-pending! current #f)
+      (let ([name (next-linklet-name! (comp-module current) (car p))])
+        (instantiate-linklet! (comp-store current) name
+                              (append (linklet-storage-forms (car p) name) (apply append (reverse (cddr p)))) (cadr p))))))
 
 ;; The memory and table forms for a linklet at phase, named name (spec
 ;; 3.3). A phase's linklets share one memory: the first linklet after
@@ -1564,7 +1578,9 @@
   (let ([cached (hash-ref (cstore-values st) getter #f)])
     (if cached
         (car cached)
-        (let ([v (call-getter (function-index st getter))])
+        ;; A getter without an instance is in a unit still waiting.
+        (let ([v (begin (unless (func-info-instance getter) (run-pending!))
+                        (call-getter (function-index st getter)))])
           (hash-set! (cstore-values st) getter (list v))
           v))))
 
@@ -1606,10 +1622,10 @@
                       (cadr (last unit)))]
             [global (global-info name eqref #t #f #f)]
             [getter (func-info name '() (list eqref) #f #f #f)])
-       (run-compile-time-linklet! (append (if adapter unit (take unit (- (length unit) 1)))
-                                          (list (list 'global global init)
-                                                (list 'func getter '() (list 'gref global))))
-                                  (+ phase 1) f)
+       (defer-unit! (append (if adapter unit (take unit (- (length unit) 1)))
+                            (list (list 'global global init)
+                                  (list 'func getter '() (list 'gref global))))
+                    (+ phase 1) f)
        (hash-set! macro-modules getter (comp-module current))
        (bind-definition! id phase (list 'compile-time-value getter)))]))
 
@@ -2271,9 +2287,9 @@
                      (list (expand-let* s later body phase))))))))
 
 (define (bind-local! id phase)
-  (let ([key (bind! id phase #f)])
-    (hash-set! meanings key (list 'local key))
-    key))
+  (let ([b (bind! id phase #f)])
+    (set-binding-meaning! b (list 'local (binding-key b)))
+    (binding-key b)))
 
 ;; Local variable id, bound, as fully expanded code holds it: recording its
 ;; binding for local-binding (spec 2.3).
@@ -2294,8 +2310,8 @@
 (define label-functions (make-hasheqv))
 
 (define (fresh-label! id phase)
-  (let ([key (bind! id phase #f)])
-    (hash-set! meanings key (list 'label key))
+  (let* ([b (bind! id phase #f)] [key (binding-key b)])
+    (set-binding-meaning! b (list 'label key))
     (hash-set! label-functions key current-function)
     key))
 
@@ -2590,11 +2606,11 @@
                   [(import global data tag) (syntax-match f [(_ name . _) (hash-set! kept (cadr (meaning-of name 0)) #t)])]
                   [else #f]))
               forms)
-    (for-each (lambda (key)
-                (let ([m (hash-ref meanings key #f)])
+    (for-each (lambda (b)
+                (let ([m (binding-meaning b)])
                   (when (and m (memq (car m) '(func global data tag)) (not (hash-has-key? kept (cadr m))))
                     (hash-set! removed (cadr m) #t))))
-              (comp-definition-keys c))
+              (comp-definitions c))
     removed))
 
 (define (local-key-of id phase)

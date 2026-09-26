@@ -149,7 +149,7 @@ at the phase where it appears, plus any it lists to bind unqualified
 | Group | Functions |
 |---|---|
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
-| lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
+| lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(unsafe-car p)`, `(unsafe-cdr p)`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)` |
@@ -193,6 +193,9 @@ at the phase where it appears, plus any it lists to bind unqualified
   would, but without asking the expander.
 - Accessors trap with a message ("expected a pair") when given the wrong
   kind of value.
+- `unsafe-car` and `unsafe-cdr` are for code that has tested `pair?`
+  itself, such as a language's own checked accessors: given anything else
+  they trap on the cast, without the message.
 - `free-identifier=?` is 1 when `a` and `b` refer to the same bindings at
   the running macro's phase, as a value and as a type (6.1). An imported
   name and the definition it imports are the same binding. Two identifiers
@@ -292,11 +295,14 @@ they trap.
     by definition or import, is an error.
 - Expansion must run phase-1 code before the module is finished: a macro
   works on the line after its definition. So while a module is expanded,
-  each `begin-for-syntax` and each `define-syntax` is compiled into a
-  linklet of its own and instantiated at once, in
-  source order, as Racket evaluates them. When the module is done, each
-  phase's code is compiled again as a whole, into the module's linklet for
-  that phase. Other modules only ever use those.
+  each `begin-for-syntax` is compiled into a linklet of its own and
+  instantiated at once, in source order, as Racket evaluates them, and the
+  `define-syntax` forms between them are compiled and run together, as one
+  linklet, before anything can see their values: at the first use of one,
+  before the next `begin-for-syntax`, or at the end of the module. When
+  the module is done, each phase's code is compiled again as a
+  whole, into the module's linklet for that phase. Other modules only ever
+  use those.
 
 ### 3.2 Stores and instance names
 
