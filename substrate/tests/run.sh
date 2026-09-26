@@ -82,5 +82,21 @@ for f in "$builds"/tests/order-a/order-[mn].*.wasm; do
     echo "FAIL tests/order-b: $(basename "$f") differs from tests/order-a's"
   fi
 done
+# The cache (spec 3.7): a program built again, its modules loaded from
+# the cache, is byte for byte what the first build wrote.
+again="$builds/tests/order-a-again"
+rm -rf "$again"
+mkdir -p "$again"
+if (cd tests && "$compiler" build order-a.sub -o "$root/$again" > /dev/null 2>&1); then
+  while read -r linklet; do
+    if ! cmp -s "$again/$linklet.wasm" "$builds/tests/order-a/$linklet.wasm"; then
+      fail=$((fail + 1))
+      echo "FAIL tests/order-a: built again from the cache, $linklet differs"
+    fi
+  done < "$again/program"
+else
+  fail=$((fail + 1))
+  echo "FAIL tests/order-a: does not build again from the cache"
+fi
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]
