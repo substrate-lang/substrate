@@ -77,6 +77,8 @@
          ;; output and errors
          write display newline write-byte write-bytes open-output-bytes get-output-bytes
          call-with-output-bytes file-position printf eprintf format error
+         ;; exceptions
+         raise call-with-handlers dynamic-wind exn? exn-message syntax-error?
          ;; the host: files, the command line, instantiating code
          file->bytes file->string file-exists? display-to-file current-command-line-arguments instantiate exit)
 
@@ -100,7 +102,9 @@
                          (field next (mut (ref null entry)))))
      ;; An output port: the bytes written to it, and the file descriptor
      ;; the host writes them to, 1 or 2, or -1 for a port that keeps them.
-     (type port (struct (field bytes (mut (ref bytes))) (field length (mut i32)) (field fd i32))))
+     (type port (struct (field bytes (mut (ref bytes))) (field length (mut i32)) (field fd i32)))
+     ;; What error and the functions' checks raise: its message, a string.
+     (type exception (struct (field message eqref))))
 
 ;; The arguments after the first four, of the call being made.
 (type arguments (array (mut eqref)))
@@ -126,7 +130,11 @@
 (data msg-overflow 64 "integer overflow: integers are at most 64 bits")
 (data msg-divide 128 "division by zero")
 
-(func (fail [addr i32] [len i32]) (host-trap addr len) (unreachable))
+;; Raise an exception whose message is the len bytes at addr.
+(func (fail [addr i32] [len i32])
+  (let ([p (new-port -1)])
+    (out-memory p addr len)
+    (drop (fail-with p))))
 
 (func (not-a-function [f eqref]) -> eqref
   (fail (data-address msg-not-a-function) (data-size msg-not-a-function))
@@ -465,10 +473,50 @@
     (out-byte p 41)))
 
 ;; ---- run-time errors, continued -----------------------------------------------------------
+;;
+;; An error raises an exception, whose message is what was written to a
+;; port. Raising a value finds a handler for it first, among those
+;; with-handlers installed: if there is one, the value is thrown to it,
+;; with the syntax library's tag; if not, the program stops where it is, as
+;; at a trap, so the error keeps its backtrace (spec 4).
 
-;; Abort with what was written to p as the message, copied into bytes
+;; The handlers with-handlers installed, innermost first: for each, a list
+;; of its predicates.
+(global handlers (mut eqref) '())
+
+(func (fail-with [p (ref port)]) -> eqref (raise* (struct.new exception (port-string p))))
+
+;; Raise v.
+(func (raise* [v eqref]) -> eqref
+  (if (taken? v) (throw s:exn v))
+  (let ([p (new-port -1)])
+    (if (ref.test (ref exception) v)
+        (out-string p (struct.get exception message (ref.cast (ref exception) v)) 0)
+        (if (s:syntax-error? v)
+            (out-string p (s:syntax-error-message v) 0)
+            (begin (out-string p '"uncaught exception: " 0) (out-datum p v 0))))
+    (trap-with p)))
+
+;; Whether a predicate of an installed handler is true of v.
+(func (taken? [v eqref]) -> i32
+  (let ([hs handlers] [ps '()])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (s:pair? hs)))
+        (set! ps (s:car hs))
+        (block tried
+          (loop each
+            (br-if tried (i32.eqz (s:pair? ps)))
+            (if (i32.eqz (ref.is_null (app (s:car ps) v))) (return 1))
+            (set! ps (s:cdr ps))
+            (br each)))
+        (set! hs (s:cdr hs))
+        (br next)))
+    0))
+
+;; Trap, with what was written to p as the message, copied into bytes
 ;; 1024.. of this memory.
-(func (fail-with [p (ref port)]) -> eqref
+(func (trap-with [p (ref port)]) -> eqref
   (let* ([n (struct.get port length p)] [n (select n 4096 (i32.lt_u n 4096))] [a (struct.get port bytes p)] [i 0])
     (block done
       (loop next
@@ -476,7 +524,7 @@
         (i32.store8 (i32.add 1024 i) (array.get_u bytes a i))
         (set! i (i32.add i 1))
         (br next)))
-    (fail 1024 n))
+    (host-trap 1024 n))
   (unreachable))
 
 ;; Function who (a string) needs what (a string) where it was given v.
@@ -1640,7 +1688,7 @@
     (if (member? head '(quote quote-syntax #%datum ref.func func-index data-address data-size
                         unreachable nop i32.const i64.const f32.const f64.const))
         (return -1))
-    (if (member? head '(#%app block loop br br-if call-indirect)) (return 2))
+    (if (member? head '(#%app block loop br br-if call-indirect throw)) (return 2))
     (if (member? head '(struct.new array.new array.new_default array.new_fixed array.get array.get_s
                         array.get_u array.set array.fill ref.null ref.test ref.cast call-ref))
         (return 2))
@@ -1698,6 +1746,10 @@
               (if (i32.eqz mode) (note-types bs 0))
               (scan-inits bs env outside mode)
               (return (scan-list (s:cddr l) (s:append (binders bs) env) outside mode))))
+        (if (ref.eq head 'try)
+            (begin
+              (scan-clauses (s:syntax->list (s:cadr l)) env outside mode)
+              (return (scan-list (s:cddr l) env outside mode))))
         (if (ref.eq head 'set!)
             (begin
               (if (i32.eqz mode)
@@ -1715,6 +1767,25 @@
     (if (i32.eqz (s:null? bs))
         (begin (scan (binding-init (s:car bs)) env outside mode) (scan-inits (s:cdr bs) env outside mode))))
 
+  ;; A try's clauses: each binds its variables in its body.
+  (func (scan-clauses [cs eqref] [env eqref] [outside eqref] [mode i32])
+    (if (i32.eqz (s:null? cs))
+        (let* ([c (s:syntax->list (s:car cs))] [k (clause-body-start c)])
+          (scan-list (drop-n c k) (s:append (clause-vars c k) env) outside mode)
+          (scan-clauses (s:cdr cs) env outside mode))))
+
+  ;; Where try clause c's body starts, after its head, tag and variables:
+  ;; [catch tag (x ...) body ...], [catch-ref tag (x ... e) body ...],
+  ;; [catch-all body ...] or [catch-all-ref (e) body ...].
+  (func (clause-body-start [c eqref]) -> i32
+    (if (named? (s:car c) 'catch-all) (return 1))
+    (if (named? (s:car c) 'catch-all-ref) (return 2))
+    3)
+
+  ;; The variables of clause c, whose body starts at k.
+  (func (clause-vars [c eqref] [k i32]) -> eqref
+    (if (i32.lt_u k 2) '() (s:syntax->list (nth c (i32.sub k 1)))))
+
   ;; x with its lambdas converted and its boxed variables used through their
   ;; boxes.
   (func (convert-expr [x eqref] [env eqref]) -> eqref
@@ -1731,6 +1802,11 @@
                        x (s:cons (s:car l)
                                  (s:cons (s:syntax-rewrap (s:cadr l) (convert-bindings bs env))
                                          (convert-list (s:cddr l) (s:append (binders bs) env))))))))
+        (if (ref.eq head 'try)
+            (return (s:syntax-rewrap
+                     x (s:cons (s:car l)
+                               (s:cons (s:syntax-rewrap (s:cadr l) (convert-clauses (s:syntax->list (s:cadr l)) env))
+                                       (convert-list (s:cddr l) env))))))
         (if (ref.eq head 'set!)
             (let* ([target (s:cadr l)]
                    [b (lookup target env)]
@@ -1744,6 +1820,14 @@
 
   (func (convert-list [xs eqref] [env eqref]) -> eqref
     (if (s:null? xs) '() (s:cons (convert-expr (s:car xs) env) (convert-list (s:cdr xs) env))))
+
+  ;; A try's clauses, converted; a boxed variable is put in a new box.
+  (func (convert-clauses [cs eqref] [env eqref]) -> eqref
+    (if (s:null? cs) (return '()))
+    (let* ([c (s:syntax->list (s:car cs))] [k (clause-body-start c)] [xs (clause-vars c k)])
+      (s:cons (s:syntax-rewrap (s:car cs)
+                               (s:append (take c k) (boxing-params xs (convert-list (drop-n c k) (s:append xs env)))))
+              (convert-clauses (s:cdr cs) env))))
 
   ;; A let's bindings, converted; a boxed variable is bound to a new box.
   (func (convert-bindings [bs eqref] [env eqref]) -> eqref
@@ -2938,6 +3022,55 @@
         (set! l (s:cdr l))
         (br next)))
     '#f))
+
+;; ---- exceptions ----
+;;
+;; See run-time errors, above. with-handlers (lib/substrate.sub) calls
+;; call-with-handlers.
+
+(substrate-define (raise v) (raise* v))
+
+;; thunk's value. If it raises a value that one of preds is true of, the
+;; value, once thunk has been left, of the procedure at the same place in
+;; procs, called with it.
+(substrate-define (call-with-handlers preds procs thunk)
+  (let ([outer handlers])
+    (set! handlers (s:cons preds outer))
+    (try ([catch-ref s:exn (v e) (set! handlers outer) (handle v preds procs e)]
+          [catch-all-ref (e) (set! handlers outer) (throw-ref e)])
+      (let ([r (app thunk)])
+        (set! handlers outer)
+        r))))
+
+;; The value of the handler for v, or else exception e, whose value v is,
+;; thrown again.
+(func (handle [v eqref] [preds eqref] [hs eqref] [e exnref]) -> eqref
+  (block none
+    (loop next
+      (br-if none (i32.eqz (s:pair? preds)))
+      (if (i32.eqz (ref.is_null (app (s:car preds) v))) (return (app (s:car hs) v)))
+      (set! preds (s:cdr preds))
+      (set! hs (s:cdr hs))
+      (br next)))
+  (throw-ref e))
+
+;; thunk's value, with pre called before it and post after it, also when
+;; an exception leaves it.
+(substrate-define (dynamic-wind pre thunk post)
+  (app pre)
+  (let ([r (try ([catch-all-ref (e) (app post) (throw-ref e)])
+             (app thunk))])
+    (app post)
+    r))
+
+;; Is v an exception: what error or a function's check raises, or a
+;; syntax error?
+(substrate-define (exn? v) (bool (i32.or (ref.test (ref exception) v) (s:syntax-error? v))))
+(substrate-define (exn-message v)
+  (if (ref.test (ref exception) v) (return (struct.get exception message (ref.cast (ref exception) v))))
+  (if (s:syntax-error? v) (return (s:syntax-error-message v)))
+  (wrong-type '"exn-message" '"an exception" v))
+(substrate-define (syntax-error? v) (bool (s:syntax-error? v)))
 
 ;; ---- syntax ----
 ;;

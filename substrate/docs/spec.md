@@ -120,10 +120,10 @@ are references, wasm's own type checking keeps them apart from numbers.
 
 ### 2.3 Functions
 
-`(require name syntax)` binds these as `name:function` at the phase where
-it appears, plus any it lists to bind unqualified (3.1). They are imported
-from the instance `"syntax"`. Parameters are `eqref` unless marked with
-another type, such as `n:i32`.
+`(require name syntax)` binds these, and the tag `exn`, as `name:function`
+at the phase where it appears, plus any it lists to bind unqualified
+(3.1). They are imported from the instance `"syntax"`. Parameters are
+`eqref` unless marked with another type, such as `n:i32`.
 
 | Group | Functions |
 |---|---|
@@ -132,7 +132,8 @@ another type, such as `n:i32`.
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)` |
-| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(raise-syntax-error name message stx)` (aborts expansion; returns nothing), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
+| exceptions | the tag `exn`, whose exceptions carry one `eqref`; `(raise-syntax-error name message stx)` (throws a syntax error), `(syntax-error? v) -> i32`, `(syntax-error-message e)`, `(syntax-error-syntax e)` (the syntax it blames, or `#f`) |
+| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
   otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
@@ -175,11 +176,21 @@ another type, such as `n:i32`.
   the running macro's phase, as a value and as a type (6.1). An imported
   name and the definition it imports are the same binding. Two identifiers
   bound in neither namespace are equal when their names are.
-- `raise-syntax-error` is Racket's: it aborts expansion with `message`,
-  a string, blamed on `stx`. The message is prefixed with `name: `, or if
-  `name` is `#f` with the name `stx` gives: an identifier's own, or that
+- `exn` is the tag every language throws values with (5.3). A store has
+  one instance of the syntax library, and tags are identified by instance
+  (5.2), so this one tag lets the compiler and all compile-time code,
+  whatever module or phase it belongs to, catch one another's exceptions.
+- A **syntax error** is a value: a message and the syntax it blames. The
+  expander throws one, with `exn`, for each error in the code it expands,
+  and `raise-syntax-error`, Racket's, throws one with `message`, a
+  string, blamed on `stx`: the message is prefixed with `name: `, or if
+  `name` is `#f` with the name `stx` gives, an identifier's own or that
   of the identifier heading a list. A macro that blames part of its input
-  passes its own name.
+  passes its own name. A macro may handle the syntax errors from the code
+  it expands with `local-expand`, and the expander goes on as if that
+  expansion had not started. The compiler reports the others, where the
+  syntax they blame is, or, if it has no location, where the macro that
+  raised it was used.
 - `identifier-binding-kind` says what identifier `id` is bound to as a
   value at the running macro's phase: the symbol `function`, `variable` (a
   local or global), `macro` (a compile-time value that is a
@@ -441,7 +452,9 @@ loaded. The compiler is such a program.
 JavaScript API does not tell a host import which instance called it, so
 this host finds the caller's memory and table through the caller's
 exports, and runs a module's start function just after instantiating it
-rather than during instantiation, when the exports do not exist yet.
+rather than during instantiation, when the exports do not exist yet. Wasm
+code can catch a JavaScript exception, so this host makes its traps, such
+as `trap`'s, by calling a wasm function that traps.
 `bin/sub` runs the compiler on V8: today it runs it about eight times
 faster than wasmtime, whose support for GC is younger (a collector that
 counts references and frees objects one at a time, and a call into the
@@ -633,8 +646,10 @@ exception thrown with it (5.3) carries values of the types `t ...`.
 Unlike a type, a tag is identified by the instance that defines it, as in
 wasm: two declarations of the same tag are two tags, and so are the tags
 of two instances of one module, such as its linklets at two phase shifts.
-A module that imports a tag gets that tag. Exceptions need no GC: a
-freestanding program (3.4) can throw and catch them.
+A module that imports a tag gets that tag. So code that must catch the
+exceptions of code in other instances shares a tag with it, as all code
+at compile time can with the syntax library's `exn` (2.3). Exceptions
+need no GC: a freestanding program (3.4) can throw and catch them.
 
 ### 5.3 Expressions
 
@@ -1056,6 +1071,15 @@ the compiler may, because it is part of the expander.
 
   `%transformer-code`, `(func (eqref eqref -> eqref))`, is declared
   before the group, alone, so other modules can declare it too.
+
+  The group cannot change. Compile-time code that the seed compiles (1.4)
+  declares the group as the source has it, to read its quoted data, and
+  links to the seed's own instance of the library, whose group is the
+  seed's. So a type added since is in a group of its own, such as the
+  syntax errors' `(rec (type %syntax-error (struct (field message eqref)
+  (field syntax eqref) (field srcloc eqref))) (type %syntax-error-group
+  (struct (field error (ref %syntax-error)))))`, whose second member keeps
+  another module's struct of three `eqref`s from being one.
 
 - **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
   single `%atom` objects made at start. A linklet's quoted data is a

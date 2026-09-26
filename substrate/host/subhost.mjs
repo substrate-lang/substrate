@@ -25,7 +25,29 @@ const modules = new Map();
 // The message of the last failure, for host.error_message.
 let lastError = '';
 
-class Trap extends Error {}
+// A trap the host makes, host.trap's among them, with a message. Wasm
+// code can catch a JavaScript exception, with catch_all, but not a trap
+// (spec 4), so the host keeps the message and traps in wasm, calling this
+// module: (module $subhost-trap (func (export "trap") unreachable)).
+const trapper = new WebAssembly.Instance(new WebAssembly.Module(Uint8Array.from([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01,
+  0x00, 0x07, 0x08, 0x01, 0x04, 0x74, 0x72, 0x61, 0x70, 0x00, 0x00, 0x0a, 0x05, 0x01, 0x03, 0x00, 0x00,
+  0x0b, 0x00, 0x14, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x00, 0x0d, 0x0c, 0x73, 0x75, 0x62, 0x68, 0x6f, 0x73,
+  0x74, 0x2d, 0x74, 0x72, 0x61, 0x70,
+]))).exports;
+let trapMessage = null;
+
+function hostTrap(message) {
+  trapMessage = message;
+  trapper.trap();
+}
+
+// A trap's message: the host's, if it made the trap, or the engine's.
+function trapMessageOf(e) {
+  const m = trapMessage === null ? e.message : trapMessage;
+  trapMessage = null;
+  return m;
+}
 
 // The system's message for a failed file operation, worded as C's
 // strerror words it, as build/subhost reports it.
@@ -151,7 +173,7 @@ function importMap(bytes) {
 function hostImports(self) {
   const memory = () => {
     const m = self.exports && self.exports.memory;
-    if (!m) throw new Trap('host: the caller exports no memory, or is still starting');
+    if (!m) hostTrap('host: the caller exports no memory, or is still starting');
     return new Uint8Array(m.buffer);
   };
   const string = (ptr, len) => text.decode(memory().slice(ptr, ptr + len));
@@ -161,7 +183,7 @@ function hostImports(self) {
       return len;
     },
     trap(ptr, len) {
-      throw new Trap(string(ptr, len));
+      hostTrap(string(ptr, len));
     },
     instantiate(np, nl, bp, bl, mp, ml) {
       const name = string(np, nl);
@@ -171,7 +193,7 @@ function hostImports(self) {
     },
     export_index(ip, il, fp, fl) {
       const table = self.exports.table;
-      if (!table) throw new Trap('host.export_index: the caller exports no table');
+      if (!table) hostTrap('host.export_index: the caller exports no table');
       const exports = registry.get(string(ip, il));
       const f = exports && exports[string(fp, fl)];
       return typeof f === 'function' ? table.grow(1, f) : -1;
@@ -315,9 +337,9 @@ function instantiate(name, bytes, map) {
     if (start) start();
   } catch (e) {
     // An exception out of the start function goes on to the caller (spec 4).
-    if (!(e instanceof Trap || e instanceof WebAssembly.RuntimeError || e instanceof RangeError ||
+    if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError ||
           e instanceof WebAssembly.LinkError)) throw e;
-    lastError = `instantiate: ${e.message}`;
+    lastError = `instantiate: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}`;
     return false;
   }
   registry.set(name, self.exports);
@@ -329,10 +351,11 @@ function instantiate(name, bytes, map) {
 // program's on-trap, if it has one, reports it instead (spec 4), reading
 // the message with host.error_message.
 function fail(e, exports) {
-  if (e instanceof Trap || e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
+  if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
     // The wasm frames: the host's own are not the program's.
-    const where = (e.stack || '').split('\n').filter((l) => l.includes('wasm://')).map(located).join('\n');
-    lastError = `trap: ${e.message}\n${where}`;
+    const where = (e.stack || '').split('\n').filter((l) => l.includes('wasm://') && !l.includes('subhost-trap'))
+      .map(located).join('\n');
+    lastError = `trap: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}\n${where}`;
   } else if (e instanceof WebAssembly.Exception) {
     lastError = 'uncaught exception';
   } else {
