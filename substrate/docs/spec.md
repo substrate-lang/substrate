@@ -1057,16 +1057,26 @@ right-hand side's.
 - **Controlling expansion**: `#%linklet` rewrites a unit after it is
   expanded (6.5). A language cannot change how a module body expands, as
   Racket's `#%module-begin` can. Nothing planned needs that.
-- **Inferred types in fully expanded code**: fully expanded code carries
-  only the types the source wrote (6.4). A pass that creates wasm
-  declarations from the code it rewrites, such as CPS for general effect
-  handlers or closure conversion for a typed language, would need the
-  checker to write types into fully expanded code before the pass, and
-  queries for the types of imported definitions. Substrate's `#%linklet`
-  gives a captured variable the type it is written with, or `eqref`, so a
+- **Kernel types that fully expanded code leaves out**: fully expanded
+  code carries only the kernel types the source wrote (6.4), and the
+  kernel infers the others when it compiles. A language with types of its
+  own does not need them: `examples/typed/typed.sub` gives every variable
+  its own type and derives the kernel types it writes from those.
+  Substrate has no types of its own: its `#%linklet` gives a captured
+  variable the kernel type it is written with, or `eqref`, so a Substrate
   lambda that captures a kernel local whose inferred type is another fails
-  to type-check. Nothing needs more yet; the typed layer, a rung after
-bootstrap, will.
+  to type-check.
+- **Using a lifted definition in the same macro use**:
+  `syntax-local-lift-definition` returns the form as declared, with the
+  use's introduction scope (2.3). Another use can put its names in its
+  output, but not the use that lifted it: its output's scopes are flipped
+  again, which takes the introduction scope off. So a macro that remembers
+  the types it declared (5.1) must, in the use that declares one, write
+  the names it gave the lift, as `tests/fixtures/tuple.sub` does.
+  `examples/typed/typed.sub` declares its closure types where it uses them
+  instead. A contract where the lift returns the form as the macro wrote
+  it, and a function moves syntax between the macro's view and the
+  module's, would make remembering safe.
 - **Structs after the typed layer**: declared types are identified by
   structure (5.1), so the accessors of `examples/shapes/struct.sub` check
   brands at run time: passing a `fahrenheit` to `celsius-t` is a run-time

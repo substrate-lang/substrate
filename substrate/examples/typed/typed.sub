@@ -1,0 +1,316 @@
+;; Lifecycle: example. A typed language on the kernel. Its #%linklet (spec
+;; 6.5) checks its types and gives its closures types, in Substrate at
+;; compile time. A module takes these forms with require-unqualified:
+;;
+;;   (define (f [x : A] ...) : R body ...)  a function of type (-> A ... R)
+;;   (lambda ([x : A] ...) body ...)         a function value
+;;   (f arg ...), (e arg ...)                applications: of a function
+;;                                           define made, a direct call,
+;;                                           or of a function value
+;;   let, let*, if, begin, integers, #t, #f  as in the kernel
+;;   + - * < = print                         functions on Int
+;;
+;; Types are Int, a 64-bit integer, Bool, and (-> A ... R), the functions
+;; from A ... to R, written with their words, which are compared by name.
+;; Every variable has a type: a parameter the one written, a variable let
+;; binds its value's. A function define made is a value too.
+;;
+;; How it works. The forms only bind. define and lambda keep each
+;; parameter's type in a syntax property of its name, and define binds f to
+;; a transformer that turns each use of f into the function, with f's type
+;; in the same property: that is how a module that imports f knows its
+;; type. The kernel types they must write, of parameters and results, come
+;; from the types. #%linklet then checks each function define made, and
+;; lowers its body: a lambda becomes a struct, of a closure type, holding
+;; the values the lambda captures, and a module-level function, its code;
+;; an application of a function value, a call-ref of the code in its
+;; struct. A function type has one closure type, which each module that
+;; uses it declares; wasm makes the declarations one type (spec 5.1).
+
+(require print "../../lib/print.sub" write-i64 newline)
+(begin-for-syntax
+  (require-unqualified substrate "../../lib/substrate.sub")
+  (require k kernel))
+
+(provide [define typed-define] [lambda typed-lambda] [#%linklet typed-linklet] + - * < = print)
+
+(begin-for-syntax
+  ;; ---- types ----
+  ;;
+  ;; A type is the datum Int, Bool or (-> A ... R).
+
+  ;; The syntax property holding the type of a parameter, or of a use of a
+  ;; function define made.
+  (define type-key 'typed-type)
+  (define (with-type x t) (syntax-property x type-key t))
+  (define (type-of-syntax x) (syntax-property x type-key))
+
+  (define (function-type? t) (pair? t))
+  (define (parameter-types t) (take (cdr t) (- (length t) 2)))
+  (define (result-type t) (last t))
+
+  (define (type-error where form . args)
+    (raise-syntax-error 'typed (apply format form args) where))
+
+  ;; Type syntax s as a type.
+  (define (parse-type s)
+    (syntax-match s
+      ['Int 'Int]
+      ['Bool 'Bool]
+      [('-> a ... r) `(-> ,@(map parse-type a) ,(parse-type r))]
+      [_ (type-error s "expected a type: Int, Bool or (-> type ... type)")]))
+
+  ;; ---- kernel types ----
+  ;;
+  ;; Int is an i64 and Bool an i32. A function type is (ref C), C its
+  ;; closure type: a struct whose field code is the function's code, of
+  ;; type F, which takes the struct and the arguments. A lambda's struct
+  ;; is of a subtype of C, with a field for each value it captures.
+
+  (define (kernel-type t)
+    (cond [(eq? t 'Int) #'i64]
+          [(eq? t 'Bool) #'i32]
+          [else #`(ref #,(car (closure-types t)))]))
+
+  ;; While #%linklet runs, the definitions it adds, the latest first, and
+  ;; the closure types they declare, as function type -> (C . F).
+  (define added #f)
+  (define declared #f)
+  (define (add! form) (set! added (cons form added)))
+
+  (define counter 0)
+  (define (fresh base)
+    (set! counter (+ counter 1))
+    (datum->syntax #'here (string->symbol (format "~a~a" base counter))))
+
+  ;; The closure and code types of function type t, as (C . F), declared
+  ;; where they are used: a macro lifts their declaration, and #%linklet
+  ;; adds it to its output, once. Declarations of one structure are one
+  ;; type (spec 5.1).
+  (define (closure-types t)
+    (or (and added (hash-ref declared t #f))
+        (let* ([params (map kernel-type (parameter-types t))]
+               [result (kernel-type (result-type t))]
+               [c (fresh 'closure)]
+               [f (fresh 'code)]
+               [form #`(rec (type #,c (sub (struct (field code (ref #,f)))))
+                            (type #,f (func ((ref #,c) #,@params -> #,result))))])
+          (if added
+              (begin (add! form) (hash-set! declared t (cons c f)))
+              (syntax-local-lift-definition form))
+          (cons c f))))
+
+  ;; ---- forms ----
+
+  (define (named-after id suffix)
+    (datum->syntax #'here (string->symbol (format "~a~a" (syntax-e id) suffix)) id))
+
+  ;; (define (f [x : A] ...) : R body ...): the function, under a name of
+  ;; this macro's that has its type; its value, a struct of its closure
+  ;; type whose code calls it; and f, bound to the transformer.
+  (define (typed-define stx)
+    (syntax-match stx
+      [(_ ((? identifier? name) ((? identifier? x) ': a) ...) ': r body ...)
+       (let* ([t `(-> ,@(map parse-type a) ,(parse-type r))]
+              [types (closure-types t)]
+              [func (with-type (datum->syntax #'here (syntax-e name) name) t)]
+              [value (named-after name ".value")]
+              [code (named-after name ".code")]
+              [params (map (lambda (x a) #`[#,(with-type x a) #,(kernel-type a)]) x (parameter-types t))]
+              [result (kernel-type (result-type t))])
+         #`(begin
+             (func (#,func #,@params) #:value #,value -> #,result #,@body)
+             (func (#,code [self (ref #,(car types))] #,@params) -> #,result (type #,(cdr types))
+               (#,func #,@x))
+             (global #,value (ref #,(car types)) (struct.new #,(car types) (ref.func #,code)))
+             (define-syntax #,name (function-transformer (quote-syntax #,func) '#,(datum->syntax #'here t)))))]))
+
+  ;; The transformer define binds f to: a use of f is func, the function,
+  ;; with f's type t in its property; so is the head of an application.
+  (define (function-transformer func t)
+    (lambda (stx)
+      (let ([f (with-type func t)])
+        (syntax-match stx
+          [(_ arg ...) #`(#%app #,f #,@arg)]
+          [_ f]))))
+
+  ;; (lambda ([x : A] ...) body ...): the kernel's lambda, whose parameters
+  ;; have their types.
+  (define (typed-lambda stx)
+    (syntax-match stx
+      [(_ (((? identifier? x) ': a) ...) body ...)
+       (let ([types (map parse-type a)])
+         #`(lambda (#,@(map (lambda (x t) #`[#,(with-type x t) #,(kernel-type t)]) x types)) #,@body))]))
+
+  ;; ---- #%linklet ----
+  ;;
+  ;; Checking and lowering are one walk: lower gives an expression's type
+  ;; and its code. env holds the variables in scope, each as (key binder .
+  ;; type), key being its local binding (spec 2.3).
+
+  ;; A module's forms, with each function define made checked and its body
+  ;; lowered, then the definitions lowering adds.
+  (define (typed-linklet stx)
+    (syntax-match stx
+      [(_ 'module form ...)
+       (set! added '())
+       (set! declared (make-hash))
+       (let* ([out (map (lambda (f) (if (typed-function? f) (lower-function f) f)) form)]
+              [new (reverse added)])
+         (set! added #f)
+         (append out new))]
+      [(_ _ form ...) form]))
+
+  ;; Is f a function define made, a func whose name has a type?
+  (define (typed-function? f)
+    (syntax-match f
+      [('func (name . _) . _) (and (type-of-syntax name) #t)]
+      [_ #f]))
+
+  (define (lower-function f)
+    (syntax-match f
+      [(word (name (x kt) ...) #:value value '-> r body ...)
+       (let* ([t (type-of-syntax name)]
+              [b (lower-body f body (map variable x))])
+         (unless (equal? (car b) (result-type t))
+           (type-error (last body) "~a returns ~s, but its body is ~s" (syntax-e name) (result-type t) (car b)))
+         (rebuild f #`(#,word (#,name #,@(map (lambda (x kt) #`[#,x #,kt]) x kt)) #:value #,value -> #,r #,@(cdr b))))]))
+
+  ;; Parameter or let variable x, of the type in its property, for env.
+  (define (variable x) (cons (k:local-binding x) (cons x (type-of-syntax x))))
+
+  ;; code, a form in place of e, at e's location.
+  (define (rebuild e code) (syntax-rewrap e (syntax-e code)))
+
+  ;; A body, lowered: (type . forms), its type the last form's.
+  (define (lower-body where forms env)
+    (when (null? forms) (type-error where "expected a body"))
+    (let ([rs (map (lambda (e) (lower e env)) forms)])
+      (cons (car (last rs)) (map cdr rs))))
+
+  ;; Expression e, checked and lowered: (type . code).
+  (define (lower e env)
+    (syntax-match e
+      [(? identifier? x) (cons (variable-type x env) x)]
+      [('#%datum n) (literal e n)]
+      [('let (binding ...) body ...) (lower-let e binding body env)]
+      [('if test then otherwise)
+       (let ([c (expect test 'Bool env)] [a (lower then env)] [b (lower otherwise env)])
+         (unless (equal? (car a) (car b)) (type-error otherwise "expected ~s, got ~s" (car a) (car b)))
+         (cons (car a) (rebuild e #`(if #,c #,(cdr a) #,(cdr b)))))]
+      [('begin body ...)
+       (let ([b (lower-body e body env)]) (cons (car b) (rebuild e #`(begin #,@(cdr b)))))]
+      [('#%app f arg ...)
+       (if (and (identifier? f) (eq? (identifier-binding-kind f) 'function))
+           (direct-call e f arg env)
+           (value-call e f arg env))]
+      [('lambda ((x _) ...) body ...) (lower-lambda e x body env)]
+      [_ (type-error e "this is not typed code")]))
+
+  (define (expect e t env)
+    (let ([r (lower e env)])
+      (unless (equal? (car r) t) (type-error e "expected ~s, got ~s" t (car r)))
+      (cdr r)))
+
+  (define (variable-type x env)
+    (let ([b (assv (k:local-binding x) env)])
+      (if b (cddr b) (or (type-of-syntax x) (type-error x "~a has no type" (syntax-e x))))))
+
+  (define (literal e n)
+    (let ([d (syntax-e n)])
+      (cond [(integer? d) (cons 'Int (rebuild e #`(i64.const #,n)))]
+            [(boolean? d) (cons 'Bool e)]
+            [else (type-error e "~s is not a literal of a type" d)])))
+
+  (define (lower-let e bindings body env)
+    (let* ([bs (map (lambda (b)
+                      (syntax-match b
+                        [(x init) (let ([r (lower init env)]) (list x (car r) (cdr r)))]
+                        [_ (type-error b "this is not typed code")]))
+                    bindings)]
+           [inner (append (map (lambda (b) (cons (k:local-binding (car b)) (cons (car b) (cadr b)))) bs) env)]
+           [r (lower-body e body inner)])
+      (cons (car r)
+            (rebuild e #`(let (#,@(map (lambda (b) #`[#,(car b) #,(kernel-type (cadr b)) #,(caddr b)]) bs))
+                           #,@(cdr r))))))
+
+  ;; The arguments args of e, a call of a function of type t, checked and
+  ;; lowered.
+  (define (arguments e t args env)
+    (let ([ps (parameter-types t)])
+      (unless (= (length ps) (length args))
+        (type-error e "expected ~a argument~a, got ~a" (length ps) (if (= (length ps) 1) "" "s") (length args)))
+      (map (lambda (a p) (expect a p env)) args ps)))
+
+  ;; A call of f, a function define made: direct.
+  (define (direct-call e f args env)
+    (let ([t (or (type-of-syntax f) (type-error f "~a is not a typed function" (syntax-e f)))])
+      (cons (result-type t) (rebuild e #`(#%app #,f #,@(arguments e t args env))))))
+
+  ;; An application of a function value: a call-ref of the code in its
+  ;; struct, given the struct.
+  (define (value-call e f args env)
+    (let ([r (lower f env)])
+      (unless (function-type? (car r)) (type-error f "expected a function, got ~s" (car r)))
+      (let ([types (closure-types (car r))] [lowered (arguments e (car r) args env)])
+        (cons (result-type (car r))
+              (rebuild e #`(let ([c #,(kernel-type (car r)) #,(cdr r)])
+                             (call-ref #,(cdr types) (struct.get #,(car types) code c) c #,@lowered)))))))
+
+  ;; A lambda: a struct of its closure type, or of a subtype of it with a
+  ;; field for each variable the lambda captures, holding its code, a
+  ;; module-level function, and their values. The code binds the captured
+  ;; variables to the fields, with their binders, so the lambda's body
+  ;; refers to them.
+  (define (lower-lambda e xs body env)
+    (let* ([vs (map variable xs)]
+           [b (lower-body e body (append vs env))]
+           [t `(-> ,@(map cddr vs) ,(car b))]
+           [types (closure-types t)]
+           [captured (captured-variables e env)]
+           [code (fresh 'lambda)]
+           [head #`(#,code [self (ref #,(car types))] #,@(map (lambda (v) #`[#,(cadr v) #,(kernel-type (cddr v))]) vs))]
+           [result (kernel-type (car b))])
+      (if (null? captured)
+          (begin
+            (add! #`(func #,head -> #,result (type #,(cdr types)) #,@(cdr b)))
+            (cons t (rebuild e #`(struct.new #,(car types) (ref.func #,code)))))
+          (let ([closure (fresh 'closure)]
+                [fields (map (lambda (v) (fresh 'v)) captured)])
+            (add! #`(type #,closure (sub final #,(car types)
+                                         (struct (field code (ref #,(cdr types)))
+                                                 #,@(map (lambda (v f) #`(field #,f #,(kernel-type (cddr v)))) captured fields)))))
+            (add! #`(func #,head -> #,result (type #,(cdr types))
+                      (let ([env (ref.cast (ref #,closure) self)])
+                        (let (#,@(map (lambda (v f) #`[#,(cadr v) #,(kernel-type (cddr v)) (struct.get #,closure #,f env)])
+                                      captured fields))
+                          #,@(cdr b)))))
+            (cons t (rebuild e #`(struct.new #,closure (ref.func #,code) #,@(map cadr captured))))))))
+
+  ;; The variables of env that e refers to, each once, in order.
+  (define (captured-variables e env)
+    (let ([seen (make-hasheqv)] [out '()])
+      (let walk ([x e])
+        (cond [(identifier? x)
+               (let* ([key (k:local-binding x)] [v (and key (assv key env))])
+                 (when (and v (not (hash-ref seen key #f)))
+                   (hash-set! seen key #t)
+                   (set! out (cons v out))))]
+              [(syntax? x) (walk (syntax-e x))]
+              [(pair? x) (walk (car x)) (walk (cdr x))]
+              [else #f]))
+      (reverse out))))
+
+(define-syntax typed-define typed-define)
+(define-syntax typed-lambda typed-lambda)
+(define-syntax typed-linklet typed-linklet)
+
+;; ---- functions on Int ----
+
+(typed-define (+ [a : Int] [b : Int]) : Int (i64.add a b))
+(typed-define (- [a : Int] [b : Int]) : Int (i64.sub a b))
+(typed-define (* [a : Int] [b : Int]) : Int (i64.mul a b))
+(typed-define (< [a : Int] [b : Int]) : Bool (i64.lt_s a b))
+(typed-define (= [a : Int] [b : Int]) : Bool (i64.eq a b))
+;; Write n on a line, and return it.
+(typed-define (print [n : Int]) : Int (write-i64 n) (newline) n)

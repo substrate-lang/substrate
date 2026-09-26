@@ -102,6 +102,11 @@ in, on the Substrate kernel: every value is an `eqref`, and closure and
 assignment conversion run per unit, on fully expanded code, in
 Substrate's `#%linklet` (spec 6.5). `examples/effects.sub` is an effect language on Substrate (`examples/effects/handlers.sub`): declared effects, handlers
 with a clause per operation, and Koka's evidence passing, built from
-`#%app`, `local-expand` and compile-time values.
+`#%app`, `local-expand` and compile-time values. `examples/typed.sub` is
+a typed language on the kernel (`examples/typed/typed.sub`): `Int`,
+`Bool` and function types, checked by its `#%linklet`, which also lowers
+its lambdas to structs of typed closures, one closure type per function
+type. A function's type reaches the modules that import it through the
+transformer its name is bound to.
 
 Open questions are in `docs/spec.md` section 7.
