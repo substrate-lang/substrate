@@ -9,9 +9,6 @@ it did not ask for. The language most code is written in, also called
 Substrate, is one such library (`lib/substrate.sub`), as `racket/base` is
 built over Racket's `#%kernel`.
 
-Status markers: **[v0]** is implemented by stage0 now, **[planned]** is
-specified but not built yet.
-
 ## 1. Principles and architecture
 
 ### 1.1 Principles
@@ -37,7 +34,7 @@ specified but not built yet.
 | Component | What it is | Where |
 |---|---|---|
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime), `host/subhost.mjs` (JavaScript, over Node's V8) |
-| compiler | Reader, expander, kernel compiler, binary encoder: what only compiling needs. | `compiler/*.sub` (Substrate); stage0, the bootstrap compiler: `stage0/*.sls` (Chez Scheme) |
+| compiler | Reader, expander, kernel compiler, binary encoder: what only compiling needs. | `compiler/*.sub` (Substrate) |
 | syntax library | The data of every language built on the kernel, as wasm GC objects, syntax objects among them, and the functions of section 2. The compiler links to its own instance. | `lib/syntax.sub` (kernel code) |
 | libraries | Ordinary modules, what programs in the languages built on the kernel use, such as printing for programs without GC. | `lib/*.sub` |
 | languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub`, written in Substrate on its core in kernel code, `lib/substrate-core.sub` |
@@ -63,29 +60,30 @@ GC types or requires the syntax library.
 ### 1.4 Bootstrap
 
 The compiler is written in Substrate (`compiler/*.sub`), and requires the
-syntax library (`lib/syntax.sub`) and Substrate (`lib/substrate.sub`). Stage0, a compiler of the same language written in Chez
-Scheme (`stage0/`), builds it: that build is **stage1**. Stage1 builds the
-compiler from the same source (**stage2**), and stage2 builds it again
-(**stage3**). The bootstrap reaches its **fixpoint** when stage2 and stage3
-are the same bytes, and so is the syntax library each writes: the compiler
-reproduces itself exactly. That needs compilation to be deterministic,
-which is why the host gives programs no clocks or randomness (section 4).
-Nor does a build depend on where the repository is: the syntax library's
-source locations (3.6) name it `lib/syntax.sub`, as other files are named
-by the paths the build gives, relative to the repository.
-While stage0 is kept, stage1 = stage2 too: two compilers written apart, in
-different languages, write the same bytes. `make bootstrap` builds the
-stages and checks both.
+syntax library (`lib/syntax.sub`) and Substrate (`lib/substrate.sub`). It
+is built by a build of itself, the **seed**, checked in (`seed/`). The
+compiler bin/sub runs, `build/sub`, is the compiler's source built by the
+seed, then by that build: the source compiled by itself, even when the
+seed is older than the source. The bootstrap reaches its **fixpoint** when
+`build/sub` builds itself into the same bytes, the syntax library's
+included: the compiler reproduces itself exactly (`make bootstrap`). That
+needs compilation to be deterministic, which is why the host gives
+programs no clocks or randomness (section 4). Nor does a build depend on
+where the repository is: the syntax library's source locations (3.6) name
+it `lib/syntax.sub`, as other files are named by the paths the build
+gives, relative to the repository.
 
-The **seed** is a build of the compiler by itself, checked in (`seed/`).
-The compiler bin/sub runs, `build/sub`, is the compiler's source built by
-the seed, then by that build: the source compiled by itself, even when the
-seed is older than the source. For the compiler's source to use something
-the seed does not know, the feature is added first, then the seed is
-replaced by the new build (`make seed`, which checks that the build
-reproduces itself). Earlier seeds stay in the repository's history. While
-stage0 is kept, `make bootstrap` also checks that the seed's way and
-stage0's give the same compiler.
+For the compiler's source to use something the seed does not know, the
+feature is added first, then the seed is replaced by the new build (`make
+seed`, which checks the fixpoint first). Earlier seeds stay in the
+repository's history.
+
+The first compiler was built by **stage0**, a compiler of the same
+language written apart in Chez Scheme. Its build of the compiler built
+itself, and that build built itself again, and all three were the same
+bytes: two compilers written apart, in different languages, wrote the
+same compiler. Stage0 was retired after commit 3e74bce, where this still
+held; it can be run from there.
 
 ## 2. The macro contract
 
@@ -163,8 +161,6 @@ another type, such as `n:i32`.
   Scope operations (6.2) do not reach into property values. The expander
   keeps a syntax object's properties when it adds or removes scopes, but
   does not copy the properties of a macro use onto the macro's result.
-  [v0] Stage0 can keep only syntax-library data in properties; a macro that
-  returns syntax holding another GC object is an error.
 - `local-binding` identifies the local variable that identifier `id`
   binds or refers to in fully expanded code (6.4): a fixnum, the same at
   the variable's binder and at each use and different for every local
@@ -207,8 +203,8 @@ another type, such as `n:i32`.
   as it is declared: with the macro's introduction scope, like the
   macro's output, so each use gets fresh names.
 
-The queries only work while an expander is running. [v0] Stage0 answers
-them in Chez; in a run-time store they trap.
+The queries only work while an expander is running; in a run-time store
+they trap.
 
 ## 3. Modules, linklets and linking
 
@@ -270,10 +266,10 @@ them in Chez; in a run-time store they trap.
   it requires, are instantiated for it on demand. So no compile-time state
   is shared between the compilations of two modules, as in Racket.
   Compiled wasm code is not state: the host compiles a linklet's bytes once
-  and instantiates the result wherever it is needed. [v0] Stage0 gives
-  each compilation a fresh store. The self-hosted compiler runs in a store
-  of its own and gives each compilation a namespace in it (below), since
-  macros share syntax objects with the compiler by reference.
+  and instantiates the result wherever it is needed. The compiler runs in
+  a store of its own and gives each compilation a namespace in it
+  (below), since macros share syntax objects with the compiler by
+  reference.
 - A module is named by what it is: `<module>` is its file's stem and a
   hash of its source and of the names of the modules it requires, at the
   phase shifts it requires them, such as `substrate-core.7bb8be1396e6`
@@ -292,9 +288,8 @@ them in Chez; in a run-time store they trap.
 - A program runs in a fresh run-time store holding exactly the linklets
   reached from its phase-0 linklet at phase shift 0. A module required
   only inside `begin-for-syntax` is never loaded at run time.
-- The other instance names are `syntax`, `host`, `expander`, the linklets
-  of compile-time code (`<module>@<phase>#<n>`) and per-store entry
-  linklets (`entry#<n>`).
+- The other instance names are `syntax`, `host`, and the linklets of
+  compile-time code (`<module>@<phase>#<n>`).
 - **Namespaces**: the compiler registers a compilation's instances as
   `<ns>/<name>`, and maps the imports of each from linklets to
   `<ns>/<linklet>`, after the phase shift. Its other imports, such as
@@ -412,11 +407,11 @@ like the source a compiler reads.
 
 `instantiate` is **the hook**: wasm cannot make new code executable by
 itself, and this is how it does. The compiler runs compile-time code with
-it; stage0 uses the equivalent C functions. An instantiated module can reach
-exactly what its imports name, so compile-time code runs sandboxed.
-[v0: the first five are tested from kernel code in `tests/hook.sub`, and
-the rest through Substrate (`lib/substrate.sub`).] A path is relative to
-the process's working directory.
+it. An instantiated module can reach exactly what its imports name, so
+compile-time code runs sandboxed. The first five imports are tested from
+kernel code in `tests/hook.sub`, and the rest through Substrate
+(`lib/substrate.sub`). A path is relative to the process's working
+directory.
 
 **Running a program.** `sub build FILE -o DIR` writes the program
 `FILE` is the entry of: each linklet it instantiates at run time, as
@@ -739,9 +734,12 @@ which is what macro templates need. The reader abbreviations are
 `'` `` ` `` `,` `,@` and `#'` `` #` `` `#,` `#,@`. The reader reads `#%name`
 as the symbol `#%name`, and `#:name` as a keyword, as Racket does: a kind
 of datum of its own, used for options in forms such as `#:mutable`. A
-keyword is not an expression, but quoted it is a value. An integer literal
-must fit in 64 bits, from -2^63 to 2^64 - 1, and a number literal is an
-integer or a decimal: the reader rejects others, such as `1/2`. A decimal
+keyword is not an expression, but quoted it is a value. A number literal
+is an integer or a decimal. An integer is an optional sign and digits, or
+`#x`, `#b`, `#o` or `#d` and an integer in that radix, and must fit in 64
+bits, from -2^63 to 2^64 - 1. A decimal has a point, an exponent or both,
+or is `+inf.0`, `-inf.0`, `+nan.0` or `-nan.0`. A fraction, such as
+`1/2`, is an error, and any other token is a symbol. A decimal
 is the f64 nearest its exact value, ties to even: infinity above the
 largest f64, and zero below half the smallest.
 
@@ -868,10 +866,6 @@ The value lives in a global of the phase+1 linklet, so another module that
 requires this one computes it again in its own compile-time store. The
 right-hand side is a unit for `#%linklet` (6.5), which may make its value a
 transformer: Substrate's makes a procedure one.
-
-[v0] Stage0 expands in Chez, so syntax crosses between Chez and wasm by
-copy, through the syntax library's embedder functions (appendix A). The
-self-hosted expander will hold references directly and need no copy.
 
 ### 6.4 Fully expanded code
 
@@ -1000,11 +994,10 @@ bootstrap, will.
   `match`) so that it is a compile-time error again, as a library of the
   typed language.
 
-## Appendix A: stage0's syntax library representation (not part of the contract)
+## Appendix A: the syntax library's representation (not part of the contract)
 
-This describes `lib/syntax.sub` and `stage0/marshal.sls` as they are.
-Macros must not depend on it; the compiler may, because it is part of the
-expander.
+This describes `lib/syntax.sub` as it is. Macros must not depend on it;
+the compiler may, because it is part of the expander.
 
 - **Types**, all in one recursion group, so that no type declared elsewhere
   is the same wasm type unless it copies the whole group (5.2):
@@ -1017,7 +1010,7 @@ expander.
   | `%atom` | `(struct (field kind i32) (field value i32))` | characters (kind 0), `#t` (1), `()` (2) |
   | `%syntax` | `(struct (field e (mut eqref)) (field scopes eqref) (field srcloc eqref) (field props eqref) (field pending (mut eqref)))` | syntax objects |
   | `%srcloc` | `(struct (field source eqref) (field line i32) (field col i32) (field pos i32) (field span i32))` | source locations |
-  | `%table` | `(array (mut eqref))` | the symbol table, the handle table and a linklet's quoted data |
+  | `%table` | `(array (mut eqref))` | the symbol and keyword tables and a linklet's quoted data |
   | `%integer` | `(struct (field negative i32) (field magnitude i64))` | integers beyond the fixnum range |
   | `%flonum` | `(struct (field value f64))` | flonums |
   | `%builder` | `(struct (field bytes (mut (ref %string))) (field length (mut i32)))` | string builders |
@@ -1044,25 +1037,12 @@ expander.
   Properties are a list of `(key . value)` pairs, newest first, with each
   key at most once. The expander records a local variable's binding in
   the property `%local-binding`.
-- **Memory**: the library's memory holds its error messages, and from
-  address 1024 the buffer stage0 copies values through.
-- **Embedder interface (stage0 only)**: Chez cannot hold GC references, so
-  it names objects by `i32` handles, indexes into the library's handle
-  table (handle 0 is `#f`). A value crosses whole, in the format of a
-  linklet's quoted data, through the buffer: stage0 writes the bytes and
-  `%h-deserialize` builds the objects, or `%h-serialize` writes a value
-  and stage0 reads the bytes. A value the format has no kind for crosses
-  as a handle. Handles made while a macro runs are released when it
-  returns. A compile-time value is fetched the first time it is needed,
-  perhaps while a macro runs, so its handle is pinned: pinned handles are
-  negative, index a second table, and are never released. Each store gets
-  a small entry linklet per compile-time value it uses, which converts between handles and references. Transformers are
-  called through `%h-call-transformer`.
-  After bootstrap this section goes away.
+- **Memory**: the library's memory holds its error messages.
+- **Queries**: the compiler registers the functions that answer the
+  queries (2.3) with `%set-queries`. Until it does, each query traps.
 - **Shifted literals**: `%scope-map-add` tells `%make-syntax` to replace
-  one scope id with another. Stage0 records which module and phase shift
-  each module scope stands for, and each linklet lists the module scopes in
-  its literals. Around the instantiation of a linklet at phase shift *t* ≠ 0
-  it maps each of them to its copy for its phase shift + *t* (6.1), and
-  clears the map
-  after (`%scope-map-clear`).
+  one scope id with another. The compiler records which module and phase
+  shift each module scope stands for, and each linklet lists the module
+  scopes in its literals. Around the instantiation of a linklet at phase
+  shift *t* ≠ 0 it maps each of them to its copy for its phase shift + *t*
+  (6.1), and clears the map after (`%scope-map-clear`).

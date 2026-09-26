@@ -11,7 +11,6 @@
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = [
-            pkgs.chez          # stage0 compiler host
             pkgs.wasmtime      # wasm engine (CLI, for poking at modules)
             pkgs.wasmtime.dev  # C API headers for host/subhost.c
             pkgs.wasmtime.lib  # libwasmtime.so

@@ -3,8 +3,8 @@
 // runs the compiler on it. The stack limit, in KiB, is build/subhost's: 4 MiB
 // (V8's default is under 1 MiB).
 //
-// host/subhost.mjs DIR [arg ...]: run the program subc build wrote to DIR,
-// as build/subhost does. The stage0-only expander imports trap.
+// host/subhost.mjs DIR [arg ...]: run the program sub build wrote to DIR,
+// as build/subhost does.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import util from 'node:util';
@@ -218,10 +218,6 @@ function hostImports(self) {
   };
 }
 
-function expanderQuery() {
-  throw new Trap('expander query used outside the expander');
-}
-
 // ---- start functions ----
 //
 // A host import gets no reference to the instance calling it, so the host
@@ -284,10 +280,9 @@ function deferStart(bytes) {
   return Buffer.concat(parts);
 }
 
-// Compile and instantiate bytes as instance name at phase shift shift,
-// linking its imports by name. False, with lastError set, on failure.
-// Instantiate bytes as instance name, linking each import to the instance
-// map names for its module, or to the instance of that name.
+// Compile and instantiate bytes as instance name, linking each import to
+// the instance map names for its module, or to the instance of that name.
+// False, with lastError set, on failure.
 function instantiate(name, bytes, map) {
   let module;
   try {
@@ -304,8 +299,6 @@ function instantiate(name, bytes, map) {
     if (imp.module === 'host') {
       host = host || hostImports(self);
       value = host[imp.name];
-    } else if (imp.module === 'expander') {
-      value = expanderQuery;
     } else {
       const exports = registry.get(map.get(imp.module) ?? imp.module);
       value = exports && exports[imp.name];

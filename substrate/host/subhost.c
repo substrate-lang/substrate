@@ -1,35 +1,43 @@
-/* Lifecycle: permanent. After bootstrap the host runs the compiler. */
-/* subhost: see subhost.h and docs/spec.md section 4. */
-#include "subhost.h"
-
+/* Lifecycle: permanent. The host of spec section 4 over the wasmtime C API;
+ * it runs programs, the compiler among them.
+ *
+ * subhost DIR [arg ...]: run the program sub build wrote to DIR. DIR/program
+ * names the program's linklets, one per line, in the order they are
+ * instantiated, each after those it imports from; the last is the
+ * program's own. Each is instantiated from DIR/<name>.wasm under its name,
+ * then the last one's main is called with the arguments.
+ *
+ * Exit status: 0 when main returns, 1 when the program cannot be loaded, 2
+ * when it traps (the message goes to stderr, unless the program's on-trap
+ * reports it), and whatever the program passes to host.exit.
+ *
+ * The host is one store and a linker. Instances are registered by name and
+ * link to each other by name. The host owns no memory: each of its imports
+ * reads pointers from the calling instance's own memory. */
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <wasm.h>
 #include <wasmtime.h>
 
-struct sub_host {
+static struct {
   wasmtime_store_t *store;
   wasmtime_linker_t *linker;
   /* The context every call uses. Inside a host function it is the caller's
    * context, so nested calls into wasm go through the right one. */
   wasmtime_context_t *ctx;
-  int32_t result;
-  sub_callback cb;
-  char *pending_trap;
   char **args; /* the program's command-line arguments */
   int nargs;
-  char err[8192];
-};
+  char err[8192]; /* the last failure's message */
+} host;
 
-static void set_err(sub_host *h, const char *fmt, ...) {
+static void set_err(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(h->err, sizeof h->err, fmt, ap);
+  vsnprintf(host.err, sizeof host.err, fmt, ap);
   va_end(ap);
 }
 
@@ -186,7 +194,7 @@ static void backtrace_of(wasm_frame_vec_t frames, char *out, size_t cap) {
 }
 
 /* Record a wasmtime error or trap as the last error; consumes it. */
-static void take_failure(sub_host *h, const char *what, wasmtime_error_t *error, wasm_trap_t *trap) {
+static void take_failure(const char *what, wasmtime_error_t *error, wasm_trap_t *trap) {
   wasm_frame_vec_t frames = {0};
   if (error) wasmtime_error_wasm_trace(error, &frames);
   else if (trap) wasm_trap_trace(trap, &frames);
@@ -205,12 +213,12 @@ static void take_failure(sub_host *h, const char *what, wasmtime_error_t *error,
     const char *cause = caused ? caused + strlen(marker) : text;
     while (*cause == ' ') cause++;
     for (size_t k = strlen(text); k > 0 && (text[k - 1] == '\n' || text[k - 1] == ' '); k--) text[k - 1] = '\0';
-    char trace[sizeof h->err];
+    char trace[sizeof host.err];
     backtrace_of(frames, trace, sizeof trace);
     wasm_frame_vec_delete(&frames);
     if (error) wasmtime_error_delete(error);
     else wasm_trap_delete(trap);
-    set_err(h, "%s: %s\n%s", what, cause, trace);
+    set_err("%s: %s\n%s", what, cause, trace);
     free(text);
     return;
   }
@@ -239,99 +247,11 @@ static void take_failure(sub_host *h, const char *what, wasmtime_error_t *error,
     const char *context = text;
     const char *prefix = "error while executing at ";
     if (strncmp(context, prefix, strlen(prefix)) == 0) context += strlen(prefix);
-    set_err(h, "%s: %s\n%s", what, cause, context);
+    set_err("%s: %s\n%s", what, cause, context);
   } else {
-    set_err(h, "%s: %s", what, text);
+    set_err("%s: %s", what, text);
   }
   free(text);
-}
-
-const char *sub_last_error(sub_host *h) { return h->err; }
-int32_t sub_result(sub_host *h) { return h->result; }
-
-/* ---- profile ---------------------------------------------------------- */
-
-/* With SUBHOST_PROFILE set in the environment, the host keeps the time
- * spent in each category, excluding the categories nested in it, and
- * prints the totals to stderr at exit. The embedder marks its own
- * categories with sub_profile_push and sub_profile_pop. */
-enum { P_EMBEDDER, P_WASM, P_COMPILE, P_INSTANTIATE, P_COUNT = SUB_PROFILE_FIRST_EMBEDDER + 8 };
-
-static int profiling = -1;
-static double p_time[P_COUNT];
-static long p_entries[P_COUNT];
-static int p_stack[1024];
-static int p_depth;
-static double p_since;
-static long p_calls, p_callbacks[8], p_compiles, p_cache_hits;
-static size_t p_compiled_bytes;
-static const char *p_naming = "";  /* the instance being compiled, for the log */
-
-static double now(void) {
-  struct timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
-}
-
-static const char *p_name(int c) {
-  static const char *names[] = {"embedder", "wasm", "cranelift", "instantiate"};
-  static const char *embedder[] = {"marshal", "codegen", "read"};
-  if (c < SUB_PROFILE_FIRST_EMBEDDER) return names[c];
-  if (c - SUB_PROFILE_FIRST_EMBEDDER < 3) return embedder[c - SUB_PROFILE_FIRST_EMBEDDER];
-  return "?";
-}
-
-static void p_report(void) {
-  double total = 0;
-  for (int c = 0; c < P_COUNT; c++) total += p_time[c];
-  fprintf(stderr, "subhost profile (seconds, exclusive):\n");
-  for (int c = 0; c < P_COUNT; c++)
-    if (p_entries[c] || p_time[c] > 0)
-      fprintf(stderr, "  %-12s %8.3f  %5.1f%%  %ld entries\n", p_name(c), p_time[c],
-              total > 0 ? 100 * p_time[c] / total : 0, p_entries[c]);
-  fprintf(stderr, "  %-12s %8.3f\n", "total", total);
-  fprintf(stderr, "  calls into wasm %ld; compiles %ld (%zu bytes), cache hits %ld\n", p_calls, p_compiles,
-          p_compiled_bytes, p_cache_hits);
-  fprintf(stderr, "  queries: syntax-local-value %ld, raise-syntax-error %ld, free-identifier=? %ld, identifier-binding-kind %ld, local-expand %ld, syntax-local-lift-definition %ld, identifier-function-signature %ld\n",
-          p_callbacks[1], p_callbacks[2], p_callbacks[3], p_callbacks[4], p_callbacks[5], p_callbacks[6], p_callbacks[7]);
-}
-
-static bool p_on(void) {
-  if (profiling < 0) {
-    profiling = getenv("SUBHOST_PROFILE") != NULL;
-    if (profiling) {
-      p_since = now();
-      atexit(p_report);
-    }
-  }
-  return profiling;
-}
-
-static void p_switch(void) {
-  double t = now();
-  p_time[p_stack[p_depth]] += t - p_since;
-  p_since = t;
-}
-
-void sub_profile_push(int category) {
-  if (!p_on() || p_depth + 1 >= (int)(sizeof p_stack / sizeof p_stack[0])) return;
-  p_switch();
-  p_stack[++p_depth] = category;
-  p_entries[category]++;
-}
-
-void sub_profile_pop(void) {
-  if (!p_on() || p_depth == 0) return;
-  p_switch();
-  p_depth--;
-}
-
-/* A call into wasm from an embedder category counts as that category: the
- * embedder's marshalling is mostly calls into the syntax library. */
-static void p_enter_wasm(void) {
-  if (!p_on()) return;
-  p_calls++;
-  sub_profile_push(p_stack[p_depth] == P_EMBEDDER ? P_WASM : p_stack[p_depth]);
 }
 
 /* ---- memory ----------------------------------------------------------- */
@@ -342,33 +262,6 @@ static uint8_t *range(wasmtime_context_t *ctx, const wasmtime_memory_t *mem, uin
   return wasmtime_memory_data(ctx, mem) + addr;
 }
 
-/* The len bytes at addr in the memory instance inst exports as "memory". */
-static uint8_t *instance_range(sub_host *h, const char *inst, uint32_t addr, size_t len) {
-  wasmtime_extern_t ext;
-  if (!wasmtime_linker_get(h->linker, h->ctx, inst, strlen(inst), "memory", 6, &ext) ||
-      ext.kind != WASMTIME_EXTERN_MEMORY) {
-    set_err(h, "memory: %s exports no memory", inst);
-    return NULL;
-  }
-  uint8_t *p = len > UINT32_MAX ? NULL : range(h->ctx, &ext.of.memory, addr, (uint32_t)len);
-  if (!p) set_err(h, "memory: %zu bytes at %u are outside %s's memory", len, addr, inst);
-  return p;
-}
-
-int sub_memory_write(sub_host *h, const char *inst, uint32_t addr, const uint8_t *bytes, size_t len) {
-  uint8_t *p = instance_range(h, inst, addr, len);
-  if (!p) return 1;
-  memcpy(p, bytes, len);
-  return 0;
-}
-
-int sub_memory_read(sub_host *h, const char *inst, uint32_t addr, uint8_t *out, size_t len) {
-  uint8_t *p = instance_range(h, inst, addr, len);
-  if (!p) return 1;
-  memcpy(out, p, len);
-  return 0;
-}
-
 /* The calling instance's memory: the one it exports as "memory". */
 static bool caller_memory(wasmtime_caller_t *caller, wasmtime_memory_t *out) {
   wasmtime_extern_t ext;
@@ -377,16 +270,12 @@ static bool caller_memory(wasmtime_caller_t *caller, wasmtime_memory_t *out) {
   return true;
 }
 
-
 /* ---- compiled modules ------------------------------------------------- */
 
-/* The engine all hosts share. A compiled module belongs to an engine, and
- * stage0 makes a store per module it compiles (docs/spec.md section 3.2),
- * so sharing the engine lets those stores share compiled modules. */
-static wasm_engine_t *shared_engine;
+static wasm_engine_t *the_engine;
 
 static wasm_engine_t *engine(void) {
-  if (!shared_engine) {
+  if (!the_engine) {
     wasm_config_t *config = wasm_config_new();
     wasmtime_config_wasm_tail_call_set(config, true);
     wasmtime_config_wasm_multi_value_set(config, true);
@@ -401,12 +290,14 @@ static wasm_engine_t *engine(void) {
     /* max_wasm_stack may not exceed async_stack_size, even without async. */
     wasmtime_config_async_stack_size_set(config, (size_t)8 << 20);
     wasmtime_config_max_wasm_stack_set(config, (size_t)4 << 20);
-    shared_engine = wasm_engine_new_with_config(config);
+    the_engine = wasm_engine_new_with_config(config);
   }
-  return shared_engine;
+  return the_engine;
 }
 
-/* Every module compiled so far, by its bytes, for the life of the process. */
+/* Every module compiled so far, by its bytes. The compiler instantiates a
+ * linklet in the namespace of each compilation that needs it (spec 3.2),
+ * and it is compiled once. */
 typedef struct compiled {
   uint64_t hash;
   size_t len;
@@ -431,21 +322,11 @@ static wasmtime_error_t *compile(const uint8_t *bytes, size_t len, wasmtime_modu
   compiled **bucket = &compiled_modules[hash % COMPILED_BUCKETS];
   for (compiled *c = *bucket; c; c = c->next)
     if (c->hash == hash && c->len == len && memcmp(c->bytes, bytes, len) == 0) {
-      if (p_on()) p_cache_hits++;
       *out = c->module;
       return NULL;
     }
   wasmtime_module_t *module = NULL;
-  if (p_on()) {
-    p_compiles++;
-    p_compiled_bytes += len;
-  }
-  double started = profiling > 0 ? now() : 0;
-  sub_profile_push(P_COMPILE);
   wasmtime_error_t *error = wasmtime_module_new(engine(), bytes, len, &module);
-  sub_profile_pop();
-  if (profiling > 0 && getenv("SUBHOST_PROFILE")[0] == '2')
-    fprintf(stderr, "compile %7zu bytes %6.1f ms  %s\n", len, 1000 * (now() - started), p_naming);
   if (error) return error;
   note_locations(bytes, len);
   compiled *c = malloc(sizeof *c);
@@ -481,16 +362,20 @@ static void mapped_import(const char *map, size_t map_len, const char *mod, size
   snprintf(out, cap, "%.*s", (int)len, mod);
 }
 
-static int instantiate(sub_host *h, const char *name, size_t name_len, const uint8_t *bytes, size_t len,
+/* Compile and instantiate the module in bytes, link each import to the
+ * instance map names for its module, or to the instance of that name, and
+ * register it as name. 0 on success. The arguments must not be in wasm
+ * memory: instantiation runs the module's start function, which may move
+ * it. */
+static int instantiate(const char *name, size_t name_len, const uint8_t *bytes, size_t len,
                        const char *map, size_t map_len) {
   int rc = 1;
   wasmtime_module_t *module = NULL;
   wasm_importtype_vec_t imports = {0};
   wasmtime_extern_t *externs = NULL;
-  p_naming = name;
   wasmtime_error_t *error = compile(bytes, len, &module);
   if (error) {
-    take_failure(h, "compile", error, NULL);
+    take_failure("compile", error, NULL);
     goto done;
   }
   wasmtime_module_imports(module, &imports);
@@ -500,23 +385,21 @@ static int instantiate(sub_host *h, const char *name, size_t name_len, const uin
     const wasm_name_t *field = wasm_importtype_name(imports.data[i]);
     char linked[512];
     mapped_import(map, map_len, mod->data, mod->size, linked, sizeof linked);
-    if (!wasmtime_linker_get(h->linker, h->ctx, linked, strlen(linked), field->data, field->size, &externs[i])) {
-      set_err(h, "instantiate %.*s: no import %s.%.*s", (int)name_len, name, linked, (int)field->size, field->data);
+    if (!wasmtime_linker_get(host.linker, host.ctx, linked, strlen(linked), field->data, field->size, &externs[i])) {
+      set_err("instantiate %.*s: no import %s.%.*s", (int)name_len, name, linked, (int)field->size, field->data);
       goto done;
     }
   }
   wasmtime_instance_t inst;
   wasm_trap_t *trap = NULL;
-  sub_profile_push(P_INSTANTIATE);
-  error = wasmtime_instance_new(h->ctx, module, externs, imports.size, &inst, &trap);
-  sub_profile_pop();
+  error = wasmtime_instance_new(host.ctx, module, externs, imports.size, &inst, &trap);
   if (error || trap) {
-    take_failure(h, "instantiate", error, trap);
+    take_failure("instantiate", error, trap);
     goto done;
   }
-  error = wasmtime_linker_define_instance(h->linker, h->ctx, name, name_len, &inst);
+  error = wasmtime_linker_define_instance(host.linker, host.ctx, name, name_len, &inst);
   if (error) {
-    take_failure(h, "register", error, NULL);
+    take_failure("register", error, NULL);
     goto done;
   }
   rc = 0;
@@ -526,75 +409,41 @@ done:
   return rc;
 }
 
-int sub_instantiate(sub_host *h, const char *name, const uint8_t *bytes, size_t len, const char *map, size_t map_len) {
-  /* Copy the arguments first: instantiation runs start functions. */
-  char *name_copy = strdup(name);
-  uint8_t *copy = malloc(len ? len : 1);
-  memcpy(copy, bytes, len);
-  char *map_copy = malloc(map_len ? map_len : 1);
-  memcpy(map_copy, map, map_len);
-  int rc = instantiate(h, name_copy, strlen(name_copy), copy, len, map_copy, map_len);
-  free(map_copy);
-  free(copy);
-  free(name_copy);
-  return rc;
-}
-
-/* ---- calls ------------------------------------------------------------ */
-
-static int call(sub_host *h, const char *inst, const char *fn, int nargs,
-                int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5) {
-  int32_t args[6] = {a0, a1, a2, a3, a4, a5};
-  if (nargs < 0 || nargs > 6) {
-    set_err(h, "call: bad argument count %d", nargs);
-    return 1;
-  }
+/* Call the function inst exports as fn, which takes no arguments. 0 on
+ * success. */
+static int call(const char *inst, const char *fn) {
   wasmtime_extern_t ext;
-  if (!wasmtime_linker_get(h->linker, h->ctx, inst, strlen(inst), fn, strlen(fn), &ext) ||
+  if (!wasmtime_linker_get(host.linker, host.ctx, inst, strlen(inst), fn, strlen(fn), &ext) ||
       ext.kind != WASMTIME_EXTERN_FUNC) {
-    set_err(h, "call: no function %s.%s", inst, fn);
+    set_err("call: no function %s.%s", inst, fn);
     return 1;
   }
   wasmtime_func_t func = ext.of.func;
-  wasm_functype_t *ty = wasmtime_func_type(h->ctx, &func);
+  wasm_functype_t *ty = wasmtime_func_type(host.ctx, &func);
   size_t nparams = wasm_functype_params(ty)->size;
   size_t nresults = wasm_functype_results(ty)->size;
   wasm_functype_delete(ty);
-  if ((size_t)nargs != nparams || nresults > 1) {
-    set_err(h, "call: %s.%s takes %zu arguments and returns %zu values, given %d arguments",
-            inst, fn, nparams, nresults, nargs);
+  if (nparams != 0 || nresults > 1) {
+    set_err("call: %s.%s takes %zu arguments and returns %zu values", inst, fn, nparams, nresults);
     return 1;
   }
-  wasmtime_val_t argv[6], res[1];
-  for (int i = 0; i < nargs; i++) {
-    argv[i].kind = WASMTIME_I32;
-    argv[i].of.i32 = args[i];
-  }
+  wasmtime_val_t res[1];
   wasm_trap_t *trap = NULL;
-  wasmtime_error_t *error = wasmtime_func_call(h->ctx, &func, argv, (size_t)nargs, res, nresults, &trap);
+  wasmtime_error_t *error = wasmtime_func_call(host.ctx, &func, NULL, 0, res, nresults, &trap);
   if (error || trap) {
-    take_failure(h, "trap", error, trap);
+    take_failure("trap", error, trap);
     return 1;
   }
-  h->result = (nresults == 1 && res[0].kind == WASMTIME_I32) ? res[0].of.i32 : 0;
   return 0;
-}
-
-int sub_call(sub_host *h, const char *inst, const char *fn, int nargs,
-             int32_t a0, int32_t a1, int32_t a2, int32_t a3, int32_t a4, int32_t a5) {
-  p_enter_wasm();
-  int rc = call(h, inst, fn, nargs, a0, a1, a2, a3, a4, a5);
-  sub_profile_pop();
-  return rc;
 }
 
 /* ---- host imports ----------------------------------------------------- */
 /* Every pointer a host import receives is into the caller's own memory,
  * the one it exports as "memory" (spec section 4). */
 
-/* Run a host function body with h->ctx set to the caller's context. */
-#define ENTER(h, caller) wasmtime_context_t *saved_ctx = (h)->ctx; (h)->ctx = wasmtime_caller_context(caller)
-#define LEAVE(h) (h)->ctx = saved_ctx
+/* Run a host function body with host.ctx set to the caller's context. */
+#define ENTER(caller) wasmtime_context_t *saved_ctx = host.ctx; host.ctx = wasmtime_caller_context(caller)
+#define LEAVE() host.ctx = saved_ctx
 
 static wasm_trap_t *trap_msg(const char *msg) { return wasmtime_trap_new(msg, strlen(msg)); }
 
@@ -625,7 +474,6 @@ static wasm_trap_t *host_trap(void *env, wasmtime_caller_t *caller, const wasmti
 
 static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                      size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
   uint32_t np = (uint32_t)args[0].of.i32, nl = (uint32_t)args[1].of.i32;
   uint32_t bp = (uint32_t)args[2].of.i32, bl = (uint32_t)args[3].of.i32;
   uint32_t mp = (uint32_t)args[4].of.i32, ml = (uint32_t)args[5].of.i32;
@@ -643,9 +491,9 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   memcpy(copy, bytes, bl);
   char *map_copy = malloc(ml ? ml : 1);
   memcpy(map_copy, map, ml);
-  ENTER(h, caller);
-  int rc = instantiate(h, name_copy, nl, copy, bl, map_copy, ml);
-  LEAVE(h);
+  ENTER(caller);
+  int rc = instantiate(name_copy, nl, copy, bl, map_copy, ml);
+  LEAVE();
   free(map_copy);
   free(copy);
   free(name_copy);
@@ -657,7 +505,6 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
 /* Append inst.field to the caller's table (exported as "table"). */
 static wasm_trap_t *host_export_index(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                       size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
   uint32_t ip = (uint32_t)args[0].of.i32, il = (uint32_t)args[1].of.i32;
   uint32_t fp = (uint32_t)args[2].of.i32, fl = (uint32_t)args[3].of.i32;
   wasmtime_memory_t mem;
@@ -670,14 +517,14 @@ static wasm_trap_t *host_export_index(void *env, wasmtime_caller_t *caller, cons
   if (!inst || !field) return trap_msg("host.export_index: out of bounds");
   int32_t index = -1;
   wasmtime_extern_t ext;
-  if (wasmtime_linker_get(h->linker, cctx, (const char *)inst, il, (const char *)field, fl, &ext) &&
+  if (wasmtime_linker_get(host.linker, cctx, (const char *)inst, il, (const char *)field, fl, &ext) &&
       ext.kind == WASMTIME_EXTERN_FUNC) {
     wasmtime_val_t init = {.kind = WASMTIME_FUNCREF};
     init.of.funcref = ext.of.func;
     uint64_t prev = 0;
     wasmtime_error_t *error = wasmtime_table_grow(cctx, &table.of.table, 1, &init, &prev);
     if (error)
-      take_failure(h, "host.export_index", error, NULL);
+      take_failure("host.export_index", error, NULL);
     else
       index = (int32_t)prev;
   }
@@ -688,29 +535,22 @@ static wasm_trap_t *host_export_index(void *env, wasmtime_caller_t *caller, cons
 
 static wasm_trap_t *host_error_message(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                        size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
   uint32_t bp = (uint32_t)args[0].of.i32, cap = (uint32_t)args[1].of.i32;
   wasmtime_memory_t mem;
   if (!caller_memory(caller, &mem)) return trap_msg("host.error_message: caller exports no memory");
-  size_t n = strlen(h->err);
+  size_t n = strlen(host.err);
   if (n > cap) n = cap;
   uint8_t *buf = range(wasmtime_caller_context(caller), &mem, bp, (uint32_t)n);
-  if (buf) memcpy(buf, h->err, n);
+  if (buf) memcpy(buf, host.err, n);
   results[0].kind = WASMTIME_I32;
   results[0].of.i32 = buf ? (int32_t)n : -1;
   return NULL;
 }
 
-void sub_add_arg(sub_host *h, const char *arg) {
-  h->args = realloc(h->args, (size_t)(h->nargs + 1) * sizeof *h->args);
-  h->args[h->nargs++] = strdup(arg);
-}
-
 static wasm_trap_t *host_arg_count(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                    size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
   results[0].kind = WASMTIME_I32;
-  results[0].of.i32 = h->nargs;
+  results[0].of.i32 = host.nargs;
   return NULL;
 }
 
@@ -718,19 +558,18 @@ static wasm_trap_t *host_arg_count(void *env, wasmtime_caller_t *caller, const w
  * if there is no argument i. */
 static wasm_trap_t *host_arg(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                              size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
   int32_t i = args[0].of.i32;
   uint32_t bp = (uint32_t)args[1].of.i32, cap = (uint32_t)args[2].of.i32;
   results[0].kind = WASMTIME_I32;
   results[0].of.i32 = -1;
-  if (i < 0 || i >= h->nargs) return NULL;
+  if (i < 0 || i >= host.nargs) return NULL;
   wasmtime_memory_t mem;
   if (!caller_memory(caller, &mem)) return trap_msg("host.arg: caller exports no memory");
-  size_t n = strlen(h->args[i]);
+  size_t n = strlen(host.args[i]);
   uint32_t k = n < cap ? (uint32_t)n : cap;
   uint8_t *buf = range(wasmtime_caller_context(caller), &mem, bp, k);
   if (!buf) return trap_msg("host.arg: out of bounds");
-  memcpy(buf, h->args[i], k);
+  memcpy(buf, host.args[i], k);
   results[0].of.i32 = (int32_t)n;
   return NULL;
 }
@@ -751,7 +590,6 @@ static char *caller_string(wasmtime_caller_t *caller, const wasmtime_memory_t *m
  * why. */
 static wasm_trap_t *host_read_file(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                    size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
   uint32_t pp = (uint32_t)args[0].of.i32, pl = (uint32_t)args[1].of.i32;
   uint32_t bp = (uint32_t)args[2].of.i32, cap = (uint32_t)args[3].of.i32;
   wasmtime_memory_t mem;
@@ -764,9 +602,9 @@ static wasm_trap_t *host_read_file(void *env, wasmtime_caller_t *caller, const w
   long size = -1;
   if (f && fseek(f, 0, SEEK_END) == 0) size = ftell(f);
   if (!f || size < 0) {
-    set_err(h, "%s: %s", path, strerror(errno));
+    set_err("%s: %s", path, strerror(errno));
   } else if (size > INT32_MAX) {
-    set_err(h, "%s: the file is larger than 2 GiB", path);
+    set_err("%s: the file is larger than 2 GiB", path);
   } else {
     uint32_t k = (uint32_t)size < cap ? (uint32_t)size : cap;
     uint8_t *buf = range(wasmtime_caller_context(caller), &mem, bp, k);
@@ -779,7 +617,7 @@ static wasm_trap_t *host_read_file(void *env, wasmtime_caller_t *caller, const w
     if (fread(buf, 1, k, f) == k)
       results[0].of.i32 = (int32_t)size;
     else
-      set_err(h, "%s: %s", path, strerror(errno));
+      set_err("%s: %s", path, strerror(errno));
   }
   if (f) fclose(f);
   free(path);
@@ -791,7 +629,6 @@ static wasm_trap_t *host_read_file(void *env, wasmtime_caller_t *caller, const w
  * saying why. */
 static wasm_trap_t *host_write_file(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
                                     size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  sub_host *h = env;
   uint32_t pp = (uint32_t)args[0].of.i32, pl = (uint32_t)args[1].of.i32;
   uint32_t bp = (uint32_t)args[2].of.i32, len = (uint32_t)args[3].of.i32;
   wasmtime_memory_t mem;
@@ -806,9 +643,9 @@ static wasm_trap_t *host_write_file(void *env, wasmtime_caller_t *caller, const 
   results[0].of.i32 = -1;
   FILE *f = fopen(path, "wb");
   if (!f)
-    set_err(h, "%s: %s", path, strerror(errno));
+    set_err("%s: %s", path, strerror(errno));
   else if (fwrite(buf, 1, len, f) != len || fclose(f) != 0)
-    set_err(h, "%s: %s", path, strerror(errno));
+    set_err("%s: %s", path, strerror(errno));
   else
     results[0].of.i32 = 0;
   free(path);
@@ -823,41 +660,6 @@ static wasm_trap_t *host_exit(void *env, wasmtime_caller_t *caller, const wasmti
   exit(args[0].of.i32);
 }
 
-/* Expander queries (stage0 only): forward to the embedder's callback. env
- * points at an op code; the host is found through the store's data. */
-static const int32_t op_codes[] = {SUB_OP_SYNTAX_LOCAL_VALUE, SUB_OP_RAISE_SYNTAX_ERROR, SUB_OP_FREE_IDENTIFIER_EQ,
-                                   SUB_OP_IDENTIFIER_BINDING_KIND, SUB_OP_LOCAL_EXPAND,
-                                   SUB_OP_SYNTAX_LOCAL_LIFT_DEFINITION, SUB_OP_IDENTIFIER_FUNCTION_SIGNATURE};
-
-static wasm_trap_t *expander_call(void *env, wasmtime_caller_t *caller, const wasmtime_val_t *args,
-                                  size_t nargs, wasmtime_val_t *results, size_t nresults) {
-  int32_t op = *(const int32_t *)env;
-  sub_host *h = wasmtime_context_get_data(wasmtime_caller_context(caller));
-  if (!h->cb) return trap_msg("expander query used outside the expander");
-  ENTER(h, caller);
-  if (p_on() && op >= 0 && op < 8) p_callbacks[op]++;
-  sub_profile_push(P_EMBEDDER);
-  int32_t r = h->cb(op, nargs > 0 ? args[0].of.i32 : 0, nargs > 1 ? args[1].of.i32 : 0);
-  sub_profile_pop();
-  LEAVE(h);
-  if (h->pending_trap) {
-    wasm_trap_t *t = trap_msg(h->pending_trap);
-    free(h->pending_trap);
-    h->pending_trap = NULL;
-    return t;
-  }
-  results[0].kind = WASMTIME_I32;
-  results[0].of.i32 = r;
-  return NULL;
-}
-
-void sub_set_callback(sub_host *h, sub_callback cb) { h->cb = cb; }
-
-void sub_request_trap(sub_host *h, const char *msg) {
-  free(h->pending_trap);
-  h->pending_trap = strdup(msg);
-}
-
 /* ---- setup ------------------------------------------------------------ */
 
 static wasm_functype_t *i32_functype(int nparams, int nresults) {
@@ -870,53 +672,106 @@ static wasm_functype_t *i32_functype(int nparams, int nresults) {
   return wasm_functype_new(&params, &results);
 }
 
-static int define(sub_host *h, const char *module, const char *name, int np, int nr,
-                  wasmtime_func_callback_t cb, void *env) {
+/* Define host.name, taking np i32s and returning nr. */
+static void define(const char *name, int np, int nr, wasmtime_func_callback_t cb) {
   wasm_functype_t *ty = i32_functype(np, nr);
   wasmtime_error_t *error =
-      wasmtime_linker_define_func(h->linker, module, strlen(module), name, strlen(name), ty, cb, env, NULL);
+      wasmtime_linker_define_func(host.linker, "host", 4, name, strlen(name), ty, cb, NULL, NULL);
   wasm_functype_delete(ty);
   if (error) {
-    take_failure(h, "define", error, NULL);
-    return 1;
-  }
-  return 0;
-}
-
-sub_host *sub_host_new(void) {
-  sub_host *h = calloc(1, sizeof *h);
-  h->store = wasmtime_store_new(engine(), h, NULL);
-  h->ctx = wasmtime_store_context(h->store);
-  h->linker = wasmtime_linker_new(engine());
-  if (define(h, "host", "write", 3, 1, host_write, h) ||
-      define(h, "host", "trap", 2, 0, host_trap, h) ||
-      define(h, "host", "instantiate", 6, 1, host_instantiate, h) ||
-      define(h, "host", "export_index", 4, 1, host_export_index, h) ||
-      define(h, "host", "error_message", 2, 1, host_error_message, h) ||
-      define(h, "host", "arg_count", 0, 1, host_arg_count, h) ||
-      define(h, "host", "arg", 3, 1, host_arg, h) ||
-      define(h, "host", "read_file", 4, 1, host_read_file, h) ||
-      define(h, "host", "write_file", 4, 1, host_write_file, h) ||
-      define(h, "host", "exit", 1, 0, host_exit, h) ||
-      define(h, "expander", "syntax-local-value", 1, 1, expander_call, (void *)&op_codes[0]) ||
-      define(h, "expander", "raise-syntax-error", 2, 1, expander_call, (void *)&op_codes[1]) ||
-      define(h, "expander", "free-identifier=?", 2, 1, expander_call, (void *)&op_codes[2]) ||
-      define(h, "expander", "identifier-binding-kind", 1, 1, expander_call, (void *)&op_codes[3]) ||
-      define(h, "expander", "local-expand", 1, 1, expander_call, (void *)&op_codes[4]) ||
-      define(h, "expander", "syntax-local-lift-definition", 1, 1, expander_call, (void *)&op_codes[5]) ||
-      define(h, "expander", "identifier-function-signature", 1, 1, expander_call, (void *)&op_codes[6])) {
-    fprintf(stderr, "subhost: %s\n", h->err);
+    take_failure("define", error, NULL);
+    fprintf(stderr, "subhost: %s\n", host.err);
     abort();
   }
-  return h;
 }
 
-void sub_host_free(sub_host *h) {
-  if (!h) return;
-  wasmtime_linker_delete(h->linker);
-  wasmtime_store_delete(h->store);
-  free(h->pending_trap);
-  for (int i = 0; i < h->nargs; i++) free(h->args[i]);
-  free(h->args);
-  free(h);
+static void start_host(void) {
+  host.store = wasmtime_store_new(engine(), NULL, NULL);
+  host.ctx = wasmtime_store_context(host.store);
+  host.linker = wasmtime_linker_new(engine());
+  define("write", 3, 1, host_write);
+  define("trap", 2, 0, host_trap);
+  define("instantiate", 6, 1, host_instantiate);
+  define("export_index", 4, 1, host_export_index);
+  define("error_message", 2, 1, host_error_message);
+  define("arg_count", 0, 1, host_arg_count);
+  define("arg", 3, 1, host_arg);
+  define("read_file", 4, 1, host_read_file);
+  define("write_file", 4, 1, host_write_file);
+  define("exit", 1, 0, host_exit);
+}
+
+/* ---- running a program ------------------------------------------------ */
+
+/* The whole file at path, or NULL; its length in *len. */
+static char *read_all(const char *path, size_t *len) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  char *buf = NULL;
+  long size = -1;
+  if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+  if (size >= 0 && fseek(f, 0, SEEK_SET) == 0) {
+    buf = malloc((size_t)size + 1);
+    if (fread(buf, 1, (size_t)size, f) == (size_t)size) {
+      buf[size] = '\0';
+      *len = (size_t)size;
+    } else {
+      free(buf);
+      buf = NULL;
+    }
+  }
+  fclose(f);
+  return buf;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    fprintf(stderr, "usage: subhost DIR [arg ...]\n");
+    return 64;
+  }
+  const char *dir = argv[1];
+  char path[4096];
+  size_t len;
+  snprintf(path, sizeof path, "%s/program", dir);
+  char *program = read_all(path, &len);
+  if (!program) {
+    fprintf(stderr, "subhost: cannot read %s\n", path);
+    return 1;
+  }
+  start_host();
+  host.args = argv + 2;
+  host.nargs = argc - 2;
+  const char *last = NULL;
+  for (char *name = strtok(program, "\n"); name; name = strtok(NULL, "\n")) {
+    snprintf(path, sizeof path, "%s/%s.wasm", dir, name);
+    char *bytes = read_all(path, &len);
+    if (!bytes) {
+      fprintf(stderr, "subhost: cannot read %s\n", path);
+      return 1;
+    }
+    int rc = instantiate(name, strlen(name), (const uint8_t *)bytes, len, "", 0);
+    free(bytes);
+    if (rc) {
+      fprintf(stderr, "error: %s\n", host.err);
+      return 2;
+    }
+    last = name;
+  }
+  if (!last) {
+    fprintf(stderr, "subhost: %s names no linklets\n", path);
+    return 1;
+  }
+  if (call(last, "main")) {
+    /* A program without main has nothing to run. */
+    if (strncmp(host.err, "call: no function", 17) == 0) return 0;
+    /* A program's on-trap, if it has one, reports the trap (spec 4): the
+     * trap's message is the host's last error message, which it reads with
+     * host.error_message. If it has none, or traps too, the host reports
+     * the trap itself. */
+    char *trap = strdup(host.err);
+    if (call(last, "on-trap")) fprintf(stderr, "error: %s\n", trap);
+    free(trap);
+    return 2;
+  }
+  return 0;
 }

@@ -20,12 +20,10 @@ line says the same.
 | `docs/` | the kernel specification | permanent |
 | `host/` | the hosts, in C over wasmtime (`subhost.c`) and in JavaScript over Node's V8 (`subhost.mjs`): stores, linking, the `host` imports and the instantiate hook | permanent: they run programs, the compiler among them |
 | `compiler/` | the compiler, written in Substrate: reader, expander, kernel compiler, wasm encoder; what only compiling needs. It compiles itself (spec 1.4) | permanent, grows |
-| `stage0/` | the bootstrap compiler, in Chez Scheme: reader, expander, compiler, wasm encoder, FFI | temporary: builds stage1, and checks the compiler, until it is retired |
 | `lib/` | what programs use, the compiler among them: the syntax library (`syntax.sub`), the data of every language and the functions macros use on it; Substrate (`substrate.sub`, written in Substrate on its core in kernel code, `substrate-core.sub`), the language built on the kernel; and printing for programs without GC (`print.sub`) | permanent, grows |
 | `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.imports`) and any modules it requires in `NAME/`; checked by `make check` | grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.imports` (what the compiled phase-0 linklet may import). `tests/fixtures/` holds modules the tests require | grows |
 | `seed/` | the compiler, built by itself: what builds the compiler's source (spec 1.4) | permanent, replaced as the compiler grows |
-| `bin/subc` | runs stage0 | temporary, as stage0 |
 | `bin/sub` | runs the compiler written in Substrate (`build/sub`) | permanent |
 
 A library in `lib/` is one we intend to build on, not the only way to do
@@ -51,30 +49,19 @@ HOST=host/subhost.mjs tests/run.sh   # run the tests' programs on V8
 SUBHOST_PERFMAP=1 HOST=build/subhost perf record -g bin/sub ...   # wasmtime samples, named by wasm function
 ```
 
-bin/sub runs the compiler, `build/sub`, on V8. While stage0 is kept,
-`bin/subc` runs it, with the same commands and `run`:
-
-```sh
-make check-stage0               # the tests, built by stage0
-bin/subc run tests/macros.sub   # compile and run a program's main
-SUBHOST_PROFILE=1 bin/subc run FILE   # time per category, printed at exit
-SUBHOST_PROFILE=2 bin/subc run FILE   # also each wasm compile: size, time, instance
-```
-
-`make build/sub` builds the compiler bin/sub runs from the checked-in seed
-(`seed/`): the seed builds the source, and that build builds it again.
-`make bootstrap` builds the compiler with stage0 (stage1), then with itself
-twice (stage2, stage3), and checks that stage2 = stage3, that stage0 agrees
-(stage1 = stage2) and that the seed does (spec 1.4). `make seed` makes
-`build/sub` the seed, once it reproduces itself.
+bin/sub runs the compiler, `build/sub`, on V8. `make build/sub` builds it
+from the checked-in seed (`seed/`): the seed builds the source, and that
+build builds it again. `make bootstrap` checks that `build/sub` builds
+itself into the same bytes, its fixpoint (spec 1.4), and `make seed` makes
+`build/sub` the seed, once it does.
 
 ## Status
 
-The compiler is written in Substrate (`compiler/`) and compiles itself:
-built by stage0, then by itself, it reaches its fixpoint, and stage0 and it
-write the same bytes (`make bootstrap`, spec 1.4). It is built from a
-checked-in seed, and on V8 it builds itself in under a second. Stage0 is
-kept for now, as a second compiler to check it against.
+The compiler is written in Substrate (`compiler/`) and compiles itself: it
+is built from a checked-in seed, reaches its fixpoint (`make bootstrap`,
+spec 1.4), and on V8 builds itself in under a second. It was first built
+by stage0, a compiler written apart in Chez Scheme, which wrote the same
+bytes; stage0 was retired after commit 3e74bce.
 
 The compiler goes from source to a program: reader, expander, kernel
 compiler, binary wasm, which a host runs on wasmtime or V8. Errors and

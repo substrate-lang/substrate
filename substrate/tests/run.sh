@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Lifecycle: test harness.
 #
-# Build every tests/*.sub and examples/*.sub with COMPILER build and run it
+# Build every tests/*.sub and examples/*.sub with bin/sub build and run it
 # with a host, build/subhost unless HOST names another (host/subhost.mjs
 # runs programs on Node's V8); the output checked is the build's, then the
 # run's.
@@ -12,16 +12,13 @@
 #   NAME.imports  the instance names the compiled phase-0 linklet may import
 #                 from, one per line (checks that programs import only what
 #                 they use)
-#   NAME.stage0.err  with stage0, what NAME.err says, where stage0 differs
 #
-# COMPILER is the compiler to build with (default bin/sub, the compiler
-# written in Substrate; bin/subc is stage0), and OUT where builds go
-# (default build).
+# OUT is where builds go (default build).
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-compiler="$root/${COMPILER:-bin/sub}"
+compiler="$root/bin/sub"
 builds="${OUT:-build}"
 host="$root/${HOST:-build/subhost}"
 
@@ -46,11 +43,7 @@ for t in tests/*.sub examples/*.sub; do
             "$host" "$root/$program" "${args[@]}" 2>&1)"
   code=$?
   problem=""
-  if [ "$compiler" = "$root/bin/subc" ] && [ -f "$base.stage0.err" ]; then
-    if [ $code -eq 0 ] || ! grep -qF -- "$(cat "$base.stage0.err")" <<< "$actual"; then
-      problem="expected an error containing: $(cat "$base.stage0.err")"
-    fi
-  elif [ -f "$base.out" ]; then
+  if [ -f "$base.out" ]; then
     if [ $code -ne 0 ] || [ "$actual" != "$(cat "$base.out")" ]; then
       problem="output differs (exit $code)"
     elif ! while read -r linklet; do
