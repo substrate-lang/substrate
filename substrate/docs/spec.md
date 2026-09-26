@@ -154,7 +154,7 @@ at the phase where it appears, plus any it lists to bind unqualified
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)` |
 | exceptions | the tag `exn`, whose exceptions carry one `eqref`; `(raise-syntax-error name message stx)` (throws a syntax error), `(syntax-error? v) -> i32`, `(syntax-error-message e)`, `(syntax-error-syntax e)` (the syntax it blames, or `#f`) |
-| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)` |
+| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)` |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
   otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
@@ -232,9 +232,15 @@ at the phase where it appears, plus any it lists to bind unqualified
   macro's input expands as it would at the use site.
 - `syntax-local-lift-definition` adds a module-level form (a `func`, `global`,
   `import`, `type` or `data` form, or an expression) to the module body
-  being expanded, at the running macro's phase (6.4). It returns the form
-  as it is declared: with the macro's introduction scope, like the
-  macro's output, so each use gets fresh names.
+  being expanded, at the running macro's phase (6.4). The form is declared
+  as the macro's output is, with the use's introduction scope, so each
+  use gets fresh names. It returns the form as given, so the macro can put
+  its names in its output.
+- `syntax-local-introduce` flips the running macro's introduction scope
+  on `stx`: it turns syntax as the macro sees it into syntax as the module
+  sees it, and back. A macro that keeps syntax from one use for another,
+  such as the names of a definition it lifted, keeps it as the module sees
+  it, and flips it again to put it in a later use's output.
 
 The queries only work while an expander is running; in a run-time store
 they trap.
@@ -527,8 +533,8 @@ quotation and compile-time forms.
   type: `(ref (tuple i32 3))`, as in Zig. Such a macro usually declares the
   type with `syntax-local-lift-definition` and returns its name. Uses in
   any module get the same type, since the declarations have the same
-  structure; the macro can remember a name to declare the type once per
-  module
+  structure; the macro can remember the name, as the module sees it
+  (`syntax-local-introduce`, 2.3), to declare the type once per module
   (`tests/fixtures/tuple.sub`).
   Type positions are the types of parameters, results, globals, `let`
   bindings, fields and signatures, and the type immediates of GC
@@ -1066,17 +1072,6 @@ right-hand side's.
   variable the kernel type it is written with, or `eqref`, so a Substrate
   lambda that captures a kernel local whose inferred type is another fails
   to type-check.
-- **Using a lifted definition in the same macro use**:
-  `syntax-local-lift-definition` returns the form as declared, with the
-  use's introduction scope (2.3). Another use can put its names in its
-  output, but not the use that lifted it: its output's scopes are flipped
-  again, which takes the introduction scope off. So a macro that remembers
-  the types it declared (5.1) must, in the use that declares one, write
-  the names it gave the lift, as `tests/fixtures/tuple.sub` does.
-  `examples/typed/typed.sub` declares its closure types where it uses them
-  instead. A contract where the lift returns the form as the macro wrote
-  it, and a function moves syntax between the macro's view and the
-  module's, would make remembering safe.
 - **Structs after the typed layer**: declared types are identified by
   structure (5.1), so the accessors of `examples/shapes/struct.sub` check
   brands at run time: passing a `fahrenheit` to `celsius-t` is a run-time
