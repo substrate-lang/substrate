@@ -25,8 +25,8 @@ built over Racket's `#%kernel`.
    phase gets its own instances.
 4. **Syntax belongs to the expander.** Macros create and inspect syntax
    only through the syntax library's functions (section 2). At compile time
-   they link to the running compiler's instance of that library, so its
-   interface is part of the bootstrap seed.
+   they link to the running compiler's instance of that library, and are
+   compiled against it (1.4).
 5. **The compiler is an ordinary program.** After bootstrap it requires the
    syntax library at phase 0, as any program that transforms code would.
 
@@ -78,6 +78,19 @@ For the compiler's source to use something the seed does not know, the
 feature is added first, then the seed is replaced by the new build (`make
 seed`, which checks the fixpoint first). Earlier seeds stay in the
 repository's history.
+
+A compiler runs with a build of the syntax library, whose instance its
+macros share with it, and builds programs with `lib/syntax.sub`. The two
+are one library, except while a compiler builds a new one whose syntax
+library has changed. So the compiler carries the text of the library it
+runs with, the **host library**: `lib/syntax.sub` as it was when the
+compiler was compiled. It compiles compile-time code against the host
+library, and programs against `lib/syntax.sub`, the **target library**.
+When they differ, a module's phase-0 linklet, which both runs at compile
+time and goes into programs, is compiled for each. So a change to the
+syntax library, even to its representation, takes effect in one build.
+Compile-time code can call a function the host library does not have
+once the compiler that compiles it has it: after the seed is replaced.
 
 The first compiler was built by **stage0**, a compiler of the same
 language written apart in Chez Scheme. Its build of the compiler built

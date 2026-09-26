@@ -98,12 +98,14 @@
 (define (meaning-namespace meaning)
   (if (and meaning (eq? (car meaning) 'type)) 'type 'value))
 
-;; A compiled (or compiling) module. linklets: phase -> linklet. requires:
+;; A compiled (or compiling) module. linklets: phase -> linklet, compiled
+;; against the host library, for compile time. program: its phase-0
+;; linklet compiled against the target library, for programs. requires:
 ;; list of (module . shift). provides: list of (symbol . meaning). entries:
 ;; its module-level bindings, as (symbol scopes phase key). scope: its
 ;; module scope. name: what its instance names start with (spec 3.2).
 (struct unit (path source [name #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
-              [entries #:mutable] [expanded #:mutable] [scope #:mutable]))
+              [entries #:mutable] [expanded #:mutable] [scope #:mutable] [program #:mutable]))
 
 ;; One phase of a module, compiled: bytes, the instance names it imports
 ;; from (relative to the module at phase shift 0), whether it uses GC, and
@@ -136,65 +138,128 @@
 
 (define core-scope 0)
 
-;; ---- the syntax library ----
+;; ---- the syntax libraries ----
 ;;
-;; Compiled from source for the programs the compiler writes. Compile-time
-;; code links to the compiler's own instance, built from the same source.
-;; The source is lib/syntax.sub under the repository's root, and its
-;; source locations name it so, whatever the root is: the compiler's bytes
-;; do not depend on where the repository is (spec 1.4).
+;; There are two, which are one except while a compiler builds a new one
+;; (spec 1.4): the host library, the one this compiler runs with, whose
+;; instance it shares with its macros, and the target library,
+;; lib/syntax.sub under the repository's root, which the programs it writes
+;; link to. Compile-time code is compiled against the host library, and
+;; programs against the target library. The compiler carries the host
+;; library's text; when lib/syntax.sub is that text, the two are one.
+;; Names are bound to the target library's definitions, and code compiled
+;; against the host library uses the host's of the same names. Both
+;; libraries' source locations name them lib/syntax.sub, whatever the root
+;; is: the compiler's bytes do not depend on where the repository is.
 
 (define library-name "lib/syntax.sub")
 (define library-root #f)
-(define syntax-lib #f)                      ; (bytes . infos)
 (define (set-syntax-library-root! root) (set! library-root root))
 
-;; symbol -> func-info or global-info of the syntax library's exports; #f
-;; while compiling the syntax library itself.
-(define current-syntax-infos #f)
-(define (set-syntax-infos! infos)
-  (set! current-syntax-infos infos)
-  (set-current-syntax-infos! infos))
+;; The host library's text: the target library of the compiler that
+;; compiled this one, lib/syntax.sub under the root that compiler was given,
+;; which it compiled for this compiler to run with.
+(begin-for-syntax (require-unqualified substrate "../lib/substrate.sub"))
+(define-syntax (host-library-source stx)
+  (datum->syntax stx (file->string (string-append (vector-ref (current-command-line-arguments) 0) "/lib/syntax.sub"))
+                 stx))
+(define host-library-text (host-library-source))
 
-(define (ensure-library!)
-  (unless syntax-lib
-    (let* ([m (unit library-name library-name "syntax" 'compiling (make-hasheqv) '() '() '() #f #f)]
-           [c (comp m #f 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())]
-           [saved-infos current-syntax-infos]
-           [text (file->string (string-append library-root "/" library-name))])
-      (with-comp c
-        (lambda ()
-          (set-syntax-infos! #f)
-          (let* ([forms (lower-forms (expand-module-body (read-string-all text (string->symbol library-name))) 0)]
-                 [forms (append (storage-forms 0) forms)]
-                 [type (lambda (name)
-                         (cadr (findf (lambda (f) (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) name)))
-                                      forms)))])
-            (set-syntax-types! (type '%string) (type '%table))
-            (set-current-source! (string->symbol library-name))
-            (let ([compiled (compile-module forms "syntax")] [table (make-hasheq)])
-              (for-each (lambda (f)
-                          (case (car f)
-                            [(func) (hash-set! table (func-info-name (cadr f)) (cadr f))]
-                            [(global) (hash-set! table (global-info-name (cadr f)) (cadr f))]
-                            [(tag) (hash-set! table (tag-info-name (cadr f)) (cadr f))]
-                            [else #f]))
-                        forms)
-              (set! syntax-lib (cons (car compiled) table))))
-          (set-syntax-infos! saved-infos))))))
+;; A syntax library, compiled: its bytes; its definitions (func-, global-
+;; and tag-infos) by name; its string and table types, which quoted data
+;; is read with (spec 3.5); and the lowered bodies of the inline functions
+;; that code compiled against it inlines, its own and the modules' compiled
+;; against it.
+(struct library ([bytes #:mutable] [infos #:mutable] [string-type #:mutable] [table-type #:mutable] inlines))
 
-(define (syntax-library-bytes) (ensure-library!) (car syntax-lib))
+(define host-library #f)
+(define target-library #f)
 
-(define (syntax-info name)
-  (or (hash-ref current-syntax-infos name #f)
+;; The library that code is lowered and compiled against: the host
+;; library, but for a program's phase-0 linklets (finish-module!), and
+;; while a library is compiled, that library, whose infos are #f.
+(define lowering-library #f)
+
+(define (set-lowering-library! lib)
+  (set! lowering-library lib)
+  (set-current-syntax-infos! (library-infos lib))
+  (set-syntax-types! (library-string-type lib) (library-table-type lib)))
+
+;; (thunk), with code lowered and compiled against lib.
+(define (with-library lib thunk)
+  (let ([saved lowering-library])
+    (set-lowering-library! lib)
+    (let ([r (thunk)])
+      (when saved (set-lowering-library! saved))
+      r)))
+
+(define (ensure-libraries!)
+  (unless target-library
+    (let ([text (file->string (string-append library-root "/" library-name))])
+      (set! target-library (compile-library text))
+      (set! host-library (if (string=? text host-library-text) target-library (compile-library host-library-text)))
+      (set-lowering-library! host-library))))
+
+;; The syntax library whose source is text, compiled.
+(define (compile-library text)
+  (let* ([lib (library #f #f #f #f (make-hasheq))]
+         [m (unit library-name library-name "syntax" 'compiling (make-hasheqv) '() '() '() #f #f #f)]
+         [c (comp m #f 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())])
+    (with-comp c
+      (lambda ()
+        (with-library lib
+          (lambda ()
+            (let* ([forms (lower-forms (expand-module-body (read-string-all text (string->symbol library-name))) 0)]
+                   [forms (append (storage-forms 0) forms)]
+                   [type (lambda (name)
+                           (cadr (findf (lambda (f) (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) name)))
+                                        forms)))])
+              (set-library-string-type! lib (type '%string))
+              (set-library-table-type! lib (type '%table))
+              (set-syntax-types! (type '%string) (type '%table))
+              (set-current-source! (string->symbol library-name))
+              (let ([compiled (compile-module forms "syntax")] [table (make-hasheq)])
+                (for-each (lambda (f)
+                            (case (car f)
+                              [(func) (hash-set! table (func-info-name (cadr f)) (cadr f))]
+                              [(global) (hash-set! table (global-info-name (cadr f)) (cadr f))]
+                              [(tag) (hash-set! table (tag-info-name (cadr f)) (cadr f))]
+                              [else #f]))
+                          forms)
+                (set-library-bytes! lib (car compiled))
+                (set-library-infos! lib table)))))))
+    lib))
+
+(define (syntax-library-bytes) (ensure-libraries!) (library-bytes target-library))
+
+;; The definition of name in library lib.
+(define (library-info lib name)
+  (or (hash-ref (library-infos lib) name #f)
       (raise-compile-error #f "internal: the syntax library has no ~a" name)))
+
+;; info, a definition that code names, as the library the code is lowered
+;; against has it: if info is the target library's and that library is
+;; the host, the host's definition of the same name. id is where it is
+;; named.
+(define (in-lowering-library info id)
+  (if (or (eq? lowering-library target-library) (not (library-infos lowering-library)))
+      info
+      (let ([name (cond [(func-info? info) (func-info-name info)]
+                        [(global-info? info) (global-info-name info)]
+                        [(tag-info? info) (tag-info-name info)]
+                        [else #f])])
+        (if (and name (eq? (hash-ref (library-infos target-library) name #f) info))
+            (or (hash-ref (library-infos lowering-library) name #f)
+                (raise-compile-error id "~a is not in the syntax library this compiler runs with: compile-time code can use it once the compiler that compiles it has it (spec 1.4)"
+                                     name))
+            info))))
 
 ;; ---- instances ----
 
 (define namespace-counter 0)
 
 (define (new-cstore)
-  (ensure-library!)
+  (ensure-libraries!)
   (set! namespace-counter (+ namespace-counter 1))
   (cstore (format "c~a" namespace-counter) (make-hash) (make-hasheq) 0))
 
@@ -605,18 +670,15 @@
       [known (raise-compile-error #f "cyclic require: ~a requires itself" source)]
       [else
        (unless (file-exists? source) (raise-compile-error #f "no module file ~a" source))
-       (ensure-library!)
+       (ensure-libraries!)
        (let* ([text (file->string source)]
-              [m (unit path source (provisional-name path) 'compiling (make-hasheqv) '() '() '() #f #f)]
-              [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())]
-              [saved-infos current-syntax-infos])
+              [m (unit path source (provisional-name path) 'compiling (make-hasheqv) '() '() '() #f #f #f)]
+              [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())])
          (hash-set! registry path m)
          (with-comp c
            (lambda ()
-             (set-syntax-infos! (cdr syntax-lib))
              (set-unit-expanded! m (expand-module-body (read-string-all text (string->symbol source))))
-             (finish-module! c text)
-             (set-syntax-infos! saved-infos)))
+             (finish-module! c text)))
          m)])))
 
 ;; Expand a module body at phase 0; phase >= 1 code runs as it goes.
@@ -670,6 +732,17 @@
                     (hash-set! (unit-linklets m) p
                                (linklet (car compiled) (cadr compiled) (caddr compiled) (literal-module-scopes forms)))))
                 phases))
+    ;; Programs link to the target library: when it is not the host,
+    ;; the phase-0 code is lowered and compiled again, against it.
+    (set-unit-program!
+     m
+     (if (eq? host-library target-library)
+         (hash-ref (unit-linklets m) 0)
+         (with-library target-library
+           (lambda ()
+             (let* ([forms (append (storage-forms 0) (lower-forms (unit-expanded m) 0))]
+                    [compiled (compile-module forms (linklet-name m 0 0))])
+               (linklet (car compiled) (cadr compiled) (caddr compiled) (literal-module-scopes forms)))))))
     (hash-set! installed (format "~a|0" (unit-path m)) #t)
     (set-unit-state! m 'done)
     (let ([form (comp-freestanding-form c)])
@@ -682,7 +755,7 @@
     (cond [(null? todo) (reverse seen)]
           [(memq (car todo) seen) (loop (cdr todo) seen)]
           [else
-           (let* ([p (hash-ref (unit-linklets (car todo)) 0 #f)]
+           (let* ([p (unit-program (car todo))]
                   [deps (filter (lambda (x) x)
                                 (map (lambda (imp)
                                        (let ([r (linklet-ref imp)])
@@ -694,7 +767,7 @@
 ;; and each other, and use no GC (spec 3.4).
 (define (check-freestanding! m form)
   (for-each (lambda (mm)
-              (let* ([p (hash-ref (unit-linklets mm) 0 #f)]
+              (let* ([p (unit-program mm)]
                      [extra (filter (lambda (imp) (not (or (string=? imp "host") (linklet-ref imp))))
                                     (linklet-imports p))])
                 (unless (and (null? extra) (not (linklet-gc? p)))
@@ -716,13 +789,13 @@
       (let ([name (linklet-name m 0 0)])
         (unless (hash-has-key? seen name)
           (hash-set! seen name #t)
-          (let ([p (hash-ref (unit-linklets m) 0 #f)])
+          (let ([p (unit-program m)])
             (for-each (lambda (imp)
                         (let ([l (linklet-ref imp)])
                           (cond [(string=? imp "syntax")
                                  (unless (hash-has-key? seen imp)
                                    (hash-set! seen imp #t)
-                                   (set! out (cons (cons imp (car syntax-lib)) out)))]
+                                   (set! out (cons (cons imp (library-bytes target-library)) out)))]
                                 [l
                                  (unless (and (= (cadr l) 0) (= (caddr l) 0))
                                    (raise-compile-error #f "internal: a program imports from ~a" imp))
@@ -734,7 +807,8 @@
 
 ;; (phase . bytes) for each linklet of m, in phase order.
 (define (module-linklet-list m)
-  (sort (map (lambda (p) (cons p (linklet-bytes (hash-ref (unit-linklets m) p #f)))) (hash-keys (unit-linklets m)))
+  (sort (map (lambda (p) (cons p (linklet-bytes (if (= p 0) (unit-program m) (hash-ref (unit-linklets m) p #f)))))
+             (hash-keys (unit-linklets m)))
         (lambda (a b) (< (car a) (car b)))))
 
 ;; ==== module bodies ====
@@ -1372,7 +1446,7 @@
 ;; The syntax library's contract (spec 2.3), its functions and its tag, as
 ;; (symbol . meaning), sorted by name for deterministic keys.
 (define (require-syntax! source phase)
-  (unless current-syntax-infos
+  (unless (library-infos lowering-library)
     (raise-compile-error source "the syntax library cannot require itself"))
   (sort (filter (lambda (p) (not (internal-name? (car p))))
                 (filter (lambda (x) x)
@@ -1380,7 +1454,7 @@
                                (cond [(func-info? info) (cons (func-info-name info) (list 'func info))]
                                      [(tag-info? info) (cons (tag-info-name info) (list 'tag info))]
                                      [else #f]))
-                             (hash-values current-syntax-infos))))
+                             (hash-values (library-infos target-library)))))
         (lambda (a b) (symbol<? (car a) (car b)))))
 
 (define (module-path-of f spec)
@@ -1577,7 +1651,7 @@
                        (append (lower-forms (take out (- (length out) 1)) (+ phase 1))
                                (list (list 'expr (lower-expr value (+ phase 1)))))))]
            [init (if adapter
-                     (list 'call (syntax-info 'make-transformer)
+                     (list 'call (library-info lowering-library 'make-transformer)
                            (list (list 'ref-func (cadr adapter)) (list 'quote #f)))
                      (cadr (last unit)))]
            [global (global-info name eqref #t #f #f)]
@@ -1592,7 +1666,7 @@
 ;; The func form of transformer code named name, of the syntax library's
 ;; type for it, that calls function info on the syntax.
 (define (transformer-adapter name info)
-  (let ([code-type (ref-heap (car (func-info-params (syntax-info 'make-transformer))))]
+  (let ([code-type (ref-heap (car (func-info-params (library-info lowering-library 'make-transformer))))]
         [env (fresh-key!)] [s (fresh-key!)])
     (list 'func (func-info name (list eqref eqref) (list eqref) #f #f code-type)
           (list (cons env eqref) (cons s eqref))
@@ -1876,7 +1950,7 @@
   (unless syntax-lib-scope (set! syntax-lib-scope (new-scope!)))
   (or (hash-ref syntax-lib-ids name #f)
       (let ([id (make-stx name (list syntax-lib-scope) #f '())])
-        (bind-raw! name (list syntax-lib-scope) 'all (list 'func (syntax-info name)))
+        (bind-raw! name (list syntax-lib-scope) 'all (list 'func (library-info target-library name)))
         (hash-set! syntax-lib-ids name id)
         id)))
 
@@ -2435,7 +2509,7 @@
   (let ([m (and (id? id) (meaning-of id phase))])
     (unless (and m (eq? (car m) 'func)) (not-expanded id))
     (check-not-removed (cadr m) id)
-    (cadr m)))
+    (in-lowering-library (cadr m) id)))
 
 ;; ---- function values (spec 5.2) ----
 
@@ -2468,10 +2542,10 @@
 
 ;; ---- inline functions (spec 5.2) ----
 
-;; An inline function's info -> (params results body returns?): its
-;; parameters as (key . type), its result types, its lowered body, and
-;; whether the body has a return.
-(define inline-bodies (make-hasheq))
+;; The library code is lowered against keeps its inline functions' bodies
+;; (library-inlines): info -> (params results body returns?), their
+;; parameters as (key . type), their result types, their lowered bodies,
+;; and whether each has a return.
 
 ;; Check that the lowered body of inline function info, named by id, does
 ;; not depend on which module it is compiled in, and keep it.
@@ -2506,7 +2580,7 @@
         [(throw-ref) (check (cadr e))]
         [(try) (for-each (lambda (c) (check (cadddr c))) (cadr e)) (check (caddr e))]
         [else (raise-compile-error id "internal: lowered form ~a" (car e))]))
-    (hash-set! inline-bodies info
+    (hash-set! (library-inlines lowering-library) info
                (list params (func-info-results info) body returns?
                      (filter (lambda (p) (assigns? body (car p))) params)))))
 
@@ -2525,7 +2599,7 @@
 ;; original's, shifted alike.
 (define (inline-call info args)
   (let* ([origin (hash-ref shift-origins info #f)]
-         [b (hash-ref inline-bodies (if origin (car origin) info) #f)])
+         [b (hash-ref (library-inlines lowering-library) (if origin (car origin) info) #f)])
     (and b (= (length args) (length (car b)))
          (let* ([keys (make-hasheqv)] [labels (make-hasheqv)]
                 [ret (and (cadddr b) (fresh-key!))]
@@ -2598,7 +2672,7 @@
 (define (lowered-tag-info id phase)
   (let ([info (tag-info-of id phase)])
     (check-not-removed info id)
-    info))
+    (in-lowering-library info id)))
 
 ;; While lowering a module's phase-0 code: the infos of its definitions
 ;; that #%linklet removed, which its code must not use.
@@ -2639,7 +2713,7 @@
            (let ([m (meaning-of s phase)])
              (case (and m (car m))
                [(local) (list 'lref (cadr m))]
-               [(global) (check-not-removed (cadr m) s) (list 'gref (cadr m))]
+               [(global) (check-not-removed (cadr m) s) (list 'gref (in-lowering-library (cadr m) s))]
                ;; A function's name as an expression is its value (5.2).
                [(func)
                 (let ([g (function-value (cadr m))])
@@ -2679,7 +2753,8 @@
           (let ([m (meaning-of (cadr parts) phase)])
             (case (and m (car m))
               [(local) (list 'lset (cadr m) (lo (caddr parts)))]
-              [(global) (check-not-removed (cadr m) (cadr parts)) (list 'gset (cadr m) (lo (caddr parts)))]
+              [(global) (check-not-removed (cadr m) (cadr parts))
+                        (list 'gset (in-lowering-library (cadr m) (cadr parts)) (lo (caddr parts)))]
               [else (not-expanded s)]))]
          [(let)
           (list 'let
