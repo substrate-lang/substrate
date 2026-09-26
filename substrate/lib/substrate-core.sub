@@ -68,7 +68,8 @@
          list->string string string->bytes/utf-8 bytes->string/utf-8
          string-utf-8-length string-utf-8-byte string-ref/utf-8 substring/utf-8
          symbol? symbol->string string->symbol symbol<? keyword? keyword->string string->keyword
-         ;; vectors and byte strings
+         ;; boxes, vectors and byte strings
+         box box? unbox set-box!
          vector? vector make-vector vector-length vector-ref vector-set! vector->list
          list->vector vector-fill! vector-copy
          bytes? bytes make-bytes bytes-length bytes-ref bytes-set! subbytes bytes-copy
@@ -418,6 +419,8 @@
         (out-datum p (struct.get struct-type name (ref.cast (ref struct-type) (struct.get structure type (ref.cast (ref structure) v)))) 0)
         (return (out-byte p 62))))
   (if (ref.test (ref hashtable) v) (return (out-table p (ref.cast (ref hashtable) v) display)))
+  (if (ref.test (ref box) v)
+      (begin (out-string p '"#&" 0) (return (out-datum p (struct.get box value (ref.cast (ref box) v)) display))))
   (if (ref.test (ref port) v) (return (out-string p '"#<port>" 0)))
   (if (k:syntax? v)
       (begin
@@ -1525,13 +1528,14 @@
   (func (binding-inits [bs eqref]) -> eqref
     (if (k:null? bs) '() (k:cons (k:cadr (k:syntax->list (k:car bs))) (binding-inits (k:cdr bs)))))
 
-  ;; (let ([x e] ...) body ...), or (let name ([x e] ...) body ...), a loop.
+  ;; (let ([x e] ...) body ...), or (let name ([x e] ...) body ...), a
+  ;; loop, whose lambda is located at the let.
   (func (substrate-let [stx eqref]) -> eqref
     (let ([parts (k:syntax->list stx)])
       (if (k:identifier? (k:cadr parts))
-          (let ([bs (k:syntax->list (k:caddr parts))])
-            (return #`(letrec ([#,(k:cadr parts) (substrate-lambda (#,@(binding-names bs)) #,@(k:cdddr parts))])
-                        (app #,(k:cadr parts) #,@(binding-inits bs))))))
+          (let* ([bs (k:syntax->list (k:caddr parts))]
+                 [f (k:datum->syntax '#f (k:syntax-e #`(substrate-lambda (#,@(binding-names bs)) #,@(k:cdddr parts))) stx)])
+            (return #`(letrec ([#,(k:cadr parts) #,f]) (app #,(k:cadr parts) #,@(binding-inits bs))))))
       #`(let #,@(k:cdr parts))))
 
   (func (false-bindings [xs eqref]) -> eqref
@@ -2000,7 +2004,7 @@
           (return (if (i32.and (i32.eqz (ref.is_null b)) (boxed? b)) #`(struct.get box value #,x) x))))
     (let ([l (k:syntax->list x)])
       (if (i32.or (ref.is_null l) (k:null? l)) (return x))
-      (if (lambda? l) (return (convert-lambda l env '#f)))
+      (if (lambda? l) (return (convert-lambda x l env '#f)))
       (let ([head (k:syntax-e (k:car l))])
         (if (ref.eq head 'let)
             (let ([bs (k:syntax->list (k:cadr l))])
@@ -2124,9 +2128,14 @@
     (let ([boxes (param-boxes ps)])
       (if (k:null? boxes) body (k:cons #`(let (#,@boxes) #,@body) '()))))
 
-  ;; A lambda, converted: its code becomes a module-level function, named
-  ;; after name (an identifier, or #f), and the lambda its closure.
-  (func (convert-lambda [l eqref] [env eqref] [name eqref]) -> eqref
+  ;; form, located where syntax x is: a function lifted from a lambda is
+  ;; located at the lambda.
+  (func (at [x eqref] [form eqref]) -> eqref (k:datum->syntax '#f (k:syntax-e form) x))
+
+  ;; A lambda x, whose parts are l, converted: its code becomes a
+  ;; module-level function, named after name (an identifier, or #f), and
+  ;; the lambda its closure.
+  (func (convert-lambda [x eqref] [l eqref] [env eqref] [name eqref]) -> eqref
     (let* ([params (lambda-params l)] [inner (k:append params env)])
       ;; The variables it captures, in the order they appear.
       (set! free '())
@@ -2138,16 +2147,16 @@
              [arrow (lambda-arrow l)])
         (if (k:null? captures)
             (begin
-              (set! lifted (k:cons #`(func #,head #,@arrow (type code) #,@body) lifted))
+              (set! lifted (k:cons (at x #`(func #,head #,@arrow (type code) #,@body)) lifted))
               #`(struct.new closure (ref.func #,code)))
             (let ([t (fresh-name 'closure)] [fields (field-names captures 0)])
               (set! lifted
                     (k:cons #`(type #,t (sub final closure (struct (field code (ref code)) #,@(field-decls fields captures))))
                             lifted))
               (set! lifted
-                    (k:cons #`(func #,head #,@arrow (type code)
-                                (let ([env (ref.cast (ref #,t) self)])
-                                  (let (#,@(env-bindings captures fields t)) #,@body)))
+                    (k:cons (at x #`(func #,head #,@arrow (type code)
+                                     (let ([env (ref.cast (ref #,t) self)])
+                                       (let (#,@(env-bindings captures fields t)) #,@body))))
                             lifted))
               #`(struct.new #,t (ref.func #,code) #,@captures))))))
 
@@ -2156,14 +2165,15 @@
   ;; their field types (above).
   (func (lift-function [b eqref])
     (let* ([f (function-of b)]
-           [l (k:syntax->list (struct.get local-function lambda f))]
+           [x (struct.get local-function lambda f)]
+           [l (k:syntax->list x)]
            [params (lambda-params l)]
            [inner (k:append params (struct.get local-function env f))]
            [body (boxing-params params (convert-list (lambda-body l) inner))])
       (set! lifted
-            (k:cons #`(func (#,(struct.get local-function code f) #,@(k:syntax->list (k:cadr l))
-                             #,@(capture-params (struct.get local-function captures f)))
-                        #,@(lambda-arrow l) #,@body)
+            (k:cons (at x #`(func (#,(struct.get local-function code f) #,@(k:syntax->list (k:cadr l))
+                                  #,@(capture-params (struct.get local-function captures f)))
+                             #,@(lambda-arrow l) #,@body))
                     lifted))))
 
   (func (capture-params [xs eqref]) -> eqref
@@ -2174,7 +2184,7 @@
     (let ([l (k:syntax->list e)])
       (if (i32.eqz (ref.is_null l))
           (if (i32.eqz (k:null? l))
-              (if (lambda? l) (return (convert-lambda l '() name)))))
+              (if (lambda? l) (return (convert-lambda e l '() name)))))
       (convert-expr e '())))
 
   ;; Where a func form's body starts: after its head, its and
@@ -2291,11 +2301,15 @@
                   0)))
   0)
 
-;; equal?: eqv?, or pairs, strings, vectors or byte strings with equal
-;; contents.
+;; equal?: eqv?, or pairs, strings, vectors, byte strings or boxes with
+;; equal contents.
 (func (equal [a eqref] [b eqref]) -> i32
   (if (eqv a b) (return 1))
   (if (k:symbol? a) (return 0))
+  (if (ref.test (ref box) a)
+      (return (if (ref.test (ref box) b)
+                  (equal (struct.get box value (ref.cast (ref box) a)) (struct.get box value (ref.cast (ref box) b)))
+                  0)))
   (if (k:pair? a)
       (return (if (k:pair? b)
                   (if (equal (k:car a) (k:car b)) (equal (k:cdr a) (k:cdr b)) 0)
@@ -2825,6 +2839,17 @@
   (substrate-case-lambda
     [(s start end) (substring* s start end '"substring/utf-8")]
     [(s start) (substring* s start '#f '"substring/utf-8")]))
+
+;; ---- boxes ----
+
+(func (not-a-box [b eqref] [who eqref]) -> (ref box) (drop (wrong-type who '"a box" b)) (unreachable))
+(func (box-arg [b eqref] [who eqref]) #:inline -> (ref box)
+  (if (ref.test (ref box) b) (ref.cast (ref box) b) (not-a-box b who)))
+
+(substrate-define (box v) (struct.new box v))
+(substrate-define (box? x) (bool (ref.test (ref box) x)))
+(substrate-define (unbox b) (struct.get box value (box-arg b '"unbox")))
+(substrate-define (set-box! b v) (struct.set box value (box-arg b '"set-box!") v) '#f)
 
 ;; ---- vectors ----
 
