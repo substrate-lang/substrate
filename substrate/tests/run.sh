@@ -22,11 +22,11 @@ compiler="$root/bin/sub"
 builds="${OUT:-build}"
 host="$root/${HOST:-build/subhost}"
 
-# Build the syntax library once first, so library compile notices stay out
+# Build the kernel module once first, so its compile notices stay out
 # of test output.
 mkdir -p build
-"$compiler" syntax-library -o build/syntax.wasm > /dev/null
-wasm-tools validate build/syntax.wasm || { echo "FAIL syntax.wasm does not validate"; exit 1; }
+"$compiler" kernel -o build/kernel.wasm > /dev/null
+wasm-tools validate build/kernel.wasm || { echo "FAIL kernel.wasm does not validate"; exit 1; }
 
 pass=0
 fail=0
