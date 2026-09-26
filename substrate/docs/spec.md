@@ -152,7 +152,7 @@ at the phase where it appears, plus any it lists to bind unqualified
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(unsafe-car p)`, `(unsafe-cdr p)`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`), `(syntax-id s) -> i32` |
-| transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)`, `(transformer-env t)` |
+| transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)`, `(transformer? v) -> i32`, `(transformer-env t)` |
 | exceptions | the tag `exn`, whose exceptions carry one `eqref`; `(raise-syntax-error name message stx)` (throws a syntax error), `(syntax-error? v) -> i32`, `(syntax-error-message e)`, `(syntax-error-syntax e)` (the syntax it blames, or `#f`) |
 | queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)` |
 
@@ -883,8 +883,9 @@ reference is an error.
   introduction scope, are never made.
 - **Phases.** Bindings are recorded per phase, and a syntax object has one
   scope set. A module required at phase shift *s* ≠ 0 has its bindings
-  installed at their phase + *s*, with its module scope replaced by a copy
-  for that phase shift. So a module required at two phase shifts, which
+  installed at their phase + *s*, with each module scope in their scope
+  sets, its own or another module's that a macro's template gave a
+  definition, replaced by that module's copy for the phase shift + *s*. So a module required at two phase shifts, which
   has bindings from both at the same phase (a macro `m` shifted up, next to
   the phase-1 function behind `m`), keeps them apart. The syntax literals a
   linklet builds when instantiated at phase shift *t* are shifted the same
