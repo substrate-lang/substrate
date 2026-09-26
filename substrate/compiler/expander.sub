@@ -8,11 +8,11 @@
 ;; expanded, each begin-for-syntax is compiled into a linklet and run. A
 ;; macro's transformer is a value (spec 2.1).
 ;;
-;; The compiler runs in a store of its own, with the syntax library its
+;; The compiler runs in a store of its own, with the kernel module its
 ;; macros share. Each module compilation instantiates its compile-time
 ;; linklets in a namespace of that store (spec 3.2), and calls macros and
-;; compile-time functions directly. The expander answers the syntax
-;; library's queries through functions it registers (register-queries!).
+;; compile-time functions directly. The expander answers the kernel
+;; module's queries through functions it registers (register-queries!).
 (require-unqualified substrate "../lib/substrate.sub")
 (require stx "stx.sub"
          make-stx stx? stx-e stx-scopes stx-srcloc stx-props make-srcloc srcloc? srcloc-source
@@ -34,8 +34,8 @@
 (require num "numbers.sub" content-hash)
 (require host "host.sub" export-index call-getter scope-map-add scope-map-clear error-string)
 
-(provide report-trap set-syntax-library-root! compile-module-file module-linklet-list module-expanded-forms
-         syntax-library-bytes program-linklets register-queries!)
+(provide report-trap set-repository-root! compile-module-file module-linklet-list module-expanded-forms
+         target-kernel-bytes program-linklets register-queries!)
 
 (import %call-transformer "kernel" "%call-transformer" (eqref eqref -> eqref))
 (import %transformer? "kernel" "%transformer?" (eqref -> eqref))
@@ -99,8 +99,8 @@
   (if (and meaning (eq? (car meaning) 'type)) 'type 'value))
 
 ;; A compiled (or compiling) module. linklets: phase -> linklet, compiled
-;; against the host library, for compile time. program: its phase-0
-;; linklet compiled against the target library, for programs. requires:
+;; against the running kernel, for compile time. program: its phase-0
+;; linklet compiled against the target kernel, for programs. requires:
 ;; list of (module . shift). provides: list of (symbol . meaning). entries:
 ;; its module-level bindings, as (symbol scopes phase key). scope: its
 ;; module scope. name: what its instance names start with (spec 3.2).
@@ -138,86 +138,89 @@
 
 (define core-scope 0)
 
-;; ---- the syntax libraries ----
+;; ---- the kernel module ----
 ;;
-;; There are two, which are one except while a compiler builds a new one
-;; (spec 1.4): the host library, the one this compiler runs with, whose
-;; instance it shares with its macros, and the target library,
-;; lib/syntax.sub under the repository's root, which the programs it writes
-;; link to. Compile-time code is compiled against the host library, and
-;; programs against the target library. The compiler carries the host
-;; library's text; when lib/syntax.sub is that text, the two are one.
-;; Names are bound to the target library's definitions, and code compiled
-;; against the host library uses the host's of the same names. Both
-;; libraries' source locations name them lib/syntax.sub, whatever the root
-;; is: the compiler's bytes do not depend on where the repository is.
+;; compiler/kernel.sub under the repository's root: the kernel's data and
+;; the functions on it (spec 2), which the compiler carries into the
+;; programs it writes. There are two builds of it, which are one except
+;; while a compiler builds a new one whose kernel module changed (spec
+;; 1.4): the running kernel, the one this compiler runs with, whose
+;; instance it shares with its macros, and the target kernel,
+;; compiler/kernel.sub, which the programs it writes link to. Compile-time
+;; code is compiled against the running kernel, and programs against the
+;; target kernel. The compiler carries the running kernel's text; when
+;; compiler/kernel.sub is that text, the two are one. Names are bound to
+;; the target kernel's definitions, and code compiled against the running
+;; kernel uses its definitions of the same names. The source locations of
+;; both name them compiler/kernel.sub, whatever the root is: the
+;; compiler's bytes do not depend on where the repository is.
 
-(define library-name "compiler/kernel.sub")
-(define library-root #f)
-(define (set-syntax-library-root! root) (set! library-root root))
+(define kernel-path "compiler/kernel.sub")
+(define repository-root #f)
+(define (set-repository-root! root) (set! repository-root root))
 
-;; The host library's text: the target library of the compiler that
-;; compiled this one, lib/syntax.sub under the root that compiler was given,
-;; which it compiled for this compiler to run with.
+;; The running kernel's text: the target kernel of the compiler that
+;; compiled this one, compiler/kernel.sub under the root that compiler was
+;; given, which it compiled for this compiler to run with.
 (begin-for-syntax (require-unqualified substrate "../lib/substrate.sub"))
-(define-syntax (host-library-source stx)
+(define-syntax (running-kernel-source stx)
   (datum->syntax stx (file->string (string-append (vector-ref (current-command-line-arguments) 0) "/compiler/kernel.sub"))
                  stx))
-(define host-library-text (host-library-source))
+(define running-kernel-text (running-kernel-source))
 
-;; A syntax library, compiled: its bytes; its definitions (func-, global-
-;; and tag-infos) by name; its string and table types, which quoted data
-;; is read with (spec 3.5); and the lowered bodies of the inline functions
-;; that code compiled against it inlines, its own and the modules' compiled
-;; against it.
-(struct library ([bytes #:mutable] [infos #:mutable] [string-type #:mutable] [table-type #:mutable] inlines))
+;; A build of the kernel module: its bytes; its definitions (func-,
+;; global- and tag-infos) by name; its string and table types, which
+;; quoted data is read with (spec 3.5); and the lowered bodies of the
+;; inline functions that code compiled against it inlines, its own and
+;; those of the modules compiled against it.
+(struct kernel ([bytes #:mutable] [infos #:mutable] [string-type #:mutable] [table-type #:mutable] inlines))
 
-(define host-library #f)
-(define target-library #f)
+(define running-kernel #f)
+(define target-kernel #f)
 
-;; The library that code is lowered and compiled against: the host
-;; library, but for a program's phase-0 linklets (finish-module!), and
-;; while a library is compiled, that library, whose infos are #f.
-(define lowering-library #f)
+;; The kernel that code is lowered and compiled against: the running
+;; kernel, but for a program's phase-0 linklets (finish-module!), and
+;; while a kernel is compiled, that kernel, whose infos are #f.
+(define lowering-kernel #f)
 
-(define (set-lowering-library! lib)
-  (set! lowering-library lib)
-  (set-current-syntax-infos! (library-infos lib))
-  (set-syntax-types! (library-string-type lib) (library-table-type lib)))
+(define (set-lowering-kernel! k)
+  (set! lowering-kernel k)
+  (set-current-syntax-infos! (kernel-infos k))
+  (set-syntax-types! (kernel-string-type k) (kernel-table-type k)))
 
-;; (thunk), with code lowered and compiled against lib.
-(define (with-library lib thunk)
-  (let ([saved lowering-library])
-    (set-lowering-library! lib)
+;; (thunk), with code lowered and compiled against kernel k.
+(define (with-kernel k thunk)
+  (let ([saved lowering-kernel])
+    (set-lowering-kernel! k)
     (let ([r (thunk)])
-      (when saved (set-lowering-library! saved))
+      (when saved (set-lowering-kernel! saved))
       r)))
 
-(define (ensure-libraries!)
-  (unless target-library
-    (let ([text (file->string (string-append library-root "/" library-name))])
-      (set! target-library (compile-library text))
-      (set! host-library (if (string=? text host-library-text) target-library (compile-library host-library-text)))
-      (set-lowering-library! host-library))))
+(define (ensure-kernels!)
+  (unless target-kernel
+    (let ([text (file->string (string-append repository-root "/" kernel-path))])
+      (set! target-kernel (compile-kernel text))
+      (set! running-kernel (if (string=? text running-kernel-text) target-kernel (compile-kernel running-kernel-text)))
+      (set-lowering-kernel! running-kernel))))
 
-;; The syntax library whose source is text, compiled.
-(define (compile-library text)
-  (let* ([lib (library #f #f #f #f (make-hasheq))]
-         [m (unit library-name library-name "kernel" 'compiling (make-hasheqv) '() '() '() #f #f #f)]
+;; The kernel module whose source is text, compiled.
+(define (compile-kernel text)
+  (let* ([k (kernel #f #f #f #f (make-hasheq))]
+         [m (unit kernel-path kernel-path "kernel" 'compiling (make-hasheqv) '() '() '() #f #f #f)]
          [c (comp m #f 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())])
     (with-comp c
       (lambda ()
-        (with-library lib
+        (with-kernel k
           (lambda ()
-            (let* ([forms (lower-forms (expand-module-body (read-string-all text (string->symbol library-name))) 0)]
+            (let* ([forms (lower-forms (expand-module-body (read-string-all text (string->symbol kernel-path))) 0)]
                    [forms (append (storage-forms 0) forms)]
                    [type (lambda (name)
                            (cadr (findf (lambda (f) (and (eq? (car f) 'type) (eq? (type-info-name (cadr f)) name)))
                                         forms)))])
-              (set-library-string-type! lib (type '%string))
-              (set-library-table-type! lib (type '%table))
+              (set-kernel-string-type! k (type '%string))
+              (set-kernel-table-type! k (type '%table))
               (set-syntax-types! (type '%string) (type '%table))
-              (set-current-source! (string->symbol library-name))
+              (set-current-source! (string->symbol kernel-path))
               (let ([compiled (compile-module forms "kernel")] [table (make-hasheq)])
                 (for-each (lambda (f)
                             (case (car f)
@@ -226,31 +229,31 @@
                               [(tag) (hash-set! table (tag-info-name (cadr f)) (cadr f))]
                               [else #f]))
                           forms)
-                (set-library-bytes! lib (car compiled))
-                (set-library-infos! lib table)))))))
-    lib))
+                (set-kernel-bytes! k (car compiled))
+                (set-kernel-infos! k table)))))))
+    k))
 
-(define (syntax-library-bytes) (ensure-libraries!) (library-bytes target-library))
+(define (target-kernel-bytes) (ensure-kernels!) (kernel-bytes target-kernel))
 
-;; The definition of name in library lib.
-(define (library-info lib name)
-  (or (hash-ref (library-infos lib) name #f)
-      (raise-compile-error #f "internal: the syntax library has no ~a" name)))
+;; The definition of name in kernel k.
+(define (kernel-info k name)
+  (or (hash-ref (kernel-infos k) name #f)
+      (raise-compile-error #f "internal: the kernel module has no ~a" name)))
 
-;; info, a definition that code names, as the library the code is lowered
-;; against has it: if info is the target library's and that library is
-;; the host, the host's definition of the same name. id is where it is
-;; named.
-(define (in-lowering-library info id)
-  (if (or (eq? lowering-library target-library) (not (library-infos lowering-library)))
+;; info, a definition that code names, as the kernel the code is lowered
+;; against has it: if info is the target kernel's, and code is lowered
+;; against the running kernel, the running kernel's definition of the same
+;; name. id is where it is named.
+(define (in-lowering-kernel info id)
+  (if (or (eq? lowering-kernel target-kernel) (not (kernel-infos lowering-kernel)))
       info
       (let ([name (cond [(func-info? info) (func-info-name info)]
                         [(global-info? info) (global-info-name info)]
                         [(tag-info? info) (tag-info-name info)]
                         [else #f])])
-        (if (and name (eq? (hash-ref (library-infos target-library) name #f) info))
-            (or (hash-ref (library-infos lowering-library) name #f)
-                (raise-compile-error id "~a is not in the syntax library this compiler runs with: compile-time code can use it once the compiler that compiles it has it (spec 1.4)"
+        (if (and name (eq? (hash-ref (kernel-infos target-kernel) name #f) info))
+            (or (hash-ref (kernel-infos lowering-kernel) name #f)
+                (raise-compile-error id "~a is not in the kernel this compiler runs with: compile-time code can use it once the compiler that compiles it has it (spec 1.4)"
                                      name))
             info))))
 
@@ -259,7 +262,7 @@
 (define namespace-counter 0)
 
 (define (new-cstore)
-  (ensure-libraries!)
+  (ensure-kernels!)
   (set! namespace-counter (+ namespace-counter 1))
   (cstore (format "c~a" namespace-counter) (make-hash) (make-hasheq) 0))
 
@@ -286,7 +289,7 @@
 ;; What linklet p's imports link to in st when it is instantiated at phase
 ;; shift t: an alist from each module name its code imports from to the
 ;; instance that is. A module linklet's name, relative to shift 0, moves
-;; by t; a compile-time linklet is in st; the syntax library and the host
+;; by t; a compile-time linklet is in st; the kernel module and the host
 ;; keep their names.
 (define (import-map st imports t)
   (foldl (lambda (imp acc)
@@ -297,7 +300,7 @@
          '() imports))
 
 ;; Make sure the instance an import names exists in st. imp is relative to
-;; a module instantiated at phase shift `shift`. The syntax library is the
+;; a module instantiated at phase shift `shift`. The kernel module is the
 ;; store's own.
 (define (ensure-import! st imp shift)
   (let ([r (linklet-ref imp)])
@@ -313,7 +316,7 @@
         (for-each (lambda (imp) (ensure-import! st imp t)) (linklet-imports p))
         ;; The syntax literals the linklet builds are shifted too (spec 6.1):
         ;; each module scope in them, module X's copy for phase shift s,
-        ;; becomes X's copy for s + t. The syntax library maps them while the
+        ;; becomes X's copy for s + t. The kernel module maps them while the
         ;; linklet starts.
         (let ([shifted? (and (not (= t 0)) (pair? (linklet-scopes p)))])
           (when shifted?
@@ -670,7 +673,7 @@
       [known (raise-compile-error #f "cyclic require: ~a requires itself" source)]
       [else
        (unless (file-exists? source) (raise-compile-error #f "no module file ~a" source))
-       (ensure-libraries!)
+       (ensure-kernels!)
        (let* ([text (file->string source)]
               [m (unit path source (provisional-name path) 'compiling (make-hasheqv) '() '() '() #f #f #f)]
               [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())])
@@ -732,13 +735,13 @@
                     (hash-set! (unit-linklets m) p
                                (linklet (car compiled) (cadr compiled) (caddr compiled) (literal-module-scopes forms)))))
                 phases))
-    ;; Programs link to the target library: when it is not the host,
+    ;; Programs link to the target kernel: when it is not the host,
     ;; the phase-0 code is lowered and compiled again, against it.
     (set-unit-program!
      m
-     (if (eq? host-library target-library)
+     (if (eq? running-kernel target-kernel)
          (hash-ref (unit-linklets m) 0)
-         (with-library target-library
+         (with-kernel target-kernel
            (lambda ()
              (let* ([forms (append (storage-forms 0) (lower-forms (unit-expanded m) 0))]
                     [compiled (compile-module forms (linklet-name m 0 0))])
@@ -782,7 +785,7 @@
 
 ;; The linklets m's program instantiates at run time, each after those it
 ;; imports from, as (instance-name . bytes): phase-0 linklets at phase
-;; shift 0, and the syntax library if they use it. m's own comes last.
+;; shift 0, and the kernel module if they use it. m's own comes last.
 (define (program-linklets m)
   (let ([seen (make-hash)] [out '()])
     (let visit ([m m])
@@ -795,7 +798,7 @@
                           (cond [(string=? imp "kernel")
                                  (unless (hash-has-key? seen imp)
                                    (hash-set! seen imp #t)
-                                   (set! out (cons (cons imp (library-bytes target-library)) out)))]
+                                   (set! out (cons (cons imp (kernel-bytes target-kernel)) out)))]
                                 [l
                                  (unless (and (= (cadr l) 0) (= (caddr l) 0))
                                    (raise-compile-error #f "internal: a program imports from ~a" imp))
@@ -1395,8 +1398,8 @@
 
 ;; ---- require, provide, storage ----
 
-;; (require name source item ...), where source is "path" or syntax (the
-;; syntax library). Everything the source provides is bound as name:thing.
+;; (require name source item ...), where source is "path" or kernel (the
+;; kernel module). Everything the source provides is bound as name:thing.
 ;; Each item also binds one thing unqualified: x as itself, or [new old] as
 ;; new. A require at phase p imports at phase p; inside begin-for-syntax it
 ;; imports for compile-time code (spec 3.1). (require-unqualified name
@@ -1406,16 +1409,16 @@
 (define (require! f phase all?)
   (let ([parts (stx-list-of f 'require)])
     (unless (and (>= (length parts) 3) (id? (cadr parts))
-                 (or (string? (stx-e (caddr parts))) (core-name? (caddr parts) 'syntax) (core-name? (caddr parts) 'kernel))
+                 (or (string? (stx-e (caddr parts))) (core-name? (caddr parts) 'kernel))
                  (or (not all?) (= (length parts) 3)))
       (raise-compile-error f (if all?
-                                 "expected (require-unqualified name \"path\") or (require-unqualified name syntax)"
-                                 "expected (require name \"path\" item ...) or (require name syntax item ...)")))
+                                 "expected (require-unqualified name \"path\") or (require-unqualified name kernel)"
+                                 "expected (require name \"path\" item ...) or (require name kernel item ...)")))
     (let* ([name (cadr parts)]
            [source (caddr parts)]
            [provided (if (string? (stx-e source))
                          (require-module! f name source phase)
-                         (require-syntax! source phase))])
+                         (require-kernel! source phase))])
       (for-each (lambda (p) (bind-import! (qualified name (car p)) phase (cdr p))) provided)
       (when all?
         (for-each (lambda (p)
@@ -1443,18 +1446,18 @@
   (check-unbound! id phase meaning)
   (bind-module-level! (stx-e id) (stx-scopes id) phase meaning))
 
-;; The syntax library's contract (spec 2.3), its functions and its tag, as
+;; The kernel module's contract (spec 2.3), its functions and its tag, as
 ;; (symbol . meaning), sorted by name for deterministic keys.
-(define (require-syntax! source phase)
-  (unless (library-infos lowering-library)
-    (raise-compile-error source "the syntax library cannot require itself"))
+(define (require-kernel! source phase)
+  (unless (kernel-infos lowering-kernel)
+    (raise-compile-error source "the kernel module cannot require itself"))
   (sort (filter (lambda (p) (not (internal-name? (car p))))
                 (filter (lambda (x) x)
                         (map (lambda (info)
                                (cond [(func-info? info) (cons (func-info-name info) (list 'func info))]
                                      [(tag-info? info) (cons (tag-info-name info) (list 'tag info))]
                                      [else #f]))
-                             (hash-values (library-infos target-library)))))
+                             (hash-values (kernel-infos target-kernel)))))
         (lambda (a b) (symbol<? (car a) (car b)))))
 
 (define (module-path-of f spec)
@@ -1651,7 +1654,7 @@
                        (append (lower-forms (take out (- (length out) 1)) (+ phase 1))
                                (list (list 'expr (lower-expr value (+ phase 1)))))))]
            [init (if adapter
-                     (list 'call (library-info lowering-library 'make-transformer)
+                     (list 'call (kernel-info lowering-kernel 'make-transformer)
                            (list (list 'ref-func (cadr adapter)) (list 'quote #f)))
                      (cadr (last unit)))]
            [global (global-info name eqref #t #f #f)]
@@ -1663,10 +1666,10 @@
       (hash-set! macro-modules getter (comp-module current))
       (bind-definition! (cadr parts) phase (list 'compile-time-value getter)))))
 
-;; The func form of transformer code named name, of the syntax library's
+;; The func form of transformer code named name, of the kernel module's
 ;; type for it, that calls function info on the syntax.
 (define (transformer-adapter name info)
-  (let ([code-type (ref-heap (car (func-info-params (library-info lowering-library 'make-transformer))))]
+  (let ([code-type (ref-heap (car (func-info-params (kernel-info lowering-kernel 'make-transformer))))]
         [env (fresh-key!)] [s (fresh-key!)])
     (list 'func (func-info name (list eqref eqref) (list eqref) #f #f code-type)
           (list (cons env eqref) (cons s eqref))
@@ -1832,7 +1835,7 @@
 
 ;; ---- the queries ----
 ;;
-;; The syntax library's expander queries (spec 2.3), answered for the
+;; The kernel module's expander queries (spec 2.3), answered for the
 ;; running macro.
 
 (define (query-local-value id)
@@ -1910,7 +1913,7 @@
 (import %set-queries "kernel" "%set-queries"
         ((ref query1) (ref query2) (ref query1) (ref query1) (ref query1) (ref query1) ->))
 
-;; Answer the syntax library's queries from here from now on.
+;; Answer the kernel module's queries from here from now on.
 (func (register-queries!) -> eqref
   (%set-queries (ref.func q-local-value) (ref.func q-free-identifier=?) (ref.func q-binding-kind)
                 (ref.func q-local-expand) (ref.func q-lift) (ref.func q-signature))
@@ -1941,17 +1944,17 @@
 ;; Module-level form f with its head replaced by the core identifier.
 (define (core-headed f name) (out-list f (cons (core-id name (car (stx-e f))) (cdr (stx-e f)))))
 
-;; An identifier for one of the syntax library's functions, for the calls
+;; An identifier for one of the kernel module's functions, for the calls
 ;; quasiquote and quasisyntax expand into. Its private scope is on no
 ;; module's code, so only fully expanded code can refer to it.
-(define syntax-lib-scope #f)
-(define syntax-lib-ids (make-hasheq))
-(define (syntax-lib-id name)
-  (unless syntax-lib-scope (set! syntax-lib-scope (new-scope!)))
-  (or (hash-ref syntax-lib-ids name #f)
-      (let ([id (make-stx name (list syntax-lib-scope) #f '())])
-        (bind-raw! name (list syntax-lib-scope) 'all (list 'func (library-info target-library name)))
-        (hash-set! syntax-lib-ids name id)
+(define kernel-id-scope #f)
+(define kernel-ids (make-hasheq))
+(define (kernel-id name)
+  (unless kernel-id-scope (set! kernel-id-scope (new-scope!)))
+  (or (hash-ref kernel-ids name #f)
+      (let ([id (make-stx name (list kernel-id-scope) #f '())])
+        (bind-raw! name (list kernel-id-scope) 'all (list 'func (kernel-info target-kernel name)))
+        (hash-set! kernel-ids name id)
         id)))
 
 ;; ==== expressions ====
@@ -2033,7 +2036,7 @@
           [(eq? e #t) '(const i32 1)]
           [(eq? e #f) '(const i32 0)]
           [(string? e)
-           (raise-compile-error s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for a syntax-library string")]
+           (raise-compile-error s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for a kernel string")]
           [else (raise-compile-error s "~s is not a literal" (stx->datum s))])))
 
 ;; The core #%app: (#%app f arg ...) calls the function f.
@@ -2379,7 +2382,7 @@
 (define (bound-local id phase) (with-local-binding id (bind-local! id phase)))
 
 ;; id, recording that it binds or refers to the local variable with key.
-;; The property's key is private to the syntax library (appendix A).
+;; The property's key is private to the kernel module (appendix A).
 (define local-binding-sym '%local-binding)
 (define (with-local-binding id key)
   (make-stx (stx-e id) (stx-scopes id) (stx-srcloc id)
@@ -2412,7 +2415,7 @@
 ;; ==== quasiquote / quasisyntax ====
 ;;
 ;; One walker for both. The result is fully expanded code that calls the
-;; syntax library. For quasisyntax, unchanged subtemplates become syntax
+;; kernel module. For quasisyntax, unchanged subtemplates become syntax
 ;; constants and changed lists are rewrapped with the template's own
 ;; scopes and srcloc (syntax-rewrap).
 
@@ -2430,7 +2433,7 @@
                                       [(stx? e) (changes? e depth)]
                                       [else (or (changes? (car e) depth) (loop (cdr e)))]))]
                              [else #f]))]
-           [call (lambda (name . args) (apply out where app-sym (syntax-lib-id name) args))]
+           [call (lambda (name . args) (apply out where app-sym (kernel-id name) args))]
            [constant (lambda (x)
                        (if syntax?
                            (out x 'quote-syntax (prune-local-scopes x))
@@ -2509,7 +2512,7 @@
   (let ([m (and (id? id) (meaning-of id phase))])
     (unless (and m (eq? (car m) 'func)) (not-expanded id))
     (check-not-removed (cadr m) id)
-    (in-lowering-library (cadr m) id)))
+    (in-lowering-kernel (cadr m) id)))
 
 ;; ---- function values (spec 5.2) ----
 
@@ -2542,8 +2545,8 @@
 
 ;; ---- inline functions (spec 5.2) ----
 
-;; The library code is lowered against keeps its inline functions' bodies
-;; (library-inlines): info -> (params results body returns?), their
+;; The kernel code is lowered against keeps its inline functions' bodies
+;; (kernel-inlines): info -> (params results body returns?), their
 ;; parameters as (key . type), their result types, their lowered bodies,
 ;; and whether each has a return.
 
@@ -2580,7 +2583,7 @@
         [(throw-ref) (check (cadr e))]
         [(try) (for-each (lambda (c) (check (cadddr c))) (cadr e)) (check (caddr e))]
         [else (raise-compile-error id "internal: lowered form ~a" (car e))]))
-    (hash-set! (library-inlines lowering-library) info
+    (hash-set! (kernel-inlines lowering-kernel) info
                (list params (func-info-results info) body returns?
                      (filter (lambda (p) (assigns? body (car p))) params)))))
 
@@ -2599,7 +2602,7 @@
 ;; original's, shifted alike.
 (define (inline-call info args)
   (let* ([origin (hash-ref shift-origins info #f)]
-         [b (hash-ref (library-inlines lowering-library) (if origin (car origin) info) #f)])
+         [b (hash-ref (kernel-inlines lowering-kernel) (if origin (car origin) info) #f)])
     (and b (= (length args) (length (car b)))
          (let* ([keys (make-hasheqv)] [labels (make-hasheqv)]
                 [ret (and (cadddr b) (fresh-key!))]
@@ -2672,7 +2675,7 @@
 (define (lowered-tag-info id phase)
   (let ([info (tag-info-of id phase)])
     (check-not-removed info id)
-    (in-lowering-library info id)))
+    (in-lowering-kernel info id)))
 
 ;; While lowering a module's phase-0 code: the infos of its definitions
 ;; that #%linklet removed, which its code must not use.
@@ -2713,7 +2716,7 @@
            (let ([m (meaning-of s phase)])
              (case (and m (car m))
                [(local) (list 'lref (cadr m))]
-               [(global) (check-not-removed (cadr m) s) (list 'gref (in-lowering-library (cadr m) s))]
+               [(global) (check-not-removed (cadr m) s) (list 'gref (in-lowering-kernel (cadr m) s))]
                ;; A function's name as an expression is its value (5.2).
                [(func)
                 (let ([g (function-value (cadr m))])
@@ -2754,7 +2757,7 @@
             (case (and m (car m))
               [(local) (list 'lset (cadr m) (lo (caddr parts)))]
               [(global) (check-not-removed (cadr m) (cadr parts))
-                        (list 'gset (in-lowering-library (cadr m) (cadr parts)) (lo (caddr parts)))]
+                        (list 'gset (in-lowering-kernel (cadr m) (cadr parts)) (lo (caddr parts)))]
               [else (not-expanded s)]))]
          [(let)
           (list 'let

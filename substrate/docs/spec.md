@@ -9,6 +9,12 @@ it did not ask for. The language most code is written in, also called
 Substrate, is one such library (`lib/substrate.sub`), as `racket/base` is
 built over Racket's `#%kernel`.
 
+The kernel has three parts: its forms (section 5), which the compiler
+implements; the **kernel module** (section 2), the data every language
+builds on and the functions on it, which the compiler shares with its
+macros and carries into the programs that use them; and the host
+interface (section 4). Kernel code is code written in the kernel's forms.
+
 ## 1. Principles and architecture
 
 ### 1.1 Principles
@@ -24,19 +30,21 @@ built over Racket's `#%kernel`.
    requires the libraries it uses, at the phase that uses them, and each
    phase gets its own instances.
 4. **Syntax belongs to the expander.** Macros create and inspect syntax
-   only through the syntax library's functions (section 2). At compile time
-   they link to the running compiler's instance of that library, and are
-   compiled against it (1.4).
+   only through the kernel module's functions (section 2). At compile time
+   they link to the running compiler's instance of that module, and are
+   compiled against it (1.4). So adding a function to the kernel module is
+   adding to the kernel, as adding a form is: compile-time code can use it
+   once the compiler that runs that code has it.
 5. **The compiler is an ordinary program.** After bootstrap it requires the
-   syntax library at phase 0, as any program that transforms code would.
+   kernel module at phase 0, as any program that transforms code would.
 
 ### 1.2 Components
 
 | Component | What it is | Where |
 |---|---|---|
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime), `host/subhost.mjs` (JavaScript, over Node's V8) |
-| compiler | Reader, expander, kernel compiler, binary encoder: what only compiling needs. | `compiler/*.sub` (Substrate) |
-| syntax library | The data of every language built on the kernel, as wasm GC objects, syntax objects among them, and the functions of section 2. The compiler links to its own instance. | `lib/syntax.sub` (kernel code) |
+| compiler | Reader, expander, kernel compiler, binary encoder. | `compiler/*.sub` (Substrate) |
+| kernel module | The data of every language built on the kernel, as wasm GC objects, syntax objects among them, and the functions of section 2. The compiler links to its own instance, and carries the module into the programs that use its data. | `compiler/kernel.sub` (kernel code), with the compiler |
 | libraries | Ordinary modules, what programs in the languages built on the kernel use, such as printing for programs without GC. | `lib/*.sub` |
 | languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub`, written in Substrate on its core in kernel code, `lib/substrate-core.sub` |
 
@@ -44,34 +52,34 @@ built over Racket's `#%kernel`.
 
 | | While compiling | While a program runs |
 |---|---|---|
-| the syntax library | always instantiated in each compile-time store; macros link to it | instantiated only if the program's linklets import it |
-| GC | syntax data lives in the engine's GC heap | only if the program's code uses GC types or the syntax library |
+| the kernel module | always instantiated in each compile-time store; macros link to it | instantiated only if the program's linklets import it |
+| GC | syntax data lives in the engine's GC heap | only if the program's code uses GC types or the kernel module |
 | each module's memory and table | its own, if it defines them | its own, if it defines them |
 | the host | no memory of its own; reads and writes the caller's | same |
 
 A **store** is one wasm store with one linker. Each module is compiled
-with its own **compile-time store**, which holds the syntax library, the
+with its own **compile-time store**, which holds the kernel module, the
 linklets the module's compile-time code runs in, and the linklets of what it
 requires (3.2). A **run-time store** holds the linklets a program loads.
 
 The compile-time environment is garbage collected: syntax objects are GC
 objects. A compiled program is garbage collected only if its own code uses
-GC types or requires the syntax library.
+GC types or requires the kernel module.
 
 ### 1.4 Bootstrap
 
 The compiler is written in Substrate (`compiler/*.sub`), and requires the
-syntax library (`lib/syntax.sub`) and Substrate (`lib/substrate.sub`). It
+kernel module (`compiler/kernel.sub`) and Substrate (`lib/substrate.sub`). It
 is built by a build of itself, the **seed**, checked in (`seed/`). The
 compiler bin/sub runs, `build/sub`, is the compiler's source built by the
 seed, then by that build: the source compiled by itself, even when the
 seed is older than the source. The bootstrap reaches its **fixpoint** when
-`build/sub` builds itself into the same bytes, the syntax library's
+`build/sub` builds itself into the same bytes, the kernel module's
 included: the compiler reproduces itself exactly (`make bootstrap`). That
 needs compilation to be deterministic, which is why the host gives
 programs no clocks or randomness (section 4). Nor does a build depend on
-where the repository is: the syntax library's source locations (3.6) name
-it `lib/syntax.sub`, as other files are named by the paths the build
+where the repository is: the kernel module's source locations (3.6) name
+it `compiler/kernel.sub`, as other files are named by the paths the build
 gives, relative to the repository.
 
 For the compiler's source to use something the seed does not know, the
@@ -79,17 +87,17 @@ feature is added first, then the seed is replaced by the new build (`make
 seed`, which checks the fixpoint first). Earlier seeds stay in the
 repository's history.
 
-A compiler runs with a build of the syntax library, whose instance its
-macros share with it, and builds programs with `lib/syntax.sub`. The two
-are one library, except while a compiler builds a new one whose syntax
-library has changed. So the compiler carries the text of the library it
-runs with, the **host library**: `lib/syntax.sub` as it was when the
-compiler was compiled. It compiles compile-time code against the host
-library, and programs against `lib/syntax.sub`, the **target library**.
-When they differ, a module's phase-0 linklet, which both runs at compile
-time and goes into programs, is compiled for each. So a change to the
-syntax library, even to its representation, takes effect in one build.
-Compile-time code can call a function the host library does not have
+A compiler runs with a build of the kernel module, whose instance its
+macros share with it, and builds programs with `compiler/kernel.sub`. The
+two are one, except while a compiler builds a new one whose kernel module
+has changed. So the compiler carries the text of the **running kernel**,
+the build it runs with: `compiler/kernel.sub` as it was when the compiler
+was compiled. It compiles compile-time code against the running kernel,
+and programs against `compiler/kernel.sub`, the **target kernel**. When
+they differ, a module's phase-0 linklet, which both runs at compile time
+and goes into programs, is compiled for each. So a change to the kernel
+module, even to its representation, takes effect in one build.
+Compile-time code can call a function the running kernel does not have
 once the compiler that compiles it has it: after the seed is replaced.
 
 The first compiler was built by **stage0**, a compiler of the same
@@ -116,7 +124,7 @@ name that `define-syntax` binds to a transformer is a **macro** (6.3).
 
 ### 2.2 Values
 
-The syntax library represents data as **values** of wasm type `eqref`.
+The kernel module represents data as **values** of wasm type `eqref`.
 The contract promises this about them:
 
 - `#f` is the null reference, so `(ref.is_null v)` tests for it.
@@ -133,9 +141,9 @@ are references, wasm's own type checking keeps them apart from numbers.
 
 ### 2.3 Functions
 
-`(require name syntax)` binds these, and the tag `exn`, as `name:function`
+`(require name kernel)` binds these, and the tag `exn`, as `name:function`
 at the phase where it appears, plus any it lists to bind unqualified
-(3.1). They are imported from the instance `"syntax"`. Parameters are
+(3.1). They are imported from the instance `"kernel"`. Parameters are
 `eqref` unless marked with another type, such as `n:i32`.
 
 | Group | Functions |
@@ -190,7 +198,7 @@ at the phase where it appears, plus any it lists to bind unqualified
   name and the definition it imports are the same binding. Two identifiers
   bound in neither namespace are equal when their names are.
 - `exn` is the tag every language throws values with (5.3). A store has
-  one instance of the syntax library, and tags are identified by instance
+  one instance of the kernel module, and tags are identified by instance
   (5.2), so this one tag lets the compiler and all compile-time code,
   whatever module or phase it belongs to, catch one another's exceptions.
 - A **syntax error** is a value: a message and the syntax it blames. The
@@ -252,8 +260,8 @@ they trap.
   bound both as a type and as a value provides both. One name cannot be
   provided for two different bindings.
 - `(require name source item ...)` imports what another module provides.
-  `source` is `"path"` (relative to the requiring file) or `syntax` (the
-  syntax library, section 2).
+  `source` is `"path"` (relative to the requiring file) or `kernel` (the
+  kernel module, section 2).
   - Everything the source provides is bound **qualified**, as
     `name:thing`. Nothing is imported unqualified by default.
   - Each item also binds one thing unqualified: `x` binds `x`, and
@@ -313,12 +321,12 @@ they trap.
 - A program runs in a fresh run-time store holding exactly the linklets
   reached from its phase-0 linklet at phase shift 0. A module required
   only inside `begin-for-syntax` is never loaded at run time.
-- The other instance names are `syntax`, `host`, and the linklets of
+- The other instance names are `kernel`, `host`, and the linklets of
   compile-time code (`<module>@<phase>#<n>`).
 - **Namespaces**: the compiler registers a compilation's instances as
   `<ns>/<name>`, and maps the imports of each from linklets to
   `<ns>/<linklet>`, after the phase shift. Its other imports, such as
-  `syntax` and `host`, are the store's. These names mean something only to
+  `kernel` and `host`, are the store's. These names mean something only to
   the compiler: the host links each import to the instance the map
   names, or to the instance its module name names.
 
@@ -326,9 +334,9 @@ they trap.
 
 - **A module imports only what its code uses.** Nothing is bound or
   imported by default. Code that calls a required module's functions
-  imports from that module's linklet. Code that calls the syntax library, or
+  imports from that module's linklet. Code that calls the kernel module, or
   uses `quote`, `quasiquote`, `quote-syntax` or `quasisyntax`, imports from
-  `"syntax"`.
+  `"kernel"`.
 - **A module owns its memory and table, or takes them from a module it
   requires.** `(memory pages)` defines memory 0. `(memory from name)`
   imports the memory of the module required as `name` at the same phase, so a
@@ -370,7 +378,7 @@ Quoted fixnums and `#f` are the constant expressions `(ref.i31 n)` and
 `(ref.null eq)`, and `'()` and `#t` read immutable globals the syntax
 library defines for them, also a constant expression. The compiler
 serializes the linklet's other quoted data into one passive data segment,
-which the syntax library turns into a table of objects when the linklet
+which the kernel module turns into a table of objects when the linklet
 starts; code reads a quoted datum from the table. So compiled code does
 not grow with its literals, and each is built once per instance. As in
 Scheme, equal quoted data may share structure: whether two quoted data,
@@ -607,7 +615,7 @@ body, with the arguments bound to new locals in order and the result at
 the function's declared result types; a `return` in the body leaves only
 the body. A wasm engine cannot inline a call of another module's function,
 because modules are compiled apart and linked when they are instantiated,
-so this is how a library's small functions, such as the syntax library's
+so this is how a library's small functions, such as the kernel module's
 `car`, are inlined into the code that uses them. A call is compiled so
 only if the function's body has been compiled before it: a function's
 calls of itself, and calls before its definition in its own module, stay
@@ -661,7 +669,7 @@ wasm: two declarations of the same tag are two tags, and so are the tags
 of two instances of one module, such as its linklets at two phase shifts.
 A module that imports a tag gets that tag. So code that must catch the
 exceptions of code in other instances shares a tag with it, as all code
-at compile time can with the syntax library's `exn` (2.3). Exceptions
+at compile time can with the kernel module's `exn` (2.3). Exceptions
 need no GC: a freestanding program (3.4) can throw and catch them.
 
 ### 5.3 Expressions
@@ -692,7 +700,7 @@ id                                  ; local or global variable
 (try (clause ...) body ...)         ; clause: [catch tag (x ...) body ...]
                                     ;   [catch-ref tag (x ... e) body ...]
                                     ;   [catch-all body ...] [catch-all-ref (e) body ...]
-(quote d)  (quasiquote d)           ; syntax-library data (values)
+(quote d)  (quasiquote d)           ; kernel data (values)
 (quote-syntax d)  (quasisyntax d)   ; syntax objects
 ```
 
@@ -776,8 +784,8 @@ which would expand through it again.
 
 Under the core `#%datum`, unquoted literals are wasm numbers. `quote` turns
 a literal into a value.
-Values are syntax-library data, so a linklet that quotes imports from the
-syntax library, as it would for any library function it calls; at phase 0
+Values are kernel data, so a linklet that quotes imports from the
+kernel module, as it would for any module whose functions it calls; at phase 0
 that is visible in what the program imports, and `(freestanding)` rejects
 it (3.4).
 
@@ -972,7 +980,7 @@ clause ::= (catch id (id ...) expr ...) | (catch-ref id (id ...) expr ...)
   `freestanding`, `define-syntax`, `begin-for-syntax`)
   take effect during expansion and leave nothing.
   `let*` becomes nested `let`s. `quasiquote` and `quasisyntax` become
-  calls to the syntax library's functions, through identifiers with a
+  calls to the kernel module's functions, through identifiers with a
   scope of their own that no module's code has, so user code cannot name
   them.
 - Each local variable, at its binder and at each use, records its
@@ -1059,9 +1067,9 @@ bootstrap, will.
   `match`) so that it is a compile-time error again, as a library of the
   typed language.
 
-## Appendix A: the syntax library's representation (not part of the contract)
+## Appendix A: the kernel module's representation (not part of the contract)
 
-This describes `lib/syntax.sub` as it is. Macros must not depend on it;
+This describes `compiler/kernel.sub` as it is. Macros must not depend on it;
 the compiler may, because it is part of the expander.
 
 - **Types**, all in one recursion group, so that no type declared elsewhere
@@ -1090,8 +1098,8 @@ the compiler may, because it is part of the expander.
   single `%atom` objects made at start. A linklet's quoted data is a
   `%string` made with `array.new_data` from its data segment, which
   `%deserialize` turns into a `%table` of objects (the format is in
-  `lib/syntax.sub`). The compiler declares these types in the linklet;
-  wasm makes them the same types as the library's.
+  `compiler/kernel.sub`). The compiler declares these types in the linklet;
+  wasm makes them the same types as the kernel module's.
 - **Syntax objects** are wrapped eagerly: the datum of a list is a list
   whose elements are syntax objects. Scopes are a list of fixnum scope ids,
   newest (greatest) first, so a change to a new scope is made at the
@@ -1103,7 +1111,7 @@ the compiler may, because it is part of the expander.
   Properties are a list of `(key . value)` pairs, newest first, with each
   key at most once. The expander records a local variable's binding in
   the property `%local-binding`.
-- **Memory**: the library's memory holds its error messages.
+- **Memory**: the kernel module's memory holds its error messages.
 - **Queries**: the compiler registers the functions that answer the
   queries (2.3) with `%set-queries`. Until it does, each query traps.
 - **Shifted literals**: `%scope-map-add` tells `%make-syntax` to replace

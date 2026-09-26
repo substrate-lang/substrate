@@ -19,8 +19,8 @@ line says the same.
 |---|---|---|
 | `docs/` | the kernel specification | permanent |
 | `host/` | the hosts, in C over wasmtime (`subhost.c`) and in JavaScript over Node's V8 (`subhost.mjs`): stores, linking, the `host` imports and the instantiate hook | permanent: they run programs, the compiler among them |
-| `compiler/` | the compiler, written in Substrate: reader, expander, kernel compiler, wasm encoder; what only compiling needs. It compiles itself (spec 1.4) | permanent, grows |
-| `lib/` | what programs use, the compiler among them: the syntax library (`syntax.sub`), the data of every language and the functions macros use on it; Substrate (`substrate.sub`, written in Substrate on its core in kernel code, `substrate-core.sub`), the language built on the kernel; and printing for programs without GC (`print.sub`) | permanent, grows |
+| `compiler/` | the compiler, written in Substrate: reader, expander, kernel compiler, wasm encoder. It compiles itself (spec 1.4). And the kernel module (`kernel.sub`, in kernel code): the data of every language and the functions macros use on it, which the compiler carries into the programs that use them | permanent, grows |
+| `lib/` | libraries, which programs use, the compiler among them: Substrate (`substrate.sub`, written in Substrate on its core in kernel code, `substrate-core.sub`), the language built on the kernel; and printing for programs without GC (`print.sub`) | permanent, grows |
 | `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.imports`) and any modules it requires in `NAME/`; checked by `make check` | grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.imports` (what the compiled phase-0 linklet may import). `tests/fixtures/` holds modules the tests require | grows |
 | `seed/` | the compiler, built by itself: what builds the compiler's source (spec 1.4) | permanent, replaced as the compiler grows |
@@ -42,7 +42,7 @@ build/subhost DIR [ARG ...]     # run it on wasmtime
 host/subhost.mjs DIR [ARG ...]  # run it on V8
 bin/sub expand FILE             # print FILE's fully expanded phase-0 forms
 bin/sub compile FILE -o OUT     # write FILE's linklets (phase 0 to OUT)
-bin/sub syntax-library -o build/syntax.wasm      # write the syntax library
+bin/sub kernel -o build/kernel.wasm      # write the kernel module
 wasm-tools print OUT            # inspect a module
 HOST=build/subhost bin/sub ...  # run the compiler on wasmtime rather than V8
 HOST=host/subhost.mjs tests/run.sh   # run the tests' programs on V8
