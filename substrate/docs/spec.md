@@ -688,6 +688,7 @@ id                                  ; local or global variable
 (br label [expr])  (br-if label test)  (return [expr])
 (f arg ...)                         ; application: (#%app f arg ...)
 (#%app f arg ...)                   ; core: a direct call of the function f
+(#%app e arg ...)                   ; core: an application of the function value e
 (op arg ... [offset])               ; a numeric or memory instruction, e.g. (i32.add a b)
 (call-indirect (t ... -> t ...) index arg ...)
 (ref.func f)                        ; (ref T), for f declared with (type T)
@@ -755,8 +756,12 @@ GC instructions take their type and field immediates by name:
   The kernel gives `lambda` a meaning but no representation: a language
   lowers each `lambda` to other kernel code, usually a struct holding the
   captured values and a reference to a module-level function, and chooses
-  how. The compiler rejects a `lambda` that has not been lowered. A
-  language lowers its lambdas in its `#%linklet` (6.5).
+  how. An application whose head is not a function's name, `(#%app e arg
+  ...)`, applies the function value `e`, such as a `lambda`'s, to the
+  args, and the kernel leaves it to the language in the same way. The
+  compiler rejects a `lambda`, or an application of a function value,
+  that has not been lowered. A language lowers them in its `#%linklet`
+  (6.5).
 - **Application is an implicit form**, as in Racket. A form whose head is
   not bound to a macro, a core form or a wasm operator, including one
   whose head is not an identifier, is expanded as `(#%app head arg ...)`.
@@ -765,7 +770,8 @@ GC instructions take their type and field immediates by name:
   expanded. A module changes the meaning of its applications by binding
   `#%app` to a macro, usually by importing one, as a module written in
   Substrate does. Code a macro introduces keeps its own module's `#%app`.
-  The core `#%app` calls a function directly and rejects anything else. A macro standing for `#%app` must not return an
+  The core `#%app` calls a function directly, and applies anything else
+  as a function value, which the language lowers (above). A macro standing for `#%app` must not return an
   application written with the use's scopes, which would expand through it
   again; one written with its own module's scopes uses that module's
   `#%app`. Wasm operators are not applications and never go through
@@ -942,8 +948,8 @@ syntax in the grammar
 below, with every macro use expanded and every application and literal
 explicit. `local-expand` returns it, `#%linklet` (6.5) receives and returns
 it,
-`sub expand` prints it, and the compiler compiles it once no `lambda`
-remains (5.3).
+`sub expand` prints it, and the compiler compiles it once no `lambda`,
+and no application of a function value, remains (5.3).
 
 ```
 form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)] expr ...)
@@ -958,6 +964,7 @@ expr ::= id                                   ; a local or global variable, or a
        | (#%datum literal)                    ; a wasm number, typed by context
        | (quote datum) | (quote-syntax datum)
        | (#%app id expr ...)                  ; a direct call; id names a function
+       | (#%app expr expr ...)                ; an application of a function value (5.3)
        | (op expr ... [offset])               ; a wasm numeric or memory operator
        | (gc-op immediate ... expr ...)       ; struct.new, ref.cast, ... (5.3)
        | (let ([id expr] | [id type expr] ...) expr ...)
@@ -1037,7 +1044,8 @@ right-hand side's.
   hook of the language it takes at phase 1, which may differ from its
   phase-0 language. A module whose phase-1 code is kernel code gets the
   core hook.
-- This is where a language lowers `lambda` (5.3) and makes its values
+- This is where a language lowers `lambda` and applications of function
+  values (5.3), and makes its values
   transformers. Substrate's `#%linklet` converts the closures of every
   unit, and makes the value of a `define-syntax` unit a transformer when
   it is a procedure. A language built on another provides that one's
