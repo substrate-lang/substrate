@@ -16,6 +16,7 @@
          set-func-info-instance! func-info-export set-func-info-export! func-info-type
          global-info? global-info-name global-info-type global-info-mutable? global-info-instance
          set-global-info-instance! global-info-export set-global-info-export!
+         tag-info-name tag-info-params tag-info-instance set-tag-info-instance! tag-info-export set-tag-info-export!
          data-info-offset data-info-bytes
          type-info? type-info-name type-info-kind type-info-fields type-info-super type-info-final?
          type-info-group func-type?
@@ -43,6 +44,7 @@
 (define (set-syntax-types! string table) (set! string-type string) (set! table-type table))
 
 (define eqref (make-ref #t 'eq))
+(define exnref (make-ref #t 'exn))
 
 ;; ---- error locations ----
 
@@ -91,6 +93,28 @@
          (let ([j (map valtype-join a b)])
            (and (andmap (lambda (x) x) j) j))]
         [else #f]))
+
+;; Is lowered expression e a literal alone?
+(define (bare-literal? e)
+  (case (car e)
+    [(at) (bare-literal? (caddr e))]
+    [(int float) #t]
+    [else #f]))
+
+;; The branches es, of an if or a try, each compiled by (compile i e
+;; expected), as a list of (code . type). Without an expected type, a
+;; branch takes the numeric type of a branch compiled before it; so that
+;; literals take the others' type, as in (if c 0 x) with x an i64, the
+;; branches that are literals alone are compiled last.
+(define (compile-branches es compile expected)
+  (let* ([n (length es)]
+         [order (append (filter (lambda (i) (not (bare-literal? (list-ref es i)))) (range n))
+                        (filter (lambda (i) (bare-literal? (list-ref es i))) (range n)))])
+    (let loop ([is order] [known #f] [done '()])
+      (if (null? is)
+          (map (lambda (i) (cdr (assv i done))) (range n))
+          (let* ([r (compile (car is) (list-ref es (car is)) (or expected known))] [t (cdr r)])
+            (loop (cdr is) (or known (and (pair? t) (andmap numeric-type? t) t)) (cons (cons (car is) r) done)))))))
 
 (define (s32 n) (or (i32-bits n) (fail "integer ~a does not fit in i32" n)))
 (define (s64 n) (i64-bits n))
@@ -144,6 +168,7 @@
 (struct mstate (self
                 [func-imports #:mutable]   ; external func-infos, reversed
                 [global-imports #:mutable] ; external global-infos, reversed
+                [tag-imports #:mutable]    ; external tag-infos, reversed
                 [synths #:mutable]         ; synth records, reversed
                 [fidx #:mutable]           ; alist func-info -> synth
                 [uses-memory #:mutable]    ; where code first needs a memory, or #f
@@ -163,6 +188,11 @@
              (external? ms (global-info-instance info))
              (not (memq info (mstate-global-imports ms))))
     (set-mstate-global-imports! ms (cons info (mstate-global-imports ms)))))
+
+(define (note-tag! ms info)
+  (when (and (external? ms (tag-info-instance info))
+             (not (memq info (mstate-tag-imports ms))))
+    (set-mstate-tag-imports! ms (cons info (mstate-tag-imports ms)))))
 
 (define (note-memory! ms) (unless (mstate-uses-memory ms) (set-mstate-uses-memory! ms (or current-loc #t))))
 (define (note-table! ms) (unless (mstate-uses-table ms) (set-mstate-uses-table! ms (or current-loc #t))))
@@ -312,6 +342,64 @@
        (finish (append (arg 0 (make-ref #t 'i31)) `((,op))) '(i32) expected)]
       [else (fail "internal: unknown GC operation ~a" op)])))
 
+;; (try clauses body) (spec 5.3). The body is in a try_table whose catches
+;; branch to a block per clause; after its block, a clause sets its
+;; variables to the values the block received, and runs. The body and each
+;; clause end the try's own block:
+;;
+;;   block T
+;;     block P_n ... block P_1
+;;           try_table T (catch ... 0) ... (catch ... n-1)  body  end
+;;           br n
+;;         end  clause 1  br n-1
+;;       ...
+;;     end  clause n
+;;   end
+;;
+;; A call in the body is not a tail call, which would leave the try.
+(define (compile-try ms fc labels clauses body expected tail?)
+  (let* ([n (length clauses)]
+         [blocks (map (lambda (c) (label #f 'block #f)) clauses)]
+         [outer (cons (label #f 'block #f) labels)]
+         ;; The values each clause's block receives.
+         [payloads (map (lambda (c)
+                          (append (if (cadr c) (tag-info-params (cadr c)) '())
+                                  (if (memq (car c) '(catch-ref catch-all-ref)) (list exnref) '())))
+                        clauses)]
+         [rs (compile-branches
+              (cons body (map cadddr clauses))
+              (lambda (i e expected)
+                (if (= i 0)
+                    (cx ms fc (cons (label #f 'block #f) (append blocks outer)) e expected #f)
+                    (let ([c (list-ref clauses (- i 1))])
+                      (for-each (lambda (key t) (add-local! fc key t)) (caddr c) (list-ref payloads (- i 1)))
+                      (cx ms fc (append (list-tail blocks i) outer) e expected tail?))))
+              expected)]
+         [t (or expected
+                (foldl (lambda (r t) (and t (join-types t (cdr r)))) 'bottom rs)
+                (fail "the body and the clauses of try have different types: ~a"
+                      (apply string-append (map (lambda (r) (format " ~a" (type->string (cdr r)))) rs))))]
+         [t (if (eq? t 'bottom) '() t)]
+         [catches (map (lambda (c i)
+                         (when (cadr c) (note-tag! ms (cadr c)))
+                         (case (car c)
+                           [(catch) `(catch ,(cadr c) ,i)]
+                           [(catch-ref) `(catch_ref ,(cadr c) ,i)]
+                           [(catch-all) `(catch_all ,i)]
+                           [else `(catch_all_ref ,i)]))
+                       clauses (range n))])
+    (let loop ([i 1] [code `((try_table ,(blocktype t) ,catches ,(car (car rs))) (br ,n))]
+               [rs (cdr rs)] [cs clauses] [ps payloads])
+      (if (> i n)
+          (cons `((block ,(blocktype t) ,code)) t)
+          (loop (+ i 1)
+                (append `((block ,(blocktype (car ps)) ,code))
+                        ;; The values, the last on the stack first.
+                        (map (lambda (key) `(local.set ,(car (lookup-local fc key)))) (reverse (caddr (car cs))))
+                        (car (car rs))
+                        (if (< i n) `((br ,(- n i))) '()))
+                (cdr rs) (cdr cs) (cdr ps))))))
+
 ;; Compile e. expected: #f or a list of valtypes. tail?: e's value is the
 ;; function's return value. Returns (code . type).
 (define (cx ms fc labels e expected tail?)
@@ -404,13 +492,9 @@
          (if (not els)
              (let ([c (car (sub-in lbls then '() #f))])
                (finish (append tc `((if () ,c ()))) '() expected))
-             (let* ([r1 (sub-in lbls then expected tail?)] [t1 (cdr r1)]
-                    ;; Without an expected type, numeric literals in the else
-                    ;; branch take the then branch's type.
-                    [r2 (sub-in lbls els
-                                (or expected (and (not (eq? t1 'bottom)) (andmap numeric-type? t1) t1))
-                                tail?)]
-                    [t2 (cdr r2)]
+             (let* ([rs (compile-branches (list then els) (lambda (i e expected) (sub-in lbls e expected tail?))
+                                          expected)]
+                    [r1 (car rs)] [r2 (cadr rs)] [t1 (cdr r1)] [t2 (cdr r2)]
                     [t (or expected
                            (join-types t1 t2)
                            (fail "the branches of if have different types: ~a and ~a"
@@ -503,7 +587,8 @@
              (cons (append code fcode `((return_call_ref ,t))) results)
              (finish (append code fcode `((call_ref ,t))) results expected)))]
       [(gc)
-       (set-mstate-uses-gc! ms #t)
+       ;; A null, and testing for one, touch no GC object.
+       (unless (memq (car args) '(ref.null ref.is_null ref.as_non_null)) (set-mstate-uses-gc! ms #t))
        (compile-gc ms fc labels (car args) (cadr args) (caddr args) expected)]
       [(select)
        (let* ([ra (sub (car args) #f #f)] [ta (cdr ra)])
@@ -516,6 +601,12 @@
          (finish (if (eq? t 'bottom) (car r) (append (car r) (map (lambda (_) '(drop)) t))) '() expected))]
       [(unreachable) (cons '((unreachable)) 'bottom)]
       [(nop) (finish '((nop)) '() expected)]
+      [(throw)
+       (let ([info (car args)])
+         (note-tag! ms info)
+         (cons (append (args-code ms fc labels (cadr args) (tag-info-params info)) `((throw ,info))) 'bottom))]
+      [(throw-ref) (cons (append (code-of (car args) exnref) '((throw_ref))) 'bottom)]
+      [(try) (compile-try ms fc labels (car args) (cadr args) expected tail?)]
       [(quote)
        ;; A quoted fixnum or #f is a constant, and so are '() and #t, which
        ;; are globals of the syntax library. Other data is an entry in the
@@ -633,12 +724,13 @@
 ;; (bytes imported-instance-names uses-gc?).
 (define (compile-module forms self)
   (set! current-loc #f)
-  (let* ([ms (mstate self '() '() '() '() #f #f #f #f)]
+  (let* ([ms (mstate self '() '() '() '() '() #f #f #f #f)]
          [kind? (lambda (k) (lambda (f) (eq? (car f) k)))]
          [func-forms (filter (kind? 'func) forms)]
          [global-forms (filter (kind? 'global) forms)]
          [data-forms (filter (kind? 'data) forms)]
          [type-forms (filter (kind? 'type) forms)]
+         [tag-forms (filter (kind? 'tag) forms)]
          ;; (memory pages) defines memory 0; (memory-import instance)
          ;; imports the memory another instance exports. Tables likewise.
          [memory-form (findf (lambda (f) (memq (car f) '(memory memory-import))) forms)]
@@ -660,7 +752,12 @@
                         (let ([info (cadr f)])
                           (set-global-info-instance! info self)
                           (set-global-info-export! info (export-name! (global-info-name info)))))
-                      global-forms))]
+                      global-forms)
+            (for-each (lambda (f)
+                        (let ([info (cadr f)])
+                          (set-tag-info-instance! info self)
+                          (set-tag-info-export! info (export-name! (tag-info-name info)))))
+                      tag-forms))]
          [constant-inits (constant-inits ms global-forms)]
          ;; Function bodies.
          [compiled-funcs
@@ -718,6 +815,11 @@
          ;; ---- index assignment ----
          [func-imports (reverse (mstate-func-imports ms))]
          [global-imports (reverse (mstate-global-imports ms))]
+         [tag-imports (reverse (mstate-tag-imports ms))]
+         [tag-index (make-hasheq)]
+         [n-tags
+          (let loop ([ts (append tag-imports (map cadr tag-forms))] [i 0])
+            (if (null? ts) i (begin (hash-set! tag-index (car ts) i) (loop (cdr ts) (+ i 1)))))]
          [synths (reverse (mstate-synths ms))]
          [n-func-imports (length func-imports)]
          [func-index (make-hasheq)]
@@ -740,7 +842,8 @@
                                     func-imports)
                                (map (lambda (cf) (func-info-type (car cf))) compiled-funcs)
                                (map global-info-type global-imports) (map cdr constant-inits)
-                               (map (lambda (f) (global-info-type (cadr f))) global-forms)))]
+                               (map (lambda (f) (global-info-type (cadr f))) global-forms)
+                               (map tag-info-params (append tag-imports (map cadr tag-forms)))))]
          [gc-index
           (let ([table (make-hasheq)])
             (let loop ([ts gc-types] [i 0])
@@ -763,6 +866,8 @@
                    (fail "internal: function ~a has no index" (func-info-name info))))]
          [gi (lambda (g) (or (hash-ref global-index g #f) (fail "internal: global has no index")))]
          [ti (lambda (t) (or (hash-ref gc-index t #f) (fail "internal: type has no index")))]
+         [tgi (lambda (t) (or (hash-ref tag-index t #f) (fail "internal: tag ~a has no index" (tag-info-name t))))]
+         [tag-type-index (lambda (t) (type-index (list 'func (tag-info-params t) '())))]
          ;; A function's type index: its declared function type's, or else
          ;; its signature's.
          [func-type-index (lambda (info sig) (if (func-info-type info) (ti (func-info-type info)) (type-index sig)))]
@@ -796,6 +901,12 @@
                                 (list (car i) (ti (cadr i)) (caddr i))]
                                [(array.copy) (list 'array.copy (ti (cadr i)) (ti (caddr i)))]
                                [(array.new_data) (list 'array.new_data (ti (cadr i)) (caddr i))]
+                               [(throw) (list 'throw (tgi (cadr i)))]
+                               [(try_table)
+                                (list 'try_table (resolve-bt (cadr i))
+                                      (map (lambda (c) (if (memq (car c) '(catch catch_ref)) (list (car c) (tgi (cadr c)) (caddr c)) c))
+                                           (caddr i))
+                                      (resolve (cadddr i)))]
                                [else i]))
                            instrs))])
             resolve)]
@@ -809,6 +920,7 @@
            (map (lambda (g) (list (global-info-instance g) (global-info-export g) 'global
                                   (list (rv (global-info-type g)) (global-info-mutable? g))))
                 global-imports)
+           (map (lambda (t) (list (tag-info-instance t) (tag-info-export t) 'tag (tag-type-index t))) tag-imports)
            (if (imported? memory-form) (list (list (cadr memory-form) "memory" 'memory '(0 #f))) '())
            (if (imported? table-form) (list (list (cadr table-form) "table" 'table '(0 #f))) '()))]
 
@@ -849,6 +961,7 @@
           (append
            (map (lambda (cf) (list (func-info-export (car cf)) 'func (fi (car cf)))) compiled-funcs)
            (map (lambda (f) (list (global-info-export (cadr f)) 'global (gi (cadr f)))) global-forms)
+           (map (lambda (f) (list (tag-info-export (cadr f)) 'tag (tgi (cadr f)))) tag-forms)
            (if memory-form '(("memory" memory 0)) '())
            (if table-form '(("table" table 0)) '()))]
 
@@ -878,13 +991,15 @@
                      (loop (list-tail ts n) (cons (cons 'rec (map type-entry (take ts n))) acc)))]
                   [else (loop (cdr ts) (cons (type-entry (car ts)) acc))]))]
 
+         [wtags (map (lambda (f) (tag-type-index (cadr f))) tag-forms)]
+
          [module-bytes
           (encode-module
            (wmodule (append gc-type-entries func-types) imports
                     (map (lambda (f) (list (car f) (cadr f) (caddr f) (cadddr f))) wfuncs)
                     (if (and table-form (not (imported? table-form))) (list (list (cadr table-form) #f)) '())
                     (if (and memory-form (not (imported? memory-form))) (list (list (cadr memory-form) #f)) '())
-                    wglobals exports
+                    wtags wglobals exports
                     (and has-start? start-index)
                     (reverse declared)
                     (append (map (lambda (f) (cons (data-info-offset (cadr f)) (data-info-bytes (cadr f)))) data-forms)

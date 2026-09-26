@@ -14,7 +14,8 @@ built over Racket's `#%kernel`.
 ### 1.1 Principles
 
 1. **The kernel is wasm with names, plus compile-time execution.** "Wasm" is
-   Wasm 3.0, including reference types and GC. The kernel adds no memory
+   Wasm 3.0, including reference types, GC and exception handling. The
+   kernel adds no memory
    model and no runtime of its own.
 2. **Pay as you go.** Compiled code contains only what its code uses. A
    module can declare that it needs nothing beyond the host at run time,
@@ -182,7 +183,7 @@ another type, such as `n:i32`.
 - `identifier-binding-kind` says what identifier `id` is bound to as a
   value at the running macro's phase: the symbol `function`, `variable` (a
   local or global), `macro` (a compile-time value that is a
-  transformer), `compile-time-value` (any other), `data`, `label` or
+  transformer), `compile-time-value` (any other), `data`, `tag`, `label` or
   `core` (a core form or wasm operator); `type` if it is bound only as a
   type; or `#f` if it is unbound. An implicit `#%app` (5.3) uses it to tell
   a call of a function from a call through a variable.
@@ -218,7 +219,7 @@ they trap.
   phase-1 linklet holds its transformers, its compile-time values and its
   `begin-for-syntax` code.
 - `(provide item ...)` names the phase-0 bindings other modules get:
-  functions, globals, macros, compile-time values, types and data, whether the
+  functions, globals, macros, compile-time values, types, tags and data, whether the
   module defines them or imported them. An item `x` provides `x`, and
   `[new old]` provides `old` under the name `new`. `(all-from-out name)`
   provides everything the module required as `name` at phase 0 provides,
@@ -315,8 +316,8 @@ they trap.
   ones import it, so, as with macros, code can use it only after the
   declaration. Tables likewise.
 - A linklet exports its memory as `"memory"` and its table as `"table"` (the
-  host relies on this, section 4), and every module-level function and
-  global under its name. If two bindings share a name, the compiler appends
+  host relies on this, section 4), and every module-level function, global
+  and tag under its name. If two bindings share a name, the compiler appends
   `.<n>` to later ones.
 
 ### 3.4 Freestanding modules
@@ -396,7 +397,7 @@ like the source a compiler reads.
 |---|---|---|
 | `write` | `(fd ptr len) -> i32` | write bytes to fd 1 or 2; returns `len` |
 | `trap` | `(ptr len) -> ()` | abort with the UTF-8 message at `ptr` |
-| `instantiate` | `(name name-len bytes bytes-len map map-len) -> i32` | compile and instantiate the wasm module in `bytes`, and register it as `name`. The map is pairs of names, a module's then an instance's, each followed by a zero byte: an import from a module the map names links to that instance, and any other import to the instance its module name names (3.2). 0 on success. |
+| `instantiate` | `(name name-len bytes bytes-len map map-len) -> i32` | compile and instantiate the wasm module in `bytes`, and register it as `name`. The map is pairs of names, a module's then an instance's, each followed by a zero byte: an import from a module the map names links to that instance, and any other import to the instance its module name names (3.2). 0 on success. An exception that escapes the module's start function goes on to the caller, as from a call. |
 | `export_index` | `(inst inst-len field field-len) -> i32` | append the function `inst.field` to the caller's table (exported as `"table"`) and return its index, or -1 |
 | `error_message` | `(buf cap) -> i32` | copy the last error of `instantiate`, `read_file` or `write_file` into `buf`; returns its length |
 | `arg_count` | `() -> i32` | the number of the program's command-line arguments |
@@ -421,7 +422,10 @@ line, each after the linklets it imports from, the entry's own last.
 instantiates each linklet under its name, gives the program the arguments,
 and calls the entry's `main`. It exits with status 0 when `main` returns,
 1 if the program cannot be loaded, 2 when it traps, with the message on
-stderr, or the status the program passes to `exit`. Wasm code cannot catch
+stderr, or the status the program passes to `exit`. An exception that
+escapes `main`, or a start function while the program loads, is reported
+as a trap whose message is `uncaught exception`: a host cannot read what
+an exception carries, which is the language's. Wasm code cannot catch
 a trap, but the store stays usable after one: if the entry exports a
 function `on-trap`, the host calls it after a trap in `main`, with the
 trap's message as its last error message (`error_message`), and it reports
@@ -453,10 +457,11 @@ quotation and compile-time forms.
 
 - Numbers: `i32`, `i64`, `f32`, `f64`.
 - References: `anyref`, `eqref`, `i31ref`, `structref`, `arrayref`,
-  `funcref`, `externref`, and `(ref T)` or `(ref null T)` where `T` is one
-  of `any eq i31 struct array func extern none nofunc` or a declared type.
-  A declared function type is below `func` only: functions are not in the
-  `any` hierarchy.
+  `funcref`, `externref`, `exnref`, and `(ref T)` or `(ref null T)` where
+  `T` is one of `any eq i31 struct array func extern exn none nofunc
+  noextern noexn` or a declared type. A declared function type is below
+  `func` only: functions are not in the `any` hierarchy, and neither are
+  exceptions (`exn`, 5.3).
 - The words of type syntax (`ref null mut struct array field sub final func
   rec ->`) are compared by name, like wasm's keywords, not looked up as
   bindings. So they are reserved: a declared type may not be named by one,
@@ -510,6 +515,7 @@ quotation and compile-time forms.
 (type name (sub [final] [super] def))          ; def: (struct ...) or (array ...)
 (type name (func (t ... -> t ...)))            ; a function type
 (rec (type name def) ...)                      ; types that refer to each other
+(tag name (type ...))               ; an exception tag, carrying values of the types
 (require name source item ...)      ; source: "path" or syntax; item: x or [new old]
 (require-unqualified name source)   ; every provided name unqualified too (3.1)
 (provide item ...)                  ; phase 0 only; item: x or [new old]
@@ -589,9 +595,9 @@ not depend on which module it is compiled in:
 - It may quote only fixnums, booleans, `()`, symbols and keywords: quoted
   data is made by the module that holds the code, and only these are the
   same values whichever module makes them.
-- It may call its own module's functions, use its globals and take
-  `ref.func` of its functions: every definition is exported (3.3), and a
-  module that inlines the body imports what it uses.
+- It may call its own module's functions, use its globals, take
+  `ref.func` of its functions and throw its tags: every definition is
+  exported (3.3), and a module that inlines the body imports what it uses.
 
 A call in an inline function's body to an inline function compiled
 before it is inlined there too.
@@ -622,6 +628,14 @@ other expressions, so only a mutable global of a numeric or nullable type
 may have one. Another module that imports a global imports its mutability
 with it.
 
+**Tags** follow wasm too. `(tag name (t ...))` declares a tag: an
+exception thrown with it (5.3) carries values of the types `t ...`.
+Unlike a type, a tag is identified by the instance that defines it, as in
+wasm: two declarations of the same tag are two tags, and so are the tags
+of two instances of one module, such as its linklets at two phase shifts.
+A module that imports a tag gets that tag. Exceptions need no GC: a
+freestanding program (3.4) can throw and catch them.
+
 ### 5.3 Expressions
 
 ```
@@ -646,6 +660,10 @@ id                                  ; local or global variable
 (data-address name)  (data-size name)
 (i32.const n)  (i64.const n)  (f32.const x)  (f64.const x)   ; a constant of that type
 (select a b test)  (drop expr)  (unreachable)  (nop)
+(throw tag arg ...)  (throw-ref e)  ; throw an exception; throw e, an exnref, again
+(try (clause ...) body ...)         ; clause: [catch tag (x ...) body ...]
+                                    ;   [catch-ref tag (x ... e) body ...]
+                                    ;   [catch-all body ...] [catch-all-ref (e) body ...]
 (quote d)  (quasiquote d)           ; syntax-library data (values)
 (quote-syntax d)  (quasisyntax d)   ; syntax objects
 ```
@@ -673,7 +691,21 @@ GC instructions take their type and field immediates by name:
 - Non-final expressions in a body are dropped. An `if` without an else,
   and any expression whose value is unused, has no value. The branches of
   an `if` may differ when both are references: its type is the least type
-  both fit, such as their common declared supertype, or `eqref`.
+  both fit, such as their common declared supertype, or `eqref`. Without
+  an expected type, a branch that is a literal alone takes the numeric
+  type of the others: `(if c 0 x)` is an `i64` if `x` is.
+- **`try`** runs its body, and if an exception that one of its clauses
+  catches escapes the body, the first such clause, in place of the rest of
+  the body: `catch` catches the exceptions of its tag and binds its
+  variables to their values, `catch-all` catches any exception, and
+  `catch-ref` and `catch-all-ref` also bind their last variable to the
+  exception itself, an `exnref`, which `throw-ref` throws again. The
+  clause runs after the exception has left the body, so an exception from
+  the clause goes to the code around the `try`. The words of the clauses
+  are compared by name. A `try`'s value is its body's or the clause's,
+  typed as the branches of an `if` are. A call in the body is not a tail
+  call, which would leave the `try`. This is wasm's `try_table`, whose
+  catches branch to blocks that the clauses follow.
 - A call in tail position whose callee's result types fit the function's
   is emitted as `return_call`, so recursion in tail position runs in
   constant stack.
@@ -882,6 +914,7 @@ form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)
        | (global id type expr) | (global id (mut type) expr)
        | (import id "module" "field" (type ... -> type ...)) | (import id "module" "field" id)
        | (type id def) | (rec (type id def) ...) | (data id offset "bytes" ...)
+       | (tag id (type ...))
        | expr
 
 expr ::= id                                   ; a local or global variable, or a function
@@ -901,6 +934,10 @@ expr ::= id                                   ; a local or global variable, or a
        | (func-index id) | (data-address id) | (data-size id)
        | (i32.const n) | (i64.const n) | (f32.const x) | (f64.const x)
        | (select expr expr expr) | (drop expr) | (unreachable) | (nop)
+       | (throw id expr ...) | (throw-ref expr) | (try (clause ...) expr ...)
+
+clause ::= (catch id (id ...) expr ...) | (catch-ref id (id ...) expr ...)
+         | (catch-all expr ...) | (catch-all-ref (id) expr ...)
 ```
 
 - The other module-level forms (`require`, `provide`, `memory`, `table`,
@@ -956,7 +993,7 @@ right-hand side's.
   the hook can change a function's body or signature. A definition it
   leaves out is removed, and code that still uses it, or a `provide` of
   it, is an error. It may return only `func`, `global`, `import`, `type`,
-  `rec` and `data` forms and expressions. A form it returns unchanged, the same object as a form it was given, and
+  `rec`, `tag` and `data` forms and expressions. A form it returns unchanged, the same object as a form it was given, and
   in the same order among those, introduces nothing, so it is not expanded
   again. The transformer has an introduction scope, as a macro use does
   (6.2).

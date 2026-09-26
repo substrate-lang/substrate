@@ -8,8 +8,9 @@
  * then the last one's main is called with the arguments.
  *
  * Exit status: 0 when main returns, 1 when the program cannot be loaded, 2
- * when it traps (the message goes to stderr, unless the program's on-trap
- * reports it), and whatever the program passes to host.exit.
+ * when it traps or an exception escapes it (the message goes to stderr,
+ * unless the program's on-trap reports it), and whatever the program
+ * passes to host.exit.
  *
  * The host is one store and a linker. Instances are registered by name and
  * link to each other by name. The host owns no memory: each of its imports
@@ -254,6 +255,23 @@ static void take_failure(const char *what, wasmtime_error_t *error, wasm_trap_t 
   free(text);
 }
 
+/* Whether a failed call or instantiation failed because an exception
+ * escaped it, rather than a trap. The exception stays pending on the
+ * store, and the error or trap is deleted. */
+static bool uncaught(wasmtime_error_t *error, wasm_trap_t *trap) {
+  if (!wasmtime_context_has_exception(host.ctx)) return false;
+  if (error) wasmtime_error_delete(error);
+  if (trap) wasm_trap_delete(trap);
+  return true;
+}
+
+/* Take the pending exception off the store, reported as the last error. */
+static void drop_exception(const char *what) {
+  wasmtime_exnref_t exn;
+  if (wasmtime_context_take_exception(host.ctx, &exn)) wasmtime_exnref_unroot(&exn);
+  set_err("%s", what);
+}
+
 /* ---- memory ----------------------------------------------------------- */
 
 static uint8_t *range(wasmtime_context_t *ctx, const wasmtime_memory_t *mem, uint32_t addr, uint32_t len) {
@@ -283,6 +301,7 @@ static wasm_engine_t *engine(void) {
     wasmtime_config_wasm_reference_types_set(config, true);
     wasmtime_config_wasm_function_references_set(config, true);
     wasmtime_config_wasm_gc_set(config, true);
+    wasmtime_config_wasm_exceptions_set(config, true);
     /* With SUBHOST_PERFMAP set, wasmtime writes /tmp/perf-PID.map, which
      * names compiled wasm functions in perf's samples. */
     if (getenv("SUBHOST_PERFMAP"))
@@ -364,9 +383,10 @@ static void mapped_import(const char *map, size_t map_len, const char *mod, size
 
 /* Compile and instantiate the module in bytes, link each import to the
  * instance map names for its module, or to the instance of that name, and
- * register it as name. 0 on success. The arguments must not be in wasm
- * memory: instantiation runs the module's start function, which may move
- * it. */
+ * register it as name. 0 on success; 2 if an exception escaped the
+ * module's start function, which is left pending on the store; 1 on any
+ * other failure. The arguments must not be in wasm memory: instantiation
+ * runs the start function, which may move it. */
 static int instantiate(const char *name, size_t name_len, const uint8_t *bytes, size_t len,
                        const char *map, size_t map_len) {
   int rc = 1;
@@ -394,7 +414,10 @@ static int instantiate(const char *name, size_t name_len, const uint8_t *bytes, 
   wasm_trap_t *trap = NULL;
   error = wasmtime_instance_new(host.ctx, module, externs, imports.size, &inst, &trap);
   if (error || trap) {
-    take_failure("instantiate", error, trap);
+    if (uncaught(error, trap))
+      rc = 2;
+    else
+      take_failure("instantiate", error, trap);
     goto done;
   }
   error = wasmtime_linker_define_instance(host.linker, host.ctx, name, name_len, &inst);
@@ -431,7 +454,10 @@ static int call(const char *inst, const char *fn) {
   wasm_trap_t *trap = NULL;
   wasmtime_error_t *error = wasmtime_func_call(host.ctx, &func, NULL, 0, res, nresults, &trap);
   if (error || trap) {
-    take_failure("trap", error, trap);
+    if (uncaught(error, trap))
+      drop_exception("uncaught exception");
+    else
+      take_failure("trap", error, trap);
     return 1;
   }
   return 0;
@@ -497,6 +523,14 @@ static wasm_trap_t *host_instantiate(void *env, wasmtime_caller_t *caller, const
   free(map_copy);
   free(copy);
   free(name_copy);
+  /* An exception out of the start function goes on to the caller (spec 4). */
+  if (rc == 2) {
+    wasmtime_exnref_t exn;
+    wasmtime_context_take_exception(cctx, &exn);
+    wasm_trap_t *rethrow = wasmtime_context_set_exception(cctx, &exn);
+    wasmtime_exnref_unroot(&exn);
+    return rethrow;
+  }
   results[0].kind = WASMTIME_I32;
   results[0].of.i32 = rc;
   return NULL;
@@ -751,6 +785,7 @@ int main(int argc, char **argv) {
     }
     int rc = instantiate(name, strlen(name), (const uint8_t *)bytes, len, "", 0);
     free(bytes);
+    if (rc == 2) drop_exception("instantiate: uncaught exception");
     if (rc) {
       fprintf(stderr, "error: %s\n", host.err);
       return 2;

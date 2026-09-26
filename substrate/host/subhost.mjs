@@ -314,6 +314,7 @@ function instantiate(name, bytes, map) {
     const start = self.exports[START_EXPORT];
     if (start) start();
   } catch (e) {
+    // An exception out of the start function goes on to the caller (spec 4).
     if (!(e instanceof Trap || e instanceof WebAssembly.RuntimeError || e instanceof RangeError ||
           e instanceof WebAssembly.LinkError)) throw e;
     lastError = `instantiate: ${e.message}`;
@@ -323,27 +324,31 @@ function instantiate(name, bytes, map) {
   return true;
 }
 
-// A trap in main, reported as build/subhost reports it: what happened,
-// then where. The program's on-trap, if it has one, reports it instead
-// (spec 4), reading the message with host.error_message.
+// A trap in main, or an exception that escapes it, reported as
+// build/subhost reports it: what happened, then, for a trap, where. The
+// program's on-trap, if it has one, reports it instead (spec 4), reading
+// the message with host.error_message.
 function fail(e, exports) {
   if (e instanceof Trap || e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
     // The wasm frames: the host's own are not the program's.
     const where = (e.stack || '').split('\n').filter((l) => l.includes('wasm://')).map(located).join('\n');
     lastError = `trap: ${e.message}\n${where}`;
-    const onTrap = exports['on-trap'];
-    if (typeof onTrap === 'function') {
-      try {
-        onTrap();
-        process.exit(2);
-      } catch (e2) {
-        // It trapped too: report the first trap.
-      }
-    }
-    process.stderr.write(`error: ${lastError}\n`);
-    process.exit(2);
+  } else if (e instanceof WebAssembly.Exception) {
+    lastError = 'uncaught exception';
+  } else {
+    throw e;
   }
-  throw e;
+  const onTrap = exports['on-trap'];
+  if (typeof onTrap === 'function') {
+    try {
+      onTrap();
+      process.exit(2);
+    } catch (e2) {
+      // It trapped too: report the first trap.
+    }
+  }
+  process.stderr.write(`error: ${lastError}\n`);
+  process.exit(2);
 }
 
 let names;
@@ -361,7 +366,14 @@ for (const name of names) {
     process.stderr.write(`subhost: cannot read ${dir}/${name}.wasm\n`);
     process.exit(1);
   }
-  if (!instantiate(name, bytes, new Map())) {
+  let loaded;
+  try {
+    loaded = instantiate(name, bytes, new Map());
+  } catch (e) {
+    if (!(e instanceof WebAssembly.Exception)) throw e;
+    lastError = 'instantiate: uncaught exception';
+  }
+  if (!loaded) {
     process.stderr.write(`error: ${lastError}\n`);
     process.exit(2);
   }

@@ -23,7 +23,7 @@
          func-info func-info? func-info-name func-info-params func-info-results func-info-instance
          func-info-export func-info-type
          global-info global-info? global-info-name global-info-type global-info-mutable? global-info-instance
-         global-info-export
+         global-info-export tag-info tag-info? tag-info-name tag-info-params tag-info-instance tag-info-export
          data-info data-info-offset data-info-bytes
          make-type-info type-info-name type-info-kind type-info-fields set-type-info-fields!
          type-info-super type-info-final? set-type-info-group! identify-group! func-type?
@@ -53,10 +53,11 @@
 
 (define core-forms
   (append
-   '(func global import memory table data type rec define-syntax begin-for-syntax
+   '(func global import memory table data type rec tag define-syntax begin-for-syntax
      begin require require-unqualified provide freestanding set! let let* lambda if block loop br br-if
      return
      call-indirect call-ref ref.func func-index data-address data-size select drop unreachable nop
+     throw throw-ref try
      i32.const i64.const f32.const f64.const
      quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
    (list app-sym datum-sym linklet-sym)
@@ -89,7 +90,7 @@
 (struct binding (scopes phase namespace key))
 
 ;; meaning: (core name) (prim name) (func info) (global info) (data info)
-;;          (type info) (local key) (label key) (compile-time-value getter-info)
+;;          (type info) (tag info) (local key) (label key) (compile-time-value getter-info)
 ;; A name bound to a compile-time value that is a transformer is a macro.
 ;; A type meaning is in the type namespace, every other one in the value
 ;; namespace. Locals and labels are bound before their meaning is set, so
@@ -453,6 +454,9 @@
                              [(global-info? info)
                               (global-info (global-info-name info) (global-info-type info) (global-info-mutable? info)
                                            (shift-instance (global-info-instance info) k) (global-info-export info))]
+                             [(tag-info? info)
+                              (tag-info (tag-info-name info) (tag-info-params info)
+                                        (shift-instance (tag-info-instance info) k) (tag-info-export info))]
                              [else info])])
               (hash-set! shifted-infos info (cons (cons k new) cache))
               (hash-set! shift-origins new
@@ -465,7 +469,7 @@
 (define shift-origins (make-hasheq))
 
 (define (shift-meaning meaning k)
-  (if (and meaning (memq (car meaning) '(func global compile-time-value)))
+  (if (and meaning (memq (car meaning) '(func global compile-time-value tag)))
       (list (car meaning) (shift-info (cadr meaning) k))
       meaning))
 
@@ -647,7 +651,7 @@
             (map (lambda (item)
                    (let* ([id (cdr item)]
                           [value (let ([v (meaning-of id 0)])
-                                   (and v (memq (car v) '(func global compile-time-value data)) v))]
+                                   (and v (memq (car v) '(func global compile-time-value data tag)) v))]
                           [found (filter (lambda (x) x) (list (type-meaning-of id 0) value))])
                      (when (null? found)
                        (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
@@ -804,7 +808,7 @@
     (when (and only
                (memq kind '(require require-unqualified provide freestanding memory table
                             define-syntax begin-for-syntax)))
-      (raise-compile-error f "~a (~a ...), but only func, global, import, type and data forms and expressions are allowed there"
+      (raise-compile-error f "~a (~a ...), but only func, global, import, type, tag and data forms and expressions are allowed there"
                            only kind))
     (case kind
       [(begin) (for-each (lambda (g) (declare-form! g b only)) (cdr (stx-list-of f 'begin)))]
@@ -818,6 +822,7 @@
       [(memory table) (declare-storage! f phase)]
       [(data) (item! (declare-data f phase))]
       [(type) (item! (declare-type f phase))]
+      [(tag) (item! (declare-tag f phase))]
       [(rec) (item! (declare-rec f phase))]
       [(define-syntax) (define-syntax! f phase)]
       [(begin-for-syntax) (begin-for-syntax! f phase)]
@@ -854,7 +859,7 @@
 
 (define shorthand-refs
   '((anyref . any) (eqref . eq) (i31ref . i31) (structref . struct) (arrayref . array)
-    (funcref . func) (externref . extern)))
+    (funcref . func) (externref . extern) (exnref . exn)))
 
 ;; A heap type: an abstract name, or a type declared with `type`.
 (define (parse-heap s phase)
@@ -1296,6 +1301,23 @@
       (bind-definition! (cadr parts) phase (list 'data info))
       (list 'plain (core-headed f 'data)))))
 
+;; (tag name (t ...)): a tag, whose exceptions carry values of types t ...
+;; (spec 5.2).
+(define (declare-tag f phase)
+  (let ([parts (stx-list-of f 'tag)])
+    (unless (and (= (length parts) 3) (id? (cadr parts)) (stx->list (caddr parts)))
+      (raise-compile-error f "expected (tag name (type ...))"))
+    (let* ([types (stx-rewrap (caddr parts) (map (lambda (t) (expand-type t phase)) (stx->list (caddr parts))))]
+           [info (tag-info (stx-e (cadr parts)) (map (lambda (t) (parse-type t phase)) (stx->list types)) #f #f)])
+      (bind-definition! (cadr parts) phase (list 'tag info))
+      (list 'plain (out f 'tag (cadr parts) types)))))
+
+(define (tag-info-of id phase)
+  (let ([m (and (id? id) (meaning-of id phase))])
+    (unless (and m (eq? (car m) 'tag))
+      (raise-compile-error id "~s is not a tag" (stx->datum id)))
+    (cadr m)))
+
 ;; ---- require, provide, storage ----
 
 ;; (require name source item ...), where source is "path" or syntax (the
@@ -1545,7 +1567,7 @@
                      (let* ([out (apply-linklet-hook 'define-syntax (list (expand-expr rhs (+ phase 1)))
                                                      rhs (+ phase 1))]
                             [value (last out)])
-                       (when (memq (core-head value (+ phase 1)) '(func global import type rec data))
+                       (when (memq (core-head value (+ phase 1)) '(func global import type rec data tag))
                          (raise-compile-error f "#%linklet returned a define-syntax unit that does not end with an expression"))
                        (append (lower-forms (take out (- (length out) 1)) (+ phase 1))
                                (list (list 'expr (lower-expr value (+ phase 1)))))))]
@@ -1765,6 +1787,7 @@
       [(local global) 'variable]
       [(compile-time-value) (if (transformer-of m) 'macro 'compile-time-value)]
       [(data) 'data]
+      [(tag) 'tag]
       [(label) 'label]
       [(core prim) 'core]
       [else (and (type-meaning-of id api-phase) 'type)])))
@@ -1881,6 +1904,7 @@
                 s
                 (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e))]
            [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
+           [(tag) (raise-compile-error s "~a is a tag: throw it with (throw ~a arg ...)" e e)]
            [(core prim) (raise-compile-error s "bad use of ~a" e)]
            [(label) (raise-compile-error s "~a is a label" e)]
            [else (unbound s e phase)]))]
@@ -1943,7 +1967,7 @@
     (case (and m (car m))
       [(func) (apply out s app-sym f (map (lambda (a) (expand-expr a phase)) (cddr parts)))]
       [(local global) (raise-compile-error s "~a is a variable, not a function" (stx-e f))]
-      [(compile-time-value data label core prim)
+      [(compile-time-value data label core prim tag)
        (raise-compile-error s "~a is not a function" (stx-e f))]
       [else (if (id? f)
                 (unbound f (stx-e f) phase)
@@ -2189,6 +2213,20 @@
           (arity-check (= (length parts) 2))
           (o (ex (cadr parts)))]
          [(unreachable nop) (arity-check (= (length parts) 1)) (o)]
+         ;; (throw tag arg ...): throw an exception of tag, carrying the args.
+         [(throw)
+          (arity-check (>= (length parts) 2))
+          (tag-info-of (cadr parts) phase)
+          (apply o (cadr parts) (map ex (cddr parts)))]
+         [(throw-ref)
+          (arity-check (= (length parts) 2))
+          (o (ex (cadr parts)))]
+         ;; (try (clause ...) body ...): body, with the exceptions the clauses
+         ;; catch handled by them (spec 5.3).
+         [(try)
+          (arity-check (and (>= (length parts) 2) (stx->list (cadr parts))))
+          (apply o (out-list (cadr parts) (map (lambda (c) (expand-catch c phase)) (stx->list (cadr parts))))
+                 (map ex (cddr parts)))]
          [else
           (if (memq name gc-forms)
               (expand-gc name s parts phase)
@@ -2204,6 +2242,35 @@
 
 (define (const-type name)
   (case name [(i32.const) 'i32] [(i64.const) 'i64] [(f32.const) 'f32] [else 'f64]))
+
+;; The parts of try clause c, [catch tag (x ...) body ...], [catch-ref tag
+;; (x ... e) body ...], [catch-all body ...] or [catch-all-ref (e) body
+;; ...], whose first word is compared by name: (kind tag-or-#f
+;; variables-or-#f body). The variables are bound to the exception's
+;; values, then, for the -ref kinds, to the exception itself.
+(define (catch-parts c)
+  (let* ([l (or (stx->list c) '())]
+         [kind (and (pair? l) (id? (car l)) (memq (stx-e (car l)) '(catch catch-ref catch-all catch-all-ref))
+                    (stx-e (car l)))]
+         [n (case kind [(catch catch-ref) 3] [(catch-all-ref) 2] [(catch-all) 1] [else #f])])
+    (unless (and n (>= (length l) n) (or (< n 2) (stx->list (list-ref l (- n 1)))))
+      (raise-compile-error c "expected [catch tag (x ...) body ...], [catch-ref tag (x ... e) body ...], [catch-all body ...] or [catch-all-ref (e) body ...]"))
+    (list kind (and (= n 3) (cadr l)) (and (>= n 2) (list-ref l (- n 1))) (list-tail l n))))
+
+(define (expand-catch c phase)
+  (let* ([p (catch-parts c)] [kind (car p)] [tag (cadr p)] [vars (caddr p)] [body (cadddr p)]
+         [xs (if vars (stx->list vars) '())]
+         [n (+ (if tag (length (tag-info-params (tag-info-of tag phase))) 0)
+               (if (memq kind '(catch-ref catch-all-ref)) 1 0))]
+         [sc (new-local-scope!)])
+    (unless (andmap id? xs) (raise-compile-error vars "expected variable names"))
+    (unless (= (length xs) n)
+      (raise-compile-error vars "this clause binds ~a variable~a, not ~a" n (if (= n 1) "" "s") (length xs)))
+    (let ([bound (map (lambda (x) (bound-local (add-scope x sc) phase)) xs)])
+      (out-list c (append (list (core-id kind (car (stx->list c))))
+                          (if tag (list tag) '())
+                          (if vars (list (out-list vars bound)) '())
+                          (map (lambda (b) (expand-expr (add-scope b sc) phase)) body))))))
 
 ;; A let binding [x init] or [x type init].
 (define (binding-init bp) (if (= (length bp) 3) (caddr bp) (cadr bp)))
@@ -2356,6 +2423,7 @@
       [(type) (list (list 'type (type-of (cadr parts) phase)))]
       [(rec) (map (lambda (t) (list 'type (type-of (cadr (stx->list t)) phase))) (cdr parts))]
       [(data) (list (list 'data (data-info-of (cadr parts) phase)))]
+      [(tag) (list (list 'tag (tag-info-of (cadr parts) phase)))]
       [else (list (list 'expr (lower-expr f phase)))])))
 
 (define (lower-seq forms where phase)
@@ -2432,6 +2500,9 @@
         [(call-ref) (check (caddr e)) (for-each check (cadddr e))]
         [(gc) (for-each check (cadddr e))]
         [(select drop) (for-each check (cdr e))]
+        [(throw) (for-each check (caddr e))]
+        [(throw-ref) (check (cadr e))]
+        [(try) (for-each (lambda (c) (check (cadddr c))) (cadr e)) (check (caddr e))]
         [else (raise-compile-error id "internal: lowered form ~a" (car e))]))
     (hash-set! inline-bodies info
                (list params (func-info-results info) body returns?
@@ -2509,10 +2580,21 @@
       [(prim) (list 'prim (cadr e) (caddr e) (map copy (cadddr e)))]
       [(call-ref) (list 'call-ref (cadr e) (copy (caddr e)) (map copy (cadddr e)))]
       [(gc) (list 'gc (cadr e) (caddr e) (map copy (cadddr e)))]
+      [(throw) (list 'throw (shift (cadr e)) (map copy (caddr e)))]
+      [(throw-ref) (list 'throw-ref (copy (cadr e)))]
+      [(try) (list 'try
+                   (map (lambda (c) (list (car c) (and (cadr c) (shift (cadr c))) (map local (caddr c)) (copy (cadddr c))))
+                        (cadr e))
+                   (copy (caddr e)))]
       [else (raise-compile-error #f "internal: lowered form ~a" (car e))])))
 
 (define (lowered-data-info id phase)
   (let ([info (data-info-of id phase)])
+    (check-not-removed info id)
+    info))
+
+(define (lowered-tag-info id phase)
+  (let ([info (tag-info-of id phase)])
     (check-not-removed info id)
     info))
 
@@ -2532,12 +2614,12 @@
                 (let ([parts (stx->list f)])
                   (case (core-head f 0)
                     [(func) (hash-set! kept (cadr (meaning-of (car (stx->list (cadr parts))) 0)) #t)]
-                    [(import global data) (hash-set! kept (cadr (meaning-of (cadr parts) 0)) #t)]
+                    [(import global data tag) (hash-set! kept (cadr (meaning-of (cadr parts) 0)) #t)]
                     [else #f])))
               forms)
     (for-each (lambda (key)
                 (let ([m (hash-ref meanings key #f)])
-                  (when (and m (memq (car m) '(func global data)) (not (hash-has-key? kept (cadr m))))
+                  (when (and m (memq (car m) '(func global data tag)) (not (hash-has-key? kept (cadr m))))
                     (hash-set! removed (cadr m) #t))))
               (comp-definition-keys c))
     removed))
@@ -2624,6 +2706,17 @@
          [(drop) (list 'drop (lo (cadr parts)))]
          [(unreachable) '(unreachable)]
          [(nop) '(nop)]
+         [(throw) (list 'throw (lowered-tag-info (cadr parts) phase) (map lo (cddr parts)))]
+         [(throw-ref) (list 'throw-ref (lo (cadr parts)))]
+         [(try)
+          (list 'try
+                (map (lambda (c)
+                       (let* ([p (catch-parts c)] [tag (cadr p)] [vars (caddr p)])
+                         (list (car p) (and tag (lowered-tag-info tag phase))
+                               (map (lambda (x) (local-key-of x phase)) (if vars (stx->list vars) '()))
+                               (lower-seq (cadddr p) c phase))))
+                     (stx->list (cadr parts)))
+                (lower-seq (cddr parts) s phase))]
          [else
           (if (memq name gc-forms)
               (let ([ia (gc-parts name parts phase)])
