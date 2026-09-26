@@ -104,6 +104,10 @@ and goes into programs, is compiled for each. So a change to the kernel
 module, even to its representation, takes effect in one build.
 Compile-time code can call a function the running kernel does not have
 once the compiler that compiles it has it: after the seed is replaced.
+A type the kernel declares on its own (appendix A) is the same type in
+every module that declares it, so it may not differ between the two
+kernels of a build; the compiler stops if one does, and such a change is
+made in a build of its own.
 
 The first compiler was built by **stage0**, a compiler of the same
 language written apart in Chez Scheme. Its build of the compiler built
@@ -138,10 +142,8 @@ The contract promises this about them:
   equal. Characters, strings, larger integers and flonums are not
   guaranteed to be `ref.eq`; compare characters and strings with
   `char->integer` and `string=?`, and numbers by their values.
-- Bytes, a mutable byte array, are a value too: quoted data (3.5) can
-  hold them, and they are the wasm type `(array (mut i8))` declared on
-  its own, wherever it is declared, so a language's bytes are the
-  kernel's without naming them (appendix A).
+- Bytes, a mutable byte array and nothing else, are a value too. The
+  contract provides the type (2.3), and quoted data (3.5) holds them.
 - Everything else about the representation is private (appendix A).
 
 Counts, indices, bytes and predicate results are `i32`, not values:
@@ -150,10 +152,12 @@ are references, wasm's own type checking keeps them apart from numbers.
 
 ### 2.3 Functions
 
-`(require name kernel)` binds these, and the tag `exn`, as `name:function`
-at the phase where it appears, plus any it lists to bind unqualified
-(3.1). They are imported from the instance `"kernel"`. Parameters are
-`eqref` unless marked with another type, such as `n:i32`.
+`(require name kernel)` binds these functions, the tag `exn` and the type
+`bytes` (2.2) as `name:thing` at the phase where it appears, plus any it
+lists to bind unqualified (3.1). Functions and the tag are imported from
+the instance `"kernel"`; the type is declared, being the same type
+wherever it is declared (appendix A). Parameters are `eqref` unless
+marked with another type, such as `n:i32`.
 
 | Group | Functions |
 |---|---|
@@ -1180,13 +1184,14 @@ the compiler may, because it is part of the expander.
 
 - **Types**, all in one recursion group, so that no type declared elsewhere
   is the same wasm type unless it copies the whole group (5.2), except
-  `%bytes` and `%transformer-code`, declared on their own so that they are
-  the same type wherever they are declared:
+  two whose shape is their whole meaning, declared on their own so that
+  a module declaring the same type has the kernel's, and frozen (1.4):
+  `%transformer-code` and `bytes`.
 
   | Type | Definition | Holds |
   |---|---|---|
   | `%string` | `(array (mut i8))` | UTF-8 bytes |
-  | `%bytes` | `(array (mut i8))`, on its own | bytes (2.2) |
+  | `bytes` | `(array (mut i8))`, on its own | bytes (2.2) |
   | `%pair` | `(struct (field car eqref) (field cdr eqref))` | pairs |
   | `%symbol` | `(struct (field name (ref %string)) (field hash i32))` | symbols, with their name's hash |
   | `%atom` | `(struct (field kind i32) (field value i32))` | characters (kind 0), `#t` (1), `()` (2) |
