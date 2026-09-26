@@ -1081,18 +1081,10 @@ the compiler may, because it is part of the expander.
   | `%builder` | `(struct (field bytes (mut (ref %string))) (field length (mut i32)))` | string builders |
   | `%keyword` | `(struct (field name (ref %string)))` | keywords |
   | `%transformer` | `(struct (field code (ref %transformer-code)) (field env eqref))` | transformers |
+  | `%syntax-error` | `(struct (field message eqref) (field syntax eqref) (field srcloc eqref))` | syntax errors (2.3), with where the compiler reports them, or `#f` |
 
   `%transformer-code`, `(func (eqref eqref -> eqref))`, is declared
   before the group, alone, so other modules can declare it too.
-
-  The group cannot change. Compile-time code that the seed compiles (1.4)
-  declares the group as the source has it, to read its quoted data, and
-  links to the seed's own instance of the library, whose group is the
-  seed's. So a type added since is in a group of its own, such as the
-  syntax errors' `(rec (type %syntax-error (struct (field message eqref)
-  (field syntax eqref) (field srcloc eqref))) (type %syntax-error-group
-  (struct (field error (ref %syntax-error)))))`, whose second member keeps
-  another module's struct of three `eqref`s from being one.
 
 - **Values**: a fixnum is an `i31ref`. `#f` is null. `#t` and `()` are
   single `%atom` objects made at start. A linklet's quoted data is a
