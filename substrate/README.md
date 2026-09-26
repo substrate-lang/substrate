@@ -37,7 +37,7 @@ Everything runs in the flake's dev shell:
 ```sh
 nix develop
 make check                      # the tests: built by bin/sub, run on build/subhost
-bin/sub build FILE -o DIR       # write FILE's program to DIR
+bin/sub build FILE -o DIR       # write FILE's program to DIR; modules are cached in build/cache (spec 3.7)
 build/subhost DIR [ARG ...]     # run it on wasmtime
 host/subhost.mjs DIR [ARG ...]  # run it on V8
 bin/sub expand FILE             # print FILE's fully expanded phase-0 forms
@@ -49,7 +49,9 @@ HOST=host/subhost.mjs tests/run.sh   # run the tests' programs on V8
 SUBHOST_PERFMAP=1 HOST=build/subhost perf record -g bin/sub ...   # wasmtime samples, named by wasm function
 ```
 
-bin/sub runs the compiler, `build/sub`, on V8. `make build/sub` builds it
+bin/sub runs the compiler, `build/sub`, on V8, and keeps the modules it
+compiles in `build/cache` (spec 3.7); `rm -rf build/cache` starts
+over. `make build/sub` builds it
 from the checked-in seed (`seed/`): the seed builds the source, and that
 build builds it again. `make bootstrap` checks that `build/sub` builds
 itself into the same bytes, its fixpoint (spec 1.4), and `make seed` makes

@@ -32,7 +32,8 @@
 (require cmp "compile.sub" compile-module set-current-syntax-infos! set-syntax-types! set-current-source!)
 (require rd "reader.sub" read-file read-string-all)
 (require num "numbers.sub" content-hash)
-(require host "host.sub" export-index call-getter scope-map-new scope-map-add scope-map-clear error-string)
+(require host "host.sub" export-index call-getter scope-map-new scope-map-add scope-map-clear error-string read-data)
+(require ser "serialize.sub" make-serializer serialize! serializer-bytes)
 
 (provide report-trap set-repository-root! set-cache-directory! compile-module-file module-linklet-list
          module-expanded-forms keep-expanded-forms! target-kernel-bytes program-linklets register-queries!)
@@ -106,15 +107,15 @@
 (struct unit (path source [name #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
               [entries #:mutable] [expanded #:mutable] [scope #:mutable] [program #:mutable]
               scopes                                  ; index -> the scopes its expansion made, in order
-              [types #:mutable]))                     ; the types it declared, in order
+              [types #:mutable]                       ; the types it declared, in order
+              [infos #:mutable]))                     ; its functions, globals and tags, or the index of them
 
 (define (new-unit path source name)
-  (unit path source name 'compiling (make-hasheqv) '() '() '() #f #f #f (make-hasheqv) '()))
+  (unit path source name 'compiling (make-hasheqv) '() '() '() #f #f #f (make-hasheqv) '() '()))
 
 (define units-by-name (make-hash))           ; content name -> unit
 (define scope-owners (make-hasheqv))         ; scope -> (unit . index): the unit whose expansion made it
 (define type-owners (make-hasheq))           ; type-info -> (unit . index) in the unit's types
-(define infos-by-name (make-hash))           ; "instance kind export" -> info, for the interfaces (3.7)
 
 ;; One phase of a module, compiled: bytes, the instance names it imports
 ;; from (relative to the module at phase shift 0), whether it uses GC, and
@@ -296,10 +297,11 @@
 ;;
 ;; With a cache directory (sub build -c DIR), a module compiled once is
 ;; loaded from the cache while its source and the names of its requires
-;; are as they were (spec 3.7): its linklets, and its interface, an
-;; s-expression of what the expander keeps of a module it compiled. The
-;; cache is one compiler's: its files are named after the build, a hash
-;; of the compiler's sources, taken when the compiler is compiled.
+;; are as they were (spec 3.7): its linklets, and its interface, what the
+;; expander keeps of a module it compiled, as quoted data in the kernel's
+;; format (spec 3.5). The cache is one compiler's: its files are named
+;; after the build, a hash of the compiler's sources, taken when the
+;; compiler is compiled.
 
 (define cache-directory #f)
 (define (set-cache-directory! dir) (set! cache-directory dir))
@@ -320,10 +322,13 @@
 (define (cache-file suffix) (string-append cache-directory "/" build-id "." suffix))
 
 ;; The datum in cache file f, or #f if there is none.
-(define (read-cache f)
-  (and (file-exists? f)
-       (let ([forms (read-string-all (file->string f) (string->symbol f))])
-         (and (pair? forms) (stx->datum (car forms))))))
+(define (read-cache f) (read-data f))
+
+;; datum, in the kernel's data format.
+(define (data-bytes datum)
+  (let ([s (make-serializer)])
+    (serialize! s datum)
+    (serializer-bytes s)))
 
 ;; The module at path, from the cache, if its entry is there and its
 ;; source and the names of its requires are as the entry recorded; else
@@ -353,9 +358,9 @@
                   (display-to-file (linklet-bytes (hash-ref (unit-linklets m) p))
                                    (cache-file (format "~a@~a.wasm" (unit-name m) p))))
                 (hash-keys (unit-linklets m)))
-      (display-to-file (format "~s" (write-interface m)) (cache-file (string-append (unit-name m) ".interface")))
-      (display-to-file (format "~s" (list (unit-name m)
-                                          (map (lambda (r) (list (unit-path (car r)) (cdr r))) (unit-requires m))))
+      (display-to-file (data-bytes (write-interface m)) (cache-file (string-append (unit-name m) ".interface")))
+      (display-to-file (data-bytes (list (unit-name m)
+                                         (map (lambda (r) (list (unit-path (car r)) (cdr r))) (unit-requires m))))
                        (cache-file (string-append (content-hash (list (unit-path m))) ".path"))))))
 
 ;; ---- interfaces ----
@@ -366,7 +371,7 @@
 ;; expansion made; a type is (type i), the module's own, (kernel-type
 ;; name) or (foreign-type name i); a definition is (own i), an entry of
 ;; the interface's table, (kernel name), (foreign instance kind export)
-;; or (shifted ref k). Its sections are an alist.
+;; or (shifted ref k). Its sections are an alist of quoted data.
 
 (define (write-interface m)
   (let ([own (make-hasheq)] [own-list '()] [type-index (make-hasheq)] [types (unit-types m)])
@@ -495,7 +500,7 @@
                      [(own) (vector-ref infos (cadr r))]
                      [(kernel) (kernel-info target-kernel (cadr r))]
                      [(shifted) (shift-info (ires (cadr r)) (caddr r))]
-                     [else (or (hash-ref infos-by-name (format "~a ~a ~a" (cadr r) (caddr r) (cadddr r)) #f)
+                     [else (or (find-info (cadr r) (caddr r) (cadddr r))
                                (raise-compile-error #f "the cache is inconsistent: no ~a ~a in ~a" (caddr r) (cadddr r) (cadr r)))]))]
            [mres (lambda (r) (list (car r) (if (eq? (car r) 'type) (tres (cadr r)) (ires (cadr r)))))]
            [sres (lambda (r)
@@ -541,7 +546,7 @@
                                   [(tag) (tag-info (cadr f) (map vres (caddr f)) (cadddr f) (list-ref f 4))]
                                   [else (data-info (cadr f) (caddr f) (list->bytes (cadddr f)))])])
                       (vector-set! infos i info)
-                      (unless (data-info? info) (register-info! info))))
+                      (unless (data-info? info) (note-info! m info))))
                   (section 'infos) (range (length (section 'infos))))
         ;; What the expander keeps of a module: its bindings, provides,
         ;; function values, inline bodies and macros.
@@ -1087,12 +1092,12 @@
 
 ;; The types and definitions in module m's lowered forms, for the
 ;; interfaces (3.7): its types in order, and its functions, globals and
-;; tags by instance and export name.
+;; tags.
 (define (note-definitions! m forms)
   (for-each (lambda (f)
               (case (car f)
                 [(type) (own-type! m (cadr f))]
-                [(func global tag) (register-info! (cadr f))]
+                [(func global tag) (note-info! m (cadr f))]
                 [else #f]))
             forms))
 
@@ -1101,16 +1106,26 @@
     (hash-set! type-owners t (cons m (length (unit-types m))))
     (set-unit-types! m (append (unit-types m) (list t)))))
 
-(define (register-info! info)
-  (let ([key (info-key info)]) (when key (hash-set! infos-by-name key info))))
+(define (note-info! m info) (set-unit-infos! m (cons info (unit-infos m))))
 
-;; "instance kind export" for a function, global or tag with an instance.
+;; The definition of kind with export name export in the instance named
+;; instance, one of a module's linklets, or #f. The module's index of its
+;; definitions is made at the first search.
+(define (find-info instance kind export)
+  (let* ([r (linklet-ref instance)] [m (and r (car r))])
+    (and m
+         (begin
+           (when (list? (unit-infos m))
+             (let ([index (make-hash)])
+               (for-each (lambda (info) (hash-set! index (info-key info) info)) (unit-infos m))
+               (set-unit-infos! m index)))
+           (hash-ref (unit-infos m) (string-append instance " " (symbol->string kind) " " export) #f)))))
+
+;; "instance kind export" of a function, global or tag.
 (define (info-key info)
-  (let ([instance (info-instance info)])
-    (and instance
-         (format "~a ~a ~a" instance
-                 (cond [(func-info? info) 'func] [(global-info? info) 'global] [else 'tag])
-                 (info-export info)))))
+  (string-append (or (info-instance info) "") " "
+                 (cond [(func-info? info) "func"] [(global-info? info) "global"] [else "tag"]) " "
+                 (info-export info)))
 
 (define (info-instance info)
   (cond [(func-info? info) (func-info-instance info)]

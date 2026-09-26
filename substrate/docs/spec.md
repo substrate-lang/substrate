@@ -445,6 +445,45 @@ the use takes the use's location (6.2). So what a library's macro expands
 to is located where the macro was used. The code of an inline function
 (5.2) takes the location of the call it is inlined at.
 
+### 3.7 The cache
+
+With a cache directory (`sub build -c DIR`, which `bin/sub` gives as
+`build/cache`), a module compiled once is loaded from the cache while
+its source and the names of its requires are as they were: its
+linklets, one per phase, and its **interface**, what the expander keeps
+of a module it compiled, as quoted data in the kernel's format (3.5).
+The cache is one compiler's: its files are named after the compiler's
+**build**, a hash of the compiler's sources taken when the compiler is
+compiled, so another compiler's files are never taken.
+
+- An entry records the module's content name (3.2) and its requires, by
+  path and phase shift, a macro-introduced `require` among them. To
+  look a module up, the compiler compiles or loads the recorded requires
+  first, as it would to compile the module, computes the module's name
+  from its source and their names, and takes the entry if the name is
+  the recorded one. Nothing is cached while the running and target
+  kernels differ (1.4), since the cache holds one kernel's code.
+- An interface holds what compiled code refers to in the module and what
+  other modules' expansions need: its provides, its module-level bindings
+  with their scope sets and phases, its functions with their signatures,
+  declared types and values, its globals, tags and data, its types as
+  structural forms, the getters of its compile-time values, the lowered
+  bodies of its inline functions, and its linklets' imports and scope
+  tables. Scopes and definitions belong to a run, so the interface names
+  them relative to modules: a scope is the core scope, a module scope's
+  copy for a phase shift, or the *n*-th scope a module's expansion made;
+  a definition is the module's own, the kernel module's, or another
+  module's by instance and export name. Loaded, a module binds its
+  entries under scopes made for it, installs its requires at their
+  shifts, and registers its linklets, types and definitions as a
+  compiled one would; its compile-time values are computed per
+  compilation as before (6.3).
+- Since a linklet's bytes do not depend on the run that compiled it
+  (3.5), a program built from cached modules is byte for byte the program
+  a cold build writes, and the bootstrap (1.4), which uses no cache, is
+  what `make check` runs with one. `sub expand` compiles from source,
+  since it prints the expansion.
+
 ## 4. Host interface
 
 Imports from the instance `"host"`. Every pointer is into the **caller's
@@ -1106,60 +1145,6 @@ right-hand side's.
   `match`) so that it is a compile-time error again, as a library of the
   typed language.
 
-### 7.1 Caching compiled modules (planned)
-
-Every run compiles the kernel module and every module a program requires
-from source, so a build of a program pays for its libraries each time. A
-cache of compiled modules would make a build cost the modules that
-changed. The design that fits the rest of this specification:
-
-- **Key.** A module's content name (3.2) is its cache key, and the
-  compiler's own build is part of it: a linklet another compiler compiled
-  is not reused. An entry records the module's dependencies, by path and
-  content name, since a macro can introduce a `require`; to look a module
-  up, the compiler hashes its source, looks up or recomputes the names of
-  the recorded dependencies, and takes the entry if every name matches.
-- **What an entry holds.** The module's linklets per phase, its program
-  linklet, and its interface: what it provides, its module-level bindings
-  (its entries, with their scope sets and phases), its requires with their
-  shifts, and what compiled code refers to in it: its functions with their
-  signatures, declared types and values, its globals, tags, data and
-  types, as canonical structural forms, the getters of its compile-time
-  values, and the lowered bodies of its inline functions.
-- **Names that belong to a run.** Scope ids and local binding keys are
-  counters of one run. A linklet's literals carry scope ids as the run
-  that compiled it assigned them, which the bootstrap tolerates only
-  because a full build does the same work in the same order every time;
-  with a cache the work differs, so ids must not reach the bytes. Hence:
-  a linklet's literals name scopes relative to the linklet. Each linklet
-  lists the scopes its literals hold, which the serializer records today,
-  and a literal holds an index into that list; the compiler maps the
-  indexes to the run's ids when it instantiates the linklet, always, as it
-  maps module scopes at a phase shift today (`%scope-map`, appendix A,
-  with a vector for the map). The interface's scope sets are relative the
-  same way, mapped when the interface is loaded, with a run id allocated
-  for each of the module's scopes once. Local binding keys in inline
-  bodies are renamed at every inlining already; a key in a quoted literal
-  is relative to its linklet in the same way.
-- **What stays as it is.** Instance names are content names, so imports
-  link unchanged. Type identities are structural (5.1), so they are
-  recomputed on load. Compile-time values are computed per compilation
-  as before (6.3): the cache holds code and interfaces, no compile-time
-  state.
-- **Determinism.** With relative scopes, a program's bytes do not depend
-  on which of its modules were compiled and which were loaded: `make
-  bootstrap` holds with a warm cache or a cold one, and a module loaded
-  from the cache is byte for byte what a fresh compile of it would be,
-  which is the property to test first.
-- **Where.** `build/cache/<compiler build>/<content name>/`, written by
-  `sub build` and `sub compile` and read by both; `sub expand` compiles
-  from source, since it prints the expansion.
-
-The relative scopes are the real work, and they are worth doing first on
-their own: they make the compiler's output independent of the order in
-which modules are compiled, which is a stronger form of the determinism
-1.4 asks for.
-
 ## Appendix A: the kernel module's representation (not part of the contract)
 
 This describes `compiler/kernel.sub` as it is. Macros must not depend on it;
@@ -1209,6 +1194,8 @@ the compiler may, because it is part of the expander.
 - **Memory**: the kernel module's memory holds its error messages.
 - **Queries**: the compiler registers the functions that answer the
   queries (2.3) with `%set-queries`. Until it does, each query traps.
+- **Interfaces** (3.7) are read with `%builder-data`: the last object
+  the bytes of a string builder describe, in the format above.
 - **Literal scopes**: a linklet's literals hold scope indexes (3.5), and
   `%make-syntax` maps them through `%scope-map`, a table the compiler
   fills before it instantiates a linklet in a compile-time store
