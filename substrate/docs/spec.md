@@ -214,8 +214,10 @@ them in Chez; in a run-time store they trap.
 
 ### 3.1 Modules and linklets
 
-- One source file is one module. A module's code at one phase compiles to
-  one wasm module, called a **linklet**, as in Racket. Phase 0 is the
+- One source file is one module, and two files with the same source,
+  requiring the same modules, are the same one (3.2). A module's code at
+  one phase compiles to one wasm module, called a **linklet**, as in
+  Racket. Phase 0 is the
   program. Phase *n*+1 code runs while phase *n* is expanded, so a module's
   phase-1 linklet holds its transformers, its compile-time values and its
   `begin-for-syntax` code.
@@ -272,6 +274,15 @@ them in Chez; in a run-time store they trap.
   each compilation a fresh store. The self-hosted compiler runs in a store
   of its own and gives each compilation a namespace in it (below), since
   macros share syntax objects with the compiler by reference.
+- A module is named by what it is: `<module>` is its file's stem and a
+  hash of its source and of the names of the modules it requires, at the
+  phase shifts it requires them, such as `substrate-core.7bb8be1396e6`
+  (64-bit FNV-1a over those strings, each followed by a zero byte, its top
+  48 bits in hexadecimal). So names do not depend on the order modules
+  are compiled in, or on where the files are, and two files with the same
+  source and requires name one module, whose instances they share.
+  While a module is expanded its compile-time linklets are named after
+  its stem, since its requires are not known yet.
 - A module's linklet instantiated at phase shift *t* is registered as
   `<module>@<phase>+<t>`. A compiled linklet imports from other linklets by
   names relative to its own module at phase shift 0, so one compiled

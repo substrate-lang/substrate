@@ -58,7 +58,9 @@ for t in tests/*.sub examples/*.sub; do
       problem="a compiled linklet does not validate"
     elif [ -f "$base.imports" ]; then
       entry="$(tail -n 1 "$program/program")"
-      imports="$(wasm-tools print "$program/$entry.wasm" | sed -n 's/^ *(import "\([^"]*\)".*/\1/p' | sort -u)"
+      # Instance names without the hash that ends a module's name (spec 3.2).
+      imports="$(wasm-tools print "$program/$entry.wasm" | sed -n 's/^ *(import "\([^"]*\)".*/\1/p' |
+                 sed 's/\.[0-9a-f]\{12\}@/@/' | sort -u)"
       if [ "$imports" != "$(sort -u "$base.imports")" ]; then
         problem="imports from: $(echo $imports), expected: $(echo $(cat "$base.imports"))"
       fi

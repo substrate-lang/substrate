@@ -18,7 +18,6 @@
 
   ;; Reading and code generation, marked for the host's profile.
   (define (profiled-compile-module forms name) (with-profile 'codegen (lambda () (compile-module forms name))))
-  (define (profiled-read-file path) (with-profile 'read (lambda () (read-file path))))
 
   (define gc-forms
     '(struct.new struct.get struct.get_s struct.get_u struct.set
@@ -85,7 +84,7 @@
   ;; module-level bindings, as (symbol scopes phase key). scope: its module
   ;; scope.
   (define-record-type unit
-    (fields path source name (mutable state) linklets (mutable requires) (mutable provides)
+    (fields path source (mutable name) (mutable state) linklets (mutable requires) (mutable provides)
             (mutable entries) (mutable expanded) (mutable scope)))
 
   ;; One phase of a module, compiled: bytes, the instance names it imports
@@ -517,17 +516,45 @@
             [else (loop (- i 1))])))
 
   ;; An instance-name stem from the file name: letters, digits, - and _.
-  (define (fresh-unit-name path)
+  ;; The stem of the file name at path: its letters, digits, - and _.
+  (define (file-stem path)
     (let* ([base (let loop ([cs (reverse (string->list path))] [acc '()])
                    (if (or (null? cs) (char=? (car cs) #\/)) (list->string acc) (loop (cdr cs) (cons (car cs) acc))))]
            [stem (let ([dot (let loop ([i (- (string-length base) 1)])
                               (cond [(< i 0) #f] [(char=? (string-ref base i) #\.) i] [else (loop (- i 1))]))])
-                   (if dot (substring base 0 dot) base))]
-           [clean (list->string (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_))) c #\_))
-                                     (string->list stem)))])
+                   (if dot (substring base 0 dot) base))])
+      (list->string (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_))) c #\_))
+                         (string->list stem)))))
+
+  ;; A module's name while it is expanded, for its compile-time linklets:
+  ;; its stem, numbered to be unique in this run.
+  (define provisional-names (make-hashtable string-hash string=?))
+  (define (provisional-name path)
+    (let ([stem (file-stem path)])
       (let loop ([n 1])
-        (let ([name (if (= n 1) clean (format "~a-~a" clean n))])
-          (if (hashtable-contains? modules-by-name name) (loop (+ n 1)) name)))))
+        (let ([name (if (= n 1) stem (format "~a-~a" stem n))])
+          (if (hashtable-contains? provisional-names name)
+              (loop (+ n 1))
+              (begin (hashtable-set! provisional-names name #t) name))))))
+
+  ;; The name of module m, whose source is text, once it is expanded: its
+  ;; stem and a hash of what it is, its source and the names of the modules
+  ;; it requires, at the phase shifts it requires them (spec 3.2).
+  (define (content-name m text)
+    (format "~a.~a" (file-stem (unit-path m))
+            (content-hash (cons text (apply append (map (lambda (r) (list (unit-name (car r)) (number->string (cdr r))))
+                                                        (unit-requires m)))))))
+
+  ;; A hash of the strings in list ss, as 12 hexadecimal digits: 64-bit
+  ;; FNV-1a over their UTF-8 bytes, each string followed by a zero byte,
+  ;; keeping the top 48 bits.
+  (define (content-hash ss)
+    (let* ([prime #x100000001b3] [mask (- (expt 2 64) 1)]
+           [step (lambda (h b) (bitwise-and (* (bitwise-xor h b) prime) mask))]
+           [h (fold-left (lambda (h s) (step (fold-left step h (bytevector->u8-list (string->utf8 s))) 0))
+                         #xcbf29ce484222325 ss)]
+           [digits (string-downcase (number->string (bitwise-arithmetic-shift-right h 16) 16))])
+      (string-append (make-string (- 12 (string-length digits)) #\0) digits)))
 
   ;; Compile the module in file `source` (and, first, what it requires).
   ;; Returns the module. Each module is compiled once per run.
@@ -540,17 +567,17 @@
         [else
          (unless (file-exists? source) (raise-compile-error #f "no module file ~a" source))
          (ensure-library!)
-         (let* ([name (fresh-unit-name path)]
-                [m (make-unit path source name 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
+         (let* ([text (call-with-input-file source get-string-all)]
+                [m (make-unit path source (provisional-name path) 'compiling (make-eqv-hashtable) '() '() '() #f #f)]
                 [c (make-comp m (new-cstore #t) 0 '() #f
                               (make-eqv-hashtable) (make-eqv-hashtable) (make-eqv-hashtable) '() '() '() '())])
            (hashtable-set! registry path m)
-           (hashtable-set! modules-by-name name m)
            (with-comp c
              (lambda ()
                (parameterize ([current-syntax-infos (cdr syntax-lib)])
-                 (unit-expanded-set! m (expand-module-body (profiled-read-file source)))
-                 (finish-module! c))))
+                 (unit-expanded-set! m (expand-module-body
+                                        (with-profile 'read (lambda () (read-string-all text (string->symbol source))))))
+                 (finish-module! c text))))
            m)])))
 
   ;; Expand a module body at phase 0; phase >= 1 code runs as it goes.
@@ -573,7 +600,7 @@
 
   ;; Run #%linklet over the expanded phase-0 code, resolve provides,
   ;; compile each phase's linklet, check (freestanding).
-  (define (finish-module! c)
+  (define (finish-module! c text)
     (let ([m (comp-module c)])
       (unit-expanded-set! m (apply-linklet-hook 'module (unit-expanded m)
                                                 (make-stx 'module (list (unit-scope m) core-scope) #f '()) 0))
@@ -594,6 +621,10 @@
                           (map (lambda (meaning) (cons (stx-e (car item)) meaning)) found)))
                       (reverse (comp-provide-ids c)))))
       (removed-definitions #f)
+      ;; Its requires known, the module takes its name, and its linklets theirs.
+      (unit-name-set! m (content-name m text))
+      (unless (hashtable-contains? modules-by-name (unit-name m))
+        (hashtable-set! modules-by-name (unit-name m) m))
       (let ([phases (list-sort < (let-values ([(ks vs) (hashtable-entries (comp-phase-forms c))])
                                    (let ([ps (vector->list ks)]) (if (memv 0 ps) ps (cons 0 ps)))))])
         (for-each (lambda (p)

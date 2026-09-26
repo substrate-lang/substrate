@@ -31,6 +31,7 @@
 (require ops "ops.sub" lookup-prim prim-op-params prim-op-kind prim-names)
 (require cmp "compile.sub" compile-module set-current-syntax-infos! set-syntax-types! set-current-source!)
 (require rd "reader.sub" read-file read-string-all)
+(require num "numbers.sub" content-hash)
 (require host "host.sub" export-index call-getter scope-map-add scope-map-clear error-string)
 
 (provide report-trap set-syntax-library-root! compile-module-file module-linklet-list module-expanded-forms
@@ -99,8 +100,8 @@
 ;; A compiled (or compiling) module. linklets: phase -> linklet. requires:
 ;; list of (module . shift). provides: list of (symbol . meaning). entries:
 ;; its module-level bindings, as (symbol scopes phase key). scope: its
-;; module scope.
-(struct unit (path source name [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
+;; module scope. name: what its instance names start with (spec 3.2).
+(struct unit (path source [name #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
               [entries #:mutable] [expanded #:mutable] [scope #:mutable]))
 
 ;; One phase of a module, compiled: bytes, the instance names it imports
@@ -560,20 +561,34 @@
   (let ([slash (last-byte-index path 47)])
     (if slash (substring/utf-8 path 0 (+ slash 1)) "")))
 
-;; The names of the modules compiled so far.
-(define unit-names (make-hash))
-
-;; An instance-name stem from the file name: letters, digits, - and _.
-(define (fresh-unit-name path)
+;; The stem of the file name at path: its letters, digits, - and _.
+(define (file-stem path)
   (let* ([slash (last-byte-index path 47)]
          [base (if slash (substring/utf-8 path (+ slash 1) (string-utf-8-length path)) path)]
          [dot (last-byte-index base 46)]
-         [stem (if dot (substring/utf-8 base 0 dot) base)]
-         [clean (list->string (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_))) c #\_))
-                                   (string->list stem)))])
+         [stem (if dot (substring/utf-8 base 0 dot) base)])
+    (list->string (map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c) (memv c '(#\- #\_))) c #\_))
+                       (string->list stem)))))
+
+;; A module's name while it is expanded, for its compile-time linklets:
+;; its stem, numbered to be unique in this run.
+(define provisional-names (make-hash))
+(define (provisional-name path)
+  (let ([stem (file-stem path)])
     (let loop ([n 1])
-      (let ([name (if (= n 1) clean (format "~a-~a" clean n))])
-        (if (hash-has-key? unit-names name) (loop (+ n 1)) (begin (hash-set! unit-names name #t) name))))))
+      (let ([name (if (= n 1) stem (format "~a-~a" stem n))])
+        (if (hash-has-key? provisional-names name)
+            (loop (+ n 1))
+            (begin (hash-set! provisional-names name #t) name))))))
+
+;; The name of module m, whose source is text, once it is expanded: its
+;; stem and a hash of what it is, its source and the names of the modules
+;; it requires, at the phase shifts it requires them (spec 3.2). Modules
+;; with the same name are the same module.
+(define (content-name m text)
+  (format "~a.~a" (file-stem (unit-path m))
+          (content-hash (cons text (apply append (map (lambda (r) (list (unit-name (car r)) (number->string (cdr r))))
+                                                      (unit-requires m)))))))
 
 ;; Compile the module in file `source` (and, first, what it requires).
 ;; Returns the module. Each module is compiled once per run.
@@ -586,16 +601,16 @@
       [else
        (unless (file-exists? source) (raise-compile-error #f "no module file ~a" source))
        (ensure-library!)
-       (let* ([name (fresh-unit-name path)]
-              [m (unit path source name 'compiling (make-hasheqv) '() '() '() #f #f)]
+       (let* ([text (file->string source)]
+              [m (unit path source (provisional-name path) 'compiling (make-hasheqv) '() '() '() #f #f)]
               [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '())]
               [saved-infos current-syntax-infos])
          (hash-set! registry path m)
          (with-comp c
            (lambda ()
              (set-syntax-infos! (cdr syntax-lib))
-             (set-unit-expanded! m (expand-module-body (read-file source)))
-             (finish-module! c)
+             (set-unit-expanded! m (expand-module-body (read-string-all text (string->symbol source))))
+             (finish-module! c text)
              (set-syntax-infos! saved-infos)))
          m)])))
 
@@ -619,7 +634,7 @@
 
 ;; Run #%linklet over the expanded phase-0 code,
 ;; resolve provides, compile each phase's linklet, check (freestanding).
-(define (finish-module! c)
+(define (finish-module! c text)
   (let ([m (comp-module c)])
     (set-unit-expanded! m (apply-linklet-hook 'module (unit-expanded m)
                                               (make-stx 'module (list (unit-scope m) core-scope) #f '()) 0))
@@ -640,6 +655,8 @@
                      (map (lambda (meaning) (cons (stx-e (car item)) meaning)) found)))
                  (reverse (comp-provide-ids c)))))
     (set! removed-definitions #f)
+    ;; Its requires known, the module takes its name, and its linklets theirs.
+    (set-unit-name! m (content-name m text))
     (let ([phases (sort (let ([ps (hash-keys (comp-phase-forms c))]) (if (memv 0 ps) ps (cons 0 ps))) <)])
       (for-each (lambda (p)
                   (let* ([forms (append (storage-forms p) (reverse (hash-ref (comp-phase-forms c) p '())))]
