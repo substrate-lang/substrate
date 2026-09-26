@@ -22,11 +22,25 @@ compiler="$root/bin/sub"
 builds="${OUT:-build}"
 host="$root/${HOST:-build/subhost}"
 
+# bin/sub keeps compiled modules in build/cache. The suite removes it
+# first, so that every test compiles its module: a test's expected output
+# includes what the module prints while compiling, and a module loaded
+# from the cache prints nothing. Each program is then built again from
+# the cache, which must give the same bytes (below).
+rm -rf "$root/build/cache"
 # Build the kernel module once first, so its compile notices stay out
 # of test output.
 mkdir -p build
 "$compiler" kernel -o build/kernel.wasm > /dev/null
 wasm-tools validate build/kernel.wasm || { echo "FAIL kernel.wasm does not validate"; exit 1; }
+
+# Each linklet of the program in directory $1 validates.
+validates() { while read -r l; do wasm-tools validate "$1/$l.wasm" || return 1; done < "$1/program"; }
+# The program in directory $1 is byte for byte the one in $2.
+same_program() {
+  cmp -s "$1/program" "$2/program" || return 1
+  while read -r l; do cmp -s "$1/$l.wasm" "$2/$l.wasm" || return 1; done < "$1/program"
+}
 
 pass=0
 fail=0
@@ -46,8 +60,7 @@ for t in tests/*.sub examples/*.sub; do
   if [ -f "$base.out" ]; then
     if [ $code -ne 0 ] || [ "$actual" != "$(cat "$base.out")" ]; then
       problem="output differs (exit $code)"
-    elif ! while read -r linklet; do
-             wasm-tools validate "$program/$linklet.wasm" || exit 1; done < "$program/program"; then
+    elif ! validates "$program"; then
       problem="a compiled linklet does not validate"
     elif [ -f "$base.imports" ]; then
       entry="$(tail -n 1 "$program/program")"
@@ -82,21 +95,23 @@ for f in "$builds"/tests/order-a/order-[mn].*.wasm; do
     echo "FAIL tests/order-b: $(basename "$f") differs from tests/order-a's"
   fi
 done
-# The cache (spec 3.7): a program built again, its modules loaded from
-# the cache, is byte for byte what the first build wrote.
-again="$builds/tests/order-a-again"
-rm -rf "$again"
-mkdir -p "$again"
-if (cd tests && "$compiler" build order-a.sub -o "$root/$again" > /dev/null 2>&1); then
-  while read -r linklet; do
-    if ! cmp -s "$again/$linklet.wasm" "$builds/tests/order-a/$linklet.wasm"; then
-      fail=$((fail + 1))
-      echo "FAIL tests/order-a: built again from the cache, $linklet differs"
-    fi
-  done < "$again/program"
-else
-  fail=$((fail + 1))
-  echo "FAIL tests/order-a: does not build again from the cache"
-fi
-echo "$pass passed, $fail failed"
+# The cache (spec 3.7): every program built again, its modules loaded
+# from the cache, is byte for byte what the first build wrote.
+again=0
+for t in tests/*.sub examples/*.sub; do
+  dir="$(dirname "$t")"
+  name="$(basename "$t" .sub)"
+  program="$builds/$dir/$name"
+  [ -f "$program/program" ] || continue
+  rebuilt="$builds/again/$dir/$name"
+  rm -rf "$rebuilt"
+  mkdir -p "$rebuilt"
+  if (cd "$dir" && "$compiler" build "$name.sub" -o "$root/$rebuilt" > /dev/null 2>&1) && same_program "$rebuilt" "$program"; then
+    again=$((again + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL $dir/$name: built again from the cache, the program differs"
+  fi
+done
+echo "$pass passed, $fail failed; $again programs rebuilt from the cache"
 [ $fail -eq 0 ]

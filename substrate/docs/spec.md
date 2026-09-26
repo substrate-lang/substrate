@@ -78,9 +78,9 @@ seed is older than the source. The bootstrap reaches its **fixpoint** when
 included: the compiler reproduces itself exactly (`make bootstrap`). That
 needs compilation to be deterministic, which is why the host gives
 programs no clocks or randomness (section 4). Nor does a build depend on
-where the repository is: the kernel module's source locations (3.6) name
-it `compiler/kernel.sub`, as other files are named by the paths the build
-gives, relative to the repository.
+where the repository is, or where it is run from: the kernel module's
+source locations (3.6) name it `compiler/kernel.sub`, and other files are
+named relative to the package root (3.6).
 
 For the compiler's source to use something the seed does not know, the
 feature is added first, then the seed is replaced by the new build (`make
@@ -445,6 +445,14 @@ the use takes the use's location (6.2). So what a library's macro expands
 to is located where the macro was used. The code of an inline function
 (5.2) takes the location of the call it is inlined at.
 
+A file is named by its path as the build gives it, `.` and `..` segments
+resolved, which is also what names the module in it. Paths are relative
+to the working directory (section 4), and `bin/sub` runs the compiler
+from the **package root**, the repository unless `-p DIR` names another,
+giving it the files relative to that root: so a module's bytes are the
+same wherever it is built from, and a module outside the package is
+named by an absolute path.
+
 ### 3.7 The cache
 
 With a cache directory (`sub build -c DIR`, which `bin/sub` gives as
@@ -479,10 +487,13 @@ compiled, so another compiler's files are never taken.
   compiled one would; its compile-time values are computed per
   compilation as before (6.3).
 - Since a linklet's bytes do not depend on the run that compiled it
-  (3.5), a program built from cached modules is byte for byte the program
-  a cold build writes, and the bootstrap (1.4), which uses no cache, is
-  what `make check` runs with one. `sub expand` compiles from source,
-  since it prints the expansion.
+  (3.5) or on where it was built from (3.6), a program built from cached
+  modules is byte for byte the program a cold build writes: `make check`
+  removes the cache, builds every test, then builds each again from the
+  cache and compares. Two files that are one module (3.2) have one set of
+  linklets, the first file's, whose source they name (3.6); the second is
+  expanded, for what its expansion does, and takes the first's. `sub
+  expand` compiles from source, since it prints the expansion.
 
 ## 4. Host interface
 
@@ -512,7 +523,8 @@ it. An instantiated module can reach exactly what its imports name, so
 compile-time code runs sandboxed. The first five imports are tested from
 kernel code in `tests/hook.sub`, and the rest through Substrate
 (`lib/substrate.sub`). A path is relative to the process's working
-directory.
+directory, which is the package root when `bin/sub` runs the compiler
+(3.6).
 
 **Running a program.** `sub build FILE -o DIR` writes the program
 `FILE` is the entry of: each linklet it instantiates at run time, as
