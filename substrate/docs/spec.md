@@ -323,13 +323,14 @@ they trap.
   a store of its own and gives each compilation a namespace in it
   (below), since macros share syntax objects with the compiler by
   reference.
-- A module is named by what it is: `<module>` is its file's stem and a
-  hash of its source and of the names of the modules it requires, at the
-  phase shifts it requires them, such as `substrate-core.7bb8be1396e6`
-  (64-bit FNV-1a over those strings, each followed by a zero byte, its top
-  48 bits in hexadecimal). So names do not depend on the order modules
-  are compiled in, or on where the files are, and two files with the same
-  source and requires name one module, whose instances they share.
+- A module is what it is: its identity is a hash of its source and of
+  the hashes of the modules it requires, at the phase shifts it requires
+  them (64-bit FNV-1a over those strings, each followed by a zero byte,
+  its top 48 bits in hexadecimal), and `<module>` is its file's stem and
+  that hash, such as `substrate-core.7bb8be1396e6`. So the hash does not
+  depend on the order modules are compiled in, or on where or what the
+  files are called, and two files with the same source and requires are
+  one module, whose instances they share.
   While a module is expanded its compile-time linklets are named after
   its stem, since its requires are not known yet.
 - A module's linklet instantiated at phase shift *t* is registered as
@@ -455,22 +456,22 @@ named by an absolute path.
 
 ### 3.7 The cache
 
-With a cache directory (`sub build -c DIR`, which `bin/sub` gives as
-`build/cache`), a module compiled once is loaded from the cache while
-its source and the names of its requires are as they were: its
-linklets, one per phase, and its **interface**, what the expander keeps
-of a module it compiled, as quoted data in the kernel's format (3.5).
-The cache is one compiler's: its files are named after the compiler's
-**build**, a hash of the compiler's sources taken when the compiler is
-compiled, so another compiler's files are never taken.
+With a cache directory (`sub build -c DIR`; `bin/sub` gives
+`build/cache` unless told another), a module compiled once is loaded
+from the cache while its source and its requires are as they were: its
+linklets, one per phase, named as their instances are, and its
+**interface**, what the expander keeps of a module it compiled, as
+quoted data in the kernel's format (3.5).
 
-- An entry records the module's content name (3.2) and its requires, by
-  path and phase shift, a macro-introduced `require` among them. To
-  look a module up, the compiler compiles or loads the recorded requires
-  first, as it would to compile the module, computes the module's name
-  from its source and their names, and takes the entry if the name is
-  the recorded one. Nothing is cached while the running and target
-  kernels differ (1.4), since the cache holds one kernel's code.
+- An interface begins with what it is of: the interface format's
+  version, the kernel by hash, the module's hash (3.2), and its
+  requires by path, hash and phase shift, a macro-introduced `require`
+  among them. The cache's index maps a source path to the hash of the
+  module last compiled from it. To look a module up, the compiler reads
+  the index and the interface, compiles or loads the recorded requires
+  as it would to compile the module, and takes the interface if it is of
+  this format and kernel and the module's hash, of its source and their
+  hashes, comes out as recorded.
 - An interface holds what compiled code refers to in the module and what
   other modules' expansions need: its provides, its module-level bindings
   with their scope sets and phases, its functions with their signatures,
@@ -492,8 +493,12 @@ compiled, so another compiler's files are never taken.
   removes the cache, builds every test, then builds each again from the
   cache and compares. Two files that are one module (3.2) have one set of
   linklets, the first file's, whose source they name (3.6); the second is
-  expanded, for what its expansion does, and takes the first's. `sub
-  expand` compiles from source, since it prints the expansion.
+  expanded, for what its expansion does, and takes the first's. The cache
+  holds one kernel's code, so it is neither read nor written while the
+  running and target kernels differ (1.4); and a compiled module has the
+  compiler's decisions in it, so `make build/sub` removes the cache when
+  it builds a new compiler. `sub expand` compiles from source, since it
+  prints the expansion.
 
 ## 4. Host interface
 

@@ -8,11 +8,12 @@ build/subhost: host/subhost.c
 
 # The compiler bin/sub runs (spec 1.4). The seed, a build of the compiler
 # by itself, checked in, builds the compiler's source (build/sub-1), which
-# builds it again: build/sub is the source compiled by itself.
+# builds it again: build/sub is the source compiled by itself. A new
+# compiler starts its cache (spec 3.7) over.
 COMPILER_SOURCES := $(wildcard compiler/*.sub lib/*.sub)
 
 build/sub: $(COMPILER_SOURCES) seed/program
-	rm -rf build/sub-1 build/sub
+	rm -rf build/sub-1 build/sub build/cache
 	mkdir -p build/sub-1 build/sub
 	host/subhost.mjs seed $(CURDIR) build compiler/main.sub -o build/sub-1
 	host/subhost.mjs build/sub-1 $(CURDIR) build compiler/main.sub -o build/sub

@@ -37,7 +37,7 @@ Everything runs in the flake's dev shell:
 ```sh
 nix develop
 make check                      # the tests: built by bin/sub, run on build/subhost
-bin/sub build FILE -o DIR       # write FILE's program to DIR; modules are cached in build/cache (spec 3.7)
+bin/sub build FILE -o DIR       # write FILE's program to DIR; modules are cached in build/cache, or -c DIR (spec 3.7)
 bin/sub -p DIR build FILE ...   # FILE is in the package at DIR (spec 3.6), rather than in this repository
 build/subhost DIR [ARG ...]     # run it on wasmtime
 host/subhost.mjs DIR [ARG ...]  # run it on V8
