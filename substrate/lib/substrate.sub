@@ -56,6 +56,11 @@
 ;;                                  that a pred is true of, the value of
 ;;                                  the first such pred's handler, called
 ;;                                  with it once body has been left
+;;   (syntax-match subject [pattern body ...] ...)
+;;                                  the body of the first clause whose
+;;                                  pattern subject matches, with the
+;;                                  pattern's variables bound (syntax
+;;                                  patterns, below)
 ;;
 ;; and the functions the provides below list, grouped as they are defined
 ;; there. A function given an argument of the wrong type, or the wrong
@@ -87,6 +92,7 @@
 (begin-for-syntax (require-unqualified core "substrate-core.sub"))
 
 (provide (except-out (all-from-out core) call-with-handlers) else when unless and or cond case do with-handlers
+         syntax-match _ ... ?
          list-tail list-ref last-pair take [drop list-drop] last findf range sort
          memq memv member assq assv assoc map for-each andmap ormap filter foldl foldr)
 
@@ -348,3 +354,236 @@
 (define (foldl-in f acc l) (if (pair? l) (foldl-in f (f (car l) acc) (cdr l)) acc))
 (define (foldl-n f acc ls)
   (if (pair? (car ls)) (foldl-n f (apply f (append (cars ls) (list acc))) (cdrs ls)) acc))
+
+;; ---- syntax patterns -------------------------------------------------------------------
+;;
+;; (syntax-match subject [pattern body ...] ...) takes syntax apart, as
+;; quasisyntax builds it. The clauses are tried in order: the first whose
+;; pattern subject matches binds the pattern's variables, and its body
+;; gives the value. A pattern is:
+;;
+;;   x                  an identifier: anything, bound to x
+;;   _                  anything
+;;   #:kw "s" 5 #\c #t  syntax whose datum is equal to it
+;;   'd                 syntax whose datum is equal to d: for a symbol, an
+;;                      identifier of that name
+;;   #'id               an identifier free-identifier=? to id, which asks
+;;                      the expander, so only a macro can use it
+;;   (p ...), (p ... . tail)
+;;                      a syntax list or a list, element by element
+;;   p ...              in a list, as many elements that match p as there
+;;                      can be while the rest of the list matches
+;;   (? pred p ...)     x, if (pred x) is true and every p matches x
+;;
+;; A variable is bound to syntax, or under an ellipsis to the list of what
+;; each element bound, which #,@ splices. _, ... and ? are compared by
+;; binding. If no clause matches, it is a syntax error blamed on subject:
+;; "expected" and the patterns, each written as it is, but for a check
+;; (? pred p ...), written as its last p, and a _ at a pattern's head,
+;; written as subject's head.
+
+(define-syntax (_ stx) (raise-syntax-error #f "allowed only in a pattern" stx))
+(define-syntax (... stx) (raise-syntax-error #f "allowed only in a pattern" stx))
+(define-syntax (? stx) (raise-syntax-error #f "allowed only in a pattern" stx))
+
+(begin-for-syntax
+  ;; A pattern is parsed into a description, a datum that match-syntax
+  ;; walks: (var i name), the pattern's variable i; (any); (datum d);
+  ;; (bound i name), an identifier free-identifier=? to value i; (check i
+  ;; p ...), value i being the predicate; or (list (element ...) tail),
+  ;; where an element is a description or (repeat p (i ...)), p repeated,
+  ;; binding variables i ..., and tail is a description or (null). The
+  ;; values are the syntax-match's predicates and #'id identifiers, which
+  ;; it evaluates first. A name is as written, for errors.
+
+  (define (pattern-keyword? x k) (if (identifier? x) (free-identifier=? x k) #f))
+
+  ;; Is l a list of two elements?
+  (define (two? l) (if (pair? l) (if (pair? (cdr l)) (null? (cdr (cdr l))) #f) #f))
+
+  ;; The numbers from i below n.
+  (define (numbers-from i n) (if (< i n) (cons i (numbers-from (+ i 1) n)) '()))
+
+  ;; Is an identifier in ids named as id is?
+  (define (named-in? id ids)
+    (if (null? ids) #f (if (eq? (syntax-e (car ids)) (syntax-e id)) #t (named-in? id (cdr ids)))))
+
+  ;; Patterns ps parsed, as (descriptions variables values): for each
+  ;; pattern its description and its variables, in order, and the values
+  ;; the descriptions refer to, in order.
+  (define (parse-patterns ps)
+    (let ([values '()] [vars '()])
+      (letrec
+          ([value! (lambda (e) (set! values (cons e values)) (- (length values) 1))]
+           [var! (lambda (id)
+                   (if (named-in? id vars)
+                       (raise-syntax-error 'syntax-match "this pattern variable appears twice in its pattern" id)
+                       (begin (set! vars (cons id vars)) (- (length vars) 1))))]
+           [parse (lambda (p)
+                    (let ([e (syntax-e p)])
+                      (if (symbol? e)
+                          (if (pattern-keyword? p #'_)
+                              '(any)
+                              (if (if (pattern-keyword? p #'...) #t (pattern-keyword? p #'?))
+                                  (raise-syntax-error 'syntax-match "not allowed here in a pattern" p)
+                                  (list 'var (var! p) e)))
+                          (if (pair? e) (parse-form p e) (if (null? e) '(list () (null)) (list 'datum e))))))]
+           [parse-form (lambda (p e)
+                         (if (if (two? e) (pattern-keyword? (car e) #'quote) #f)
+                             (list 'datum (syntax->datum (cadr e)))
+                             (if (if (two? e) (pattern-keyword? (car e) #'quote-syntax) #f)
+                                 (if (identifier? (cadr e))
+                                     (list 'bound (value! p) (syntax-e (cadr e)))
+                                     (raise-syntax-error 'syntax-match "expected #'identifier" p))
+                                 (if (pattern-keyword? (car e) #'?)
+                                     (if (if (pair? (cdr e)) (list? (cdr e)) #f)
+                                         (cons 'check (cons (value! (cadr e)) (parse-all (cddr e))))
+                                         (raise-syntax-error 'syntax-match "expected (? predicate pattern ...)" p))
+                                     (let ([r (elements e)]) (list 'list (car r) (cdr r)))))))]
+           [parse-all (lambda (ps) (if (null? ps) '() (let ([d (parse (car ps))]) (cons d (parse-all (cdr ps))))))]
+           ;; The elements and the tail of pair chain l, as (elements . tail).
+           [elements (lambda (l)
+                       (if (pair? l)
+                           (if (pattern-keyword? (car l) #'...)
+                               (raise-syntax-error 'syntax-match "... follows the pattern it repeats" (car l))
+                               (if (if (pair? (cdr l)) (pattern-keyword? (cadr l) #'...) #f)
+                                   (let* ([before (length vars)]
+                                          [d (parse (car l))]
+                                          [repeat (list 'repeat d (numbers-from before (length vars)))]
+                                          [r (elements (cddr l))])
+                                     (cons (cons repeat (car r)) (cdr r)))
+                                   (let* ([d (parse (car l))] [r (elements (cdr l))])
+                                     (cons (cons d (car r)) (cdr r)))))
+                           (cons '() (if (null? l) '(null) (parse l)))))])
+        (let loop ([ps ps] [descs '()] [varss '()])
+          (if (null? ps)
+              (list (reverse descs) (reverse varss) (reverse values))
+              (begin
+                (set! vars '())
+                (let ([d (parse (car ps))])
+                  (loop (cdr ps) (cons d descs) (cons (reverse vars) varss)))))))))
+
+  ;; A syntax-match's clauses, each [pattern body ...], as lists.
+  (define (match-clauses cs)
+    (if (null? cs)
+        '()
+        (let ([c (syntax->list (car cs))])
+          (if (if c (>= (length c) 2) #f)
+              (cons c (match-clauses (cdr cs)))
+              (raise-syntax-error 'syntax-match "expected a clause [pattern body ...]" (car cs))))))
+
+  (define (clause-patterns cs) (if (null? cs) '() (cons (car (car cs)) (clause-patterns (cdr cs)))))
+
+  (define (literal d) (datum->syntax #'here d))
+
+  ;; [x (vector-ref m i)] for each variable x, the i-th.
+  (define (variable-bindings vars i)
+    (if (null? vars)
+        '()
+        (cons #`[#,(car vars) (vector-ref m #,(literal i))] (variable-bindings (cdr vars) (+ i 1)))))
+
+  ;; Code that tries clauses cs, whose patterns have descriptions ds and
+  ;; variables varss, in turn; all: every description, for the error if
+  ;; none matches.
+  (define (match-code cs ds varss all)
+    (if (null? cs)
+        #`(no-match '#,(literal all) s)
+        #`(let ([m (match-syntax '#,(literal (car ds)) #,(literal (length (car varss))) values s)])
+            (if m
+                (let (#,@(variable-bindings (car varss) 0)) #,@(cdr (car cs)))
+                #,(match-code (cdr cs) (cdr ds) (cdr varss) all))))))
+
+;; (syntax-match subject [pattern body ...] ...)
+(define-syntax (syntax-match stx)
+  (let* ([parts (syntax->list stx)]
+         [clauses (if (if parts (>= (length parts) 3) #f)
+                      (match-clauses (cddr parts))
+                      (raise-syntax-error #f "expected (syntax-match subject [pattern body ...] ...)" stx))]
+         [parsed (parse-patterns (clause-patterns clauses))]
+         [values (caddr parsed)])
+    #`(let ([s #,(cadr parts)] [values #,(if (null? values) #''#f #`(vector #,@values))])
+        #,(match-code clauses (car parsed) (cadr parsed) (car parsed)))))
+
+;; The bindings of the n variables of description d, as a vector, if x
+;; matches d; otherwise #f. values: the syntax-match's values.
+(define (match-syntax d n values x)
+  (let ([vs (make-vector n #f)])
+    (and (matches? d x values vs) vs)))
+
+;; Does x match description d? The variables d binds are written in vs.
+(define (matches? d x values vs)
+  (case (car d)
+    [(list) (elements-match? (cadr d) (caddr d) (list-part x) values vs)]
+    [(var) (vector-set! vs (cadr d) x) #t]
+    [(datum) (equal? (syntax->datum x) (cadr d))]
+    [(check) (and ((vector-ref values (cadr d)) x) (andmap (lambda (p) (matches? p x values vs)) (cddr d)))]
+    [(any) #t]
+    [(bound) (and (identifier? x) (free-identifier=? x (vector-ref values (cadr d))))]))
+
+;; x's elements if it is a syntax list; otherwise x.
+(define (list-part x) (if (syntax? x) (syntax-e x) x))
+
+;; Do the elements of list l match descriptions es, and what follows them
+;; tail?
+(define (elements-match? es tail l values vs)
+  (cond [(null? es) (if (eq? (car tail) 'null) (null? (list-part l)) (matches? tail l values vs))]
+        [(eq? (car (car es)) 'repeat) (repeat-matches? (car es) (cdr es) tail l values vs)]
+        [else (let ([l (list-part l)])
+                (and (pair? l) (matches? (car es) (car l) values vs)
+                     (elements-match? (cdr es) tail (cdr l) values vs)))]))
+
+;; e is (repeat p (i ...)): do elements from the start of l match p, as
+;; many as can while es and tail match the rest? Variables i ... are bound
+;; to lists.
+(define (repeat-matches? e es tail l values vs)
+  (let ([p (cadr e)] [vars (caddr e)])
+    ;; rows: for each element that matches p, the latest first, the values
+    ;; of vars then and the rest of l after it.
+    (let collect ([rest l] [rows '()])
+      (let ([m (list-part rest)])
+        (if (and (pair? m) (matches? p (car m) values vs))
+            (collect (cdr m) (cons (cons (map (lambda (i) (vector-ref vs i)) vars) (cdr m)) rows))
+            (let try ([rows rows])
+              (set-repeated! vars (reverse (map car rows)) vs)
+              (or (elements-match? es tail (if (null? rows) l (cdr (car rows))) values vs)
+                  (and (pair? rows) (try (cdr rows))))))))))
+
+;; Bind each of vars to the list of its values in rows, each row the values
+;; of vars, in order.
+(define (set-repeated! vars rows vs)
+  (unless (null? vars)
+    (vector-set! vs (car vars) (map car rows))
+    (set-repeated! (cdr vars) (map cdr rows) vs)))
+
+;; No clause matched x, and ds are the descriptions of the clauses'
+;; patterns: the error.
+(define (no-match ds x)
+  (raise-syntax-error #f (string-append "expected " (alternatives (map (lambda (d) (pattern-text d x)) ds))) x))
+
+;; "a", "a or b", "a, b or c".
+(define (alternatives ts)
+  (cond [(null? (cdr ts)) (car ts)]
+        [(null? (cddr ts)) (string-append (car ts) " or " (cadr ts))]
+        [else (string-append (car ts) ", " (alternatives (cdr ts)))]))
+
+;; Description d written as its pattern is, in an error about x: a _ at its
+;; head as x's head.
+(define (pattern-text d x)
+  (let ([l (list-part x)])
+    (if (and (eq? (car d) 'list) (pair? (cadr d)) (equal? (car (cadr d)) '(any)) (pair? l) (identifier? (car l)))
+        (description-text (list 'list (cons (list 'datum (syntax-e (car l))) (cdr (cadr d))) (caddr d)))
+        (description-text d))))
+
+(define (description-text d)
+  (case (car d)
+    [(var bound) (symbol->string (caddr d))]
+    [(datum) (format "~s" (cadr d))]
+    [(any) "_"]
+    [(check) (if (null? (cddr d)) "_" (description-text (last (cddr d))))]
+    [(repeat) (string-append (description-text (cadr d)) " ...")]
+    [(list) (string-append "(" (spaced (map description-text (cadr d)))
+                           (if (eq? (car (caddr d)) 'null) "" (string-append " . " (description-text (caddr d))))
+                           ")")]))
+
+;; Strings ts, with a space between each two.
+(define (spaced ts) (if (null? ts) "" (foldl (lambda (t acc) (string-append acc " " t)) (car ts) (cdr ts))))
