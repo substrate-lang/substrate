@@ -138,6 +138,10 @@ The contract promises this about them:
   equal. Characters, strings, larger integers and flonums are not
   guaranteed to be `ref.eq`; compare characters and strings with
   `char->integer` and `string=?`, and numbers by their values.
+- Bytes, a mutable byte array, are a value too: quoted data (3.5) can
+  hold them, and they are the wasm type `(array (mut i8))` declared on
+  its own, wherever it is declared, so a language's bytes are the
+  kernel's without naming them (appendix A).
 - Everything else about the representation is private (appendix A).
 
 Counts, indices, bytes and predicate results are `i32`, not values:
@@ -1175,11 +1179,14 @@ This describes `compiler/kernel.sub` as it is. Macros must not depend on it;
 the compiler may, because it is part of the expander.
 
 - **Types**, all in one recursion group, so that no type declared elsewhere
-  is the same wasm type unless it copies the whole group (5.2):
+  is the same wasm type unless it copies the whole group (5.2), except
+  `%bytes` and `%transformer-code`, declared on their own so that they are
+  the same type wherever they are declared:
 
   | Type | Definition | Holds |
   |---|---|---|
   | `%string` | `(array (mut i8))` | UTF-8 bytes |
+  | `%bytes` | `(array (mut i8))`, on its own | bytes (2.2) |
   | `%pair` | `(struct (field car eqref) (field cdr eqref))` | pairs |
   | `%symbol` | `(struct (field name (ref %string)) (field hash i32))` | symbols, with their name's hash |
   | `%atom` | `(struct (field kind i32) (field value i32))` | characters (kind 0), `#t` (1), `()` (2) |
