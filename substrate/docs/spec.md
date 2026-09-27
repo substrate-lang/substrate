@@ -290,8 +290,9 @@ they trap.
   bound both as a type and as a value provides both. One name cannot be
   provided for two different bindings.
 - `(require name source item ...)` imports what another module provides.
-  `source` is `"path"` (relative to the requiring file) or `kernel` (the
-  kernel module, section 2).
+  `source` is `"path"` (relative to the requiring file), `kernel` (the
+  kernel module, section 2), or `(compiled "dir")`, the program built to
+  `dir` (3.7), whose entry it requires.
   - Everything the source provides is bound **qualified**, as
     `name:thing`. Nothing is imported unqualified by default.
   - Each item also binds one thing unqualified: `x` binds `x`, and
@@ -502,6 +503,16 @@ next to embed (1.4).
   shifts, and registers its linklets, types and definitions as a
   compiled one would; its compile-time values are computed per
   compilation as before (6.3).
+- A module's compiled form is its files: its linklets, named as their
+  instances are, and its interface, named by its hash. `sub build`
+  writes them beside the program, for the entry and every module it
+  requires at any phase, when the run has one kernel (1.4); the cache
+  holds them the same way, with its index. `(require name (compiled
+  "dir"))` loads the entry of the program in `dir`, and each module it
+  requires from the same directory by hash, unless the run has made that
+  module already; a module of another interface format or of another
+  kernel is an error. So a program's directory is what a host runs and
+  what a compiler imports.
 - Since a linklet's bytes do not depend on the run that compiled it
   (3.5) or on where it was built from (3.6), a program built from cached
   modules is byte for byte the program a cold build writes: `make check`
@@ -549,7 +560,8 @@ directory, which is the package root when `bin/sub` runs the compiler
 **Running a program.** `sub build FILE -o DIR` writes the program
 `FILE` is the entry of: each linklet it instantiates at run time, as
 `DIR/<instance name>.wasm`, and `DIR/program`, their instance names one per
-line, each after the linklets it imports from, the entry's own last.
+line, each after the linklets it imports from, the entry's own last; and
+beside them the compiled modules of the entry and its requires (3.7).
 `build/subhost DIR arg ...` runs it: in one store, it
 instantiates each linklet under its name, gives the program the arguments,
 and calls the entry's `main`. It exits with status 0 when `main` returns,

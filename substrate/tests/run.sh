@@ -36,11 +36,19 @@ wasm-tools validate build/kernel.wasm || { echo "FAIL kernel.wasm does not valid
 
 # Each linklet of the program in directory $1 validates.
 validates() { while read -r l; do wasm-tools validate "$1/$l.wasm" || return 1; done < "$1/program"; }
-# The program in directory $1 is byte for byte the one in $2.
+# The program in directory $1 is byte for byte the one in $2, its
+# compiled modules' interfaces included.
 same_program() {
   cmp -s "$1/program" "$2/program" || return 1
   while read -r l; do cmp -s "$1/$l.wasm" "$2/$l.wasm" || return 1; done < "$1/program"
+  for f in "$2"/*.interface; do cmp -s "$1/$(basename "$f")" "$f" || return 1; done
 }
+
+# A compiled module for tests/compiled-import.sub: a fixture built to a
+# directory (spec 3.7).
+mkdir -p build/tests/compiled
+(cd tests/fixtures && "$compiler" build geometry.sub -o "$root/build/tests/compiled/geometry" > /dev/null) ||
+  { echo "FAIL building tests/fixtures/geometry.sub as a compiled module"; exit 1; }
 
 pass=0
 fail=0
@@ -106,11 +114,14 @@ for t in tests/*.sub examples/*.sub; do
   rebuilt="$builds/again/$dir/$name"
   rm -rf "$rebuilt"
   mkdir -p "$rebuilt"
-  if (cd "$dir" && "$compiler" build "$name.sub" -o "$root/$rebuilt" > /dev/null 2>&1) && same_program "$rebuilt" "$program"; then
-    again=$((again + 1))
-  else
+  if ! (cd "$dir" && "$compiler" build "$name.sub" -o "$root/$rebuilt" > /dev/null 2>&1); then
+    fail=$((fail + 1))
+    echo "FAIL $dir/$name: does not build again from the cache"
+  elif ! same_program "$rebuilt" "$program"; then
     fail=$((fail + 1))
     echo "FAIL $dir/$name: built again from the cache, the program differs"
+  else
+    again=$((again + 1))
   fi
 done
 echo "$pass passed, $fail failed; $again programs rebuilt from the cache"
