@@ -63,11 +63,12 @@
 ;;
 ;; A data type's value is a struct, of its variant's type, one of the
 ;; subtypes of a base, which each module that uses the data type at some
-;; types declares. data binds D to its definition, as a compile-time value,
-;; and each constructor to a transformer whose use is a hole holding the
-;; definition, as a generic's is. #%linklet fills it with the struct, of
-;; the type at the types it finds; and a match, whose hole holds the
-;; clauses' variants, with a test of the subject's struct type for each.
+;; types declares. data binds D and each constructor to transformers
+;; whose uses are holes holding the definition, as a generic's is: a type
+;; names D, and takes the definition from its hole, which is not a value.
+;; #%linklet fills a constructor's with the struct, of the type at the
+;; types it finds; and a match, whose hole holds the clauses' variants,
+;; with a test of the subject's struct type for each.
 ;; A data type holds its definition, so a module that meets it only in a
 ;; signature, as in another module's generic's, can declare it; two data
 ;; types whose definitions are the same are one.
@@ -115,7 +116,8 @@
              (if (null? (data-arguments t)) name (cons name (map shown (data-arguments t)))))]
           [else t]))
 
-  ;; An error in an instance of a generic (below) names the instance.
+  ;; An error in an instance of a generic (below) names the instance, and
+  ;; where it was used.
   (define (type-error where form . args)
     (raise-syntax-error 'typed (string-append (apply format form args) (if instantiating (format ", in ~a" instantiating) ""))
                         where))
@@ -153,13 +155,18 @@
   (define (not-a-type s)
     (type-error s "expected a type: Int, Bool, (-> type ... type), a data type or a type parameter"))
 
-  ;; Data type d at types ts: (data D t ...), D the definition d is bound
-  ;; to, or (self t ...) in d's own definition.
+  ;; Data type d at types ts: (data D t ...), D the definition in the hole
+  ;; a use of d is, or (self t ...) in d's own definition.
   (define (data-application d ts where)
-    (let ([definition (if (and defining (eq? (syntax-e d) (car defining)))
-                          defining
-                          (let ([v (syntax-local-value d)])
-                            (if (and (pair? v) (eq? (car v) 'typed-data)) (cadr v) (not-a-type where))))])
+    (let ([definition
+           (cond [(and defining (eq? (syntax-e d) (car defining))) defining]
+                 [(eq? (identifier-binding-kind d) 'macro)
+                  (syntax-match (local-expand d)
+                    [('#%hole 'typed-data definition) (syntax->datum definition)]
+                    [_ (type-error d "~a is not a type" (syntax-e d))])]
+                 [(or (memq (syntax-e d) '(Int Bool)) (memq (syntax-e d) type-parameters) (assq (syntax-e d) type-arguments))
+                  (type-error where "~a takes no types" (syntax-e d))]
+                 [else (type-error d "~a is not a type" (syntax-e d))])])
       (unless (= (length ts) (length (cadr definition)))
         (type-error where "~a takes ~a type~a, not ~a" (car definition) (length (cadr definition))
                     (if (= (length (cadr definition)) 1) "" "s") (length ts)))
@@ -299,12 +306,14 @@
   (define (typed-define stx)
     (syntax-match stx
       [(_ #:forall ((? identifier? tv) ...) ((? identifier? name) ((? identifier? x) ': a) ...) ': r body ...)
+       (when (null? body) (type-error stx "expected a body"))
        (type-parameters! tv)
        (with-types (map syntax-e tv) '() (lambda () (map parse-type a) (parse-type r)))
        #`(define-syntax #,name
            (generic-transformer
             (quote-syntax (#,name (#,@tv) (#,@(map (lambda (x a) #`[#,x #,a]) x a)) #,r (#,@body)))))]
       [(_ ((? identifier? name) ((? identifier? x) ': a) ...) ': r body ...)
+       (when (null? body) (type-error stx "expected a body"))
        (let* ([t `(-> ,@(map parse-type a) ,(parse-type r))]
               [types (closure-types t)]
               [func (with-type (datum->syntax #'here (syntax-e name) name) t)]
@@ -313,9 +322,9 @@
               [params (map (lambda (x a) #`[#,(with-type x a) #,(kernel-type a)]) x (parameter-types t))]
               [result (kernel-type (result-type t))])
          #`(begin
-             (func (#,func #,@params) #:value #,value -> #,result #,@body)
-             (func (#,code [self (ref #,(car types))] #,@params) -> #,result (type #,(cdr types))
-               (#,func #,@x))
+             #,(located stx #`(func (#,func #,@params) #:value #,value -> #,result #,@body))
+             #,(located stx #`(func (#,code [self (ref #,(car types))] #,@params) -> #,result (type #,(cdr types))
+                                (#,func #,@x)))
              (global #,value (ref #,(car types)) (struct.new #,(car types) (ref.func #,code)))
              (define-syntax #,name (function-transformer (quote-syntax #,func) '#,(datum->syntax #'here t)))))]))
 
@@ -356,8 +365,7 @@
   ;; (data (D T ...) [V A ...] ...), or (data D [V A ...] ...) with no type
   ;; parameters: a data type, whose values its constructors V ... make, each
   ;; from values of the types A ..., which may name T ... and D. D is bound
-  ;; to (typed-data definition), a compile-time value, and each V to
-  ;; constructor-transformer.
+  ;; to data-transformer, and each V to constructor-transformer.
   (define (typed-data stx)
     (syntax-match stx
       [(_ head variant ...)
@@ -385,7 +393,7 @@
                   (lambda () (set! defining outer))))]
               [d (datum->syntax #'here definition)])
          #`(begin
-             (define-syntax #,name '(typed-data #,d))
+             (define-syntax #,name (data-transformer '#,d))
              #,@(map (lambda (v i) #`(define-syntax #,(car v) (constructor-transformer '#,d #,(datum->syntax #'here i)))) vs (range (length vs)))))]))
 
   ;; Field type a of data type name, whose type parameters are tvs, as a
@@ -402,6 +410,11 @@
               [(function-type? u) (for-each (lambda (x) (check x #f)) (cdr u))]
               [(data-type? u) (for-each (lambda (x) (check x #f)) (data-arguments u))]))
       t))
+
+  ;; The transformer a data type's name, of definition d, is bound to: a use
+  ;; of it is a hole, (#%hole typed-data d), which a type holds, and which
+  ;; is not a value.
+  (define (data-transformer d) (hole-transformer #`(#%hole typed-data #,(datum->syntax #'here d))))
 
   ;; The transformer a constructor, variant i of data definition d, is
   ;; bound to: a use of it is a hole, (#%hole typed-constructor d i), which
@@ -440,11 +453,11 @@
   ;; and its constructor, or _.
   (define (match-clause c)
     (syntax-match c
-      [(p body ...)
+      [(p body0 body ...)
        (syntax-match p
-         ['_ (list #f '() body #f p)]
-         [((? identifier? v) x ...) (constructor-clause v x body p)]
-         [(? identifier? v) (constructor-clause v '() body p)]
+         ['_ (list #f '() (cons body0 body) #f p)]
+         [((? identifier? v) x ...) (constructor-clause v x (cons body0 body) p)]
+         [(? identifier? v) (constructor-clause v '() (cons body0 body) p)]
          [_ (type-error p "expected a pattern: (constructor variable ...), constructor or _")])]
       [_ (type-error c "expected a clause [pattern body ...]")]))
 
@@ -515,6 +528,9 @@
   ;; code, a form in place of e, at e's location.
   (define (rebuild e code) (syntax-rewrap e (syntax-e code)))
 
+  ;; A definition made from where, at its location rather than this file's.
+  (define (located where form) (datum->syntax form (syntax-e form) where))
+
   ;; A body, lowered: (type . forms), its type the last form's; hint, the
   ;; type its place expects, if it is known, is the last form's (lower).
   (define (lower-body where forms env . hint)
@@ -533,6 +549,7 @@
       (syntax-match e
         [('#%hole 'typed-generic g . given) (instance-value e g given)]
         [('#%hole 'typed-constructor d i . given) (constructor e d i given '() env t)]
+        [('#%hole 'typed-data d) (type-error e "~a is a data type, not a value" (car (syntax->datum d)))]
         [(? identifier? x) (cons (variable-type x env) x)]
         [('#%datum n) (literal e n)]
         [('let (binding ...) body ...) (lower-let e binding body env t)]
@@ -550,6 +567,7 @@
              (direct-call e f arg env)
              (value-call e f arg env))]
         [('lambda ((x _) ...) body ...) (lower-lambda e x body env)]
+        [((? identifier? h) . _) (type-error e "~a is not a form of the typed language" (syntax-e h))]
         [_ (type-error e "this is not typed code")])))
 
   (define (expect e t env)
@@ -618,7 +636,7 @@
            [result (kernel-type (car b))])
       (if (null? captured)
           (begin
-            (syntax-local-lift-definition #`(func #,head -> #,result (type #,(cdr types)) #,@(cdr b)))
+            (syntax-local-lift-definition (located e #`(func #,head -> #,result (type #,(cdr types)) #,@(cdr b))))
             (cons t (rebuild e #`(struct.new #,(car types) (ref.func #,code)))))
           (let ([closure (fresh 'closure)]
                 [fields (map (lambda (v) (fresh 'v)) captured)])
@@ -627,11 +645,11 @@
                                     (struct (field code (ref #,(cdr types)))
                                             #,@(map (lambda (v f) #`(field #,f #,(kernel-type (cddr v)))) captured fields)))))
             (syntax-local-lift-definition
-             #`(func #,head -> #,result (type #,(cdr types))
-                 (let ([env (ref.cast (ref #,closure) self)])
-                   (let (#,@(map (lambda (v f) #`[#,(cadr v) #,(kernel-type (cddr v)) (struct.get #,closure #,f env)])
-                                 captured fields))
-                     #,@(cdr b)))))
+             (located e #`(func #,head -> #,result (type #,(cdr types))
+                            (let ([env (ref.cast (ref #,closure) self)])
+                              (let (#,@(map (lambda (v f) #`[#,(cadr v) #,(kernel-type (cddr v)) (struct.get #,closure #,f env)])
+                                            captured fields))
+                                #,@(cdr b))))))
             (cons t (rebuild e #`(struct.new #,closure (ref.func #,code) #,@(map cadr captured))))))))
 
   ;; The variables of env that e refers to, each once, in order.
@@ -651,17 +669,21 @@
   ;; ---- data ----
 
   ;; Constructor e, variant i of data definition d, applied to args, or
-  ;; alone with none: a struct of its variant's type. Its data type's types
+  ;; alone: a struct of its variant's type. Its data type's types
   ;; are those that make its fields' types the arguments', given what inst
   ;; gave and, if it does not give them, what hint, the type expected, is;
   ;; an argument is lowered with its field's type as a hint once that type
   ;; is known.
   (define (constructor e d i given args env hint)
     (let* ([d (syntax->datum d)] [i (syntax->datum i)] [variant (list-ref (variants d) i)]
-           [written (syntax-rewrap e (if (null? args) (car variant) (cons (car variant) args)))]
+           [alone? (syntax-match e [('#%app . _) #f] [_ #t])]
+           [written (syntax-rewrap e (if alone? (car variant) (cons (car variant) args)))]
            [fields (map (lambda (ft) (substitute ft '() d)) (cdr variant))]
            [n (length fields)]
            [codes (make-vector n #f)])
+      (when (and alone? (> n 0))
+        (type-error written "~a is a constructor, not a function value: apply it to its ~a argument~a"
+                    (car variant) n (if (= n 1) "" "s")))
       (unless (= n (length args))
         (type-error written "~a takes ~a argument~a, not ~a" (car variant) n (if (= n 1) "" "s") (length args)))
       ;; The arguments lowered, a constructor alone last, since only its
@@ -737,8 +759,8 @@
 
   ;; While #%linklet runs, the instances it made, by the generic's name:
   ;; name -> list of (id types . f), id the name as the generic wrote it,
-  ;; compared by binding. While one is made, its name, as errors give it,
-  ;; and the generics whose instances are being made, one inside another,
+  ;; compared by binding. While one is made, its name and where it was
+  ;; used, as errors give them, and the generics whose instances are being made, one inside another,
   ;; innermost first.
   (define instances #f)
   (define instantiating #f)
@@ -813,14 +835,21 @@
                                      where))
                (hash-set! instances (syntax-e name) (cons (cons name (cons ts f)) (hash-ref instances (syntax-e name) '())))
                (dynamic-wind
-                (lambda () (set! instantiating label) (set! making (cons (syntax-e name) making)))
+                (lambda () (set! instantiating (string-append label (used-at where))) (set! making (cons (syntax-e name) making)))
                 (lambda ()
                   (with-types '() (map cons (map syntax-e tv) ts)
                     (lambda ()
                       (add-function! f (local-expand #`(typed-lambda (#,@(map (lambda (x a) #`[#,x : #,a]) x a)) #,@body))
-                                     (parse-type r)))))
+                                     (parse-type r) name))))
                 (lambda () (set! instantiating outer) (set! making (cdr making))))
                f)]))))
+
+  ;; ", used at file:line:col", where syntax s is, as errors write it; "" if
+  ;; it has no location.
+  (define (used-at s)
+    (if (k:syntax-line s)
+        (format ", used at ~a:~a:~a" (k:syntax-source s) (k:syntax-line s) (+ 1 (k:syntax-column s)))
+        ""))
 
   ;; The name that most often recurs in names.
   (define (recurring names)
@@ -829,8 +858,8 @@
 
   ;; lam, a fully expanded lambda whose result type is result, as function
   ;; f with a value, as define makes them: the function, its code, and its
-  ;; value, lifted.
-  (define (add-function! f lam result)
+  ;; value, lifted, located at where.
+  (define (add-function! f lam result where)
     (syntax-match lam
       [(_ ((x k) ...) body ...)
        (let* ([b (lower-body lam body (map variable x) result)]
@@ -842,10 +871,10 @@
          (unless (equal? (car b) result)
            (type-error (last body) "~a returns ~s, but its body is ~s" (syntax-e f) (shown result) (shown (car b))))
          (syntax-local-lift-definition
-          #`(func (#,f #,@(map (lambda (x k) #`[#,x #,k]) x k)) #:value #,value -> #,rk #,@(cdr b)))
+          (located where #`(func (#,f #,@(map (lambda (x k) #`[#,x #,k]) x k)) #:value #,value -> #,rk #,@(cdr b))))
          (syntax-local-lift-definition
-          #`(func (#,code [self (ref #,(car types))] #,@(map (lambda (y k) #`[#,y #,k]) ys k)) -> #,rk (type #,(cdr types))
-              (#%app #,f #,@ys)))
+          (located where #`(func (#,code [self (ref #,(car types))] #,@(map (lambda (y k) #`[#,y #,k]) ys k)) -> #,rk (type #,(cdr types))
+                             (#%app #,f #,@ys))))
          (syntax-local-lift-definition
           #`(global #,value (ref #,(car types)) (struct.new #,(car types) (ref.func #,code)))))])))
 
