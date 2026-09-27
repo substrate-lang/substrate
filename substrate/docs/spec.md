@@ -1207,7 +1207,8 @@ right-hand side's.
 unevaluated, as a **fact** about the definition `id` refers to. It binds
 nothing. A language records facts where finding things by name will not
 do, as for the instances of a type class, which a use of the class finds
-without naming them.
+without naming them: the typed example's `impl` is a fact about its
+trait.
 
 - A fact is about a **definition**: a module's function, global, tag or
   compile-time value, made before the fact. Every identifier that

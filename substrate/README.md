@@ -120,9 +120,14 @@ its lambdas to structs of typed closures, one closure type per function
 type. A function's type reaches the modules that import it through the
 transformer its name is bound to. Generics are monomorphized: its
 `#%linklet` makes each instance a module uses from the generic's
-definition, which reaches other modules the same way. Its data types,
-which may have type parameters, are GC structs, a subtype of one base
-for each variant; `match` checks that its clauses cover the variants,
-and tests the struct's type.
+definition, which reaches other modules the same way; a generic is
+checked once, where it is defined. Its data types, which may have type
+parameters, are GC structs, a subtype of one base for each variant;
+`match` checks that its clauses cover the variants, and tests the
+struct's type. Its traits have impls, written with the trait or the
+type, which are facts about the trait: a method call finds the impl for
+its type among them, and calls the impl's function for that type
+directly. A generic's type parameter can need a trait, whose methods its
+body can then use.
 
 Open questions are in `docs/spec.md` section 7.
