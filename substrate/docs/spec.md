@@ -167,7 +167,7 @@ marked with another type, such as `n:i32`.
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`), `(syntax-source s)`, `(syntax-line s)`, `(syntax-column s)` (where `s` is: its file as errors name it, its line from 1 and its column from 0, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)`, `(transformer? v) -> i32`, `(transformer-env t)` |
 | exceptions | the tag `exn`, whose exceptions carry one `eqref`; `(raise-syntax-error name message stx)` (throws a syntax error), `(syntax-error? v) -> i32`, `(syntax-error-message e)`, `(syntax-error-syntax e)` (the syntax it blames, or `#f`) |
-| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)`, `(syntax-local-facts id)` (6.6) |
+| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)`, `(syntax-local-facts id)` (6.6), `(identifier-name id)` (a symbol, or `#f`) and `(name-identifier name)` (6.7) |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
   otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
@@ -1233,6 +1233,34 @@ trait.
   module's interface holds its facts (3.7).
 - A fact is a claim a language made, not a checked one: a language that
   checks what facts say, such as a proof checker, derives it again.
+
+### 6.7 Names
+
+A definition has a **name**, a symbol that is data: a language can keep
+it in a datum, such as a term or a type, compare it with `eq?`, hash it,
+and quote it, where an identifier, syntax, could not go.
+
+- `(identifier-name id)` resolves `id` at the running macro's phase and
+  gives the name of the definition it refers to: a module's function,
+  global, tag or compile-time value, as a fact is about (6.6), whatever
+  name, module or phase shift it is seen under. It is `#f` for locals,
+  core forms and the kernel module's definitions.
+- A name is `file:symbol`, the file as 3.6 names it and the symbol the
+  definition's own, with `@p` after it for a definition at phase *p* of
+  its module and `#n` for the *n*-th definition of that symbol at that
+  phase in the module, counting from 0, in the module's order: hygiene
+  can make several, such as a macro's that each use defines. So a name
+  depends only on the module's source.
+- `(name-identifier name)` gives an identifier that refers to the
+  definition `name` names, at the running macro's phase, the way an
+  identifier from the defining module's own code would: its symbol with
+  its scopes, at the phase shift its module is required at. The
+  definition must be the module being expanded's, made so far, or that of
+  a module it requires, directly or not, as for facts; otherwise it is an
+  error. So a name reaches what the module depends on, which its hash
+  covers (3.2), unexported definitions included, and nothing else. With
+  it, `syntax-local-value`, `local-expand` and `syntax-local-facts` take
+  a name.
 
 ## 7. Open questions and later milestones
 

@@ -2258,19 +2258,22 @@
        form)]
     [_ (raise-compile-error f "expected (#%fact id syntax)")]))
 
-;; The definition id refers to at phase, which a fact is about: the info
-;; of its function, global or tag, or the getter of its compile-time
-;; value, unshifted, so that every name and phase shift it is seen under
-;; has the same facts (spec 6.6). Core forms, locals and the kernel
-;; module's definitions, which every language shares, have none.
-(define (fact-key id phase)
-  (let* ([m (meaning-of id phase)]
-         [info (and m (memq (car m) '(func global tag compile-time-value)) (cadr m))]
+;; The definition meaning m is of, if it is a module's: the info of its
+;; function, global or tag, or the getter of its compile-time value,
+;; unshifted, so that every name and phase shift it is seen under gives
+;; the same one (spec 6.6, 6.7); otherwise #f. Core forms, locals and the
+;; kernel module's definitions, which every language shares, are none.
+(define (definition-of m)
+  (let* ([info (and m (memq (car m) '(func global tag compile-time-value)) (cadr m))]
          [base (and info (let ([o (hash-ref shift-origins info #f)]) (if o (car o) info)))]
          [instance (and base (info-instance base))])
+    (and base (not (and instance (eq? (instance-unit instance) (kernel-unit target-kernel)))) base)))
+
+;; The definition id refers to at phase, which a fact is about.
+(define (fact-key id phase)
+  (let* ([m (meaning-of id phase)] [base (definition-of m)])
     (unless m (raise-compile-error id "~a is unbound: a fact is about a definition made before it" (stx-e id)))
-    (unless (and base (not (and instance (eq? (instance-unit instance) (kernel-unit target-kernel)))))
-      (raise-compile-error id "a fact is about a module's definition, and ~a is not one" (stx-e id)))
+    (unless base (raise-compile-error id "a fact is about a module's definition, and ~a is not one" (stx-e id)))
     base))
 
 ;; A definition #%linklet redefines keeps its facts (spec 6.5, 6.6): only
@@ -2540,27 +2543,90 @@
   (unless (stx? s) (raise-compile-error api-where "syntax-local-introduce: expected syntax"))
   (flip-scope s api-intro))
 
-;; The facts about the definition id refers to, at the running macro's
-;; phase (spec 6.6): those the module being expanded has recorded so far,
-;; and those of each module it requires, directly or not, dependencies
-;; first, each module once at each phase shift it is required at. Each is
-;; (module phase stx): the file of the module that recorded it, the phase
-;; that module recorded it at, and its syntax.
-(define (query-local-facts id)
-  (unless (id? id) (raise-compile-error api-where "syntax-local-facts: expected an identifier"))
-  (let ([key (fact-key id api-phase)] [seen (make-hash)] [found '()])
+;; The module being expanded and each module it requires, directly or
+;; not, as (module . shift): dependencies first, in the order of their
+;; requires, each module once at each phase shift it is required at.
+(define (dependencies)
+  (let ([seen (make-hash)] [out '()])
     (let visit ([m (comp-module current)] [shift 0])
       (let ([k (format "~a|~a" (unit-path m) shift)])
         (unless (hash-ref seen k #f)
           (hash-set! seen k #t)
           (for-each (lambda (r) (visit (car r) (+ shift (cdr r)))) (unit-requires m))
-          (for-each (lambda (f)
-                      (when (and (eq? (car f) key) (= (+ (cadr f) shift) api-phase))
-                        (set! found (cons (list (string->symbol (format "~a" (unit-path m))) (cadr f)
-                                                (compile-time-value (comp-store current) (shift-info (caddr f) shift)))
-                                          found))))
-                    (reverse (unit-facts m))))))
-    (reverse found)))
+          (set! out (cons (cons m shift) out)))))
+    (reverse out)))
+
+;; The facts about the definition id refers to, at the running macro's
+;; phase (spec 6.6): those of the module being expanded, recorded so far,
+;; and of each module it requires (dependencies). Each is (module phase
+;; stx): the file of the module that recorded it, the phase that module
+;; recorded it at, and its syntax.
+(define (query-local-facts id)
+  (unless (id? id) (raise-compile-error api-where "syntax-local-facts: expected an identifier"))
+  (let ([key (fact-key id api-phase)])
+    (apply append
+           (map (lambda (d)
+                  (let ([m (car d)] [shift (cdr d)])
+                    (map (lambda (f)
+                           (list (string->symbol (format "~a" (unit-path m))) (cadr f)
+                                 (compile-time-value (comp-store current) (shift-info (caddr f) shift))))
+                         (filter (lambda (f) (and (eq? (car f) key) (= (+ (cadr f) shift) api-phase)))
+                                 (reverse (unit-facts m))))))
+                (dependencies)))))
+
+;; ---- names (spec 6.7) ----
+
+;; The module that makes definition base: the module being compiled for a
+;; function not yet compiled.
+(define (definition-module base)
+  (or (hash-ref macro-modules base #f)
+      (let ([i (info-instance base)]) (and i (instance-unit i)))
+      (comp-module current)))
+
+;; Module m's names, from its entries in order: a table from each of its
+;; own definitions to its name, and one from each name to its entry,
+;; (symbol scopes phase binding). The n-th definition of a symbol at a
+;; phase, which hygiene can make, is file:symbol@phase#n, without @0 and
+;; #0. Kept while m's entries are the same.
+(define name-tables (make-hasheq))
+(define (module-names m)
+  (let ([entries (unit-entries m)] [known (hash-ref name-tables m #f)])
+    (if (and known (eq? (car known) entries))
+        (cdr known)
+        (let ([by-definition (make-hasheq)] [by-name (make-hasheq)] [counts (make-hash)])
+          (for-each (lambda (e)
+                      (let ([base (definition-of (binding-meaning (cadddr e)))])
+                        (when (and base (not (hash-ref by-definition base #f)) (eq? (definition-module base) m))
+                          (let* ([key (cons (car e) (caddr e))] [n (hash-ref counts key 0)]
+                                 [name (string->symbol (format "~a:~a~a~a" (unit-path m) (car e)
+                                                               (if (eqv? (caddr e) 0) "" (format "@~a" (caddr e)))
+                                                               (if (= n 0) "" (format "#~a" n))))])
+                            (hash-set! counts key (+ n 1))
+                            (hash-set! by-definition base name)
+                            (hash-set! by-name name e)))))
+                    (reverse entries))
+          (hash-set! name-tables m (cons entries (list by-definition by-name)))
+          (list by-definition by-name)))))
+
+;; The name of the definition id refers to at the running macro's phase,
+;; or #f (spec 6.7).
+(define (query-identifier-name id)
+  (unless (id? id) (raise-compile-error api-where "identifier-name: expected an identifier"))
+  (let ([base (definition-of (meaning-of id api-phase))])
+    (and base (hash-ref (car (module-names (definition-module base))) base #f))))
+
+;; An identifier that refers to the definition name names, at the running
+;; macro's phase, if the module being expanded made it or requires, directly
+;; or not, the module that did: its symbol, with its scopes at the phase
+;; shift that module is required at (spec 6.7).
+(define (query-name-identifier name)
+  (unless (symbol? name) (raise-compile-error api-where "name-identifier: expected a name, a symbol"))
+  (or (ormap (lambda (d)
+               (let ([e (hash-ref (cadr (module-names (car d))) name #f)])
+                 (and e (= (+ (caddr e) (cdr d)) api-phase)
+                      (make-stx (car e) (shift-scopes (cadr e) (cdr d)) #f '()))))
+             (dependencies))
+      (raise-compile-error api-where "name-identifier: ~a names no definition of this module, or of one it requires, at this phase" name)))
 
 (type query1 (func (eqref -> eqref)))
 (type query2 (func (eqref eqref -> eqref)))
@@ -2572,14 +2638,17 @@
 (func (q-signature [id eqref]) -> eqref (type query1) (query-function-signature id))
 (func (q-introduce [s eqref]) -> eqref (type query1) (query-introduce s))
 (func (q-local-facts [id eqref]) -> eqref (type query1) (query-local-facts id))
+(func (q-identifier-name [id eqref]) -> eqref (type query1) (query-identifier-name id))
+(func (q-name-identifier [name eqref]) -> eqref (type query1) (query-name-identifier name))
 (import %set-queries "kernel" "%set-queries"
-        ((ref query1) (ref query2) (ref query1) (ref query1) (ref query1) (ref query1) (ref query1) (ref query1) ->))
+        ((ref query1) (ref query2) (ref query1) (ref query1) (ref query1) (ref query1) (ref query1) (ref query1)
+         (ref query1) (ref query1) ->))
 
 ;; Answer the kernel module's queries from here from now on.
 (func (register-queries!) -> eqref
   (%set-queries (ref.func q-local-value) (ref.func q-free-identifier=?) (ref.func q-binding-kind)
                 (ref.func q-local-expand) (ref.func q-lift) (ref.func q-signature) (ref.func q-introduce)
-                (ref.func q-local-facts))
+                (ref.func q-local-facts) (ref.func q-identifier-name) (ref.func q-name-identifier))
   (ref.null eq))
 
 ;; ==== fully expanded code ====
