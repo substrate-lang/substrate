@@ -46,12 +46,14 @@
     array.len array.copy array.fill
     ref.null ref.is_null ref.eq ref.as_non_null ref.test ref.cast ref.i31 i31.get_s i31.get_u))
 
-;; The implicit forms (spec 5.3, 5.4), the linklet hook (spec 6.5), and
-;; holes, which a language leaves in code for its hook to fill (6.4).
+;; The implicit forms (spec 5.3, 5.4), the linklet hook (spec 6.5), holes,
+;; which a language leaves in code for its hook to fill (6.4), and facts,
+;; which a language records about definitions (6.6).
 (define app-sym '#%app)
 (define datum-sym '#%datum)
 (define linklet-sym '#%linklet)
 (define hole-sym '#%hole)
+(define fact-sym '#%fact)
 
 (define core-forms
   (append
@@ -62,7 +64,7 @@
      throw throw-ref try
      i32.const i64.const f32.const f64.const
      quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
-   (list app-sym datum-sym linklet-sym hole-sym)
+   (list app-sym datum-sym linklet-sym hole-sym fact-sym)
    gc-forms))
 
 (define eqref (make-ref #t 'eq))
@@ -109,14 +111,18 @@
 ;; hashes (spec 3.2). name: what its instance names start with, its
 ;; stem and hash. path: its file, which its source locations name (3.6),
 ;; or (compiled file hash) for a module loaded from a compiled file (3.7).
+;; facts: the facts it recorded, newest first, each (definition phase
+;; getter form): the definition it is about (fact-key), the phase, the
+;; getter of its syntax, and, while it compiles, its #%fact form.
 (struct unit (path [name #:mutable] [hash #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
               [entries #:mutable] [expanded #:mutable] [scope #:mutable] [program #:mutable]
               scopes                                  ; index -> the scopes its expansion made, in order
               [types #:mutable]                       ; the types it declared, in order
-              [infos #:mutable]))                     ; its functions, globals and tags, newest first
+              [infos #:mutable]                       ; its functions, globals and tags, newest first
+              [facts #:mutable]))
 
 (define (new-unit path name)
-  (unit path name #f 'compiling (make-hasheqv) '() '() '() #f #f #f (make-hasheqv) '() '()))
+  (unit path name #f 'compiling (make-hasheqv) '() '() '() #f #f #f (make-hasheqv) '() '() '()))
 
 (define units-by-hash (make-hash))           ; hash -> unit
 (define scope-owners (make-hasheqv))         ; scope -> (unit . index): the unit whose expansion made it
@@ -350,7 +356,7 @@
 (define cache-directory #f)
 (define (set-cache-directory! dir) (set! cache-directory dir))
 
-(define interface-format 6)
+(define interface-format 7)
 
 ;; Does the run have one kernel, the running and target kernels being one?
 (define (one-kernel?) (eq? running-kernel target-kernel))
@@ -552,13 +558,14 @@
                               (let ([n (length (type-info-group (car ts)))])
                                 (loop (list-tail ts n) (+ i n) (cons (range i (+ i n)) acc)))]
                              [else (loop (cdr ts) (+ i 1) acc)]))]
+             [facts (map (lambda (f) (list (encode (car f)) (cadr f) (encode (caddr f)))) (reverse (unit-facts m)))]
              [infos (map (lambda (info) (encode (info->list info))) (reverse own-list))])
         (list (cons 'format interface-format) (cons 'kernel (kernel-hash target-kernel)) (cons 'hash (unit-hash m))
               (cons 'definitions (length (unit-infos m)))
               (cons 'requires (map (lambda (r) (list (unit-path (car r)) (unit-hash (car r)) (cdr r))) (unit-requires m)))
               (cons 'name (unit-name m)) (cons 'types type-forms) (cons 'groups groups)
               (cons 'infos infos) (cons 'provides provides) (cons 'entries entries) (cons 'values values)
-              (cons 'inlines inlines) (cons 'macros macros) (cons 'linklets linklets))))))
+              (cons 'inlines inlines) (cons 'macros macros) (cons 'facts facts) (cons 'linklets linklets))))))
 
 ;; Scope references in an order that does not depend on the run, for a
 ;; binding's scope set; loaded, a set is sorted by the run's numbers.
@@ -675,6 +682,8 @@
                                      (filter (lambda (p) (memv (car p) (list-ref x 5))) params)))))
                 (section d 'inlines))
       (for-each (lambda (g) (hash-set! macro-modules (decode (car g)) m)) (section d 'macros))
+      (set-unit-facts! m (reverse (map (lambda (f) (let ([f (decode f)]) (list (car f) (cadr f) (caddr f) #f)))
+                                       (section d 'facts))))
       (set-unit-program! m (hash-ref (unit-linklets m) 0))
       (set-unit-state! m 'done)
       ;; As its requires would have when it was compiled: its own
@@ -880,7 +889,7 @@
                     (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
                          (eq? (binding-namespace b) (meaning-namespace meaning))))
                   (bindings-under (stx-e id) (binding-slot (stx-scopes id))))])
-    (and b (begin (set-binding-meaning! b meaning) #t))))
+    (and b (begin (rekey-facts! (binding-meaning b) meaning) (set-binding-meaning! b meaning) #t))))
 
 (define (phase-matches? b phase)
   (let ([p (binding-phase b)])
@@ -1441,7 +1450,7 @@
     (when (and only
                (memq kind '(require require-unqualified provide freestanding memory table
                             define-syntax begin-for-syntax)))
-      (raise-compile-error f "~a (~a ...), but only func, global, import, type, tag and data forms and expressions are allowed there"
+      (raise-compile-error f "~a (~a ...), but only func, global, import, type, tag, data and #%fact forms and expressions are allowed there"
                            only kind))
     (case kind
       ;; A form a macro's begin splices is its output too (spec 6.2).
@@ -1460,6 +1469,7 @@
       [(rec) (item! (declare-rec f phase))]
       [(define-syntax) (define-syntax! f phase)]
       [(begin-for-syntax) (begin-for-syntax! f phase)]
+      [(#%fact) (item! (list 'done (fact! f phase)))]
       [else (item! (list 'expr f))])))
 
 ;; Pass 2 for one item: its fully expanded code.
@@ -2226,6 +2236,56 @@
        (hash-set! macro-modules getter (comp-module current))
        (bind-definition! id phase (list 'compile-time-value getter)))]))
 
+;; (#%fact id stx): stx, as it is, recorded as a fact about the definition
+;; id refers to at phase (spec 6.6). stx is a compile-time value of the
+;; module's phase+1 linklet, which syntax-local-facts fetches as
+;; syntax-local-value fetches define-syntax's; it runs no code, so it
+;; waits with the define-syntax units that run none. The form, as fully
+;; expanded code holds it.
+(define (fact! f phase)
+  (syntax-match f
+    [('#%fact (? id? id) stx)
+     (let* ([key (fact-key id phase)]
+            [name (string->symbol (string-append "__fact." (symbol->string (stx-e id))))]
+            [global (global-info name eqref #t #f #f)]
+            [getter (func-info name '() (list eqref) #f #f #f)]
+            [form (core-headed f fact-sym)]
+            [m (comp-module current)])
+       (defer-unit! (list (list 'global global (lower-expr (expand-expr (out f 'quote-syntax stx) (+ phase 1)) (+ phase 1)))
+                          (list 'func getter '() (list 'gref global)))
+                    (+ phase 1) f)
+       (set-unit-facts! m (cons (list key phase getter form) (unit-facts m)))
+       form)]
+    [_ (raise-compile-error f "expected (#%fact id syntax)")]))
+
+;; The definition id refers to at phase, which a fact is about: the info
+;; of its function, global or tag, or the getter of its compile-time
+;; value, unshifted, so that every name and phase shift it is seen under
+;; has the same facts (spec 6.6). Core forms, locals and the kernel
+;; module's definitions, which every language shares, have none.
+(define (fact-key id phase)
+  (let* ([m (meaning-of id phase)]
+         [info (and m (memq (car m) '(func global tag compile-time-value)) (cadr m))]
+         [base (and info (let ([o (hash-ref shift-origins info #f)]) (if o (car o) info)))]
+         [instance (and base (info-instance base))])
+    (unless m (raise-compile-error id "~a is unbound: a fact is about a definition made before it" (stx-e id)))
+    (unless (and base (not (and instance (eq? (instance-unit instance) (kernel-unit target-kernel)))))
+      (raise-compile-error id "a fact is about a module's definition, and ~a is not one" (stx-e id)))
+    base))
+
+;; A definition #%linklet redefines keeps its facts (spec 6.5, 6.6): only
+;; the module being compiled has any about it yet.
+(define (rekey-facts! old new)
+  (when (and current old new (memq (car old) '(func global tag)) (not (eq? (cadr old) (cadr new))))
+    (let ([m (comp-module current)])
+      (set-unit-facts! m (map (lambda (f) (if (eq? (car f) (cadr old)) (cons (cadr new) (cdr f)) f)) (unit-facts m))))))
+
+;; The facts of the forms #%linklet was given and did not return go with
+;; them (spec 6.5).
+(define (drop-facts! dropped)
+  (let ([m (comp-module current)])
+    (set-unit-facts! m (filter (lambda (f) (not (memq (cadddr f) dropped))) (unit-facts m)))))
+
 ;; The func form of transformer code named name, of the kernel module's
 ;; type for it, that calls function info on the syntax.
 (define (transformer-adapter name info)
@@ -2293,11 +2353,14 @@
               ;; A form returned unchanged is one of the forms the hook was
               ;; given: it stays the unit's form, and is not expanded again.
               [fv (list->vector forms)]
+              [positions (same-positions returned (cddr (stx->list in)))]
               [new (map (lambda (r p) (if (>= p 0) (expanded (vector-ref fv p)) (flip-scope r intro)))
-                        returned (same-positions returned (cddr (stx->list in))))]
+                        returned positions)]
               [saved-redefining redefining?] [saved-hook hook-output?])
          (set! redefining? "#%linklet returned")
          (set! hook-output? #t)
+         (drop-facts! (let ([kept (map (lambda (p) (and (>= p 0) (vector-ref fv p))) positions)])
+                        (filter (lambda (f) (not (memq f kept))) forms)))
          (declare-forms! b new)
          (let ([r (finish-body! b)])
            (set! redefining? saved-redefining)
@@ -2477,6 +2540,28 @@
   (unless (stx? s) (raise-compile-error api-where "syntax-local-introduce: expected syntax"))
   (flip-scope s api-intro))
 
+;; The facts about the definition id refers to, at the running macro's
+;; phase (spec 6.6): those the module being expanded has recorded so far,
+;; and those of each module it requires, directly or not, dependencies
+;; first, each module once at each phase shift it is required at. Each is
+;; (module phase stx): the file of the module that recorded it, the phase
+;; that module recorded it at, and its syntax.
+(define (query-local-facts id)
+  (unless (id? id) (raise-compile-error api-where "syntax-local-facts: expected an identifier"))
+  (let ([key (fact-key id api-phase)] [seen (make-hash)] [found '()])
+    (let visit ([m (comp-module current)] [shift 0])
+      (let ([k (format "~a|~a" (unit-path m) shift)])
+        (unless (hash-ref seen k #f)
+          (hash-set! seen k #t)
+          (for-each (lambda (r) (visit (car r) (+ shift (cdr r)))) (unit-requires m))
+          (for-each (lambda (f)
+                      (when (and (eq? (car f) key) (= (+ (cadr f) shift) api-phase))
+                        (set! found (cons (list (string->symbol (format "~a" (unit-path m))) (cadr f)
+                                                (compile-time-value (comp-store current) (shift-info (caddr f) shift)))
+                                          found))))
+                    (reverse (unit-facts m))))))
+    (reverse found)))
+
 (type query1 (func (eqref -> eqref)))
 (type query2 (func (eqref eqref -> eqref)))
 (func (q-local-value [id eqref]) -> eqref (type query1) (query-local-value id))
@@ -2486,13 +2571,15 @@
 (func (q-lift [form eqref]) -> eqref (type query1) (query-lift form))
 (func (q-signature [id eqref]) -> eqref (type query1) (query-function-signature id))
 (func (q-introduce [s eqref]) -> eqref (type query1) (query-introduce s))
+(func (q-local-facts [id eqref]) -> eqref (type query1) (query-local-facts id))
 (import %set-queries "kernel" "%set-queries"
-        ((ref query1) (ref query2) (ref query1) (ref query1) (ref query1) (ref query1) (ref query1) ->))
+        ((ref query1) (ref query2) (ref query1) (ref query1) (ref query1) (ref query1) (ref query1) (ref query1) ->))
 
 ;; Answer the kernel module's queries from here from now on.
 (func (register-queries!) -> eqref
   (%set-queries (ref.func q-local-value) (ref.func q-free-identifier=?) (ref.func q-binding-kind)
-                (ref.func q-local-expand) (ref.func q-lift) (ref.func q-signature) (ref.func q-introduce))
+                (ref.func q-local-expand) (ref.func q-lift) (ref.func q-signature) (ref.func q-introduce)
+                (ref.func q-local-facts))
   (ref.null eq))
 
 ;; ==== fully expanded code ====
@@ -3031,7 +3118,7 @@
         (let ([info (cadr (meaning-of name phase))])
           (filled-type (global-info-type info))
           (list (list 'global info (lower-expr init phase))))])]
-    [(import) '()]
+    [(import #%fact) '()]
     [(type) (syntax-match f [(_ name _) (list (list 'type (type-of name phase)))])]
     [(rec) (syntax-match f [(_ (_ name _) ...) (map (lambda (n) (list 'type (type-of n phase))) name)])]
     [(data) (syntax-match f [(_ name . _) (list (list 'data (data-info-of name phase)))])]

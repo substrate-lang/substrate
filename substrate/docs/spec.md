@@ -167,7 +167,7 @@ marked with another type, such as `n:i32`.
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`), `(syntax-source s)`, `(syntax-line s)`, `(syntax-column s)` (where `s` is: its file as errors name it, its line from 1 and its column from 0, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)`, `(transformer? v) -> i32`, `(transformer-env t)` |
 | exceptions | the tag `exn`, whose exceptions carry one `eqref`; `(raise-syntax-error name message stx)` (throws a syntax error), `(syntax-error? v) -> i32`, `(syntax-error-message e)`, `(syntax-error-syntax e)` (the syntax it blames, or `#f`) |
-| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)` |
+| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)`, `(syntax-local-facts id)` (6.6) |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
   otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
@@ -502,8 +502,9 @@ kernel's bytes, for the compiler built next to embed (1.4).
   other modules' expansions need: its provides, its module-level bindings
   with their scope sets and phases, its functions with their signatures,
   declared types and values, its globals, tags and data, its types as
-  structural forms, the getters of its compile-time values, the lowered
-  bodies of its inline functions, and its linklets, with their imports
+  structural forms, the getters of its compile-time values, its facts
+  (6.6), the lowered bodies of its inline functions, and its linklets,
+  with their imports
   and scope tables. Scopes and definitions belong to a run, so the
   interface names
   them relative to modules: a scope is the core scope, a module scope's
@@ -1085,6 +1086,7 @@ form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)
        | (import id "module" "field" (type ... -> type ...)) | (import id "module" "field" id)
        | (type id def) | (rec (type id def) ...) | (data id offset "bytes" ...)
        | (tag id (type ...))
+       | (#%fact id datum)                    ; a fact about id's definition (6.6)
        | expr
 
 expr ::= id                                   ; a local or global variable, or a function
@@ -1172,7 +1174,10 @@ right-hand side's.
   the hook can change a function's body or signature. A definition it
   leaves out is removed, and code that still uses it, or a `provide` of
   it, is an error. It may return only `func`, `global`, `import`, `type`,
-  `rec`, `tag` and `data` forms and expressions. A form it returns unchanged, the same object as a form it was given, and
+  `rec`, `tag`, `data` and `#%fact` forms and expressions. A fact it
+  leaves out is removed with its form, and one it returns or lifts is
+  recorded, so a language can record what it elaborated (6.6); a
+  definition it replaces keeps its facts. A form it returns unchanged, the same object as a form it was given, and
   in the same order among those, introduces nothing, so it is not expanded
   again. The transformer has an introduction scope, as a macro use does
   (6.2).
@@ -1195,6 +1200,38 @@ right-hand side's.
   it is a procedure. A language built on another provides that one's
   `#%linklet`, or its own that runs it, with `(except-out (all-from-out
   name) #%linklet)` for the rest (3.1).
+
+### 6.6 Facts
+
+`(#%fact id datum)`, a module-level form, records `datum`, as syntax and
+unevaluated, as a **fact** about the definition `id` refers to. It binds
+nothing. A language records facts where finding things by name will not
+do, as for the instances of a type class, which a use of the class finds
+without naming them.
+
+- A fact is about a **definition**: a module's function, global, tag or
+  compile-time value, made before the fact. Every identifier that
+  refers to that definition sees its facts: under another name, as a
+  qualified import, at another phase shift, and after `#%linklet`
+  replaces it (6.5). Core forms, locals and the kernel module's
+  definitions, which every language shares, have none.
+- `(syntax-local-facts id)` returns the facts about `id`'s definition at
+  the running macro's phase: those recorded so far by the module being
+  expanded, and those of every module it requires, directly or not.
+  Each is `(module phase stx)`: the file of the module that recorded it,
+  the phase it recorded it at, and the syntax. A module's facts come
+  after those of every module it requires, in the order of its requires,
+  and each module's in the order it recorded them; a module required
+  more than once counts once for each phase shift. So a fact can
+  override one of a module its module requires, if the language that
+  reads them says so.
+- A module required at phase shift *s* has its facts at their phase
+  plus *s*, as its bindings are (6.1).
+- The syntax of a fact is a compile-time value of the module's phase+1
+  linklet, fetched as `syntax-local-value` fetches one (6.3), and the
+  module's interface holds its facts (3.7).
+- A fact is a claim a language made, not a checked one: a language that
+  checks what facts say, such as a proof checker, derives it again.
 
 ## 7. Open questions and later milestones
 
