@@ -91,10 +91,10 @@ A compiler runs with a build of the kernel module, whose instance its
 macros share with it, and builds programs with `compiler/kernel.sub`. The
 two are one, except while a compiler builds a new one whose kernel module
 has changed. So the compiler carries the **running kernel**, the build it
-runs with, compiled: the interface (3.7) and bytes that `sub kernel` wrote
-from the target kernel of the compiler that compiled it, embedded when it
-was compiled, so that nothing is compiled at startup. A compiler carrying
-none, or an interface of a format it does not read, compiles
+runs with, compiled: the module that `sub kernel` wrote (3.7) from the
+target kernel of the compiler that compiled it, embedded when it was
+compiled, so that nothing is compiled at startup. A compiler carrying
+none, or one of a format it does not read, compiles
 `compiler/kernel.sub` as its running kernel, which is then its source. It
 compiles compile-time code against the running kernel, and programs
 against `compiler/kernel.sub`, the **target kernel**, which is the running
@@ -291,8 +291,8 @@ they trap.
   provided for two different bindings.
 - `(require name source item ...)` imports what another module provides.
   `source` is `"path"` (relative to the requiring file), `kernel` (the
-  kernel module, section 2), or `(compiled "dir")`, the program built to
-  `dir` (3.7), whose entry it requires.
+  kernel module, section 2), or `(compiled "file")`, a compiled file
+  (3.7), whose entry it requires.
   - Everything the source provides is bound **qualified**, as
     `name:thing`. Nothing is imported unqualified by default.
   - Each item also binds one thing unqualified: `x` binds `x`, and
@@ -473,11 +473,10 @@ named by an absolute path.
 With a cache directory (`sub build -c DIR`; `bin/sub` gives
 `build/cache` unless told another), a module compiled once is loaded
 from the cache while its source and its requires are as they were: its
-linklets, one per phase, named as their instances are, and its
-**interface**, what the expander keeps of a module it compiled, as
-quoted data in the kernel's format (3.5). The kernel module has one too:
-`sub kernel` writes it beside the kernel's bytes, for the compiler built
-next to embed (1.4).
+**interface**, what the expander keeps of a module it compiled, with its
+linklets inside, one per phase, as quoted data in the kernel's format
+(3.5). The kernel module has one too: `sub kernel` writes it beside the
+kernel's bytes, for the compiler built next to embed (1.4).
 
 - An interface begins with what it is of: the interface format's
   version, the kernel by hash, the module's hash (3.2), and its
@@ -493,8 +492,9 @@ next to embed (1.4).
   with their scope sets and phases, its functions with their signatures,
   declared types and values, its globals, tags and data, its types as
   structural forms, the getters of its compile-time values, the lowered
-  bodies of its inline functions, and its linklets' imports and scope
-  tables. Scopes and definitions belong to a run, so the interface names
+  bodies of its inline functions, and its linklets, with their imports
+  and scope tables. Scopes and definitions belong to a run, so the
+  interface names
   them relative to modules: a scope is the core scope, a module scope's
   copy for a phase shift, or the *n*-th scope a module's expansion made;
   a definition is the module's own, or another module's by instance and
@@ -503,16 +503,14 @@ next to embed (1.4).
   shifts, and registers its linklets, types and definitions as a
   compiled one would; its compile-time values are computed per
   compilation as before (6.3).
-- A module's compiled form is its files: its linklets, named as their
-  instances are, and its interface, named by its hash. `sub build`
-  writes them beside the program, for the entry and every module it
-  requires at any phase, when the run has one kernel (1.4); the cache
-  holds them the same way, with its index. `(require name (compiled
-  "dir"))` loads the entry of the program in `dir`, and each module it
-  requires from the same directory by hash, unless the run has made that
-  module already; a module of another interface format or of another
-  kernel is an error. So a program's directory is what a host runs and
-  what a compiler imports.
+- A **compiled file**, `.subc`, holds modules, each its interface with
+  its linklets inside, those a module requires before it and the entry
+  last. `sub build FILE -o DIR -m OUT` writes the compiled file of `FILE`
+  and every module it requires at any phase to `OUT`, when the run has
+  one kernel (1.4); the cache's files hold one module each, beside its
+  index. `(require name (compiled "file"))` loads the file's modules in
+  order, but for those the run has made already, and requires its entry;
+  a module of another interface format or of another kernel is an error.
 - Since a linklet's bytes do not depend on the run that compiled it
   (3.5) or on where it was built from (3.6), a program built from cached
   modules is byte for byte the program a cold build writes: `make check`
@@ -560,8 +558,7 @@ directory, which is the package root when `bin/sub` runs the compiler
 **Running a program.** `sub build FILE -o DIR` writes the program
 `FILE` is the entry of: each linklet it instantiates at run time, as
 `DIR/<instance name>.wasm`, and `DIR/program`, their instance names one per
-line, each after the linklets it imports from, the entry's own last; and
-beside them the compiled modules of the entry and its requires (3.7).
+line, each after the linklets it imports from, the entry's own last.
 `build/subhost DIR arg ...` runs it: in one store, it
 instantiates each linklet under its name, gives the program the arguments,
 and calls the entry's `main`. It exits with status 0 when `main` returns,
@@ -1242,7 +1239,7 @@ the compiler may, because it is part of the expander.
 - **Memory**: the kernel module's memory holds its error messages.
 - **Queries**: the compiler registers the functions that answer the
   queries (2.3) with `%set-queries`. Until it does, each query traps.
-- **Interfaces** (3.7) are read with `%builder-data`: the last object
+- **Compiled files** (3.7) are read with `%builder-data`: the last object
   the bytes of a string builder describe, in the format above.
 - **Literal scopes**: a linklet's literals hold scope indexes (3.5), and
   `%make-syntax` maps them through `%scope-map`, a table the compiler

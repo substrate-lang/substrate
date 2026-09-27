@@ -37,13 +37,14 @@ Everything runs in the flake's dev shell:
 ```sh
 nix develop
 make check                      # the tests: built by bin/sub, run on build/subhost
-bin/sub build FILE -o DIR       # write FILE's program to DIR, with its compiled modules (spec 3.7); the cache is build/cache, or -c DIR
+bin/sub build FILE -o DIR       # write FILE's program to DIR; the cache is build/cache, or -c DIR (spec 3.7)
+bin/sub build FILE -o DIR -m OUT.subc    # and FILE's compiled file, for (require name (compiled "OUT.subc"))
 bin/sub -p DIR build FILE ...   # FILE is in the package at DIR (spec 3.6), rather than in this repository
 build/subhost DIR [ARG ...]     # run it on wasmtime
 host/subhost.mjs DIR [ARG ...]  # run it on V8
 bin/sub expand FILE             # print FILE's fully expanded phase-0 forms
 bin/sub compile FILE -o OUT     # write FILE's linklets (phase 0 to OUT)
-bin/sub kernel -o build/kernel.wasm      # write the kernel module, and its interface beside it
+bin/sub kernel -o build/kernel.wasm      # write the kernel module, and its compiled file beside it
 wasm-tools print OUT            # inspect a module
 HOST=build/subhost bin/sub ...  # run the compiler on wasmtime rather than V8
 HOST=host/subhost.mjs tests/run.sh   # run the tests' programs on V8

@@ -32,11 +32,11 @@
 (require cmp "compile.sub" compile-module set-syntax-lookup! set-syntax-types! set-current-source!)
 (require rd "reader.sub" read-file read-string-all)
 (require num "numbers.sub" content-hash)
-(require host "host.sub" export-index call-getter scope-map-new scope-map-add scope-map-clear error-string read-data bytes-data)
+(require host "host.sub" export-index call-getter scope-map-new scope-map-add scope-map-clear error-string read-data)
 (require ser "serialize.sub" make-serializer serialize! serializer-bytes)
 
 (provide report-trap set-repository-root! set-cache-directory! compile-module-file module-linklet-list
-         module-expanded-forms keep-expanded-forms! target-kernel-bytes target-kernel-interface write-module! module-closure one-kernel? program-linklets register-queries!)
+         module-expanded-forms keep-expanded-forms! target-kernel-bytes target-kernel-interface compiled-file-bytes program-linklets register-queries!)
 
 (import %call-transformer "kernel" "%call-transformer" (eqref eqref -> eqref))
 
@@ -106,16 +106,15 @@
 ;; module scope. hash: its identity, of its source and its requires'
 ;; hashes (spec 3.2). name: what its instance names start with, its
 ;; stem and hash. path: its file, which its source locations name (3.6),
-;; or (compiled dir hash) for a compiled module loaded from dir (3.7).
+;; or (compiled file hash) for a module loaded from a compiled file (3.7).
 (struct unit (path [name #:mutable] [hash #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
               [entries #:mutable] [expanded #:mutable] [scope #:mutable] [program #:mutable]
               scopes                                  ; index -> the scopes its expansion made, in order
               [types #:mutable]                       ; the types it declared, in order
-              [infos #:mutable]                       ; its functions, globals and tags, newest first
-              [interface #:mutable]))                 ; its interface's bytes, once read or written (3.7)
+              [infos #:mutable]))                     ; its functions, globals and tags, newest first
 
 (define (new-unit path name)
-  (unit path name #f 'compiling (make-hasheqv) '() '() '() #f #f #f (make-hasheqv) '() '() #f))
+  (unit path name #f 'compiling (make-hasheqv) '() '() '() #f #f #f (make-hasheqv) '() '()))
 
 (define units-by-hash (make-hash))           ; hash -> unit
 (define scope-owners (make-hasheqv))         ; scope -> (unit . index): the unit whose expansion made it
@@ -197,23 +196,22 @@
 (define repository-root #f)
 (define (set-repository-root! root) (set! repository-root root))
 
-;; The kernel this compiler runs with, compiled: the interface (spec 3.7)
-;; and bytes in build/kernel.interface and build/kernel.wasm under the
-;; root when this compiler was compiled, which the compiler compiling it
-;; wrote from its target kernel (sub kernel), the kernel it gives this
-;; compiler to run with; or #f when there were none.
+;; The kernel this compiler runs with, compiled: the module in
+;; build/kernel.subc under the root when this compiler was compiled (spec
+;; 3.7), which the compiler compiling it wrote from its target kernel
+;; (sub kernel), the kernel it gives this compiler to run with; or #f
+;; when there was none.
 (begin-for-syntax
   (require-unqualified substrate "../lib/substrate.sub")
   (require host "host.sub" read-data)
   (require num "numbers.sub" content-hash))
 (define-syntax (compiled-kernel stx)
   (let* ([root (vector-ref (current-command-line-arguments) 0)]
-         [d (read-data (string-append root "/build/kernel.interface"))])
-    (cond [(not d) (datum->syntax stx #f stx)]
-          [(not (equal? (cdr (assq 'hash d)) (content-hash (list (file->string (string-append root "/compiler/kernel.sub"))))))
-           (error 'compiled-kernel "build/kernel.interface is not of compiler/kernel.sub: write it again with sub kernel")]
-          [else
-           (datum->syntax stx (list 'quote (list d (file->bytes (string-append root "/build/kernel.wasm")))) stx)])))
+         [ds (read-data (string-append root "/build/kernel.subc"))])
+    (cond [(not ds) (datum->syntax stx #f stx)]
+          [(not (equal? (cdr (assq 'hash (car ds))) (content-hash (list (file->string (string-append root "/compiler/kernel.sub"))))))
+           (error 'compiled-kernel "build/kernel.subc is not of compiler/kernel.sub: write it again with sub kernel")]
+          [else (datum->syntax stx (list 'quote (car ds)) stx)])))
 (define embedded-kernel (compiled-kernel))
 
 ;; A build of the kernel module: its unit, whose one linklet it is and
@@ -255,15 +253,12 @@
 
 (define (ensure-kernels!)
   (unless target-kernel
-    (let* ([text (file->string (string-append repository-root "/" kernel-path))]
-           [d (and embedded-kernel (car embedded-kernel))])
+    (let ([text (file->string (string-append repository-root "/" kernel-path))] [d embedded-kernel])
       ;; The running kernel is the embedded one, unless there is none or
-      ;; its interface is of a format this compiler does not read: then
+      ;; it is of a format this compiler does not read: then
       ;; compiler/kernel.sub is its source.
       (set! running-kernel
-            (if (and d (eqv? (section d 'format) interface-format))
-                (load-kernel d (cadr embedded-kernel))
-                (compile-kernel text)))
+            (if (and d (eqv? (section d 'format) interface-format)) (load-kernel d) (compile-kernel text)))
       (set! target-kernel
             (if (string=? (kernel-hash running-kernel) (content-hash (list text))) running-kernel (compile-kernel text)))
       (unless (eq? running-kernel target-kernel) (check-shared-types! running-kernel target-kernel))
@@ -302,10 +297,10 @@
               (set-unit-state! m 'done))))))
     k))
 
-;; The kernel module whose compiled form is interface d and bytes.
-(define (load-kernel d bytes)
+;; The kernel module whose compiled form is d.
+(define (load-kernel d)
   (let* ([m (new-unit kernel-path "kernel")] [k (kernel m (make-hasheq) #f #f)])
-    (with-kernel k (lambda () (load-module! m d (lambda (p) bytes))))
+    (with-kernel k (lambda () (load-module! m d)))
     (take-kernel-types! k)
     k))
 
@@ -319,11 +314,11 @@
 
 (define (target-kernel-bytes) (ensure-kernels!) (kernel-bytes target-kernel))
 
-;; The target kernel's interface (spec 3.7), in the kernel's data format:
-;; with its bytes, what the compiler compiled next embeds.
+;; The target kernel as a compiled file's bytes (spec 3.7): what the
+;; compiler compiled next embeds.
 (define (target-kernel-interface)
   (ensure-kernels!)
-  (with-kernel target-kernel (lambda () (unit-interface-bytes (kernel-unit target-kernel)))))
+  (data-bytes (list (with-kernel target-kernel (lambda () (write-interface (kernel-unit target-kernel)))))))
 
 ;; info, a definition that code names, as the kernel the code is lowered
 ;; against has it: if info is the target kernel's, and code is lowered
@@ -343,8 +338,8 @@
 ;;
 ;; With a cache directory (sub build -c DIR), a module compiled once is
 ;; loaded from the cache while its source and its requires are as they
-;; were (spec 3.7): its linklets, and its interface, what the expander
-;; keeps of a module it compiled, as quoted data in the kernel's format
+;; were (spec 3.7): its interface, what the expander keeps of a module it
+;; compiled, its linklets inside, as quoted data in the kernel's format
 ;; (spec 3.5). An interface starts with what it is of: the interface
 ;; format, the kernel, the module and its requires, by hash. The cache
 ;; holds one kernel's code, so it is neither read nor written while the
@@ -353,7 +348,7 @@
 (define cache-directory #f)
 (define (set-cache-directory! dir) (set! cache-directory dir))
 
-(define interface-format 3)
+(define interface-format 5)
 
 ;; Does the run have one kernel, the running and target kernels being one?
 (define (one-kernel?) (eq? running-kernel target-kernel))
@@ -373,103 +368,89 @@
 ;; Section key of interface d.
 (define (section d key) (cdr (assq key d)))
 
-;; The module at path, from the cache, if the cache has one for it whose
-;; interface is of this format and kernel, and of the source and requires
-;; as they are now; else #f. Its requires are compiled or loaded first, as
-;; they would be.
+;; The module at path, from the cache, if the cache has one for it that
+;; is of this format and kernel, and of the source and requires as they
+;; are now; else #f. Its requires are compiled or loaded first, as they
+;; would be.
 (define (load-cached path)
   (let* ([kernel (cache-kernel)]
          [hash (and kernel (read-data (cache-file (string-append (content-hash (list path)) ".path"))))]
-         [f (and hash (cache-file (string-append hash ".interface")))]
-         [bs (and f (file-exists? f) (file->bytes f))]
-         [d (and bs (bytes-data bs))])
+         [ds (and hash (read-data (cache-file (string-append hash ".subc"))))]
+         [d (and ds (car ds))])
     (and d (eqv? (section d 'format) interface-format) (equal? (section d 'kernel) kernel)
          (begin
            (hash-set! registry path (new-unit path hash))    ; a cycle through the requires is an error, as when compiling
            (let ([requires (map (lambda (r) (cons (module-of (car r)) (caddr r))) (section d 'requires))])
              (cond [(string=? (module-hash (file->string path) requires) hash)
                     (let ([m (or (hash-ref units-by-hash hash #f)          ; another file that is this module (spec 3.2)
-                                 (load-compiled-data cache-directory hash path bs d))])
+                                 (load-compiled-module d path))])
                       (hash-set! registry path m)
                       m)]
                    [else (hash-remove! registry path) #f]))))))
 
 ;; The module a recorded require names: the module in a file, compiled
-;; or loaded as it would be, or a compiled module loaded from its
-;; directory.
+;; or loaded as it would be, or the entry of a compiled file.
 (define (module-of spec)
-  (if (pair? spec) (load-compiled (cadr spec) (caddr spec) spec) (compile-module-file spec)))
+  (if (pair? spec) (load-compiled-file (cadr spec)) (compile-module-file spec)))
 
-;; ---- compiled modules ----
-;;
-;; A module's compiled form is its files (spec 3.7): its linklets, named
-;; as their instances are, and its interface, named by its hash. The
-;; cache holds them, and so does a program's directory, for (require name
-;; (compiled dir)).
-
-;; Write module m's compiled form to directory dir.
-(define (write-module! m dir)
-  (for-each (lambda (p)
-              (display-to-file (linklet-bytes (hash-ref (unit-linklets m) p))
-                               (string-append dir "/" (linklet-name m p 0) ".wasm")))
-            (hash-keys (unit-linklets m)))
-  (display-to-file (unit-interface-bytes m) (string-append dir "/" (unit-hash m) ".interface")))
-
-;; Module m's interface, as bytes: read with the module, or written once.
-(define (unit-interface-bytes m)
-  (or (unit-interface m)
-      (let ([bs (data-bytes (write-interface m))])
-        (set-unit-interface! m bs)
-        bs)))
-
-;; The compiled module of hash in directory dir: the one this run has made
-;; already, or loaded from the directory's files, its requires first from
-;; the same directory; known by path, its file or (compiled dir hash).
-(define (load-compiled dir hash path)
-  (or (hash-ref units-by-hash hash #f)
-      (let ([f (string-append dir "/" hash ".interface")])
-        (unless (file-exists? f) (raise-compile-error #f "no compiled module ~a in ~a" hash dir))
-        (let ([bs (file->bytes f)])
-          (load-compiled-data dir hash path bs (bytes-data bs))))))
-
-;; Module m of hash, loaded from directory dir, given its interface as
-;; bytes bs and datum d: it must be of this interface format and of the
-;; run's kernel.
-(define (load-compiled-data dir hash path bs d)
-  (let ([m (new-unit path hash)])
-    (unless (eqv? (section d 'format) interface-format)
-      (raise-compile-error #f "the compiled module ~a in ~a is of another interface format" hash dir))
-    (unless (equal? (section d 'kernel) (kernel-hash target-kernel))
-      (raise-compile-error #f "the compiled module ~a in ~a was compiled for another kernel" hash dir))
-    (set-unit-interface! m bs)
-    (set-unit-requires! m (map (lambda (r) (cons (load-compiled dir (cadr r) (list 'compiled dir (cadr r))) (caddr r)))
-                               (section d 'requires)))
-    (load-module! m d (lambda (p) (file->bytes (string-append dir "/" (linklet-name m p 0) ".wasm"))))
-    m))
-
-;; The hash of the entry of the program in dir: the last instance name
-;; in dir/program is <stem>.<hash>@0+0 (spec 3.2).
-(define (entry-hash dir)
-  (let* ([text (file->string (string-append dir "/program"))]
-         [at (last-byte-index text 64)]
-         [dot (last-byte-index (substring/utf-8 text 0 at) 46)])
-    (substring/utf-8 text (+ dot 1) at)))
-
-;; Module m and every module it requires, at any phase shift,
-;; transitively, each once.
-(define (module-closure m)
-  (let loop ([todo (list m)] [seen '()])
-    (cond [(null? todo) (reverse seen)]
-          [(memq (car todo) seen) (loop (cdr todo) seen)]
-          [else (loop (append (cdr todo) (map car (unit-requires (car todo)))) (cons (car todo) seen))])))
-
-;; Write module m to the cache: its compiled form and the index entry
+;; Write module m to the cache: its compiled file, and the index entry
 ;; for its path.
 (define (store-cached! m)
   (when (cache-kernel)
     (with-handlers ([exn? (lambda (e) #f)])
-      (write-module! m cache-directory)
+      (display-to-file (data-bytes (list (write-interface m))) (cache-file (string-append (unit-hash m) ".subc")))
       (store-index! m))))
+
+;; ---- compiled files ----
+;;
+;; A compiled file (spec 3.7) holds modules, each its interface with its
+;; linklets inside: those a module requires before it, the entry last.
+;; The cache's files hold one module each; sub build -m writes a
+;; program's closure to one, for (require name (compiled file)).
+
+;; The bytes of the compiled file of module m and its requires.
+(define (compiled-file-bytes m)
+  (unless (one-kernel?)
+    (raise-compile-error #f "a compiled file holds one kernel's code, and this build has two (spec 1.4)"))
+  (data-bytes (map write-interface (module-closure m))))
+
+;; Module m and every module it requires, at any phase shift,
+;; transitively, each once, after those it requires.
+(define (module-closure m)
+  (let ([seen (make-hasheq)] [out '()])
+    (let visit ([m m])
+      (unless (hash-ref seen m #f)
+        (hash-set! seen m #t)
+        (for-each (lambda (r) (visit (car r))) (unit-requires m))
+        (set! out (cons m out))))
+    (reverse out)))
+
+;; The entry of the compiled file at path, its modules loaded in order,
+;; but for those this run has made already.
+(define (load-compiled-file path)
+  (let ([ds (read-data path)])
+    (unless ds (raise-compile-error #f "no compiled file ~a" path))
+    (foldl (lambda (d entry)
+             (or (hash-ref units-by-hash (section d 'hash) #f)
+                 (load-compiled-module d (list 'compiled path (section d 'hash)))))
+           #f ds)))
+
+;; Module d of a compiled file, loaded, its requires being modules this
+;; run has; known by path. It must be of this interface format and of
+;; the run's kernel.
+(define (load-compiled-module d path)
+  (let ([m (new-unit path (section d 'hash))])
+    (unless (eqv? (section d 'format) interface-format)
+      (raise-compile-error #f "the compiled module ~a is of another interface format" path))
+    (unless (equal? (section d 'kernel) (kernel-hash target-kernel))
+      (raise-compile-error #f "the compiled module ~a was compiled for another kernel" path))
+    (set-unit-requires! m (map (lambda (r)
+                                 (cons (or (hash-ref units-by-hash (cadr r) #f)
+                                           (raise-compile-error #f "the compiled module ~a requires ~a, which is not with it" path (cadr r)))
+                                       (caddr r)))
+                               (section d 'requires)))
+    (load-module! m d)
+    m))
 
 ;; The cache's entry for m's path: the hash of the module there.
 (define (store-index! m)
@@ -534,13 +515,14 @@
                        [else e]))]
          [own? (lambda (info) (own-instance? m (info-instance info)))]
          [by-index (lambda (l) (sort l (lambda (a b) (< (cadr (car a)) (cadr (car b))))))])
-      (for-each own-ref (reverse (unit-infos m)))     ; every definition, in order, before what refers to them
+      (for-each own-ref (reverse (unit-infos m)))     ; every definition, in order, before what else is referred to
       (let* ([linklets (map (lambda (p)
                               (let ([l (hash-ref (unit-linklets m) p)])
-                                (list p (linklet-imports l) (linklet-gc? l) (map sref (linklet-scopes l)))))
+                                (list p (linklet-bytes l) (linklet-imports l) (linklet-gc? l) (map sref (linklet-scopes l)))))
                             (sort (hash-keys (unit-linklets m)) <))]
              [provides (map (lambda (p) (cons (car p) (mref (cdr p)))) (unit-provides m))]
-             [entries (map (lambda (e) (list (car e) (map sref (cadr e)) (caddr e) (mref (binding-meaning (cadddr e)))))
+             [entries (map (lambda (e)
+                             (list (car e) (sort (map sref (cadr e)) scope-ref<?) (caddr e) (mref (binding-meaning (cadddr e)))))
                            (reverse (unit-entries m)))]
              [values (by-index (filter (lambda (v) v)
                                        (map (lambda (f) (let ([g (function-value f)]) (and g (list (iref f) (iref g)))))
@@ -581,14 +563,19 @@
                                  [else (list 'data (data-info-name info) (data-info-offset info) (data-info-bytes info))]))
                          (reverse own-list))])
         (list (cons 'format interface-format) (cons 'kernel (kernel-hash target-kernel)) (cons 'hash (unit-hash m))
+              (cons 'definitions (length (unit-infos m)))
               (cons 'requires (map (lambda (r) (list (unit-path (car r)) (unit-hash (car r)) (cdr r))) (unit-requires m)))
               (cons 'name (unit-name m)) (cons 'types type-forms) (cons 'groups groups)
               (cons 'infos infos) (cons 'provides provides) (cons 'entries entries) (cons 'values values)
               (cons 'inlines inlines) (cons 'macros macros) (cons 'linklets linklets))))))
 
-;; Load module m from its interface d, with (bytes-of p) the bytes of
-;; its phase-p linklet, as if it had been compiled in this run.
-(define (load-module! m d bytes-of)
+;; Scope references in an order that does not depend on the run, for a
+;; binding's scope set; loaded, a set is sorted by the run's numbers.
+(define (scope-ref<? a b) (string<? (format "~s" a) (format "~s" b)))
+
+;; Load module m from its interface d, as if it had been compiled in
+;; this run.
+(define (load-module! m d)
   (begin
     (set-unit-name! m (section d 'name))
     (set-unit-hash! m (section d 'hash))
@@ -648,7 +635,14 @@
                             [else #f])))
                   (range (length type-forms)))
         (for-each (lambda (t) (own-type! m t)) (vector->list shells))
-        ;; Definitions.
+        ;; Its linklets; the program is phase 0's.
+        (for-each (lambda (l)
+                    (hash-set! (unit-linklets m) (car l)
+                               (linklet (cadr l) (caddr l) (cadddr l) (map sres (list-ref l 4))))
+                    (linklet-name m (car l) 0))
+                  (section d 'linklets))
+        ;; Definitions: the first are its own, as note-definitions! notes
+        ;; them; the rest are what else its sections refer to.
         (for-each (lambda (f i)
                     (let ([info (case (car f)
                                   [(func) (func-info (cadr f) (map vres (caddr f)) (map vres (cadddr f)) (list-ref f 4) (list-ref f 5)
@@ -657,7 +651,7 @@
                                   [(tag) (tag-info (cadr f) (map vres (caddr f)) (cadddr f) (list-ref f 4))]
                                   [else (data-info (cadr f) (caddr f) (cadddr f))])])
                       (vector-set! infos i info)
-                      (unless (data-info? info) (note-info! m info))))
+                      (when (< i (section d 'definitions)) (note-info! m info))))
                   (section d 'infos) (range (length (section d 'infos))))
         ;; What the expander keeps of a module: its bindings, provides,
         ;; function values, inline bodies and macros.
@@ -674,12 +668,6 @@
                                        (filter (lambda (p) (memv (car p) (list-ref x 5))) params)))))
                   (section d 'inlines))
         (for-each (lambda (g) (hash-set! macro-modules (ires (car g)) m)) (section d 'macros))
-        ;; Its linklets; the program is phase 0's.
-        (for-each (lambda (l)
-                    (hash-set! (unit-linklets m) (car l)
-                               (linklet (bytes-of (car l)) (cadr l) (caddr l) (map sres (cadddr l))))
-                    (linklet-name m (car l) 0))
-                  (section d 'linklets))
         (set-unit-program! m (hash-ref (unit-linklets m) 0))
         (set-unit-state! m 'done)
         ;; As its requires would have when it was compiled: its own
@@ -1929,7 +1917,7 @@
                   (for-each (lambda (p) (bind-import! (car names) phase (cdr p))) ps)))
               (caddr parts))))
 
-;; A module's source in a require: a path, kernel, or (compiled dir).
+;; A module's source in a require: a path, kernel, or (compiled file).
 (define (module-source? s)
   (or (string-literal? s) (core-name? s 'kernel) (syntax-match s [('compiled (? string-literal? _)) #t] [_ #f])))
 
@@ -1970,11 +1958,10 @@
 (define (require-module! f name spec phase)
   (require-unit! name (compile-module-file (module-path-of f spec)) phase))
 
-;; (require name (compiled dir) item ...): the entry of the program built
-;; to dir, loaded from dir's files with its requires (spec 3.7).
+;; (require name (compiled file) item ...): the entry of the compiled
+;; file, loaded with its requires (spec 3.7).
 (define (require-compiled! f name spec phase)
-  (let* ([dir (normalize-path (module-path-of f (cadr (stx-e spec))))] [hash (entry-hash dir)])
-    (require-unit! name (load-compiled dir hash (list 'compiled dir hash)) phase)))
+  (require-unit! name (load-compiled-file (normalize-path (module-path-of f (cadr (stx-e spec))))) phase))
 
 ;; Module m, required as name at phase: recorded, its bindings made
 ;; resolvable for its macros; what it provides, as seen from phase.
