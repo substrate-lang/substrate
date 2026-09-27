@@ -26,7 +26,7 @@
          global-info-export tag-info tag-info? tag-info-name tag-info-params tag-info-instance tag-info-export
          data-info data-info-offset data-info-bytes
          make-type-info type-info-name type-info-kind type-info-fields set-type-info-fields!
-         type-info-super type-info-final? type-info-group set-type-info-group! identify-group! same-type? func-type?
+         type-info-super type-info-final? type-info-group set-type-info-group! type-info-identity identify-group! same-type? func-type?
          make-ref ref-type? ref-nullable? ref-heap type-info? abstract-heaps valtype<=? types<=? types=? fresh-key!)
 (require ops "ops.sub" lookup-prim prim-op-params prim-op-kind prim-names)
 (require cmp "compile.sub" compile-module set-syntax-lookup! set-syntax-types! set-current-source!)
@@ -46,10 +46,12 @@
     array.len array.copy array.fill
     ref.null ref.is_null ref.eq ref.as_non_null ref.test ref.cast ref.i31 i31.get_s i31.get_u))
 
-;; The implicit forms (spec 5.3, 5.4) and the linklet hook (spec 6.5).
+;; The implicit forms (spec 5.3, 5.4), the linklet hook (spec 6.5), and
+;; holes, which a language leaves in code for its hook to fill (6.4).
 (define app-sym '#%app)
 (define datum-sym '#%datum)
 (define linklet-sym '#%linklet)
+(define hole-sym '#%hole)
 
 (define core-forms
   (append
@@ -60,7 +62,7 @@
      throw throw-ref try
      i32.const i64.const f32.const f64.const
      quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
-   (list app-sym datum-sym linklet-sym)
+   (list app-sym datum-sym linklet-sym hole-sym)
    gc-forms))
 
 (define eqref (make-ref #t 'eq))
@@ -605,8 +607,24 @@
                          [else (cons (decode (car x)) (decode (cdr x)))]))]
          [type-at (lambda (r)
                     (if (null? (cdr r))
-                        (vector-ref shells (car r))
+                        (shell (car r))
                         (list-ref (unit-types (unit-with-hash (car r))) (cadr r))))]
+         ;; Its i-th type, made the first time something names it: a
+         ;; supertype is made before its subtypes, wherever it is listed.
+         [shell (lambda (i)
+                  (or (vector-ref shells i)
+                      (let* ([f (list-ref type-forms i)]
+                             [t (make-type-info (car f) (cadr f) #f (decode (cadddr f)) (caddr f) #f)])
+                        (vector-set! shells i t)
+                        t)))]
+         ;; The identity of t's group, once the groups of the types its
+         ;; members name have theirs; wasm allows no cycle between groups.
+         [identify! (lambda (t)
+                      (unless (type-info-identity t)
+                        (let ([group (or (type-info-group t) (list t))])
+                          (for-each (lambda (u) (unless (memq u group) (identify! u)))
+                                    (apply append (map type-references group)))
+                          (identify-group! group))))]
          [info-at (lambda (r)
                     (case (car r)
                       [(own) (vector-ref infos (cadr r))]
@@ -618,22 +636,15 @@
                        [(eq? r 'kernel-ids) (kernel-id-scope!)]
                        [(eq? (car r) 'm) (module-scope-at (unit-with-hash (cadr r)) (caddr r))]
                        [else (unit-scope-at (unit-with-hash (cadr r)) (caddr r))]))])
-      ;; Types: each after its supertype; fields, which may name later
-      ;; types of a group, once all exist; identities in order.
-      (for-each (lambda (f i)
-                  (vector-set! shells i (make-type-info (car f) (cadr f) #f (decode (cadddr f)) (caddr f) #f)))
-                type-forms (range (length type-forms)))
+      ;; Types, in any order: each made, then its fields, which may name any
+      ;; of them, then the identities.
+      (for-each shell (range (length type-forms)))
       (for-each (lambda (f t) (set-type-info-fields! t (decode (list-ref f 4)))) type-forms (vector->list shells))
       (for-each (lambda (g)
                   (let ([members (map (lambda (i) (vector-ref shells i)) g)])
                     (for-each (lambda (t) (set-type-info-group! t members)) members)))
                 (section d 'groups))
-      (for-each (lambda (t)
-                  (let ([g (type-info-group t)])
-                    (cond [(not g) (identify-group! (list t))]
-                          [(eq? t (car g)) (identify-group! g)]
-                          [else #f])))
-                (vector->list shells))
+      (for-each identify! (vector->list shells))
       (for-each (lambda (t) (own-type! m t)) (vector->list shells))
       ;; Its linklets; the program is phase 0's.
       (for-each (lambda (l)
@@ -669,6 +680,16 @@
       ;; As its requires would have when it was compiled: its own
       ;; bindings are made, and its requires' installed at their shifts.
       (install-module-bindings! m 0))))
+
+;; The declared types type t names: its supertype, and those its fields
+;; or signature refer to.
+(define (type-references t)
+  (let* ([fs (type-info-fields t)]
+         [vals (case (type-info-kind t)
+                 [(struct) (map cadr fs)]
+                 [(array) (list (car fs))]
+                 [else (append (car fs) (cadr fs))])])
+    (filter type-info? (cons (type-info-super t) (map (lambda (v) (and (ref-type? v) (ref-heap v))) vals)))))
 
 (define (unit-with-hash hash)
   (or (hash-ref units-by-hash hash #f)
@@ -1383,23 +1404,30 @@
 (define (expand-body forms phase)
   (let ([b (body phase '() #f '())] [saved current-body])
     (set! current-body b)
-    ;; Pass 1: find definitions, run compile-time forms, splice begins.
-    (for-each (lambda (f)
-                (if (expanded? f)
-                    (set-body-items! b (cons (list 'done (expanded-form f)) (body-items b)))
-                    (declare-form! f b redefining?)))
-              forms)
-    ;; Pass 2: expand bodies and expressions. What an item lifts goes
-    ;; before it.
-    (set-body-pass2?! b #t)
-    (let ([out (apply append
-                      (map (lambda (item)
-                             (set-body-lifted! b '())
-                             (let ([out (expand-item item phase)])
-                               (append (reverse (body-lifted b)) (list out))))
-                           (reverse (body-items b))))])
+    (declare-forms! b forms)
+    (let ([out (finish-body! b)])
       (set! current-body saved)
       out)))
+
+;; Pass 1 for forms, of body b: find definitions, run compile-time forms,
+;; splice begins.
+(define (declare-forms! b forms)
+  (for-each (lambda (f)
+              (if (expanded? f)
+                  (set-body-items! b (cons (list 'done (expanded-form f)) (body-items b)))
+                  (declare-form! f b redefining?)))
+            forms))
+
+;; Pass 2 for body b: expand bodies and expressions, in the order pass 1
+;; declared them. What an item lifts goes before it.
+(define (finish-body! b)
+  (set-body-pass2?! b #t)
+  (apply append
+         (map (lambda (item)
+                (set-body-lifted! b '())
+                (let ([out (expand-item item (body-phase b))])
+                  (append (reverse (body-lifted b)) (list out))))
+              (reverse (body-items b)))))
 
 ;; Pass 1 for module-level form f0 of body b: expand macro uses at its
 ;; head, then declare it, run it, or keep it for pass 2. only is #f, or
@@ -1475,11 +1503,14 @@
            (cadr m))]
         [else (raise-compile-error s "expected a heap type, got ~s" (stx->datum s))]))
 
+;; A value type; or a hole, which a language's #%linklet fills (6.4), as
+;; (%hole s).
 (define (parse-type s phase)
   (let* ([d (stx-e s)] [short (assq d shorthand-refs)])
     (cond [(memq d '(i32 i64 f32 f64)) d]
           [short (make-ref #t (cdr short))]
           [else (syntax-match s
+                  [('#%hole . _) (list '%hole s)]
                   [('ref heap) (make-ref #f (parse-heap heap phase))]
                   [('ref 'null heap) (make-ref #t (parse-heap heap phase))]
                   [('ref . _) (raise-compile-error s "expected (ref T) or (ref null T)")]
@@ -1490,6 +1521,17 @@
   (let ([t (parse-type s phase)])
     (unless (ref-type? t) (raise-compile-error s "expected a reference type"))
     t))
+
+;; A hole in a type, (%hole s). Code is lowered once #%linklet has run, so
+;; a hole left then, in a type or as an expression, is one no language
+;; filled (spec 6.5).
+(define (hole-type? t) (and (pair? t) (eq? (car t) '%hole)))
+
+(define (unfilled-hole s)
+  (raise-compile-error s "this hole was never filled: the #%linklet of the language that left it must replace it (spec 6.5)"))
+
+;; Type t, which code is lowered with: not a hole.
+(define (filled-type t) (if (hole-type? t) (unfilled-hole (cadr t)) t))
 
 ;; The words of type syntax are compared by name, like wasm's keywords, so
 ;; they are reserved: no declared type may be named by one (spec 5.1).
@@ -1727,6 +1769,7 @@
   (syntax-match body
     [('-> r . rest) (cons (syntax-match r
                             [('ref . _) (list (parse-type r phase))]
+                            [('#%hole . _) (list (parse-type r phase))]
                             [(t ...) (map (lambda (x) (parse-type x phase)) t)]
                             [_ (list (parse-type r phase))])
                           rest)]
@@ -1735,12 +1778,14 @@
 
 ;; The `-> r` that starts rest, a func's or a lambda's, as a list of the
 ;; two, or (). r is one type or a list of them, and has its types
-;; expanded; a macro use is one type, though it looks like a list.
+;; expanded; a macro use or a hole is one type, though it looks like a
+;; list.
 (define (arrow-of rest phase)
   (syntax-match rest
     [('-> r . _)
      (list (car rest) (syntax-match r
                         [('ref . _) (expand-type r phase)]
+                        [('#%hole . _) r]
                         [(t ...) (if (type-macro-use r phase)
                                      (expand-type r phase)
                                      (stx-rewrap r (map (lambda (x) (expand-type x phase)) t)))]
@@ -2232,9 +2277,16 @@
          [t (transformer-of m)])
     (cond
       [t
+       ;; The unit's new code is a body of its own. While the hook runs,
+       ;; what it lifts is declared there at once, so the code it expands
+       ;; next can use the names; then what it returns is declared there,
+       ;; and all of it is expanded, what it lifted first.
        (let* ([intro (new-scope!)]
               [in (flip-scope (out-list ctx (cons id (cons (datum->stx ctx kind #f) forms))) intro)]
-              [result (call-syntax-function "#%linklet" (lambda (s) (%call-transformer t s)) in phase intro #t)]
+              [b (body phase '() #f '())]
+              [saved-body current-body]
+              [result (begin (set! current-body b)
+                             (call-syntax-function "#%linklet" (lambda (s) (%call-transformer t s)) in phase intro #t))]
               [returned (or (stx->list result)
                             (raise-compile-error ctx "#%linklet returned something other than a list of forms"))]
               ;; A form returned unchanged is one of the forms the hook was
@@ -2245,9 +2297,11 @@
               [saved-redefining redefining?] [saved-hook hook-output?])
          (set! redefining? "#%linklet returned")
          (set! hook-output? #t)
-         (let ([r (expand-body new phase)])
+         (declare-forms! b new)
+         (let ([r (finish-body! b)])
            (set! redefining? saved-redefining)
            (set! hook-output? saved-hook)
+           (set! current-body saved-body)
            r))]
       [(or (not m) (eq? (car m) 'core)) forms]
       [else (raise-compile-error ctx "#%linklet is bound here, but not to a transformer")])))
@@ -2384,8 +2438,8 @@
       [else (and (type-meaning-of id api-phase) 'type)])))
 
 ;; The signature of the function id is bound to, (t ... -> r ...), each
-;; type written as in the kernel: a numeric type's name, or (ref T) or
-;; (ref null T) with T a heap type's name; #f if id is not a function.
+;; type written as in the kernel: a numeric type's name, (ref T) or (ref
+;; null T) with T a heap type's name, or #%hole; #f if id is not a function.
 (define (query-function-signature id)
   (unless (id? id) (raise-compile-error api-where "identifier-function-signature: expected an identifier"))
   (let ([m (meaning-of id api-phase)])
@@ -2394,10 +2448,11 @@
            (append (map type->datum (func-info-params info)) '(->) (map type->datum (func-info-results info)))))))
 
 (define (type->datum t)
-  (if (ref-type? t)
-      (let* ([h (ref-heap t)] [name (if (type-info? h) (type-info-name h) h)])
-        (if (ref-nullable? t) (list 'ref 'null name) (list 'ref name)))
-      t))
+  (cond [(hole-type? t) hole-sym]
+        [(ref-type? t)
+         (let* ([h (ref-heap t)] [name (if (type-info? h) (type-info-name h) h)])
+           (if (ref-nullable? t) (list 'ref 'null name) (list 'ref name)))]
+        [else t]))
 
 ;; The running macro's introduction scope is flipped around the expansion,
 ;; so code from the macro's input expands as it would at the use site. If
@@ -2662,6 +2717,8 @@
       [(#%app) (syntax-match s [(_ f arg ...) (core-app s f arg phase)])]
       [(#%datum) (syntax-match s [(_ literal) (core-datum literal) (o literal)])]
       [(#%linklet) (raise-compile-error s "#%linklet is not a form: it names the hook for a unit's code (spec 6.5)")]
+      ;; A hole is left as it is, for the language's #%linklet (spec 6.5).
+      [(#%hole) (core-headed s hole-sym)]
       [(quote) (syntax-match s [(_ datum) (o datum)])]
       [(quote-syntax) (syntax-match s [(_ datum) (o (prune-local-scopes datum))])]
       [(quasiquote) (syntax-match s [(_ template) (quasi s template 0 phase 'quasiquote 'unquote 'unquote-splicing #f)])]
@@ -2956,10 +3013,16 @@
                [params (map (lambda (p t) (cons (local-key-of p phase) t)) param (func-info-params info))]
                ;; A (type T) clause first is in the info already.
                [code (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase)])
+          (for-each filled-type (append (func-info-params info) (func-info-results info)))
           (when inline? (record-inline! info params code name))
           (when (cadr options) (function-value info))
           (list (list 'func info params code)))])]
-    [(global) (syntax-match f [(_ name _ init) (list (list 'global (cadr (meaning-of name phase)) (lower-expr init phase)))])]
+    [(global)
+     (syntax-match f
+       [(_ name _ init)
+        (let ([info (cadr (meaning-of name phase))])
+          (filled-type (global-info-type info))
+          (list (list 'global info (lower-expr init phase))))])]
     [(import) '()]
     [(type) (syntax-match f [(_ name _) (list (list 'type (type-of name phase)))])]
     [(rec) (syntax-match f [(_ (_ name _) ...) (map (lambda (n) (list 'type (type-of n phase))) name)])]
@@ -3235,11 +3298,12 @@
                 (map (lambda (b)
                        (syntax-match b
                          [(x init) (list (local-key-of x phase) #f (lo init))]
-                         [(x type init) (list (local-key-of x phase) (parse-type type phase) (lo init))]))
+                         [(x type init) (list (local-key-of x phase) (filled-type (parse-type type phase)) (lo init))]))
                      binding)
                 (lower-seq body s phase))])]
       [(lambda)
        (raise-compile-error s "lambda: a lambda must be lowered to other kernel code before it is compiled (spec 5.3)")]
+      [(#%hole) (unfilled-hole s)]
       [(begin) (syntax-match s [(_ e ...) (cons 'seq (map lo e))])]
       [(if) (syntax-match s
               [(_ test then) (list 'if (lo test) (lo then) #f)]

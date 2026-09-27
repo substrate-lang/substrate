@@ -251,10 +251,11 @@ marked with another type, such as `n:i32`.
   macro's input expands as it would at the use site.
 - `syntax-local-lift-definition` adds a module-level form (a `func`, `global`,
   `import`, `type` or `data` form, or an expression) to the module body
-  being expanded, at the running macro's phase (6.4). The form is declared
-  as the macro's output is, with the use's introduction scope, so each
-  use gets fresh names. It returns the form as given, so the macro can put
-  its names in its output.
+  being expanded, at the running macro's phase (6.4), or, while
+  `#%linklet` runs, to the unit the hook returns (6.5). The form is
+  declared as the macro's output is, with the use's introduction scope,
+  so each use gets fresh names. It returns the form as given, so the
+  macro can put its names in its output.
 - `syntax-local-introduce` flips the running macro's introduction scope
   on `stx`: it turns syntax as the macro sees it into syntax as the module
   sees it, and back. A macro that keeps syntax from one use for another,
@@ -1098,6 +1099,7 @@ expr ::= id                                   ; a local or global variable, or a
        | (i32.const n) | (i64.const n) | (f32.const x) | (f64.const x)
        | (select expr expr expr) | (drop expr) | (unreachable) | (nop)
        | (throw id expr ...) | (throw-ref expr) | (try (clause ...) expr ...)
+       | (#%hole datum ...)                   ; a hole: code the language's #%linklet fills
 
 clause ::= (catch id (id ...) expr ...) | (catch-ref id (id ...) expr ...)
          | (catch-all expr ...) | (catch-all-ref (id) expr ...)
@@ -1117,6 +1119,13 @@ clause ::= (catch id (id ...) expr ...) | (catch-ref id (id ...) expr ...)
   inferred types; the kernel's checker infers them after `#%linklet`, as
   it does for any code. Type functions (5.1) are expanded: types in fully
   expanded code contain no macro uses.
+- A **hole**, `(#%hole datum ...)`, is code a language leaves for its
+  `#%linklet` to fill (6.5), where it will know what goes there: an
+  expression or, as a type, a parameter's, a result's, a global's or a
+  `let` binding's type. Expansion leaves a hole and what it holds as they
+  are, so a macro can put what the hook needs to know in it: the typed
+  example's generics leave one for each use, holding the generic. A hole
+  still in the code when it is compiled is an error.
 - **The core forms in fully expanded code are named by identifiers with
   only the core scope**, so they mean the core forms in any module, whatever it
   binds, for example its own `let` or `#%app`. Every other identifier keeps
@@ -1160,6 +1169,14 @@ right-hand side's.
   in the same order among those, introduces nothing, so it is not expanded
   again. The transformer has an introduction scope, as a macro use does
   (6.2).
+- While it runs, the hook asks the queries (2.3) as a macro does. It can
+  expand more code with `local-expand`, and lift definitions with
+  `syntax-local-lift-definition`: each is declared at once, so the code it
+  expands next can use the names, and is expanded as what it returns is,
+  and put before it. It fills the holes (6.4) its language left, which is
+  how a language decides, once the unit is expanded, what goes where it
+  could not while expanding: the typed example fills a generic's hole
+  with the generic's instance at the types it finds.
 - `#%linklet` is resolved per phase, so a module's phase-1 code gets the
   hook of the language it takes at phase 1, which may differ from its
   phase-0 language. A module whose phase-1 code is kernel code gets the

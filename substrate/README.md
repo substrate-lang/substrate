@@ -90,6 +90,9 @@ application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
 5.4). Expansion produces fully expanded code, syntax in a fixed grammar (spec
 6.4): a macro can see its input's with `local-expand`, a language's
 `#%linklet` (spec 6.5) can rewrite each unit's, and `bin/sub expand` prints it.
+A macro can leave a hole, `(#%hole ...)`, for the language's `#%linklet`
+to fill once the unit is expanded, and the hook can expand more code and
+lift definitions while it fills them.
 Modules `require` each other by name, with
 qualified imports (`print:write-int`), at any phase:
 each phase of a module compiles to its own wasm module, a linklet, and a
