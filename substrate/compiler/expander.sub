@@ -348,7 +348,7 @@
 (define cache-directory #f)
 (define (set-cache-directory! dir) (set! cache-directory dir))
 
-(define interface-format 5)
+(define interface-format 6)
 
 ;; Does the run have one kernel, the running and target kernels being one?
 (define (one-kernel?) (eq? running-kernel target-kernel))
@@ -462,44 +462,48 @@
 
 ;; ---- interfaces ----
 ;;
-;; An interface names what belongs to a run relative to modules, by hash:
-;; a scope is core, kernel-ids, (m hash shift), a module scope's copy for
+;; An interface names what belongs to a run relative to modules, by hash.
+;; A scope is core, kernel-ids, (m hash shift), a module scope's copy for
 ;; a phase shift, or (s hash index), the index-th scope a module's
-;; expansion made; a type is (type i), the module's own, or (foreign-type
-;; hash i); a definition is (own i), an entry of the interface's table,
-;; (foreign instance kind export), the kernel module's among them, or
-;; (shifted ref k). Its sections are an alist of quoted data, the first
-;; four saying what it is of.
+;; expansion made. The other sections hold the module's data as the
+;; expander keeps it, written with encode: a type in them is (%type i),
+;; the module's i-th, or (%type hash i), another module's; a definition is
+;; (%info own i), the i-th of the infos section, (%info foreign instance
+;; kind export), another module's, the kernel module's among them, or
+;; (%info shifted d k), definition d shifted by k (6.1); and a list that
+;; starts with %type, %info or %quote, such as a struct field named so,
+;; has %quote put before it. load-module! reads them back with decode.
+;; Its sections are an alist of quoted data, the first four saying what it
+;; is of.
 
 (define (write-interface m)
   (let ([own (make-hasheq)] [own-list '()] [type-index (make-hasheq)] [types (unit-types m)])
     (for-each (lambda (t i) (hash-set! type-index t i)) types (range (length types)))
     (letrec
-        ([tref (lambda (t)
-                 (let ([i (hash-ref type-index t #f)] [o (hash-ref type-owners t #f)])
-                   (cond [i (list 'type i)]
-                         [o (list 'foreign-type (unit-hash (car o)) (cdr o))]
-                         [else (raise-compile-error #f "internal: the type ~a belongs to no module" (type-info-name t))])))]
-         [vref (lambda (v)
-                 (if (ref-type? v)
-                     (list 'ref (ref-nullable? v) (let ([h (ref-heap v)]) (if (type-info? h) (tref h) h)))
-                     v))]
-         [storage-ref (lambda (s) (if (memq s '(i8 i16)) s (vref s)))]
+        ([encode (lambda (x)
+                   (cond [(type-info? x) (cons '%type (type-ref x))]
+                         [(or (func-info? x) (global-info? x) (tag-info? x) (data-info? x)) (cons '%info (info-ref x))]
+                         [(and (pair? x) (memq (car x) '(%type %info %quote))) (cons '%quote (cons (car x) (encode (cdr x))))]
+                         [(pair? x) (cons (encode (car x)) (encode (cdr x)))]
+                         [else x]))]
+         [type-ref (lambda (t)
+                     (let ([i (hash-ref type-index t #f)] [o (hash-ref type-owners t #f)])
+                       (cond [i (list i)]
+                             [o (list (unit-hash (car o)) (cdr o))]
+                             [else (raise-compile-error #f "internal: the type ~a belongs to no module" (type-info-name t))])))]
          [own-ref (lambda (info)
-                    (or (let ([i (hash-ref own info #f)]) (and i (list 'own i)))
-                        (let ([i (hash-count own)])
-                          (hash-set! own info i)
-                          (set! own-list (cons info own-list))
-                          (list 'own i))))]
-         [iref (lambda (info)
-                 (let ([origin (hash-ref shift-origins info #f)]
-                       [instance (info-instance info)])
-                   (cond [origin (list 'shifted (iref (car origin)) (cdr origin))]
-                         [(data-info? info) (own-ref info)]
-                         [(and instance (instance-unit instance) (not (own-instance? m instance)))
-                          (list 'foreign instance (info-kind info) (info-export info))]
-                         [else (own-ref info)])))]
-         [mref (lambda (meaning) (list (car meaning) (if (eq? (car meaning) 'type) (tref (cadr meaning)) (iref (cadr meaning)))))]
+                    (list 'own (or (hash-ref own info #f)
+                                   (let ([i (hash-count own)])
+                                     (hash-set! own info i)
+                                     (set! own-list (cons info own-list))
+                                     i))))]
+         [info-ref (lambda (info)
+                     (let ([origin (hash-ref shift-origins info #f)] [instance (info-instance info)])
+                       (cond [origin (list 'shifted (encode (car origin)) (cdr origin))]
+                             [(data-info? info) (own-ref info)]
+                             [(and instance (instance-unit instance) (not (own-instance? m instance)))
+                              (list 'foreign instance (info-kind info) (info-export info))]
+                             [else (own-ref info)])))]
          [sref (lambda (sc)
                  (let ([origin (hash-ref module-scope-origins sc #f)] [owner (hash-ref scope-owners sc #f)])
                    (cond [(= sc core-scope) 'core]
@@ -507,43 +511,32 @@
                          [origin (list 'm (unit-hash (car origin)) (cdr origin))]
                          [owner (list 's (unit-hash (car owner)) (cdr owner))]
                          [else (raise-compile-error #f "internal: scope ~a belongs to no module" sc)])))]
-         ;; A lowered inline body, its infos and types as references and
-         ;; its source locations dropped.
-         [body (lambda (e)
-                 (cond [(type-info? e) (list '%type (tref e))]
-                       [(or (func-info? e) (global-info? e) (tag-info? e)) (list '%info (iref e))]
-                       [(and (pair? e) (eq? (car e) 'at)) (body (caddr e))]
-                       [(pair? e) (cons (body (car e)) (body (cdr e)))]
-                       [else e]))]
          [own? (lambda (info) (own-instance? m (info-instance info)))]
-         [by-index (lambda (l) (sort l (lambda (a b) (< (cadr (car a)) (cadr (car b))))))])
+         ;; Encoded lists that start with one of its own definitions, in
+         ;; the order of their indexes.
+         [by-index (lambda (l) (sort l (lambda (a b) (< (caddr (car a)) (caddr (car b))))))])
       (for-each own-ref (reverse (unit-infos m)))     ; every definition, in order, before what else is referred to
       (let* ([linklets (map (lambda (p)
                               (let ([l (hash-ref (unit-linklets m) p)])
                                 (list p (linklet-bytes l) (linklet-imports l) (linklet-gc? l) (map sref (linklet-scopes l)))))
                             (sort (hash-keys (unit-linklets m)) <))]
-             [provides (map (lambda (p) (cons (car p) (mref (cdr p)))) (unit-provides m))]
+             [provides (map (lambda (p) (cons (car p) (encode (cdr p)))) (unit-provides m))]
              [entries (map (lambda (e)
-                             (list (car e) (sort (map sref (cadr e)) scope-ref<?) (caddr e) (mref (binding-meaning (cadddr e)))))
+                             (list (car e) (sort (map sref (cadr e)) scope-ref<?) (caddr e) (encode (binding-meaning (cadddr e)))))
                            (reverse (unit-entries m)))]
              [values (by-index (filter (lambda (v) v)
-                                       (map (lambda (f) (let ([g (function-value f)]) (and g (list (iref f) (iref g)))))
+                                       (map (lambda (f) (let ([g (function-value f)]) (and g (encode (list f g)))))
                                             (filter own? (hash-keys function-values)))))]
              [inlines (by-index (map (lambda (f)
                                        (let ([b (hash-ref (kernel-inlines lowering-kernel) f)])
-                                         (list (iref f) (map (lambda (p) (cons (car p) (vref (cdr p)))) (car b))
-                                               (map vref (cadr b)) (body (caddr b)) (cadddr b) (map car (list-ref b 4)))))
+                                         (encode (list f (car b) (cadr b) (without-locations (caddr b)) (cadddr b)
+                                                       (map car (list-ref b 4))))))
                                      (filter own? (hash-keys (kernel-inlines lowering-kernel)))))]
-             [macros (by-index (map (lambda (g) (list (iref g)))
+             [macros (by-index (map (lambda (g) (encode (list g)))
                                     (filter (lambda (g) (eq? (hash-ref macro-modules g) m)) (hash-keys macro-modules))))]
              [type-forms (map (lambda (t)
                                 (list (type-info-name t) (type-info-kind t) (type-info-final? t)
-                                      (and (type-info-super t) (tref (type-info-super t)))
-                                      (let ([fs (type-info-fields t)])
-                                        (case (type-info-kind t)
-                                          [(struct) (map (lambda (f) (list (car f) (storage-ref (cadr f)) (caddr f))) fs)]
-                                          [(array) (list (storage-ref (car fs)) (cadr fs))]
-                                          [else (list (map vref (car fs)) (map vref (cadr fs)))]))))
+                                      (encode (type-info-super t)) (encode (type-info-fields t))))
                               types)]
              [groups (let loop ([ts types] [i 0] [acc '()])
                        (cond [(null? ts) (reverse acc)]
@@ -551,19 +544,7 @@
                               (let ([n (length (type-info-group (car ts)))])
                                 (loop (list-tail ts n) (+ i n) (cons (range i (+ i n)) acc)))]
                              [else (loop (cdr ts) (+ i 1) acc)]))]
-             [infos (map (lambda (info)
-                           (cond [(func-info? info)
-                                  (list 'func (func-info-name info) (map vref (func-info-params info))
-                                        (map vref (func-info-results info)) (func-info-instance info) (func-info-export info)
-                                        (and (func-info-type info) (tref (func-info-type info))))]
-                                 [(global-info? info)
-                                  (list 'global (global-info-name info) (vref (global-info-type info)) (global-info-mutable? info)
-                                        (global-info-instance info) (global-info-export info))]
-                                 [(tag-info? info)
-                                  (list 'tag (tag-info-name info) (map vref (tag-info-params info)) (tag-info-instance info)
-                                        (tag-info-export info))]
-                                 [else (list 'data (data-info-name info) (data-info-offset info) (data-info-bytes info))]))
-                         (reverse own-list))])
+             [infos (map (lambda (info) (encode (info->list info))) (reverse own-list))])
         (list (cons 'format interface-format) (cons 'kernel (kernel-hash target-kernel)) (cons 'hash (unit-hash m))
               (cons 'definitions (length (unit-infos m)))
               (cons 'requires (map (lambda (r) (list (unit-path (car r)) (unit-hash (car r)) (cdr r))) (unit-requires m)))
@@ -575,106 +556,113 @@
 ;; binding's scope set; loaded, a set is sorted by the run's numbers.
 (define (scope-ref<? a b) (string<? (format "~s" a) (format "~s" b)))
 
+;; Lowered form e without its source locations, for an inline body, whose
+;; code takes the location of the call it is inlined at (spec 3.6).
+(define (without-locations e)
+  (cond [(not (pair? e)) e]
+        [(eq? (car e) 'at) (without-locations (caddr e))]
+        [(eq? (car e) 'quote) e]
+        [else (let loop ([l e]) (if (pair? l) (cons (without-locations (car l)) (loop (cdr l))) l))]))
+
+;; Definition info as a list, (kind field ...), its fields in the order
+;; its constructor takes them; and the definition such a list describes.
+(define (info->list info)
+  (cond [(func-info? info)
+         (list 'func (func-info-name info) (func-info-params info) (func-info-results info)
+               (func-info-instance info) (func-info-export info) (func-info-type info))]
+        [(global-info? info)
+         (list 'global (global-info-name info) (global-info-type info) (global-info-mutable? info)
+               (global-info-instance info) (global-info-export info))]
+        [(tag-info? info) (list 'tag (tag-info-name info) (tag-info-params info) (tag-info-instance info) (tag-info-export info))]
+        [else (list 'data (data-info-name info) (data-info-offset info) (data-info-bytes info))]))
+
+(define (list->info l)
+  (apply (case (car l) [(func) func-info] [(global) global-info] [(tag) tag-info] [else data-info]) (cdr l)))
+
 ;; Load module m from its interface d, as if it had been compiled in
 ;; this run.
 (define (load-module! m d)
-  (begin
-    (set-unit-name! m (section d 'name))
-    (set-unit-hash! m (section d 'hash))
-    (hash-set! units-by-hash (unit-hash m) m)
-    (set-unit-scope! m (new-run-scope!))
-    (hash-set! module-scope-origins (unit-scope m) (cons m 0))
-    (let* ([type-forms (section d 'types)]
-           [shells (make-vector (length type-forms) #f)]
-           [infos (make-vector (length (section d 'infos)) #f)])
-      (letrec
-          ([tres (lambda (r)
-                   (case (car r)
-                     [(type) (vector-ref shells (cadr r))]
-                     [else (list-ref (unit-types (unit-with-hash (cadr r))) (caddr r))]))]
-           [vres (lambda (v)
-                   (if (and (pair? v) (eq? (car v) 'ref))
-                       (make-ref (cadr v) (let ([h (caddr v)]) (if (pair? h) (tres h) h)))
-                       v))]
-           [storage-res (lambda (s) (if (memq s '(i8 i16)) s (vres s)))]
-           [ires (lambda (r)
-                   (case (car r)
-                     [(own) (vector-ref infos (cadr r))]
-                     [(shifted) (shift-info (ires (cadr r)) (caddr r))]
-                     [else (or (find-info (cadr r) (caddr r) (cadddr r))
-                               (raise-compile-error #f "the cache is inconsistent: no ~a ~a in ~a" (caddr r) (cadddr r) (cadr r)))]))]
-           [mres (lambda (r) (list (car r) (if (eq? (car r) 'type) (tres (cadr r)) (ires (cadr r)))))]
-           [sres (lambda (r)
-                   (cond [(eq? r 'core) core-scope]
-                         [(eq? r 'kernel-ids) (kernel-id-scope!)]
-                         [(eq? (car r) 'm) (module-scope-at (unit-with-hash (cadr r)) (caddr r))]
-                         [else (unit-scope-at (unit-with-hash (cadr r)) (caddr r))]))]
-           [body (lambda (e)
-                   (cond [(and (pair? e) (eq? (car e) '%type)) (tres (cadr e))]
-                         [(and (pair? e) (eq? (car e) '%info)) (ires (cadr e))]
-                         [(pair? e) (cons (body (car e)) (body (cdr e)))]
-                         [else e]))])
-        ;; Types: each after its supertype; fields, which may name later
-        ;; types of a group, once all exist; identities in order.
-        (for-each (lambda (f i)
-                    (vector-set! shells i (make-type-info (car f) (cadr f) #f (and (cadddr f) (tres (cadddr f))) (caddr f) #f)))
-                  type-forms (range (length type-forms)))
-        (for-each (lambda (f i)
-                    (let ([t (vector-ref shells i)] [fs (list-ref f 4)])
-                      (set-type-info-fields! t (case (cadr f)
-                                                 [(struct) (map (lambda (x) (list (car x) (storage-res (cadr x)) (caddr x))) fs)]
-                                                 [(array) (list (storage-res (car fs)) (cadr fs))]
-                                                 [else (list (map vres (car fs)) (map vres (cadr fs)))]))))
-                  type-forms (range (length type-forms)))
-        (for-each (lambda (g)
-                    (let ([members (map (lambda (i) (vector-ref shells i)) g)])
-                      (for-each (lambda (t) (set-type-info-group! t members)) members)))
-                  (section d 'groups))
-        (for-each (lambda (i)
-                    (let* ([t (vector-ref shells i)] [g (type-info-group t)])
-                      (cond [(not g) (identify-group! (list t))]
-                            [(eq? t (car g)) (identify-group! g)]
-                            [else #f])))
-                  (range (length type-forms)))
-        (for-each (lambda (t) (own-type! m t)) (vector->list shells))
-        ;; Its linklets; the program is phase 0's.
-        (for-each (lambda (l)
-                    (hash-set! (unit-linklets m) (car l)
-                               (linklet (cadr l) (caddr l) (cadddr l) (map sres (list-ref l 4))))
-                    (linklet-name m (car l) 0))
-                  (section d 'linklets))
-        ;; Definitions: the first are its own, as note-definitions! notes
-        ;; them; the rest are what else its sections refer to.
-        (for-each (lambda (f i)
-                    (let ([info (case (car f)
-                                  [(func) (func-info (cadr f) (map vres (caddr f)) (map vres (cadddr f)) (list-ref f 4) (list-ref f 5)
-                                                     (and (list-ref f 6) (tres (list-ref f 6))))]
-                                  [(global) (global-info (cadr f) (vres (caddr f)) (cadddr f) (list-ref f 4) (list-ref f 5))]
-                                  [(tag) (tag-info (cadr f) (map vres (caddr f)) (cadddr f) (list-ref f 4))]
-                                  [else (data-info (cadr f) (caddr f) (cadddr f))])])
-                      (vector-set! infos i info)
-                      (when (< i (section d 'definitions)) (note-info! m info))))
-                  (section d 'infos) (range (length (section d 'infos))))
-        ;; What the expander keeps of a module: its bindings, provides,
-        ;; function values, inline bodies and macros.
-        (set-unit-entries! m (reverse (map (lambda (e)
-                                             (list (car e) (sort (map sres (cadr e)) >) (caddr e)
-                                                   (bind-raw! (car e) (sort (map sres (cadr e)) >) (caddr e) (mres (cadddr e)))))
-                                           (section d 'entries))))
-        (set-unit-provides! m (map (lambda (p) (cons (car p) (mres (cdr p)))) (section d 'provides)))
-        (for-each (lambda (v) (hash-set! function-values (ires (car v)) (ires (cadr v)))) (section d 'values))
-        (for-each (lambda (x)
-                    (let ([params (map (lambda (p) (cons (car p) (vres (cdr p)))) (cadr x))])
-                      (hash-set! (kernel-inlines lowering-kernel) (ires (car x))
-                                 (list params (map vres (caddr x)) (body (cadddr x)) (list-ref x 4)
-                                       (filter (lambda (p) (memv (car p) (list-ref x 5))) params)))))
-                  (section d 'inlines))
-        (for-each (lambda (g) (hash-set! macro-modules (ires (car g)) m)) (section d 'macros))
-        (set-unit-program! m (hash-ref (unit-linklets m) 0))
-        (set-unit-state! m 'done)
-        ;; As its requires would have when it was compiled: its own
-        ;; bindings are made, and its requires' installed at their shifts.
-        (install-module-bindings! m 0)))))
+  (set-unit-name! m (section d 'name))
+  (set-unit-hash! m (section d 'hash))
+  (hash-set! units-by-hash (unit-hash m) m)
+  (set-unit-scope! m (new-run-scope!))
+  (hash-set! module-scope-origins (unit-scope m) (cons m 0))
+  (let* ([type-forms (section d 'types)]
+         [shells (make-vector (length type-forms) #f)]
+         [infos (make-vector (length (section d 'infos)) #f)])
+    (letrec
+        ([decode (lambda (x)
+                   (cond [(not (pair? x)) x]
+                         [(eq? (car x) '%type) (type-at (cdr x))]
+                         [(eq? (car x) '%info) (info-at (cdr x))]
+                         [(eq? (car x) '%quote) (cons (cadr x) (decode (cddr x)))]
+                         [else (cons (decode (car x)) (decode (cdr x)))]))]
+         [type-at (lambda (r)
+                    (if (null? (cdr r))
+                        (vector-ref shells (car r))
+                        (list-ref (unit-types (unit-with-hash (car r))) (cadr r))))]
+         [info-at (lambda (r)
+                    (case (car r)
+                      [(own) (vector-ref infos (cadr r))]
+                      [(shifted) (shift-info (decode (cadr r)) (caddr r))]
+                      [else (or (find-info (cadr r) (caddr r) (cadddr r))
+                                (raise-compile-error #f "the cache is inconsistent: no ~a ~a in ~a" (caddr r) (cadddr r) (cadr r)))]))]
+         [sres (lambda (r)
+                 (cond [(eq? r 'core) core-scope]
+                       [(eq? r 'kernel-ids) (kernel-id-scope!)]
+                       [(eq? (car r) 'm) (module-scope-at (unit-with-hash (cadr r)) (caddr r))]
+                       [else (unit-scope-at (unit-with-hash (cadr r)) (caddr r))]))])
+      ;; Types: each after its supertype; fields, which may name later
+      ;; types of a group, once all exist; identities in order.
+      (for-each (lambda (f i)
+                  (vector-set! shells i (make-type-info (car f) (cadr f) #f (decode (cadddr f)) (caddr f) #f)))
+                type-forms (range (length type-forms)))
+      (for-each (lambda (f t) (set-type-info-fields! t (decode (list-ref f 4)))) type-forms (vector->list shells))
+      (for-each (lambda (g)
+                  (let ([members (map (lambda (i) (vector-ref shells i)) g)])
+                    (for-each (lambda (t) (set-type-info-group! t members)) members)))
+                (section d 'groups))
+      (for-each (lambda (t)
+                  (let ([g (type-info-group t)])
+                    (cond [(not g) (identify-group! (list t))]
+                          [(eq? t (car g)) (identify-group! g)]
+                          [else #f])))
+                (vector->list shells))
+      (for-each (lambda (t) (own-type! m t)) (vector->list shells))
+      ;; Its linklets; the program is phase 0's.
+      (for-each (lambda (l)
+                  (hash-set! (unit-linklets m) (car l)
+                             (linklet (cadr l) (caddr l) (cadddr l) (map sres (list-ref l 4))))
+                  (linklet-name m (car l) 0))
+                (section d 'linklets))
+      ;; Definitions: the first are its own, as note-definitions! notes
+      ;; them; the rest are what else its sections refer to.
+      (for-each (lambda (f i)
+                  (let ([info (list->info (decode f))])
+                    (vector-set! infos i info)
+                    (when (< i (section d 'definitions)) (note-info! m info))))
+                (section d 'infos) (range (length (section d 'infos))))
+      ;; What the expander keeps of a module: its bindings, provides,
+      ;; function values, inline bodies and macros.
+      (set-unit-entries! m (reverse (map (lambda (e)
+                                           (let ([scopes (sort (map sres (cadr e)) >)])
+                                             (list (car e) scopes (caddr e)
+                                                   (bind-raw! (car e) scopes (caddr e) (decode (cadddr e))))))
+                                         (section d 'entries))))
+      (set-unit-provides! m (map (lambda (p) (cons (car p) (decode (cdr p)))) (section d 'provides)))
+      (for-each (lambda (v) (let ([v (decode v)]) (hash-set! function-values (car v) (cadr v)))) (section d 'values))
+      (for-each (lambda (x)
+                  (let* ([x (decode x)] [params (cadr x)])
+                    (hash-set! (kernel-inlines lowering-kernel) (car x)
+                               (list params (caddr x) (cadddr x) (list-ref x 4)
+                                     (filter (lambda (p) (memv (car p) (list-ref x 5))) params)))))
+                (section d 'inlines))
+      (for-each (lambda (g) (hash-set! macro-modules (decode (car g)) m)) (section d 'macros))
+      (set-unit-program! m (hash-ref (unit-linklets m) 0))
+      (set-unit-state! m 'done)
+      ;; As its requires would have when it was compiled: its own
+      ;; bindings are made, and its requires' installed at their shifts.
+      (install-module-bindings! m 0))))
 
 (define (unit-with-hash hash)
   (or (hash-ref units-by-hash hash #f)
