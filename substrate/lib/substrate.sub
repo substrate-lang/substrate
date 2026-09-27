@@ -94,6 +94,7 @@
 ;; for its compile-time code.
 
 (require-unqualified core "substrate-core.sub")
+(require k kernel)
 (begin-for-syntax (require-unqualified core "substrate-core.sub"))
 
 (provide (except-out (all-from-out core) call-with-handlers) else when unless and or cond case do with-handlers
@@ -407,8 +408,8 @@
 (define-syntax (? stx) (raise-syntax-error #f "allowed only in a pattern" stx))
 
 (begin-for-syntax
-  ;; A pattern is parsed into a description, a datum that match-syntax
-  ;; walks: (var i name), the pattern's variable i; (any); (datum d);
+  ;; A pattern is parsed into a description, a datum that the pattern's
+  ;; code is compiled from (below), and matches? walks if it backtracks: (var i name), the pattern's variable i; (any); (datum d);
   ;; (bound i name), an identifier free-identifier=? to value i; (check i
   ;; p ...), value i being the predicate; (struct i name (p ...)), value
   ;; i being the struct's predicate and the values after it its
@@ -530,48 +531,197 @@
 
   (define (literal d) (datum->syntax #'here d))
 
-  ;; [x (vector-ref m i)] for each variable x, the i-th.
-  (define (variable-bindings vars i)
-    (if (null? vars)
+  ;; ---- compiling patterns ----
+  ;;
+  ;; A clause's pattern is compiled into a test of the subject: an
+  ;; expression true if the subject matches, which sets a local for each
+  ;; of the pattern's variables to what it matched on the way. The clause
+  ;; is (if test body next), next the following clauses', so each is
+  ;; written once. A value the patterns use that is an identifier, such as
+  ;; a struct's predicate or accessor, is called by name, and any other is
+  ;; evaluated once, first. p ... ending a list is a loop; a list in which
+  ;; p ... is followed by more of it backtracks, and is left to matches?.
+
+  (define temps 0)
+
+  ;; A temporary: an identifier no other of this expansion is.
+  (define (temp base)
+    (set! temps (+ temps 1))
+    (datum->syntax #'here (string->symbol (string-append base (number->string temps)))))
+
+  (define (temps-for l base) (if (null? l) '() (cons (temp base) (temps-for (cdr l) base))))
+
+  ;; The form's values vs, each (expression . identifier): itself if it is
+  ;; an identifier, or else a temporary bound to it.
+  (define (value-slots vs)
+    (if (null? vs) '() (cons (cons (car vs) (if (identifier? (car vs)) (car vs) (temp "v"))) (value-slots (cdr vs)))))
+
+  (define (value-bindings slots)
+    (if (null? slots)
         '()
-        (cons #`[#,(car vars) (vector-ref m #,(literal i))] (variable-bindings (cdr vars) (+ i 1)))))
+        (if (eq? (car (car slots)) (cdr (car slots)))
+            (value-bindings (cdr slots))
+            (cons #`[#,(cdr (car slots)) #,(car (car slots))] (value-bindings (cdr slots))))))
+
+  (define (value-ref slots i) (cdr (nth slots i)))
+
+  (define (value-refs slots) (if (null? slots) '() (cons (cdr (car slots)) (value-refs (cdr slots)))))
+
+  (define (pairs-of xs f) (if (null? xs) '() (cons #`[#,(car xs) #,(f (car xs))] (pairs-of (cdr xs) f))))
+  (define (zip-with xs ys f) (if (null? xs) '() (cons (f (car xs) (car ys)) (zip-with (cdr xs) (cdr ys) f))))
+
+  ;; A test is code true if it matched, or (always statement ...), which
+  ;; matched and sets variables: a test that only binds a variable is
+  ;; nothing more.
+  (define (always? t) (if (pair? t) (eq? (car t) 'always) #f))
+
+  (define (test-code t) (if (always? t) #`(begin #,@(cdr t) #t) t))
+
+  ;; a, then b.
+  (define (both a b)
+    (if (always? a)
+        (if (always? b) (cons 'always (append (cdr a) (cdr b))) #`(begin #,@(cdr a) #,(test-code b)))
+        #`(if #,a #,(test-code b) #f)))
+
+  ;; The test of x, an identifier, against description d, setting vars,
+  ;; the pattern's variables' locals by index. slots: the form's values.
+  (define (compile-test d x vars slots)
+    (let ([kind (car d)])
+      (if (eq? kind 'var)
+          (list 'always #`(set! #,(nth vars (cadr d)) #,x))
+          (if (eq? kind 'any)
+              (list 'always)
+              (if (eq? kind 'datum)
+                  #`(datum-matches? #,x '#,(literal (cadr d)))
+                  (if (eq? kind 'bound)
+                      #`(bound-matches? #,x #,(value-ref slots (cadr d)))
+                      (if (eq? kind 'check)
+                          (both #`(#,(value-ref slots (cadr d)) #,x) (compile-tests (cddr d) x vars slots))
+                          (if (eq? kind 'struct)
+                              (both #`(#,(value-ref slots (cadr d)) #,x) (compile-fields (cadddr d) (+ (cadr d) 1) x vars slots))
+                              (compile-elements (cadr d) (caddr d) x vars slots)))))))))
+
+  (define (compile-tests ds x vars slots)
+    (if (null? ds)
+        (list 'always)
+        (if (null? (cdr ds))
+            (compile-test (car ds) x vars slots)
+            (both (compile-test (car ds) x vars slots) (compile-tests (cdr ds) x vars slots)))))
+
+  ;; A struct's fields ps, read from x by the accessors, values j ....
+  (define (compile-fields ps j x vars slots)
+    (if (null? ps)
+        (list 'always)
+        (if (eq? (car (car ps)) 'any)
+            (compile-fields (cdr ps) (+ j 1) x vars slots)
+            (let ([y (temp "f")])
+              #`(let ([#,y (#,(value-ref slots j) #,x)])
+                  #,(test-code (both (compile-test (car ps) y vars slots) (compile-fields (cdr ps) (+ j 1) x vars slots))))))))
+
+  ;; The elements es, then the tail, of r, a list or syntax list.
+  (define (compile-elements es tail r vars slots)
+    (if (null? es)
+        (if (eq? (car tail) 'null)
+            #`(null? (list-part #,r))
+            (compile-test tail r vars slots))
+        (if (eq? (car (car es)) 'repeat)
+            (if (if (null? (cdr es)) (eq? (car tail) 'null) #f)
+                (compile-repeat (car es) r vars slots)
+                (compile-interpreted (list 'list es tail) r vars slots))
+            (let ([m (temp "m")] [a (temp "a")] [d (temp "d")])
+              #`(let ([#,m (list-pair #,r)])
+                  (if #,m
+                      #,(if (eq? (car (car es)) 'any)
+                            #`(let ([#,d (k:unsafe-cdr #,m)]) #,(test-code (compile-elements (cdr es) tail d vars slots)))
+                            #`(let ([#,a (k:unsafe-car #,m)] [#,d (k:unsafe-cdr #,m)])
+                                #,(test-code (both (compile-test (car es) a vars slots) (compile-elements (cdr es) tail d vars slots)))))
+                      #f))))))
+
+  ;; e, (repeat p (i ...)), matching every element of r to its end: its
+  ;; variables i ... set to the lists of what p matched.
+  (define (compile-repeat e r vars slots)
+    (let ([p (cadr e)] [is (caddr e)])
+      (if (eq? (car p) 'var)
+          (let ([xs (temp "xs")])
+            #`(let ([#,xs (elements-of #,r)]) (if #,xs (begin (set! #,(nth vars (cadr p)) #,xs) #t) #f)))
+          (if (eq? (car p) 'any)
+              #`(if (elements-of #,r) #t #f)
+              (let* ([loop (temp "loop")] [rest (temp "r")] [m (temp "m")] [a (temp "a")] [accs (temps-for is "acc")])
+                #`(let #,loop ([#,rest #,r] #,@(pairs-of accs (lambda (acc) #''())))
+                    (let ([#,m (list-part #,rest)])
+                      (if (null? #,m)
+                          (begin #,@(zip-with is accs (lambda (i acc) #`(set! #,(nth vars i) (reverse #,acc)))) #t)
+                          (if (pair? #,m)
+                              (let ([#,a (car #,m)])
+                                (if #,(test-code (compile-test p a vars slots))
+                                    (#,loop (cdr #,m) #,@(zip-with is accs (lambda (i acc) #`(cons #,(nth vars i) #,acc))))
+                                    #f))
+                              #f)))))))))
+
+  ;; Description d, a list that backtracks, matched by matches?, as match
+  ;; did before patterns were compiled.
+  (define (compile-interpreted d r vars slots)
+    (let ([vs (temp "vs")])
+      #`(let ([#,vs (make-vector #,(literal (length vars)) #f)])
+          (if (matches? '#,(literal d) #,r (vector #,@(value-refs slots)) #,vs)
+              (begin #,@(vector-sets (description-vars d) vars vs) #t)
+              #f))))
+
+  (define (vector-sets is vars vs)
+    (if (null? is)
+        '()
+        (cons #`(set! #,(nth vars (car is)) (vector-ref #,vs #,(literal (car is)))) (vector-sets (cdr is) vars vs))))
+
+  ;; The variables description d binds.
+  (define (description-vars d)
+    (if (eq? (car d) 'var)
+        (list (cadr d))
+        (if (eq? (car d) 'list)
+            (append (elements-vars (cadr d)) (description-vars (caddr d)))
+            (if (eq? (car d) 'repeat)
+                (description-vars (cadr d))
+                (if (eq? (car d) 'check)
+                    (elements-vars (cddr d))
+                    (if (eq? (car d) 'struct) (elements-vars (cadddr d)) '()))))))
+
+  (define (elements-vars ds) (if (null? ds) '() (append (description-vars (car ds)) (elements-vars (cdr ds)))))
 
   ;; Code that tries clauses cs, whose patterns have descriptions ds and
-  ;; variables varss, in turn, and runs fail if none matches.
-  (define (match-code cs ds varss fail)
+  ;; variables varss, against x, in turn, and runs last if none matches.
+  (define (compile-clauses cs ds varss x last slots)
     (if (null? cs)
-        fail
-        #`(let ([m (match-syntax '#,(literal (car ds)) #,(literal (length (car varss))) values s)])
-            (if m
-                (let (#,@(variable-bindings (car varss) 0)) #,@(cdr (car cs)))
-                #,(match-code (cdr cs) (cdr ds) (cdr varss) fail)))))
+        last
+        (let* ([vars (temps-for (car varss) "v")]
+               [test (compile-test (car ds) x vars slots)]
+               [body #`(let (#,@(zip-with (car varss) vars (lambda (name v) #`[#,name #,v]))) #,@(cdr (car cs)))])
+          ;; A pattern that always matches leaves the clauses after it
+          ;; unreachable.
+          (if (always? test)
+              #`(let (#,@(pairs-of vars (lambda (v) #''#f))) #,@(cdr test) #,body)
+              #`(let (#,@(pairs-of vars (lambda (v) #''#f)))
+                  (if #,test #,body #,(compile-clauses (cdr cs) (cdr ds) (cdr varss) x last slots)))))))
 
   ;; (who subject [pattern body ...] ...) expanded: the subject and the
   ;; values bound, then the clauses tried in turn, and if none matches
-  ;; the code fail gives for every description.
+  ;; the code fail gives for every description and the subject.
   (define (match-form stx who fail)
     (let* ([parts (syntax->list stx)]
            [clauses (if (if parts (>= (length parts) 3) #f)
                         (match-clauses (cddr parts) who)
                         (raise-syntax-error who (format "expected (~a subject [pattern body ...] ...)" who) stx))]
            [parsed (parse-patterns (clause-patterns clauses) who)]
-           [values (caddr parsed)])
-      #`(let ([s #,(cadr parts)] [values #,(if (null? values) #''#f #`(vector #,@values))])
-          #,(match-code clauses (car parsed) (cadr parsed) (fail (car parsed)))))))
+           [slots (value-slots (caddr parsed))]
+           [x (temp "s")])
+      #`(let ([#,x #,(cadr parts)] #,@(value-bindings slots))
+          #,(compile-clauses clauses (car parsed) (cadr parsed) x (fail (car parsed) x) slots)))))
 
 ;; (syntax-match subject [pattern body ...] ...)
 (define-syntax (syntax-match stx)
-  (match-form stx 'syntax-match (lambda (all) #`(no-match '#,(literal all) s))))
+  (match-form stx 'syntax-match (lambda (all x) #`(no-match '#,(literal all) #,x))))
 
 ;; (match subject [pattern body ...] ...)
 (define-syntax (match stx)
-  (match-form stx 'match (lambda (all) #'(no-value-match s))))
-
-;; The bindings of the n variables of description d, as a vector, if x
-;; matches d; otherwise #f. values: the form's values.
-(define (match-syntax d n values x)
-  (let ([vs (make-vector n #f)])
-    (and (matches? d x values vs) vs)))
+  (match-form stx 'match (lambda (all x) #`(no-value-match #,x))))
 
 ;; Does x match description d? The variables d binds are written in vs.
 (define (matches? d x values vs)
@@ -597,7 +747,16 @@
                   (loop (cdr ps) (+ j 1)))))))
 
 ;; x's elements if it is a syntax list; otherwise x.
-(define (list-part x) (if (syntax? x) (syntax-e x) x))
+(define (list-part x) #:inline (if (syntax? x) (syntax-e x) x))
+
+;; x's elements, if they are a pair: that pair; otherwise #f.
+(define (list-pair x) (let ([m (list-part x)]) (if (pair? m) m #f)))
+
+;; Does x match (datum v): is it v, or syntax whose datum is?
+(define (datum-matches? x v) (equal? (if (pair? v) (syntax->datum x) (list-part x)) v))
+
+;; Does x match #'id: is it an identifier free-identifier=? to id?
+(define (bound-matches? x id) (and (identifier? x) (free-identifier=? x id)))
 
 ;; Do the elements of list l match descriptions es, and what follows them
 ;; tail?
