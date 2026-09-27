@@ -112,6 +112,8 @@ a typed language on the kernel (`examples/typed/typed.sub`): `Int`,
 `Bool` and function types, checked by its `#%linklet`, which also lowers
 its lambdas to structs of typed closures, one closure type per function
 type. A function's type reaches the modules that import it through the
-transformer its name is bound to.
+transformer its name is bound to. Generics are monomorphized: its
+`#%linklet` makes each instance a module uses from the generic's
+definition, which reaches other modules the same way.
 
 Open questions are in `docs/spec.md` section 7.

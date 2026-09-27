@@ -3,17 +3,23 @@
 ;; compile time. A module takes these forms with require-unqualified:
 ;;
 ;;   (define (f [x : A] ...) : R body ...)  a function of type (-> A ... R)
+;;   (define #:forall (T ...) (f [x : A] ...) : R body ...)
+;;                                           a generic, whose types may
+;;                                           name its type parameters T ...
 ;;   (lambda ([x : A] ...) body ...)         a function value
 ;;   (f arg ...), (e arg ...)                applications: of a function
 ;;                                           define made, a direct call,
 ;;                                           or of a function value
+;;   (inst f T ...)                          generic f at types T ...
 ;;   let, let*, if, begin, integers, #t, #f  as in the kernel
 ;;   + - * < = print                         functions on Int
 ;;
 ;; Types are Int, a 64-bit integer, Bool, and (-> A ... R), the functions
 ;; from A ... to R, written with their words, which are compared by name.
 ;; Every variable has a type: a parameter the one written, a variable let
-;; binds its value's. A function define made is a value too.
+;; binds its value's. A function define made is a value too. A call of a
+;; generic takes its type parameters from its arguments' types; inst gives
+;; them, and makes a generic's instance a value.
 ;;
 ;; How it works. The forms only bind. define and lambda keep each
 ;; parameter's type in a syntax property of its name, and define binds f to
@@ -26,18 +32,27 @@
 ;; an application of a function value, a call-ref of the code in its
 ;; struct. A function type has one closure type, which each module that
 ;; uses it declares; wasm makes the declarations one type (spec 5.1).
+;;
+;; A generic is monomorphized. define binds its name to a transformer that
+;; keeps its definition, and a use of it is a variable holding the generic
+;; in a property. #%linklet, meeting a call of it or an inst, makes its
+;; instance at those types, once in each module that uses it: it expands
+;; the generic's body as a lambda, with the type parameters bound to the
+;; types, and lowers that as a function define made. So an instance is
+;; checked at its types, and a generic nothing uses is not checked.
 
 (require print "../../lib/print.sub" write-i64 newline)
 (begin-for-syntax
   (require-unqualified substrate "../../lib/substrate.sub")
   (require k kernel))
 
-(provide [define typed-define] [lambda typed-lambda] [#%linklet typed-linklet] + - * < = print)
+(provide [define typed-define] [lambda typed-lambda] [inst typed-inst] [#%linklet typed-linklet] + - * < = print)
 
 (begin-for-syntax
   ;; ---- types ----
   ;;
-  ;; A type is the datum Int, Bool or (-> A ... R).
+  ;; A type is the datum Int, Bool or (-> A ... R); in a generic's
+  ;; signature, a type parameter too, the symbol that names it.
 
   ;; The syntax property holding the type of a parameter, or of a use of a
   ;; function define made.
@@ -49,8 +64,22 @@
   (define (parameter-types t) (take (cdr t) (- (length t) 2)))
   (define (result-type t) (last t))
 
+  ;; An error in an instance of a generic (below) names the instance.
   (define (type-error where form . args)
-    (raise-syntax-error 'typed (apply format form args) where))
+    (raise-syntax-error 'typed (string-append (apply format form args) (if instantiating (format ", in ~a" instantiating) ""))
+                        where))
+
+  ;; While a generic's signature is parsed, the names of its type
+  ;; parameters; while one of its instances is expanded, each name's type,
+  ;; as (name . type).
+  (define type-parameters '())
+  (define type-arguments '())
+
+  (define (with-types parameters arguments thunk)
+    (let ([p type-parameters] [a type-arguments])
+      (dynamic-wind (lambda () (set! type-parameters parameters) (set! type-arguments arguments))
+                    thunk
+                    (lambda () (set! type-parameters p) (set! type-arguments a)))))
 
   ;; Type syntax s as a type.
   (define (parse-type s)
@@ -58,7 +87,29 @@
       ['Int 'Int]
       ['Bool 'Bool]
       [('-> a ... r) `(-> ,@(map parse-type a) ,(parse-type r))]
-      [_ (type-error s "expected a type: Int, Bool or (-> type ... type)")]))
+      [(? identifier? v)
+       (let ([bound (assq (syntax-e v) type-arguments)])
+         (cond [bound (cdr bound)]
+               [(memq (syntax-e v) type-parameters) (syntax-e v)]
+               [else (type-error v "expected a type: Int, Bool, (-> type ... type) or a type parameter")]))]
+      [_ (type-error s "expected a type: Int, Bool, (-> type ... type) or a type parameter")]))
+
+  ;; Type t with each type parameter that s, an alist, binds replaced.
+  (define (substitute t s)
+    (cond [(pair? t) (cons '-> (map (lambda (x) (substitute x s)) (cdr t)))]
+          [(assq t s) (cdr (assq t s))]
+          [else t]))
+
+  ;; s, an alist, extended so that pattern p, a type with type parameters,
+  ;; is type t; #f if it cannot be.
+  (define (unify p t s)
+    (cond [(not s) #f]
+          [(pair? p) (and (pair? t) (= (length p) (length t)) (unify-all (cdr p) (cdr t) s))]
+          [(memq p '(Int Bool)) (and (eq? p t) s)]
+          [(assq p s) (and (equal? (cdr (assq p s)) t) s)]
+          [else (cons (cons p t) s)]))
+
+  (define (unify-all ps ts s) (if (null? ps) s (unify-all (cdr ps) (cdr ts) (unify (car ps) (car ts) s))))
 
   ;; ---- kernel types ----
   ;;
@@ -110,8 +161,18 @@
   ;; (define (f [x : A] ...) : R body ...): the function, under a name of
   ;; this macro's that has its type; its value, a struct of its closure
   ;; type whose code calls it; and f, bound to the transformer.
+  ;;
+  ;; (define #:forall (T ...) (f [x : A] ...) : R body ...): a generic, whose
+  ;; types may name T ...; f is bound to generic-transformer, which keeps
+  ;; the definition to make its instances (below).
   (define (typed-define stx)
     (syntax-match stx
+      [(_ #:forall ((? identifier? tv) ...) ((? identifier? name) ((? identifier? x) ': a) ...) ': r body ...)
+       (for-each (lambda (v) (when (memq (syntax-e v) '(Int Bool)) (type-error v "~a is a type" (syntax-e v)))) tv)
+       (with-types (map syntax-e tv) '() (lambda () (map parse-type a) (parse-type r)))
+       #`(define-syntax #,name
+           (generic-transformer
+            (quote-syntax (#,name (#,@tv) (#,@(map (lambda (x a) #`[#,x #,a]) x a)) #,r (#,@body)))))]
       [(_ ((? identifier? name) ((? identifier? x) ': a) ...) ': r body ...)
        (let* ([t `(-> ,@(map parse-type a) ,(parse-type r))]
               [types (closure-types t)]
@@ -136,13 +197,38 @@
           [(_ arg ...) #`(#%app #,f #,@arg)]
           [_ f]))))
 
+  ;; The transformer a generic's name is bound to: a use of it is
+  ;; generic-use, a variable #%linklet replaces with an instance of the
+  ;; generic, holding in a property the generic, the syntax (f (T ...)
+  ;; ([x A] ...) R (body ...)); so is the head of an application.
+  (define generic-key 'typed-generic)
+  (define (generic-transformer g)
+    (lambda (stx)
+      (let ([f (syntax-property #'generic-use generic-key g)])
+        (syntax-match stx
+          [(_ arg ...) #`(#%app #,f #,@arg)]
+          [_ f]))))
+
+  (define (generic-of f) (and (identifier? f) (syntax-property f generic-key)))
+
+  ;; (inst f T ...): generic f's instance at types T ..., a use of f whose
+  ;; property holds the types too.
+  (define arguments-key 'typed-type-arguments)
+  (define (typed-inst stx)
+    (syntax-match stx
+      [(_ f t ...)
+       (let ([g (local-expand f)])
+         (unless (generic-of g) (type-error f "~s is not a generic function" (syntax->datum f)))
+         (syntax-property g arguments-key (map parse-type t)))]))
+
   ;; (lambda ([x : A] ...) body ...): the kernel's lambda, whose parameters
-  ;; have their types.
+  ;; have their types. #%linklet gives them kernel types when it lowers the
+  ;; lambda, so the ones written here, eqref, are only for expansion: no
+  ;; closure type need be declared while a generic's instance expands.
   (define (typed-lambda stx)
     (syntax-match stx
       [(_ (((? identifier? x) ': a) ...) body ...)
-       (let ([types (map parse-type a)])
-         #`(lambda (#,@(map (lambda (x t) #`[#,(with-type x t) #,(kernel-type t)]) x types)) #,@body))]))
+       #`(lambda (#,@(map (lambda (x a) #`[#,(with-type x (parse-type a)) eqref]) x a)) #,@body)]))
 
   ;; ---- #%linklet ----
   ;;
@@ -156,9 +242,11 @@
     (syntax-match stx
       [(_ 'module form ...)
        (set! added '())
+       (set! instances '())
        (let* ([out (map (lambda (f) (if (typed-function? f) (lower-function f) f)) form)]
               [new (reverse added)])
          (set! added #f)
+         (set! instances #f)
          (append out new))]
       [(_ _ form ...) form]))
 
@@ -192,6 +280,7 @@
   ;; Expression e, checked and lowered: (type . code).
   (define (lower e env)
     (syntax-match e
+      [(? generic-of x) (instance-value x)]
       [(? identifier? x) (cons (variable-type x env) x)]
       [('#%datum n) (literal e n)]
       [('let (binding ...) body ...) (lower-let e binding body env)]
@@ -202,9 +291,9 @@
       [('begin body ...)
        (let ([b (lower-body e body env)]) (cons (car b) (rebuild e #`(begin #,@(cdr b)))))]
       [('#%app f arg ...)
-       (if (and (identifier? f) (eq? (identifier-binding-kind f) 'function))
-           (direct-call e f arg env)
-           (value-call e f arg env))]
+       (cond [(generic-of f) (generic-call e f arg env)]
+             [(and (identifier? f) (eq? (identifier-binding-kind f) 'function)) (direct-call e f arg env)]
+             [else (value-call e f arg env)])]
       [('lambda ((x _) ...) body ...) (lower-lambda e x body env)]
       [_ (type-error e "this is not typed code")]))
 
@@ -300,11 +389,131 @@
               [(syntax? x) (walk (syntax-e x))]
               [(pair? x) (walk (car x)) (walk (cdr x))]
               [else #f]))
-      (reverse out))))
+      (reverse out)))
+
+  ;; ---- generics ----
+  ;;
+  ;; A generic is monomorphized: each module that uses it at some types
+  ;; gets an instance of it, a function of its own, made from the generic's
+  ;; definition when #%linklet first meets the use. Its body is checked
+  ;; there, at those types, as C++ checks a template's.
+
+  ;; While #%linklet runs, the instances it made, as ((g . types) . name);
+  ;; while one is made, its name, as errors give it, and the generics whose
+  ;; instances are being made, one inside another, innermost first.
+  (define instances #f)
+  (define instantiating #f)
+  (define making '())
+
+  ;; Generic g's type parameters, its parameters' types and its result
+  ;; type, the type parameters in them: (T ... ) (A ...) R.
+  (define (signature g)
+    (syntax-match g
+      [(_ (tv ...) ((_ a) ...) r _)
+       (let ([tvs (map syntax-e tv)])
+         (with-types tvs '() (lambda () (list tvs (map parse-type a) (parse-type r)))))]))
+
+  ;; A call of generic f: of its instance at the types that make its
+  ;; parameters' types the arguments', which (inst f T ...) may give.
+  (define (generic-call e f args env)
+    (let* ([g (generic-of f)]
+           [sig (signature g)]
+           [rs (map (lambda (a) (lower a env)) args)]
+           [given (syntax-property f arguments-key)])
+      (unless (= (length (cadr sig)) (length args))
+        (type-error e "expected ~a argument~a, got ~a" (length (cadr sig)) (if (= (length (cadr sig)) 1) "" "s") (length args)))
+      (let ([s (unify-all (cadr sig) (map car rs) (if given (bindings e g sig given) '()))])
+        (unless s
+          (type-error e "~a takes ~s, not ~s" (generic-name g) (cadr sig) (map car rs)))
+        (for-each (lambda (v)
+                    (unless (assq v s)
+                      (type-error e "~a's type ~a is not known from its arguments: give it with inst" (generic-name g) v)))
+                  (car sig))
+        (cons (substitute (caddr sig) s)
+              (rebuild e #`(#%app #,(instance g (map (lambda (v) (cdr (assq v s))) (car sig)) e) #,@(map cdr rs)))))))
+
+  ;; (inst f T ...) as a value: its instance, a function define made.
+  (define (instance-value f)
+    (let* ([g (generic-of f)] [sig (signature g)] [given (syntax-property f arguments-key)])
+      (unless given (type-error f "~a is generic: give its types with inst" (generic-name g)))
+      (let ([s (bindings f g sig given)])
+        (cons `(-> ,@(map (lambda (p) (substitute p s)) (cadr sig)) ,(substitute (caddr sig) s))
+              (instance g given f)))))
+
+  ;; The types (inst f T ...) gives generic g, as its type parameters'.
+  (define (bindings where g sig given)
+    (unless (= (length given) (length (car sig)))
+      (type-error where "~a takes ~a type~a, got ~a" (generic-name g) (length (car sig)) (if (= (length (car sig)) 1) "" "s")
+                  (length given)))
+    (map cons (car sig) given))
+
+  (define (generic-name g) (syntax-e (car (syntax-e g))))
+
+  ;; Generic g's instance at types ts: its function's name. The first time
+  ;; this module asks for it, g's body is expanded as a lambda, its type
+  ;; parameters bound to ts, and lowered as a function define made: the
+  ;; name is known first, so the body can call it.
+  (define (instance g ts where)
+    (let ([known (findf (lambda (i) (and (eq? (caar i) g) (equal? (cdar i) ts))) instances)])
+      (if known
+          (cdr known)
+          (syntax-match g
+            [(name (tv ...) ((x a) ...) r (body ...))
+             (let* ([listed (format "~s" ts)]
+                    [label (format "~a<~a>" (syntax-e name) (substring/utf-8 listed 1 (- (string-utf-8-length listed) 1)))]
+                    [f (fresh label)]
+                    [outer instantiating])
+               ;; Polymorphic recursion, an instance that needs one at larger types,
+               ;; would make instances without end.
+               (when (= (length making) 100)
+                 (raise-syntax-error 'typed (format "~a needs instances at ever larger types: it cannot be monomorphized" (recurring making))
+                                     where))
+               (set! instances (cons (cons (cons g ts) f) instances))
+               (dynamic-wind
+                (lambda () (set! instantiating label) (set! making (cons (syntax-e name) making)))
+                (lambda ()
+                  (with-types '() (map cons (map syntax-e tv) ts)
+                    (lambda ()
+                      (add-function! f (local-expand #`(typed-lambda (#,@(map (lambda (x a) #`[#,x : #,a]) x a)) #,@body))
+                                     (parse-type r)))))
+                (lambda () (set! instantiating outer) (set! making (cdr making))))
+               f)]))))
+
+  ;; The name that most often recurs in names.
+  (define (recurring names)
+    (let ([count (lambda (n) (length (filter (lambda (m) (eq? m n)) names)))])
+      (foldl (lambda (n best) (if (> (count n) (count best)) n best)) (car names) names)))
+
+  ;; lam, a fully expanded lambda whose result type is result, as function
+  ;; f with a value: the function, its code, and its value, as define
+  ;; makes them.
+  (define (add-function! f lam result)
+    (syntax-match lam
+      [(_ ((x _) ...) body ...)
+       (let* ([k (map (lambda (x) (kernel-type (type-of-syntax x))) x)]
+              [b (lower-body lam body (map variable x))]
+              [types (closure-types `(-> ,@(map type-of-syntax x) ,result))]
+              [value (fresh 'value)]
+              [code (fresh 'code)]
+              [ys (map (lambda (x) (fresh 'y)) x)]
+              [rk (kernel-type result)])
+         (unless (equal? (car b) result)
+           (type-error (last body) "~a returns ~s, but its body is ~s" (syntax-e f) result (car b)))
+         (add! #`(func (#,f #,@(map (lambda (x k) #`[#,x #,k]) x k)) #:value #,value -> #,rk #,@(cdr b)))
+         (add! #`(func (#,code [self (ref #,(car types))] #,@(map (lambda (y k) #`[#,y #,k]) ys k)) -> #,rk
+                   (type #,(cdr types))
+                   (#%app #,f #,@ys)))
+         (add! #`(global #,value (ref #,(car types)) (struct.new #,(car types) (ref.func #,code)))))])))
 
 (define-syntax typed-define typed-define)
 (define-syntax typed-lambda typed-lambda)
+(define-syntax typed-inst typed-inst)
 (define-syntax typed-linklet typed-linklet)
+
+;; What a use of a generic expands to, until #%linklet replaces it with an
+;; instance: a variable, so the use is fully expanded code, as a value or
+;; applied.
+(global generic-use i32 (i32.const 0))
 
 ;; ---- functions on Int ----
 
