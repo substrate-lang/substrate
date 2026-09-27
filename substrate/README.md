@@ -128,6 +128,8 @@ struct's type. Its traits have impls, written with the trait or the
 type, which are facts about the trait: a method call finds the impl for
 its type among them, and calls the impl's function for that type
 directly. A generic's type parameter can need a trait, whose methods its
-body can then use.
+body can then use. A trait can have associated types, which each impl
+gives: a type `(Elem C)` is the one `C`'s impl gives, found the same way,
+and the checker compares types once such projections are reduced.
 
 Open questions are in `docs/spec.md` section 7.
