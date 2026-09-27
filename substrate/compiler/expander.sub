@@ -370,23 +370,25 @@
 
 ;; The module at path, from the cache, if the cache has one for it that
 ;; is of this format and kernel, and of the source and requires as they
-;; are now; else #f. Its requires are compiled or loaded first, as they
-;; would be.
+;; are now; else #f. The source is checked first, with the hashes its
+;; requires had; then the requires are compiled or loaded in order, as
+;; they would be, until one is not as it was.
 (define (load-cached path)
   (let* ([kernel (cache-kernel)]
          [hash (and kernel (read-data (cache-file (string-append (content-hash (list path)) ".path"))))]
          [ds (and hash (read-data (cache-file (string-append hash ".subc"))))]
          [d (and ds (car ds))])
     (and d (eqv? (section d 'format) interface-format) (equal? (section d 'kernel) kernel)
-         (begin
-           (hash-set! registry path (new-unit path hash))    ; a cycle through the requires is an error, as when compiling
-           (let ([requires (map (lambda (r) (cons (module-of (car r)) (caddr r))) (section d 'requires))])
-             (cond [(string=? (module-hash (file->string path) requires) hash)
-                    (let ([m (or (hash-ref units-by-hash hash #f)          ; another file that is this module (spec 3.2)
-                                 (load-compiled-module d path))])
-                      (hash-set! registry path m)
-                      m)]
-                   [else (hash-remove! registry path) #f]))))))
+         (let ([requires (section d 'requires)])                     ; each (path hash shift)
+           (and (string=? (module-hash (file->string path) (map cdr requires)) hash)
+                (begin
+                  (hash-set! registry path (new-unit path hash))    ; a cycle through the requires is an error, as when compiling
+                  (cond [(andmap (lambda (r) (string=? (unit-hash (module-of (car r))) (cadr r))) requires)
+                         (let ([m (or (hash-ref units-by-hash hash #f)          ; another file that is this module (spec 3.2)
+                                      (load-compiled-module d path))])
+                           (hash-set! registry path m)
+                           m)]
+                        [else (hash-remove! registry path) #f])))))))
 
 ;; The module a recorded require names: the module in a file, compiled
 ;; or loaded as it would be, or the entry of a compiled file.
@@ -1101,10 +1103,10 @@
 
 ;; The hash that is a module's identity once it is expanded: of its
 ;; source text and the hashes of the modules it requires, at the phase
-;; shifts it requires them (spec 3.2). Modules with the same hash are the
-;; same module.
+;; shifts it requires them, each (hash shift) (spec 3.2). Modules with
+;; the same hash are the same module.
 (define (module-hash text requires)
-  (content-hash (cons text (apply append (map (lambda (r) (list (unit-hash (car r)) (number->string (cdr r)))) requires)))))
+  (content-hash (cons text (apply append (map (lambda (r) (list (car r) (number->string (cadr r)))) requires)))))
 
 ;; Compile the module in file `source` (and, first, what it requires).
 ;; Returns the module. Each module is compiled once per run.
@@ -1177,7 +1179,7 @@
     (set! removed-definitions #f)
     ;; Its requires known, the module takes its hash, and the name its
     ;; instance names start with: its stem and hash.
-    (set-unit-hash! m (module-hash text (unit-requires m)))
+    (set-unit-hash! m (module-hash text (map (lambda (r) (list (unit-hash (car r)) (cdr r))) (unit-requires m))))
     (set-unit-name! m (format "~a.~a" (file-stem (unit-path m)) (unit-hash m)))
     (let ([known (hash-ref units-by-hash (unit-hash m) #f)])
       (cond [known (store-index! m) known]
@@ -2067,8 +2069,8 @@
     name))
 
 ;; A linklet of this module's phase-`phase` code, run now, as each
-;; begin-for-syntax is. Its code also goes into the module's phase-`phase`
-;; linklet.
+;; begin-for-syntax is, after the define-syntax units waiting. Its code
+;; also goes into the module's phase-`phase` linklet.
 (define (run-compile-time-linklet! forms phase where)
   (run-pending!)
   (add-phase-forms! phase forms)
@@ -2077,8 +2079,8 @@
 
 ;; A define-syntax unit's forms, kept to be run with the other units
 ;; waiting, as one linklet, before anything can see their values: at the
-;; first use of one of them, before a begin-for-syntax runs, and at the
-;; end of the module. where is the first unit's form.
+;; first use of one of them, before any other compile-time linklet runs,
+;; and at the end of the module. where is the first unit's form.
 (define (defer-unit! forms phase where)
   (let ([p (comp-pending current)])
     (unless (and p (eqv? (car p) phase)) (run-pending!))
@@ -2143,7 +2145,9 @@
 ;; In (define-syntax name f), where f names a phase+1 function of type
 ;; (eqref) -> eqref, the value is a transformer that calls f. The value
 ;; lives in a global of the phase+1 linklet, computed when the linklet is
-;; instantiated.
+;; instantiated. A unit whose value is made by a lambda, or by f, runs no
+;; code of its own, so it waits to run with others (defer-unit!); any
+;; other runs now, since its code can read the values of those before it.
 (define (define-syntax! f phase)
   (syntax-match f
     [('define-syntax (? id? id) rhs)
@@ -2153,10 +2157,10 @@
             [adapter (and m (eq? (car m) 'func)
                           (transformer-adapter (string->symbol (string-append "__transformer." base))
                                                (syntax-function-of rhs phase "a transformer")))]
+            [expanded (and (not adapter) (expand-expr rhs (+ phase 1)))]
             [unit (if adapter
                       (list adapter)
-                      (let* ([out (apply-linklet-hook 'define-syntax (list (expand-expr rhs (+ phase 1)))
-                                                      rhs (+ phase 1))]
+                      (let* ([out (apply-linklet-hook 'define-syntax (list expanded) rhs (+ phase 1))]
                              [value (last out)])
                         (when (memq (core-head value (+ phase 1)) '(func global import type rec data tag))
                           (raise-compile-error f "#%linklet returned a define-syntax unit that does not end with an expression"))
@@ -2167,11 +2171,13 @@
                             (list (list 'ref-func (cadr adapter)) (list 'quote #f)))
                       (cadr (last unit)))]
             [global (global-info name eqref #t #f #f)]
-            [getter (func-info name '() (list eqref) #f #f #f)])
-       (defer-unit! (append (if adapter unit (take unit (- (length unit) 1)))
-                            (list (list 'global global init)
-                                  (list 'func getter '() (list 'gref global))))
-                    (+ phase 1) f)
+            [getter (func-info name '() (list eqref) #f #f #f)]
+            [forms (append (if adapter unit (take unit (- (length unit) 1)))
+                           (list (list 'global global init)
+                                 (list 'func getter '() (list 'gref global))))])
+       (if (or adapter (eq? (core-head expanded (+ phase 1)) 'lambda))
+           (defer-unit! forms (+ phase 1) f)
+           (run-compile-time-linklet! forms (+ phase 1) f))
        (hash-set! macro-modules getter (comp-module current))
        (bind-definition! id phase (list 'compile-time-value getter)))]))
 

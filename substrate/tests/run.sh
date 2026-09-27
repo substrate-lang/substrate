@@ -126,5 +126,24 @@ for t in tests/*.sub examples/*.sub; do
     again=$((again + 1))
   fi
 done
+# A cache entry for a module whose source has changed is not used, and
+# the requires it recorded are not looked at (spec 3.7): a required b,
+# and now does not, and b is gone.
+stale=build/tests/stale
+rm -rf "$stale"
+mkdir -p "$stale"
+lib='(require-unqualified substrate "../../../lib/substrate.sub")'
+printf '%s\n(provide x)\n(define x 1)\n' "$lib" > "$stale/b.sub"
+printf '%s\n(require b "b.sub")\n(define (run) (display b:x))\n(func (main) (run))\n' "$lib" > "$stale/a.sub"
+first="$("$compiler" build "$stale/a.sub" -o "$stale/a" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
+rm "$stale/b.sub"
+printf '%s\n(define (run) (display 2))\n(func (main) (run))\n' "$lib" > "$stale/a.sub"
+second="$("$compiler" build "$stale/a.sub" -o "$stale/a" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
+if [ "$first" = 1 ] && [ "$second" = 2 ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a changed module's cache entry: built $first, then $second"
+fi
 echo "$pass passed, $fail failed; $again programs rebuilt from the cache"
 [ $fail -eq 0 ]

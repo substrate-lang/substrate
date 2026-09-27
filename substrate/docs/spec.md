@@ -317,14 +317,15 @@ they trap.
     by definition or import, is an error.
 - Expansion must run phase-1 code before the module is finished: a macro
   works on the line after its definition. So while a module is expanded,
-  each `begin-for-syntax` is compiled into a linklet of its own and
-  instantiated at once, in source order, as Racket evaluates them, and the
-  `define-syntax` forms between them are compiled and run together, as one
-  linklet, before anything can see their values: at the first use of one,
-  before the next `begin-for-syntax`, or at the end of the module. When
-  the module is done, each phase's code is compiled again as a
-  whole, into the module's linklet for that phase. Other modules only ever
-  use those.
+  each `begin-for-syntax`, and each `define-syntax`, is compiled into a
+  linklet of its own and instantiated at once, in source order, as Racket
+  evaluates them. A `define-syntax` whose value is a `lambda`, or a
+  function it names, runs no code of its own, so those between the others
+  are compiled and run together, as one linklet, before anything can see
+  their values: at the first use of one, before the next compile-time
+  linklet, or at the end of the module. When the module is done, each
+  phase's code is compiled again as a whole, into the module's linklet for
+  that phase. Other modules only ever use those.
 
 ### 3.2 Stores and instance names
 
@@ -483,10 +484,12 @@ kernel's bytes, for the compiler built next to embed (1.4).
   requires by path, hash and phase shift, a macro-introduced `require`
   among them. The cache's index maps a source path to the hash of the
   module last compiled from it. To look a module up, the compiler reads
-  the index and the interface, compiles or loads the recorded requires
-  as it would to compile the module, and takes the interface if it is of
-  this format and kernel and the module's hash, of its source and their
-  hashes, comes out as recorded.
+  the index and the interface, which it takes if it is of this format
+  and kernel, if the module's hash, of its source and the recorded
+  requires' hashes, comes out as recorded, and if the recorded requires,
+  compiled or loaded in order as they would be to compile the module,
+  each have the recorded hash. So a require the source no longer has is
+  not looked at, and none after the first that changed.
 - An interface holds what compiled code refers to in the module and what
   other modules' expansions need: its provides, its module-level bindings
   with their scope sets and phases, its functions with their signatures,
