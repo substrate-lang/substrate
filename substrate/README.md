@@ -131,5 +131,16 @@ directly. A generic's type parameter can need a trait, whose methods its
 body can then use. A trait can have associated types, which each impl
 gives: a type `(Elem C)` is the one `C`'s impl gives, found the same way,
 and the checker compares types once such projections are reduced.
+`examples/bend.sub` is Bend on the kernel (`examples/bend/`): a port of
+Bend2's kernel, a dependently typed language with quantities, in
+s-expressions. Its kernel, `core.sub`, checks each module's definitions
+in order while the module compiles: datatypes, definitions by pattern
+matching, which terminate by descent, and proofs by rewriting. A term's
+binders expand to kernel lambdas, so the expander keeps them hygienic,
+and its other nodes to holes; each definition reads its expansion back
+as a term and records it as a fact about its name, which the checker
+looks up by name when a term refers to it (spec 6.6, 6.7). A law
+declares a definition that a later one, in any module that requires it,
+fills. A Bend module does not run yet.
 
 Open questions are in `docs/spec.md` section 7.

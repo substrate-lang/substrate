@@ -1,0 +1,561 @@
+;; Lifecycle: example. Bend on the kernel: a port of Bend2's dependently
+;; typed, affine language (bend2/bend.ts), in s-expressions, whose kernel,
+;; core.sub, checks each module's definitions while it compiles. A module
+;; takes these forms with require-unqualified:
+;;
+;;   (type (D p ...) K [C field ...] ...)    a datatype, of kind K, whose
+;;   (type D K [C field ...] ...)            parameters p are [q x : A],
+;;                                           or x, an erased Quant, and a
+;;                                           constructor's fields [q x : A]
+;;   (def (f [q x : A] ...) R body)          a definition of type
+;;                                           (-> [q x : A] ... R)
+;;   (law (f [q x : A] ...) R)               a law: f declared, of that
+;;                                           type, and stuck until
+;;   (def (f x ...) body)                    fills it, here or in a module
+;;                                           that requires this one
+;;
+;; A binder's quantity q is -, erased, + for many uses, or nothing for one.
+;; A body is a term or (match x ... [(pattern ...) body] ...), whose
+;; scrutinees are parameters or fields, as in Bend, and a pattern is a
+;; variable, _, which binds nothing, a constructor C or (C pattern ...).
+;; Terms:
+;;
+;;   x, f, D, C              a variable, or a definition, datatype or
+;;                           constructor by name (spec 6.7)
+;;   (f a ...), (D a ...), (C a ...)
+;;                           an application, a datatype's instance, whose
+;;                           leading parameters that are quantities can be
+;;                           left out, as in Bend, and a value
+;;   (fn (x ...) t)          a function
+;;   (-> [q x : A] ... B), (-> A ... B)
+;;                           a function type
+;;   (let ([q x v] ...) t)   values bound in parallel
+;;   Type Data Quant (Kind q) &0 &1 &2 (meet a b)
+;;                           kinds and quantities
+;;   (split C h m), (absurd) a lambda-match: C's case h, the others m
+;;   (== a b T), refl, (rewrite e P f)
+;;                           equality, its proof, and its eliminator J,
+;;                           whose motive P has _ where it rewrites, as
+;;                           Bend's does
+;;   (the T x), (? name)     an annotation, and a hole
+;;   (nat n)                 the Nat n, of the Succ and Zero in scope
+;;
+;; Bend keeps constructors apart from other names, and writes them with
+;; braces; here a constructor is a name like any other, so one cannot be
+;; named as its datatype is.
+;;
+;; How it works. The forms only bind and record. type, def and law bind
+;; each name they define to a transformer, whose use is a hole naming it
+;; (spec 6.4, 6.7); then, the names bound, they expand the definition's
+;; types and body, in which binders are kernel lambdas, so the expander
+;; keeps them hygienic, and every other node is a hole; read the expansion
+;; back as data (read-term); and record it as a fact about the name (spec
+;; 6.6), which is how another module finds it, by name. A match is
+;; flattened into lambda-matches at the binders it scrutinizes, as Bend's
+;; parser does (core.sub). #%linklet validates the module's definitions in
+;; order, as Bend's book_valid does: each checks against those before it
+;; and those of the modules it requires. An error shows the term it is
+;; about as it is written here, at the place it was written.
+
+(begin-for-syntax
+  (require-unqualified substrate "../../lib/substrate.sub")
+  (require k kernel)
+  (require-unqualified core "core.sub"))
+
+(provide [type bend-type] [def bend-def] [law bend-law] [match bend-match] [fn bend-fn] [-> bend-arrow]
+         [let bend-let] [split bend-split] [absurd bend-absurd] [== bend-eql] [refl bend-refl]
+         [rewrite bend-rewrite] [the bend-the] [? bend-hole] [nat bend-nat] [Kind bend-kind] [meet bend-meet]
+         [Type bend-Type] [Data bend-Data] [Quant bend-Quant] [&0 bend-q0] [&1 bend-q1] [&2 bend-q2]
+         [#%app bend-app] [#%datum bend-datum] [#%linklet bend-linklet])
+
+(begin-for-syntax
+  (define (bend-error where form . args) (raise-syntax-error 'bend (apply format form args) where))
+  (define (datum d) (datum->syntax #'here d))
+
+  ;; ---- terms, as the expander sees them ----
+  ;;
+  ;; A term expands to kernel code whose binders are lambdas, with holes
+  ;; for types, and whose every other node is (#%hole bend kind data ...),
+  ;; alone or applied to the node's parts, which the expander expands (spec
+  ;; 6.4).
+
+  (define (node kind . data) #`(#%hole bend #,@(map datum (cons kind data))))
+
+  (define (binder x) #`[#,x (#%hole)])
+
+  ;; (f a ...): an application, as the kernel's; read-term tells which.
+  (define (bend-app stx)
+    (syntax-match stx
+      [(_ f a ...) #`(#%app #,f #,@a)]))
+
+  (define (bend-datum stx)
+    (bend-error stx "a number is a U32, which this example does not have yet: write a Nat as (nat n)"))
+
+  (define (bend-fn stx)
+    (syntax-match stx
+      [(_ ((? identifier? x) ...) t)
+       (when (null? x) (bend-error stx "expected (fn (x ...) t), with a variable"))
+       (foldr (lambda (x t) #`(lambda (#,(binder x)) #,t)) t x)]
+      [_ (bend-error stx "expected (fn (x ...) t)")]))
+
+  ;; A binder written [q x : A], q - or +, or [x : A]: (q x A).
+  (define (bind-spec b)
+    (syntax-match b
+      [((? identifier? x) ': A) (list 'lone x A)]
+      [('- (? identifier? x) ': A) (list 'none x A)]
+      [('+ (? identifier? x) ': A) (list 'many x A)]
+      [_ #f]))
+
+  ;; A parameter of a datatype: a binder, or x alone, an erased Quant.
+  (define (param-spec p)
+    (or (bind-spec p)
+        (syntax-match p
+          [(? identifier? x) (list 'none x #'bend-Quant)]
+          [_ (bend-error p "expected a parameter: [q x : A], or x, a quantity")])))
+
+  (define (quant-type? A) (and (identifier? A) (free-identifier=? A #'bend-Quant)))
+
+  ;; How many of a datatype's parameters, from the first, are quantities.
+  (define (leading-quantities ps)
+    (let loop ([ps ps] [i 0]) (if (and (pair? ps) (quant-type? (caddr (car ps)))) (loop (cdr ps) (+ i 1)) i)))
+
+  ;; (-> b ... B): each b a binder, or a type bound to nothing.
+  (define (bend-arrow stx)
+    (syntax-match stx
+      [(_ b ... B)
+       (when (null? b) (bend-error stx "expected (-> A ... B), with a domain"))
+       (arrow (map (lambda (b) (or (bind-spec b) (list 'lone (datum '_) b))) b) B)]))
+
+  (define (arrow specs B)
+    (foldr (lambda (spec B)
+             #`(#%app #,(node 'all (car spec)) #,(caddr spec) (lambda (#,(binder (cadr spec))) #,B)))
+           B specs))
+
+  (define (bend-let stx)
+    (syntax-match stx
+      [(_ (b ...) t)
+       (let ([bs (map (lambda (b)
+                        (syntax-match b
+                          [((? identifier? x) v) (list 'lone x v)]
+                          [('- (? identifier? x) v) (list 'none x v)]
+                          [('+ (? identifier? x) v) (list 'many x v)]
+                          [_ (bend-error b "expected a binding: [q x v]")]))
+                      b)])
+         (when (null? bs) (bend-error stx "expected (let ([q x v] ...) t), with a binding"))
+         #`(#%app #,(node 'let (map car bs)) #,@(map caddr bs) (lambda (#,@(map (lambda (b) (binder (cadr b))) bs)) #,t)))]))
+
+  (define (bend-split stx)
+    (syntax-match stx
+      [(_ (? identifier? c) h m) #`(#%app #,(node 'mat) #,c #,h #,m)]
+      [_ (bend-error stx "expected (split C h m)")]))
+
+  (define (bend-absurd stx) (node 'efq))
+  (define (bend-eql stx) (syntax-match stx [(_ a b T) #`(#%app #,(node 'eql) #,a #,b #,T)]))
+  (define (bend-refl stx) (node 'rfl))
+  ;; (rewrite e P f): P the motive, with _ where the rewrite applies, as
+  ;; Bend writes it: _ is bound in P, as is e's proof, unnamed.
+  (define (bend-rewrite stx)
+    (syntax-match stx
+      [(_ e P f)
+       #`(#%app #,(node 'rwt) #,e (lambda (#,(binder (datum->syntax stx '_ stx))) (lambda (#,(binder (datum 'e))) #,P)) #,f)]
+      [_ (bend-error stx "expected (rewrite e P f)")]))
+  (define (bend-the stx) (syntax-match stx [(_ T x) #`(#%app #,(node 'ann) #,x #,T)]))
+  (define (bend-hole stx) (syntax-match stx [(_ (? identifier? h)) (node 'hol (syntax-e h))]))
+  (define (bend-kind stx) (syntax-match stx [(_ g) #`(#%app #,(node 'typ) #,g)]))
+  (define (bend-meet stx) (syntax-match stx [(_ a b) #`(#%app #,(node 'min) #,a #,b)]))
+  (define (bend-Type stx) #`(#%app #,(node 'typ) #,(node 'qua 'lone)))
+  (define (bend-Data stx) #`(#%app #,(node 'typ) #,(node 'qua 'many)))
+  (define (bend-Quant stx) (node 'qnt))
+  (define (bend-q0 stx) (node 'qua 'none))
+  (define (bend-q1 stx) (node 'qua 'lone))
+  (define (bend-q2 stx) (node 'qua 'many))
+
+  ;; (nat n): Succ applied n times to Zero, as the module names them.
+  (define (bend-nat stx)
+    (syntax-match stx
+      [(_ n)
+       (let ([n (syntax-e n)])
+         (unless (and (fixnum? n) (>= n 0)) (bend-error stx "expected (nat n), n a natural number"))
+         (let loop ([i n] [t (datum->syntax stx 'Zero stx)])
+           (if (= i 0) t (loop (- i 1) #`(#,(datum->syntax stx 'Succ stx) #,t)))))]))
+
+  ;; (match x ... [(p ...) body] ...), a single scrutinee's patterns not in
+  ;; parentheses: each row binds its patterns' variables in a lambda, and
+  ;; the hole holds the rows' patterns, which read-body reads. A
+  ;; scrutinee is a variable, as the flattener needs (core.sub).
+  (define (bend-match stx)
+    (syntax-match stx
+      [(_ (? identifier? x) ... row ...)
+       (when (null? x)
+         (bend-error (if (pair? row) (car row) stx)
+                     "expected a parameter or field scrutinee (a match cannot scrutinize a computed value: give it its own def)"))
+       (let ([rows (map (lambda (r)
+                          (syntax-match r
+                            [(ps body)
+                             (let ([ps (if (= (length x) 1) (list ps) (or (syntax->list ps) (bend-error ps "expected (pattern ...)")))])
+                               (unless (= (length ps) (length x))
+                                 (bend-error r "expected ~a pattern~a" (length x) (if (= (length x) 1) "" "s")))
+                               (list ps (apply append (map pattern-vars ps)) body))]
+                            [_ (bend-error r "expected a row [pattern body]")]))
+                        row)])
+         #`(#%app (#%hole bend match #,(datum (length x)) #,@(map (lambda (r) #`(#,@(car r))) rows)) #,@x
+                  #,@(map (lambda (r) #`(lambda (#,@(map binder (cadr r))) #,(caddr r))) rows)))]))
+
+  ;; A pattern's variables, in order: a variable, not a constructor's name,
+  ;; is one, and (C p ...) has its patterns', one per field of C. _ binds
+  ;; nothing.
+  (define (pattern-vars p)
+    (syntax-match p
+      [(? identifier? x)
+       (cond [(eq? (syntax-e x) '_) '()]
+             [(constructor x) (fields-matched p x '()) '()]
+             [else (list x)])]
+      [((? identifier? c) q ...)
+       (unless (constructor c) (bend-error c "~a is not a constructor" (syntax-e c)))
+       (fields-matched p c q)
+       (apply append (map pattern-vars q))]
+      [_ (bend-error p "expected a pattern: a variable, _, C or (C pattern ...)")]))
+
+  (define (fields-matched p c q)
+    (let ([n (cdr (constructor c))])
+      (unless (= (length q) n)
+        (bend-error p "expected a ~a pattern with ~a field~a" (syntax-e c) n (if (= n 1) "" "s")))))
+
+  ;; The constructor x names, as (name . fields), or #f.
+  (define (constructor x)
+    (and (eq? (identifier-binding-kind x) 'macro)
+         (syntax-match (local-expand x)
+           [('#%hole 'bend 'ctr name n) (cons (syntax-e name) (syntax-e n))]
+           [_ #f])))
+
+  (define (constructor-name x) (let ([c (constructor x)]) (and c (car c))))
+
+  ;; ---- names ----
+
+  ;; The transformer each name a module defines is bound to: a use of it is
+  ;; (#%hole bend kind name data ...), kind ref; ctr, and a constructor's
+  ;; fields; or adt, and a datatype's parameters n and the leading ones
+  ;; that are quantities g, which can be left out, as in Bend: they are
+  ;; &1. So is an application's head.
+  (define (name-transformer kind . ng)
+    (lambda (stx)
+      (let* ([id (if (identifier? stx) stx (car (syntax-e stx)))]
+             [hole (datum->syntax #'here (syntax-e (apply node kind (k:identifier-name id) ng)) id)])
+        (syntax-match stx
+          [(_ a ...)
+           (let ([a (if (and (eq? kind 'adt) (= (+ (length a) (cadr ng)) (car ng)))
+                        (append (map (lambda (_) (node 'qua 'lone)) (range (cadr ng))) a)
+                        a)])
+             #`(#%app #,hole #,@a))]
+          [_ hole]))))
+
+  ;; ---- reading terms back ----
+  ;;
+  ;; A term's expansion as data (core.sub): env maps each local variable's
+  ;; binding (spec 2.3) to its name and id, a number fresh for each binder,
+  ;; which next counts. A node's syntax is located where its expansion is,
+  ;; and holds the node as this example writes it, which an error shows.
+  (define next 0)
+  (define (fresh!) (set! next (+ next 1)) next)
+  (define (bind x i env) (cons (cons (k:local-binding x) (cons (syntax-e x) i)) env))
+
+  (define (surface e d) (datum->syntax #f d e))
+  (define (short-name k) (string->symbol (short k)))
+  (define (s-of d) (last d))
+
+  ;; f applied to the terms as, one at a time, as the application e.
+  (define (apps e f as)
+    (let loop ([t f] [as as] [ss (list (s-of f))])
+      (if (null? as)
+          t
+          (let ([ss (cons (s-of (car as)) ss)])
+            (loop (list 'app t (car as) (surface e (reverse ss))) (cdr as) ss)))))
+
+  ;; (head x ...) with x's syntax, or head alone.
+  (define (applied head xs) (if (null? xs) head (cons head (map s-of xs))))
+
+  ;; A binder's surface: one whose body is another of the same form is
+  ;; joined with it, so (-> A (-> B C)) is (-> A B C), and (fn (x) (fn (y)
+  ;; t)) is (fn (x y) t); joins marks the syntax so.
+  (define (joins e d) (syntax-property (surface e d) 'bend-joins #t))
+
+  (define (read-term e env)
+    (let ([r (lambda (x) (read-term x env))])
+      (syntax-match e
+        [(? identifier? x)
+         (let ([v (and (k:local-binding x) (assv (k:local-binding x) env))])
+           (unless v (bend-error x "~a is not a variable or a definition of Bend" (syntax-e x)))
+           (list 'var (cadr v) (cddr v) x))]
+        [('#%hole 'bend kind . data) (read-node e e (syntax-e kind) (map syntax-e data) '() env)]
+        [('#%app (? hole? h) arg ...) (read-node e h (syntax-e (caddr (syntax-e h))) (map syntax-e (cdddr (syntax-e h))) arg env)]
+        [('#%app f arg ...) (apps e (r f) (map r arg))]
+        [('lambda ((x _)) body)
+         (let* ([i (fresh!)] [b (read-term body (bind x i env))])
+           (list 'lam (syntax-e x) i b (joins e (fn-surface x b))))]
+        [_ (bend-error e "this is not a Bend term")])))
+
+  (define (fn-surface x b)
+    (let ([l (syntax->list (s-of b))])
+      (if (and l (eq? (syntax-property (s-of b) 'bend-joins) #t) (eq? (syntax-e (car l)) 'fn))
+          (list 'fn (cons x (syntax->list (cadr l))) (caddr l))
+          (list 'fn (list x) (s-of b)))))
+
+  (define (arrow-surface q x A B)
+    (let ([dom (cond [(eq? (syntax-e x) '_) (s-of A)]
+                     [(eq? q 'lone) (list x ': (s-of A))]
+                     [else (list (if (eq? q 'none) '- '+) x ': (s-of A))])]
+          [l (syntax->list (s-of B))])
+      (if (and l (eq? (syntax-property (s-of B) 'bend-joins) #t) (eq? (syntax-e (car l)) '->))
+          (cons '-> (cons dom (cdr l)))
+          (list '-> dom (s-of B)))))
+
+  (define (hole? h) (syntax-match h [('#%hole 'bend . _) #t] [_ #f]))
+
+  ;; Node kind of Bend, its hole's data, applied to args, as the
+  ;; expression e, whose hole is h.
+  (define (read-node e h kind data args env)
+    (let* ([r (lambda (x) (read-term x env))]
+           [xs (lambda () (map r args))]
+           [node (lambda (d s) (append d (list (surface e s))))])
+      (case kind
+        [(ref) (apps e (list 'ref (car data) (surface h (short-name (car data)))) (xs))]
+        [(adt) (let ([ts (xs)] [k (car data)])
+                 (if (and (null? ts) (> (cadr data) 0))
+                     (list 'ref k (surface e (short-name k)))
+                     (node (list 'adt k ts '()) (applied (short-name k) ts))))]
+        [(ctr) (let ([ts (xs)]) (node (list 'ctr (car data) ts) (applied (short-name (car data)) ts)))]
+        [(qua) (node (list 'qua (car data)) (case (car data) [(none) '&0] [(lone) '&1] [else '&2]))]
+        [(qnt) (node '(qnt) 'Quant)]
+        [(efq) (node '(efq) '(absurd))]
+        [(rfl) (node '(rfl) 'refl)]
+        [(hol) (node (list 'hol (car data)) (list '? (car data)))]
+        [(typ) (let ([g (r (car args))])
+                 (node (list 'typ g) (if (eq? (car g) 'qua) (case (cadr g) [(lone) 'Type] [(many) 'Data] [else (list 'Kind (s-of g))]) (list 'Kind (s-of g)))))]
+        [(min) (let ([ts (xs)]) (node (cons 'min ts) (applied 'meet ts)))]
+        [(eql) (let ([ts (xs)]) (node (cons 'eql ts) (applied '== ts)))]
+        [(rwt) (let ([ts (xs)]) (node (cons 'rwt ts) (applied 'rewrite ts)))]
+        [(ann) (let ([x (r (car args))] [T (r (cadr args))]) (node (list 'ann x T) (list 'the (s-of T) (s-of x))))]
+        [(mat)
+         (syntax-match (car args)
+           [('#%hole 'bend 'ctr name _)
+            (let ([h (r (cadr args))] [m (r (caddr args))])
+              (node (list 'mat (syntax-e name) h m) (list 'split (short-name (syntax-e name)) (s-of h) (s-of m))))]
+           [_ (bend-error (car args) "expected a constructor")])]
+        [(all)
+         (syntax-match (cadr args)
+           [('lambda ((x _)) B)
+            (let* ([i (fresh!)] [A (r (car args))] [B (read-term B (bind x i env))])
+              (list 'all (car data) (syntax-e x) i A B (joins e (arrow-surface (car data) x A B))))])]
+        [(let)
+         (syntax-match (last args)
+           [('lambda ((x _) ...) f)
+            (let* ([is (map (lambda (x) (fresh!)) x)]
+                   [vs (map r (take args (length x)))]
+                   [f (read-term f (foldl bind env x is))])
+              (node (list 'let (map syntax-e x) is (car data) vs f)
+                    (list 'let (map (lambda (q x v) (if (eq? q 'lone) (list x (s-of v)) (list (if (eq? q 'none) '- '+) x (s-of v))))
+                                    (car data) x vs)
+                          (s-of f))))])]
+        [(match) (bend-error e "a match is a body: a definition's, or a case's")]
+        [else (bend-error e "this is not a Bend term")])))
+
+  ;; A body read back: a term, or (match (e ...) (((p ...) body) ...) s).
+  (define (read-body e env)
+    (syntax-match e
+      [('#%app ('#%hole 'bend 'match n row ...) arg ...)
+       (let* ([n (syntax-e n)]
+              [es (map (lambda (x) (read-term x env)) (take arg n))]
+              [rows (map (lambda (ps lam)
+                           (syntax-match lam
+                             [('lambda ((x _) ...) body)
+                              (let ([is (map (lambda (x) (fresh!)) x)])
+                                (list (patterns (syntax->list ps) (map list (map syntax-e x) is x))
+                                      (read-body body (foldl bind env x is))
+                                      ps))]))
+                         row (list-tail arg n))])
+         (list 'match es (map (lambda (row) (list (car row) (cadr row))) rows)
+               (surface e (append (cons 'match (map s-of es))
+                                  (map (lambda (row) (list (if (= n 1) (car (syntax->list (caddr row))) (caddr row)) (s-of (cadr row))))
+                                       rows)))))]
+      [_ (read-term e env)]))
+
+  ;; A row's patterns ps as data, its variables vars, each (k i x), taken
+  ;; in order; a _ is a variable of its own, which nothing refers to.
+  (define (patterns ps vars)
+    (letrec ([build (lambda (p)
+                      (syntax-match p
+                        [(? identifier? x)
+                         (let ([c (constructor-name x)])
+                           (cond [c (list 'pctr c '() p)]
+                                 [(eq? (syntax-e x) '_) (list 'pvar '_ (fresh!) x)]
+                                 [else (let ([v (car vars)]) (set! vars (cdr vars)) (cons 'pvar v))]))]
+                        [(c q ...) (list 'pctr (constructor-name c) (map build q) p)]))])
+      (map build ps)))
+
+  ;; ---- definitions ----
+  ;;
+  ;; The definitions this module makes, in order, as core.sub's events,
+  ;; for #%linklet to validate.
+  (define defined-here '())
+  (define (record! event) (set! defined-here (cons event defined-here)))
+
+  ;; Type syntax T, expanded and read back.
+  (define (read-type T) (set! next 0) (read-term (local-expand T) '()))
+
+  ;; A definition's value from its parameters xs and its body: the body,
+  ;; the parameters bound, expanded, read back and flattened.
+  (define (read-value xs body)
+    (set! next 0)
+    (syntax-match (local-expand #`(lambda (#,@(map binder xs)) #,body))
+      [('lambda ((x _) ...) b)
+       (let* ([is (map (lambda (x) (fresh!)) x)]
+              [body (read-body b (foldl bind '() x is))])
+         (flatten-definition body (map (lambda (x i) (list 'pvar (syntax-e x) i x)) x is) next #t))]))
+
+  (define (fact id d) #`(#%fact #,id #,(datum d)))
+
+  ;; (type (D p ...) K [C field ...] ...), or (type D K ...): D and each C
+  ;; bound, then (type-info ...), which reads their types.
+  (define (type-parts stx)
+    (syntax-match stx
+      [(_ head K ctr ...)
+       (list (syntax-match head
+               [((? identifier? d) p ...) (cons d (map param-spec p))]
+               [(? identifier? d) (list d)]
+               [_ (bend-error head "expected (D parameter ...) or D")])
+             K
+             (map (lambda (c)
+                    (syntax-match c
+                      [((? identifier? n) f ...)
+                       (cons n (map (lambda (f) (or (bind-spec f) (bend-error f "expected a field: [q x : A]"))) f))]
+                      [(? identifier? n) (list n)]
+                      [_ (bend-error c "expected a constructor: [C field ...]")]))
+                  ctr))]
+      [_ (bend-error stx "expected (type (D parameter ...) K [C field ...] ...)")]))
+
+  (define (bend-type stx)
+    (let* ([parts (type-parts stx)] [h (car parts)] [ps (cdr h)])
+      #`(begin
+          (define-syntax #,(car h) (name-transformer 'adt #,(datum (length ps)) #,(datum (leading-quantities ps))))
+          #,@(map (lambda (c) #`(define-syntax #,(car c) (name-transformer 'ctr #,(datum (length (cdr c)))))) (caddr parts))
+          (type-info #,stx))))
+
+  (define (type-info stx)
+    (syntax-match stx
+      [(_ form)
+       (let* ([parts (type-parts form)] [d (car (car parts))] [ps (cdr (car parts))]
+              [n (length ps)]
+              [g (leading-quantities ps)]
+              [T (read-type (arrow ps (cadr parts)))]
+              [tip (if (null? ps) d #`(#%app #,d #,@(map cadr ps)))]
+              [cs (map (lambda (c) (list (k:identifier-name (car c)) (length (cdr c)) (read-type (arrow (append ps (cdr c)) tip))))
+                       (caddr parts))])
+         (record! (list 'adt (k:identifier-name d) n g T cs form))
+         #`(begin
+             #,(fact d (list 'adt n g (strip-datum T) (map (lambda (c) (list (car c) (cadr c) (strip-datum (caddr c)))) cs)))
+             #,@(map (lambda (c part) (fact (car part) (list 'ctr (car c) (cadr c) (strip-datum (caddr c)))))
+                     cs (caddr parts))))]))
+
+  ;; (def (f [q x : A] ...) R body): f bound, then its type and body read.
+  ;; (def (f x ...) body): f's law filled.
+  (define (bend-def stx)
+    (syntax-match stx
+      [(_ ((? identifier? f) (? identifier? x) ...) body) #`(fill-info #,stx)]
+      [(_ ((? identifier? f) b ...) R body)
+       #`(begin (define-syntax #,f (name-transformer 'ref)) (def-info #,stx))]
+      [_ (bend-error stx "expected (def (f [q x : A] ...) R body), or (def (f x ...) body) to fill a law")]))
+
+  (define (def-specs b) (map (lambda (b) (or (bind-spec b) (bend-error b "expected a parameter: [q x : A]"))) b))
+
+  ;; (def-info form), (law-info form), (fill-info form): the forms'
+  ;; second steps.
+  (define (def-info stx)
+    (let ([form (cadr (syntax->list stx))])
+      (syntax-match form
+        [(_ (f b ...) R body)
+         (let* ([specs (def-specs b)]
+                [T (read-type (arrow specs R))]
+                [v (read-value (map cadr specs) body)])
+           (record! (list 'def (k:identifier-name f) (length specs) T v form))
+           (fact f (list 'def (length specs) (strip-datum T) (strip-datum v))))])))
+
+  (define (bend-law stx)
+    (syntax-match stx
+      [(_ ((? identifier? f) b ...) R)
+       #`(begin (define-syntax #,f (name-transformer 'ref)) (law-info #,stx))]
+      [_ (bend-error stx "expected (law (f [q x : A] ...) R)")]))
+
+  (define (law-info stx)
+    (let ([form (cadr (syntax->list stx))])
+      (syntax-match form
+        [(_ (f b ...) R)
+         (let* ([specs (def-specs b)] [T (read-type (arrow specs R))])
+           (record! (list 'def (k:identifier-name f) (length specs) T #f form))
+           (fact f (list 'def (length specs) (strip-datum T) #f)))])))
+
+  (define (fill-info stx)
+    (let ([form (cadr (syntax->list stx))])
+      (syntax-match form
+        [(_ (f x ...) body)
+         (unless (and (eq? (identifier-binding-kind f) 'macro) (syntax-match (local-expand f) [('#%hole 'bend 'ref _) #t] [_ #f]))
+           (bend-error f "~a is not a law to fill" (syntax-e f)))
+         (let ([v (read-value x body)])
+           (record! (list 'fill (k:identifier-name f) v form))
+           (fact f (list 'fill (strip-datum v))))])))
+
+  ;; ---- #%linklet ----
+
+  ;; A module's definitions validated, in order (core.sub); its forms
+  ;; left as they are. Each definition recorded a fact about its name, and
+  ;; the module's facts come last (spec 6.6), so the last about one of its
+  ;; names says which module this is.
+  (define (bend-linklet stx)
+    (syntax-match stx
+      [(_ 'module form ...)
+       (unless (null? defined-here)
+         (let ([here (car (last (k:syntax-local-facts (k:name-identifier (cadr (car defined-here))))))])
+           (validate! (lambda (name) (lookup name here)) (reverse defined-here))))
+       form]
+      [(_ _ form ...) form]))
+
+  ;; What the modules this one requires say of name, from the facts about
+  ;; it: its definition's information, a law's filled by a fill if one is.
+  (define (lookup name here)
+    (let* ([facts (filter (lambda (f) (not (eq? (car f) here))) (k:syntax-local-facts (k:name-identifier name)))]
+           [data (map (lambda (f) (syntax->datum (caddr f))) facts)]
+           [info (findf (lambda (d) (memq (car d) '(adt ctr def))) data)]
+           [fill (findf (lambda (d) (eq? (car d) 'fill)) data)])
+      (cond [(not info) #f]
+            [(and fill (eq? (car info) 'def) (not (cadddr info))) (list 'def (cadr info) (caddr info) (cadr fill))]
+            [else info]))))
+
+(define-syntax bend-type bend-type)
+(define-syntax type-info type-info)
+(define-syntax bend-def bend-def)
+(define-syntax def-info def-info)
+(define-syntax fill-info fill-info)
+(define-syntax bend-law bend-law)
+(define-syntax law-info law-info)
+(define-syntax bend-match bend-match)
+(define-syntax bend-fn bend-fn)
+(define-syntax bend-arrow bend-arrow)
+(define-syntax bend-let bend-let)
+(define-syntax bend-split bend-split)
+(define-syntax bend-absurd bend-absurd)
+(define-syntax bend-eql bend-eql)
+(define-syntax bend-refl bend-refl)
+(define-syntax bend-rewrite bend-rewrite)
+(define-syntax bend-the bend-the)
+(define-syntax bend-hole bend-hole)
+(define-syntax bend-nat bend-nat)
+(define-syntax bend-kind bend-kind)
+(define-syntax bend-meet bend-meet)
+(define-syntax bend-Type bend-Type)
+(define-syntax bend-Data bend-Data)
+(define-syntax bend-Quant bend-Quant)
+(define-syntax bend-q0 bend-q0)
+(define-syntax bend-q1 bend-q1)
+(define-syntax bend-q2 bend-q2)
+(define-syntax bend-app bend-app)
+(define-syntax bend-datum bend-datum)
+(define-syntax bend-linklet bend-linklet)
