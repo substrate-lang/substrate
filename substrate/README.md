@@ -141,6 +141,10 @@ and its other nodes to holes; each definition reads its expansion back
 as a term and records it as a fact about its name, which the checker
 looks up by name when a term refers to it (spec 6.6, 6.7). A law
 declares a definition that a later one, in any module that requires it,
-fills. A Bend module does not run yet.
+fills. Its `#%linklet` then makes each definition a function
+(`lower.sub`), with every value an `eqref`: a datatype a recursion group
+of structs, one per constructor, a function value a closure, and what is
+erased, types, proofs' rewrites and binders of quantity `-`, left out. A
+module that defines `main` is a program that writes `main`'s value.
 
 Open questions are in `docs/spec.md` section 7.

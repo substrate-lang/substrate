@@ -1,7 +1,8 @@
 ;; Lifecycle: example. Bend on the kernel: a port of Bend2's dependently
 ;; typed, affine language (bend2/bend.ts), in s-expressions, whose kernel,
-;; core.sub, checks each module's definitions while it compiles. A module
-;; takes these forms with require-unqualified:
+;; core.sub, checks each module's definitions while it compiles, and which
+;; lower.sub makes kernel code. A module takes these forms with
+;; require-unqualified:
 ;;
 ;;   (type (D p ...) K [C field ...] ...)    a datatype, of kind K, whose
 ;;   (type D K [C field ...] ...)            parameters p are [q x : A],
@@ -56,11 +57,19 @@
 ;; order, as Bend's book_valid does: each checks against those before it
 ;; and those of the modules it requires. An error shows the term it is
 ;; about as it is written here, at the place it was written.
+;;
+;; A definition with a value is a function, which def declares, and which
+;; #%linklet makes from the value as it checked it (lower.sub): a fact
+;; about the definition holds the function's name, which is how code in
+;; any module calls it. A module that defines main is a program, which
+;; writes main's value, with runtime.sub.
 
+(require rt "runtime.sub")
 (begin-for-syntax
   (require-unqualified substrate "../../lib/substrate.sub")
   (require k kernel)
-  (require-unqualified core "core.sub"))
+  (require-unqualified core "core.sub")
+  (require-unqualified lower "lower.sub"))
 
 (provide [type bend-type] [def bend-def] [law bend-law] [match bend-match] [fn bend-fn] [-> bend-arrow]
          [let bend-let] [split bend-split] [absurd bend-absurd] [== bend-eql] [refl bend-refl]
@@ -286,8 +295,8 @@
          (let ([v (and (k:local-binding x) (assv (k:local-binding x) env))])
            (unless v (bend-error x "~a is not a variable or a definition of Bend" (syntax-e x)))
            (list 'var (cadr v) (cddr v) x))]
-        [('#%hole 'bend kind . data) (read-node e e (syntax-e kind) (map syntax-e data) '() env)]
-        [('#%app (? hole? h) arg ...) (read-node e h (syntax-e (caddr (syntax-e h))) (map syntax-e (cdddr (syntax-e h))) arg env)]
+        [('#%hole 'bend kind . data) (read-node e e (syntax-e kind) (map syntax->datum data) '() env)]
+        [('#%app (? hole? h) arg ...) (read-node e h (syntax-e (caddr (syntax-e h))) (map syntax->datum (cdddr (syntax-e h))) arg env)]
         [('#%app f arg ...) (apps e (r f) (map r arg))]
         [('lambda ((x _)) body)
          (let* ([i (fresh!)] [b (read-term body (bind x i env))])
@@ -356,7 +365,7 @@
                     (list 'let (map (lambda (q x v) (if (eq? q 'lone) (list x (s-of v)) (list (if (eq? q 'none) '- '+) x (s-of v))))
                                     (car data) x vs)
                           (s-of f))))])]
-        [(match) (bend-error e "a match is a body: a definition's, or a case's")]
+        [(match) (bend-error (surface e 'match) "expected a match only as a body, a definition's or a case's: a term splits with split")]
         [else (bend-error e "this is not a Bend term")])))
 
   ;; A body read back: a term, or (match (e ...) (((p ...) body) ...) s).
@@ -456,28 +465,42 @@
              #,@(map (lambda (c part) (fact (car part) (list 'ctr (car c) (cadr c) (strip-datum (caddr c)))))
                      cs (caddr parts))))]))
 
-  ;; (def (f [q x : A] ...) R body): f bound, then its type and body read.
-  ;; (def (f x ...) body): f's law filled.
+  ;; (def (f [q x : A] ...) R body): f bound, and its function declared,
+  ;; which #%linklet makes, then its type and body read. (def (f x ...)
+  ;; body): f's law filled, and its function declared. A function's body is
+  ;; a hole that names what it is the code of; its name, which the facts
+  ;; about f hold, is how code calls it (spec 6.7).
   (define (bend-def stx)
     (syntax-match stx
-      [(_ ((? identifier? f) (? identifier? x) ...) body) #`(fill-info #,stx)]
+      [(_ ((? identifier? f) (? identifier? x) ...) body)
+       (let ([code (datum->syntax #'here (syntax-e f))])
+         #`(begin (func (#,code) -> eqref (#%hole bend code #,f)) (fill-info #,stx #,code)))]
       [(_ ((? identifier? f) b ...) R body)
-       #`(begin (define-syntax #,f (name-transformer 'ref)) (def-info #,stx))]
+       (let ([code (datum->syntax #'here (syntax-e f))])
+         #`(begin (define-syntax #,f (name-transformer 'ref))
+                  (func (#,code) -> eqref (#%hole bend code #,f))
+                  (def-info #,stx #,code)))]
       [_ (bend-error stx "expected (def (f [q x : A] ...) R body), or (def (f x ...) body) to fill a law")]))
 
   (define (def-specs b) (map (lambda (b) (or (bind-spec b) (bend-error b "expected a parameter: [q x : A]"))) b))
 
-  ;; (def-info form), (law-info form), (fill-info form): the forms'
-  ;; second steps.
+  ;; The names of the functions of this module's definitions, by the
+  ;; definitions' names.
+  (define own-codes (make-hasheq))
+
+  ;; (def-info form code), (law-info form), (fill-info form code): the
+  ;; forms' second steps, code a definition's function.
   (define (def-info stx)
-    (let ([form (cadr (syntax->list stx))])
+    (let ([form (cadr (syntax->list stx))] [code (k:identifier-name (caddr (syntax->list stx)))])
       (syntax-match form
         [(_ (f b ...) R body)
          (let* ([specs (def-specs b)]
                 [T (read-type (arrow specs R))]
-                [v (read-value (map cadr specs) body)])
-           (record! (list 'def (k:identifier-name f) (length specs) T v form))
-           (fact f (list 'def (length specs) (strip-datum T) (strip-datum v))))])))
+                [v (read-value (map cadr specs) body)]
+                [name (k:identifier-name f)])
+           (hash-set! own-codes name code)
+           (record! (list 'def name (length specs) T v form))
+           (fact f (list 'def (length specs) (strip-datum T) (strip-datum v) code)))])))
 
   (define (bend-law stx)
     (syntax-match stx
@@ -491,32 +514,66 @@
         [(_ (f b ...) R)
          (let* ([specs (def-specs b)] [T (read-type (arrow specs R))])
            (record! (list 'def (k:identifier-name f) (length specs) T #f form))
-           (fact f (list 'def (length specs) (strip-datum T) #f)))])))
+           (fact f (list 'def (length specs) (strip-datum T) #f #f)))])))
 
   (define (fill-info stx)
-    (let ([form (cadr (syntax->list stx))])
+    (let ([form (cadr (syntax->list stx))] [code (k:identifier-name (caddr (syntax->list stx)))])
       (syntax-match form
         [(_ (f x ...) body)
          (unless (and (eq? (identifier-binding-kind f) 'macro) (syntax-match (local-expand f) [('#%hole 'bend 'ref _) #t] [_ #f]))
            (bend-error f "~a is not a law to fill" (syntax-e f)))
-         (let ([v (read-value x body)])
-           (record! (list 'fill (k:identifier-name f) v form))
-           (fact f (list 'fill (strip-datum v))))])))
+         (let ([v (read-value x body)] [name (k:identifier-name f)])
+           (hash-set! own-codes name code)
+           (record! (list 'fill name v form))
+           (fact f (list 'fill (strip-datum v) code)))])))
 
   ;; ---- #%linklet ----
 
-  ;; A module's definitions validated, in order (core.sub); its forms
-  ;; left as they are. Each definition recorded a fact about its name, and
-  ;; the module's facts come last (spec 6.6), so the last about one of its
-  ;; names says which module this is.
+  ;; A module's definitions validated, in order (core.sub), and made code
+  ;; (lower.sub): each definition's function takes the place of the one it
+  ;; declared, and the forms they need come first. Each definition
+  ;; recorded a fact about its name, and the module's facts come last (spec
+  ;; 6.6), so the last about one of its names says which module this is.
   (define (bend-linklet stx)
     (syntax-match stx
       [(_ 'module form ...)
-       (unless (null? defined-here)
-         (let ([here (car (last (k:syntax-local-facts (k:name-identifier (cadr (car defined-here))))))])
-           (validate! (lambda (name) (lookup name here)) (reverse defined-here))))
-       form]
+       (if (null? defined-here)
+           form
+           (let* ([here (car (last (k:syntax-local-facts (k:name-identifier (cadr (car defined-here))))))]
+                  [checked (validate! (lambda (name) (lookup name here)) (reverse defined-here))]
+                  [codes (declared-codes form)]
+                  [at (lambda (k) (last (findf (lambda (ev) (and (memq (car ev) '(def fill)) (eq? (cadr ev) k))) defined-here)))]
+                  [defs (map (lambda (d) (append d (list (cdr (assq (car d) codes)) (at (car d))))) (cdr checked))]
+                  [main (findf (lambda (d) (equal? (short (car d)) "main")) (cdr checked))]
+                  [out (lower-module (car checked) defs code-of
+                                     (and main (list (car main) (cadr main) (caddr main) (at (car main)))))]
+                  [funcs (map (lambda (d f) (cons (list-ref d 4) f)) defs (cdr out))])
+             (append (map (lambda (x) (datum->syntax #'here x)) (car out))
+                     (map (lambda (f)
+                            (let ([code (declared-code f)])
+                              (if code (datum->syntax #'here (cdr (assq (cdr code) funcs))) f)))
+                          form))))]
       [(_ _ form ...) form]))
+
+  ;; A function a definition declared, (func (id) -> eqref (#%hole bend code
+  ;; f)), as (name . id), name the definition's; or #f.
+  (define (declared-code form)
+    (syntax-match form
+      [('func (id) '-> 'eqref ('#%hole 'bend 'code f)) (cons (k:identifier-name f) id)]
+      [_ #f]))
+
+  (define (declared-codes forms) (filter (lambda (x) x) (map declared-code forms)))
+
+  ;; The function of definition name, an identifier as #%linklet sees it
+  ;; (spec 2.3), so that its output means the definition's.
+  (define (code-of name)
+    (k:syntax-local-introduce
+     (k:name-identifier (or (hash-ref own-codes name #f) (hash-ref codes name #f)
+                            (raise-syntax-error 'bend (format "~a has no code" (short name)) #f)))))
+
+  ;; The names of the functions of other modules' definitions, as lookup
+  ;; found them.
+  (define codes (make-hasheq))
 
   ;; What the modules this one requires say of name, from the facts about
   ;; it: its definition's information, a law's filled by a fill if one is.
@@ -526,7 +583,10 @@
            [info (findf (lambda (d) (memq (car d) '(adt ctr def))) data)]
            [fill (findf (lambda (d) (eq? (car d) 'fill)) data)])
       (cond [(not info) #f]
-            [(and fill (eq? (car info) 'def) (not (cadddr info))) (list 'def (cadr info) (caddr info) (cadr fill))]
+            [(eq? (car info) 'def)
+             (let ([v (or (cadddr info) (and fill (cadr fill)))] [code (or (list-ref info 4) (and fill (caddr fill)))])
+               (when code (hash-set! codes name code))
+               (list 'def (cadr info) (caddr info) v))]
             [else info]))))
 
 (define-syntax bend-type bend-type)
