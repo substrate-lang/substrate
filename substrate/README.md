@@ -22,7 +22,7 @@ line says the same.
 | `compiler/` | the compiler, written in Substrate: reader, expander, kernel compiler, wasm encoder. It compiles itself (spec 1.4). And the kernel module (`kernel.sub`, in kernel code): the data of every language and the functions macros use on it, which the compiler carries into the programs that use them | permanent, grows |
 | `lib/` | libraries, which programs use, the compiler among them: Substrate (`substrate.sub`, written in Substrate on its core in kernel code, `substrate-core.sub`), the language built on the kernel; and printing for programs without GC (`print.sub`) | permanent, grows |
 | `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.imports`) and any modules it requires in `NAME/`; checked by `make check` | grows |
-| `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.imports` (what the compiled phase-0 linklet may import). `tests/fixtures/` holds modules the tests require | grows |
+| `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error), and `.imports` (what the compiled phase-0 linklet may import). `tests/fixtures/` holds modules the tests require, and a directory such as `tests/bend/` holds a language's tests, with fixtures of their own | grows |
 | `seed/` | the compiler, built by itself: what builds the compiler's source (spec 1.4) | permanent, replaced as the compiler grows |
 | `bin/sub` | runs the compiler written in Substrate (`build/sub`) | permanent |
 
@@ -145,6 +145,12 @@ fills. Its `#%linklet` then makes each definition a function
 (`lower.sub`), with every value an `eqref`: a datatype a recursion group
 of structs, one per constructor, a function value a closure, and what is
 erased, types, proofs' rewrites and binders of quantity `-`, left out.
+A def whose first parameters are `~` is a template, as in Bend: an
+application gives it closed template arguments first, and is of its
+instance at them, a definition of its own, made by putting them for its
+parameters, so a function argument is called directly, or put in place
+if it is a lambda. A module shares the instances that the modules it
+requires made.
 Kernel code calls a definition directly, with its live arguments, and
 `(print e)` writes a term's value; the example's `main` is kernel code,
 as the others' are.

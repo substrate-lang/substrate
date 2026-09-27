@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Lifecycle: test harness.
 #
-# Build every tests/*.sub and examples/*.sub with bin/sub build and run it
-# with a host, build/subhost unless HOST names another (host/subhost.mjs
-# runs programs on Node's V8); the output checked is the build's, then the
-# run's.
+# Build every tests/*.sub, the programs of each directory in tests, such
+# as tests/bend, all but fixtures, and examples/*.sub, with bin/sub build,
+# and run it with a host, build/subhost unless HOST names another
+# (host/subhost.mjs runs programs on Node's V8); the output checked is the
+# build's, then the run's.
 # Next to each file:
 #   NAME.out      expected output of a successful run
 #   NAME.err      a line that must appear in the output of a failing run
@@ -52,9 +53,15 @@ mkdir -p build/tests/compiled
    -m "$root/build/tests/compiled/geometry.subc" > /dev/null) ||
   { echo "FAIL building tests/fixtures/geometry.sub as a compiled file"; exit 1; }
 
+# The programs, and the directories they are in: tests/, the directories
+# in it but fixtures, which hold the modules tests require, and examples/.
+programs=(tests/*.sub)
+for d in tests/*/; do [ "$d" = tests/fixtures/ ] || programs+=("$d"*.sub); done
+programs+=(examples/*.sub)
+
 pass=0
 fail=0
-for t in tests/*.sub examples/*.sub; do
+for t in "${programs[@]}"; do
   dir="$(dirname "$t")"
   name="$(basename "$t" .sub)"
   base="$dir/$name"
@@ -108,7 +115,7 @@ done
 # The cache (spec 3.7): every program built again, its modules loaded
 # from the cache, is byte for byte what the first build wrote.
 again=0
-for t in tests/*.sub examples/*.sub; do
+for t in "${programs[@]}"; do
   dir="$(dirname "$t")"
   name="$(basename "$t" .sub)"
   program="$builds/$dir/$name"

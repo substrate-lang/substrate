@@ -14,6 +14,8 @@
 ;;                                           type, and stuck until
 ;;   (def (f x ...) body)                    fills it, here or in a module
 ;;                                           that requires this one
+;;   (def (f [~ t : A] ... [q x : A] ...) R body)
+;;                                           a template (below)
 ;;
 ;; A binder's quantity q is -, erased, + for many uses, or nothing for one.
 ;; A body is a term or (match x ... [(pattern ...) body] ...), whose
@@ -110,12 +112,14 @@
        (foldr (lambda (x t) #`(lambda (#,(binder x)) #,t)) t x)]
       [_ (bend-error stx "expected (fn (x ...) t)")]))
 
-  ;; A binder written [q x : A], q - or +, or [x : A]: (q x A).
+  ;; A binder written [q x : A], q - or +, or [x : A]: (q x A). A def's
+  ;; parameter may also be [~ x : A], a template's (q template).
   (define (bind-spec b)
     (syntax-match b
       [((? identifier? x) ': A) (list 'lone x A)]
       [('- (? identifier? x) ': A) (list 'none x A)]
       [('+ (? identifier? x) ': A) (list 'many x A)]
+      [('~ (? identifier? x) ': A) (list 'template x A)]
       [_ #f]))
 
   ;; A parameter of a datatype: a binder, or x alone, an erased Quant.
@@ -140,6 +144,8 @@
 
   (define (arrow specs B)
     (foldr (lambda (spec B)
+             (when (eq? (car spec) 'template)
+               (bend-error (cadr spec) "expected ~~ only on a def's first parameters, which make it a template"))
              #`(#%app #,(node 'all (car spec)) #,(caddr spec) (lambda (#,(binder (cadr spec))) #,B)))
            B specs))
 
@@ -330,7 +336,8 @@
            [xs (lambda () (map r args))]
            [node (lambda (d s) (append d (list (surface e s))))])
       (case kind
-        [(ref) (apps e (list 'ref (car data) (surface h (short-name (car data)))) (xs))]
+        [(ref tmpl) (when (eq? kind 'tmpl) (set! template-read #t))
+                    (apps e (list 'ref (car data) (surface h (short-name (car data)))) (xs))]
         [(adt) (let ([ts (xs)] [k (car data)])
                  (if (and (null? ts) (> (cadr data) 0))
                      (list 'ref k (surface e (short-name k)))
@@ -412,12 +419,16 @@
   (define (record! event) (set! defined-here (cons event defined-here)))
 
   ;; Type syntax T, expanded and read back.
-  (define (read-type T) (set! next 0) (read-term (local-expand T) '()))
+  (define (read-type T) (set! next 0) (set! template-read #f) (read-term (local-expand T) '()))
+
+  ;; Whether the term read last applies a template.
+  (define template-read #f)
 
   ;; A definition's value from its parameters xs and its body: the body,
   ;; the parameters bound, expanded, read back and flattened.
   (define (read-value xs body)
     (set! next 0)
+    (set! template-read #f)
     (syntax-match (local-expand #`(lambda (#,@(map binder xs)) #,body))
       [('lambda ((x _) ...) b)
        (let* ([is (map (lambda (x) (fresh!)) x)]
@@ -458,9 +469,9 @@
        (let* ([parts (type-parts form)] [d (car (car parts))] [ps (cdr (car parts))]
               [n (length ps)]
               [g (leading-quantities ps)]
-              [T (read-type (arrow ps (cadr parts)))]
+              [T (resolve (read-type (arrow ps (cadr parts))) form)]
               [tip (if (null? ps) d #`(#%app #,d #,@(map cadr ps)))]
-              [cs (map (lambda (c) (list (k:identifier-name (car c)) (length (cdr c)) (read-type (arrow (append ps (cdr c)) tip))))
+              [cs (map (lambda (c) (list (k:identifier-name (car c)) (length (cdr c)) (resolve (read-type (arrow (append ps (cdr c)) tip)) form)))
                        (caddr parts))])
          (record! (list 'adt (k:identifier-name d) n g T cs form))
          #`(begin
@@ -479,13 +490,24 @@
        (let ([code (datum->syntax #'here (syntax-e f))])
          #`(begin (func (#,code) -> eqref (#%hole bend code #,f)) (fill-info #,stx #,code)))]
       [(_ ((? identifier? f) b ...) R body)
-       (let ([code (datum->syntax #'here (syntax-e f))])
-         #`(begin (define-syntax #,f (name-transformer 'ref))
-                  (func (#,code) -> eqref (#%hole bend code #,f))
-                  (def-info #,stx #,code)))]
+       (let ([code (datum->syntax #'here (syntax-e f))] [m (leading-templates (def-specs b))])
+         (if (> m 0)
+             #`(begin (define-syntax #,f (name-transformer 'tmpl #,(datum m))) (template-info #,stx))
+             #`(begin (define-syntax #,f (name-transformer 'ref))
+                      (func (#,code) -> eqref (#%hole bend code #,f))
+                      (def-info #,stx #,code))))]
       [_ (bend-error stx "expected (def (f [q x : A] ...) R body), or (def (f x ...) body) to fill a law")]))
 
   (define (def-specs b) (map (lambda (b) (or (bind-spec b) (bend-error b "expected a parameter: [q x : A]"))) b))
+
+  ;; How many of a def's parameters, from the first, are a template's; and
+  ;; its parameters with each ~ erased, as a ~ after the first is, as in
+  ;; Bend.
+  (define (leading-templates specs)
+    (let loop ([ps specs] [m 0]) (if (and (pair? ps) (eq? (car (car ps)) 'template)) (loop (cdr ps) (+ m 1)) m)))
+
+  (define (erase-templates specs)
+    (map (lambda (s) (if (eq? (car s) 'template) (cons 'none (cdr s)) s)) specs))
 
   ;; The names of the functions of this module's definitions, by the
   ;; definitions' names.
@@ -497,9 +519,9 @@
     (let ([form (cadr (syntax->list stx))] [code (k:identifier-name (caddr (syntax->list stx)))])
       (syntax-match form
         [(_ (f b ...) R body)
-         (let* ([specs (def-specs b)]
-                [T (read-type (arrow specs R))]
-                [v (read-value (map cadr specs) body)]
+         (let* ([specs (erase-templates (def-specs b))]
+                [T (resolve (read-type (arrow specs R)) form)]
+                [v (resolve (read-value (map cadr specs) body) form)]
                 [name (k:identifier-name f)])
            (hash-set! own-codes name code)
            (record! (list 'def name (length specs) T v form))
@@ -515,7 +537,7 @@
     (let ([form (cadr (syntax->list stx))])
       (syntax-match form
         [(_ (f b ...) R)
-         (let* ([specs (def-specs b)] [T (read-type (arrow specs R))])
+         (let* ([specs (def-specs b)] [T (resolve (read-type (arrow specs R)) form)])
            (record! (list 'def (k:identifier-name f) (length specs) T #f form))
            (fact f (list 'def (length specs) (strip-datum T) #f #f)))])))
 
@@ -525,10 +547,115 @@
         [(_ (f x ...) body)
          (unless (and (eq? (identifier-binding-kind f) 'macro) (syntax-match (local-expand f) [('#%hole 'bend 'ref _) #t] [_ #f]))
            (bend-error f "~a is not a law to fill" (syntax-e f)))
-         (let ([v (read-value x body)] [name (k:identifier-name f)])
+         (let ([v (resolve (read-value x body) form)] [name (k:identifier-name f)])
            (hash-set! own-codes name code)
            (record! (list 'fill name v form))
            (fact f (list 'fill (strip-datum v) code)))])))
+
+  ;; ---- templates ----
+  ;;
+  ;; A def whose first parameters are [~ x : A] is a template, as in Bend:
+  ;; not a definition, which is checked and compiled, but its instances
+  ;; are, each a definition of the rest of its parameters. An application
+  ;; of a template gives it its template arguments first, closed terms;
+  ;; its instance at them is the template's type and value with them put
+  ;; for its template parameters, and it is shared by every application at
+  ;; the same arguments: an instance's own recursion reaches it. A lambda
+  ;; argument applied in the template is put in place, as Bend puts it, so
+  ;; the instance calls no closure. A template is read, and kept, as data, with
+  ;; the applications of templates in it left for its instances. An
+  ;; instance is a definition of its own, its function, whose name is its
+  ;; name: a fact about it holds it, as for a def, and a fact about the
+  ;; template names it, so a module that requires this one uses it too.
+
+  ;; This module's templates, and those found in facts, by name: (m n T v
+  ;; where), m template parameters of n; or #f for other names.
+  (define templates (make-hasheq))
+
+  (define (template-info stx)
+    (let ([form (cadr (syntax->list stx))])
+      (syntax-match form
+        [(_ (f b ...) R body)
+         (let* ([specs (def-specs b)] [m (leading-templates specs)] [specs (erase-templates specs)]
+                [T (read-type (arrow specs R))]
+                [v (read-value (map cadr specs) body)])
+           (hash-set! templates (k:identifier-name f) (list m (length specs) T v form))
+           (fact f (list 'template m (length specs) (strip-datum T) (strip-datum v))))])))
+
+  (define (template-of k)
+    (let ([t (hash-ref templates k 'unknown)])
+      (if (eq? t 'unknown)
+          (let* ([d (findf (lambda (d) (eq? (car d) 'template)) (fact-data k))]
+                 [t (and d (append (cdr d) (list #f)))])
+            (hash-set! templates k t)
+            t)
+          t)))
+
+  (define (fact-data k) (map (lambda (f) (syntax->datum (caddr f))) (k:syntax-local-facts (k:name-identifier k))))
+
+  ;; Term d, as data, each application of a template made one of its
+  ;; instance; at locates errors. A term just read that applies none is as
+  ;; it is.
+  (define (resolve d at) (if template-read (resolve-calls d at) d))
+
+  (define (resolve-calls d at)
+    (rewrite-calls d (lambda (k xs s)
+                       (let ([t (template-of k)])
+                         (and t (template-call k t xs (or s at) at))))))
+
+  (define (template-call k t xs s at)
+    (let ([m (car t)])
+      (when (< (length xs) m)
+        (bend-error s "expected ~a applied to its ~a template argument~a first" (short k) m (if (= m 1) "" "s")))
+      (let ([args (take xs m)])
+        (for-each (lambda (x)
+                    (unless (closed? x)
+                      (bend-error s "expected closed template arguments to ~a: this one uses a local variable, which only a run-time argument can" (short k))))
+                  args)
+        (cons (instance k t args at) m))))
+
+  ;; The instances made, by (template . key), as names, and how many each
+  ;; template has here.
+  (define instances (make-hash))
+  (define counts (make-hasheq))
+
+  (define (instance k t args at)
+    (let ([key (cons k (map term-key args))])
+      (or (hash-ref instances key #f)
+          (hash-ref (required-instances k) key #f)
+          (make-instance k t args key at))))
+
+  ;; The instances of template k that modules this one requires made, as
+  ;; facts about it say, read once: made here, one is in instances.
+  (define required (make-hasheq))
+  (define (required-instances k)
+    (or (hash-ref required k #f)
+        (let ([is (make-hash)])
+          (for-each (lambda (d) (when (eq? (car d) 'instance) (hash-set! is (cadr d) (caddr d)))) (fact-data k))
+          (hash-set! required k is)
+          is)))
+
+  ;; A new instance, k~n: its function declared, which #%linklet makes, and
+  ;; its definition recorded after those of the instances it applies.
+  (define (make-instance k t args key at)
+    (when (> (datum-size key) 512)
+      (bend-error at "expected the template arguments of ~a to stop growing: each call makes an instance" (short k)))
+    (let* ([n (hash-ref counts k 0)]
+           [id (datum->syntax #'here (string->symbol (format "~a~~~a" (short k) n)))]
+           [where (or (list-ref t 4) at)])
+      (hash-set! counts k (+ n 1))
+      (syntax-local-lift-definition #`(func (#,id) -> eqref (#%hole bend code #,id)))
+      (let ([name (k:identifier-name (k:syntax-local-introduce id))] [T (term-instantiate (caddr t) args)] [v (term-instantiate (cadddr t) args)])
+        (unless (and T v) (bend-error where "expected ~a's template parameters to be its first, and not matched" (short k)))
+        (hash-set! instances key name)
+        (hash-set! own-codes name name)
+        (let ([T (resolve-calls T where)] [v (resolve-calls v where)] [n (- (cadr t) (car t))])
+          (record! (list 'def name n T v where))
+          (syntax-local-lift-definition (fact id (list 'def n (strip-datum T) (strip-datum v) name)))
+          (syntax-local-lift-definition (fact (k:syntax-local-introduce (k:name-identifier k)) (list 'instance key name)))
+          name))))
+
+  (define (datum-size d) (if (pair? d) (+ 1 (datum-size (car d)) (datum-size (cdr d))) 0))
 
   ;; ---- print ----
 
@@ -542,7 +669,8 @@
     (syntax-match stx
       [(_ e)
        (set! next 0)
-       (let ([t (read-term (local-expand e) '())])
+       (set! template-read #f)
+       (let ([t (resolve (read-term (local-expand e) '()) stx)])
          (set! prints (cons (list t stx) prints))
          (node 'print (- (length prints) 1)))]
       [_ (bend-error stx "expected (print e)")]))
@@ -634,6 +762,7 @@
 (define-syntax bend-def bend-def)
 (define-syntax def-info def-info)
 (define-syntax fill-info fill-info)
+(define-syntax template-info template-info)
 (define-syntax bend-law bend-law)
 (define-syntax law-info law-info)
 (define-syntax bend-match bend-match)
