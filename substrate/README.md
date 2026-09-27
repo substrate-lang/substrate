@@ -144,7 +144,9 @@ declares a definition that a later one, in any module that requires it,
 fills. Its `#%linklet` then makes each definition a function
 (`lower.sub`), with every value an `eqref`: a datatype a recursion group
 of structs, one per constructor, a function value a closure, and what is
-erased, types, proofs' rewrites and binders of quantity `-`, left out. A
-module that defines `main` is a program that writes `main`'s value.
+erased, types, proofs' rewrites and binders of quantity `-`, left out.
+Kernel code calls a definition directly, with its live arguments, and
+`(print e)` writes a term's value; the example's `main` is kernel code,
+as the others' are.
 
 Open questions are in `docs/spec.md` section 7.
