@@ -164,7 +164,7 @@ marked with another type, such as `n:i32`.
 | atoms | `(fixnum n:i32)`, `(fixnum-value v) -> i32`, `(fixnum? v) -> i32`, `(integer n:i64)`, `(integer? v) -> i32`, `(integer-value v) -> i64`, `(integer-negative? v) -> i32`, `(flonum x:f64)`, `(flonum? v) -> i32`, `(flonum-value v) -> f64`, `(char? v) -> i32`, `(char->integer c) -> i32`, `(integer->char n:i32)`, `(boolean? v) -> i32`, `(null? v) -> i32` |
 | lists | `(cons a d)`, `(car p)`, `(cdr p)`, `cadr`, `cddr`, `caddr`, `cdddr`, `(unsafe-car p)`, `(unsafe-cdr p)`, `(pair? v) -> i32`, `(list? v) -> i32`, `(length l) -> i32`, `(append a b)`, `(reverse l)` |
 | strings and symbols | `(string? v) -> i32`, `(string-length s) -> i32`, `(string-byte s i:i32) -> i32`, `(string=? a b) -> i32`, `(string-append a b)`, `(make-string-builder)`, `(string-builder-add-byte! b byte:i32)`, `(string-builder-add! b s start:i32 end:i32)`, `(string-builder->string b)` (a new string, or `#f`), `(symbol? v) -> i32`, `(symbol->string s)`, `(string->symbol s)`, `(symbol-append a b)`, `(symbol-hash s) -> i32`, `(keyword? v) -> i32`, `(string->keyword s)`, `(keyword->string k)` |
-| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`) |
+| syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`), `(syntax-source s)`, `(syntax-line s)`, `(syntax-column s)` (where `s` is: its file as errors name it, its line from 1 and its column from 0, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)`, `(transformer? v) -> i32`, `(transformer-env t)` |
 | exceptions | the tag `exn`, whose exceptions carry one `eqref`; `(raise-syntax-error name message stx)` (throws a syntax error), `(syntax-error? v) -> i32`, `(syntax-error-message e)`, `(syntax-error-syntax e)` (the syntax it blames, or `#f`) |
 | queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)` |
@@ -444,8 +444,10 @@ module less the previous entry's (the first's, less 0), `file` an index
 into the files, `line` from 1, `col` from 0, and a `line` of 0 means no
 location. An instruction's location is the last entry's at or before its
 offset. Entries are made only where an instruction that can call or trap
-starts at a new location, and at each function's first instruction, since
-those are where a backtrace's frames are. A function that made a tail call
+starts at a new location, and at the start of each function's body, with
+the function's own location, since those are where a backtrace's frames
+are: an engine reports a frame that overflowed the stack as it entered
+the function at the body's start. A function that made a tail call
 has no frame left to show.
 
 The location of code is that of the syntax it was compiled from, with two
@@ -453,9 +455,10 @@ exceptions for code a macro from another file introduced, whose own
 location is in that macro's file. Such code takes the location of the
 nearest enclosing code of the linklet's own file, if there is one; and a
 macro's output whose outermost syntax object comes from another file than
-the use takes the use's location (6.2). So what a library's macro expands
-to is located where the macro was used. The code of an inline function
-(5.2) takes the location of the call it is inlined at.
+the use takes the use's location, as does each form of a module-level
+`begin` that is such output (6.2). So what a library's macro expands to
+is located where the macro was used. The code of an inline function (5.2)
+takes the location of the call it is inlined at.
 
 A file is named canonically, as Racket names a module, and its name
 names the module in it (3.2). The compiler runs from the **package
@@ -962,8 +965,10 @@ reference is an error.
 - Core bindings have the scope set `{0}`, which every module body carries.
   A module's own definitions have more scopes, so they shadow core names.
 - A module-level definition of a name that is already defined with the same
-  scope set at the same phase is an error. So is a reference whose best
-  candidates have identical scope sets but different meanings.
+  scope set at the same phase is an error, and so is a local binding form
+  that binds one name twice, reported where it binds it again. So is a
+  reference whose best candidates have identical scope sets but different
+  meanings.
 - **Bindings outlive a module's compilation.** The binding table and scope
   ids last for the whole compiler run. A macro's template identifiers carry
   its module's scopes, so they keep resolving to its module's bindings,
@@ -1029,7 +1034,9 @@ identifier with the scopes of the use, as if the user had written it.
 **Output takes the use's location.** If the outermost syntax object of a
 macro's output comes from another file than the use, as a library macro's
 template does, it takes the use's source location, so errors in it and
-code compiled from it are located where the macro was used (3.6).
+code compiled from it are located where the macro was used (3.6). The
+forms of a module-level `begin` are spliced, each of them output too:
+each that comes from another file than the `begin` takes its location.
 
 **Literals drop local scopes.** `quote-syntax` and the constant parts of
 `quasisyntax` remove from their literal the scopes of local binding forms
