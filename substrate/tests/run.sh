@@ -145,5 +145,19 @@ else
   fail=$((fail + 1))
   echo "FAIL a changed module's cache entry: built $first, then $second"
 fi
+# A file has one name however a require spells it (spec 3.6): required by
+# its absolute path and by a relative one, it is one module, one counter.
+canonical=build/tests/canonical
+rm -rf "$canonical"
+mkdir -p "$canonical"
+printf '(require print "../../../lib/print.sub" write-int newline)\n(require a "%s")\n(require b "%s")\n(func (main) (write-int (a:bump)) (newline) (write-int (b:bump)) (newline))\n' \
+  "$root/tests/fixtures/twin-a/counter.sub" "../../../tests/fixtures/twin-a/counter.sub" > "$canonical/main.sub"
+actual="$("$compiler" build "$canonical/main.sub" -o "$canonical/main" 2>&1 && "$host" "$root/$canonical/main" 2>&1)"
+if [ "$actual" = "$(printf '1\n2')" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a file required by two spellings: $actual"
+fi
 echo "$pass passed, $fail failed; $again programs rebuilt from the cache"
 [ $fail -eq 0 ]

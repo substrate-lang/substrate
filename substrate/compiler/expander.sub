@@ -35,7 +35,7 @@
 (require host "host.sub" export-index call-getter scope-map-new scope-map-add scope-map-clear error-string read-data)
 (require ser "serialize.sub" make-serializer serialize! serializer-bytes)
 
-(provide report-trap set-repository-root! set-cache-directory! compile-module-file module-linklet-list
+(provide report-trap set-repository-root! set-package-root! set-cache-directory! compile-module-file module-linklet-list
          module-expanded-forms keep-expanded-forms! target-kernel-bytes target-kernel-interface compiled-file-bytes program-linklets register-queries!)
 
 (import %call-transformer "kernel" "%call-transformer" (eqref eqref -> eqref))
@@ -380,11 +380,11 @@
          [d (and ds (car ds))])
     (and d (eqv? (section d 'format) interface-format) (equal? (section d 'kernel) kernel)
          (let ([requires (section d 'requires)])                     ; each (path hash shift)
-           (and (string=? (module-hash (file->string path) (map cdr requires)) hash)
+           (and (string=? (module-hash path (file->string path) (map cdr requires)) hash)
                 (begin
                   (hash-set! registry path (new-unit path hash))    ; a cycle through the requires is an error, as when compiling
                   (cond [(andmap (lambda (r) (string=? (unit-hash (module-of (car r))) (cadr r))) requires)
-                         (let ([m (or (hash-ref units-by-hash hash #f)          ; another file that is this module (spec 3.2)
+                         (let ([m (or (hash-ref units-by-hash hash #f)          ; brought by a compiled file (3.7)
                                       (load-compiled-module d path))])
                            (hash-set! registry path m)
                            m)]
@@ -708,11 +708,8 @@
       (kernel-unit target-kernel)
       (let ([r (linklet-ref name)]) (and r (car r)))))
 
-;; Is instance one of module m's linklets? Two files that are one module
-;; (spec 3.2) have one set of instance names, so m is known by its hash.
-(define (own-instance? m instance)
-  (let ([u (and instance (instance-unit instance))])
-    (and u (string=? (unit-hash u) (unit-hash m)))))
+;; Is instance one of module m's linklets?
+(define (own-instance? m instance) (and instance (eq? (instance-unit instance) m)))
 
 ;; What linklet p's imports link to in st when it is instantiated at phase
 ;; shift t: an alist from each module name its code imports from to the
@@ -1038,25 +1035,37 @@
             [(= (string-utf-8-byte p i) 47) (loop (+ i 1) (+ i 1) (cons (substring/utf-8 p start i) acc))]
             [else (loop (+ i 1) start acc)]))))
 
-;; p with its . and .. segments resolved: the name of the module in it,
-;; which its source locations carry (spec 3.6). Relative paths are
-;; relative to the working directory, the package root when bin/sub runs
-;; the compiler, and keep the .. segments that lead out of it.
-(define (normalize-path p)
-  (let* ([absolute? (and (> (string-utf-8-length p) 0) (= (string-utf-8-byte p 0) 47))]
-         [kept (foldl (lambda (seg acc)
-                        (cond [(or (string=? seg "") (string=? seg ".")) acc]
-                              [(string=? seg "..")
-                               (cond [(and (pair? acc) (not (string=? (car acc) ".."))) (cdr acc)]
-                                     [absolute? acc]
-                                     [else (cons seg acc)])]
-                              [else (cons seg acc)]))
-                      '() (path-segments p))])
-    (string-append (if absolute? "/" "")
-                   (let loop ([segs (reverse kept)])
-                     (cond [(null? segs) ""]
-                           [(null? (cdr segs)) (car segs)]
-                           [else (string-append (car segs) "/" (loop (cdr segs)))])))))
+;; The package root, an absolute path: the working directory, which
+;; module names are relative to (spec 3.6). bin/sub gives it with -p;
+;; otherwise it is the repository root.
+(define package-root #f)
+(define (set-package-root! dir) (set! package-root dir))
+
+(define (absolute-path? p) (and (> (string-utf-8-length p) 0) (= (string-utf-8-byte p 0) 47)))
+
+;; The name of the file at path p, which names the module in it and which
+;; its source locations carry (spec 3.6), as Racket names a module: p
+;; completed from the package root and its . and .. segments resolved,
+;; then relative to the package root if it is in it, and absolute if not.
+;; So a file has one name however a require spells it. Symbolic links are
+;; not resolved.
+(define (canonical-path p)
+  (let* ([root (resolve-segments (or package-root repository-root))]
+         [full (resolve-segments (if (absolute-path? p) p (string-append root "/" p)))]
+         [n (+ (string-utf-8-length root) 1)])
+    (if (and (> (string-utf-8-length full) n) (string=? (substring/utf-8 full 0 n) (string-append root "/")))
+        (substring/utf-8 full n)
+        full)))
+
+;; Absolute path p with its . and .. segments resolved.
+(define (resolve-segments p)
+  (let ([kept (foldl (lambda (seg acc)
+                       (cond [(or (string=? seg "") (string=? seg ".")) acc]
+                             [(string=? seg "..") (if (pair? acc) (cdr acc) acc)]
+                             [else (cons seg acc)]))
+                     '() (path-segments p))])
+    (let loop ([segs (reverse kept)])
+      (if (null? segs) "" (string-append "/" (car segs) (loop (cdr segs)))))))
 
 ;; The byte index of the last byte b in string s, or #f.
 (define (last-byte-index s b)
@@ -1089,17 +1098,18 @@
             (loop (+ n 1))
             (begin (hash-set! provisional-names name #t) name))))))
 
-;; The hash that is a module's identity once it is expanded: of its
-;; source text and the hashes of the modules it requires, at the phase
-;; shifts it requires them, each (hash shift) (spec 3.2). Modules with
-;; the same hash are the same module.
-(define (module-hash text requires)
-  (content-hash (cons text (apply append (map (lambda (r) (list (car r) (number->string (cadr r)))) requires)))))
+;; The hash that is a module's identity once it is expanded: of its path,
+;; which its source locations name (spec 3.6), its source text, and the
+;; hashes of the modules it requires, at the phase shifts it requires
+;; them, each (hash shift) (spec 3.2). Modules with the same hash are the
+;; same module, the same bytes.
+(define (module-hash path text requires)
+  (content-hash (cons path (cons text (apply append (map (lambda (r) (list (car r) (number->string (cadr r)))) requires))))))
 
 ;; Compile the module in file `source` (and, first, what it requires).
 ;; Returns the module. Each module is compiled once per run.
 (define (compile-module-file source)
-  (let* ([path (normalize-path source)]
+  (let* ([path (canonical-path source)]
          [known (hash-ref registry path #f)])
     (cond
       [(and known (eq? (unit-state known) 'done)) known]
@@ -1140,10 +1150,8 @@
     (append (if mem (list mem) '()) (if tbl (list tbl) '()))))
 
 ;; Run #%linklet over the expanded phase-0 code, resolve provides, and
-;; compile the linklets. Returns the module: the one already known by the
-;; name this one gets, if there is one, since two files that are one
-;; module (spec 3.2) have one set of linklets, the first's, whose source
-;; they name (3.6).
+;; compile the linklets. Returns the module: the one this run already has
+;; by its hash, if a compiled file brought it (spec 3.7), or else this one.
 (define (finish-module! c text)
   (let ([m (comp-module c)])
     (set-unit-expanded! m (apply-linklet-hook 'module (unit-expanded m)
@@ -1167,13 +1175,12 @@
     (set! removed-definitions #f)
     ;; Its requires known, the module takes its hash, and the name its
     ;; instance names start with: its stem and hash.
-    (set-unit-hash! m (module-hash text (map (lambda (r) (list (unit-hash (car r)) (cdr r))) (unit-requires m))))
+    (set-unit-hash! m (module-hash (unit-path m) text (map (lambda (r) (list (unit-hash (car r)) (cdr r))) (unit-requires m))))
     (set-unit-name! m (format "~a.~a" (file-stem (unit-path m)) (unit-hash m)))
-    (let ([known (hash-ref units-by-hash (unit-hash m) #f)])
-      (cond [known (store-index! m) known]
-            [else (hash-set! units-by-hash (unit-hash m) m)
-                  (compile-linklets! c)
-                  m]))))
+    (or (hash-ref units-by-hash (unit-hash m) #f)
+        (begin (hash-set! units-by-hash (unit-hash m) m)
+               (compile-linklets! c)
+               m))))
 
 ;; Compile each phase's linklet of the module c compiles, and its program;
 ;; check (freestanding); store it.
@@ -1939,9 +1946,7 @@
   (let* ([loc (stx-srcloc f)]
          [dir (if loc (directory-of (symbol->string (srcloc-source loc))) "")]
          [given (stx-e spec)])
-    (if (and (> (string-utf-8-length given) 0) (= (string-utf-8-byte given 0) 47))
-        given
-        (string-append dir given))))
+    (if (absolute-path? given) given (string-append dir given))))
 
 ;; Compile the module if needed and make its own bindings resolvable for
 ;; its macros. Returns what it provides, as seen from phase.
@@ -1951,7 +1956,7 @@
 ;; (require name (compiled file) item ...): the entry of the compiled
 ;; file, loaded with its requires (spec 3.7).
 (define (require-compiled! f name spec phase)
-  (require-unit! name (load-compiled-file (normalize-path (module-path-of f (cadr (stx-e spec))))) phase))
+  (require-unit! name (load-compiled-file (canonical-path (module-path-of f (cadr (stx-e spec))))) phase))
 
 ;; Module m, required as name at phase: recorded, its bindings made
 ;; resolvable for its macros; what it provides, as seen from phase.

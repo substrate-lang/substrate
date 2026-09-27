@@ -268,8 +268,7 @@ they trap.
 
 ### 3.1 Modules and linklets
 
-- One source file is one module, and two files with the same source,
-  requiring the same modules, are the same one (3.2). A module's code at
+- One source file is one module (3.2). A module's code at
   one phase compiles to one wasm module, called a **linklet**, as in
   Racket. Phase 0 is the
   program. Phase *n*+1 code runs while phase *n* is expanded, so a module's
@@ -333,14 +332,15 @@ they trap.
   a store of its own and gives each compilation a namespace in it
   (below), since macros share syntax objects with the compiler by
   reference.
-- A module is what it is: its identity is a hash of its source and of
-  the hashes of the modules it requires, at the phase shifts it requires
-  them (64-bit FNV-1a over those strings, each followed by a zero byte,
-  its top 48 bits in hexadecimal), and `<module>` is its file's stem and
-  that hash, such as `substrate-core.7bb8be1396e6`. So the hash does not
-  depend on the order modules are compiled in, or on where or what the
-  files are called, and two files with the same source and requires are
-  one module, whose instances they share.
+- A module is what it is: its identity is a hash of its path (3.6), its
+  source, and the hashes of the modules it requires, at the phase shifts
+  it requires them (64-bit FNV-1a over those strings, each followed by a
+  zero byte, its top 48 bits in hexadecimal), and `<module>` is its
+  file's stem and that hash, such as `substrate-core.7bb8be1396e6`. The
+  hash covers what its bytes depend on, since its source locations name
+  its path: two modules with one hash are the same bytes. So the hash
+  does not depend on the order modules are compiled in, or on where the
+  package is, and a file copied to another path is another module.
   While a module is expanded its compile-time linklets are named after
   its stem, since its requires are not known yet.
 - A module's linklet instantiated at phase shift *t* is registered as
@@ -456,13 +456,15 @@ the use takes the use's location (6.2). So what a library's macro expands
 to is located where the macro was used. The code of an inline function
 (5.2) takes the location of the call it is inlined at.
 
-A file is named by its path as the build gives it, `.` and `..` segments
-resolved, which is also what names the module in it. Paths are relative
-to the working directory (section 4), and `bin/sub` runs the compiler
-from the **package root**, the repository unless `-p DIR` names another,
-giving it the files relative to that root: so a module's bytes are the
-same wherever it is built from, and a module outside the package is
-named by an absolute path.
+A file is named canonically, as Racket names a module, and its name
+names the module in it (3.2). The compiler runs from the **package
+root**, the repository unless `-p DIR` names another, whose absolute
+path `bin/sub` gives it: a path is completed from that root and its `.`
+and `..` segments resolved, then named relative to the root if the file
+is in the package, and by its absolute path if not. So a file has one
+name however a `require` spells it, relative or absolute, and a module's
+bytes are the same wherever the package is. Symbolic links are not
+resolved: a file reached through one has another name.
 
 ### 3.7 The cache
 
@@ -513,9 +515,10 @@ kernel's bytes, for the compiler built next to embed (1.4).
   (3.5) or on where it was built from (3.6), a program built from cached
   modules is byte for byte the program a cold build writes: `make check`
   removes the cache, builds every test, then builds each again from the
-  cache and compares. Two files that are one module (3.2) have one set of
-  linklets, the first file's, whose source they name (3.6); the second is
-  expanded, for what its expansion does, and takes the first's. The cache
+  cache and compares. A module that a compiled file brought and a file
+  the run compiles can be one module, of one hash (3.2): the run keeps
+  the first it has, and expands the second for what its expansion does.
+  The cache
   holds one kernel's code, so it is neither read nor written while the
   running and target kernels differ (1.4); and a compiled module has the
   compiler's decisions in it, so `make build/sub` removes the cache when
