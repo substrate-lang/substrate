@@ -1238,7 +1238,8 @@ trait.
 
 A definition has a **name**, a symbol that is data: a language can keep
 it in a datum, such as a term or a type, compare it with `eq?`, hash it,
-and quote it, where an identifier, syntax, could not go.
+and quote it, where an identifier, syntax, could not go. The typed
+example's projections, types, name their trait so.
 
 - `(identifier-name id)` resolves `id` at the running macro's phase and
   gives the name of the definition it refers to: a module's function,
