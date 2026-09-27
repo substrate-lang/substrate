@@ -487,6 +487,13 @@ kernel's bytes, for the compiler built next to embed (1.4).
   compiled or loaded in order as they would be to compile the module,
   each have the recorded hash. So a require the source no longer has is
   not looked at, and none after the first that changed.
+- The cache knows what a module's expansion read only by its source and
+  its requires. Compile-time code can also read other files and the
+  command line through the host (section 4): a module whose expansion
+  depends on them is loaded as it was first compiled until its source or
+  a require changes, and `rm -rf build/cache` starts over. A module
+  loaded from the cache runs none of its compile-time code, so what that
+  code printed is not printed again.
 - An interface holds what compiled code refers to in the module and what
   other modules' expansions need: its provides, its module-level bindings
   with their scope sets and phases, its functions with their signatures,
