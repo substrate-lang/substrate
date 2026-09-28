@@ -1091,7 +1091,8 @@ form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)
        | (import id "module" "field" (type ... -> type ...)) | (import id "module" "field" id)
        | (type id def) | (rec (type id def) ...) | (data id offset "bytes" ...)
        | (tag id (type ...))
-       | (#%fact id datum)                    ; a fact about id's definition (6.6)
+       | (#%fact id (quote datum))            ; a fact about id's definition (6.6)
+       | (#%fact id (quote-syntax datum))
        | expr
 
 expr ::= id                                   ; a local or global variable, or a function
@@ -1208,12 +1209,14 @@ right-hand side's.
 
 ### 6.6 Facts
 
-`(#%fact id datum)`, a module-level form, records `datum`, as syntax and
-unevaluated, as a **fact** about the definition `id` refers to. It binds
-nothing. A language records facts where finding things by name will not
-do, as for the instances of a type class, which a use of the class finds
-without naming them: the typed example's `impl` is a fact about its
-trait.
+`(#%fact id 'datum)` and `(#%fact id #'stx)`, module-level forms, record
+`datum`, as data, or `stx`, as syntax, unevaluated, as a **fact** about
+the definition `id` refers to. They bind nothing. A language records
+facts where finding things by name will not do, as for the instances of
+a type class, which a use of the class finds without naming them: the
+typed example's `impl` is a fact about its trait, its syntax, which
+another module expands. Data can name definitions too (6.7), as the Bend
+example's facts do.
 
 - A fact is about a **definition**: a module's function, global, tag or
   compile-time value, made before the fact. Every identifier that
@@ -1224,18 +1227,18 @@ trait.
 - `(syntax-local-facts id)` returns the facts about `id`'s definition at
   the running macro's phase: those recorded so far by the module being
   expanded, and those of every module it requires, directly or not.
-  Each is `(module phase stx)`: the file of the module that recorded it,
-  the phase it recorded it at, and the syntax. A module's facts come
-  after those of every module it requires, in the order of its requires,
-  and each module's in the order it recorded them; a module required
-  more than once counts once for each phase shift. So a fact can
-  override one of a module its module requires, if the language that
-  reads them says so.
+  Each is `(module phase value)`: the file of the module that recorded
+  it, the phase it recorded it at, and the datum or syntax. A module's
+  facts come after those of every module it requires, in the order of
+  its requires, and each module's in the order it recorded them; a
+  module required more than once counts once for each phase shift. So a
+  fact can override one of a module its module requires, if the
+  language that reads them says so.
 - A module required at phase shift *s* has its facts at their phase
   plus *s*, as its bindings are (6.1).
-- The syntax of a fact is a compile-time value of the module's phase+1
-  linklet, fetched as `syntax-local-value` fetches one (6.3), and the
-  module's interface holds its facts (3.7).
+- A fact's datum or syntax is a compile-time value of the module's
+  phase+1 linklet, fetched as `syntax-local-value` fetches one (6.3),
+  and the module's interface holds its facts (3.7).
 - A fact is a claim a language made, not a checked one: a language that
   checks what facts say, such as a proof checker, derives it again.
 

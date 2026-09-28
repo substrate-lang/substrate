@@ -93,7 +93,8 @@ application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
 A macro can leave a hole, `(#%hole ...)`, for the language's `#%linklet`
 to fill once the unit is expanded, and the hook can expand more code and
 lift definitions while it fills them. A module can record facts about a
-definition, `(#%fact id datum)`, which every module that requires it,
+definition, a datum or syntax, `(#%fact id 'datum)` or `(#%fact id #'stx)`,
+which every module that requires it,
 directly or not, reads with `syntax-local-facts`: how a language finds
 what no name leads to.
 Modules `require` each other by name, with
