@@ -312,15 +312,20 @@ they trap.
     by definition or import, is an error.
 - Expansion must run phase-1 code before the module is finished: a macro
   works on the line after its definition. So while a module is expanded,
-  each `begin-for-syntax`, and each `define-syntax`, is compiled into a
-  linklet of its own and instantiated at once, in source order, as Racket
-  evaluates them. A `define-syntax` whose value is a `lambda`, or a
-  function it names, runs no code of its own, so those between the others
-  are compiled and run together, as one linklet, before anything can see
-  their values: at the first use of one, before the next compile-time
-  linklet, or at the end of the module. When the module is done, each
+  each `begin-for-syntax`, and each `define-syntax`, runs at once, in
+  source order, as Racket evaluates them. When the module is done, each
   phase's code is compiled again as a whole, into the module's linklet for
   that phase. Other modules only ever use those.
+- What running at once costs: the expander compiles only new code. A
+  value that needs none it makes itself: quoted data or syntax, a fact
+  (6.6), a transformer that calls a function `define-syntax` names (6.3),
+  and a call, on such values, of a function from values to a value that
+  is already instantiated. Other code is compiled into a linklet of its
+  own and instantiated. A `define-syntax` whose value is a `lambda` runs
+  no code of its own, so those between the others are compiled together,
+  as one linklet, before anything can see their values: at the first use
+  of one, before the next compile-time linklet, or at the end of the
+  module.
 
 ### 3.2 Stores and instance names
 
@@ -1051,8 +1056,8 @@ a local scope.
 
 ### 6.3 Compile-time bindings
 
-`(define-syntax s expr)` binds `s` at compile time: `expr` is compiled and
-run at phase+1 now, and `s` is bound to its value, an `eqref`, a
+`(define-syntax s expr)` binds `s` at compile time: `expr` is run at
+phase+1 now (3.1), and `s` is bound to its value, an `eqref`, a
 **compile-time value**.
 
 - If the value is a transformer (2.1), `s` is a macro. The expander checks

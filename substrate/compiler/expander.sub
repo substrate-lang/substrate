@@ -32,7 +32,7 @@
 (require cmp "compile.sub" compile-module set-syntax-lookup! set-syntax-types! set-current-source!)
 (require rd "reader.sub" read-file read-string-all)
 (require num "numbers.sub" content-hash)
-(require host "host.sub" export-index call-getter scope-map-new scope-map-add scope-map-clear error-string read-data)
+(require host "host.sub" export-index call-getter call-function indexed-transformer scope-map-new scope-map-add scope-map-clear error-string read-data)
 (require ser "serialize.sub" make-serializer serialize! serializer-bytes)
 
 (provide report-trap set-repository-root! set-package-root! set-cache-directory! compile-module-file module-linklet-list
@@ -2171,9 +2171,10 @@
 
 ;; The index in the host glue's table of function info, in st.
 (define (function-index st info)
-  (ensure-import! st (func-info-instance info) 0)
-  (or (export-index (ns-name st (func-info-instance info)) (func-info-export info))
-      (raise-compile-error #f "internal: no function ~a in ~a" (func-info-export info) (func-info-instance info))))
+  (let ([instance (func-info-instance info)])
+    (ensure-import! st instance 0)
+    (or (export-index (if (string=? instance "kernel") instance (ns-name st instance)) (func-info-export info))
+        (raise-compile-error #f "internal: no function ~a in ~a" (func-info-export info) instance))))
 
 ;; A compile-time value in st, from its getter function. Fetched when
 ;; first needed.
@@ -2200,18 +2201,20 @@
 ;; In (define-syntax name f), where f names a phase+1 function of type
 ;; (eqref) -> eqref, the value is a transformer that calls f. The value
 ;; lives in a global of the phase+1 linklet, computed when the linklet is
-;; instantiated. A unit whose value is made by a lambda, or by f, runs no
-;; code of its own, so it waits to run with others (defer-unit!); any
-;; other runs now, since its code can read the values of those before it.
+;; instantiated; while this module is expanded, it is computed now, and
+;; only new code is compiled for it (spec 3.1). A value that needs none,
+;; a transformer that calls f or what plain? accepts, the expander makes
+;; itself. One made by a lambda runs no code of its own, so it waits to
+;; be compiled with others (defer-unit!); any other is compiled and run
+;; now, since its code can read the values of those before it.
 (define (define-syntax! f phase)
   (syntax-match f
     [('define-syntax (? id? id) rhs)
      (let* ([m (and (id? rhs) (meaning-of rhs (+ phase 1)))]
             [base (symbol->string (stx-e id))]
             [name (string->symbol (string-append "__value." base))]
-            [adapter (and m (eq? (car m) 'func)
-                          (transformer-adapter (string->symbol (string-append "__transformer." base))
-                                               (syntax-function-of rhs phase "a transformer")))]
+            [function (and m (eq? (car m) 'func) (syntax-function-of rhs phase "a transformer"))]
+            [adapter (and function (transformer-adapter (string->symbol (string-append "__transformer." base)) function))]
             [expanded (and (not adapter) (expand-expr rhs (+ phase 1)))]
             [unit (if adapter
                       (list adapter)
@@ -2230,17 +2233,58 @@
             [forms (append (if adapter unit (take unit (- (length unit) 1)))
                            (list (list 'global global init)
                                  (list 'func getter '() (list 'gref global))))])
-       (if (or adapter (eq? (core-head expanded (+ phase 1)) 'lambda))
-           (defer-unit! forms (+ phase 1) f)
-           (run-compile-time-linklet! forms (+ phase 1) f))
+       (cond [(and function (callable? function 1))
+              (add-phase-forms! (+ phase 1) forms)
+              (made-value! getter (indexed-transformer (function-index (comp-store current) function)))]
+             [(and (not adapter) (null? (cdr unit)) (plain? init))
+              (add-phase-forms! (+ phase 1) forms)
+              (made-value! getter (plain-value init rhs))]
+             [(or adapter (eq? (core-head expanded (+ phase 1)) 'lambda)) (defer-unit! forms (+ phase 1) f)]
+             [else (run-compile-time-linklet! forms (+ phase 1) f)])
        (hash-set! macro-modules getter (comp-module current))
        (bind-definition! id phase (list 'compile-time-value getter)))]))
+
+;; ---- values the expander makes (spec 3.1) ----
+
+;; The compile-time value of getter, made by the expander: the getter,
+;; whose unit is not compiled until the module's linklet is, is never
+;; called in this compilation.
+(define (made-value! getter v) (hash-set! (cstore-values (comp-store current)) getter (list v)))
+
+;; Can the expander make the value of lowered expression e itself, with no
+;; new code? Quoted data or syntax can, and so can a call, on such values,
+;; of an instantiated function from values to a value.
+(define (plain? e)
+  (case (car e)
+    [(at) (plain? (caddr e))]
+    [(quote) #t]
+    [(call) (and (callable? (cadr e) (length (caddr e))) (andmap plain? (caddr e)))]
+    [else #f]))
+
+;; Can the expander call function info with n values: is it instantiated,
+;; from values to a value, and are there few enough for call-function?
+(define (callable? info n)
+  (and (func-info-instance info) (<= n 6)
+       (equal? (func-info-params info) (map (lambda (_) eqref) (range n)))
+       (equal? (func-info-results info) (list eqref))))
+
+;; The value of lowered expression e, which plain? accepts. While its calls
+;; run, a trap in them is reported at where, the code they come from.
+(define (plain-value e where)
+  (case (car e)
+    [(at) (plain-value (caddr e) where)]
+    [(quote) (cadr e)]
+    [else
+     (let ([args (map (lambda (a) (plain-value a where)) (caddr e))] [saved api-where])
+       (dynamic-wind (lambda () (set! api-where where))
+                     (lambda () (call-function (function-index (comp-store current) (cadr e)) args))
+                     (lambda () (set! api-where saved))))]))
 
 ;; (#%fact id stx): stx, as it is, recorded as a fact about the definition
 ;; id refers to at phase (spec 6.6). stx is a compile-time value of the
 ;; module's phase+1 linklet, which syntax-local-facts fetches as
-;; syntax-local-value fetches define-syntax's; it runs no code, so it
-;; waits with the define-syntax units that run none. The form, as fully
+;; syntax-local-value fetches define-syntax's; while this module is
+;; expanded, the expander has it already (spec 3.1). The form, as fully
 ;; expanded code holds it.
 (define (fact! f phase)
   (syntax-match f
@@ -2249,11 +2293,11 @@
             [name (string->symbol (string-append "__fact." (symbol->string (stx-e id))))]
             [global (global-info name eqref #t #f #f)]
             [getter (func-info name '() (list eqref) #f #f #f)]
+            [value (lower-expr (expand-expr (out f 'quote-syntax stx) (+ phase 1)) (+ phase 1))]
             [form (core-headed f fact-sym)]
             [m (comp-module current)])
-       (defer-unit! (list (list 'global global (lower-expr (expand-expr (out f 'quote-syntax stx) (+ phase 1)) (+ phase 1)))
-                          (list 'func getter '() (list 'gref global)))
-                    (+ phase 1) f)
+       (add-phase-forms! (+ phase 1) (list (list 'global global value) (list 'func getter '() (list 'gref global))))
+       (made-value! getter (plain-value value f))
        (set-unit-facts! m (cons (list key phase getter form) (unit-facts m)))
        form)]
     [_ (raise-compile-error f "expected (#%fact id syntax)")]))
