@@ -889,7 +889,7 @@
                     (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
                          (eq? (binding-namespace b) (meaning-namespace meaning))))
                   (bindings-under (stx-e id) (binding-slot (stx-scopes id))))])
-    (and b (begin (rekey-facts! (binding-meaning b) meaning) (set-binding-meaning! b meaning) #t))))
+    (and b (begin (note-redefinition! (binding-meaning b) meaning) (set-binding-meaning! b meaning) #t))))
 
 (define (phase-matches? b phase)
   (let ([p (binding-phase b)])
@@ -2321,17 +2321,30 @@
     base))
 
 ;; A definition #%linklet redefines keeps its facts (spec 6.5, 6.6): only
-;; the module being compiled has any about it yet.
-(define (rekey-facts! old new)
-  (when (and current old new (memq (car old) '(func global tag)) (not (eq? (cadr old) (cadr new))))
-    (let ([m (comp-module current)])
-      (set-unit-facts! m (map (lambda (f) (if (eq? (car f) (cadr old)) (cons (cadr new) (cdr f)) f)) (unit-facts m))))))
+;; the module being compiled has any about it yet. While what #%linklet
+;; returned is declared, rekeys maps each definition it redefines to the
+;; new one; then its facts are rekeyed, all at once.
+(define rekeys #f)
 
-;; The facts of the forms #%linklet was given and did not return go with
-;; them (spec 6.5).
+(define (note-redefinition! old new)
+  (when (and current rekeys old new (memq (car old) '(func global tag)) (not (eq? (cadr old) (cadr new))))
+    (hash-set! rekeys (cadr old) (cadr new))))
+
+(define (rekey-facts!)
+  (when (> (hash-count rekeys) 0)
+    (let ([m (comp-module current)])
+      (set-unit-facts! m (map (lambda (f)
+                                (let loop ([key (car f)])
+                                  (let ([new (hash-ref rekeys key #f)])
+                                    (cond [new (loop new)] [(eq? key (car f)) f] [else (cons key (cdr f))]))))
+                              (unit-facts m))))))
+
+;; The facts of the #%fact forms #%linklet was given and did not return go
+;; with them (spec 6.5).
 (define (drop-facts! dropped)
-  (let ([m (comp-module current)])
-    (set-unit-facts! m (filter (lambda (f) (not (memq (cadddr f) dropped))) (unit-facts m)))))
+  (unless (null? dropped)
+    (let ([m (comp-module current)])
+      (set-unit-facts! m (filter (lambda (f) (not (memq (cadddr f) dropped))) (unit-facts m))))))
 
 ;; The func form of transformer code named name, of the kernel module's
 ;; type for it, that calls function info on the syntax.
@@ -2390,7 +2403,7 @@
        ;; next can use the names; then what it returns is declared there,
        ;; and all of it is expanded, what it lifted first.
        (let* ([intro (new-scope!)]
-              [in (flip-scope (out-list ctx (cons id (cons (datum->stx ctx kind #f) forms))) intro)]
+              [in (flip-scope (out-list ctx (cons id (cons (datum->stx ctx kind #f) (numbered-forms forms)))) intro)]
               [b (body phase '() #f '())]
               [saved-body current-body]
               [result (begin (set! current-body b)
@@ -2403,15 +2416,20 @@
               [positions (same-positions returned (cddr (stx->list in)))]
               [new (map (lambda (r p) (if (>= p 0) (expanded (vector-ref fv p)) (flip-scope r intro)))
                         returned positions)]
-              [saved-redefining redefining?] [saved-hook hook-output?])
+              [saved-redefining redefining?] [saved-hook hook-output?] [saved-rekeys rekeys])
          (set! redefining? "#%linklet returned")
          (set! hook-output? #t)
-         (drop-facts! (let ([kept (map (lambda (p) (and (>= p 0) (vector-ref fv p))) positions)])
-                        (filter (lambda (f) (not (memq f kept))) forms)))
+         (set! rekeys (make-hasheq))
+         (drop-facts! (let ([kept (make-vector (vector-length fv) #f)])
+                        (for-each (lambda (p) (when (>= p 0) (vector-set! kept p #t))) positions)
+                        (filter (lambda (f) (eq? (core-head f phase) fact-sym))
+                                (filter (lambda (x) x) (map (lambda (f k) (and (not k) f)) forms (vector->list kept))))))
          (declare-forms! b new)
          (let ([r (finish-body! b)])
+           (rekey-facts!)
            (set! redefining? saved-redefining)
            (set! hook-output? saved-hook)
+           (set! rekeys saved-rekeys)
            (set! current-body saved-body)
            r))]
       [(or (not m) (eq? (car m) 'core)) forms]
@@ -2432,24 +2450,24 @@
                    [else #f])])
     (if loc (eprintf "~a: error: ~a~n" loc msg) (eprintf "error: ~a~n" msg))))
 
-;; For each form #%linklet returned, the position of the form it was given
-;; that it is, or -1. Given forms are matched in order: each returned form
-;; is looked for after the last one matched.
-(define (same-positions returned given)
-  (let loop ([rs returned] [gs given] [i 0] [out '()])
-    (if (null? rs)
-        (reverse out)
-        (let ([k (position-of (car rs) gs)])
-          (if k
-              (loop (cdr rs) (list-tail gs (+ k 1)) (+ i k 1) (cons (+ i k) out))
-              (loop (cdr rs) gs i (cons -1 out)))))))
+;; The forms given to #%linklet, each numbered by its position in a
+;; property, so that same-positions finds a returned one in one step.
+(define hook-position '%hook-position)
+(define (numbered-forms forms)
+  (map (lambda (f i) (syntax-property f hook-position i)) forms (range (length forms))))
 
-;; The position of x in list l, by eq?, or #f.
-(define (position-of x l)
-  (let loop ([l l] [i 0])
-    (cond [(null? l) #f]
-          [(eq? (car l) x) i]
-          [else (loop (cdr l) (+ i 1))])))
+;; For each form #%linklet returned, the position of the form it was given
+;; that it is, or -1. Given forms are matched in order: a returned form is
+;; one only after the last one matched. A form's number says where to
+;; look, and the form there must be the same object.
+(define (same-positions returned given)
+  (let ([gv (list->vector given)] [last -1])
+    (map (lambda (r)
+           (let ([i (and (stx? r) (syntax-property r hook-position))])
+             (if (and (fixnum? i) (> i last) (< i (vector-length gv)) (eq? r (vector-ref gv i)))
+                 (begin (set! last i) i)
+                 -1)))
+         returned)))
 
 ;; ==== macros ====
 
