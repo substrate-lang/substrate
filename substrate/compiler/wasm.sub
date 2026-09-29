@@ -1,11 +1,13 @@
 ;; Lifecycle: permanent. Part of the compiler.
 ;;
-;; Binary wasm encoder. The compiler builds a module description and this
-;; turns it into bytes; nothing here knows about the kernel language.
+;; Binary wasm encoder and assembler. The compiler assembles each body an
+;; instruction at a time (instr!), links it once the module's indices are
+;; known (link-body), and builds a module description, which this turns
+;; into bytes; nothing here knows about the kernel language.
 ;;
-;; Instructions are lists (op imm ...). Structured ones nest:
-;;   (block bt instrs) (loop bt instrs) (if bt then-instrs else-instrs)
-;; where bt is () | valtype | (type n).
+;; Instructions are lists (op imm ...), flat: a block, loop, if or
+;; try_table is opened by its instruction and closed by (end), with
+;; (else) between an if's arms; a block type is () | valtype | (type n).
 ;;
 ;; Value types are resolved: i32 i64 f32 f64, or (ref nullable? heap) where
 ;; heap is an abstract heap type symbol or a type index.
@@ -14,7 +16,7 @@
 (require leb "leb128.sub" write-uleb write-sleb)
 (require num "numbers.sub" flonum-bits flonum32-bits)
 
-(provide wmodule encode-module)
+(provide wmodule encode-module new-asm asm-size instr! link-body cell cell? cell-value set-cell-value!)
 
 ;; types:   list of (func (param ...) (result ...)) | (struct ((storage mut?) ...))
 ;;          | (array (storage mut?)) | (sub final? (supertypeidx ...) comptype)
@@ -22,10 +24,10 @@
 ;;          storage is a valtype, i8 or i16
 ;; imports: list of (module field kind desc); kind func or tag: typeidx,
 ;;          memory/table: (min max-or-#f), global: (valtype mutable?)
-;; funcs:   list of (typeidx locals instrs name)
+;; funcs:   list of (typeidx locals body name), body linked (link-body)
 ;; tables, memories: list of (min max-or-#f)
 ;; tags:    list of typeidx, each a function type with no results
-;; globals: list of (valtype mutable? init-instrs)
+;; globals: list of (valtype mutable? init-bytes), the bytes linked
 ;; exports: list of (name kind idx)
 ;; start:   funcidx or #f
 ;; declared: funcidxs referenced by ref.func (declarative elem segment)
@@ -99,19 +101,42 @@
         [(and (pair? bt) (eq? (car bt) 'type)) (write-sleb (cadr bt) p)]
         [else (valtype! p bt)]))
 
+;; ---- assembly ----
+;;
+;; Code is assembled as it is compiled, an instruction at a time (instr!),
+;; into an asm: its bytes, and the fields they cannot hold yet. A field
+;; the compiler resolves only once every function, global, type and tag
+;; has its index, or decides after the code that follows it, is deferred:
+;; the asm holds no bytes for it, but records (offset kind key), and
+;; link-body writes it as (resolve kind key) says. The kinds are func,
+;; ref-func, global, type and tag, an index; heap, valtype and blocktype,
+;; written as those; and const, a whole constant instruction. A source
+;; location is recorded the same way, at the offset of the instruction
+;; it is of.
+(struct asm (port [relocs #:mutable] [locations #:mutable] [pending #:mutable] [current #:mutable] [start #:mutable]
+             [else-pending? #:mutable]))   ; an else to write before the next instruction, if any comes
+
+(define (new-asm) (asm (open-output-bytes) '() '() location-none location-none #f #f))
+(define (asm-size a) (file-position (asm-port a)))
+
+;; A value the compiler settles later, which a deferred field holds: a
+;; block's type once its body is compiled, or a constant once the
+;; branches around it are.
+(struct cell ([value #:mutable]))
+
+(define (reloc! a kind key)
+  (set-asm-relocs! a (cons (list (asm-size a) kind key) (asm-relocs a))))
+
 ;; ---- source locations ----
 ;;
 ;; Code carries the pseudo-instruction (location file line col), file #f
 ;; for none, which says where the instructions after it come from. The
-;; encoder records a location where an instruction that can call or trap
-;; starts at a new one, and at the start of each function's body, the
-;; function's own, the first its code gives: those are where a backtrace's
-;; frames are, one that overflowed the stack at the body's start. The
-;; module's source-locations section lists them (spec 3.6).
+;; asm records a location where an instruction that can call or trap
+;; starts at a new one, and the first location a body gives, at its start,
+;; is the function's own: those are where a backtrace's frames are, one
+;; that overflowed the stack at the body's start. The module's
+;; source-locations section lists them (spec 3.6).
 (define location-none (list #f 0 0))
-(define location-pending location-none)   ; (file line col) of the code now
-(define location-current #f)              ; the last one recorded
-(define body-locations '())               ; (offset file line col), in the body, reversed
 (define code-locations '())               ; (offset file line col), in the code section, reversed
 
 ;; The instructions that can call or trap, but for memory's loads and
@@ -132,10 +157,11 @@
   (or (hash-ref calls-or-traps op #f)
       (let ([p (lookup-prim op)]) (and p (eq? (prim-op-kind p) 'mem)))))
 
-(define (note-location! p op)
-  (when (and (records-location? op) (not (equal? location-pending location-current)))
-    (set! body-locations (cons (cons (file-position p) location-pending) body-locations))
-    (set! location-current location-pending)))
+(define (note-location! a op)
+  (unless (eq? (asm-pending a) (asm-current a))
+    (when (and (records-location? op) (not (equal? (asm-pending a) (asm-current a))))
+      (set-asm-locations! a (cons (cons (asm-size a) (asm-pending a)) (asm-locations a)))
+      (set-asm-current! a (asm-pending a)))))
 
 ;; The bytes of n as unsigned LEB128.
 (define (uleb-length n) (if (< n 128) 1 (+ 1 (uleb-length (arithmetic-shift n -7)))))
@@ -159,80 +185,98 @@
 
 ;; ---- instructions ----
 
-(define (instrs! p instrs) (for-each (lambda (i) (instr! p i)) instrs))
-
 (define (gc! p n) (write-byte #xFB p) (write-uleb n p))
 
-(define (instr! p i)
-  (let ([op (car i)] [args (cdr i)])
-    (unless (eq? op 'location) (note-location! p op))
+;; A constant instruction, (i32.const n), (i64.const n), (f32.const x) or
+;; (f64.const x).
+(define (const! p i)
+  (case (car i)
+    [(i32.const) (write-byte #x41 p) (write-sleb (cadr i) p)]
+    [(i64.const) (write-byte #x42 p) (write-sleb (cadr i) p)]
+    [(f32.const) (write-byte #x43 p) (le-bytes! p (flonum32-bits (cadr i)) 4)]
+    [(f64.const) (write-byte #x44 p) (le-bytes! p (flonum-bits (cadr i)) 8)]
+    [else (error 'encode "not a constant instruction ~s" i)]))
+
+;; Instruction i, (op imm ...), assembled into a. An index is a key for
+;; link-body: a function's, global's or tag's is the compiler's record of
+;; it, a type's its record or the signature (func params results), a heap
+;; type a record or its abstract name. A block's type and a deferred
+;; constant are cells, settled later. An else is written once an
+;; instruction follows it, so an empty else arm leaves nothing.
+(define (instr! a i)
+  (let ([op (car i)] [args (cdr i)] [p (asm-port a)])
+    (unless (memq op '(location end))
+      (when (asm-else-pending? a) (set-asm-else-pending?! a #f) (write-byte #x05 p))
+      (note-location! a op))
     (case op
-      [(location) (set! location-pending args)]
+      [(location)
+       (when (and (not (asm-start a)) (= (file-position p) 0))
+         (set-asm-start! a args)
+         (set-asm-current! a args))
+       (set-asm-pending! a args)]
+      [(const-deferred) (reloc! a 'const (car args))]
       [(unreachable) (write-byte #x00 p)]
       [(nop) (write-byte #x01 p)]
-      [(block) (write-byte #x02 p) (blocktype! p (car args)) (instrs! p (cadr args)) (write-byte #x0B p)]
-      [(loop) (write-byte #x03 p) (blocktype! p (car args)) (instrs! p (cadr args)) (write-byte #x0B p)]
-      [(if) (write-byte #x04 p) (blocktype! p (car args)) (instrs! p (cadr args))
-            (unless (null? (caddr args)) (write-byte #x05 p) (instrs! p (caddr args)))
-            (write-byte #x0B p)]
-      [(throw) (write-byte #x08 p) (write-uleb (car args) p)]
+      [(block) (write-byte #x02 p) (reloc! a 'blocktype (car args))]
+      [(loop) (write-byte #x03 p) (reloc! a 'blocktype (car args))]
+      [(if) (write-byte #x04 p) (reloc! a 'blocktype (car args))]
+      [(else) (set-asm-else-pending?! a #t)]
+      [(end) (set-asm-else-pending?! a #f) (write-byte #x0B p)]
+      [(throw) (write-byte #x08 p) (reloc! a 'tag (car args))]
       [(throw_ref) (write-byte #x0A p)]
-      ;; (try_table bt (catch ...) instrs), each catch (catch tag label),
-      ;; (catch_ref tag label), (catch_all label) or (catch_all_ref label).
+      ;; (try_table bt catches), each catch (catch tag label), (catch_ref
+      ;; tag label), (catch_all label) or (catch_all_ref label); the body
+      ;; follows, then end.
       [(try_table)
        (write-byte #x1F p)
-       (blocktype! p (car args))
-       (vec! p (cadr args) catch!)
-       (instrs! p (caddr args))
-       (write-byte #x0B p)]
+       (reloc! a 'blocktype (car args))
+       (write-uleb (length (cadr args)) p)
+       (for-each (lambda (c) (catch! a c)) (cadr args))]
       [(br) (write-byte #x0C p) (write-uleb (car args) p)]
       [(br_if) (write-byte #x0D p) (write-uleb (car args) p)]
       [(return) (write-byte #x0F p)]
-      [(call) (write-byte #x10 p) (write-uleb (car args) p)]
-      [(call_indirect) (write-byte #x11 p) (write-uleb (car args) p) (write-uleb (cadr args) p)]
-      [(return_call) (write-byte #x12 p) (write-uleb (car args) p)]
-      [(return_call_indirect) (write-byte #x13 p) (write-uleb (car args) p) (write-uleb (cadr args) p)]
-      [(call_ref) (write-byte #x14 p) (write-uleb (car args) p)]
-      [(return_call_ref) (write-byte #x15 p) (write-uleb (car args) p)]
+      [(call) (write-byte #x10 p) (reloc! a 'func (car args))]
+      [(call_indirect) (write-byte #x11 p) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
+      [(return_call) (write-byte #x12 p) (reloc! a 'func (car args))]
+      [(return_call_indirect) (write-byte #x13 p) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
+      [(call_ref) (write-byte #x14 p) (reloc! a 'type (car args))]
+      [(return_call_ref) (write-byte #x15 p) (reloc! a 'type (car args))]
       [(drop) (write-byte #x1A p)]
       [(select) (write-byte #x1B p)]
-      [(select-typed) (write-byte #x1C p) (write-uleb 1 p) (valtype! p (car args))]
+      [(select-typed) (write-byte #x1C p) (write-uleb 1 p) (reloc! a 'valtype (car args))]
       [(local.get) (write-byte #x20 p) (write-uleb (car args) p)]
       [(local.set) (write-byte #x21 p) (write-uleb (car args) p)]
       [(local.tee) (write-byte #x22 p) (write-uleb (car args) p)]
-      [(global.get) (write-byte #x23 p) (write-uleb (car args) p)]
-      [(global.set) (write-byte #x24 p) (write-uleb (car args) p)]
-      [(i32.const) (write-byte #x41 p) (write-sleb (car args) p)]
-      [(i64.const) (write-byte #x42 p) (write-sleb (car args) p)]
-      [(f32.const) (write-byte #x43 p) (le-bytes! p (flonum32-bits (car args)) 4)]
-      [(f64.const) (write-byte #x44 p) (le-bytes! p (flonum-bits (car args)) 8)]
-      [(ref.null) (write-byte #xD0 p) (heap! p (car args))]
+      [(global.get) (write-byte #x23 p) (reloc! a 'global (car args))]
+      [(global.set) (write-byte #x24 p) (reloc! a 'global (car args))]
+      [(i32.const i64.const f32.const f64.const) (const! p i)]
+      [(ref.null) (write-byte #xD0 p) (reloc! a 'heap (car args))]
       [(ref.is_null) (write-byte #xD1 p)]
-      [(ref.func) (write-byte #xD2 p) (write-uleb (car args) p)]
+      [(ref.func) (write-byte #xD2 p) (reloc! a 'ref-func (car args))]
       [(ref.eq) (write-byte #xD3 p)]
       [(ref.as_non_null) (write-byte #xD4 p)]
       [(table.grow) (write-byte #xFC p) (write-uleb 15 p) (write-uleb (car args) p)]
       [(table.size) (write-byte #xFC p) (write-uleb 16 p) (write-uleb (car args) p)]
       ;; GC (0xFB prefix)
-      [(struct.new) (gc! p 0) (write-uleb (car args) p)]
-      [(struct.get) (gc! p 2) (write-uleb (car args) p) (write-uleb (cadr args) p)]
-      [(struct.get_s) (gc! p 3) (write-uleb (car args) p) (write-uleb (cadr args) p)]
-      [(struct.get_u) (gc! p 4) (write-uleb (car args) p) (write-uleb (cadr args) p)]
-      [(struct.set) (gc! p 5) (write-uleb (car args) p) (write-uleb (cadr args) p)]
-      [(array.new) (gc! p 6) (write-uleb (car args) p)]
-      [(array.new_default) (gc! p 7) (write-uleb (car args) p)]
-      [(array.new_fixed) (gc! p 8) (write-uleb (car args) p) (write-uleb (cadr args) p)]
-      [(array.new_data) (gc! p 9) (write-uleb (car args) p) (write-uleb (cadr args) p)]
-      [(array.get) (gc! p 11) (write-uleb (car args) p)]
-      [(array.get_s) (gc! p 12) (write-uleb (car args) p)]
-      [(array.get_u) (gc! p 13) (write-uleb (car args) p)]
-      [(array.set) (gc! p 14) (write-uleb (car args) p)]
+      [(struct.new) (gc! p 0) (reloc! a 'type (car args))]
+      [(struct.get) (gc! p 2) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
+      [(struct.get_s) (gc! p 3) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
+      [(struct.get_u) (gc! p 4) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
+      [(struct.set) (gc! p 5) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
+      [(array.new) (gc! p 6) (reloc! a 'type (car args))]
+      [(array.new_default) (gc! p 7) (reloc! a 'type (car args))]
+      [(array.new_fixed) (gc! p 8) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
+      [(array.new_data) (gc! p 9) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
+      [(array.get) (gc! p 11) (reloc! a 'type (car args))]
+      [(array.get_s) (gc! p 12) (reloc! a 'type (car args))]
+      [(array.get_u) (gc! p 13) (reloc! a 'type (car args))]
+      [(array.set) (gc! p 14) (reloc! a 'type (car args))]
       [(array.len) (gc! p 15)]
-      [(array.fill) (gc! p 16) (write-uleb (car args) p)]
-      [(array.copy) (gc! p 17) (write-uleb (car args) p) (write-uleb (cadr args) p)]
+      [(array.fill) (gc! p 16) (reloc! a 'type (car args))]
+      [(array.copy) (gc! p 17) (reloc! a 'type (car args)) (reloc! a 'type (cadr args))]
       ;; (ref.test nullable? heap) / (ref.cast nullable? heap)
-      [(ref.test) (gc! p (if (car args) 21 20)) (heap! p (cadr args))]
-      [(ref.cast) (gc! p (if (car args) 23 22)) (heap! p (cadr args))]
+      [(ref.test) (gc! p (if (car args) 21 20)) (reloc! a 'heap (cadr args))]
+      [(ref.cast) (gc! p (if (car args) 23 22)) (reloc! a 'heap (cadr args))]
       [(ref.i31) (gc! p 28)]
       [(i31.get_s) (gc! p 29)]
       [(i31.get_u) (gc! p 30)]
@@ -245,12 +289,54 @@
            (write-uleb (car args) p)
            (write-uleb (cadr args) p)))])))
 
-(define (catch! p c)
-  (case (car c)
-    [(catch) (write-byte 0 p) (write-uleb (cadr c) p) (write-uleb (caddr c) p)]
-    [(catch_ref) (write-byte 1 p) (write-uleb (cadr c) p) (write-uleb (caddr c) p)]
-    [(catch_all) (write-byte 2 p) (write-uleb (cadr c) p)]
-    [(catch_all_ref) (write-byte 3 p) (write-uleb (cadr c) p)]))
+(define (catch! a c)
+  (let ([p (asm-port a)])
+    (case (car c)
+      [(catch) (write-byte 0 p) (reloc! a 'tag (cadr c)) (write-uleb (caddr c) p)]
+      [(catch_ref) (write-byte 1 p) (reloc! a 'tag (cadr c)) (write-uleb (caddr c) p)]
+      [(catch_all) (write-byte 2 p) (write-uleb (cadr c) p)]
+      [(catch_all_ref) (write-byte 3 p) (write-uleb (cadr c) p)])))
+
+;; ---- linking ----
+
+;; segments, each an asm, linked in sequence as the bytes of one body:
+;; each deferred field written as (resolve kind key) gives it, an index,
+;; a heap type, a value type, a block type or a constant instruction by
+;; its kind. Returns (bytes start locations): the first segment's start
+;; location, and the locations recorded, at their offsets in the bytes.
+(define (link-body segments resolve)
+  (let* ([locations '()]
+         [bytes (call-with-output-bytes
+                 (lambda (q)
+                   (for-each (lambda (a) (link-segment! q a resolve (lambda (l) (set! locations (cons l locations)))))
+                             segments)))])
+    (list bytes (or (asm-start (car segments)) location-none) (reverse locations))))
+
+(define (link-segment! q a resolve note!)
+  (let ([raw (get-output-bytes (asm-port a))] [n (asm-size a)])
+    (let loop ([pos 0] [relocs (reverse (asm-relocs a))] [locs (reverse (asm-locations a))])
+      (let* ([r (and (pair? relocs) (car (car relocs)))]
+             [l (and (pair? locs) (car (car locs)))]
+             [next (cond [(and r l) (min r l)] [r r] [l l] [else n])])
+        (when (< pos next) (write-bytes (subbytes raw pos next) q))
+        ;; A deferred field at the offset of an instruction's location
+        ;; belongs to the instruction before it.
+        (cond [(and r (= r next))
+               (deferred! q (car relocs) resolve)
+               (loop next (cdr relocs) locs)]
+              [(and l (= l next))
+               (note! (cons (file-position q) (cdr (car locs))))
+               (loop next relocs (cdr locs))]
+              [else #f])))))
+
+(define (deferred! q reloc resolve)
+  (let* ([kind (cadr reloc)] [v (resolve kind (caddr reloc))])
+    (case kind
+      [(func ref-func global type tag) (write-uleb v q)]
+      [(heap) (heap! q v)]
+      [(valtype) (valtype! q v)]
+      [(blocktype) (blocktype! q v)]
+      [(const) (const! q v)])))
 
 ;; ---- module ----
 
@@ -283,7 +369,7 @@
 (define (global! p g)
   (valtype! p (car g))
   (write-byte (if (cadr g) 1 0) p)
-  (instrs! p (caddr g))
+  (write-bytes (caddr g) p)
   (write-byte #x0B p))
 
 (define (export! p e)
@@ -291,27 +377,30 @@
   (write-byte (case (cadr e) [(func) 0] [(table) 1] [(memory) 2] [(global) 3] [(tag) 4]) p)
   (write-uleb (caddr e) p))
 
+;; A function's entry: its locals, then its body, linked (bytes start
+;; locations). The locations, the start's at offset 0, are kept for the
+;; code section, at their offsets in the module.
 (define (code! p f)
-  (let* ([is (caddr f)]
-         [start (if (and (pair? is) (eq? (car (car is)) 'location)) (cdr (car is)) location-none)])
-    (set! location-pending start)
-    (set! location-current start)
-    (set! body-locations (list (cons 0 start))))
-  (let ([body (call-with-output-bytes
-               (lambda (q)
-                 (vec! q (group-locals (cadr f)) (lambda (q g) (write-uleb (cdr g) q) (valtype! q (car g))))
-                 (instrs! q (caddr f))
-                 (write-byte #x0B q)))])
+  (let* ([linked (caddr f)]
+         [locations '()]
+         [body (call-with-output-bytes
+                (lambda (q)
+                  (vec! q (group-locals (cadr f)) (lambda (q g) (write-uleb (cdr g) q) (valtype! q (car g))))
+                  (let ([shift (file-position q)])
+                    (set! locations (cons (cons 0 (cadr linked))
+                                          (map (lambda (l) (cons (+ shift (car l)) (cdr l))) (caddr linked)))))
+                  (write-bytes (car linked) q)
+                  (write-byte #x0B q)))])
     (write-uleb (bytes-length body) p)
     (let ([base (file-position p)])
       (for-each (lambda (l) (set! code-locations (cons (cons (+ base (car l)) (cdr l)) code-locations)))
-                (reverse body-locations)))
+                locations))
     (write-bytes body p)))
 
 (define (data! p d)
   (if (car d)
       (begin (write-byte 0 p)                ; active, memory 0
-             (instr! p (list 'i32.const (car d)))
+             (const! p (list 'i32.const (car d)))
              (write-byte #x0B p))
       (write-byte 1 p))                      ; passive
   (write-uleb (bytes-length (cdr d)) p)
@@ -360,7 +449,6 @@
        (unless (null? datas) (section! p 12 (lambda (p) (write-uleb (length datas) p)))))
      ;; The code section, written here to know where each body is: the
      ;; source locations give offsets in the module.
-     (set! location-current #f)
      (set! code-locations '())
      (let* ([funcs (wmodule-funcs m)]
             [code (call-with-output-bytes (lambda (q) (vec! q funcs code!)))]

@@ -2,10 +2,10 @@
 ;;
 ;; Compiler: fully expanded kernel forms (see core.sub) -> wasm module bytes.
 ;;
-;; Expressions are compiled to symbolic instructions that mention info
-;; records instead of indices; a final pass assigns indices once every
-;; import, type and synthesized global is known. Compiling an expression
-;; gives (code . type).
+;; Expressions are assembled as they are compiled (wasm.sub), an
+;; instruction at a time; an index, known only once every import, type
+;; and synthesized global is, is a deferred field, written when the code
+;; is linked. Compiling an expression emits its code and gives its type.
 ;;
 ;; A module imports only what its code uses (spec 3.3). Code that needs a
 ;; memory or table must be given one: defined, or imported from a module.
@@ -26,7 +26,7 @@
 (require cl "closures.sub" analyze-closures closures-boxed? closures-known-of closures-captures-of head-local
          known-lambda known-captures known-info set-known-info! known-name known-lifted set-known-lifted!)
 (require ops "ops.sub" lookup-prim prim-op-kind prim-op-params prim-op-results prim-op-align)
-(require w "wasm.sub" wmodule encode-module)
+(require w "wasm.sub" wmodule encode-module new-asm asm-size instr! link-body cell cell? cell-value set-cell-value!)
 (require ser "serialize.sub" make-serializer serialize! serializer-bytes serializer-scope-table)
 (require num "numbers.sub" integer->flonum i32-bits i64-bits)
 
@@ -75,13 +75,14 @@
 
 (define (single? t) (and (pair? t) (null? (cdr t))))
 
-;; Make code of type `type` fit `expected`: drop unused values, or fail. A
-;; subtype fits without any code.
-(define (coerce code type expected)
-  (cond [(not expected) (cons code type)]
-        [(eq? type 'bottom) (cons code expected)]
-        [(types<=? type expected) (cons code expected)]
-        [(null? expected) (cons (append code (map (lambda (_) '(drop)) type)) '())]
+;; Make the code just emitted, of type `type`, fit `expected`: drop unused
+;; values, or fail. A subtype fits without any code. Returns the type the
+;; code has then.
+(define (fit fc type expected)
+  (cond [(not expected) type]
+        [(eq? type 'bottom) expected]
+        [(types<=? type expected) expected]
+        [(null? expected) (for-each (lambda (_) (emit! fc '(drop))) type) '()]
         [else
          (let ([e (type->string expected)] [g (type->string type)])
            ;; Two declarations can have the same name, for example one in
@@ -104,20 +105,51 @@
     [(int float) #t]
     [else #f]))
 
+;; The constant instruction for the literal (int n) or (float x) at type
+;; t, with the type it has: an integer takes any numeric type, a float
+;; f32 or f64.
+(define (literal-instr lit t)
+  (let ([n (cadr lit)])
+    (if (eq? (car lit) 'int)
+        (cons (case t
+                [(i64) (list 'i64.const (s64 n))]
+                [(f32) (list 'f32.const (integer->flonum n))]
+                [(f64) (list 'f64.const (integer->flonum n))]
+                [else (list 'i32.const (s32 n))])
+              (if (memq t '(i64 f32 f64)) t 'i32))
+        (if (eq? t 'f32)
+            (cons (list 'f32.const n) 'f32)
+            (cons (list 'f64.const n) 'f64)))))
+
 ;; The branches es, of an if or a try, each compiled by (compile i e
-;; expected), as a list of (code . type). Without an expected type, a
-;; branch takes the numeric type of a branch compiled before it; so that
-;; literals take the others' type, as in (if c 0 x) with x an i64, the
-;; branches that are literals alone are compiled last.
+;; expected) in its place, as their types. Without an expected type, a
+;; branch takes the numeric type of a branch compiled before it, so that
+;; literals take the others' type, as in (if c 0 x) with x an i64: a
+;; branch that is a literal alone, compiled before any has given a type,
+;; emits its constant deferred, in a cell the literal takes
+;; (deferred-literal), settled once the branches have.
+(define deferred-literal #f)
+
 (define (compile-branches es compile expected)
-  (let* ([n (length es)]
-         [order (append (filter (lambda (i) (not (bare-literal? (list-ref es i)))) (range n))
-                        (filter (lambda (i) (bare-literal? (list-ref es i))) (range n)))])
-    (let loop ([is order] [known #f] [done '()])
-      (if (null? is)
-          (map (lambda (i) (cdr (assv i done))) (range n))
-          (let* ([r (compile (car is) (list-ref es (car is)) (or expected known))] [t (cdr r)])
-            (loop (cdr is) (or known (and (pair? t) (andmap numeric-type? t) t)) (cons (cons (car is) r) done)))))))
+  (let* ([known expected]
+         [types (map (lambda (i e)
+                       (if (and (not known) (bare-literal? e))
+                           (let ([c (cell #f)])
+                             (set! deferred-literal c)
+                             (compile i e #f)
+                             (set! deferred-literal #f)
+                             c)
+                           (let ([t (compile i e known)])
+                             (when (and (not known) (pair? t) (andmap numeric-type? t)) (set! known t))
+                             t)))
+                     (range (length es)) es)])
+    (map (lambda (t)
+           (if (cell? t)
+               (let ([r (literal-instr (cell-value t) (if (single? known) (car known) #f))])
+                 (set-cell-value! t (car r))
+                 (list (cdr r)))
+               t))
+         types)))
 
 (define (s32 n) (or (i32-bits n) (fail "integer ~a does not fit in i32" n)))
 (define (s64 n) (i64-bits n))
@@ -128,13 +160,17 @@
               [extra #:mutable]   ; types of locals after the params, reversed
               [next #:mutable]    ; next local index
               results             ; the function's result types
-              [analysis #:mutable])) ; what closures.sub decided of the function, or #f
+              [analysis #:mutable] ; what closures.sub decided of the function, or #f
+              asm))               ; its code, assembled (wasm.sub)
 
 (define (new-fctx params results)
-  (let ([fc (fctx (make-hasheqv) '() 0 results #f)])
+  (let ([fc (fctx (make-hasheqv) '() 0 results #f (new-asm))])
     (for-each (lambda (p) (add-local! fc (car p) (cdr p))) params)
     (set-fctx-extra! fc '())
     fc))
+
+;; Instruction i, assembled into the function's code.
+(define (emit! fc i) (instr! (fctx-asm fc) i))
 
 (define (add-local! fc key type)
   (note-type! current-ms type)
@@ -249,15 +285,17 @@
 (define (boxed? fc key) (let ([a (fctx-analysis fc)]) (and a (closures-boxed? a key))))
 (define (known-of fc key) (let ([a (fctx-analysis fc)]) (and a (closures-known-of a key))))
 
-;; Code that puts local key, of type type, in a new box, in a new local
-;; that key names from now on.
+;; Put local key, of type type, in a new box, in a new local that key
+;; names from now on.
 (define (box-local! fc key type)
   (let* ([old (car (lookup-local fc key))] [box (box-type type)] [new (add-local! fc key (make-ref #f box))])
-    `((local.get ,old) (struct.new ,box) (local.set ,new))))
+    (emit! fc (list 'local.get old))
+    (emit! fc (list 'struct.new box))
+    (emit! fc (list 'local.set new))))
 
-;; The boxes of the boxed parameters among params, each (key . type).
+;; Box the boxed parameters among params, each (key . type).
 (define (box-params! fc params)
-  (apply append (map (lambda (p) (if (boxed? fc (car p)) (box-local! fc (car p) (cdr p)) '())) params)))
+  (for-each (lambda (p) (when (boxed? fc (car p)) (box-local! fc (car p) (cdr p)))) params))
 
 ;; A function lifted from a lambda, named after the function it is in:
 ;; its info, given its parameter and result types and its declared type.
@@ -323,113 +361,101 @@
 
 (define (struct-field tinfo index) (list-ref (type-info-fields tinfo) index))
 
-(define (finish code type expected) (coerce code type expected))
-
-(define (code-of ms fc labels e type) (car (cx ms fc labels e (list type) #f)))
+;; e compiled, its value made to fit type.
+(define (code-of ms fc labels e type) (cx ms fc labels e (list type) #f))
 
 ;; The location pseudo-instruction for srcloc loc, or for no location.
 (define (location-marker loc)
-  (list (if (srcloc? loc)
-            (list 'location (symbol->string (srcloc-source loc)) (srcloc-line loc) (srcloc-col loc))
-            (list 'location #f 0 0))))
+  (if (srcloc? loc)
+      (list 'location (symbol->string (srcloc-source loc)) (srcloc-line loc) (srcloc-col loc))
+      (list 'location #f 0 0)))
 
+;; args compiled, each to fit its type in types.
 (define (args-code ms fc labels args types)
   (unless (= (length args) (length types))
     (fail "expected ~a arguments, got ~a" (length types) (length args)))
-  (apply append (map (lambda (a t) (code-of ms fc labels a t)) args types)))
+  (for-each (lambda (a t) (code-of ms fc labels a t)) args types))
 
-;; Synthesize the type of a reference expression: (code . reftype).
+;; Reference expression e compiled: its type, a reftype.
 (define (ref-arg ms fc labels e who)
-  (let* ([r (cx ms fc labels e #f #f)] [t (cdr r)])
+  (let ([t (cx ms fc labels e #f #f)])
     (unless (and (single? t) (ref-type? (car t)))
       (fail "~a needs a reference, got ~a" who (type->string t)))
-    (cons (car r) (car t))))
+    (car t)))
 
 (define (blocktype t)
   (cond [(null? t) '()]
         [(single? t) (car t)]
         [else (list 'type (list 'func '() t))]))
 
+;; The tail-call instruction for call instruction op.
+(define (tail-call-op op)
+  (case op [(call) 'return_call] [(call_indirect) 'return_call_indirect] [else 'return_call_ref]))
+
 ;; GC operations (spec 5.3). imms hold type-infos, field indices and
 ;; reference types resolved by the expander.
 (define (compile-gc ms fc labels op imms args expected)
-  (let ([arg (lambda (i type) (code-of ms fc labels (list-ref args i) type))]
-        [tref (lambda (t) (make-ref #t t))])
+  (let* ([tref (lambda (t) (make-ref #t t))]
+         [element (lambda (t) (unpacked (car (type-info-fields t))))]
+         [op! (lambda (i) (emit! fc i))]
+         [done (lambda (type) (fit fc type expected))]
+         ;; The arguments compiled at types, then instruction i, whose
+         ;; value is of type result.
+         [gc! (lambda (types i result) (args-code ms fc labels args types) (op! i) (done result))])
     (for-each (lambda (i) (note-type! ms i)) imms)
     (case op
       [(struct.new)
        (let ([t (car imms)])
-         (finish (append (args-code ms fc labels args (map (lambda (f) (unpacked (cadr f))) (type-info-fields t)))
-                         `((struct.new ,t)))
-                 (list (make-ref #f t)) expected))]
+         (gc! (map (lambda (f) (unpacked (cadr f))) (type-info-fields t)) (list 'struct.new t) (list (make-ref #f t))))]
       [(struct.get struct.get_s struct.get_u)
        (let* ([t (car imms)] [i (cadr imms)] [f (struct-field t i)] [packed? (memq (cadr f) '(i8 i16))])
          (when (and packed? (eq? op 'struct.get))
            (fail "field ~a is packed: use struct.get_s or struct.get_u" (car f)))
          (when (and (not packed?) (not (eq? op 'struct.get)))
            (fail "~a is only for packed fields" op))
-         (finish (append (arg 0 (tref t)) `((,op ,t ,i))) (list (unpacked (cadr f))) expected))]
+         (gc! (list (tref t)) (list op t i) (list (unpacked (cadr f)))))]
       [(struct.set)
        (let* ([t (car imms)] [i (cadr imms)] [f (struct-field t i)])
          (unless (caddr f) (fail "field ~a is not mutable" (car f)))
-         (finish (append (arg 0 (tref t)) (arg 1 (unpacked (cadr f))) `((struct.set ,t ,i))) '() expected))]
-      [(array.new)
-       (let ([t (car imms)])
-         (finish (append (arg 0 (unpacked (car (type-info-fields t)))) (arg 1 'i32) `((array.new ,t)))
-                 (list (make-ref #f t)) expected))]
-      [(array.new_default)
-       (let ([t (car imms)])
-         (finish (append (arg 0 'i32) `((array.new_default ,t))) (list (make-ref #f t)) expected))]
+         (gc! (list (tref t) (unpacked (cadr f))) (list 'struct.set t i) '()))]
+      [(array.new) (let ([t (car imms)]) (gc! (list (element t) 'i32) (list 'array.new t) (list (make-ref #f t))))]
+      [(array.new_default) (let ([t (car imms)]) (gc! '(i32) (list 'array.new_default t) (list (make-ref #f t))))]
       [(array.new_fixed)
        (let ([t (car imms)])
-         (finish (append (apply append (map (lambda (a) (code-of ms fc labels a (unpacked (car (type-info-fields t)))))
-                                            args))
-                         `((array.new_fixed ,t ,(length args))))
-                 (list (make-ref #f t)) expected))]
+         (gc! (map (lambda (a) (element t)) args) (list 'array.new_fixed t (length args)) (list (make-ref #f t))))]
       [(array.get array.get_s array.get_u)
        (let* ([t (car imms)] [storage (car (type-info-fields t))] [packed? (memq storage '(i8 i16))])
          (when (and packed? (eq? op 'array.get))
            (fail "~a has packed elements: use array.get_s or array.get_u" (type-info-name t)))
          (when (and (not packed?) (not (eq? op 'array.get)))
            (fail "~a is only for packed elements" op))
-         (finish (append (arg 0 (tref t)) (arg 1 'i32) `((,op ,t))) (list (unpacked storage)) expected))]
+         (gc! (list (tref t) 'i32) (list op t) (list (unpacked storage))))]
       [(array.set)
        (let ([t (car imms)])
          (unless (cadr (type-info-fields t)) (fail "~a is not mutable" (type-info-name t)))
-         (finish (append (arg 0 (tref t)) (arg 1 'i32) (arg 2 (unpacked (car (type-info-fields t))))
-                         `((array.set ,t)))
-                 '() expected))]
-      [(array.len)
-       (finish (append (arg 0 (make-ref #t 'array)) '((array.len))) '(i32) expected)]
-      [(array.fill)
-       (let ([t (car imms)])
-         (finish (append (arg 0 (tref t)) (arg 1 'i32) (arg 2 (unpacked (car (type-info-fields t)))) (arg 3 'i32)
-                         `((array.fill ,t)))
-                 '() expected))]
+         (gc! (list (tref t) 'i32 (element t)) (list 'array.set t) '()))]
+      [(array.len) (gc! (list (make-ref #t 'array)) '(array.len) '(i32))]
+      [(array.fill) (let ([t (car imms)]) (gc! (list (tref t) 'i32 (element t) 'i32) (list 'array.fill t) '()))]
       [(array.copy)
        (let ([dst (car imms)] [src (cadr imms)])
-         (finish (append (arg 0 (tref dst)) (arg 1 'i32) (arg 2 (tref src)) (arg 3 'i32) (arg 4 'i32)
-                         `((array.copy ,dst ,src)))
-                 '() expected))]
-      [(ref.null)
-       (finish `((ref.null ,(car imms))) (list (make-ref #t (car imms))) expected)]
+         (gc! (list (tref dst) 'i32 (tref src) 'i32 'i32) (list 'array.copy dst src) '()))]
+      [(ref.null) (gc! '() (list 'ref.null (car imms)) (list (make-ref #t (car imms))))]
       [(ref.is_null)
-       (let ([r (ref-arg ms fc labels (car args) "ref.is_null")])
-         (finish (append (car r) '((ref.is_null))) '(i32) expected))]
-      [(ref.eq)
-       (finish (append (arg 0 eqref) (arg 1 eqref) '((ref.eq))) '(i32) expected)]
+       (ref-arg ms fc labels (car args) "ref.is_null")
+       (op! '(ref.is_null))
+       (done '(i32))]
+      [(ref.eq) (gc! (list eqref eqref) '(ref.eq) '(i32))]
       [(ref.as_non_null)
        (let ([r (ref-arg ms fc labels (car args) "ref.as_non_null")])
-         (finish (append (car r) '((ref.as_non_null))) (list (make-ref #f (ref-heap (cdr r)))) expected))]
+         (op! '(ref.as_non_null))
+         (done (list (make-ref #f (ref-heap r)))))]
       [(ref.test ref.cast)
-       (let* ([target (car imms)] [r (ref-arg ms fc labels (car args) (symbol->string op))])
-         (finish (append (car r) `((,op ,(ref-nullable? target) ,(ref-heap target))))
-                 (if (eq? op 'ref.test) '(i32) (list target))
-                 expected))]
-      [(ref.i31)
-       (finish (append (arg 0 'i32) '((ref.i31))) (list (make-ref #f 'i31)) expected)]
-      [(i31.get_s i31.get_u)
-       (finish (append (arg 0 (make-ref #t 'i31)) `((,op))) '(i32) expected)]
+       (let ([target (car imms)])
+         (ref-arg ms fc labels (car args) (symbol->string op))
+         (op! (list op (ref-nullable? target) (ref-heap target)))
+         (done (if (eq? op 'ref.test) '(i32) (list target))))]
+      [(ref.i31) (gc! '(i32) '(ref.i31) (list (make-ref #f 'i31)))]
+      [(i31.get_s i31.get_u) (gc! (list (make-ref #t 'i31)) (list op) '(i32))]
       [else (fail "internal: unknown GC operation ~a" op)])))
 
 ;; (try clauses body) (spec 5.3). The body is in a try_table whose catches
@@ -456,48 +482,60 @@
                           (append (if (cadr c) (tag-info-params (cadr c)) '())
                                   (if (memq (car c) '(catch-ref catch-all-ref)) (list exnref) '())))
                         clauses)]
-         [rs (compile-branches
-              (cons body (map cadddr clauses))
-              (lambda (i e expected)
-                (if (= i 0)
-                    (cx ms fc (cons (label #f 'block #f) (append blocks outer)) e expected #f)
-                    (let ([c (list-ref clauses (- i 1))])
-                      (for-each (lambda (key t) (add-local! fc key t)) (caddr c) (list-ref payloads (- i 1)))
-                      (cx ms fc (append (list-tail blocks i) outer) e expected tail?))))
-              expected)]
-         [t (or expected
-                (foldl (lambda (r t) (and t (join-types t (cdr r)))) 'bottom rs)
-                (fail "the body and the clauses of try have different types: ~a"
-                      (apply string-append (map (lambda (r) (format " ~a" (type->string (cdr r)))) rs))))]
-         [t (if (eq? t 'bottom) '() t)]
+         [tcell (cell '())]
          [catches (map (lambda (c i)
                          (when (cadr c) (note-tag! ms (cadr c)))
                          (case (car c)
-                           [(catch) `(catch ,(cadr c) ,i)]
-                           [(catch-ref) `(catch_ref ,(cadr c) ,i)]
-                           [(catch-all) `(catch_all ,i)]
-                           [else `(catch_all_ref ,i)]))
+                           [(catch) (list 'catch (cadr c) i)]
+                           [(catch-ref) (list 'catch_ref (cadr c) i)]
+                           [(catch-all) (list 'catch_all i)]
+                           [else (list 'catch_all_ref i)]))
                        clauses (range n))])
-    (let loop ([i 1] [code `((try_table ,(blocktype t) ,catches ,(car (car rs))) (br ,n))]
-               [rs (cdr rs)] [cs clauses] [ps payloads])
-      (if (> i n)
-          (cons `((block ,(blocktype t) ,code)) t)
-          (loop (+ i 1)
-                (append `((block ,(blocktype (car ps)) ,code))
+    (emit! fc (list 'block tcell))
+    (for-each (lambda (p) (emit! fc (list 'block (blocktype p)))) (reverse payloads))
+    (emit! fc (list 'try_table tcell catches))
+    (let* ([ts (compile-branches
+                (cons body (map cadddr clauses))
+                (lambda (i e expected)
+                  (if (= i 0)
+                      (let ([t (cx ms fc (cons (label #f 'block #f) (append blocks outer)) e expected #f)])
+                        (emit! fc '(end))
+                        (emit! fc (list 'br n))
+                        (emit! fc '(end))
+                        t)
+                      (let ([c (list-ref clauses (- i 1))] [p (list-ref payloads (- i 1))])
+                        (for-each (lambda (key t) (add-local! fc key t)) (caddr c) p)
                         ;; The values, the last on the stack first.
-                        (map (lambda (key) `(local.set ,(car (lookup-local fc key)))) (reverse (caddr (car cs))))
-                        (box-params! fc (map cons (caddr (car cs)) (car ps)))
-                        (car (car rs))
-                        (if (< i n) `((br ,(- n i))) '()))
-                (cdr rs) (cdr cs) (cdr ps))))))
+                        (for-each (lambda (key) (emit! fc (list 'local.set (car (lookup-local fc key))))) (reverse (caddr c)))
+                        (box-params! fc (map cons (caddr c) p))
+                        (let ([t (cx ms fc (append (list-tail blocks i) outer) e expected tail?)])
+                          (when (< i n) (emit! fc (list 'br (- n i))))
+                          (emit! fc '(end))
+                          t))))
+                expected)]
+           [t (or expected
+                  (foldl (lambda (bt t) (and t (join-types t bt))) 'bottom ts)
+                  (fail "the body and the clauses of try have different types: ~a"
+                        (apply string-append (map (lambda (bt) (format " ~a" (type->string bt))) ts))))]
+           [t (if (eq? t 'bottom) '() t)])
+      (set-cell-value! tcell (blocktype t))
+      t)))
 
-;; Compile e. expected: #f or a list of valtypes. tail?: e's value is the
-;; function's return value. Returns (code . type).
+;; Compile e, emitting its code. expected: #f or a list of valtypes.
+;; tail?: e's value is the function's return value. Returns e's type.
 (define (cx ms fc labels e expected tail?)
-  (let ([sub (lambda (e expected tail?) (cx ms fc labels e expected tail?))]
-        [sub-in (lambda (labels e expected tail?) (cx ms fc labels e expected tail?))]
-        [code-of (lambda (e type) (code-of ms fc labels e type))]
-        [args (cdr e)])
+  (let* ([sub (lambda (e expected tail?) (cx ms fc labels e expected tail?))]
+         [sub-in (lambda (labels e expected tail?) (cx ms fc labels e expected tail?))]
+         [code-of (lambda (e type) (code-of ms fc labels e type))]
+         [op! (lambda (i) (emit! fc i))]
+         [done (lambda (type) (fit fc type expected))]
+         ;; A call, instruction i, of a function returning results: a tail
+         ;; call if it is the function's return value and the results fit.
+         [call! (lambda (i results)
+                  (if (and tail? (types<=? results (fctx-results fc)))
+                      (begin (op! (cons (tail-call-op (car i)) (cdr i))) results)
+                      (begin (op! i) (done results))))]
+         [args (cdr e)])
     (case (car e)
       ;; (at loc e): e's code, at source location loc. The pseudo-instruction
       ;; (location file line col) says where the code after it comes from,
@@ -509,214 +547,230 @@
                          [(eq? (srcloc-source given) current-source) given]
                          [else (or saved given)])])
          (set! current-loc loc)
-         (let ([r (sub (cadr args) expected tail?)])
+         (unless (eq? loc saved) (op! (location-marker loc)))
+         (let ([t (sub (cadr args) expected tail?)])
            (set! current-loc saved)
-           (if (eq? loc saved)
-               r
-               (cons (append (location-marker loc) (car r) (location-marker saved)) (cdr r)))))]
+           (unless (eq? loc saved) (op! (location-marker saved)))
+           t))]
       ;; (as types e): e at types, which it must fit: an inlined call's body
       ;; at the function's result types (spec 5.2).
-      [(as)
-       (let ([r (sub (cadr args) (car args) tail?)])
-         (finish (car r) (cdr r) expected))]
-      [(int)
-       (let ([n (car args)] [t (if (single? expected) (car expected) 'i32)])
-         (case t
-           [(i64) (finish `((i64.const ,(s64 n))) '(i64) expected)]
-           [(f32) (finish `((f32.const ,(integer->flonum n))) '(f32) expected)]
-           [(f64) (finish `((f64.const ,(integer->flonum n))) '(f64) expected)]
-           [else (finish `((i32.const ,(s32 n))) '(i32) expected)]))]
-      [(float)
-       (if (equal? expected '(f32))
-           (finish `((f32.const ,(car args))) '(f32) expected)
-           (finish `((f64.const ,(car args))) '(f64) expected))]
+      [(as) (done (sub (cadr args) (car args) tail?))]
+      ;; A literal alone in a branch may be deferred (compile-branches).
+      [(int float)
+       (if (and (not expected) deferred-literal)
+           (let ([c deferred-literal])
+             (set-cell-value! c e)
+             (set! deferred-literal #f)
+             (op! (list 'const-deferred c))
+             '(i32))
+           (let ([r (literal-instr e (cond [(eq? (car e) 'float) (if (equal? expected '(f32)) 'f32 'f64)]
+                                           [(single? expected) (car expected)]
+                                           [else 'i32]))])
+             (op! (car r))
+             (done (list (cdr r)))))]
       [(const)
        (let ([t (car args)] [n (cadr args)])
-         (finish (case t
-                   [(i32) `((i32.const ,(s32 n)))]
-                   [(i64) `((i64.const ,(s64 n)))]
-                   [else `((,(const-op t) ,n))])
-                 (list t) expected))]
+         (op! (case t
+                [(i32) (list 'i32.const (s32 n))]
+                [(i64) (list 'i64.const (s64 n))]
+                [else (list (const-op t) n)]))
+         (done (list t)))]
       [(lref)
        (let* ([l (lookup-local fc (car args))] [box (and (boxed? fc (car args)) (ref-heap (cdr l)))])
+         (op! (list 'local.get (car l)))
          (if box
-             (finish `((local.get ,(car l)) (struct.get ,box 0)) (list (box-value-type box)) expected)
-             (finish `((local.get ,(car l))) (list (cdr l)) expected)))]
+             (begin (op! (list 'struct.get box 0)) (done (list (box-value-type box))))
+             (done (list (cdr l)))))]
       [(lset)
        (let ([k (known-of fc (car args))])
-         (cond [k (lift-known! ms fc k) (finish '() '() expected)]
+         (cond [k (lift-known! ms fc k) (done '())]
                [else
                 (let* ([l (lookup-local fc (car args))] [box (and (boxed? fc (car args)) (ref-heap (cdr l)))])
                   (if box
-                      (finish (append `((local.get ,(car l))) (code-of (cadr args) (box-value-type box)) `((struct.set ,box 0)))
-                              '() expected)
-                      (finish (append (code-of (cadr args) (cdr l)) `((local.set ,(car l)))) '() expected)))]))]
+                      (begin (op! (list 'local.get (car l)))
+                             (code-of (cadr args) (box-value-type box))
+                             (op! (list 'struct.set box 0)))
+                      (begin (code-of (cadr args) (cdr l))
+                             (op! (list 'local.set (car l)))))
+                  (done '()))]))]
       [(gref)
        (let ([info (car args)])
          (note-global! ms info)
-         (finish `((global.get ,info)) (list (global-info-type info)) expected))]
+         (op! (list 'global.get info))
+         (done (list (global-info-type info))))]
       [(gset)
        (let ([info (car args)])
          (unless (global-info-mutable? info)
            (fail "~a is immutable: declare it (global ~a (mut type) init) to set it"
                  (global-info-name info) (global-info-name info)))
          (note-global! ms info)
-         (finish (append (code-of (cadr args) (global-info-type info)) `((global.set ,info))) '() expected))]
+         (code-of (cadr args) (global-info-type info))
+         (op! (list 'global.set info))
+         (done '()))]
       [(let)
-       (let ([init-code
-              (apply append
-                     (map (lambda (b)
-                            (let* ([key (car b)] [declared (cadr b)] [init (caddr b)] [k (known-of fc key)])
-                              (cond
-                                ;; A known function has no local: its lambda is its code,
-                                ;; lifted once every variable of the let is bound, since
-                                ;; it may capture one bound after it.
-                                [k '()]
-                                [else
-                                 (let* ([r (sub init (and declared (list declared)) #f)] [t (cdr r)])
-                                   (unless (single? t)
-                                     (fail "a let binding needs a single value, got ~a~a" (type->string t)
-                                           (if (eq? t 'bottom) "; give it a type" "")))
-                                   (if (boxed? fc key)
-                                       (let* ([box (box-type (car t))] [i (add-local! fc key (make-ref #f box))])
-                                         (append (car r) `((struct.new ,box) (local.set ,i))))
-                                       (let ([i (add-local! fc key (car t))])
-                                         (append (car r) `((local.set ,i))))))])))
-                          (car args)))])
-         (for-each (lambda (b) (let ([k (known-of fc (car b))]) (when k (lift-known! ms fc k)))) (car args))
-         (let ([r (sub (cadr args) expected tail?)])
-           (cons (append init-code (car r)) (cdr r))))]
+       (for-each (lambda (b)
+                   (let* ([key (car b)] [declared (cadr b)] [init (caddr b)] [k (known-of fc key)])
+                     ;; A known function has no local: its lambda is its code,
+                     ;; lifted once every variable of the let is bound, since
+                     ;; it may capture one bound after it.
+                     (unless k
+                       (let ([t (sub init (and declared (list declared)) #f)])
+                         (unless (single? t)
+                           (fail "a let binding needs a single value, got ~a~a" (type->string t)
+                                 (if (eq? t 'bottom) "; give it a type" "")))
+                         (if (boxed? fc key)
+                             (let* ([box (box-type (car t))] [i (add-local! fc key (make-ref #f box))])
+                               (op! (list 'struct.new box))
+                               (op! (list 'local.set i)))
+                             (op! (list 'local.set (add-local! fc key (car t)))))))))
+                 (car args))
+       (for-each (lambda (b) (let ([k (known-of fc (car b))]) (when k (lift-known! ms fc k)))) (car args))
+       (sub (cadr args) expected tail?)]
       [(seq)
        (if (null? args)
-           (finish '() '() expected)
-           (let loop ([es args] [acc '()])
+           (done '())
+           (let loop ([es args])
              (if (null? (cdr es))
-                 (let ([r (sub (car es) expected tail?)])
-                   (cons (apply append (reverse (cons (car r) acc))) (cdr r)))
-                 (loop (cdr es) (cons (car (sub (car es) '() #f)) acc)))))]
+                 (sub (car es) expected tail?)
+                 (begin (sub (car es) '() #f) (loop (cdr es))))))]
       [(if)
        (let* ([test (car args)] [then (cadr args)] [els (caddr args)]
-              [tc (car (sub test '(i32) #f))]
-              [lbls (cons (label #f 'if #f) labels)])
+              [lbls (cons (label #f 'if #f) labels)]
+              [c (cell '())])
+         (sub test '(i32) #f)
+         (op! (list 'if c))
          (if (not els)
-             (let ([c (car (sub-in lbls then '() #f))])
-               (finish (append tc `((if () ,c ()))) '() expected))
-             (let* ([rs (compile-branches (list then els) (lambda (i e expected) (sub-in lbls e expected tail?))
+             (begin (sub-in lbls then '() #f)
+                    (op! '(end))
+                    (done '()))
+             (let* ([ts (compile-branches (list then els)
+                                          (lambda (i e expected)
+                                            (when (= i 1) (op! '(else)))
+                                            (sub-in lbls e expected tail?))
                                           expected)]
-                    [r1 (car rs)] [r2 (cadr rs)] [t1 (cdr r1)] [t2 (cdr r2)]
+                    [t1 (car ts)] [t2 (cadr ts)]
                     [t (or expected
                            (join-types t1 t2)
                            (fail "the branches of if have different types: ~a and ~a"
                                  (type->string t1) (type->string t2)))]
                     [t (if (eq? t 'bottom) '() t)])
-               (cons (append tc `((if ,(blocktype t) ,(car r1) ,(car r2)))) t))))]
+               (op! '(end))
+               (set-cell-value! c (blocktype t))
+               t)))]
       [(block)
-       (let* ([lbl (label (car args) 'block expected)]
-              [r (sub-in (cons lbl labels) (cadr args) expected tail?)]
-              [t (cdr r)]
-              [t (cond [(not (eq? t 'bottom))
-                        (when (and (label-type lbl) (not (types<=? t (label-type lbl))))
-                          (fail "block result is ~a but a br carries ~a"
-                                (type->string t) (type->string (label-type lbl))))
-                        (or (label-type lbl) t)]
-                       [(label-type lbl) (label-type lbl)]
-                       [else '()])])
-         (cons `((block ,(blocktype t) ,(car r))) t))]
+       (let* ([lbl (label (car args) 'block expected)] [c (cell '())])
+         (op! (list 'block c))
+         (let* ([t (sub-in (cons lbl labels) (cadr args) expected tail?)]
+                [t (cond [(not (eq? t 'bottom))
+                          (when (and (label-type lbl) (not (types<=? t (label-type lbl))))
+                            (fail "block result is ~a but a br carries ~a"
+                                  (type->string t) (type->string (label-type lbl))))
+                          (or (label-type lbl) t)]
+                         [(label-type lbl) (label-type lbl)]
+                         [else '()])])
+           (op! '(end))
+           (set-cell-value! c (blocktype t))
+           t))]
       [(loop)
-       (let* ([lbl (label (car args) 'loop '())]
-              [r (sub-in (cons lbl labels) (cadr args) expected tail?)]
-              [t (if (eq? (cdr r) 'bottom) (or expected '()) (cdr r))])
-         (cons `((loop ,(blocktype t) ,(car r))) t))]
+       (let* ([lbl (label (car args) 'loop '())] [c (cell '())])
+         (op! (list 'loop c))
+         (let* ([t (sub-in (cons lbl labels) (cadr args) expected tail?)]
+                [t (if (eq? t 'bottom) (or expected '()) t)])
+           (op! '(end))
+           (set-cell-value! c (blocktype t))
+           t))]
       [(br)
        (let* ([dl (label-depth labels (car args))] [depth (car dl)] [lbl (cdr dl)] [v (cadr args)])
          (if (eq? (label-kind lbl) 'loop)
              (begin
                (when v (fail "br to a loop label cannot carry a value"))
-               (cons `((br ,depth)) 'bottom))
-             (let* ([r (if v (sub v (label-type lbl) #f) (cons '() '()))] [t (cdr r)])
+               (op! (list 'br depth))
+               'bottom)
+             (let ([t (if v (sub v (label-type lbl) #f) '())])
                (cond [(not (label-type lbl)) (set-label-type! lbl t)]
                      [(not (types<=? t (label-type lbl)))
                       (fail "br carries ~a but the block produces ~a"
                             (type->string t) (type->string (label-type lbl)))])
-               (cons (append (car r) `((br ,depth))) 'bottom))))]
+               (op! (list 'br depth))
+               'bottom)))]
       [(br-if)
-       (let* ([dl (label-depth labels (car args))] [depth (car dl)] [lbl (cdr dl)]
-              [tc (car (sub (cadr args) '(i32) #f))])
+       (let* ([dl (label-depth labels (car args))] [depth (car dl)] [lbl (cdr dl)])
+         (sub (cadr args) '(i32) #f)
          (unless (eq? (label-kind lbl) 'loop)
            (cond [(not (label-type lbl)) (set-label-type! lbl '())]
                  [(not (null? (label-type lbl)))
                   (fail "br-if cannot exit a block that produces ~a" (type->string (label-type lbl)))]))
-         (finish (append tc `((br_if ,depth))) '() expected))]
+         (op! (list 'br_if depth))
+         (done '()))]
       [(return)
-       (let* ([v (car args)] [c (if v (car (sub v (fctx-results fc) #t)) '())])
+       (let ([v (car args)])
+         (when v (sub v (fctx-results fc) #t))
          (unless (or v (null? (fctx-results fc)))
            (fail "return needs a value of type ~a" (type->string (fctx-results fc))))
-         (cons (append c '((return))) 'bottom))]
+         (op! '(return))
+         'bottom)]
       [(call)
-       (let* ([info (car args)]
-              [code (begin (note-func! ms info) (args-code ms fc labels (cadr args) (func-info-params info)))]
-              [results (func-info-results info)])
-         (if (and tail? (types<=? results (fctx-results fc)))
-             (cons (append code `((return_call ,info))) results)
-             (finish (append code `((call ,info))) results expected)))]
+       (let ([info (car args)])
+         (note-func! ms info)
+         (args-code ms fc labels (cadr args) (func-info-params info))
+         (call! (list 'call info) (func-info-results info)))]
       [(prim)
        (let* ([name (car args)] [offset (cadr args)] [p (lookup-prim name)])
          (when (or (eq? (prim-op-kind p) 'mem) (memq name '(memory.size memory.grow memory.copy memory.fill)))
            (note-memory! ms))
-         (let ([code (args-code ms fc labels (caddr args) (prim-op-params p))])
-           (finish (append code
-                           (if (eq? (prim-op-kind p) 'mem)
-                               `((,name ,(prim-op-align p) ,(or offset 0)))
-                               `((,name))))
-                   (prim-op-results p)
-                   expected)))]
+         (args-code ms fc labels (caddr args) (prim-op-params p))
+         (op! (if (eq? (prim-op-kind p) 'mem)
+                  (list name (prim-op-align p) (or offset 0))
+                  (list name)))
+         (done (prim-op-results p)))]
       [(call-indirect)
        (note-table! ms)
        (for-each (lambda (t) (note-type! ms t)) (append (car args) (cadr args)))
-       (let* ([params (car args)] [results (cadr args)]
-              [code (args-code ms fc labels (cadddr args) params)]
-              [ic (code-of (caddr args) 'i32)]
-              [sig (list 'func params results)])
-         (if (and tail? (types<=? results (fctx-results fc)))
-             (cons (append code ic `((return_call_indirect ,sig 0))) results)
-             (finish (append code ic `((call_indirect ,sig 0))) results expected)))]
+       (let ([params (car args)] [results (cadr args)])
+         (args-code ms fc labels (cadddr args) params)
+         (code-of (caddr args) 'i32)
+         (call! (list 'call_indirect (list 'func params results) 0) results))]
       [(func-index)
-       (finish `((global.get ,(fidx-synth! ms (car args)))) '(i32) expected)]
+       (op! (list 'global.get (fidx-synth! ms (car args))))
+       (done '(i32))]
       [(ref-func)
        (let ([info (car args)])
          (note-func! ms info)
          (unless (func-info-type info)
            (fail "internal: ref.func of ~a, which has no declared function type" (func-info-name info)))
-         (finish `((ref.func ,info)) (list (make-ref #f (func-info-type info))) expected))]
+         (op! (list 'ref.func info))
+         (done (list (make-ref #f (func-info-type info)))))]
       [(call-ref)
-       (let* ([t (car args)]
-              [code (begin (note-type! ms t) (args-code ms fc labels (caddr args) (car (type-info-fields t))))]
-              [fcode (code-of (cadr args) (make-ref #t t))]
-              [results (cadr (type-info-fields t))])
-         (if (and tail? (types<=? results (fctx-results fc)))
-             (cons (append code fcode `((return_call_ref ,t))) results)
-             (finish (append code fcode `((call_ref ,t))) results expected)))]
+       (let ([t (car args)])
+         (note-type! ms t)
+         (args-code ms fc labels (caddr args) (car (type-info-fields t)))
+         (code-of (cadr args) (make-ref #t t))
+         (call! (list 'call_ref t) (cadr (type-info-fields t))))]
       [(gc)
        ;; A null, and testing for one, touch no GC object.
        (unless (memq (car args) '(ref.null ref.is_null ref.as_non_null)) (set-mstate-uses-gc! ms #t))
        (compile-gc ms fc labels (car args) (cadr args) (caddr args) expected)]
       [(select)
-       (let* ([ra (sub (car args) #f #f)] [ta (cdr ra)])
+       (let ([ta (sub (car args) #f #f)])
          (unless (single? ta) (fail "select needs single values, got ~a" (type->string ta)))
-         (let ([cb (car (sub (cadr args) ta #f))] [ct (car (sub (caddr args) '(i32) #f))])
-           (note-type! ms (car ta))
-           (finish (append (car ra) cb ct (if (ref-type? (car ta)) `((select-typed ,(car ta))) '((select))))
-                   ta expected)))]
+         (sub (cadr args) ta #f)
+         (sub (caddr args) '(i32) #f)
+         (note-type! ms (car ta))
+         (op! (if (ref-type? (car ta)) (list 'select-typed (car ta)) '(select)))
+         (done ta))]
       [(drop)
-       (let* ([r (sub (car args) #f #f)] [t (cdr r)])
-         (finish (if (eq? t 'bottom) (car r) (append (car r) (map (lambda (_) '(drop)) t))) '() expected))]
-      [(unreachable) (cons '((unreachable)) 'bottom)]
-      [(nop) (finish '((nop)) '() expected)]
+       (let ([t (sub (car args) #f #f)])
+         (unless (eq? t 'bottom) (for-each (lambda (_) (op! '(drop))) t))
+         (done '()))]
+      [(unreachable) (op! '(unreachable)) 'bottom]
+      [(nop) (op! '(nop)) (done '())]
       [(throw)
        (let ([info (car args)])
          (note-tag! ms info)
-         (cons (append (args-code ms fc labels (cadr args) (tag-info-params info)) `((throw ,info))) 'bottom))]
-      [(throw-ref) (cons (append (code-of (car args) exnref) '((throw_ref))) 'bottom)]
+         (args-code ms fc labels (cadr args) (tag-info-params info))
+         (op! (list 'throw info))
+         'bottom)]
+      [(throw-ref) (code-of (car args) exnref) (op! '(throw_ref)) 'bottom]
       [(try) (compile-try ms fc labels (car args) (cadr args) expected tail?)]
       ;; (lambda key params results body): a closure of the lambda's
       ;; signature, of a subtype with a field per captured variable if it
@@ -732,10 +786,10 @@
          (note-type! ms (closure-code closure))
          (lift! ms info (cons (cons key (make-ref #f closure)) params) params (list 'at current-loc body) a csub captures)
          (set-mstate-uses-gc! ms #t)
-         (finish (append `((ref.func ,info))
-                         (apply append (map (lambda (c) `((local.get ,(car (lookup-local fc (car c)))))) captures))
-                         `((struct.new ,csub)))
-                 (list (make-ref #f csub)) expected))]
+         (op! (list 'ref.func info))
+         (for-each (lambda (c) (op! (list 'local.get (car (lookup-local fc (car c)))))) captures)
+         (op! (list 'struct.new csub))
+         (done (list (make-ref #f csub))))]
       ;; (apply-value head args): a call of the code of head, a closure,
       ;; given the closure; of a known function, a direct call of its
       ;; code, given the variables it captures, whatever check the head
@@ -745,39 +799,39 @@
               [k (and h (known-of fc (car h)))])
          (if k
              ;; The captures go as they are, a boxed one as its box.
-             (let* ([info (known-info! ms fc k)] [results (func-info-results info)]
-                    [c (append (args-code ms fc labels (cadr args) (map cdr (caddr (known-lambda k))))
-                               (map (lambda (key) `(local.get ,(car (lookup-local fc key)))) (known-captures k)))])
-               (if (and tail? (types<=? results (fctx-results fc)))
-                   (cons (append c `((return_call ,info))) results)
-                   (finish (append c `((call ,info))) results expected)))
-             (let* ([r (sub (car args) #f #f)] [t (cdr r)]
+             (let ([info (known-info! ms fc k)])
+               (args-code ms fc labels (cadr args) (map cdr (caddr (known-lambda k))))
+               (for-each (lambda (key) (op! (list 'local.get (car (lookup-local fc key))))) (known-captures k))
+               (call! (list 'call info) (func-info-results info)))
+             (let* ([t (sub (car args) #f #f)]
                     [code (and (single? t) (ref-type? (car t)) (closure-code (ref-heap (car t))))])
                (unless code
                  (fail "an application of ~a, which is not a function value: a function value has a closure type, (ref (closure (type ... -> type ...)))"
                        (type->string t)))
-               (let* ([closure (ref-heap (car t))] [sig (type-info-fields code)] [results (cadr sig)]
-                      [tmp (begin (note-type! ms code) (temp-local! fc (car t)))]
-                      [c (append (car r) `((local.tee ,tmp)) (if (ref-nullable? (car t)) '((ref.as_non_null)) '())
-                                 (args-code ms fc labels (cadr args) (cdr (car sig)))
-                                 `((local.get ,tmp) (struct.get ,closure 0)))])
+               (let* ([closure (ref-heap (car t))] [sig (type-info-fields code)]
+                      [tmp (begin (note-type! ms code) (temp-local! fc (car t)))])
+                 (op! (list 'local.tee tmp))
+                 (when (ref-nullable? (car t)) (op! '(ref.as_non_null)))
+                 (args-code ms fc labels (cadr args) (cdr (car sig)))
+                 (op! (list 'local.get tmp))
+                 (op! (list 'struct.get closure 0))
                  (set-mstate-uses-gc! ms #t)
-                 (if (and tail? (types<=? results (fctx-results fc)))
-                     (cons (append c `((return_call_ref ,code))) results)
-                     (finish (append c `((call_ref ,code))) results expected))))))]
+                 (call! (list 'call_ref code) (cadr sig))))))]
       [(quote)
        ;; A quoted fixnum or #f is a constant, and so are '() and #t, which
        ;; are globals of the kernel module. Other data is an entry in the
        ;; module's table of quoted data.
        (let* ([d (car args)] [g (datum-global d)])
-         (cond [(fixnum? d) (finish `((i32.const ,d) (ref.i31)) (list (make-ref #f 'i31)) expected)]
-               [(eq? d #f) (finish '((ref.null eq)) (list eqref) expected)]
-               [g (sub `(gref ,g) expected tail?)]
+         (cond [(fixnum? d) (op! (list 'i32.const d)) (op! '(ref.i31)) (done (list (make-ref #f 'i31)))]
+               [(eq? d #f) (op! '(ref.null eq)) (done (list eqref))]
+               [g (sub (list 'gref g) expected tail?)]
                [else
                 (let* ([lits (module-literals ms)] [i (serialize! (literals-serializer lits) d)])
                   (set-mstate-uses-gc! ms #t)
-                  (finish `((global.get ,(literals-table lits)) (i32.const ,i) (array.get ,table-type))
-                          (list eqref) expected))]))]
+                  (op! (list 'global.get (literals-table lits)))
+                  (op! (list 'i32.const i))
+                  (op! (list 'array.get table-type))
+                  (done (list eqref)))]))]
       [else (fail "internal: unknown kernel form ~s" (car e))])))
 
 ;; ---- quoted data ----
@@ -803,7 +857,7 @@
   (let ([r (list-tail form flag)])
     (if (and (pair? r) (not (car r))) #f (analyze-closures body params))))
 
-;; Function info compiled: (info signature local-types code). params are
+;; Function info compiled: (info signature local-types asm). params are
 ;; its parameters, each (key . type), own the lambda's own among them,
 ;; whose boxed ones are put in boxes first; analysis is closures.sub's of
 ;; the function it was in, or its own. A closure's code, of closure type
@@ -814,23 +868,23 @@
     (set-mstate-fname! ms (func-info-name info))
     (set! compiling (func-info-name info))
     (set! current-loc #f)
-    (let* ([prologue
-            (if csub
-                (let ([env (temp-local! fc (make-ref #f csub))])
-                  (append `((local.get 0) (ref.cast #f ,csub) (local.set ,env))
-                          (apply append
-                                 (map (lambda (c i)
-                                        (let ([l (add-local! fc (car c) (cdr c))])
-                                          `((local.get ,env) (struct.get ,csub ,(+ i 1)) (local.set ,l))))
-                                      captures (range (length captures))))))
-                '())]
-           [boxing (box-params! fc own)]
-           [code (car (cx ms fc '() body (func-info-results info) #t))]
-           ;; The prologue follows the body's first location, the function's own.
-           [code (if (and (pair? code) (eq? (car (car code)) 'location))
-                     (cons (car code) (append prologue boxing (cdr code)))
-                     (append prologue boxing code))])
-      (list info (list 'func (map cdr params) (func-info-results info)) (reverse (fctx-extra fc)) code))))
+    ;; The body's location, the function's own, comes first, then the
+    ;; prologue.
+    (let ([loc (loc-of body)]) (when loc (emit! fc (location-marker loc))))
+    (when csub
+      (let ([env (temp-local! fc (make-ref #f csub))])
+        (emit! fc '(local.get 0))
+        (emit! fc (list 'ref.cast #f csub))
+        (emit! fc (list 'local.set env))
+        (for-each (lambda (c i)
+                    (let ([l (add-local! fc (car c) (cdr c))])
+                      (emit! fc (list 'local.get env))
+                      (emit! fc (list 'struct.get csub (+ i 1)))
+                      (emit! fc (list 'local.set l))))
+                  captures (range (length captures)))))
+    (box-params! fc own)
+    (cx ms fc '() body (func-info-results info) #t)
+    (list info (list 'func (map cdr params) (func-info-results info)) (reverse (fctx-extra fc)) (fctx-asm fc))))
 
 ;; The functions lifted so far, compiled, in the order they were lifted;
 ;; compiling one may lift more.
@@ -866,6 +920,16 @@
 (define (loc-of e) (and (pair? e) (eq? (car e) 'at) (cadr e)))
 
 (define (const-op t) (string->symbol (string-append (symbol->string t) ".const")))
+
+;; The code of a value of type t that is zero or null, assembled: a
+;; global's initial value until its initializer runs.
+(define (zero-asm t)
+  (let ([a (new-asm)])
+    (instr! a (cond [(ref-type? t) (list 'ref.null (ref-heap t))]
+                    [(eq? t 'f32) (list 'f32.const (integer->flonum 0))]
+                    [(eq? t 'f64) (list 'f64.const (integer->flonum 0))]
+                    [else (list (const-op t) 0)]))
+    a))
 
 ;; Every type-info mentioned anywhere in x, dependencies first: its
 ;; supertype, then the types its fields mention. A recursion group comes as
@@ -904,9 +968,9 @@
               (begin (hash-set! exported s #t) s)))))))
 
 ;; Global initializers (spec 5.2). A constant expression is compiled into
-;; the global itself: a table info -> code. Any other initializer runs in
-;; the start function, so its global must be mutable and start with a
-;; default value.
+;; the global itself: a table info -> its code, assembled. Any other
+;; initializer runs in the start function, so its global must be mutable
+;; and start with a default value.
 (define (constant-inits ms global-forms analyses)
   (let ([earlier (make-hasheq)] [constants (make-hasheq)])
     (for-each (lambda (f)
@@ -917,7 +981,8 @@
                      (let ([fc (new-fctx '() '())])
                        (set-fctx-analysis! fc (hash-ref analyses info))
                        (set-mstate-fname! ms (global-info-name info))
-                       (hash-set! constants info (car (cx ms fc '() init (list t) #f))))]
+                       (cx ms fc '() init (list t) #f)
+                       (hash-set! constants info (fctx-asm fc)))]
                     [(not (global-info-mutable? info))
                      (fail "global ~a is immutable, so its initializer must be a constant expression; declare it (mut ~a) to compute it when the module starts"
                            (global-info-name info) (valtype->string t))]
@@ -984,24 +1049,21 @@
          ;; expressions, in source order.
          [start-fc (new-fctx '() '())]
          [init-code
-          (apply append
-                 (map (lambda (f)
-                        (case (car f)
-                          [(global)
-                           (let ([info (cadr f)] [init (caddr f)])
-                             (if (or (not init) (hash-ref constant-inits info #f))
-                                 '()
-                                 (begin
-                                   (set-fctx-analysis! start-fc (hash-ref global-analyses info))
-                                   (set-mstate-fname! ms (global-info-name info))
-                                   (append (car (cx ms start-fc '() init (list (global-info-type info)) #f))
-                                           `((global.set ,info))))))]
-                          [(expr)
-                           (set-fctx-analysis! start-fc (form-analysis f 2 (cadr f) '()))
-                           (set-mstate-fname! ms '__start)
-                           (car (cx ms start-fc '() (cadr f) '() #f))]
-                          [else '()]))
-                      forms))]
+          (for-each (lambda (f)
+                      (case (car f)
+                        [(global)
+                         (let ([info (cadr f)] [init (caddr f)])
+                           (unless (or (not init) (hash-ref constant-inits info #f))
+                             (set-fctx-analysis! start-fc (hash-ref global-analyses info))
+                             (set-mstate-fname! ms (global-info-name info))
+                             (cx ms start-fc '() init (list (global-info-type info)) #f)
+                             (emit! start-fc (list 'global.set info))))]
+                        [(expr)
+                         (set-fctx-analysis! start-fc (form-analysis f 2 (cadr f) '()))
+                         (set-mstate-fname! ms '__start)
+                         (cx ms start-fc '() (cadr f) '() #f)]
+                        [else #f]))
+                    forms)]
          ;; The functions lifted from lambdas, compiled after the code they
          ;; were lifted from.
          [compiled-funcs (append compiled-funcs (compile-pending! ms))]
@@ -1009,18 +1071,22 @@
          ;; segment follows the module's own data segments.
          [literal-segment (and (mstate-literals ms) (serializer-bytes (literals-serializer (mstate-literals ms))))]
          ;; Table registration for func-index and quoted constants, in the
-         ;; order the code above met them.
+         ;; order the code above met them: the start function's first code.
+         [setup (new-asm)]
          [setup-code
-          (apply append
-                 (map (lambda (s)
-                        (if (eq? (synth-kind s) 'fidx)
-                            `((ref.func ,(synth-datum s)) (i32.const 1) (table.grow 0) (global.set ,s))
-                            `((i32.const 0) (i32.const ,(bytes-length literal-segment))
-                              (array.new_data ,string-type ,(length data-forms))
-                              (call ,(ex '%deserialize)) (global.set ,s))))
-                      (reverse (mstate-synths ms))))]
-         [start-code (append setup-code init-code)]
-         [has-start? (not (null? start-code))]
+          (for-each (lambda (s)
+                      (if (eq? (synth-kind s) 'fidx)
+                          (begin (instr! setup (list 'ref.func (synth-datum s)))
+                                 (instr! setup '(i32.const 1))
+                                 (instr! setup '(table.grow 0))
+                                 (instr! setup (list 'global.set s)))
+                          (begin (instr! setup '(i32.const 0))
+                                 (instr! setup (list 'i32.const (bytes-length literal-segment)))
+                                 (instr! setup (list 'array.new_data string-type (length data-forms)))
+                                 (instr! setup (list 'call (ex '%deserialize)))
+                                 (instr! setup (list 'global.set s)))))
+                    (reverse (mstate-synths ms)))]
+         [has-start? (or (> (asm-size setup) 0) (> (asm-size (fctx-asm start-fc)) 0))]
          [checked
           (begin
             (when (and (mstate-uses-memory ms) (not memory-form))
@@ -1094,6 +1160,8 @@
          ;; its signature's.
          [func-type-index (lambda (info sig) (if (func-info-type info) (ti (func-info-type info)) (type-index sig)))]
 
+         ;; Linking (wasm.sub): each deferred field of the code, by kind
+         ;; and key. A function ref.func refers to is declared.
          [declared '()]
          [declared? (make-hasheqv)]
          [resolve-bt (lambda (bt)
@@ -1101,40 +1169,22 @@
                              [(null? bt) bt]
                              [else (rv bt)]))]
          [resolve
-          (letrec ([resolve
-                    (lambda (instrs)
-                      (map (lambda (i)
-                             (case (car i)
-                               [(call return_call) (list (car i) (fi (cadr i)))]
-                               [(ref.func) (let ([n (fi (cadr i))])
-                                             (unless (hash-ref declared? n #f)
-                                               (hash-set! declared? n #t)
-                                               (set! declared (cons n declared)))
-                                             (list 'ref.func n))]
-                               [(global.get global.set) (list (car i) (gi (cadr i)))]
-                               [(call_indirect return_call_indirect) (list (car i) (type-index (cadr i)) (caddr i))]
-                               [(call_ref return_call_ref) (list (car i) (ti (cadr i)))]
-                               [(block loop) (list (car i) (resolve-bt (cadr i)) (resolve (caddr i)))]
-                               [(if) (list 'if (resolve-bt (cadr i)) (resolve (caddr i)) (resolve (cadddr i)))]
-                               [(select-typed) (list 'select-typed (rv (cadr i)))]
-                               [(ref.null) (list 'ref.null (heap-index (cadr i)))]
-                               [(ref.test ref.cast) (list (car i) (cadr i) (heap-index (caddr i)))]
-                               [(struct.new array.new array.new_default array.get array.get_s array.get_u
-                                 array.set array.fill)
-                                (list (car i) (ti (cadr i)))]
-                               [(struct.get struct.get_s struct.get_u struct.set array.new_fixed)
-                                (list (car i) (ti (cadr i)) (caddr i))]
-                               [(array.copy) (list 'array.copy (ti (cadr i)) (ti (caddr i)))]
-                               [(array.new_data) (list 'array.new_data (ti (cadr i)) (caddr i))]
-                               [(throw) (list 'throw (tgi (cadr i)))]
-                               [(try_table)
-                                (list 'try_table (resolve-bt (cadr i))
-                                      (map (lambda (c) (if (memq (car c) '(catch catch_ref)) (list (car c) (tgi (cadr c)) (caddr c)) c))
-                                           (caddr i))
-                                      (resolve (cadddr i)))]
-                               [else i]))
-                           instrs))])
-            resolve)]
+          (lambda (kind key)
+            (case kind
+              [(func) (fi key)]
+              [(ref-func) (let ([n (fi key)])
+                            (unless (hash-ref declared? n #f)
+                              (hash-set! declared? n #t)
+                              (set! declared (cons n declared)))
+                            n)]
+              [(global) (gi key)]
+              [(type) (if (type-info? key) (ti key) (type-index key))]
+              [(tag) (tgi key)]
+              [(heap) (heap-index key)]
+              [(valtype) (rv key)]
+              [(blocktype) (resolve-bt (if (cell? key) (cell-value key) key))]
+              [(const) (cell-value key)]
+              [else (fail "internal: a deferred field of kind ~a" kind)]))]
 
          [imports
           (append
@@ -1152,31 +1202,25 @@
          [wfuncs
           (append
            (map (lambda (cf)
-                  (list (func-type-index (car cf) (cadr cf)) (map rv (caddr cf)) (resolve (cadddr cf))
+                  (list (func-type-index (car cf) (cadr cf)) (map rv (caddr cf)) (link-body (list (cadddr cf)) resolve)
                         (func-info-export (car cf))))
                 compiled-funcs)
            (if has-start?
-               (list (list (type-index '(func () ())) (map rv (reverse (fctx-extra start-fc))) (resolve start-code)
+               (list (list (type-index '(func () ())) (map rv (reverse (fctx-extra start-fc)))
+                           (link-body (list setup (fctx-asm start-fc)) resolve)
                            "__start"))
                '()))]
 
-         [zero-init (lambda (t)
-                      (if (ref-type? t)
-                          `((ref.null ,(heap-index (ref-heap t))))
-                          (case t
-                            [(f32) `((f32.const ,(integer->flonum 0)))]
-                            [(f64) `((f64.const ,(integer->flonum 0)))]
-                            [else `((,(const-op t) 0))])))]
-
+         [init-bytes (lambda (a) (car (link-body (list a) resolve)))]
          [wglobals
           (append
            (map (lambda (f)
                   (let* ([info (cadr f)] [t (global-info-type info)] [init (hash-ref constant-inits info #f)])
-                    (list (rv t) (global-info-mutable? info) (if init (resolve init) (zero-init t)))))
+                    (list (rv t) (global-info-mutable? info) (init-bytes (or init (zero-asm t))))))
                 global-forms)
            (map (lambda (s) (if (eq? (synth-kind s) 'fidx)
-                                (list 'i32 #t '((i32.const 0)))
-                                (list (rv (make-ref #t table-type)) #t `((ref.null ,(heap-index table-type))))))
+                                (list 'i32 #t (init-bytes (zero-asm 'i32)))
+                                (list (rv (make-ref #t table-type)) #t (init-bytes (zero-asm (make-ref #t table-type))))))
                 synths))]
 
          ;; A module's memory and table are exported as "memory" and
