@@ -138,6 +138,14 @@ function noteLocations(module, shift) {
   locations.set(moduleName, entries);
 }
 
+// A trap's backtrace (spec 4): the wasm frames of error e, each with its
+// source location, in main or in a start function while the program
+// loads; the host's own frames are not the program's.
+function backtrace(e) {
+  return (e.stack || '').split('\n').filter((l) => l.includes('wasm://') && !l.includes('subhost-trap'))
+    .map(located).join('\n');
+}
+
 // A backtrace line of V8's, "at f (wasm://wasm/MODULE-HASH:wasm-function[i]:0xOFFSET)",
 // with the source location of the frame added.
 function located(line) {
@@ -339,7 +347,8 @@ function instantiate(name, bytes, map) {
     // An exception out of the start function goes on to the caller (spec 4).
     if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError ||
           e instanceof WebAssembly.LinkError)) throw e;
-    lastError = `instantiate: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}`;
+    const where = backtrace(e);
+    lastError = `instantiate: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}${where ? `\n${where}` : ''}`;
     return false;
   }
   registry.set(name, self.exports);
@@ -352,10 +361,7 @@ function instantiate(name, bytes, map) {
 // the message with host.error_message.
 function fail(e, exports) {
   if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
-    // The wasm frames: the host's own are not the program's.
-    const where = (e.stack || '').split('\n').filter((l) => l.includes('wasm://') && !l.includes('subhost-trap'))
-      .map(located).join('\n');
-    lastError = `trap: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}\n${where}`;
+    lastError = `trap: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}\n${backtrace(e)}`;
   } else if (e instanceof WebAssembly.Exception) {
     lastError = 'uncaught exception';
   } else {
