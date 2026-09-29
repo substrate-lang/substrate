@@ -1,0 +1,839 @@
+;; Lifecycle: example. A C-like language on the kernel: C's types, memory
+;; and control, written as s-expressions, compiled to wasm that uses linear
+;; memory and no GC; its macros are in Substrate at compile time. A module
+;; takes these forms from c.sub, with its allocator (runtime.sub), with
+;; require-unqualified:
+;;
+;;   (define (f [x T] ...) -> R body ...)   a function, of result type R,
+;;   (define (f [x T] ...) body ...)        or of none
+;;   (define x T), (define x T init)        a global variable, in memory:
+;;                                          zero, or init's value
+;;   (struct S [field T] ...)               a struct type, laid out as C
+;;                                          lays it out
+;;   (typedef N T)                          N names type T
+;;   (let ([x T init] ...) body ...)        local variables, each of type T
+;;   (let ([x init] ...) body ...), let*    or of init's
+;;   (set! place e)                         e stored in place
+;;   (if c a [b]), (when c body ...), (unless c body ...), (begin body ...)
+;;   (while c body ...)                     a loop; for's variables are in
+;;   (for ([x T init] ...) c step body ...) scope for c, step and body,
+;;                                          and step runs after each body
+;;   (break), (continue), (return [e])
+;;   (f arg ...)                            a call of a function define
+;;                                          made, or of a kernel function
+;;                                          of numeric types
+;;   + - * / %                              arithmetic; + and - also on a
+;;                                          pointer and an integer, scaled
+;;                                          by the size of what it points
+;;                                          to, and - on two pointers
+;;   == != < <= > >=, and or not            comparisons and logic, 1 or 0
+;;   bit-and bit-or bit-xor bit-not << >>
+;;   (@ p), (@ p i)                         the places *p and p[i]
+;;   (-> p field ...)                       the place p->field, p a pointer
+;;                                          to a struct or a struct's place
+;;   (& place)                              its address
+;;   (cast T e), (sizeof T), (offsetof S field)
+;;   (memory.size) (memory.grow n) (memory.copy d s n) (memory.fill d v n)
+;;   integers, decimals, #\c, #t and #f (1 and 0), and "text", a (ptr u8)
+;;   to its bytes, followed by a 0
+;;
+;; The types are i8 u8 i16 u16 i32 u32 i64 u64, f32 f64, void (a result
+;; only), (ptr T), (array T n), n a count, and the names struct and
+;; typedef give. A variable or parameter is a number or a pointer; an
+;; array or struct is in memory: a global, or what malloc gives. C's
+;; conversions are implicit between numbers, and between a (ptr void) and
+;; another pointer; cast does the others, between numbers and pointers
+;; too. A narrower integer is an i32 once read, as C promotes it; an
+;; integer literal takes the type its place needs, and a decimal the type
+;; of the float it meets, or f64; an operation on numbers of two types is
+;; at the larger, unsigned if either is, as C's.
+;;
+;; How it works. A function is the kernel's, under its own name, with a
+;; fact that gives its C types (spec 6.5), which a call from any module
+;; reads. Its body is one macro use, c-body, which the module's second
+;; pass expands (spec 5.2): it expands the body to fully expanded code
+;; (spec 6.4), checks it and lowers it to kernel code, in one walk. C's
+;; operators and places are marks, quoted data that the walk reads, as the
+;; typed example's generics are (examples/typed/typed.sub); let is the
+;; kernel's, with each variable's declared type in a syntax property of
+;; its name. A struct's name is bound to its fields' syntax, which is laid
+;; out when a type needs it, so a field may point to a struct defined
+;; later; a struct's type holds the struct's name (spec 6.6), which leads
+;; back to it in any module. Memory is print.sub's, shared by every module
+;; (memory from print): sbrk gives out the bytes past 1024, which are
+;; zero, and a global is a kernel global holding the address of its bytes,
+;; which sbrk gives when the module starts, as it gives a string literal
+;; its bytes. No code quotes data, so a program is freestanding (spec 3.4).
+
+(require print "../../lib/print.sub")
+(begin-for-syntax
+  (require-unqualified substrate "../../lib/substrate.sub")
+  (require k kernel))
+
+(provide [define c-define] [struct c-struct] typedef [let c-let] [let* c-let*] [set! c-set!]
+         [#%datum c-datum] when unless while for break continue and or not cast sizeof offsetof @ & ->
+         + - * / % == != < <= > >= bit-and bit-or bit-xor bit-not << >> sbrk)
+
+(memory from print)
+
+;; The heap's end, a multiple of 8: memory past it has not been given out,
+;; so it is zero. Bytes 0..1023 are print's.
+(global brk (mut i32) 1024)
+
+;; n more bytes past the heap's end, which moves past them, rounded up to a
+;; multiple of 8: their address, or 0 if memory cannot grow.
+(func (sbrk [n i32]) -> i32
+  (let ([p brk] [end (i32.and (i32.add (i32.add brk n) 7) -8)] [size (i32.shl (memory.size) 16)])
+    (if (i32.gt_u end size)
+        (if (i32.lt_s (memory.grow (i32.shr_u (i32.add (i32.sub end size) 65535) 16)) 0)
+            (return 0)))
+    (set! brk end)
+    p))
+
+(begin-for-syntax
+  (define (c-error where form . args) (raise-syntax-error 'c (apply format form args) (written where)))
+
+  ;; Fully expanded e as it was written, near enough, for messages.
+  (define (written e)
+    (syntax-match e
+      [('#%datum d) d]
+      [('quote ('c-string s)) s]
+      [('quote ('c-sizeof t)) (syntax-rewrap e (list 'sizeof t))]
+      [('quote ('c-offsetof t f)) (syntax-rewrap e (list 'offsetof t f))]
+      [('#%app ('quote ((? identifier? m) . data)) arg ...)
+       (let ([ws (map written arg)] [data (syntax->list data)])
+         (syntax-rewrap e (case (syntax-e m)
+                            [(c-op) (cons (car data) ws)] [(c-cast) (cons 'cast (cons (car data) ws))]
+                            [(c-arrow) (list '-> (car ws) (car data))] [(c-deref) (cons '@ ws)] [(c-addr) (cons '& ws)]
+                            [(c-set!) (cons 'set! ws)] [(c-while) (cons 'while ws)] [(c-break) '(break)] [(c-continue) '(continue)]
+                            [else (cons (syntax-e m) ws)])))]
+      [('#%app f arg ...) (syntax-rewrap e (cons f (map written arg)))]
+      [(x ...) (syntax-rewrap e (map written x))]
+      [_ e]))
+
+  (define (syn d) (datum->syntax #'here d))
+
+  ;; form, located at where.
+  (define (at where form) (datum->syntax form (syntax-e form) where))
+
+  (define counter 0)
+  (define (fresh base)
+    (set! counter (+ counter 1))
+    (syn (string->symbol (format "~a~a" base counter))))
+
+  ;; ---- types ----
+  ;;
+  ;; A type is a datum: i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 void,
+  ;; (ptr T), (array T n) or (struct name S), name the name of the
+  ;; struct's definition (spec 6.6) and S its own. An expression's type is
+  ;; a number's, i32 u32 i64 u64 f32 f64, a pointer's or void; lit, an
+  ;; integer constant, or flit, a decimal, until its place gives it a type;
+  ;; or none, for an expression that does not finish, such as a return.
+
+  (define (integer-type? t) (memq t '(i8 u8 i16 u16 i32 u32 i64 u64 lit)))
+  (define (float-type? t) (memq t '(f32 f64 flit)))
+  (define (arithmetic? t) (or (integer-type? t) (float-type? t)))
+  (define (pointer? t) (and (pair? t) (eq? (car t) 'ptr)))
+  (define (array-type? t) (and (pair? t) (eq? (car t) 'array)))
+  (define (struct-type? t) (and (pair? t) (eq? (car t) 'struct)))
+
+  ;; The type of a value read from a place of type t: C's promotion.
+  (define (promoted t) (if (memq t '(i8 u8 i16 u16)) 'i32 t))
+
+  ;; A constant's type once nothing else gives it one.
+  (define (settled-type t) (case t [(lit) 'i32] [(flit) 'f64] [else t]))
+
+  (define (kernel-type t)
+    (cond [(memq t '(i64 u64)) 'i64] [(memq t '(f32 f64)) t] [(eq? t 'flit) 'f64] [else 'i32]))
+
+  ;; Type t as it is written, for messages.
+  (define (shown t)
+    (cond [(pointer? t) (list 'ptr (shown (cadr t)))]
+          [(array-type? t) (list 'array (shown (cadr t)) (caddr t))]
+          [(struct-type? t) (caddr t)]
+          [(eq? t 'none) 'void]
+          [else (settled-type t)]))
+
+  ;; Type syntax s as a type.
+  (define (parse-type s)
+    (syntax-match s
+      [(? identifier? x)
+       (if (memq (syntax-e x) '(i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 void)) (syntax-e x) (named-type x))]
+      [('ptr t) (list 'ptr (parse-type t))]
+      [('array t n)
+       (unless (and (integer? (syntax-e n)) (>= (syntax-e n) 0)) (c-error n "an array's length is a count"))
+       (list 'array (complete! (parse-type t) t) (syntax-e n))]
+      [_ (c-error s "expected a type")]))
+
+  ;; The type x names: a struct, whose name is bound to (c-struct S
+  ;; fields), or a typedef, bound to (c-typedef type).
+  (define (named-type x)
+    (let ([v (and (eq? (identifier-binding-kind x) 'compile-time-value) (syntax-local-value x))])
+      (cond [(and (pair? v) (eq? (car v) 'c-struct)) (list 'struct (k:identifier-name x) (cadr v))]
+            [(and (pair? v) (eq? (car v) 'c-typedef)) (cadr v)]
+            [else (c-error x "~a is not a type" (syntax-e x))])))
+
+  ;; t, a type of a variable, parameter or result, which must be a
+  ;; number's or a pointer's.
+  (define (scalar! t where)
+    (unless (or (arithmetic? t) (pointer? t))
+      (c-error where "expected a number or pointer type, not ~s: an array or struct is in memory" (shown t)))
+    t)
+
+  ;; t, which must have a size: it is not void, and holds no struct that
+  ;; holds it.
+  (define (complete! t where)
+    (cond [(eq? t 'void) (c-error where "void has no size")]
+          [(array-type? t) (complete! (cadr t) where)]
+          [(and (struct-type? t) (eq? (hash-ref layouts (cadr t) #f) 'laying-out))
+           (c-error where "~a holds itself" (caddr t))])
+    t)
+
+  (define (size-of t)
+    (cond [(memq t '(i8 u8)) 1] [(memq t '(i16 u16)) 2] [(memq t '(i64 u64 f64)) 8]
+          [(array-type? t) (* (caddr t) (size-of (cadr t)))]
+          [(struct-type? t) (car (layout t))]
+          [else 4]))
+
+  (define (alignment t)
+    (cond [(array-type? t) (alignment (cadr t))] [(struct-type? t) (cadr (layout t))] [else (size-of t)]))
+
+  (define (round-up n a) (* (quotient (+ n a -1) a) a))
+
+  ;; The layout of struct type t, (size alignment ((field type offset)
+  ;; ...)), as C's: each field at the next multiple of its alignment, and
+  ;; the size a multiple of the largest. Laid out once per compilation.
+  (define layouts (make-hasheq))
+  (define (layout t)
+    (let ([known (hash-ref layouts (cadr t) #f)])
+      (or known
+          (begin
+            (hash-set! layouts (cadr t) 'laying-out)
+            (let loop ([fs (syntax->list (caddr (syntax-local-value (k:name-identifier (cadr t)))))]
+                       [offset 0] [align 1] [out '()])
+              (if (null? fs)
+                  (let ([l (list (round-up offset align) align (reverse out))])
+                    (hash-set! layouts (cadr t) l)
+                    l)
+                  (syntax-match (car fs)
+                    [(f ft)
+                     (let* ([ty (complete! (parse-type ft) ft)] [a (alignment ty)] [o (round-up offset a)])
+                       (loop (cdr fs) (+ o (size-of ty)) (max align a) (cons (list (syntax-e f) ty o) out)))])))))))
+
+  ;; ---- definitions ----
+
+  ;; form, as a module-level form of the second pass, which expands it
+  ;; once every definition of the module is declared (spec 5.2).
+  (define (second-pass form) #`(let () #,form))
+
+  ;; (define (f [x T] ...) -> R body ...), (define x T [init]).
+  (define (c-define s)
+    (syntax-match s
+      [(_ ((? identifier? f) ((? identifier? x) t) ...) '-> r body ...) (function s f x t r body)]
+      [(_ ((? identifier? f) ((? identifier? x) t) ...) body ...) (function s f x t #'void body)]
+      [(_ (? identifier? x) t) (global s x t '())]
+      [(_ (? identifier? x) t init) (global s x t (list init))]
+      [_ (c-error s "expected (define (f [x type] ...) -> type body ...) or (define x type [value])")]))
+
+  ;; Function f: the kernel's, of the kernel types of its C types, whose
+  ;; body c-body checks and lowers in the second pass, and a fact that
+  ;; gives its C types, (c-function (T ...) R).
+  (define (function s f xs ts r body)
+    (let ([ps (map (lambda (t) (scalar! (parse-type t) t)) ts)]
+          [rt (let ([t (parse-type r)]) (if (eq? t 'void) t (scalar! t r)))])
+      #`(begin
+          #,(at s #`(func (#,f #,@(map (lambda (x p) #`[#,x #,(syn (kernel-type p))]) xs ps))
+                      #,@(if (eq? rt 'void) '() (list #'-> (syn (kernel-type rt))))
+                      (c-body (#,@xs) '#,(syn (cons rt ps)) #,@body)))
+          (#%fact #,f '#,(syn (list 'c-function ps rt))))))
+
+  ;; Global x: a kernel global holding the address of its bytes, which
+  ;; c-static gives it when the module starts, and a fact that gives its
+  ;; type, (c-global T).
+  (define (global s x t init)
+    (let ([ty (complete! (parse-type t) t)])
+      #`(begin
+          #,(at s #`(global #,x (mut i32) (c-static '#,(syn ty) #,@init)))
+          (#%fact #,x '#,(syn (list 'c-global ty))))))
+
+  ;; (c-static 'T [init]): the address of a global's bytes, new from sbrk,
+  ;; so zero, with init's value stored in them.
+  (define (c-static s)
+    (syntax-match s
+      [(_ ('quote t)) #`(sbrk #,(syn (size-of (syntax->datum t))))]
+      [(_ ('quote t) init)
+       (let* ([t (syntax->datum t)] [p (fresh 'p)]
+              [r (with-function 'void (lambda () (check (local-expand init) '() t)))])
+         (unless (or (arithmetic? t) (pointer? t)) (c-error init "only a number or pointer global has an initial value"))
+         #`(let ([#,p (sbrk #,(syn (size-of t)))]) #,(store t p 0 (convert r t init #t)) #,p))]))
+
+  ;; (struct S [field T] ...): S bound to (c-struct S fields), laid out in
+  ;; the second pass, which reports its errors (c-struct-check), or before,
+  ;; when a type needs it.
+  (define (c-struct s)
+    (syntax-match s
+      [(_ (? identifier? name) field ...)
+       (let loop ([fs field] [seen '()])
+         (unless (null? fs)
+           (syntax-match (car fs)
+             [((? identifier? f) _)
+              (when (memq (syntax-e f) seen) (c-error f "~a is a field twice" (syntax-e f)))
+              (loop (cdr fs) (cons (syntax-e f) seen))]
+             [_ (c-error (car fs) "expected [field type]")])))
+       #`(begin (define-syntax #,name (list 'c-struct '#,name (quote-syntax (#,@field))))
+                #,(second-pass #`(c-struct-check #,name)))]))
+
+  (define (c-struct-check s) (syntax-match s [(_ name) (layout (named-type name)) #'(begin)]))
+
+  (define (c-typedef s)
+    (syntax-match s
+      [(_ (? identifier? n) t) #`(define-syntax #,n (list 'c-typedef '#,(syn (parse-type t))))]))
+
+  ;; ---- forms ----
+
+  ;; A transformer whose use, alone or at the head of an application, is
+  ;; mark, quoted data that the walk reads.
+  (define (mark-transformer mark)
+    (transformer (s)
+      (syntax-match s
+        [(_ arg ...) (at s #`(#%app '#,(syn mark) #,@arg))]
+        [_ (at s #`'#,(syn mark))])))
+
+  ;; (let ([x T init] | [x init] ...) body ...): the kernel's, each x with
+  ;; its type T, if it is given, in a property.
+  (define (c-let s)
+    (syntax-match s
+      [(_ (b ...) body ...)
+       (at s #`(let (#,@(map (lambda (b)
+                               (syntax-match b
+                                 [((? identifier? x) t init) #`[#,(syntax-property x 'c-type (parse-type t)) #,init]]
+                                 [((? identifier? x) init) #`[#,x #,init]]
+                                 [_ (c-error b "expected [x type value] or [x value]")]))
+                             b))
+                 #,@body))]))
+
+  (define (c-let* s)
+    (syntax-match s
+      [(_ () body ...) (at s #`(c-let () #,@body))]
+      [(_ (b rest ...) body ...) (at s #`(c-let (#,b) (c-let* (#,@rest) #,@body)))]))
+
+  (define (c-datum s)
+    (syntax-match s [(_ d) (if (string? (syntax-e d)) (at s #`'(c-string #,d)) #`(#%datum #,d))]))
+
+  (define (c-when s) (syntax-match s [(_ c body ...) (at s #`(if #,c (begin #,@body)))]))
+  (define (c-unless s) (syntax-match s [(_ c body ...) (at s #`(if #,c (begin) (begin #,@body)))]))
+
+  (define (c-while s)
+    (syntax-match s [(_ c body ...) (at s #`(#%app '(c-while) #,c (begin #,@body)))]))
+
+  (define (c-for s)
+    (syntax-match s
+      [(_ (b ...) c step body ...) (at s #`(c-let (#,@b) (#%app '(c-while) #,c (begin #,@body) #,step)))]))
+
+  (define (c-cast s) (syntax-match s [(_ t e) (at s #`(#%app '(c-cast #,t) #,e))]))
+  (define (c-sizeof s) (syntax-match s [(_ t) (at s #`'(c-sizeof #,t))]))
+  (define (c-offsetof s) (syntax-match s [(_ t (? identifier? f)) (at s #`'(c-offsetof #,t #,f))]))
+
+  (define (c-arrow s)
+    (syntax-match s
+      [(_ e (? identifier? f) (? identifier? g) ...)
+       (foldl (lambda (f e) (at s #`(#%app '(c-arrow #,f) #,e))) e (cons f g))]))
+
+  ;; ---- bodies ----
+  ;;
+  ;; One walk over fully expanded code (spec 6.4) checks each expression
+  ;; and gives its type and its kernel code, as (type . code); a
+  ;; constant's code, while its type is lit or flit, is its value. env
+  ;; holds the local variables, each as (key . type), key its local
+  ;; binding (spec 2.3).
+
+  ;; The function being checked's result type, and its loops, innermost
+  ;; first, each the labels (break . continue).
+  (define result 'void)
+  (define loops '())
+
+  (define (with-function r thunk)
+    (let ([r0 result] [l0 loops])
+      (dynamic-wind (lambda () (set! result r) (set! loops '())) thunk (lambda () (set! result r0) (set! loops l0)))))
+
+  ;; (c-body (x ...) '(R T ...) body ...): the body of a function whose
+  ;; parameters x ... are of types T ... and whose result type is R.
+  (define (c-body s)
+    (syntax-match s
+      [(_ (x ...) ('quote types) body ...)
+       (let* ([types (syntax->datum types)] [r (car types)]
+              [env (map (lambda (x t) (cons (k:local-binding (local-expand x)) t)) x (cdr types))])
+         (with-function r
+           (lambda ()
+             (let ([b (check-sequence s (map local-expand body) env (and (not (eq? r 'void)) r))])
+               (if (eq? r 'void) (as-void b) (convert b r (if (null? body) s (last body))))))))]))
+
+  ;; e's (type . code), the code located at e. hint, if it is given, is
+  ;; the type e's place expects, which a constant that a let, if or begin
+  ;; ends with takes.
+  (define (check e env . hint)
+    (let ([r (check-expression e env (and (pair? hint) (car hint)))])
+      (if (and (syntax? (cdr r)) (pair? (syntax-e (cdr r)))) (cons (car r) (syntax-rewrap e (syntax-e (cdr r)))) r)))
+
+  ;; e's value, as one of type t.
+  (define (expect e t env . stored) (apply convert (check e env t) t e stored))
+
+  (define (check-expression e env hint)
+    (syntax-match e
+      [(? identifier? x) (read-place (variable-place x env) e)]
+      [('#%datum d) (literal e (syntax-e d))]
+      [('quote ('c-string s)) (string-literal (syntax-e s))]
+      [('quote ('c-sizeof t)) (cons 'lit (size-of (complete! (parse-type t) t)))]
+      [('quote ('c-offsetof t f))
+       (let ([ty (parse-type t)])
+         (unless (struct-type? ty) (c-error t "~s is not a struct" (shown ty)))
+         (cons 'lit (caddr (field-of ty f))))]
+      [('#%app ('quote ('c-op o)) arg ...) (check-op e (syntax-e o) arg env)]
+      [('#%app ('quote ('c-cast t)) x) (check-cast t x env)]
+      [('#%app ('quote ('c-set!)) place v) (check-set place v env)]
+      [('#%app ('quote ('c-addr)) place) (let ([p (check-place place env)]) (cons (list 'ptr (car p)) (address p place)))]
+      [('#%app ('quote ('c-while)) c body step ...) (check-while c body step env)]
+      [('#%app ('quote ('c-break))) (jump e car)]
+      [('#%app ('quote ('c-continue))) (jump e cdr)]
+      [('#%app ('quote ('c-deref)) . _) (read-place (check-place e env) e)]
+      [('#%app ('quote ('c-arrow _)) . _) (read-place (check-place e env) e)]
+      [('#%app ('quote _) . _) (c-error e "bad syntax")]
+      [('#%app (? identifier? f) arg ...) (check-call e f arg env)]
+      [('let (b ...) body ...) (check-let e b body env hint)]
+      [('if c a) (cons 'void #`(if #,(truth (check c env) c) #,(as-void (check a env))))]
+      [('if c a b)
+       (let* ([t (truth (check c env) c)] [ra (check a env hint)] [rb (check b env hint)]
+              [ty (promoted (settled-for (join (car ra) (car rb)) hint))])
+         (cons ty #`(if #,t #,(as ra ty a) #,(as rb ty b))))]
+      [('begin body ...) (check-sequence e body env hint)]
+      [('return) (unless (eq? result 'void) (c-error e "expected a value to return")) (cons 'none e)]
+      [('return v)
+       (when (eq? result 'void) (c-error e "this function returns no value"))
+       (cons 'none #`(return #,(expect v result env)))]
+      [('memory.size) (cons 'i32 e)]
+      [('memory.grow n) (cons 'i32 #`(memory.grow #,(expect n 'i32 env)))]
+      [('memory.copy d s n) (cons 'void #`(memory.copy #,(address-value d env) #,(address-value s env) #,(expect n 'i32 env)))]
+      [('memory.fill d v n) (cons 'void #`(memory.fill #,(address-value d env) #,(expect v 'i32 env) #,(expect n 'i32 env)))]
+      [_ (c-error e "this is not C code")]))
+
+  ;; forms, a body: its value is the last's, and the others' are dropped.
+  (define (check-sequence where forms env hint)
+    (cond [(null? forms) (cons 'void #'(nop))]
+          [(null? (cdr forms)) (check (car forms) env hint)]
+          [else (let* ([codes (map (lambda (f) (as-void (check f env))) (take forms (- (length forms) 1)))]
+                       [r (settle (check (last forms) env hint) hint (last forms))])
+                  (cons (car r) (at where #`(begin #,@codes #,(cdr r)))))]))
+
+  (define (literal e d)
+    (cond [(integer? d) (cons 'lit d)]
+          [(number? d) (cons 'flit d)]
+          [(char? d) (cons 'lit (char->integer d))]
+          [(boolean? d) (cons 'lit (if d 1 0))]
+          [else (c-error e "~s is not a C literal" d)]))
+
+  ;; A let: each variable's type is the one its property gives, or its
+  ;; value's.
+  (define (check-let e bindings body env hint)
+    (let* ([bs (map (lambda (b)
+                      (syntax-match b
+                        [(x init)
+                         (let* ([declared (syntax-property x 'c-type)] [r (check init env declared)]
+                                [t (scalar! (or declared (settled-type (car r))) x)])
+                           (list x t (convert r t init)))]))
+                    bindings)]
+           [inner (append (map (lambda (b) (cons (k:local-binding (car b)) (cadr b))) bs) env)]
+           [r (settle (check-sequence e body inner hint) hint e)])
+      (cons (car r) #`(let (#,@(map (lambda (b) #`[#,(car b) #,(syn (kernel-type (cadr b))) #,(caddr b)]) bs)) #,(cdr r)))))
+
+  ;; A call of function f: a C function, whose fact gives its types, or a
+  ;; kernel function of numbers.
+  (define (check-call e f args env)
+    (let* ([sig (function-type f)] [ps (car sig)] [r (cadr sig)])
+      (unless (= (length ps) (length args))
+        (c-error e "~a takes ~a argument~a, got ~a" (syntax-e f) (length ps) (if (= (length ps) 1) "" "s") (length args)))
+      (cons (promoted r) #`(#%app #,f #,@(map (lambda (a p) (expect a p env)) args ps)))))
+
+  (define (function-type f)
+    (unless (eq? (identifier-binding-kind f) 'function) (c-error f "~a is not a function" (syntax-e f)))
+    (or (fact f 'c-function)
+        (let* ([sig (k:identifier-function-signature f)] [rs (cdr (memq '-> sig))])
+          (for-each (lambda (t) (unless (memq t '(i32 i64 f32 f64 ->)) (c-error f "~a takes or returns ~s, which C has not" (syntax-e f) t)))
+                    sig)
+          (when (and (pair? rs) (pair? (cdr rs))) (c-error f "~a returns more than one value" (syntax-e f)))
+          (list (take sig (- (length sig) (length rs) 1)) (if (null? rs) 'void (car rs))))))
+
+  ;; What the fact of kind kind about id's definition gives, or #f.
+  (define (fact id kind)
+    (let ([f (findf (lambda (v) (and (pair? v) (eq? (car v) kind))) (map caddr (k:syntax-local-facts id)))])
+      (and f (cdr f))))
+
+  ;; ---- places ----
+  ;;
+  ;; A place is (T local x), local variable x, or (T memory a o), the
+  ;; bytes at the address a's code gives plus o, a count; T is its type.
+
+  (define (check-place e env)
+    (syntax-match e
+      [(? identifier? x) (variable-place x env)]
+      [('#%app ('quote ('c-deref)) p) (let ([r (check p env)]) (list (pointee r p) 'memory (cdr r) 0))]
+      [('#%app ('quote ('c-deref)) p i) (index-place p i env)]
+      [('#%app ('quote ('c-arrow f)) s) (field-place s f env)]
+      [_ (c-error e "expected a place: a variable, (@ p), (@ p i) or (-> p field)")]))
+
+  (define (place-form? e)
+    (syntax-match e
+      [(? identifier? _) #t]
+      [('#%app ('quote ((? identifier? m) . _)) . _) (and (memq (syntax-e m) '(c-deref c-arrow)) #t)]
+      [_ #f]))
+
+  (define (variable-place x env)
+    (let ([b (assv (k:local-binding x) env)])
+      (cond [b (list (cdr b) 'local x)]
+            [(and (eq? (identifier-binding-kind x) 'variable) (fact x 'c-global)) (list (car (fact x 'c-global)) 'memory x 0)]
+            [(eq? (identifier-binding-kind x) 'function) (c-error x "~a is a function, not a value" (syntax-e x))]
+            [else (c-error x "~a is not a C variable" (syntax-e x))])))
+
+  (define (pointee r where)
+    (unless (pointer? (car r)) (c-error where "expected a pointer, got ~s" (shown (car r))))
+    (when (eq? (cadr (car r)) 'void) (c-error where "a (ptr void) points to no type: cast it"))
+    (cadr (car r)))
+
+  ;; p[i]: at i times the size past p, as an offset if i is a constant.
+  (define (index-place p i env)
+    (let* ([r (check p env)] [t (pointee r p)] [n (check i env)] [size (size-of (complete! t p))])
+      (unless (integer-type? (car n)) (c-error i "an index is an integer, not ~s" (shown (car n))))
+      (if (and (eq? (car n) 'lit) (>= (cdr n) 0))
+          (list t 'memory (cdr r) (* (cdr n) size))
+          (list t 'memory #`(i32.add #,(cdr r) #,(scaled n size i)) 0))))
+
+  ;; s->f: s a pointer to a struct, or a struct's place.
+  (define (field-place s f env)
+    (let* ([p (and (place-form? s) (check-place s env))]
+           [base (if (and p (struct-type? (car p)))
+                     p
+                     (let ([r (if p (read-place p s) (check s env))])
+                       (unless (and (pointer? (car r)) (struct-type? (cadr (car r))))
+                         (c-error s "-> takes a pointer to a struct, or a struct, not ~s" (shown (car r))))
+                       (list (cadr (car r)) 'memory (cdr r) 0)))]
+           [field (field-of (car base) f)])
+      (list (cadr field) 'memory (caddr base) (+ (cadddr base) (caddr field)))))
+
+  ;; Field f of struct type t: (f type offset).
+  (define (field-of t f)
+    (or (assq (syntax-e f) (caddr (layout t))) (c-error f "~a has no field ~a" (shown t) (syntax-e f))))
+
+  ;; A place's value: an array's is the address of its first element, as
+  ;; in C, and a struct has none.
+  (define (read-place p e)
+    (let ([t (car p)])
+      (cond [(array-type? t) (cons (list 'ptr (cadr t)) (address p e))]
+            [(struct-type? t) (c-error e "a struct is not a value: take its address with &, or a field with ->")]
+            [(eq? (cadr p) 'local) (cons (promoted t) (caddr p))]
+            [else (cons (promoted t) (load t (caddr p) (cadddr p)))])))
+
+  (define (address p where)
+    (when (eq? (cadr p) 'local)
+      (c-error where "~a is a local variable, not in memory: it has no address" (syntax-e (caddr p))))
+    (if (= (cadddr p) 0) (caddr p) #`(i32.add #,(caddr p) #,(const 'i32 (cadddr p)))))
+
+  (define (check-set place v env)
+    (let* ([p (check-place place env)] [t (car p)])
+      (unless (or (arithmetic? t) (pointer? t)) (c-error place "~s cannot be assigned: copy it with memcpy" (shown t)))
+      (if (eq? (cadr p) 'local)
+          (cons 'void #`(set! #,(caddr p) #,(expect v t env)))
+          (cons 'void (store t (caddr p) (cadddr p) (expect v t env #t))))))
+
+  (define (memory-op name a o . v)
+    (let ([op (syn name)])
+      (if (= o 0) #`(#,op #,a #,@v) #`(#,op #,a #,@v #,(syn o)))))
+
+  (define (load t a o)
+    (memory-op (case t
+                 [(i8) 'i32.load8_s] [(u8) 'i32.load8_u] [(i16) 'i32.load16_s] [(u16) 'i32.load16_u]
+                 [(i64 u64) 'i64.load] [(f32) 'f32.load] [(f64) 'f64.load] [else 'i32.load])
+               a o))
+
+  (define (store t a o v)
+    (memory-op (case t
+                 [(i8 u8) 'i32.store8] [(i16 u16) 'i32.store16] [(i64 u64) 'i64.store]
+                 [(f32) 'f32.store] [(f64) 'f64.store] [else 'i32.store])
+               a o v))
+
+  ;; An address for a memory instruction: a pointer, or an integer.
+  (define (address-value e env)
+    (let ([r (check e env)]) (if (pointer? (car r)) (cdr r) (convert r 'i32 e))))
+
+  ;; ---- values ----
+
+  (define (const t n) #`(#,(syn (string->symbol (format "~a.const" t))) #,(syn n)))
+  (define (op-name t name) (syn (string->symbol (format "~a.~a" (kernel-type t) name))))
+
+  ;; r, a constant made a value of the type hint gives, or its own.
+  (define (settle r hint where)
+    (let ([t (settled-for (car r) hint)])
+      (if (eq? t (car r)) r (cons (promoted t) (convert r t where)))))
+
+  (define (settled-for t hint) (if (and hint (memq t '(lit flit))) hint (settled-type t)))
+
+  (define (as-void r)
+    (cond [(memq (car r) '(void none)) (cdr r)]
+          [(memq (car r) '(lit flit)) #'(nop)]
+          [else #`(drop #,(cdr r))]))
+
+  ;; The code of r as a value of type ty, or with none if ty is void.
+  (define (as r ty where) (if (eq? ty 'void) (as-void r) (convert r ty where)))
+
+  ;; The type of an if whose branches are of types a and b.
+  (define (join a b)
+    (cond [(eq? a 'none) b]
+          [(eq? b 'none) a]
+          [(or (eq? a 'void) (eq? b 'void)) 'void]
+          [(and (memq a '(lit flit)) (eq? a b)) a]
+          [(and (arithmetic? a) (arithmetic? b)) (common a b)]
+          [(and (pointer? a) (or (equal? a b) (eq? b 'lit))) a]
+          [(and (pointer? b) (eq? a 'lit)) b]
+          [(and (pointer? a) (pointer? b) (or (eq? (cadr a) 'void) (eq? (cadr b) 'void))) '(ptr void)]
+          [else 'void]))
+
+  ;; The type two numbers of types a and b meet at: the larger, unsigned
+  ;; if either is; a constant takes the other's type.
+  (define (common a b)
+    (cond [(eq? a 'lit) (if (eq? b 'flit) 'f64 (settled-type b))]
+          [(eq? b 'lit) (common b a)]
+          [(eq? a 'flit) (if (eq? b 'f32) 'f32 'f64)]
+          [(eq? b 'flit) (common b a)]
+          [else (let ([ranks '(i32 u32 i64 u64 f32 f64)]) (if (< (length (memq a ranks)) (length (memq b ranks))) a b))]))
+
+  ;; An i32 that is not 0 if r's value is not 0 or null, for a condition.
+  (define (truth r where)
+    (let* ([r (settle r #f where)] [t (car r)])
+      (cond [(or (memq t '(i32 u32)) (pointer? t)) (cdr r)]
+            [(arithmetic? t) #`(#,(op-name t 'ne) #,(cdr r) #,(const (kernel-type t) 0))]
+            [else (c-error where "expected a number or a pointer, got ~s" (shown t))])))
+
+  ;; truth's, as 1 or 0.
+  (define (boolean r where)
+    (let ([r (settle r #f where)])
+      (if (or (memq (car r) '(i32 u32)) (pointer? (car r))) #`(i32.ne #,(cdr r) (i32.const 0)) (truth r where))))
+
+  ;; The code of r as a value of type t: C's implicit conversions. A
+  ;; narrower integer is normalized, sign or zero extended, unless the
+  ;; value is stored in memory, which cuts it anyway.
+  (define (convert r t where . stored)
+    (let ([from (car r)] [c (cdr r)] [normalize? (null? stored)])
+      (cond [(eq? from 'none) c]
+            [(eq? from 'void) (c-error where "this has no value, but ~s is expected" (shown t))]
+            [(eq? from 'lit) (constant c t where)]
+            [(eq? from 'flit) (if (float-type? t) (const t c) (numeric (const 'f64 c) 'f64 t normalize?))]
+            [(pointer? t)
+             (unless (and (pointer? from) (or (equal? from t) (eq? (cadr from) 'void) (eq? (cadr t) 'void)))
+               (c-error where "expected ~s, got ~s" (shown t) (shown from)))
+             c]
+            [(or (pointer? from) (not (arithmetic? t))) (c-error where "expected ~s, got ~s" (shown t) (shown from))]
+            [else (numeric c from t normalize?)])))
+
+  (define (constant n t where)
+    (cond [(pointer? t) (if (= n 0) (const 'i32 0) (c-error where "~a is not a pointer: cast it" n))]
+          [(float-type? t) (const t n)]
+          [(integer-type? t)
+           (const (kernel-type t)
+                  (case t
+                    [(u8) (bitwise-and n 255)] [(u16) (bitwise-and n 65535)]
+                    [(i8) (- (bitwise-and (+ n 128) 255) 128)] [(i16) (- (bitwise-and (+ n 32768) 65535) 32768)]
+                    [else n]))]
+          [else (c-error where "expected ~s, got ~a" (shown t) n)]))
+
+  ;; Code c, a number of type from, as one of type t.
+  (define (numeric c from t normalize?)
+    (let* ([to (promoted t)] [kf (kernel-type from)] [kt (kernel-type to)] [signed (memq from '(i32 i64))]
+           [v (cond [(eq? kf kt) c]
+                    [(and (eq? kf 'i32) (eq? kt 'i64)) #`(#,(if signed #'i64.extend_i32_s #'i64.extend_i32_u) #,c)]
+                    [(and (eq? kf 'i64) (eq? kt 'i32)) #`(i32.wrap_i64 #,c)]
+                    [(float-type? from)
+                     (if (float-type? to)
+                         #`(#,(if (eq? kt 'f64) #'f64.promote_f32 #'f32.demote_f64) #,c)
+                         #`(#,(op-name to (format "trunc_~a_~a" kf (if (memq to '(i32 i64)) 's 'u))) #,c))]
+                    [else #`(#,(op-name to (format "convert_~a_~a" kf (if signed 's 'u))) #,c)])])
+      (if normalize?
+          (case t
+            [(i8) #`(i32.extend8_s #,v)] [(i16) #`(i32.extend16_s #,v)]
+            [(u8) #`(i32.and #,v (i32.const 255))] [(u16) #`(i32.and #,v (i32.const 65535))]
+            [else v])
+          v)))
+
+  (define (check-cast t x env)
+    (let* ([to (parse-type t)] [r (check x env)] [from (car r)])
+      (cond [(eq? to 'void) (cons 'void (as-void r))]
+            [(pointer? to)
+             (cond [(eq? from 'lit) (cons to (const 'i32 (cdr r)))]
+                   [(or (pointer? from) (memq from '(i32 u32))) (cons to (cdr r))]
+                   [(memq from '(i64 u64)) (cons to #`(i32.wrap_i64 #,(cdr r)))]
+                   [else (c-error x "cannot cast ~s to ~s" (shown from) (shown to))])]
+            [(and (pointer? from) (integer-type? to)) (cons (promoted to) (numeric (cdr r) 'u32 to #t))]
+            [else (cons (promoted (scalar! to t)) (convert r to x))])))
+
+  ;; ---- operators ----
+
+  (define (check-op e o args env)
+    (let ([rs (map (lambda (a) (check a env)) args)] [n (length args)])
+      (case o
+        [(+ * bit-and bit-or bit-xor)
+         (arity! e o (>= n 2) "two or more arguments")
+         (foldl (lambda (b a) (binary e o a b)) (car rs) (cdr rs))]
+        [(-)
+         (arity! e o (>= n 1) "one or more arguments")
+         (if (= n 1) (negate e (car rs)) (foldl (lambda (b a) (binary e o a b)) (car rs) (cdr rs)))]
+        [(and or) (logical o rs args)]
+        [(not) (arity! e o (= n 1) "one argument") (cons 'i32 #`(i32.eqz #,(truth (car rs) (car args))))]
+        [(bit-not)
+         (arity! e o (= n 1) "one argument")
+         (let ([t (settled-type (car (car rs)))])
+           (unless (integer-type? t) (c-error e "bit-not takes an integer, not ~s" (shown t)))
+           (cons t #`(#,(op-name t 'xor) #,(convert (car rs) t e) #,(const (kernel-type t) -1))))]
+        [else (arity! e o (= n 2) "two arguments") (binary e o (car rs) (cadr rs))])))
+
+  (define (arity! e o ok what) (unless ok (c-error e "~a takes ~a" o what)))
+
+  (define (binary e o a b)
+    (let ([ta (car a)] [tb (car b)])
+      (cond [(and (memq o '(+ -)) (pointer? ta) (integer-type? tb)) (offset e o a b)]
+            [(and (eq? o '+) (integer-type? ta) (pointer? tb)) (offset e o b a)]
+            [(and (eq? o '-) (pointer? ta) (pointer? tb))
+             (unless (equal? ta tb) (c-error e "- takes pointers of one type, not ~s and ~s" (shown ta) (shown tb)))
+             (let ([size (size-of (complete! (cadr ta) e))] [d #`(i32.sub #,(cdr a) #,(cdr b))])
+               (cons 'i32 (if (= size 1) d #`(i32.div_s #,d #,(const 'i32 size)))))]
+            [(memq o '(== != < <= > >=))
+             (let ([t (cond [(pointer? ta) ta]
+                            [(pointer? tb) tb]
+                            [(and (arithmetic? ta) (arithmetic? tb)) (common ta tb)]
+                            [else (c-error e "~a compares numbers or pointers, not ~s and ~s" o (shown ta) (shown tb))])])
+               (cons 'i32 #`(#,(instruction o t) #,(convert a t e) #,(convert b t e))))]
+            [(and (arithmetic? ta) (arithmetic? tb))
+             (let ([t (if (memq o '(<< >>)) (settled-type ta) (common ta tb))])
+               (when (and (memq o '(% bit-and bit-or bit-xor << >>)) (not (and (integer-type? t) (integer-type? tb))))
+                 (c-error e "~a takes integers, not ~s and ~s" o (shown ta) (shown tb)))
+               (cons t #`(#,(instruction o t) #,(convert a t e) #,(convert b t e))))]
+            [else (c-error e "~a takes numbers, not ~s and ~s" o (shown ta) (shown tb))])))
+
+  ;; The instruction for o on values of type t.
+  (define (instruction o t)
+    (let ([u (or (memq t '(u32 u64)) (pointer? t))] [f (float-type? t)])
+      (op-name t (case o
+                   [(+) 'add] [(-) 'sub] [(*) 'mul] [(/) (if f 'div (if u 'div_u 'div_s))] [(%) (if u 'rem_u 'rem_s)]
+                   [(bit-and) 'and] [(bit-or) 'or] [(bit-xor) 'xor] [(<<) 'shl] [(>>) (if u 'shr_u 'shr_s)]
+                   [(==) 'eq] [(!=) 'ne]
+                   [(<) (if f 'lt (if u 'lt_u 'lt_s))] [(<=) (if f 'le (if u 'le_u 'le_s))]
+                   [(>) (if f 'gt (if u 'gt_u 'gt_s))] [(>=) (if f 'ge (if u 'ge_u 'ge_s))]))))
+
+  ;; Pointer p plus or minus integer n, scaled by the size p points to.
+  (define (offset e o p n)
+    (cons (car p) #`(#,(instruction o 'i32) #,(cdr p) #,(scaled n (size-of (complete! (cadr (car p)) e)) e))))
+
+  ;; The code of integer n times size, an i32.
+  (define (scaled n size where)
+    (if (eq? (car n) 'lit)
+        (const 'i32 (* (cdr n) size))
+        (let ([i (convert n 'i32 where)]) (if (= size 1) i #`(i32.mul #,i #,(const 'i32 size))))))
+
+  (define (negate e r)
+    (let ([t (car r)])
+      (cond [(memq t '(lit flit)) (cons t (- (cdr r)))]
+            [(float-type? t) (cons t #`(#,(op-name t 'neg) #,(cdr r)))]
+            [(integer-type? t) (cons t #`(#,(op-name t 'sub) #,(const (kernel-type t) 0) #,(cdr r)))]
+            [else (c-error e "- takes a number, not ~s" (shown t))])))
+
+  ;; and, or: each value tested in turn, 1 or 0.
+  (define (logical o rs args)
+    (cond [(null? rs) (cons 'lit (if (eq? o 'and) 1 0))]
+          [(null? (cdr rs)) (cons 'i32 (boolean (car rs) (car args)))]
+          [else (let ([t (truth (car rs) (car args))] [rest (cdr (logical o (cdr rs) (cdr args)))])
+                  (cons 'i32 (if (eq? o 'and) #`(if #,t #,rest (i32.const 0)) #`(if #,t (i32.const 1) #,rest))))]))
+
+  ;; ---- control ----
+
+  (define (check-while c body step env)
+    (let* ([brk (fresh 'break)] [cont (fresh 'continue)] [top (fresh 'loop)]
+           [t (truth (check c env) c)]
+           [b (let ([l0 loops])
+                (dynamic-wind (lambda () (set! loops (cons (cons brk cont) loops)))
+                              (lambda () (as-void (check body env)))
+                              (lambda () (set! loops l0))))]
+           [s (map (lambda (x) (as-void (check x env))) step)])
+      (cons 'void #`(block #,brk (loop #,top (br-if #,brk (i32.eqz #,t)) (block #,cont #,b) #,@s (br #,top))))))
+
+  ;; break or continue: a branch to the label which of the innermost loop's.
+  (define (jump e which)
+    (when (null? loops) (c-error e "not in a loop"))
+    (cons 'none #`(br #,(which (car loops)))))
+
+  ;; ---- string literals ----
+  ;;
+  ;; A string literal is a global, lifted, whose bytes, followed by a 0,
+  ;; the module stores when it starts, eight at a time; one per string per
+  ;; module, the name kept as the module sees it (spec 2.3).
+
+  (define strings (make-hash))
+
+  (define (string-literal s)
+    (let ([known (hash-ref strings s #f)])
+      (cons '(ptr u8)
+            (if known
+                (k:syntax-local-introduce known)
+                (let* ([bs (bytes-append (string->bytes/utf-8 s) (bytes 0))] [n (bytes-length bs)] [g (fresh 'string)] [p (fresh 'p)])
+                  (syntax-local-lift-definition
+                   #`(global #,g (mut i32)
+                             (let ([#,p (sbrk #,(syn n))])
+                               #,@(let loop ([i 0])
+                                    (cond [(<= (+ i 8) n) (cons (store 'u64 p i (const 'i64 (word bs i))) (loop (+ i 8)))]
+                                          [(< i n) (cons (store 'u8 p i (const 'i32 (bytes-ref bs i))) (loop (+ i 1)))]
+                                          [else '()]))
+                               #,p)))
+                  (hash-set! strings s (k:syntax-local-introduce g))
+                  g)))))
+
+  ;; The 8 bytes of bs from i, little-endian.
+  (define (word bs i)
+    (let loop ([j 7] [w 0]) (if (< j 0) w (loop (- j 1) (+ (* w 256) (bytes-ref bs (+ i j))))))))
+
+(define-syntax c-define c-define)
+(define-syntax c-body c-body)
+(define-syntax c-static c-static)
+(define-syntax c-struct c-struct)
+(define-syntax c-struct-check c-struct-check)
+(define-syntax typedef c-typedef)
+(define-syntax c-let c-let)
+(define-syntax c-let* c-let*)
+(define-syntax c-datum c-datum)
+(define-syntax when c-when)
+(define-syntax unless c-unless)
+(define-syntax while c-while)
+(define-syntax for c-for)
+(define-syntax cast c-cast)
+(define-syntax sizeof c-sizeof)
+(define-syntax offsetof c-offsetof)
+(define-syntax -> c-arrow)
+(define-syntax c-set! (mark-transformer '(c-set!)))
+(define-syntax @ (mark-transformer '(c-deref)))
+(define-syntax & (mark-transformer '(c-addr)))
+(define-syntax break (mark-transformer '(c-break)))
+(define-syntax continue (mark-transformer '(c-continue)))
+(define-syntax + (mark-transformer '(c-op +)))
+(define-syntax - (mark-transformer '(c-op -)))
+(define-syntax * (mark-transformer '(c-op *)))
+(define-syntax / (mark-transformer '(c-op /)))
+(define-syntax % (mark-transformer '(c-op %)))
+(define-syntax == (mark-transformer '(c-op ==)))
+(define-syntax != (mark-transformer '(c-op !=)))
+(define-syntax < (mark-transformer '(c-op <)))
+(define-syntax <= (mark-transformer '(c-op <=)))
+(define-syntax > (mark-transformer '(c-op >)))
+(define-syntax >= (mark-transformer '(c-op >=)))
+(define-syntax and (mark-transformer '(c-op and)))
+(define-syntax or (mark-transformer '(c-op or)))
+(define-syntax not (mark-transformer '(c-op not)))
+(define-syntax bit-and (mark-transformer '(c-op bit-and)))
+(define-syntax bit-or (mark-transformer '(c-op bit-or)))
+(define-syntax bit-xor (mark-transformer '(c-op bit-xor)))
+(define-syntax bit-not (mark-transformer '(c-op bit-not)))
+(define-syntax << (mark-transformer '(c-op <<)))
+(define-syntax >> (mark-transformer '(c-op >>)))
