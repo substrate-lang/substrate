@@ -15,7 +15,10 @@
 ;;                                          share its bytes
 ;;   (typedef N T)                          N names type T
 ;;   (let ([x T init] ...) body ...)        local variables, each of type T
-;;   (let ([x init] ...) body ...), let*    or of init's; [x T] is zero
+;;   (let ([x init] ...) body ...), let*    or of init's; [x T] is 0 if
+;;                                          it is a number or pointer,
+;;                                          and not set, as in C, if an
+;;                                          array or struct
 ;;   (set! place e)                         e stored in place, which is
 ;;                                          its value
 ;;   (+= place e), -= *= /= %= <<= >>=      place updated
@@ -48,18 +51,17 @@
 ;; The types are i8 u8 i16 u16 i32 u32 i64 u64, f32 f64, void (a result
 ;; only), (ptr T), (array T n), n a count, (fn (T ...) -> R) and (fn (T
 ;; ...)), pointers to functions, and the names struct, union and typedef
-;; give. A variable may be an array or a struct, whose type is
-;; written, and a function takes and returns structs by value. An
-;; array's value is the address of its first element, as in C, and a
-;; struct's is its address too, which set!, let, a call and a return copy
-;; the struct from; so (-> (f) x) is a field of the struct f returns, and
-;; a struct argument is read as the call starts. C's conversions are implicit between
-;; numbers, and between a (ptr void) and another pointer; cast does the
-;; others, between numbers and pointers too. A narrower integer is an i32
-;; once read, as C promotes it; an integer literal takes the type its
-;; place needs, and a decimal the type of the float it meets, or f64; an
-;; operation on numbers of two types is at the larger, unsigned if either
-;; is, as C's.
+;; give. A variable may be an array or a struct, and a function takes and
+;; returns structs by value. An array's value is
+;; the address of its first element, as in C, and a struct's is its
+;; address too, which set!, let, a call and a return copy the struct
+;; from; so (-> (f) x) is a field of the struct f returns. C's
+;; conversions are implicit between numbers, and between a (ptr void) and
+;; another pointer; cast does the others, between numbers and pointers
+;; too. A narrower integer is an i32 once read, as C promotes it; an
+;; integer literal takes the type its place needs, and a decimal the type
+;; of the float it meets, or f64; an operation on numbers of two types is
+;; at the larger, unsigned if either is, as C's.
 ;;
 ;; How it works. A function is the kernel's, under its own name, with a
 ;; fact that gives its C types (spec 6.5), which a call from any module
@@ -79,10 +81,12 @@
 ;; its bytes. A variable the kernel cannot hold, an array or struct or one
 ;; whose address is taken, is in its function's frame, which the function
 ;; takes from the stack as it starts, below the stack's top, sp, and gives
-;; back as it returns; so is a struct a call returns. A struct parameter
-;; is the struct's address, and the function copies the struct into its
-;; frame; a function that returns a struct takes, first, the address it
-;; puts it at, and returns that address. A function pointer is the
+;; back as it returns; so is a struct a call returns. Structs pass as C
+;; passes them: an argument is the address of a copy the caller makes in
+;; its frame, unless a call just returned it, and a function that returns
+;; one takes, first, the address to put it at, bytes no one reads until
+;; it returns, and returns that address; one that returns the same
+;; variable at each return builds that variable there. A function pointer is the
 ;; function's index in the table, which every module shares, and which
 ;; holds no function at 0, a null pointer; a call of one is the kernel's
 ;; call-indirect. No code quotes data, so a program is freestanding (spec
@@ -319,14 +323,16 @@
           (#%fact #,x '#,(syn (list 'c-global ty))))))
 
   ;; (c-static 'T [init]): the address of a global's bytes, new from sbrk,
-  ;; so zero, with init's value put in them.
+  ;; so zero, with init's value put in them, in a frame if that needs one.
   (define (c-static s)
     (syntax-match s
       [(_ ('quote t)) #`(sbrk #,(syn (size-of (syntax->datum t))))]
       [(_ ('quote t) init)
        (let* ([t (syntax->datum t)] [p (fresh 'p)] [e (begin (start-function! 'void #f) (local-expand init))])
          #`(let ([#,p (sbrk #,(syn (size-of t)))])
-             #,(if (aggregate? t) (as-void (copy-into p e t '())) (store t p 0 (expect e t '() #t)))
+             #,(with-frame
+                 (lambda ()
+                   (framed '() (cons 'void (if (aggregate? t) (as-void (copy-into p e t '())) (store t p 0 (expect e t '() #t)))))))
              #,p))]))
 
   ;; (struct S [field T] ...) and (union U [field T] ...): the name bound
@@ -418,49 +424,84 @@
   ;; One walk over fully expanded code (spec 6.4) checks each expression
   ;; and gives its type and its kernel code, as (type . code); a
   ;; constant's code, while its type is lit or flit, is its value. env
-  ;; holds the local variables, each as (key T), key its local binding
-  ;; (spec 2.3), or (key T offset) if it is in the frame, at offset.
+  ;; holds the local variables, each as (key T . where), key its local
+  ;; binding (spec 2.3): where is (), for a kernel local; (offset), in the
+  ;; frame at offset; (at), a struct parameter, the address of the
+  ;; caller's copy; or (result), the struct the function returns, which is
+  ;; where to says.
 
   ;; The function being checked: its result type; its loops, innermost
   ;; first, each the labels (break . continue); its frame, (fp . saved),
   ;; the locals that hold the frame's address and sp before it, or #f if
   ;; it has none, and the frame's bytes so far; the variables whose
-  ;; addresses it takes, by local binding; and the parameter that holds
-  ;; where its struct result goes.
+  ;; addresses it takes, by local binding; the parameter that holds where
+  ;; its struct result goes; and the variable it returns, if it builds it
+  ;; there. scan finds its returns' values and its lets' variables.
   (define result 'void)
   (define loops '())
   (define frame #f)
   (define frame-size 0)
   (define addressed '())
   (define to #f)
+  (define returned #f)
+  (define returns '())
+  (define binders '())
 
   (define (start-function! r result-to)
-    (set! result r) (set! loops '()) (set! frame #f) (set! frame-size 0) (set! addressed '()) (set! to result-to))
+    (set! result r) (set! loops '()) (set! frame #f) (set! frame-size 0) (set! addressed '()) (set! to result-to)
+    (set! returned #f) (set! returns '()) (set! binders '()))
+
+  ;; What frame-slot! raises in a function with no frame, which with-frame
+  ;; takes to check it again with one.
+  (define needs-frame (list 'needs-frame))
 
   ;; The offset in the frame of new bytes for a value of type t.
   (define (frame-slot! t)
+    (unless frame (raise needs-frame))
     (let ([o (round-up frame-size (alignment t))])
       (set! frame-size (+ o (size-of t)))
       o))
 
   (define (frame-place t offset) (list t 'memory (car frame) offset))
 
-  ;; Whether fully expanded e needs a frame, since it takes the address of
-  ;; a variable, has an array or struct variable, or calls a function
-  ;; that returns a struct; addressed gets the variables whose addresses
-  ;; it takes.
+  ;; (walk), which checks and lowers a body, with no frame, or if it
+  ;; finds it needs one, again with one.
+  (define (with-frame walk)
+    (set! frame #f)
+    (set! frame-size 0)
+    (or (with-handlers ([(lambda (x) (eq? x needs-frame)) (lambda (x) #f)]) (walk))
+        (begin (set! frame (cons (fresh 'fp) (fresh 'saved))) (set! frame-size 0) (walk))))
+
+  ;; What the check must know of fully expanded e before it starts:
+  ;; addressed gets the variables whose addresses e takes, returns its
+  ;; returns' values, and binders its lets' variables.
   (define (scan e)
     (syntax-match e
       [('quote . _) #f]
       [('#%app ('quote ('c-addr)) (? identifier? x))
-       (let ([b (k:local-binding x)]) (when b (set! addressed (cons b addressed))) (and b #t))]
-      [('#%app (? identifier? f) arg ...) (scan-all (cons (struct-call? f) (map scan arg)))]
+       (let ([b (k:local-binding x)]) (when b (set! addressed (cons b addressed))))]
       [('let ((x init) ...) body ...)
-       (scan-all (append (map (lambda (x) (aggregate? (syntax-property x 'c-type))) x) (map scan init) (map scan body)))]
-      [(x ...) (scan-all (map scan x))]
+       (set! binders (append (map (lambda (x) (k:local-binding x)) x) binders))
+       (for-each scan init)
+       (for-each scan body)]
+      [('return v) (set! returns (cons v returns)) (scan v)]
+      [(x ...) (for-each scan x)]
       [_ #f]))
 
-  (define (scan-all l) (ormap (lambda (x) x) l))
+  ;; The variable, by local binding, that a function whose body is forms
+  ;; returns at each return and as its value, if a let in it binds it; or
+  ;; #f.
+  (define (returned-variable forms)
+    (let ([v (value-variable (last forms))])
+      (and v (memv v binders) (andmap (lambda (e) (eqv? (value-variable e) v)) returns) v)))
+
+  (define (value-variable e)
+    (syntax-match e
+      [(? identifier? x) (k:local-binding x)]
+      [('return v) (value-variable v)]
+      [('let _ body ... v) (value-variable v)]
+      [('begin body ... v) (value-variable v)]
+      [_ #f]))
 
   ;; (c-body (x ...) to '(R T ...) body ...): the body of a function whose
   ;; parameters x ... are of types T ... and whose result type is R, to
@@ -470,22 +511,20 @@
       [(_ (x ...) result-to ('quote types) body ...)
        (let* ([types (syntax->datum types)] [xs (map local-expand x)] [forms (map local-expand body)])
          (start-function! (car types) (and (identifier? result-to) result-to))
-         (when (or (scan-all (map scan forms)) (ormap struct-type? (cdr types)))
-           (set! frame (cons (fresh 'fp) (fresh 'saved))))
-         ;; A struct parameter, or one whose address is taken, is copied
-         ;; into the frame.
-         (let* ([params (map (lambda (x t)
-                               (let ([key (k:local-binding x)])
-                                 (if (or (struct-type? t) (memv key addressed))
-                                     (let ([o (frame-slot! t)])
-                                       (list (list key t o)
-                                             (if (struct-type? t)
-                                                 #`(memory.copy #,(address (frame-place t o) x) #,x #,(const 'i32 (size-of t)))
-                                                 (store t (car frame) o x))))
-                                     (list (list key t)))))
-                             xs (cdr types))]
-                [b (function-body s forms (map car params) (car types))])
-           (framed (apply append (map cdr params)) b)))]))
+         (for-each scan forms)
+         (when (and to (pair? forms)) (set! returned (returned-variable forms)))
+         (with-frame
+           (lambda ()
+             ;; A parameter whose address is taken is copied into the
+             ;; frame.
+             (let ([params (map (lambda (x t)
+                                  (let ([key (k:local-binding x)])
+                                    (cond [(struct-type? t) (list (list key t 'at))]
+                                          [(memv key addressed)
+                                           (let ([o (frame-slot! t)]) (list (list key t o) (store t (car frame) o x)))]
+                                          [else (list (list key t))])))
+                                xs (cdr types))])
+               (framed (apply append (map cdr params)) (function-body s forms (map car params) (car types)))))))]))
 
   ;; A function's body: its value converted to the result type, or for a
   ;; struct, put where to says.
@@ -494,10 +533,18 @@
           [(struct-type? r)
            (when (null? forms) (c-error s "expected a body"))
            (let ([codes (map (lambda (f) (as-void (check f env 'void))) (take forms (- (length forms) 1)))]
-                 [v (copy-into to (last forms) r env)])
+                 [v (result-value (last forms) env)])
              (cons (car v) (at s #`(begin #,@codes #,(cdr v)))))]
           [else (let ([b (check-sequence s forms env r)])
                   (cons (if (eq? (car b) 'none) 'none r) (convert b r (if (null? forms) s (last forms)))))]))
+
+  ;; Struct e, as the function's result, where to says: (type . code), its
+  ;; code giving that address. If e is the variable the function returns,
+  ;; it is there already.
+  (define (result-value e env)
+    (if returned
+        (let ([r (check e env result)]) (if (eq? (car r) 'none) r (cons 'i32 (convert r result e))))
+        (copy-into to e result env)))
 
   ;; A body, b, in its frame if it has one: the frame taken from the stack,
   ;; with the parameters it holds stored in it by the code entry, and given
@@ -556,8 +603,7 @@
        (let* ([c (callee f env)] [r (cadr (car c))])
          (if (struct-type? r)
              ;; Its struct goes in the frame.
-             (begin (unless frame (c-error e "a struct result needs a place here: put it in a variable"))
-                    (cons r (call e f c arg env (address (frame-place r (frame-slot! r)) e))))
+             (cons r (call e f c arg env (address (frame-place r (frame-slot! r)) e)))
              (cons (promoted r) (call e f c arg env #f))))]
       [('let (b ...) body ...) (check-let e b body env hint)]
       [('if c a) (cons 'void #`(if #,(truth (check c env) c) #,(as-void (check a env 'void))))]
@@ -569,7 +615,7 @@
       [('return) (unless (eq? result 'void) (c-error e "expected a value to return")) (cons 'none (if frame #`(begin (set! sp #,(cdr frame)) (return)) e))]
       [('return v)
        (when (eq? result 'void) (c-error e "this function returns no value"))
-       (cons 'none #`(return #,(leave (if (struct-type? result) (copy-into to v result env) (cons result (expect v result env))))))]
+       (cons 'none #`(return #,(leave (if (struct-type? result) (result-value v env) (cons result (expect v result env))))))]
       [('memory.size) (cons 'i32 e)]
       [('memory.grow n) (cons 'i32 #`(memory.grow #,(expect n 'i32 env)))]
       [('memory.copy d s n) (cons 'void #`(memory.copy #,(address-value d env) #,(address-value s env) #,(expect n 'i32 env)))]
@@ -601,24 +647,31 @@
       (cons (car r) (let ([stores (filter (lambda (x) x) (map cadr vs))]) (if (null? stores) code #`(begin #,@stores #,code))))))
 
   ;; Let variable x, whose value is init's: (entry store binding), its env
-  ;; entry, and either the code that stores its value in the frame or its
-  ;; kernel binding.
+  ;; entry, and either the code that puts its value in memory, if any, or
+  ;; its kernel binding. An array or struct declared [x T] is not set, as
+  ;; in C; a number or pointer is 0.
   (define (let-variable x init env)
     (let* ([declared (syntax-property x 'c-type)] [key (k:local-binding x)]
            [zero? (syntax-match init [('quote ('c-zero)) #t] [_ #f])]
-           [r (and (not zero?) (not (aggregate? declared)) (check init env declared))]
-           [t (cond [declared (complete! declared x)]
-                    [(struct-type? (car r)) (c-error x "~a is a struct: give its type, [~a ~s value]" (syntax-e x) (syntax-e x) (shown (car r)))]
-                    [else (scalar! (settled-type (car r)) x)])]
-           [value (lambda (stored) (cond [zero? (constant 0 t x)] [stored (convert r t init #t)] [else (convert r t init)]))])
-      (if (or (aggregate? t) (memv key addressed))
-          (let* ([o (frame-slot! t)] [p (frame-place t o)])
-            (list (list key t o)
-                  (cond [(not (aggregate? t)) (store t (car frame) o (value #t))]
-                        [zero? #`(memory.fill #,(address p x) (i32.const 0) #,(const 'i32 (size-of t)))]
-                        [else (as-void (copy-into (address p x) init t env))])
-                  #f))
-          (list (list key t) #f #`[#,x #,(syn (kernel-type t)) #,(value #f)]))))
+           ;; A call that returns a struct is given the variable's bytes to
+           ;; put it in, so it is not checked here.
+           [call (and (not declared) (syntax-match init [('#%app (? struct-call? f) . _) (cadr (function-type f))] [_ #f]))]
+           [r (and (not zero?) (not (aggregate? declared)) (not call) (check init env declared))]
+           [t (cond [declared (complete! declared x)] [call call] [(struct-type? (car r)) (car r)] [else (scalar! (settled-type (car r)) x)])]
+           [value (lambda (stored) (cond [zero? (constant 0 t x)] [stored (convert r t init #t)] [else (convert r t init)]))]
+           ;; The code that puts an array's or struct's value at dst.
+           [put (lambda (dst) (if r (copy-bytes dst (cdr r) (size-of t)) (as-void (copy-into dst init t env))))])
+      (cond [(eqv? key returned)
+             (unless (equal? t result) (c-error x "~a is returned, so it is a ~s, not a ~s" (syntax-e x) (shown result) (shown t)))
+             (list (list key t 'result) (and (not zero?) (put to)) #f)]
+            [(or (aggregate? t) (memv key addressed))
+             (let* ([o (frame-slot! t)] [p (frame-place t o)])
+               (list (list key t o)
+                     (cond [(not (aggregate? t)) (store t (car frame) o (value #t))]
+                           [zero? #f]
+                           [else (put (address p x))])
+                     #f))]
+            [else (list (list key t) #f #`[#,x #,(syn (kernel-type t)) #,(value #f)])])))
 
   ;; ---- calls ----
 
@@ -634,10 +687,17 @@
           (cons (cdr (car r)) (cdr r)))))
 
   ;; The code of a call of callee c, which head f gives; to, if its result
-  ;; is a struct, the address it goes to, which the call returns.
+  ;; is a struct, the address it goes to, which the call returns. A struct
+  ;; argument is the address of a copy the caller makes in its frame, as
+  ;; C's is, and of the struct itself if a call returned it.
   (define (call e f c args env to)
     (let* ([ps (car (car c))]
-           [as (append (if to (list to) '()) (map (lambda (a p) (expect a p env)) args ps))])
+           [as (append (if to (list to) '())
+                       (map (lambda (a p)
+                              (if (struct-type? p)
+                                  (cdr (copy-into (address (frame-place p (frame-slot! p)) a) a p env))
+                                  (expect a p env)))
+                            args ps))])
       (unless (= (length ps) (length args))
         (c-error e "~a takes ~a argument~a, got ~a" (syntax->datum (written f)) (length ps) (if (= (length ps) 1) "" "s") (length args)))
       (if (cdr c)
@@ -670,6 +730,7 @@
     (and (identifier? f) (eq? (identifier-binding-kind f) 'function)
          (let ([sig (fact f 'c-function)]) (and sig (struct-type? (cadr sig))))))
 
+
   ;; What the fact of kind kind about id's definition gives, or #f.
   (define (fact id kind)
     (let ([f (findf (lambda (v) (and (pair? v) (eq? (car v) kind))) (map caddr (k:syntax-local-facts id)))])
@@ -678,7 +739,9 @@
   ;; Struct e, of type t, put at the address dst gives: (type . code),
   ;; its code giving that address, as an i32, unless e does not finish. A
   ;; call that returns the struct is given dst, and otherwise the struct
-  ;; is copied from the address that is its value.
+  ;; is copied from the address that is its value. dst is fresh, bytes no
+  ;; one reads until this is done: a new variable's, or a copy's, or the
+  ;; function's own result's.
   (define (copy-into dst e t env)
     (syntax-match e
       [('#%app (? struct-call? f) arg ...)
@@ -687,7 +750,28 @@
       [_ (let ([r (check e env t)] [d (fresh 'to)])
            (if (eq? (car r) 'none)
                r
-               (cons 'i32 #`(let ([#,d #,dst]) (memory.copy #,d #,(convert r t e) #,(const 'i32 (size-of t))) #,d))))]))
+               (cons 'i32 #`(let ([#,d #,dst]) #,(copy-bytes d (convert r t e) (size-of t)) #,d))))]))
+
+  ;; Code that copies n bytes from the address src gives to dst's: loads
+  ;; and stores, which the engine compiles in line, if n is small, and
+  ;; otherwise memory.copy, a call into the engine.
+  (define (copy-bytes dst src n)
+    (if (or (= n 0) (> n 64))
+        #`(memory.copy #,dst #,src #,(const 'i32 n))
+        (let ([d (fresh 'd)] [s (fresh 's)])
+          #`(let ([#,d #,dst] [#,s #,src])
+              #,@(map (lambda (p) (store (car p) d (cdr p) (load (car p) s (cdr p)))) (pieces n))))))
+
+  ;; n bytes in pieces, each (type . offset): 8 bytes at a time, then 4, 2
+  ;; and 1.
+  (define (pieces n)
+    (let loop ([o 0])
+      (let ([left (- n o)])
+        (cond [(>= left 8) (cons (cons 'u64 o) (loop (+ o 8)))]
+              [(>= left 4) (cons (cons 'u32 o) (loop (+ o 4)))]
+              [(>= left 2) (cons (cons 'u16 o) (loop (+ o 2)))]
+              [(>= left 1) (cons (cons 'u8 o) (loop (+ o 1)))]
+              [else '()]))))
 
   ;; ---- places ----
   ;;
@@ -710,8 +794,10 @@
 
   (define (variable-place x env)
     (let ([b (assv (k:local-binding x) env)])
-      (cond [(and b (pair? (cddr b))) (frame-place (cadr b) (caddr b))]
-            [b (list (cadr b) 'local x)]
+      (cond [(and b (null? (cddr b))) (list (cadr b) 'local x)]
+            [(and b (eq? (caddr b) 'at)) (list (cadr b) 'memory x 0)]
+            [(and b (eq? (caddr b) 'result)) (list (cadr b) 'memory to 0)]
+            [b (frame-place (cadr b) (caddr b))]
             [(and (eq? (identifier-binding-kind x) 'variable) (fact x 'c-global)) (list (car (fact x 'c-global)) 'memory x 0)]
             [(eq? (identifier-binding-kind x) 'function) (c-error x "~a is a function, not a value" (syntax-e x))]
             [else (c-error x "~a is not a C variable" (syntax-e x))])))
@@ -763,7 +849,9 @@
 
   (define (check-set place v env hint)
     (let* ([p (check-place place env)] [t (car p)])
-      (cond [(struct-type? t) (cons 'void (as-void (copy-into (address p place) v t env)))]
+      ;; A place may be read while a call runs, so a call's struct goes
+      ;; first where the call puts it, and is copied.
+      (cond [(struct-type? t) (cons 'void (copy-bytes (address p place) (expect v t env) (size-of t)))]
             [(array-type? t) (c-error place "an array cannot be assigned: copy it with memcpy")]
             [else (assign p (check v env t) v hint)])))
 
