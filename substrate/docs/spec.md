@@ -250,8 +250,9 @@ marked with another type, such as `n:i32`.
   introduction scope is flipped around the expansion, so code from the
   macro's input expands as it would at the use site.
 - `syntax-local-lift-definition` adds a module-level form (a `func`, `global`,
-  `import`, `type`, `rec`, `data`, `tag` or `#%fact` form, or an expression)
-  to the module body being expanded, at the running macro's phase (6.4).
+  `import`, `type`, `rec`, `data`, `tag` or `#%fact` form, an expression,
+  or a `begin` of these, which are declared together) to the module body
+  being expanded, at the running macro's phase (6.4).
   The form is declared as the macro's output is, with the use's introduction scope,
   so each use gets fresh names. It returns the form as given, so the
   macro can put its names in its output.
@@ -538,8 +539,8 @@ kernel's bytes, for the compiler built next to embed (1.4).
   holds one kernel's code, so it is neither read nor written while the
   running and target kernels differ (1.4); and a compiled module has the
   compiler's decisions in it, so `make build/sub` removes the cache when
-  it builds a new compiler. `sub expand` compiles from source, since it
-  prints the expansion.
+  it builds a new compiler. `sub expand` expands from source, since it
+  prints the expansion, and does not compile the module it prints.
 
 ## 4. Host interface
 
@@ -1098,8 +1099,9 @@ requires this one computes it again in its own compile-time store.
 Expansion turns a module into **fully expanded code**, as Racket calls it:
 syntax in the grammar
 below, with every macro use expanded and every application and literal
-explicit. `local-expand` returns it, `sub expand` prints it, and the
-compiler compiles it.
+explicit. `local-expand` returns it and `sub expand` prints it. The
+compiler's input is not syntax: expansion builds it as it goes, and builds
+fully expanded code only where a macro or `sub expand` asks for it.
 
 ```
 form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)] expr ...)

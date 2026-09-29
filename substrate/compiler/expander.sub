@@ -1,7 +1,8 @@
 ;; Lifecycle: permanent. Part of the compiler.
 ;;
-;; Expander: syntax objects -> fully expanded code, which is syntax too (spec
-;; 6.4) -> lowered to the compiler's input (core.sub).
+;; Expander: syntax objects -> the compiler's input (core.sub), lowered
+;; code, built as the code is expanded; or fully expanded code, syntax
+;; (spec 6.4), where a macro or sub expand asks for it.
 ;;
 ;; Binding is by sets of scopes (spec 6.1). A module is a file; each of its
 ;; phases compiles to one wasm module, a linklet (spec 3.1). While a module is
@@ -37,7 +38,7 @@
 (require ser "serialize.sub" make-serializer serialize! serializer-bytes)
 
 (provide report-trap set-repository-root! set-package-root! set-cache-directory! compile-module-file module-linklet-list
-         module-expanded-forms keep-expanded-forms! target-kernel-bytes target-kernel-interface compiled-file-bytes program-linklets register-queries!)
+         expand-module-file target-kernel-bytes target-kernel-interface compiled-file-bytes program-linklets register-queries!)
 
 (import %call-transformer "kernel" "%call-transformer" (eqref eqref -> eqref))
 (import local-binding-of "kernel" "local-binding" (eqref -> eqref))
@@ -110,7 +111,8 @@
 ;; linklet compiled against the target kernel, for programs. requires:
 ;; list of (module . shift). provides: list of (symbol . meaning). entries:
 ;; its module-level bindings, as (symbol scopes phase binding). scope: its
-;; module scope. hash: its identity, of its source and its requires'
+;; module scope. code: its lowered phase-0 forms, while it compiles.
+;; hash: its identity, of its source and its requires'
 ;; hashes (spec 3.2). name: what its instance names start with, its
 ;; stem and hash. path: its file, which its source locations name (3.6),
 ;; or (compiled file hash) for a module loaded from a compiled file (3.7).
@@ -118,7 +120,7 @@
 ;; value): the definition it is about (fact-key), the phase, and its
 ;; datum or syntax.
 (struct unit (path [name #:mutable] [hash #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
-              [entries #:mutable] [expanded #:mutable] [scope #:mutable] [program #:mutable]
+              [entries #:mutable] [code #:mutable] [scope #:mutable] [program #:mutable]
               scopes                                  ; index -> the scopes its expansion made, in order
               types                                   ; index -> the types it declared, in order
               [infos #:mutable]                       ; its functions, globals and tags, newest first
@@ -299,7 +301,7 @@
       (lambda ()
         (with-kernel k
           (lambda ()
-            (let* ([forms (lower-forms (expand-module-body (read-string-all text (string->symbol kernel-path))) 0)]
+            (let* ([forms (expand-module-body (read-string-all text (string->symbol kernel-path)) #f)]
                    [forms (append (storage-forms 0) forms)])
               (note-definitions! m forms)
               (take-kernel-types! k)
@@ -1165,18 +1167,34 @@
              (hash-set! registry path m)
              (let ([m (with-comp c
                         (lambda ()
-                          (set-unit-expanded! m (expand-module-body (read-string-all text (string->symbol path))))
+                          (set-unit-code! m (expand-module-body (read-string-all text (string->symbol path)) #f))
                           (finish-module! c text)))])
                (hash-set! registry path m)
                m)))])))
 
-;; Expand a module body at phase 0; phase >= 1 code runs as it goes.
-(define (expand-module-body forms)
+;; The fully expanded phase-0 forms of the module in file source (spec
+;; 6.4), for sub expand: it is expanded, and what it requires compiled,
+;; but it is not compiled itself.
+(define (expand-module-file source)
+  (let ([path (canonical-path source)])
+    (unless (file-exists? path) (raise-compile-error #f "no module file ~a" path))
+    (ensure-kernels!)
+    (let* ([text (file->string path)]
+           [m (new-unit path (provisional-name path))]
+           [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() #f)])
+      (hash-set! registry path m)
+      (with-comp c (lambda () (expand-module-body (read-string-all text (string->symbol path)) #t))))))
+
+;; Expand a module body at phase 0; phase >= 1 code runs as it goes. The
+;; result is its lowered code, or, syntax? being true, its fully expanded
+;; code (spec 6.4).
+(define (expand-module-body forms syntax?)
   (install-base!)
   (let ([msc (new-scope!)])
     (set-unit-scope! (comp-module current) msc)
     (hash-set! module-scope-origins msc (cons (comp-module current) 0))
-    (let ([out (expand-body (map (lambda (f) (add-scope (add-scope f core-scope) msc)) forms) 0)])
+    (let ([out (with-output syntax?
+                 (lambda () (expand-body (map (lambda (f) (add-scope (add-scope f core-scope) msc)) forms) 0)))])
       (run-pending!)
       out)))
 
@@ -1190,12 +1208,12 @@
         [tbl (hash-ref (comp-tables current) phase #f)])
     (append (if mem (list mem) '()) (if tbl (list tbl) '()))))
 
-;; Lower the expanded phase-0 code, resolve provides, and compile the
-;; linklets. Returns the module: the one this run already has by its
-;; hash, if a compiled file brought it (spec 3.7), or else this one.
+;; Take the phase-0 code, resolve provides, and compile the linklets.
+;; Returns the module: the one this run already has by its hash, if a
+;; compiled file brought it (spec 3.7), or else this one.
 (define (finish-module! c text)
   (let ([m (comp-module c)])
-    (add-phase-forms! 0 (lower-forms (unit-expanded m) 0))
+    (add-phase-forms! 0 (finished-forms (unit-code m)))
     ;; A provided name exports its binding in each namespace it has one.
     (set-unit-provides!
      m
@@ -1233,21 +1251,20 @@
     ;; Its functions' values, resolved now for its interface (5.2).
     (for-each function-value (filter (lambda (f) (own-instance? m (info-instance f))) (hash-keys function-values)))
     ;; Programs link to the target kernel: when it is not the host,
-    ;; the phase-0 code is lowered and compiled again, against it.
+    ;; the phase-0 code is finished for it and compiled again.
     (set-unit-program!
      m
      (if (eq? running-kernel target-kernel)
          (hash-ref (unit-linklets m) 0)
          (with-kernel target-kernel
            (lambda ()
-             (compiled-linklet (compile-module (append (storage-forms 0) (lower-forms (unit-expanded m) 0))
+             (compiled-linklet (compile-module (append (storage-forms 0) (finish-forms (unit-code m)))
                                                (linklet-name m 0 0)))))))
     (hash-set! (shifts-of installed m) 0 #t)
     (set-unit-state! m 'done)
     (let ([form (comp-freestanding-form c)])
       (when form (check-freestanding! m form)))
-    ;; The expanded code has served, unless sub expand wants it.
-    (unless keep-expanded? (set-unit-expanded! m #f))
+    (set-unit-code! m #f)
     (store-cached! m)))
 
 ;; The types and definitions in module m's lowered forms, for the
@@ -1309,11 +1326,6 @@
         [(tag-info? info) (tag-info-name info)]
         [else (data-info-name info)]))
 
-;; Keep every module's fully expanded code after it is compiled, for
-;; module-expanded-forms.
-(define keep-expanded? #f)
-(define (keep-expanded-forms!) (set! keep-expanded? #t))
-
 ;; The linklets a program instantiates at run time: phase 0 at phase
 ;; shift 0, reached through phase-0 requires.
 (define (runtime-closure m)
@@ -1342,9 +1354,6 @@
                                        (if (eq? mm m) "it" (format "the module ~a it requires" (unit-name mm)))
                                        (if (pair? extra) (format "imports from ~a" extra) "uses GC objects")))))
             (runtime-closure m)))
-
-;; The fully expanded phase-0 forms of m.
-(define (module-expanded-forms m) (unit-expanded m))
 
 ;; The linklets m's program instantiates at run time, each after those it
 ;; imports from, as (instance-name . bytes): phase-0 linklets at phase
@@ -1395,18 +1404,19 @@
         (head-expand (apply-macro head t s phase #t) phase)
         s)))
 
-;; A module body being expanded: its phase, the items pass 1 found
-;; (reversed), whether pass 2 has started, and the expanded forms lifted
-;; while pass 2 expands the current item (reversed).
-(struct body (phase [items #:mutable] [pass2? #:mutable] [lifted #:mutable]))
+;; A module body being expanded: its phase, whether its code is built as
+;; fully expanded code (to-syntax?), the items pass 1 found (reversed),
+;; whether pass 2 has started, and the forms lifted while pass 2 expands
+;; the current item (reversed).
+(struct body (phase syntax? [items #:mutable] [pass2? #:mutable] [lifted #:mutable]))
 
 (define current-body #f)                 ; the innermost body being expanded
 
-;; A module body -> its fully expanded code: func, global, import, type
-;; and data forms and expressions (spec 6.4). Other module-level forms take
+;; A module body -> its code: lowered forms for the compiler (core.sub),
+;; or fully expanded code (spec 6.4). Other module-level forms take
 ;; effect during expansion and leave nothing.
 (define (expand-body forms phase)
-  (let ([b (body phase '() #f '())] [saved current-body])
+  (let ([b (body phase to-syntax? '() #f '())] [saved current-body])
     (set! current-body b)
     (declare-forms! b forms)
     (let ([out (finish-body! b)])
@@ -1426,7 +1436,7 @@
          (map (lambda (item)
                 (set-body-lifted! b '())
                 (let ([out (expand-item item (body-phase b))])
-                  (append (reverse (body-lifted b)) (list out))))
+                  (append (apply append (reverse (body-lifted b))) out)))
               (reverse (body-items b)))))
 
 ;; Pass 1 for module-level form f0 of body b: expand macro uses at its
@@ -1460,20 +1470,21 @@
       [(rec) (item! (declare-rec f phase))]
       [(define-syntax) (define-syntax! f phase)]
       [(begin-for-syntax) (begin-for-syntax! f phase)]
-      [(#%fact) (item! (list 'done (fact! f phase)))]
+      [(#%fact) (item! (list 'done (fact! f phase) '()))]
       [else (item! (list 'expr f))])))
 
-;; Pass 2 for one item: its fully expanded code.
+;; Pass 2 for one item: its forms, in the body's code.
 (define (expand-item item phase)
   (case (car item)
     [(func) (expand-func item phase)]
     [(global) (expand-global item phase)]
-    [(plain done) (cadr item)]
-    [(expr) (expand-expr (cadr item) phase)]))
+    [(plain done) (if to-syntax? (list (cadr item)) (caddr item))]
+    [(expr) (let ([r (closures-noted (lambda () (expand-expr (cadr item) phase)))])
+              (if to-syntax? (list (car r)) (list (list 'expr (car r) (cdr r)))))]))
 
 ;; Lift form, from a macro, to the module level of the body being expanded
 ;; (spec 6.4): declare it now, so its names can be used at once, and put
-;; its fully expanded code before the form whose expansion lifted it.
+;; its code before the form whose expansion lifted it.
 (define (lift! form where phase)
   (let ([b current-body])
     (unless (and b (eqv? (body-phase b) phase))
@@ -1487,7 +1498,7 @@
                      (if (eq? l before) new (loop (cdr l) (cons (car l) new))))])
           (set-body-items! b before)
           (for-each (lambda (item)
-                      (let ([out (expand-item item phase)])
+                      (let ([out (with-output (body-syntax? b) (lambda () (expand-item item phase)))])
                         (set-body-lifted! b (cons out (body-lifted b)))))
                     new))))))
 
@@ -1619,7 +1630,7 @@
   (let ([m (begin-type-member f phase)])
     (finish-type-member! m phase)
     (identify-group! (list (type-member-info m)))
-    (list 'plain (type-member-out m))))
+    (list 'plain (type-member-out m) (list (list 'type (type-member-info m))))))
 
 ;; (rec (type name def) ...): types that may refer to each other, one wasm
 ;; recursion group (spec 5.2). Every name is bound before any fields are
@@ -1640,7 +1651,7 @@
        (for-each (lambda (m) (finish-type-member! m phase)) members)
        (for-each (lambda (info) (set-type-info-group! info infos)) infos)
        (identify-group! infos)
-       (list 'plain (apply out f 'rec (map type-member-out members))))]))
+       (list 'plain (apply out f 'rec (map type-member-out members)) (map (lambda (i) (list 'type i)) infos)))]))
 
 ;; A member of a rec group whose supertype is a later member.
 (define (check-super-not-later t later)
@@ -1826,7 +1837,7 @@
             [info (func-info (stx-e name) types results #f #f (cadr ct))])
        (bind-definition! name phase (list 'func info))
        (when value (hash-set! function-values info (cons (cadr value) phase)))
-       (list 'func name params arrow (caddr ct) f (car ct) inline value))]))
+       (list 'func name params arrow (caddr ct) f (car ct) inline value info))]))
 
 ;; A parameter [name type], as (name type) with the type expanded.
 (define (param-of p phase)
@@ -1850,22 +1861,30 @@
        (list (stx-rewrap (car body) (list word tname)) t rest))]
     [_ (list #f #f body)]))
 
-;; (func (name [p t] ...) [-> r] body ...), expanded.
+;; (func (name [p t] ...) [-> r] body ...), expanded: its lowered form,
+;; for the compiler, or its fully expanded form.
 (define (expand-func p phase)
   (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
-         [f (list-ref p 5)] [clause (list-ref p 6)] [inline (list-ref p 7)] [value (list-ref p 8)]
+         [f (list-ref p 5)] [clause (list-ref p 6)] [inline (list-ref p 7)] [value (list-ref p 8)] [info (list-ref p 9)]
          [sc (new-local-scope!)]
-         [xs (map (lambda (pp) (bound-local (add-scope (car pp) sc) phase)) params)]
+         [xs (map (lambda (pp) (add-scope (car pp) sc)) params)]
+         [keys (map (lambda (x) (bind-local! x phase)) xs)]
          [saved current-function])
     (set! current-function (list name))
-    (let ([r (apply out f 'func
-                    (out-list (cadr (stx->list f))
-                              (cons name (map (lambda (x pp) (out-list x (list x (cadr pp)))) xs params)))
-                    (append (if inline (list inline) '()) (or value '()) arrow
-                            (if clause (list (core-headed clause 'type)) '())
-                            (map (lambda (b) (expand-expr (add-scope b sc) phase)) body)))])
+    (let ([r (closures-noted (lambda () (map (lambda (b) (expand-expr (add-scope b sc) phase)) body)))])
       (set! current-function saved)
-      r)))
+      (if to-syntax?
+          (list (apply out f 'func
+                       (out-list (cadr (stx->list f))
+                                 (cons name (map (lambda (x key pp) (out-list x (list (with-local-binding x key) (cadr pp))))
+                                                 xs keys params)))
+                       (append (if inline (list inline) '()) (or value '()) arrow
+                               (if clause (list (core-headed clause 'type)) '())
+                               (car r))))
+          (let ([ps (map cons keys (func-info-params info))] [code (seq-at f (car r))])
+            (when inline (note-inline! info ps code name))
+            (when value (function-value info))
+            (list (list 'func info ps code (cdr r))))))))
 
 ;; (global name type init) or (global name (mut type) init), as in wasm.
 (define (declare-global f phase)
@@ -1876,10 +1895,15 @@
                     [('mut t) (global-info (stx-e name) (parse-type t phase) #t #f #f)]
                     [t (global-info (stx-e name) (parse-type t phase) #f #f #f)])])
        (bind-definition! name phase (list 'global info))
-       (list 'global f xt))]))
+       (list 'global f xt info))]))
 
 (define (expand-global p phase)
-  (syntax-match (cadr p) [(_ name _ init) (out (cadr p) 'global name (caddr p) (expand-expr init phase))]))
+  (syntax-match (cadr p)
+    [(_ name _ init)
+     (let ([r (closures-noted (lambda () (expand-expr init phase)))])
+       (if to-syntax?
+           (list (out (cadr p) 'global name (caddr p) (car r)))
+           (list (list 'global (cadddr p) (car r) (cdr r)))))]))
 
 ;; (import name "module" "field" (t ... -> r ...)), or with a function
 ;; type's name in place of the signature, to import the function at that
@@ -1898,7 +1922,7 @@
                     (parse-signature sig phase))])
        (bind-definition! name phase
                          (list 'func (func-info (stx-e name) (car pr) (cdr pr) (stx-e module) (stx-e field) ftype)))
-       (list 'plain (out f 'import name module field sig)))]))
+       (list 'plain (out f 'import name module field sig) '()))]))
 
 ;; (data name offset "bytes" ...): an active segment in the module's memory.
 (define (declare-data f phase)
@@ -1906,7 +1930,7 @@
     [('data (? id? name) (? count-literal? offset) (? string-literal? bytes) ...)
      (let ([info (data-info (stx-e name) (stx-e offset) (string->bytes/utf-8 (apply string-append (map stx-e bytes))))])
        (bind-definition! name phase (list 'data info))
-       (list 'plain (core-headed f 'data)))]))
+       (list 'plain (core-headed f 'data) (list (list 'data info))))]))
 
 ;; (tag name (t ...)): a tag, whose exceptions carry values of types t ...
 ;; (spec 5.2).
@@ -1916,7 +1940,7 @@
      (let* ([xs (map (lambda (t) (expand-type t phase)) type)]
             [info (tag-info (stx-e name) (map (lambda (t) (parse-type t phase)) xs) #f #f)])
        (bind-definition! name phase (list 'tag info))
-       (list 'plain (out f 'tag name (stx-rewrap types xs))))]))
+       (list 'plain (out f 'tag name (stx-rewrap types xs)) (list (list 'tag info))))]))
 
 (define (tag-info-of id phase)
   (let ([m (and (id? id) (meaning-of id phase))])
@@ -2206,11 +2230,11 @@
             [name (string->symbol (string-append "__value." base))]
             [function (and m (eq? (car m) 'func) (syntax-function-of rhs phase "a transformer"))]
             [adapter (and function (transformer-adapter (string->symbol (string-append "__transformer." base)) function))]
-            [expanded (and (not adapter) (expand-expr rhs (+ phase 1)))]
+            [expanded (and (not adapter) (with-output #f (lambda () (expand-expr rhs (+ phase 1)))))]
             [init (if adapter
                       (list 'call (kernel-function lowering-kernel 'make-transformer)
                             (list (list 'ref-func (cadr adapter)) (list 'quote #f)))
-                      (lower-expr expanded (+ phase 1)))]
+                      (finished-expr expanded))]
             [global (global-info name eqref #t #f #f)]
             [getter (func-info name '() (list eqref) #f #f #f)]
             [forms (append (if adapter (list adapter) '())
@@ -2222,7 +2246,7 @@
              [(and (not adapter) (plain? init))
               (add-phase-forms! (+ phase 1) forms)
               (made-value! getter (plain-value init rhs))]
-             [(or adapter (eq? (core-head expanded (+ phase 1)) 'lambda)) (defer-unit! forms (+ phase 1) f)]
+             [(or adapter (eq? (car (unlocated expanded)) 'lambda)) (defer-unit! forms (+ phase 1) f)]
              [else (run-compile-time-linklet! forms (+ phase 1) f)])
        (hash-set! macro-modules getter (comp-module current))
        (bind-definition! id phase (list 'compile-time-value getter)))]))
@@ -2335,7 +2359,8 @@
 (define (begin-for-syntax! f phase)
   (syntax-match f
     [('begin-for-syntax form ...)
-     (run-compile-time-linklet! (lower-forms (expand-body form (+ phase 1)) (+ phase 1)) (+ phase 1) f)]))
+     (run-compile-time-linklet! (finished-forms (with-output #f (lambda () (expand-body form (+ phase 1)))))
+                                (+ phase 1) f)]))
 
 ;; After a trap, which wasm code cannot catch, the host calls the
 ;; compiler's on-trap (spec 4). A trap unwinds without restoring the state
@@ -2458,15 +2483,16 @@
            (if (ref-nullable? t) (list 'ref 'null name) (list 'ref name)))]
         [else t]))
 
-;; The running macro's introduction scope is flipped around the expansion,
-;; so code from the macro's input expands as it would at the use site. If
-;; an exception leaves the expansion, the expander is as it was, since the
-;; macro may handle it and go on.
+;; s, expanded to fully expanded code (spec 6.4). The running macro's
+;; introduction scope is flipped around the expansion, so code from the
+;; macro's input expands as it would at the use site. If an exception
+;; leaves the expansion, the expander is as it was, since the macro may
+;; handle it and go on.
 (define (query-local-expand s)
   (unless (stx? s) (raise-compile-error api-where "local-expand: expected syntax"))
   (let ([saved current-function])
     (dynamic-wind (lambda () #f)
-                  (lambda () (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro))
+                  (lambda () (with-output #t (lambda () (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro))))
                   (lambda () (set! current-function saved)))))
 
 ;; The form gets the macro's introduction scope, as its output does. The
@@ -2607,10 +2633,10 @@
 
 ;; ==== fully expanded code ====
 ;;
-;; Expansion turns code into fully expanded code (spec 6.4): syntax in the
-;; kernel's core grammar, with every macro use expanded and every
-;; application and literal explicit. Lowering (below) turns fully expanded
-;; code into the compiler's input (core.sub).
+;; Fully expanded code (spec 6.4) is syntax in the kernel's core grammar,
+;; with every macro use expanded and every application and literal
+;; explicit: what local-expand gives a macro, and sub expand prints. The
+;; walk below builds it in place of lowered code when asked (to-syntax?).
 ;;
 ;; The core forms in fully expanded code are named by identifiers with only
 ;; the core scope, so they mean the core forms in any module, whatever it
@@ -2643,6 +2669,40 @@
         id)))
 
 ;; ==== expressions ====
+;;
+;; One walk expands an expression and builds its output: the compiler's
+;; input (core.sub), lowered code, which a module's code becomes; or, for
+;; local-expand and sub expand, fully expanded code, syntax (spec 6.4).
+;; The walk resolves and checks each form once, and builds either from
+;; what it found.
+
+;; Whether the walk builds fully expanded code, rather than lowered code.
+(define to-syntax? #f)
+
+;; (thunk), with the walk building fully expanded code if syntax? is true,
+;; and lowered code otherwise.
+(define (with-output syntax? thunk)
+  (let ([saved to-syntax?])
+    (dynamic-wind (lambda () (set! to-syntax? syntax?)) thunk (lambda () (set! to-syntax? saved)))))
+
+;; Lowered expression e, at s (spec 3.6).
+(define (at s e) (list 'at (stx-srcloc s) e))
+
+;; The lowered expressions es in sequence, at s.
+(define (seq-at s es) (at s (cons 'seq es)))
+
+;; Whether the form being built has a lambda or an application of a
+;; function value, which the compiler looks for closures in (core.sub).
+(define lowered-closures? #f)
+
+;; (thunk), noting the closures in what it builds apart from those of the
+;; form around it: (what it built . whether that has closures).
+(define (closures-noted thunk)
+  (let ([outer lowered-closures?])
+    (set! lowered-closures? #f)
+    (let* ([r (thunk)] [flag lowered-closures?])
+      (set! lowered-closures? outer)
+      (cons r flag))))
 
 ;; s has no value binding. It may still name a type.
 (define (unbound s sym phase)
@@ -2656,17 +2716,18 @@
       [(symbol? e)
        (let ([m (meaning-of s phase)])
          (case (and m (car m))
-           [(local) (with-local-binding s (cadr m))]
-           [(global) (with-local-binding s #f)]
+           [(local) (if to-syntax? (with-local-binding s (cadr m)) (at s (list 'lref (cadr m))))]
+           [(global) (if to-syntax? (with-local-binding s #f) (at s (list 'gref (cadr m))))]
            [(compile-time-value)
             (let ([t (transformer-of m)])
               (if t
                   (expand-expr (apply-macro s t s phase #f) phase)
                   (raise-compile-error s "~a is bound to a compile-time value: read it with syntax-local-value" e)))]
+           ;; A function's name as an expression is its value (5.2).
            [(func)
-            (if (has-value? (cadr m))
-                (with-local-binding s #f)
-                (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e))]
+            (unless (has-value? (cadr m))
+              (raise-compile-error s "~a is a function: call it, or use (func-index ~a)" e e))
+            (if to-syntax? (with-local-binding s #f) (at s (list 'gref (function-value (cadr m)))))]
            [(data) (raise-compile-error s "~a is data: use (data-address ~a) and (data-size ~a)" e e e)]
            [(tag) (raise-compile-error s "~a is a tag: throw it with (throw ~a arg ...)" e e)]
            [(core prim) (raise-compile-error s "bad use of ~a" e)]
@@ -2698,7 +2759,7 @@
               [t (transformer-of m)])
          (cond
            [t (expand-expr (apply-macro id t (stx-rewrap s (list id s)) phase #f) phase)]
-           [(and m (eq? (car m) 'core)) (core-datum s) (out s datum-sym s)]
+           [(and m (eq? (car m) 'core)) (datum-out s s)]
            [else (raise-compile-error s "the literal ~s needs #%datum, which is ~a here" (stx->datum s)
                                       (if m "not a macro or the core form" "unbound"))]))]
       [(keyword? e) (raise-compile-error s "~s: keyword misused as an expression" e)]
@@ -2724,16 +2785,22 @@
            (raise-compile-error s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for a kernel string")]
           [else (raise-compile-error s "~s is not a literal" (stx->datum s))])))
 
-;; The core #%app: (#%app f arg ...) calls the function f; with any other
-;; head, an expression, it applies a function value, which the language
-;; lowers (spec 5.3).
-(define (core-app s f args phase)
-  (let ([ex (lambda (e) (expand-expr e phase))])
-    (apply out s app-sym (if (function-name? f phase) f (ex f)) (map ex args))))
+;; (#%datum literal), the form where.
+(define (datum-out where literal)
+  (let ([d (core-datum literal)])
+    (if to-syntax? (out where datum-sym literal) (at where d))))
 
-(define (function-name? f phase)
-  (let ([m (and (id? f) (meaning-of f phase))])
-    (and m (eq? (car m) 'func))))
+;; The core #%app: (#%app f arg ...) calls the function f, or is its body
+;; if f is inline (inline-call); with any other head, an expression, it
+;; applies a function value, a closure the compiler calls (spec 5.3).
+(define (core-app s f args phase)
+  (let* ([m (and (id? f) (meaning-of f phase))]
+         [info (and m (eq? (car m) 'func) (cadr m))]
+         [h (if info f (expand-expr f phase))]
+         [a (map (lambda (e) (expand-expr e phase)) args)])
+    (cond [to-syntax? (apply out s app-sym h a)]
+          [info (at s (or (and (not (raw-code?)) (inline-call info a)) (list 'call info a)))]
+          [else (set! lowered-closures? #t) (at s (list 'apply-value h a))])))
 
 ;; A numeric or memory instruction: (args . offset), its arguments and a
 ;; trailing literal offset if it has one, else #f.
@@ -2750,9 +2817,11 @@
                                      (length args))])))
 
 (define (expand-prim name s phase)
-  (let ([ao (prim-args name s)])
-    (apply out s name (append (map (lambda (a) (expand-expr a phase)) (car ao))
-                              (if (cdr ao) (list (cdr ao)) '())))))
+  (let* ([ao (prim-args name s)]
+         [args (map (lambda (a) (expand-expr a phase)) (car ao))])
+    (if to-syntax?
+        (apply out s name (append args (if (cdr ao) (list (cdr ao)) '())))
+        (at s (list 'prim name (and (cdr ao) (stx-e (cdr ao))) args)))))
 
 (define (data-info-of id phase)
   (let ([m (and (id? id) (meaning-of id phase))])
@@ -2816,85 +2885,118 @@
 
 (define (expand-gc name s phase)
   (let* ([parts (expand-gc-immediates name (or (stx->list s) (raise-compile-error s "bad ~a syntax" name)) phase)]
-         [args (cdr (gc-parts name (stx-rewrap s parts) phase))])
-    (apply out s name (append (take (cdr parts) (- (length (cdr parts)) (length args)))
-                              (map (lambda (a) (expand-expr a phase)) args)))))
+         [ia (gc-parts name (stx-rewrap s parts) phase)]
+         [args (map (lambda (a) (expand-expr a phase)) (cdr ia))])
+    (if to-syntax?
+        (apply out s name (append (take (cdr parts) (- (length (cdr parts)) (length args))) args))
+        (at s (list 'gc name (car ia) args)))))
 
 (define (expand-core name s phase)
   (let ([ex (lambda (x) (expand-expr x phase))]
-        [o (lambda parts (apply out s name parts))])
+        [o (lambda parts (apply out s name parts))]
+        [lo (lambda (form) (at s form))])
     (case name
       [(#%app) (syntax-match s [(_ f arg ...) (core-app s f arg phase)])]
-      [(#%datum) (syntax-match s [(_ literal) (core-datum literal) (o literal)])]
+      [(#%datum) (syntax-match s [(_ literal) (datum-out s literal)])]
       [(closure) (raise-compile-error s "closure is a type, (ref (closure (type ... -> type ...))), not an expression")]
-      [(quote) (syntax-match s [(_ datum) (o datum)])]
-      [(quote-syntax) (syntax-match s [(_ datum) (o (prune-local-scopes datum))])]
-      [(quasiquote) (syntax-match s [(_ template) (quasi s template 0 phase 'quasiquote 'unquote 'unquote-splicing #f)])]
-      [(quasisyntax) (syntax-match s [(_ template) (quasi s template 0 phase 'quasisyntax 'unsyntax 'unsyntax-splicing #t)])]
+      [(quote) (syntax-match s [(_ datum) (if to-syntax? (o datum) (lo (list 'quote (stx->datum datum))))])]
+      [(quote-syntax)
+       (syntax-match s
+         [(_ datum) (let ([d (prune-local-scopes datum)]) (if to-syntax? (o d) (lo (list 'quote d))))])]
+      ;; A quasi form is calls of the kernel module (quasi), expanded.
+      [(quasiquote) (syntax-match s [(_ template) (ex (quasi s template 0 phase 'quasiquote 'unquote 'unquote-splicing #f))])]
+      [(quasisyntax) (syntax-match s [(_ template) (ex (quasi s template 0 phase 'quasisyntax 'unsyntax 'unsyntax-splicing #t))])]
       [(unquote unquote-splicing unsyntax unsyntax-splicing)
        (raise-compile-error s "~a is not inside a quasi form" name)]
-      [(data-address data-size) (syntax-match s [(_ data) (data-info-of data phase) (o data)])]
+      [(data-address data-size)
+       (syntax-match s
+         [(_ data)
+          (let ([info (data-info-of data phase)])
+            (if to-syntax?
+                (o data)
+                (lo (list 'const 'i32 (if (eq? name 'data-address)
+                                          (data-info-offset info)
+                                          (bytes-length (data-info-bytes info)))))))])]
       ;; wasm's constants: a literal of that type, whatever #%datum means
       ;; here (spec 5.3).
-      [(i32.const i64.const f32.const f64.const) (syntax-match s [(_ literal) (const-literal name literal) (o literal)])]
+      [(i32.const i64.const f32.const f64.const)
+       (syntax-match s
+         [(_ literal)
+          (let ([n (const-literal name literal)])
+            (if to-syntax?
+                (o literal)
+                (lo (list 'as (list (const-type name)) (if (integer? n) (list 'int n) (list 'float n))))))])]
       [(set!)
        (syntax-match s
          [(_ (? id? x) value)
           (let ([m (meaning-of x phase)])
             (unless (and m (memq (car m) '(local global)))
               (raise-compile-error x "set!: ~a is not a variable" (stx-e x)))
-            (o (with-local-binding x (and (eq? (car m) 'local) (cadr m))) (ex value)))])]
+            (let ([v (ex value)])
+              (cond [to-syntax? (o (with-local-binding x (and (eq? (car m) 'local) (cadr m))) v)]
+                    [(eq? (car m) 'local) (lo (list 'lset (cadr m) v))]
+                    [else (lo (list 'gset (cadr m) v))])))])]
       [(let let*)
        (syntax-match s
          [(_ (? stx? bindings (binding ...)) body ...)
           (let ([bs (map (lambda (b) (let-binding b phase)) binding)])
             (if (eq? name 'let)
-                (let* ([inits (map (lambda (bp) (ex (binding-init bp))) bs)]
+                (let* ([inits (map (lambda (bp) (ex (let-init bp))) bs)]
                        [sc (new-local-scope!)]
-                       [xs (map (lambda (bp) (bound-local (add-scope (car bp) sc) phase)) bs)])
-                  (apply o (out-list bindings (map binding-out bs xs inits))
-                         (map (lambda (x) (ex (add-scope x sc))) body)))
+                       [xs (map (lambda (bp) (add-scope (car bp) sc)) bs)]
+                       [keys (map (lambda (x) (bind-local! x phase)) xs)])
+                  (let-out s bindings bs xs keys inits (map (lambda (x) (ex (add-scope x sc))) body)))
                 (expand-let* s bs body phase)))])]
       ;; (lambda ([x t] ...) [-> r] body ...): a function that uses the
-      ;; locals around it (spec 5.3). It cannot branch to the labels
-      ;; around it.
+      ;; locals around it, a closure the compiler makes (spec 5.3). It
+      ;; cannot branch to the labels around it.
       [(lambda)
        (syntax-match s
          [(_ (? stx? ps (p ...)) . rest)
           (let* ([params (map (lambda (x) (param-of x phase)) p)]
+                 [types (map (lambda (pp) (parse-type (cadr pp) phase)) params)]
                  [arrow (arrow-of rest phase)]
+                 [results (car (parse-results arrow phase))]
                  [body (list-tail rest (length arrow))]
                  [sc (new-local-scope!)]
-                 [xs (map (lambda (pp) (bound-local (add-scope (car pp) sc) phase)) params)]
+                 [xs (map (lambda (pp) (add-scope (car pp) sc)) params)]
+                 [keys (map (lambda (x) (bind-local! x phase)) xs)]
                  [saved current-function])
-            (for-each (lambda (pp) (parse-type (cadr pp) phase)) params)
-            (parse-results arrow phase)
             (set! current-function (list s))
-            (let ([r (apply o (out-list ps (map (lambda (x pp) (out-list x (list x (cadr pp)))) xs params))
-                            (append arrow (map (lambda (b) (ex (add-scope b sc))) body)))])
+            (let ([b (map (lambda (x) (ex (add-scope x sc))) body)])
               (set! current-function saved)
-              r))])]
-      [(begin) (syntax-match s [(_ e ...) (apply o (map ex e))])]
+              (if to-syntax?
+                  (apply o (out-list ps (map (lambda (x key pp) (out-list x (list (with-local-binding x key) (cadr pp)))) xs keys params))
+                         (append arrow b))
+                  (begin (set! lowered-closures? #t)
+                         (lo (list 'lambda (fresh-key!) (map cons keys types) results (seq-at s b)))))))])]
+      [(begin) (syntax-match s [(_ e ...) (let ([es (map ex e)]) (if to-syntax? (apply o es) (lo (cons 'seq es))))])]
       [(if) (syntax-match s
-              [(_ test then) (o (ex test) (ex then))]
-              [(_ test then otherwise) (o (ex test) (ex then) (ex otherwise))])]
+              [(_ test then)
+               (let* ([c (ex test)] [t (ex then)]) (if to-syntax? (o c t) (lo (list 'if c t #f))))]
+              [(_ test then otherwise)
+               (let* ([c (ex test)] [t (ex then)] [e (ex otherwise)]) (if to-syntax? (o c t e) (lo (list 'if c t e))))])]
       [(block loop)
        (syntax-match s
          [(_ (? id? label) body ...)
-          (let* ([sc (new-local-scope!)] [l (add-scope label sc)])
-            (fresh-label! l phase)
-            (apply o l (map (lambda (x) (ex (add-scope x sc))) body)))])]
+          (let* ([sc (new-local-scope!)] [l (add-scope label sc)] [key (fresh-label! l phase)]
+                 [b (map (lambda (x) (ex (add-scope x sc))) body)])
+            (if to-syntax? (apply o l b) (lo (list name key (seq-at s b)))))])]
       [(br) (syntax-match s
-              [(_ label) (check-label-here label phase) (o label)]
-              [(_ label value) (check-label-here label phase) (o label (ex value))])]
-      [(br-if) (syntax-match s [(_ label test) (check-label-here label phase) (o label (ex test))])]
-      [(return) (syntax-match s [(_) (o)] [(_ value) (o (ex value))])]
+              [(_ label) (let ([key (label-here label phase)]) (if to-syntax? (o label) (lo (list 'br key #f))))]
+              [(_ label value)
+               (let* ([key (label-here label phase)] [v (ex value)]) (if to-syntax? (o label v) (lo (list 'br key v))))])]
+      [(br-if) (syntax-match s
+                 [(_ label test)
+                  (let* ([key (label-here label phase)] [c (ex test)]) (if to-syntax? (o label c) (lo (list 'br-if key c))))])]
+      [(return) (syntax-match s
+                  [(_) (if to-syntax? (o) (lo (list 'return #f)))]
+                  [(_ value) (let ([v (ex value)]) (if to-syntax? (o v) (lo (list 'return v))))])]
       [(call-indirect)
        (syntax-match s
          [(_ signature index arg ...)
-          (let ([sig (expand-signature signature phase)])
-            (parse-signature sig phase)
-            (apply o sig (ex index) (map ex arg)))])]
+          (let* ([sig (expand-signature signature phase)] [pr (parse-signature sig phase)] [i (ex index)] [a (map ex arg)])
+            (if to-syntax? (apply o sig i a) (lo (list 'call-indirect (car pr) (cdr pr) i a))))])]
       ;; (ref.func f): a reference to f, at its declared function type.
       [(ref.func)
        (syntax-match s
@@ -2903,8 +3005,8 @@
             (unless (and m (eq? (car m) 'func))
               (raise-compile-error f "ref.func: ~a is not a function" (stx-e f)))
             (unless (func-info-type (cadr m))
-              (raise-compile-error f "ref.func: ~a has no declared function type; give it one with (type T)" (stx-e f))))
-          (o f)])]
+              (raise-compile-error f "ref.func: ~a has no declared function type; give it one with (type T)" (stx-e f)))
+            (if to-syntax? (o f) (lo (list 'ref-func (cadr m)))))])]
       ;; (call-ref T f arg ...): call f, a (ref null T), with the args.
       [(call-ref)
        (syntax-match s
@@ -2912,26 +3014,34 @@
           (let* ([tname (expand-type-name type phase)] [t (type-of tname phase)])
             (unless (func-type? t)
               (raise-compile-error type "call-ref: ~a is not a function type" (type-info-name t)))
-            (apply o tname (ex f) (map ex arg)))])]
+            (let ([h (ex f)] [a (map ex arg)])
+              (if to-syntax? (apply o tname h a) (lo (list 'call-ref t h a)))))])]
       [(func-index)
        (syntax-match s
          [(_ (? id? f))
           (let ([m (meaning-of f phase)])
             (unless (and m (eq? (car m) 'func))
-              (raise-compile-error f "func-index: ~a is not a function" (stx-e f))))
-          (o f)])]
-      [(select) (syntax-match s [(_ a b test) (o (ex a) (ex b) (ex test))])]
-      [(drop) (syntax-match s [(_ value) (o (ex value))])]
-      [(unreachable nop) (syntax-match s [(_) (o)])]
+              (raise-compile-error f "func-index: ~a is not a function" (stx-e f)))
+            (if to-syntax? (o f) (lo (list 'func-index (cadr m)))))])]
+      [(select) (syntax-match s
+                  [(_ a b test)
+                   (let* ([x (ex a)] [y (ex b)] [c (ex test)]) (if to-syntax? (o x y c) (lo (list 'select x y c))))])]
+      [(drop) (syntax-match s [(_ value) (let ([v (ex value)]) (if to-syntax? (o v) (lo (list 'drop v))))])]
+      [(unreachable nop) (syntax-match s [(_) (if to-syntax? (o) (lo (list name)))])]
       ;; (throw tag arg ...): throw an exception of tag, carrying the args.
-      [(throw) (syntax-match s [(_ tag arg ...) (tag-info-of tag phase) (apply o tag (map ex arg))])]
-      [(throw-ref) (syntax-match s [(_ exn) (o (ex exn))])]
+      [(throw)
+       (syntax-match s
+         [(_ tag arg ...)
+          (let* ([info (tag-info-of tag phase)] [a (map ex arg)])
+            (if to-syntax? (apply o tag a) (lo (list 'throw info a))))])]
+      [(throw-ref) (syntax-match s [(_ exn) (let ([v (ex exn)]) (if to-syntax? (o v) (lo (list 'throw-ref v))))])]
       ;; (try (clause ...) body ...): body, with the exceptions the clauses
       ;; catch handled by them (spec 5.3).
       [(try)
        (syntax-match s
          [(_ (? stx? clauses (clause ...)) body ...)
-          (apply o (out-list clauses (map (lambda (c) (expand-catch c phase)) clause)) (map ex body))])]
+          (let* ([cs (map (lambda (c) (expand-catch c phase)) clause)] [b (map ex body)])
+            (if to-syntax? (apply o (out-list clauses cs) b) (lo (list 'try cs (seq-at s b)))))])]
       [else
        (if (memq name gc-forms)
            (expand-gc name s phase)
@@ -2960,47 +3070,65 @@
     [('catch-all body ...) (list 'catch-all #f #f body)]
     [('catch-all-ref (? stx? vars ((? id? e))) body ...) (list 'catch-all-ref #f vars body)]))
 
+;; Try clause c, its variables bound and its body expanded: fully
+;; expanded, or lowered as (kind tag-info-or-#f keys body).
 (define (expand-catch c phase)
   (let* ([p (catch-parts c)] [kind (car p)] [tag (cadr p)] [vars (caddr p)] [body (cadddr p)]
          [xs (if vars (stx->list vars) '())]
-         [n (+ (if tag (length (tag-info-params (tag-info-of tag phase))) 0)
+         [info (and tag (tag-info-of tag phase))]
+         [n (+ (if info (length (tag-info-params info)) 0)
                (if (memq kind '(catch-ref catch-all-ref)) 1 0))]
          [sc (new-local-scope!)])
     (unless (= (length xs) n)
       (raise-compile-error vars "this clause binds ~a variable~a, not ~a" n (if (= n 1) "" "s") (length xs)))
-    (let ([bound (map (lambda (x) (bound-local (add-scope x sc) phase)) xs)])
-      (out-list c (append (list (core-id kind (car (stx->list c))))
-                          (if tag (list tag) '())
-                          (if vars (list (out-list vars bound)) '())
-                          (map (lambda (b) (expand-expr (add-scope b sc) phase)) body))))))
+    (let* ([scoped (map (lambda (x) (add-scope x sc)) xs)]
+           [keys (map (lambda (x) (bind-local! x phase)) scoped)]
+           [b (map (lambda (x) (expand-expr (add-scope x sc) phase)) body)])
+      (if to-syntax?
+          (out-list c (append (list (core-id kind (car (stx->list c))))
+                              (if tag (list tag) '())
+                              (if vars (list (out-list vars (map with-local-binding scoped keys))) '())
+                              b))
+          (list kind info keys (seq-at c b))))))
 
-;; A let binding [x init] or [x type init], as the list (x init) or
-;; (x type init), the type expanded.
+;; A let binding [x init] or [x type init], as (x type-syntax type init),
+;; the type expanded and parsed, or #f and #f without one.
 (define (let-binding b phase)
   (syntax-match b
-    [((? id? name) init) (list name init)]
-    [((? id? name) type init) (let ([t (expand-type type phase)]) (parse-type t phase) (list name t init))]))
+    [((? id? name) init) (list name #f #f init)]
+    [((? id? name) type init) (let ([t (expand-type type phase)]) (list name t (parse-type t phase) init))]))
 
-;; A let binding [x init] or [x type init].
-(define (binding-init bp) (if (= (length bp) 3) (caddr bp) (cadr bp)))
-(define (binding-out bp x init)
-  (out-list (car bp) (if (= (length bp) 3) (list x (cadr bp) init) (list x init))))
+(define (let-init bp) (cadddr bp))
+
+;; The let, the form s whose binding list is bindings, of bindings bs,
+;; bound as the identifiers xs with the keys, to inits, around body.
+(define (let-out s bindings bs xs keys inits body)
+  (if to-syntax?
+      (apply out s 'let
+             (out-list bindings (map (lambda (bp x key init)
+                                       (let ([x (with-local-binding x key)])
+                                         (out-list (car bp) (if (cadr bp) (list x (cadr bp) init) (list x init)))))
+                                     bs xs keys inits))
+             body)
+      (at s (list 'let
+                  (map (lambda (bp key init) (list key (caddr bp) init (stx-e (car bp)))) bs keys inits)
+                  (seq-at s body)))))
 
 ;; (let* (b ...) body ...) as nested lets, one binding each.
 (define (expand-let* s bs body phase)
   (let ([ex (lambda (x) (expand-expr x phase))])
     (if (null? bs)
-        (apply out s 'let (out-list s '()) (map ex body))
+        (let-out s s '() '() '() '() (map ex body))
         (let* ([bp (car bs)]
-               [init (ex (binding-init bp))]
+               [init (ex (let-init bp))]
                [sc (new-local-scope!)]
-               [x (bound-local (add-scope (car bp) sc) phase)]
-               [later (map (lambda (bp) (map (lambda (y) (add-scope y sc)) bp)) (cdr bs))]
+               [x (add-scope (car bp) sc)]
+               [key (bind-local! x phase)]
+               [later (map (lambda (bp) (list (add-scope (car bp) sc) (cadr bp) (caddr bp) (add-scope (let-init bp) sc)))
+                           (cdr bs))]
                [body (map (lambda (y) (add-scope y sc)) body)])
-          (apply out s 'let (out-list s (list (binding-out bp x init)))
-                 (if (null? later)
-                     (map ex body)
-                     (list (expand-let* s later body phase))))))))
+          (let-out s s (list bp) (list x) (list key) (list init)
+                   (if (null? later) (map ex body) (list (expand-let* s later body phase))))))))
 
 ;; A local variable with id's name and scopes already is one the same form
 ;; binds: an error, rather than ambiguous uses.
@@ -3013,10 +3141,6 @@
   (let ([b (bind! id phase #f)])
     (set-binding-meaning! b (list 'local (binding-key b)))
     (binding-key b)))
-
-;; Local variable id, bound, as fully expanded code holds it: recording its
-;; binding for local-binding (spec 2.3).
-(define (bound-local id phase) (with-local-binding id (bind-local! id phase)))
 
 ;; id, recording that it binds or refers to the local variable with key,
 ;; or, key #f, that it refers to none: in fully expanded code an
@@ -3044,10 +3168,14 @@
     (hash-set! label-functions key current-function)
     key))
 
-(define (check-label-here id phase)
-  (unless (eq? (hash-ref label-functions (label-key-of id phase) #f) current-function)
-    (raise-compile-error id "~a is a label of the function around this lambda, which a lambda cannot branch to"
-                         (stx-e id))))
+;; The key of label id, which must be a label of the function being
+;; expanded: a lambda cannot branch to the labels around it.
+(define (label-here id phase)
+  (let ([key (label-key-of id phase)])
+    (unless (eq? (hash-ref label-functions key #f) current-function)
+      (raise-compile-error id "~a is a label of the function around this lambda, which a lambda cannot branch to"
+                           (stx-e id)))
+    key))
 
 (define (label-key-of id phase)
   (let ([m (and (id? id) (meaning-of id phase))])
@@ -3057,8 +3185,9 @@
 
 ;; ==== quasiquote / quasisyntax ====
 ;;
-;; One walker for both. The result is fully expanded code that calls the
-;; kernel module. For quasisyntax, unchanged subtemplates become syntax
+;; One walker for both. The result is code that calls the kernel module,
+;; in core forms with the unquoted expressions as written, for expand-expr
+;; to expand. For quasisyntax, unchanged subtemplates become syntax
 ;; constants and changed lists are rewrapped with the template's own
 ;; scopes and srcloc (syntax-rewrap).
 
@@ -3088,12 +3217,12 @@
                            (cond [(null? e) (out x 'quote (make-stx '() '() #f '()))]
                                  [(stx? e) (walk e depth)]
                                  [(and (= depth 0) (tagged? (car e) sname))
-                                  (let ([v (expand-expr (cadr (stx->list (car e))) phase)])
+                                  (let ([v (cadr (stx->list (car e)))])
                                     (call 'append (if syntax? (call 'splice-list v) v) (loop (cdr e))))]
                                  [else (call 'cons (walk (car e) depth) (loop (cdr e)))])))]
            [walk (lambda (x depth)
                    (cond [(not (changes? x depth)) (constant x)]
-                         [(and (tagged? x uname) (= depth 0)) (expand-expr (cadr (stx->list x)) phase)]
+                         [(and (tagged? x uname) (= depth 0)) (cadr (stx->list x))]
                          [(pair? (stx-e x))
                           (let* ([l (stx-e x)]
                                  [inner-depth (cond [(or (tagged? x uname) (tagged? x sname)) (- depth 1)]
@@ -3106,71 +3235,12 @@
                          [else (constant x)]))])
     (walk t depth)))
 
-;; ==== lowering ====
-;;
-;; Fully expanded code -> the compiler's input (core.sub). Lowering only
-;; resolves names: expansion has already checked the code and bound every
-;; variable and label, so anything else is an internal error.
-
-(define (at s ast) (list 'at (stx-srcloc s) ast))
-
-;; Whether the form being lowered has a lambda or an application of a
-;; function value, which the compiler looks for closures in (core.sub).
-(define lowered-closures? #f)
-
-(define (not-expanded s)
-  (raise-compile-error s "internal: not fully expanded code: ~s" (stx->datum s)))
-
-(define (lower-forms forms phase)
-  (apply append (map (lambda (f) (lower-form f phase)) forms)))
-
-;; A module-level form, as a list of forms for the compiler: none for an
-;; import, one per type for a recursion group.
-(define (lower-form f phase)
-  (case (core-head f phase)
-    [(func)
-     (syntax-match f
-       [(_ (name (param _) ...) . rest)
-        (let* ([info (func-info-of name phase)]
-               [options (func-options rest)]
-               [inline? (car options)]
-               [body (cdr (parse-results (caddr options) phase))]
-               [params (map (lambda (p t) (cons (local-key-of p phase) t)) param (func-info-params info))]
-               ;; A (type T) clause first is in the info already.
-               [code (begin (set! lowered-closures? #f)
-                            (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase))])
-          (when inline? (record-inline! info params code name))
-          (when (cadr options) (function-value info))
-          (list (list 'func info params code lowered-closures?)))])]
-    [(global)
-     (syntax-match f
-       [(_ name _ init)
-        (let ([info (cadr (meaning-of name phase))])
-          (set! lowered-closures? #f)
-          (let ([e (lower-expr init phase)])
-            (list (list 'global info e lowered-closures?))))])]
-    [(import #%fact) '()]
-    [(type) (syntax-match f [(_ name _) (list (list 'type (type-of name phase)))])]
-    [(rec) (syntax-match f [(_ (_ name _) ...) (map (lambda (n) (list 'type (type-of n phase))) name)])]
-    [(data) (syntax-match f [(_ name . _) (list (list 'data (data-info-of name phase)))])]
-    [(tag) (syntax-match f [(_ name _) (list (list 'tag (tag-info-of name phase)))])]
-    [else (set! lowered-closures? #f)
-          (let ([e (lower-expr f phase)]) (list (list 'expr e lowered-closures?)))]))
-
-(define (lower-seq forms where phase)
-  (at where (cons 'seq (map (lambda (f) (lower-expr f phase)) forms))))
-
-(define (func-info-of id phase)
-  (let ([m (and (id? id) (meaning-of id phase))])
-    (unless (and m (eq? (car m) 'func)) (not-expanded id))
-    (in-lowering-kernel (cadr m) id)))
-
 ;; ---- function values (spec 5.2) ----
 
 ;; A function declared with #:value g -> (g . phase), then g's info once
-;; it is resolved. In fully expanded code a function's name stays a name,
-;; and lowering reads its value then: the global may be declared after the
-;; function.
+;; it is resolved: when the function's name is first expanded as an
+;; expression, in the second pass, so the global may be declared after
+;; the function, or lifted with it.
 (define function-values (make-hasheq))
 
 (define (value-base info)
@@ -3325,130 +3395,80 @@
                    (copy (caddr e)))]
       [else (raise-compile-error #f "internal: lowered form ~a" (car e))])))
 
-(define (lowered-tag-info id phase) (in-lowering-kernel (tag-info-of id phase) id))
 
-;; The local variable id binds or refers to, from the property the
-;; expander put on it (spec 2.3), so that lowering resolves no local.
-(define (local-key-of id phase) (or (and (id? id) (local-binding-of id)) (not-expanded id)))
+;; ==== raw code ====
+;;
+;; Expansion builds lowered code for the kernel it is lowered against
+;; (lowering-kernel): the definitions bound are the target kernel's, and
+;; a call of an inline function is its body. While the running and target
+;; kernels differ (spec 1.4), a module's code is compiled against both,
+;; so the walk builds it raw, each definition as bound and every call a
+;; call, and finish-forms makes each kernel's code from it.
 
-(define (lower-expr s phase)
-  (let ([e (stx-e s)])
-    (at s
-        (cond
-          [(symbol? e)
-           (let ([key (local-binding-of s)])
-             (if key
-                 (list 'lref key)
-                 (let ([m (meaning-of s phase)])
-                   (case (and m (car m))
-                     [(global) (list 'gref (in-lowering-kernel (cadr m) s))]
-                     ;; A function's name as an expression is its value (5.2).
-                     [(func)
-                      (let ([g (function-value (cadr m))])
-                        (unless g (not-expanded s))
-                        (list 'gref g))]
-                     [else (not-expanded s)]))))]
-          [(pair? e)
-           (let* ([parts (stx->list s)]
-                  [m (and parts (id? (car parts)) (meaning-of (car parts) phase))])
-             (case (and m (car m))
-               [(core) (lower-core (cadr m) s phase)]
-               [(prim)
-                (let ([ao (prim-args (cadr m) s)])
-                  (list 'prim (cadr m) (and (cdr ao) (stx-e (cdr ao)))
-                        (map (lambda (a) (lower-expr a phase)) (car ao))))]
-               [else (not-expanded s)]))]
-          [else (not-expanded s)]))))
+;; Is the code being built raw: lowered against a kernel other than the
+;; target, whose definitions it names?
+(define (raw-code?) (and target-kernel (not (eq? lowering-kernel target-kernel))))
 
-(define (lower-core name s phase)
-  (let ([lo (lambda (x) (lower-expr x phase))])
-    (case name
-      [(#%app)
-       (syntax-match s
-         [(_ f arg ...)
-          (if (function-name? f phase)
-              (let ([info (func-info-of f phase)] [args (map lo arg)])
-                (or (inline-call info args) (list 'call info args)))
-              (begin (set! lowered-closures? #t)
-                     (list 'apply-value (lo f) (map lo arg))))])]
-      [(#%datum) (syntax-match s [(_ literal) (core-datum literal)])]
-      [(quote) (syntax-match s [(_ datum) (list 'quote (stx->datum datum))])]
-      [(quote-syntax) (syntax-match s [(_ datum) (list 'quote datum)])]
-      [(i32.const i64.const f32.const f64.const)
-       (syntax-match s
-         [(_ literal)
-          (let ([n (const-literal name literal)])
-            (list 'as (list (const-type name)) (if (integer? n) (list 'int n) (list 'float n))))])]
-      [(data-address) (syntax-match s [(_ data) (list 'const 'i32 (data-info-offset (data-info-of data phase)))])]
-      [(data-size)
-       (syntax-match s [(_ data) (list 'const 'i32 (bytes-length (data-info-bytes (data-info-of data phase))))])]
-      [(set!)
-       (syntax-match s
-         [(_ x value)
-          (let ([key (local-binding-of x)] [m (and (id? x) (meaning-of x phase))])
-            (cond
-              [key (list 'lset key (lo value))]
-              [(and m (eq? (car m) 'global))
-               (list 'gset (in-lowering-kernel (cadr m) x) (lo value))]
-              [else (not-expanded s)]))])]
-      [(let)
-       (syntax-match s
-         [(_ (binding ...) body ...)
-          (list 'let
-                (map (lambda (b)
-                       (syntax-match b
-                         [(x init) (list (local-key-of x phase) #f (lo init) (stx-e x))]
-                         [(x type init) (list (local-key-of x phase) (parse-type type phase) (lo init) (stx-e x))]))
-                     binding)
-                (lower-seq body s phase))])]
-      ;; (lambda key params results body): a closure, which the compiler
-      ;; makes (spec 5.3); key is the lambda's own.
-      [(lambda)
-       (syntax-match s
-         [(_ ((x type) ...) . rest)
-          (let ([rb (parse-results rest phase)])
-            (set! lowered-closures? #t)
-            (list 'lambda (fresh-key!)
-                  (map (lambda (x t) (cons (local-key-of x phase) (parse-type t phase))) x type)
-                  (car rb)
-                  (lower-seq (cdr rb) s phase)))])]
-      [(begin) (syntax-match s [(_ e ...) (cons 'seq (map lo e))])]
-      [(if) (syntax-match s
-              [(_ test then) (list 'if (lo test) (lo then) #f)]
-              [(_ test then otherwise) (list 'if (lo test) (lo then) (lo otherwise))])]
-      [(block loop) (syntax-match s [(_ label body ...) (list name (label-key-of label phase) (lower-seq body s phase))])]
-      [(br) (syntax-match s
-              [(_ label) (list 'br (label-key-of label phase) #f)]
-              [(_ label value) (list 'br (label-key-of label phase) (lo value))])]
-      [(br-if) (syntax-match s [(_ label test) (list 'br-if (label-key-of label phase) (lo test))])]
-      [(return) (syntax-match s [(_) (list 'return #f)] [(_ value) (list 'return (lo value))])]
-      [(call-indirect)
-       (syntax-match s
-         [(_ signature index arg ...)
-          (let ([sig (parse-signature signature phase)])
-            (list 'call-indirect (car sig) (cdr sig) (lo index) (map lo arg)))])]
-      [(func-index) (syntax-match s [(_ f) (list 'func-index (func-info-of f phase))])]
-      [(ref.func) (syntax-match s [(_ f) (list 'ref-func (func-info-of f phase))])]
-      [(call-ref) (syntax-match s [(_ type f arg ...) (list 'call-ref (type-of type phase) (lo f) (map lo arg))])]
-      [(select) (syntax-match s [(_ a b test) (list 'select (lo a) (lo b) (lo test))])]
-      [(drop) (syntax-match s [(_ value) (list 'drop (lo value))])]
-      [(unreachable) '(unreachable)]
-      [(nop) '(nop)]
-      [(throw) (syntax-match s [(_ tag arg ...) (list 'throw (lowered-tag-info tag phase) (map lo arg))])]
-      [(throw-ref) (syntax-match s [(_ exn) (list 'throw-ref (lo exn))])]
-      [(try)
-       (syntax-match s
-         [(_ (clause ...) body ...)
-          (list 'try
-                (map (lambda (c)
-                       (let* ([p (catch-parts c)] [tag (cadr p)] [vars (caddr p)])
-                         (list (car p) (and tag (lowered-tag-info tag phase))
-                               (map (lambda (x) (local-key-of x phase)) (if vars (stx->list vars) '()))
-                               (lower-seq (cadddr p) c phase))))
-                     clause)
-                (lower-seq body s phase))])]
-      [else
-       (if (memq name gc-forms)
-           (let ([ia (gc-parts name s phase)])
-             (list 'gc name (car ia) (map lo (cdr ia))))
-           (not-expanded s))])))
+;; The inline functions raw code defines, whose bodies are kept when the
+;; code is finished: info -> the function's name.
+(define raw-inline-names (make-hasheq))
+
+;; Keep inline function info's body code, of parameters params, named by
+;; name: now, or when the raw code is finished.
+(define (note-inline! info params code name)
+  (if (raw-code?) (hash-set! raw-inline-names info name) (record-inline! info params code name)))
+
+;; forms, raw, finished for the kernel code is lowered against: its
+;; definitions in place of the target kernel's, calls of inline functions
+;; inlined, and the bodies of the inline functions among them kept.
+(define (finish-forms forms)
+  (map (lambda (f)
+         (case (car f)
+           [(func)
+            (let* ([info (cadr f)]
+                   [r (closures-noted (lambda () (finish-expr (cadddr f) #f)))]
+                   [name (hash-ref raw-inline-names info #f)])
+              (when name (record-inline! info (caddr f) (car r) name))
+              (list 'func info (caddr f) (car r) (cdr r)))]
+           [(global) (let ([r (closures-noted (lambda () (finish-expr (caddr f) #f)))]) (list 'global (cadr f) (car r) (cdr r)))]
+           [(expr) (let ([r (closures-noted (lambda () (finish-expr (cadr f) #f)))]) (list 'expr (car r) (cdr r)))]
+           [else f]))
+       forms))
+
+;; forms, or the expression e, finished if the code being built is raw.
+(define (finished-forms forms) (if (raw-code?) (finish-forms forms) forms))
+(define (finished-expr e) (if (raw-code?) (finish-expr e #f) e))
+
+;; Raw expression e, finished; loc is the source location it is at, or #f.
+(define (finish-expr e loc)
+  (let* ([fin (lambda (x) (finish-expr x loc))]
+         [fin? (lambda (x) (and x (fin x)))]
+         [def (lambda (info) (in-lowering-kernel info loc))])
+    (case (car e)
+      [(at) (list 'at (cadr e) (finish-expr (caddr e) (cadr e)))]
+      [(as) (list 'as (cadr e) (fin (caddr e)))]
+      [(int float const quote lref unreachable nop) e]
+      [(lset) (list 'lset (cadr e) (fin (caddr e)))]
+      [(gref) (list 'gref (def (cadr e)))]
+      [(gset) (list 'gset (def (cadr e)) (fin (caddr e)))]
+      [(let) (list 'let (map (lambda (b) (list (car b) (cadr b) (fin (caddr b)) (cadddr b))) (cadr e)) (fin (caddr e)))]
+      [(lambda) (set! lowered-closures? #t) (list 'lambda (cadr e) (caddr e) (cadddr e) (fin (list-ref e 4)))]
+      [(apply-value) (set! lowered-closures? #t) (list 'apply-value (fin (cadr e)) (map fin (caddr e)))]
+      [(seq select drop) (cons (car e) (map fin (cdr e)))]
+      [(if) (list 'if (fin (cadr e)) (fin (caddr e)) (fin? (cadddr e)))]
+      [(block loop) (list (car e) (cadr e) (fin (caddr e)))]
+      [(br) (list 'br (cadr e) (fin? (caddr e)))]
+      [(br-if) (list 'br-if (cadr e) (fin (caddr e)))]
+      [(return) (list 'return (fin? (cadr e)))]
+      [(call) (let ([info (def (cadr e))] [args (map fin (caddr e))]) (or (inline-call info args) (list 'call info args)))]
+      [(ref-func func-index) (list (car e) (def (cadr e)))]
+      [(prim) (list 'prim (cadr e) (caddr e) (map fin (cadddr e)))]
+      [(call-indirect) (list 'call-indirect (cadr e) (caddr e) (fin (cadddr e)) (map fin (list-ref e 4)))]
+      [(call-ref) (list 'call-ref (cadr e) (fin (caddr e)) (map fin (cadddr e)))]
+      [(gc) (list 'gc (cadr e) (caddr e) (map fin (cadddr e)))]
+      [(throw) (list 'throw (def (cadr e)) (map fin (caddr e)))]
+      [(throw-ref) (list 'throw-ref (fin (cadr e)))]
+      [(try) (list 'try
+                   (map (lambda (c) (list (car c) (and (cadr c) (def (cadr c))) (caddr c) (fin (cadddr c)))) (cadr e))
+                   (fin (caddr e)))]
+      [else (raise-compile-error loc "internal: lowered form ~a" (car e))])))
