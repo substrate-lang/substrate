@@ -88,11 +88,10 @@ the expander parses the kernel's forms with it, and its errors are written
 from the patterns. A module can change what
 application and literals mean by binding `#%app` and `#%datum` (spec 5.3,
 5.4). Expansion produces fully expanded code, syntax in a fixed grammar (spec
-6.4): a macro can see its input's with `local-expand`, a language's
-`#%linklet` (spec 6.5) can rewrite each unit's, and `bin/sub expand` prints it.
-A macro can leave a hole, `(#%hole ...)`, for the language's `#%linklet`
-to fill once the unit is expanded, and the hook can expand more code and
-lift definitions while it fills them. A module can record facts about a
+6.4): a macro can see its input's with `local-expand`, and `bin/sub expand`
+prints it. A macro that needs the whole module expands into a core
+expression form, whose contents the module body's second pass expands
+once every definition is declared (spec 5.2). A module can record facts about a
 definition, a datum or syntax, `(#%fact id 'datum)` or `(#%fact id #'stx)`,
 which every module that requires it,
 directly or not, reads with `syntax-local-facts`: how a language finds
@@ -116,11 +115,12 @@ first four arguments. `examples/effects.sub` is an effect language on Substrate 
 with a clause per operation, and Koka's evidence passing, built from
 `#%app`, `local-expand` and compile-time values. `examples/typed.sub` is
 a typed language on the kernel (`examples/typed/typed.sub`): `Int`,
-`Bool` and function types, checked by its `#%linklet`; its lambdas are
+`Bool` and function types, checked as each function's body expands, in
+the module's second pass; its lambdas are
 the kernel's closures, one closure type per signature. A function's type
 reaches the modules that import it through the
-transformer its name is bound to. Generics are monomorphized: its
-`#%linklet` makes each instance a module uses from the generic's
+transformer its name is bound to. Generics are monomorphized: each
+instance a module uses is made from the generic's
 definition, which reaches other modules the same way; a generic is
 checked once, where it is defined. Its data types, which may have type
 parameters, are GC structs, a subtype of one base for each variant;
@@ -138,11 +138,11 @@ s-expressions. Its kernel, `core.sub`, checks each module's definitions
 in order while the module compiles: datatypes, definitions by pattern
 matching, which terminate by descent, and proofs by rewriting. A term's
 binders expand to kernel lambdas, so the expander keeps them hygienic,
-and its other nodes to holes; each definition reads its expansion back
+and its other nodes to quoted data; each definition reads its expansion back
 as a term and records it as a fact about its name, which the checker
-looks up by name when a term refers to it (spec 6.6, 6.7). A law
+looks up by name when a term refers to it (spec 6.5, 6.6). A law
 declares a definition that a later one, in any module that requires it,
-fills. Its `#%linklet` then makes each definition a function
+fills. Each definition with a value is then a function
 (`lower.sub`), with every value an `eqref`: a datatype a recursion group
 of structs, one per constructor, a function value a closure, and what is
 erased, types, proofs' rewrites and binders of quantity `-`, left out.

@@ -167,7 +167,7 @@ marked with another type, such as `n:i32`.
 | syntax | `(syntax? v) -> i32`, `(syntax-e s)`, `(identifier? v) -> i32`, `(syntax->list v)` (a list, or `#f`), `(syntax->datum v)`, `(datum->syntax ctx d loc)`, `(syntax-rewrap s e)`, `(splice-list v)`, `(syntax-property s key)` (the value, or `#f`), `(syntax-property-set s key value)`, `(local-binding id)` (a fixnum, or `#f`), `(syntax-source s)`, `(syntax-line s)`, `(syntax-column s)` (where `s` is: its file as errors name it, its line from 1 and its column from 0, or `#f`) |
 | transformers | `(make-transformer code:(ref (func (eqref eqref -> eqref))) env)`, `(transformer? v) -> i32`, `(transformer-env t)` |
 | exceptions | the tag `exn`, whose exceptions carry one `eqref`; `(raise-syntax-error name message stx)` (throws a syntax error), `(syntax-error? v) -> i32`, `(syntax-error-message e)`, `(syntax-error-syntax e)` (the syntax it blames, or `#f`) |
-| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)`, `(syntax-local-facts id)` (6.6), `(identifier-name id)` (a symbol, or `#f`) and `(name-identifier name)` (6.7) |
+| queries | `(syntax-local-value id)` (the compile-time value `id` is bound to, a macro's transformer included, or `#f`), `(free-identifier=? a b) -> i32`, `(identifier-binding-kind id)`, `(identifier-function-signature id)`, `(local-expand stx)`, `(syntax-local-lift-definition form)`, `(syntax-local-introduce stx)`, `(syntax-local-facts id)` (6.5), `(identifier-name id)` (a symbol, or `#f`) and `(name-identifier name)` (6.6) |
 
 - **Numbers.** An integer literal is a fixnum if it fits in 31 bits, and
   otherwise an integer value; integers run from -2^63 to 2^64 - 1, as
@@ -250,10 +250,9 @@ marked with another type, such as `n:i32`.
   introduction scope is flipped around the expansion, so code from the
   macro's input expands as it would at the use site.
 - `syntax-local-lift-definition` adds a module-level form (a `func`, `global`,
-  `import`, `type` or `data` form, or an expression) to the module body
-  being expanded, at the running macro's phase (6.4), or, while
-  `#%linklet` runs, to the unit the hook returns (6.5). The form is
-  declared as the macro's output is, with the use's introduction scope,
+  `import`, `type`, `rec`, `data`, `tag` or `#%fact` form, or an expression)
+  to the module body being expanded, at the running macro's phase (6.4).
+  The form is declared as the macro's output is, with the use's introduction scope,
   so each use gets fresh names. It returns the form as given, so the
   macro can put its names in its output.
 - `syntax-local-introduce` flips the running macro's introduction scope
@@ -295,7 +294,7 @@ they trap.
   - `(require-unqualified name source)` is `require` with every name the
     source provides bound unqualified too, with the scopes of `name`. It
     is meant for a language: the forms and functions its code is written
-    in, such as its `define`, `#%app` and `#%linklet` (6.5), and little else, since
+    in, such as its `define` and `#%app`, and little else, since
     unqualified names hide where a binding comes from. As in Racket, where
     a module's definitions shadow its language's bindings, a module-level
     definition of one of these names shadows the import throughout the
@@ -508,7 +507,7 @@ kernel's bytes, for the compiler built next to embed (1.4).
   with their scope sets and phases, its functions with their signatures,
   declared types and values, its globals, tags and data, its types as
   structural forms, the getters of its compile-time values, its facts
-  (6.6), the lowered bodies of its inline functions, and its linklets,
+  (6.5), the lowered bodies of its inline functions, and its linklets,
   with their imports
   and scope tables. Scopes and definitions belong to a run, so the
   interface names
@@ -1092,16 +1091,15 @@ phase+1 now (3.1), and `s` is bound to its value, an `eqref`, a
   macro in kernel code, and Substrate's `define-syntax` expands to it.
 
 The value lives in a global of the phase+1 linklet, so another module that
-requires this one computes it again in its own compile-time store. The
-right-hand side is a unit for `#%linklet` (6.5).
+requires this one computes it again in its own compile-time store.
 
 ### 6.4 Fully expanded code
 
 Expansion turns a module into **fully expanded code**, as Racket calls it:
 syntax in the grammar
 below, with every macro use expanded and every application and literal
-explicit. `local-expand` returns it, `#%linklet` (6.5) receives and returns
-it, `sub expand` prints it, and the compiler compiles it.
+explicit. `local-expand` returns it, `sub expand` prints it, and the
+compiler compiles it.
 
 ```
 form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)] expr ...)
@@ -1109,7 +1107,7 @@ form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)
        | (import id "module" "field" (type ... -> type ...)) | (import id "module" "field" id)
        | (type id def) | (rec (type id def) ...) | (data id offset "bytes" ...)
        | (tag id (type ...))
-       | (#%fact id (quote datum))            ; a fact about id's definition (6.6)
+       | (#%fact id (quote datum))            ; a fact about id's definition (6.5)
        | (#%fact id (quote-syntax datum))
        | expr
 
@@ -1132,7 +1130,6 @@ expr ::= id                                   ; a local or global variable, or a
        | (i32.const n) | (i64.const n) | (f32.const x) | (f64.const x)
        | (select expr expr expr) | (drop expr) | (unreachable) | (nop)
        | (throw id expr ...) | (throw-ref expr) | (try (clause ...) expr ...)
-       | (#%hole datum ...)                   ; a hole: code the language's #%linklet fills
 
 clause ::= (catch id (id ...) expr ...) | (catch-ref id (id ...) expr ...)
          | (catch-all expr ...) | (catch-all-ref (id) expr ...)
@@ -1149,16 +1146,15 @@ clause ::= (catch id (id ...) expr ...) | (catch-ref id (id ...) expr ...)
   binding, which `local-binding` reads (2.3).
 - Types appear where the source wrote them: parameters, results,
   globals, and `let` bindings that give one. Fully expanded code carries no
-  inferred types; the kernel's checker infers them after `#%linklet`, as
+  inferred types; the kernel's checker infers them when it compiles, as
   it does for any code. Type functions (5.1) are expanded: types in fully
   expanded code contain no macro uses.
-- A **hole**, `(#%hole datum ...)`, is code a language leaves for its
-  `#%linklet` to fill (6.5), where it will know what goes there: an
-  expression or, as a type, a parameter's, a result's, a global's or a
-  `let` binding's type. Expansion leaves a hole and what it holds as they
-  are, so a macro can put what the hook needs to know in it: the typed
-  example's generics leave one for each use, holding the generic. A hole
-  still in the code when it is compiled is an error.
+- **Quoted data is left as it is**: `(quote datum)` expands to itself,
+  whatever `datum` holds, syntax included. So a macro can leave, where an
+  expression goes, what a macro that expands the code later needs to
+  know: the typed example's generics leave `'(typed-generic g)` at each
+  use, holding the generic, and the macro that checks a function's body
+  replaces it with an instance.
 - **The core forms in fully expanded code are named by identifiers with
   only the core scope**, so they mean the core forms in any module, whatever it
   binds, for example its own `let` or `#%app`. Every other identifier keeps
@@ -1172,60 +1168,7 @@ clause ::= (catch id (id ...) expr ...) | (catch-ref id (id ...) expr ...)
   fully expanded code goes before the module-level form whose expansion
   lifted them.
 
-### 6.5 The linklet hook
-
-A **unit** is code that becomes a linklet or part of one (3.1): a module's
-phase-0 code, a `begin-for-syntax`, or the right-hand side of a
-`define-syntax`. Once a unit is expanded, the kernel resolves the identifier
-`#%linklet` at the unit's phase, with the scopes of where the unit's code
-was written: the module's own, the `begin-for-syntax` form's, or the
-right-hand side's.
-
-- The core `#%linklet` leaves the unit as it is. A language binds
-  `#%linklet` to a transformer (2.1) and provides it; a module that takes
-  the language with `require-unqualified` gets it. The kernel calls the
-  transformer with `(#%linklet kind form ...)`, where `kind` is the symbol
-  `module`, `begin-for-syntax` or `define-syntax`, and the forms are the
-  unit's fully expanded code (6.4). A `define-syntax` unit has one form,
-  the right-hand side.
-- The transformer returns the unit's forms as a list. It may rewrite
-  forms and add definitions. For a `define-syntax` unit the last form is
-  the expression whose value `define-syntax` binds, and the others are
-  definitions it needs.
-- What it returns must be fully expanded. It is expanded again only to
-  bind the names it introduces: a macro use there is an error, and a
-  definition there replaces the unit's own of the same name and scopes, so
-  the hook can change a function's body or signature. A definition it
-  leaves out is removed, and code that still uses it, or a `provide` of
-  it, is an error. It may return only `func`, `global`, `import`, `type`,
-  `rec`, `tag`, `data` and `#%fact` forms and expressions. A fact it
-  leaves out is removed with its form, and one it returns or lifts is
-  recorded, so a language can record what it elaborated (6.6); a
-  definition it replaces keeps its facts. A form it returns unchanged, the same object as a form it was given, and
-  in the same order among those, introduces nothing, so it is not expanded
-  again. The transformer has an introduction scope, as a macro use does
-  (6.2).
-- While it runs, the hook asks the queries (2.3) as a macro does. It can
-  expand more code with `local-expand`, and lift definitions with
-  `syntax-local-lift-definition`: each is declared at once, so the code it
-  expands next can use the names, and is expanded as what it returns is,
-  and put before it. It fills the holes (6.4) its language left, which is
-  how a language decides, once the unit is expanded, what goes where it
-  could not while expanding: the typed example fills a generic's hole
-  with the generic's instance at the types it finds.
-- `#%linklet` is resolved per phase, so a module's phase-1 code gets the
-  hook of the language it takes at phase 1, which may differ from its
-  phase-0 language. A module whose phase-1 code is kernel code gets the
-  core hook.
-- This is where a language decides what needs the whole unit, as the
-  typed example's `#%linklet` does to check its generics and impls and
-  lower its functions. Substrate needs none: its lambdas are the kernel's
-  closures (5.3), and its `define-syntax` makes transformers (6.3). A
-  language built on another provides that one's `#%linklet`, or its own
-  that runs it, with `(except-out (all-from-out name) #%linklet)` for the
-  rest (3.1).
-
-### 6.6 Facts
+### 6.5 Facts
 
 `(#%fact id 'datum)` and `(#%fact id #'stx)`, module-level forms, record
 `datum`, as data, or `stx`, as syntax, unevaluated, as a **fact** about
@@ -1233,14 +1176,14 @@ the definition `id` refers to. They bind nothing. A language records
 facts where finding things by name will not do, as for the instances of
 a type class, which a use of the class finds without naming them: the
 typed example's `impl` is a fact about its trait, its syntax, which
-another module expands. Data can name definitions too (6.7), as the Bend
+another module expands. Data can name definitions too (6.6), as the Bend
 example's facts do.
 
 - A fact is about a **definition**: a module's function, global, tag or
   compile-time value, made before the fact. Every identifier that
   refers to that definition sees its facts: under another name, as a
-  qualified import, at another phase shift, and after `#%linklet`
-  replaces it (6.5). Core forms, locals and the kernel module's
+  qualified import, and at another phase shift. Core forms, locals and the
+  kernel module's
   definitions, which every language shares, have none.
 - `(syntax-local-facts id)` returns the facts about `id`'s definition at
   the running macro's phase: those recorded so far by the module being
@@ -1260,7 +1203,7 @@ example's facts do.
 - A fact is a claim a language made, not a checked one: a language that
   checks what facts say, such as a proof checker, derives it again.
 
-### 6.7 Names
+### 6.6 Names
 
 A definition has a **name**, a symbol that is data: a language can keep
 it in a datum, such as a term or a type, compare it with `eq?`, hash it,
@@ -1269,7 +1212,7 @@ example's projections, types, name their trait so.
 
 - `(identifier-name id)` resolves `id` at the running macro's phase and
   gives the name of the definition it refers to: a module's function,
-  global, tag or compile-time value, as a fact is about (6.6), whatever
+  global, tag or compile-time value, as a fact is about (6.5), whatever
   name, module or phase shift it is seen under. It is `#f` for locals,
   core forms and the kernel module's definitions.
 - A name is `file:symbol`, the file as 3.6 names it and the symbol the
@@ -1291,9 +1234,10 @@ example's projections, types, name their trait so.
 
 ## 7. Open questions and later milestones
 
-- **Controlling expansion**: `#%linklet` rewrites a unit after it is
-  expanded (6.5). A language cannot change how a module body expands, as
-  Racket's `#%module-begin` can. Nothing planned needs that.
+- **Controlling expansion**: a language cannot change how a module body
+  expands, as Racket's `#%module-begin` can; what needs the whole module
+  waits for the second pass (5.2), as the typed example's checks do.
+  Nothing planned needs more.
 - **Kernel types that fully expanded code leaves out**: fully expanded
   code carries only the kernel types the source wrote (6.4), and the
   kernel infers the others when it compiles. A language with types of its

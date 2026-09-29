@@ -1,7 +1,7 @@
 ;; Lifecycle: permanent. Part of the compiler.
 ;;
 ;; Expander: syntax objects -> fully expanded code, which is syntax too (spec
-;; 6.4) -> after #%linklet (spec 6.5), lowered to the compiler's input (core.sub).
+;; 6.4) -> lowered to the compiler's input (core.sub).
 ;;
 ;; Binding is by sets of scopes (spec 6.1). A module is a file; each of its
 ;; phases compiles to one wasm module, a linklet (spec 3.1). While a module is
@@ -48,13 +48,10 @@
     array.len array.copy array.fill
     ref.null ref.is_null ref.eq ref.as_non_null ref.test ref.cast ref.i31 i31.get_s i31.get_u))
 
-;; The implicit forms (spec 5.3, 5.4), the linklet hook (spec 6.5), holes,
-;; which a language leaves in code for its hook to fill (6.4), and facts,
-;; which a language records about definitions (6.6).
+;; The implicit forms (spec 5.3, 5.4), and facts, which a language records
+;; about definitions (6.5).
 (define app-sym '#%app)
 (define datum-sym '#%datum)
-(define linklet-sym '#%linklet)
-(define hole-sym '#%hole)
 (define fact-sym '#%fact)
 
 (define core-forms
@@ -66,7 +63,7 @@
      throw throw-ref try closure
      i32.const i64.const f32.const f64.const
      quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
-   (list app-sym datum-sym linklet-sym hole-sym fact-sym)
+   (list app-sym datum-sym fact-sym)
    gc-forms))
 
 (define eqref (make-ref #t 'eq))
@@ -118,8 +115,8 @@
 ;; stem and hash. path: its file, which its source locations name (3.6),
 ;; or (compiled file hash) for a module loaded from a compiled file (3.7).
 ;; facts: the facts it recorded, newest first, each (definition phase
-;; value form): the definition it is about (fact-key), the phase, its
-;; datum or syntax, and, while it compiles, its #%fact form.
+;; value): the definition it is about (fact-key), the phase, and its
+;; datum or syntax.
 (struct unit (path [name #:mutable] [hash #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
               [entries #:mutable] [expanded #:mutable] [scope #:mutable] [program #:mutable]
               scopes                                  ; index -> the scopes its expansion made, in order
@@ -149,7 +146,6 @@
 (struct comp (module store [linklet-counter #:mutable] [use-site-scopes #:mutable]
               [freestanding-form #:mutable] phase-forms memories tables [provide-ids #:mutable]
               [require-names #:mutable]            ; ((name . phase) . module)
-              [definitions #:mutable]              ; the bindings of its phase-0 definitions
               [storage-linklets #:mutable]         ; ((memory-or-table . phase) . linklet that defines it)
               [pending #:mutable]))                ; define-syntax units not yet run: (phase where . forms), newest first
 
@@ -296,7 +292,7 @@
 (define (compile-kernel text)
   (let* ([m (new-unit kernel-path "kernel")]
          [k (kernel m (make-hasheq) #f #f)]
-         [c (comp m #f 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '() #f)])
+         [c (comp m #f 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() #f)])
     (set-unit-hash! m (content-hash (list text)))
     (hash-set! units-by-hash (unit-hash m) m)
     (with-comp c
@@ -706,8 +702,7 @@
                                      (filter (lambda (p) (memv (car p) (list-ref x 5))) params)))))
                 (section d 'inlines))
       (for-each (lambda (g) (hash-set! macro-modules (decode (car g)) m)) (section d 'macros))
-      (set-unit-facts! m (reverse (map (lambda (f) (let ([f (decode f)]) (list (car f) (cadr f) (caddr f) #f)))
-                                       (section d 'facts))))
+      (set-unit-facts! m (reverse (map decode (section d 'facts))))
       (set-unit-program! m (hash-ref (unit-linklets m) 0))
       (set-unit-state! m 'done)
       ;; As its requires would have when it was compiled: its own
@@ -867,16 +862,12 @@
 ;; definition a macro makes from its input is visible to the rest of the
 ;; module (spec 6.2). A second binding of the same name with the same
 ;; scopes at the same phase is an error, except that a definition shadows
-;; what require-unqualified imports (spec 3.1), and in what #%linklet
-;; returns, where it replaces this module's definition (spec 6.5).
+;; what require-unqualified imports (spec 3.1).
 (define (bind-definition! id0 phase meaning)
   (let ([id (remove-scopes id0 (comp-use-site-scopes current))])
-    (unless (and redefining? (redefine! id phase meaning))
-      (shadow-import! id phase meaning)
-      (check-unbound! id phase meaning)
-      (let ([b (bind-module-level! (stx-e id) (stx-scopes id) phase meaning)])
-        (when (eqv? phase 0)
-          (set-comp-definitions! current (cons b (comp-definitions current))))))))
+    (shadow-import! id phase meaning)
+    (check-unbound! id phase meaning)
+    (bind-module-level! (stx-e id) (stx-scopes id) phase meaning)))
 
 ;; A definition shadows a binding require-unqualified made with the same
 ;; name, scopes, phase and namespace: that binding goes, here and in the
@@ -904,16 +895,6 @@
   (let ([b (resolve id phase 'value)])
     (when (and b (hash-has-key? unqualified-imports b))
       (hash-set! unqualified-imports b #t))))
-
-;; Give this module's definition of id, if it has one in the namespace of
-;; meaning, the new meaning: the binding with id's name, scopes and phase,
-;; kept under id's name and greatest scope. Returns #f if there is none.
-(define (redefine! id phase meaning)
-  (let ([b (findf (lambda (b)
-                    (and (eqv? (binding-phase b) phase) (equal? (binding-scopes b) (stx-scopes id))
-                         (eq? (binding-namespace b) (meaning-namespace meaning))))
-                  (bindings-under (stx-e id) (binding-slot (stx-scopes id))))])
-    (and b (begin (note-redefinition! (binding-meaning b) meaning) (set-binding-meaning! b meaning) #t))))
 
 (define (phase-matches? b phase)
   (let ([p (binding-phase b)])
@@ -1180,7 +1161,7 @@
        (or (load-cached path)
            (let* ([text (file->string path)]
                   [m (new-unit path (provisional-name path))]
-                  [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() '() #f)])
+                  [c (comp m (new-cstore) 0 '() #f (make-hasheqv) (make-hasheqv) (make-hasheqv) '() '() '() #f)])
              (hash-set! registry path m)
              (let ([m (with-comp c
                         (lambda ()
@@ -1209,14 +1190,11 @@
         [tbl (hash-ref (comp-tables current) phase #f)])
     (append (if mem (list mem) '()) (if tbl (list tbl) '()))))
 
-;; Run #%linklet over the expanded phase-0 code, resolve provides, and
-;; compile the linklets. Returns the module: the one this run already has
-;; by its hash, if a compiled file brought it (spec 3.7), or else this one.
+;; Lower the expanded phase-0 code, resolve provides, and compile the
+;; linklets. Returns the module: the one this run already has by its
+;; hash, if a compiled file brought it (spec 3.7), or else this one.
 (define (finish-module! c text)
   (let ([m (comp-module c)])
-    (set-unit-expanded! m (apply-linklet-hook 'module (unit-expanded m)
-                                              (make-stx 'module (list (unit-scope m) core-scope) #f '()) 0))
-    (set! removed-definitions (definitions-removed c (unit-expanded m)))
     (add-phase-forms! 0 (lower-forms (unit-expanded m) 0))
     ;; A provided name exports its binding in each namespace it has one.
     (set-unit-provides!
@@ -1229,10 +1207,8 @@
                           [found (filter (lambda (x) x) (list (type-meaning-of id 0) value))])
                      (when (null? found)
                        (raise-compile-error id "cannot provide ~a: it is not a module-level binding" (stx-e id)))
-                     (for-each (lambda (meaning) (check-not-removed (cadr meaning) id)) found)
                      (map (lambda (meaning) (cons (stx-e (car item)) meaning)) found)))
                  (reverse (comp-provide-ids c)))))
-    (set! removed-definitions #f)
     ;; Its requires known, the module takes its hash, and the name its
     ;; instance names start with: its stem and hash.
     (set-unit-hash! m (module-hash (unit-path m) text (map (lambda (r) (list (unit-hash (car r)) (cdr r))) (unit-requires m))))
@@ -1419,10 +1395,6 @@
         (head-expand (apply-macro head t s phase #t) phase)
         s)))
 
-;; While expanding the forms #%linklet returned, what returned them (spec
-;; 6.5); otherwise #f.
-(define redefining? #f)
-
 ;; A module body being expanded: its phase, the items pass 1 found
 ;; (reversed), whether pass 2 has started, and the expanded forms lifted
 ;; while pass 2 expands the current item (reversed).
@@ -1433,10 +1405,6 @@
 ;; A module body -> its fully expanded code: func, global, import, type
 ;; and data forms and expressions (spec 6.4). Other module-level forms take
 ;; effect during expansion and leave nothing.
-;; A form in a body that is already expanded, and bound: a form #%linklet
-;; returned unchanged (spec 6.5). Both passes keep it as it is.
-(struct expanded (form))
-
 (define (expand-body forms phase)
   (let ([b (body phase '() #f '())] [saved current-body])
     (set! current-body b)
@@ -1448,11 +1416,7 @@
 ;; Pass 1 for forms, of body b: find definitions, run compile-time forms,
 ;; splice begins.
 (define (declare-forms! b forms)
-  (for-each (lambda (f)
-              (if (expanded? f)
-                  (set-body-items! b (cons (list 'done (expanded-form f)) (body-items b)))
-                  (declare-form! f b redefining?)))
-            forms))
+  (for-each (lambda (f) (declare-form! f b #f)) forms))
 
 ;; Pass 2 for body b: expand bodies and expressions, in the order pass 1
 ;; declared them. What an item lifts goes before it.
@@ -1468,7 +1432,7 @@
 ;; Pass 1 for module-level form f0 of body b: expand macro uses at its
 ;; head, then declare it, run it, or keep it for pass 2. only is #f, or
 ;; says where the form came from if it may only be a definition or an
-;; expression (what #%linklet returns, or what a macro lifts).
+;; expression (what a macro lifts).
 (define (declare-form! f0 b only)
   (let* ([phase (body-phase b)]
          [f (head-expand f0 phase)]
@@ -1547,14 +1511,12 @@
            [_ (raise-compile-error s "expected (closure (type ... -> type ...))")])]
         [else (raise-compile-error s "expected a heap type, got ~s" (stx->datum s))]))
 
-;; A value type; or a hole, which a language's #%linklet fills (6.4), as
-;; (%hole s).
+;; A value type.
 (define (parse-type s phase)
   (let* ([d (stx-e s)] [short (assq d shorthand-refs)])
     (cond [(memq d '(i32 i64 f32 f64)) d]
           [short (make-ref #t (cdr short))]
           [else (syntax-match s
-                  [('#%hole . _) (list '%hole s)]
                   [('ref heap) (make-ref #f (parse-heap heap phase))]
                   [('ref 'null heap) (make-ref #t (parse-heap heap phase))]
                   [('ref . _) (raise-compile-error s "expected (ref T) or (ref null T)")]
@@ -1565,17 +1527,6 @@
   (let ([t (parse-type s phase)])
     (unless (ref-type? t) (raise-compile-error s "expected a reference type"))
     t))
-
-;; A hole in a type, (%hole s). Code is lowered once #%linklet has run, so
-;; a hole left then, in a type or as an expression, is one no language
-;; filled (spec 6.5).
-(define (hole-type? t) (and (pair? t) (eq? (car t) '%hole)))
-
-(define (unfilled-hole s)
-  (raise-compile-error s "this hole was never filled: the #%linklet of the language that left it must replace it (spec 6.5)"))
-
-;; Type t, which code is lowered with: not a hole.
-(define (filled-type t) (if (hole-type? t) (unfilled-hole (cadr t)) t))
 
 ;; The words of type syntax are compared by name, like wasm's keywords, so
 ;; they are reserved: no declared type may be named by one (spec 5.1).
@@ -1819,7 +1770,6 @@
   (syntax-match body
     [('-> r . rest) (cons (syntax-match r
                             [('ref . _) (list (parse-type r phase))]
-                            [('#%hole . _) (list (parse-type r phase))]
                             [(t ...) (map (lambda (x) (parse-type x phase)) t)]
                             [_ (list (parse-type r phase))])
                           rest)]
@@ -1828,14 +1778,12 @@
 
 ;; The `-> r` that starts rest, a func's or a lambda's, as a list of the
 ;; two, or (). r is one type or a list of them, and has its types
-;; expanded; a macro use or a hole is one type, though it looks like a
-;; list.
+;; expanded; a macro use is one type, though it looks like a list.
 (define (arrow-of rest phase)
   (syntax-match rest
     [('-> r . _)
      (list (car rest) (syntax-match r
                         [('ref . _) (expand-type r phase)]
-                        [('#%hole . _) r]
                         [(t ...) (if (type-macro-use r phase)
                                      (expand-type r phase)
                                      (stx-rewrap r (map (lambda (x) (expand-type x phase)) t)))]
@@ -2240,7 +2188,7 @@
 
 ;; (define-syntax name expr): name is bound to expr's value at phase+1, a
 ;; compile-time value, which macros read with syntax-local-value; if the
-;; value is a transformer, name is a macro. expr is a unit for #%linklet.
+;; value is a transformer, name is a macro.
 ;; In (define-syntax name f), where f names a phase+1 function of type
 ;; (eqref) -> eqref, the value is a transformer that calls f. The value
 ;; lives in a global of the phase+1 linklet, computed when the linklet is
@@ -2259,27 +2207,19 @@
             [function (and m (eq? (car m) 'func) (syntax-function-of rhs phase "a transformer"))]
             [adapter (and function (transformer-adapter (string->symbol (string-append "__transformer." base)) function))]
             [expanded (and (not adapter) (expand-expr rhs (+ phase 1)))]
-            [unit (if adapter
-                      (list adapter)
-                      (let* ([out (apply-linklet-hook 'define-syntax (list expanded) rhs (+ phase 1))]
-                             [value (last out)])
-                        (when (memq (core-head value (+ phase 1)) '(func global import type rec data tag))
-                          (raise-compile-error f "#%linklet returned a define-syntax unit that does not end with an expression"))
-                        (append (lower-forms (take out (- (length out) 1)) (+ phase 1))
-                                (list (list 'expr (lower-expr value (+ phase 1)))))))]
             [init (if adapter
                       (list 'call (kernel-function lowering-kernel 'make-transformer)
                             (list (list 'ref-func (cadr adapter)) (list 'quote #f)))
-                      (cadr (last unit)))]
+                      (lower-expr expanded (+ phase 1)))]
             [global (global-info name eqref #t #f #f)]
             [getter (func-info name '() (list eqref) #f #f #f)]
-            [forms (append (if adapter unit (take unit (- (length unit) 1)))
+            [forms (append (if adapter (list adapter) '())
                            (list (list 'global global init)
                                  (list 'func getter '() (list 'gref global))))])
        (cond [(and function (callable? function 1))
               (add-phase-forms! (+ phase 1) forms)
               (made-value! getter (indexed-transformer (function-index (comp-store current) function)))]
-             [(and (not adapter) (null? (cdr unit)) (plain? init))
+             [(and (not adapter) (plain? init))
               (add-phase-forms! (+ phase 1) forms)
               (made-value! getter (plain-value init rhs))]
              [(or adapter (eq? (core-head expanded (+ phase 1)) 'lambda)) (defer-unit! forms (+ phase 1) f)]
@@ -2325,7 +2265,7 @@
 
 ;; (#%fact id 'datum) or (#%fact id #'stx): the datum, or the syntax as
 ;; quote-syntax keeps it (spec 6.2), recorded as a fact about the
-;; definition id refers to at phase (spec 6.6): data the module keeps,
+;; definition id refers to at phase (spec 6.5): data the module keeps,
 ;; which its interface holds (3.7). The form, as fully expanded code holds
 ;; it.
 (define (fact! f phase)
@@ -2337,7 +2277,7 @@
             [value (if (eq? kind 'quote) (stx->datum d) (prune-local-scopes d))]
             [form (core-headed f fact-sym)]
             [m (comp-module current)])
-       (set-unit-facts! m (cons (list key phase value form) (unit-facts m)))
+       (set-unit-facts! m (cons (list key phase value) (unit-facts m)))
        form)]
     [_ (raise-compile-error f "expected (#%fact id 'datum) or (#%fact id #'syntax)")]))
 
@@ -2352,7 +2292,7 @@
 ;; The definition meaning m is of, if it is a module's: the info of its
 ;; function, global or tag, or the getter of its compile-time value,
 ;; unshifted, so that every name and phase shift it is seen under gives
-;; the same one (spec 6.6, 6.7); otherwise #f. Core forms, locals and the
+;; the same one (spec 6.5, 6.6); otherwise #f. Core forms, locals and the
 ;; kernel module's definitions, which every language shares, are none.
 (define (definition-of m)
   (let* ([info (and m (memq (car m) '(func global tag compile-time-value)) (cadr m))]
@@ -2366,32 +2306,6 @@
     (unless m (raise-compile-error id "~a is unbound: a fact is about a definition made before it" (stx-e id)))
     (unless base (raise-compile-error id "a fact is about a module's definition, and ~a is not one" (stx-e id)))
     base))
-
-;; A definition #%linklet redefines keeps its facts (spec 6.5, 6.6): only
-;; the module being compiled has any about it yet. While what #%linklet
-;; returned is declared, rekeys maps each definition it redefines to the
-;; new one; then its facts are rekeyed, all at once.
-(define rekeys #f)
-
-(define (note-redefinition! old new)
-  (when (and current rekeys old new (memq (car old) '(func global tag)) (not (eq? (cadr old) (cadr new))))
-    (hash-set! rekeys (cadr old) (cadr new))))
-
-(define (rekey-facts!)
-  (when (> (hash-count rekeys) 0)
-    (let ([m (comp-module current)])
-      (set-unit-facts! m (map (lambda (f)
-                                (let loop ([key (car f)])
-                                  (let ([new (hash-ref rekeys key #f)])
-                                    (cond [new (loop new)] [(eq? key (car f)) f] [else (cons key (cdr f))]))))
-                              (unit-facts m))))))
-
-;; The facts of the #%fact forms #%linklet was given and did not return go
-;; with them (spec 6.5).
-(define (drop-facts! dropped)
-  (unless (null? dropped)
-    (let ([m (comp-module current)])
-      (set-unit-facts! m (filter (lambda (f) (not (memq (cadddr f) dropped))) (unit-facts m))))))
 
 ;; The func form of transformer code named name, of the kernel module's
 ;; type for it, that calls function info on the syntax.
@@ -2416,74 +2330,12 @@
         (raise-compile-error id "~a must be defined by an earlier begin-for-syntax" (stx-e id)))
       info)))
 
-;; (begin-for-syntax form ...): a unit for #%linklet.
+;; (begin-for-syntax form ...): phase+1 code, compiled into a linklet and
+;; run now (spec 3.1).
 (define (begin-for-syntax! f phase)
   (syntax-match f
     [('begin-for-syntax form ...)
-     (let* ([forms (expand-body form (+ phase 1))]
-            [forms (apply-linklet-hook 'begin-for-syntax forms f (+ phase 1))])
-       (run-compile-time-linklet! (lower-forms forms (+ phase 1)) (+ phase 1) f))]))
-
-;; ==== the linklet hook ====
-;;
-;; A unit is code that becomes a linklet or part of one (spec 6.5): a
-;; module's phase-0 code, a begin-for-syntax, or the right-hand side of a
-;; define-syntax. Once a unit is expanded, the transformer #%linklet is
-;; bound to where the unit's code was written, at the unit's phase,
-;; rewrites it; the core #%linklet leaves it as it is. That is where the
-;; module was, for its phase-0 code; where the begin-for-syntax form was;
-;; and where the right-hand side was, for a define-syntax. What the
-;; transformer returns is expanded again, only to bind the names it
-;; introduces: it must be fully expanded, so a macro use in it is an
-;; error, and its definitions replace the unit's own.
-
-;; The unit forms of kind (module, begin-for-syntax or define-syntax) at
-;; phase, written where ctx was, after #%linklet.
-(define (apply-linklet-hook kind forms ctx phase)
-  (let* ([id (make-stx linklet-sym (stx-scopes ctx) (stx-srcloc ctx) '())]
-         [m (meaning-of id phase)]
-         [t (transformer-of m)])
-    (cond
-      [t
-       ;; The unit's new code is a body of its own. While the hook runs,
-       ;; what it lifts is declared there at once, so the code it expands
-       ;; next can use the names; then what it returns is declared there,
-       ;; and all of it is expanded, what it lifted first.
-       (let* ([intro (new-scope!)]
-              [in (flip-scope (out-list ctx (cons id (cons (datum->stx ctx kind #f) (numbered-forms forms)))) intro)]
-              [b (body phase '() #f '())]
-              [saved-body current-body]
-              [result (begin (set! current-body b)
-                             (call-syntax-function "#%linklet" (lambda (s) (%call-transformer t s)) in phase intro #t))]
-              [returned (or (stx->list result)
-                            (raise-compile-error ctx "#%linklet returned something other than a list of forms"))]
-              ;; A form returned unchanged is one of the forms the hook was
-              ;; given: it stays the unit's form, and is not expanded again.
-              [fv (list->vector forms)]
-              [positions (same-positions returned (cddr (stx->list in)))]
-              [new (map (lambda (r p) (if (>= p 0) (expanded (vector-ref fv p)) (flip-scope r intro)))
-                        returned positions)]
-              [saved-redefining redefining?] [saved-hook hook-output?] [saved-rekeys rekeys])
-         (set! redefining? "#%linklet returned")
-         (set! hook-output? #t)
-         (set! rekeys (make-hasheq))
-         (drop-facts! (let ([kept (make-vector (vector-length fv) #f)])
-                        (for-each (lambda (p) (when (>= p 0) (vector-set! kept p #t))) positions)
-                        (filter (lambda (f) (eq? (core-head f phase) fact-sym))
-                                (filter (lambda (x) x) (map (lambda (f k) (and (not k) f)) forms (vector->list kept))))))
-         (declare-forms! b new)
-         (let ([r (finish-body! b)])
-           (rekey-facts!)
-           (set! redefining? saved-redefining)
-           (set! hook-output? saved-hook)
-           (set! rekeys saved-rekeys)
-           (set! current-body saved-body)
-           r))]
-      [(or (not m) (eq? (car m) 'core)) forms]
-      [else (raise-compile-error ctx "#%linklet is bound here, but not to a transformer")])))
-
-;; True while expanding what #%linklet returned.
-(define hook-output? #f)
+     (run-compile-time-linklet! (lower-forms (expand-body form (+ phase 1)) (+ phase 1)) (+ phase 1) f)]))
 
 ;; After a trap, which wasm code cannot catch, the host calls the
 ;; compiler's on-trap (spec 4). A trap unwinds without restoring the state
@@ -2496,25 +2348,6 @@
                    [current (unit-path (comp-module current))]
                    [else #f])])
     (if loc (eprintf "~a: error: ~a~n" loc msg) (eprintf "error: ~a~n" msg))))
-
-;; The forms given to #%linklet, each numbered by its position in a
-;; property, so that same-positions finds a returned one in one step.
-(define hook-position '%hook-position)
-(define (numbered-forms forms)
-  (map (lambda (f i) (syntax-property f hook-position i)) forms (range (length forms))))
-
-;; For each form #%linklet returned, the position of the form it was given
-;; that it is, or -1. Given forms are matched in order: a returned form is
-;; one only after the last one matched. A form's number says where to
-;; look, and the form there must be the same object.
-(define (same-positions returned given)
-  (let ([gv (list->vector given)] [last -1])
-    (map (lambda (r)
-           (let ([i (and (stx? r) (syntax-property r hook-position))])
-             (if (and (fixnum? i) (> i last) (< i (vector-length gv)) (eq? r (vector-ref gv i)))
-                 (begin (set! last i) i)
-                 -1)))
-         returned)))
 
 ;; ==== macros ====
 
@@ -2529,9 +2362,6 @@
 ;; expanded defines also gets a fresh use-site scope on its input, which
 ;; stays. transformer is a transformer value.
 (define (apply-macro head transformer s0 phase use-site?)
-  (when hook-output?
-    (raise-compile-error head "#%linklet returned code that uses the macro ~a, but it must return fully expanded code"
-                         (stx-e head)))
   (note-macro-use! head phase)
   (let* ([intro (new-scope!)]
          [s (flip-scope s0 intro)]
@@ -2542,7 +2372,7 @@
                 s)])
     (at-use s0 (flip-scope (call-syntax-function (format "macro ~a" (stx-e head))
                                                  (lambda (s) (%call-transformer transformer s))
-                                                 s phase intro #f)
+                                                 s phase intro)
                            intro))))
 
 ;; The define-syntax getter of each macro -> the module that defines it.
@@ -2563,19 +2393,18 @@
         (make-stx (stx-e out) (stx-scopes out) u (stx-props out))
         out)))
 
-;; Call a phase-1 function from syntax to syntax, (call s): a transformer,
-;; or #%linklet, which may also return a plain list (list-ok?). While
-;; it runs, the queries answer for phase, blame s, and local-expand uses
-;; intro, its introduction scope. Calls nest: a query can expand code,
-;; which calls more macros. A syntax error from the call that has no
+;; Call a phase-1 function from syntax to syntax, (call s), a transformer.
+;; While it runs, the queries answer for phase, blame s, and local-expand
+;; uses intro, its introduction scope. Calls nest: a query can expand
+;; code, which calls more macros. A syntax error from the call that has no
 ;; location is located at s, the use.
-(define (call-syntax-function who call s phase intro list-ok?)
+(define (call-syntax-function who call s phase intro)
   (let* ([saved-phase api-phase] [saved-where api-where] [saved-intro api-intro]
          [result (dynamic-wind
                   (lambda () (set! api-phase phase) (set! api-where s) (set! api-intro intro))
                   (lambda () (with-handlers ([unlocated-error? (lambda (e) (raise (located-error e s)))]) (call s)))
                   (lambda () (set! api-phase saved-phase) (set! api-where saved-where) (set! api-intro saved-intro)))])
-    (unless (or (stx? result) (and list-ok? (list? result)))
+    (unless (stx? result)
       (raise-compile-error s "~a returned a non-syntax value: ~s" who (stx->datum result)))
     result))
 
@@ -2615,7 +2444,7 @@
 
 ;; The signature of the function id is bound to, (t ... -> r ...), each
 ;; type written as in the kernel: a numeric type's name, (ref T) or (ref
-;; null T) with T a heap type's name, or #%hole; #f if id is not a function.
+;; null T) with T a heap type's name; #f if id is not a function.
 (define (query-function-signature id)
   (unless (id? id) (raise-compile-error api-where "identifier-function-signature: expected an identifier"))
   (let ([m (meaning-of id api-phase)])
@@ -2624,8 +2453,7 @@
            (append (map type->datum (func-info-params info)) '(->) (map type->datum (func-info-results info)))))))
 
 (define (type->datum t)
-  (cond [(hole-type? t) hole-sym]
-        [(ref-type? t)
+  (cond [(ref-type? t)
          (let* ([h (ref-heap t)] [name (if (type-info? h) (type-info-name h) h)])
            (if (ref-nullable? t) (list 'ref 'null name) (list 'ref name)))]
         [else t]))
@@ -2666,7 +2494,7 @@
     (reverse out)))
 
 ;; The facts about the definition id refers to, at the running macro's
-;; phase (spec 6.6): those of the module being expanded, recorded so far,
+;; phase (spec 6.5): those of the module being expanded, recorded so far,
 ;; and of each module it requires (dependencies). Each is (module phase
 ;; value): the file of the module that recorded it, the phase that module
 ;; recorded it at, and its datum or syntax.
@@ -2686,7 +2514,7 @@
 ;; scopes shifted, as a linklet's literals are (spec 3.5, 6.1).
 (define (shift-fact v k) (if (= k 0) v (map-scopes v (lambda (s) (shift-scopes s k)))))
 
-;; ---- names (spec 6.7) ----
+;; ---- names (spec 6.6) ----
 
 ;; The module that makes definition base: the module being compiled for a
 ;; function not yet compiled.
@@ -2735,7 +2563,7 @@
           [else #f])))
 
 ;; The name of the definition id refers to at the running macro's phase,
-;; or #f (spec 6.7).
+;; or #f (spec 6.6).
 (define (query-identifier-name id)
   (unless (id? id) (raise-compile-error api-where "identifier-name: expected an identifier"))
   (let ([base (definition-of (meaning-of id api-phase))])
@@ -2744,7 +2572,7 @@
 ;; An identifier that refers to the definition name names, at the running
 ;; macro's phase, if the module being expanded made it or requires, directly
 ;; or not, the module that did: its symbol, with its scopes at the phase
-;; shift that module is required at (spec 6.7).
+;; shift that module is required at (spec 6.6).
 (define (query-name-identifier name)
   (unless (symbol? name) (raise-compile-error api-where "name-identifier: expected a name, a symbol"))
   (or (ormap (lambda (d)
@@ -2787,8 +2615,7 @@
 ;; The core forms in fully expanded code are named by identifiers with only
 ;; the core scope, so they mean the core forms in any module, whatever it
 ;; binds. Everything else keeps its scopes. So fully expanded code can be
-;; expanded again: macros can embed the result of local-expand, and
-;; #%linklet returns fully expanded code.
+;; expanded again: macros can embed the result of local-expand.
 
 ;; The identifier for core form `name` in fully expanded code.
 (define (core-id name where) (make-stx name (list core-scope) (and where (stx-srcloc where)) '()))
@@ -2999,10 +2826,7 @@
     (case name
       [(#%app) (syntax-match s [(_ f arg ...) (core-app s f arg phase)])]
       [(#%datum) (syntax-match s [(_ literal) (core-datum literal) (o literal)])]
-      [(#%linklet) (raise-compile-error s "#%linklet is not a form: it names the hook for a unit's code (spec 6.5)")]
       [(closure) (raise-compile-error s "closure is a type, (ref (closure (type ... -> type ...))), not an expression")]
-      ;; A hole is left as it is, for the language's #%linklet (spec 6.5).
-      [(#%hole) (core-headed s hole-sym)]
       [(quote) (syntax-match s [(_ datum) (o datum)])]
       [(quote-syntax) (syntax-match s [(_ datum) (o (prune-local-scopes datum))])]
       [(quasiquote) (syntax-match s [(_ template) (quasi s template 0 phase 'quasiquote 'unquote 'unquote-splicing #f)])]
@@ -3309,7 +3133,6 @@
                ;; A (type T) clause first is in the info already.
                [code (begin (set! lowered-closures? #f)
                             (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase))])
-          (for-each filled-type (append (func-info-params info) (func-info-results info)))
           (when inline? (record-inline! info params code name))
           (when (cadr options) (function-value info))
           (list (list 'func info params code lowered-closures?)))])]
@@ -3317,7 +3140,6 @@
      (syntax-match f
        [(_ name _ init)
         (let ([info (cadr (meaning-of name phase))])
-          (filled-type (global-info-type info))
           (set! lowered-closures? #f)
           (let ([e (lower-expr init phase)])
             (list (list 'global info e lowered-closures?))))])]
@@ -3335,15 +3157,14 @@
 (define (func-info-of id phase)
   (let ([m (and (id? id) (meaning-of id phase))])
     (unless (and m (eq? (car m) 'func)) (not-expanded id))
-    (check-not-removed (cadr m) id)
     (in-lowering-kernel (cadr m) id)))
 
 ;; ---- function values (spec 5.2) ----
 
 ;; A function declared with #:value g -> (g . phase), then g's info once
 ;; it is resolved. In fully expanded code a function's name stays a name,
-;; and lowering reads its value then: a linklet hook's output may
-;; redefine the global (6.5).
+;; and lowering reads its value then: the global may be declared after the
+;; function.
 (define function-values (make-hasheq))
 
 (define (value-base info)
@@ -3498,40 +3319,7 @@
                    (copy (caddr e)))]
       [else (raise-compile-error #f "internal: lowered form ~a" (car e))])))
 
-(define (lowered-data-info id phase)
-  (let ([info (data-info-of id phase)])
-    (check-not-removed info id)
-    info))
-
-(define (lowered-tag-info id phase)
-  (let ([info (tag-info-of id phase)])
-    (check-not-removed info id)
-    (in-lowering-kernel info id)))
-
-;; While lowering a module's phase-0 code: the infos of its definitions
-;; that #%linklet removed, which its code must not use.
-(define removed-definitions #f)
-
-(define (check-not-removed info id)
-  (when (and removed-definitions (hash-has-key? removed-definitions info))
-    (raise-compile-error id "~a is used, but #%linklet removed its definition" (stx-e id))))
-
-;; The infos of c's phase-0 definitions (functions, imports, globals, data)
-;; that forms, its code after #%linklet, no longer defines.
-(define (definitions-removed c forms)
-  (let ([kept (make-hasheq)] [removed (make-hasheq)])
-    (for-each (lambda (f)
-                (case (core-head f 0)
-                  [(func) (syntax-match f [(_ (name . _) . _) (hash-set! kept (cadr (meaning-of name 0)) #t)])]
-                  [(import global data tag) (syntax-match f [(_ name . _) (hash-set! kept (cadr (meaning-of name 0)) #t)])]
-                  [else #f]))
-              forms)
-    (for-each (lambda (b)
-                (let ([m (binding-meaning b)])
-                  (when (and m (memq (car m) '(func global data tag)) (not (hash-has-key? kept (cadr m))))
-                    (hash-set! removed (cadr m) #t))))
-              (comp-definitions c))
-    removed))
+(define (lowered-tag-info id phase) (in-lowering-kernel (tag-info-of id phase) id))
 
 ;; The local variable id binds or refers to, from the property the
 ;; expander put on it (spec 2.3), so that lowering resolves no local.
@@ -3547,12 +3335,11 @@
                  (list 'lref key)
                  (let ([m (meaning-of s phase)])
                    (case (and m (car m))
-                     [(global) (check-not-removed (cadr m) s) (list 'gref (in-lowering-kernel (cadr m) s))]
+                     [(global) (list 'gref (in-lowering-kernel (cadr m) s))]
                      ;; A function's name as an expression is its value (5.2).
                      [(func)
                       (let ([g (function-value (cadr m))])
                         (unless g (not-expanded s))
-                        (check-not-removed g s)
                         (list 'gref g))]
                      [else (not-expanded s)]))))]
           [(pair? e)
@@ -3586,9 +3373,9 @@
          [(_ literal)
           (let ([n (const-literal name literal)])
             (list 'as (list (const-type name)) (if (integer? n) (list 'int n) (list 'float n))))])]
-      [(data-address) (syntax-match s [(_ data) (list 'const 'i32 (data-info-offset (lowered-data-info data phase)))])]
+      [(data-address) (syntax-match s [(_ data) (list 'const 'i32 (data-info-offset (data-info-of data phase)))])]
       [(data-size)
-       (syntax-match s [(_ data) (list 'const 'i32 (bytes-length (data-info-bytes (lowered-data-info data phase))))])]
+       (syntax-match s [(_ data) (list 'const 'i32 (bytes-length (data-info-bytes (data-info-of data phase))))])]
       [(set!)
        (syntax-match s
          [(_ x value)
@@ -3596,7 +3383,6 @@
             (cond
               [key (list 'lset key (lo value))]
               [(and m (eq? (car m) 'global))
-               (check-not-removed (cadr m) x)
                (list 'gset (in-lowering-kernel (cadr m) x) (lo value))]
               [else (not-expanded s)]))])]
       [(let)
@@ -3606,7 +3392,7 @@
                 (map (lambda (b)
                        (syntax-match b
                          [(x init) (list (local-key-of x phase) #f (lo init) (stx-e x))]
-                         [(x type init) (list (local-key-of x phase) (filled-type (parse-type type phase)) (lo init) (stx-e x))]))
+                         [(x type init) (list (local-key-of x phase) (parse-type type phase) (lo init) (stx-e x))]))
                      binding)
                 (lower-seq body s phase))])]
       ;; (lambda key params results body): a closure, which the compiler
@@ -3617,10 +3403,9 @@
           (let ([rb (parse-results rest phase)])
             (set! lowered-closures? #t)
             (list 'lambda (fresh-key!)
-                  (map (lambda (x t) (cons (local-key-of x phase) (filled-type (parse-type t phase)))) x type)
-                  (map filled-type (car rb))
+                  (map (lambda (x t) (cons (local-key-of x phase) (parse-type t phase))) x type)
+                  (car rb)
                   (lower-seq (cdr rb) s phase)))])]
-      [(#%hole) (unfilled-hole s)]
       [(begin) (syntax-match s [(_ e ...) (cons 'seq (map lo e))])]
       [(if) (syntax-match s
               [(_ test then) (list 'if (lo test) (lo then) #f)]
