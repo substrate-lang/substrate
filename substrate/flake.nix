@@ -15,6 +15,7 @@
             pkgs.wasmtime.dev  # C API headers for host/subhost.c
             pkgs.wasmtime.lib  # libwasmtime
             pkgs.wasm-tools    # validate / print emitted modules
+            pkgs.lld           # wasm-ld: links the C benchmarks' C to wasm (examples/c/bench)
             pkgs.gnumake
             pkgs.nodejs    # V8, to compare engines (host/subhost.mjs)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
