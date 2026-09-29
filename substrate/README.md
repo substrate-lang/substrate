@@ -110,15 +110,15 @@ define GC types and leave compile-time values that `match` reads,
 checking patterns at compile time, and the program matches, in one
 module, types defined in another.
 `lib/substrate.sub` is Substrate, the language the compiler is written
-in, on the Substrate kernel: every value is an `eqref`, and closure and
-assignment conversion run per unit, on fully expanded code, in
-Substrate's `#%linklet` (spec 6.5). `examples/effects.sub` is an effect language on Substrate (`examples/effects/handlers.sub`): declared effects, handlers
+in, on the Substrate kernel: every value is an `eqref`, and its lambdas
+are the kernel's closures (spec 5.3), of one signature, a count and the
+first four arguments. `examples/effects.sub` is an effect language on Substrate (`examples/effects/handlers.sub`): declared effects, handlers
 with a clause per operation, and Koka's evidence passing, built from
 `#%app`, `local-expand` and compile-time values. `examples/typed.sub` is
 a typed language on the kernel (`examples/typed/typed.sub`): `Int`,
-`Bool` and function types, checked by its `#%linklet`, which also lowers
-its lambdas to structs of typed closures, one closure type per function
-type. A function's type reaches the modules that import it through the
+`Bool` and function types, checked by its `#%linklet`; its lambdas are
+the kernel's closures, one closure type per signature. A function's type
+reaches the modules that import it through the
 transformer its name is bound to. Generics are monomorphized: its
 `#%linklet` makes each instance a module uses from the generic's
 definition, which reaches other modules the same way; a generic is

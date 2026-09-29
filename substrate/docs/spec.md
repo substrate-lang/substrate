@@ -620,7 +620,8 @@ quotation and compile-time forms.
 - References: `anyref`, `eqref`, `i31ref`, `structref`, `arrayref`,
   `funcref`, `externref`, `exnref`, and `(ref T)` or `(ref null T)` where
   `T` is one of `any eq i31 struct array func extern exn none nofunc
-  noextern noexn` or a declared type. A declared function type is below
+  noextern noexn`, a declared type, or `(closure (t ... -> r ...))`, the
+  closure type of that signature (5.3). A declared function type is below
   `func` only: functions are not in the `any` hierarchy, and neither are
   exceptions (`exn`, 5.3).
 - The words of type syntax (`ref null mut struct array field sub final func
@@ -767,12 +768,12 @@ before it is inlined there too.
 global, makes `g` the function's value: the function's name used as an
 expression, in any module and at any phase, means `g`, while a call of it
 stays a call. Without `#:value`, a function's name is not an expression
-(use it with `func-index` or `ref.func`). The kernel does not choose how
-a function is represented as a value: a language with first-class
-functions defines its own, typically a closure made once in a global, so
-that every use of the name is the same value, and records it with
-`#:value`. Substrate's `define` does so, and its `#%app` calls the
-function directly when it gets the arguments the function takes
+(use it with `func-index` or `ref.func`). A language with first-class
+functions makes a function's value a closure (5.3), once, in a global
+whose initializer is a `lambda` that calls the function, so that every
+use of the name is the same value, and records it with `#:value`.
+Substrate's `define` does so, and its `#%app` calls the function directly
+when it gets the arguments the function takes
 (`identifier-function-signature`, 2.3).
 
 Globals follow wasm too. A global is immutable unless its type is written
@@ -782,8 +783,9 @@ wasm requires of an immutable global. The constant expressions are
 literals, the quoted data `'n` for a fixnum n, `'#f`, `'()` and `'#t`,
 `ref.null`, `ref.i31`, `ref.func`, `struct.new`, `array.new`,
 `array.new_default` and `array.new_fixed`, `add`, `sub` and `mul` on `i32`
-and `i64`, and reads of immutable globals that are imported or defined
-earlier in the module, each with constant operands. Any other initializer
+and `i64`, reads of immutable globals that are imported or defined
+earlier in the module, each with constant operands, and a `lambda`, which
+captures nothing at module level (5.3). Any other initializer
 runs when the module is instantiated, in source order with the module's
 other expressions, so only a mutable global of a numeric or nullable type
 may have one. Another module that imports a global imports its mutability
@@ -880,15 +882,29 @@ GC instructions take their type and field immediates by name:
   reads and assigns them, and each side sees the other's assignments. Its
   parameters and result are written as a `func`'s. Its body cannot branch
   to the labels around it, and `return` in it returns from the `lambda`.
-  The kernel gives `lambda` a meaning but no representation: a language
-  lowers each `lambda` to other kernel code, usually a struct holding the
-  captured values and a reference to a module-level function, and chooses
-  how. An application whose head is not a function's name, `(#%app e arg
-  ...)`, applies the function value `e`, such as a `lambda`'s, to the
-  args, and the kernel leaves it to the language in the same way. The
-  compiler rejects a `lambda`, or an application of a function value,
-  that has not been lowered. A language lowers them in its `#%linklet`
-  (6.5).
+  A `lambda` is a **closure**: a struct whose first field is its code, a
+  module-level function of the closure and the parameters, which the
+  compiler lifts. The **closure type** of a signature, written `(closure
+  (t ... -> r ...))` in a type position, is the type of every `lambda` of
+  that signature: it and its code's type are one recursion group, so two
+  modules that write it write one type (5.1). A `lambda` that captures
+  variables is of a final subtype of it, with a field per variable holding
+  its value. A captured variable that is also assigned is held in a
+  **box**, a struct of one mutable field, which the `lambda` and the code
+  around it share. A variable bound to a `lambda` and only ever called,
+  such as a loop, is a **known function**: its code takes what the
+  `lambda` captures as parameters after its own, its calls are direct
+  calls, tail calls in tail position, and no closure is made. An
+  application whose head is not a function's name, `(#%app e arg ...)`,
+  applies the function value `e`, whose type must be a closure type: it
+  calls the closure's code, with `return_call_ref` in tail position. The
+  head may be a variable `x`, `(ref.cast (ref C) x)`, or, as a language
+  that must check a value before applying it writes, `(if (ref.test (ref
+  C) x) (ref.cast (ref C) x) e)` with `e` not using `x`: each is a call of
+  `x`, and a known function of that signature stays one. A language
+  chooses its calling convention by the signatures it writes: Substrate's
+  lambdas take a count and the first four arguments
+  (`lib/substrate-core.sub`).
 - **Application is an implicit form**, as in Racket. A form whose head is
   not bound to a macro, a core form or a wasm operator, including one
   whose head is not an identifier, is expanded as `(#%app head arg ...)`.
@@ -1069,11 +1085,15 @@ phase+1 now (3.1), and `s` is bound to its value, an `eqref`, a
   `(eqref) -> eqref`, binds `m` to a transformer that calls `f`. A
   function name is not an expression, so this is a form of its own. `f`
   may come from a module required inside `begin-for-syntax`.
+- A value that is a function value from syntax to syntax, a closure of
+  type `(closure (eqref -> eqref))` (5.3), is a macro too: the expander
+  makes it a transformer that calls it, which `syntax-local-value`
+  returns. So `(define-syntax m (lambda ([stx eqref]) -> eqref ...))` is a
+  macro in kernel code, and Substrate's `define-syntax` expands to it.
 
 The value lives in a global of the phase+1 linklet, so another module that
 requires this one computes it again in its own compile-time store. The
-right-hand side is a unit for `#%linklet` (6.5), which may make its value a
-transformer: Substrate's makes a procedure one.
+right-hand side is a unit for `#%linklet` (6.5).
 
 ### 6.4 Fully expanded code
 
@@ -1081,9 +1101,7 @@ Expansion turns a module into **fully expanded code**, as Racket calls it:
 syntax in the grammar
 below, with every macro use expanded and every application and literal
 explicit. `local-expand` returns it, `#%linklet` (6.5) receives and returns
-it,
-`sub expand` prints it, and the compiler compiles it once no `lambda`,
-and no application of a function value, remains (5.3).
+it, `sub expand` prints it, and the compiler compiles it.
 
 ```
 form ::= (func (id [id type] ...) [#:inline] [#:value id] [-> result] [(type id)] expr ...)
@@ -1199,13 +1217,13 @@ right-hand side's.
   hook of the language it takes at phase 1, which may differ from its
   phase-0 language. A module whose phase-1 code is kernel code gets the
   core hook.
-- This is where a language lowers `lambda` and applications of function
-  values (5.3), and makes its values
-  transformers. Substrate's `#%linklet` converts the closures and applications of
-  function values of every unit, and makes the value of a `define-syntax` unit a transformer when
-  it is a procedure. A language built on another provides that one's
-  `#%linklet`, or its own that runs it, with `(except-out (all-from-out
-  name) #%linklet)` for the rest (3.1).
+- This is where a language decides what needs the whole unit, as the
+  typed example's `#%linklet` does to check its generics and impls and
+  lower its functions. Substrate needs none: its lambdas are the kernel's
+  closures (5.3), and its `define-syntax` makes transformers (6.3). A
+  language built on another provides that one's `#%linklet`, or its own
+  that runs it, with `(except-out (all-from-out name) #%linklet)` for the
+  rest (3.1).
 
 ### 6.6 Facts
 
@@ -1281,10 +1299,9 @@ example's projections, types, name their trait so.
   kernel infers the others when it compiles. A language with types of its
   own does not need them: `examples/typed/typed.sub` gives every variable
   its own type and derives the kernel types it writes from those.
-  Substrate has no types of its own: its `#%linklet` gives a captured
-  variable the kernel type it is written with, or `eqref`, so a Substrate
-  lambda that captures a kernel local whose inferred type is another fails
-  to type-check.
+  Substrate has no types of its own, so its `let` writes `eqref` for each
+  variable, since a variable's inferred type, that of its first value,
+  may be narrower than what it is assigned later.
 - **Structs after the typed layer**: declared types are identified by
   structure (5.1), so the accessors of `examples/shapes/struct.sub` check
   brands at run time: passing a `fahrenheit` to `celsius-t` is a run-time

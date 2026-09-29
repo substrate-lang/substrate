@@ -1,0 +1,205 @@
+;; Lifecycle: permanent. Part of the compiler.
+;;
+;; Closures: what the compiler decides about the lambdas of a function, and
+;; the applications of function values in it (spec 5.3), before it compiles
+;; the function (compile.sub). A lambda is a closure, a struct of its code
+;; and the variables it captures (core.sub). A variable bound to a lambda
+;; that is only ever called is a known function: its calls are direct, and
+;; pass the variables the lambda captures. A captured variable that is
+;; also assigned is boxed, so that the function and its lambdas share it.
+;; One walk over the function's lowered code (core.sub) decides these,
+;; keyed by the code's local keys and by each lambda's own key.
+(require-unqualified substrate "../lib/substrate.sub")
+(require core "core.sub" closure-type ref-heap)
+
+(provide analyze-closures closures-boxed? closures-known-of closures-captures-of head-local
+         known-lambda known-captures known-info set-known-info! known-name known-lifted set-known-lifted!)
+
+;; The analysis of one function: boxed, the keys of its boxed variables;
+;; known, its known functions by variable key; captures, the keys each
+;; lambda captures, by the lambda's key, in the order they are met.
+(struct closures (boxed known captures))
+
+;; A known function: its lambda, the keys it captures, its function once
+;; the compiler has made it, whether its code has been lifted, and the
+;; name of the variable that binds it.
+(struct known (lambda captures [info #:mutable] [lifted #:mutable] name))
+
+(define (closures-boxed? a key) (hash-ref (closures-boxed a) key #f))
+(define (closures-known-of a key) (hash-ref (closures-known a) key #f))
+(define (closures-captures-of a lambda-key) (hash-ref (closures-captures a) lambda-key '()))
+
+;; e without the locations and types around it.
+(define (unwrapped e) (if (memq (car e) '(at as)) (unwrapped (caddr e)) e))
+
+(define (lambda-node? e) (eq? (car (unwrapped e)) 'lambda))
+(define (false-node? e) (let ([u (unwrapped e)]) (and (eq? (car u) 'quote) (eq? (cadr u) #f))))
+
+;; The local variable an application's head calls, with the closure type
+;; it is cast to, as (key . type) or (key . #f); or #f. The head is the
+;; variable itself, the variable cast to a closure type, or, as a language
+;; applies a value it must check first (spec 5.3), the variable tested for
+;; the type and cast, (if (ref.test T x) (ref.cast T x) e), where e does
+;; not use x.
+(define (head-local head)
+  (let ([h (unwrapped head)])
+    (case (car h)
+      [(lref) (cons (cadr h) #f)]
+      [(gc) (and (eq? (cadr h) 'ref.cast) (cast-of h))]
+      [(if) (let ([t (unwrapped (cadr h))] [c (unwrapped (caddr h))])
+              (and (eq? (car t) 'gc) (eq? (cadr t) 'ref.test) (eq? (car c) 'gc) (eq? (cadr c) 'ref.cast)
+                   (let ([x (cast-of t)] [y (cast-of c)])
+                     (and x y (eqv? (car x) (car y)) (eq? (cdr x) (cdr y)) (cadddr h) (not (mentions? (cadddr h) (car x)))
+                          x))))]
+      [else #f])))
+
+;; (key . heap type) of gc form g, a ref.test or ref.cast of a variable.
+(define (cast-of g)
+  (let ([x (unwrapped (car (cadddr g)))])
+    (and (eq? (car x) 'lref) (cons (cadr x) (ref-heap (car (caddr g)))))))
+
+;; Does e refer to local key?
+(define (mentions? e key)
+  (cond [(not (pair? e)) #f]
+        [(eq? (car e) 'quote) #f]
+        [(and (eq? (car e) 'lref) (eqv? (cadr e) key)) #t]
+        [else (ormap (lambda (x) (mentions? x key)) (cdr e))]))
+
+;; The analysis of a function with parameters params, keys, whose code is
+;; body.
+(define (analyze-closures body params)
+  (let ([assigned (make-hasheqv)]    ; key -> #t: set! assigns it
+        [free (make-hasheqv)]        ; lambda key -> the keys free in it, newest first
+        [lambdas (make-hasheqv)]     ; lambda key -> its node
+        [bound-to (make-hasheqv)]    ; key -> the lambda key its let binds it to, or false for '#f
+        [sets (make-hasheqv)]        ; key -> how many set!s assign it
+        [set-to (make-hasheqv)]      ; key -> the lambda key its first set! assigns it, if a lambda
+        [escapes (make-hasheqv)]     ; key -> #t: used as a value
+        [casts (make-hasheqv)]       ; key -> the closure types its calls cast it to
+        [names (make-hasheqv)]       ; key -> the name of the variable
+        [frames '()])                ; the lambdas around the code being walked, innermost first: (key . bound keys)
+    (letrec
+        ([bind! (lambda (key) (hash-set! (cdr (car frames)) key #t))]
+         ;; A reference to key: the lambdas it is not bound in capture it.
+         [reference! (lambda (key)
+                       (let loop ([fs frames])
+                         (unless (or (null? fs) (hash-ref (cdr (car fs)) key #f))
+                           (let ([l (car (car fs))])
+                             (when l
+                               (unless (memv key (hash-ref free l '()))
+                                 (hash-set! free l (cons key (hash-ref free l '()))))))
+                           (loop (cdr fs)))))]
+         [walk-lambda (lambda (node)
+                        (let ([bound (make-hasheqv)])
+                          (for-each (lambda (p) (hash-set! bound (car p) #t)) (caddr node))
+                          (hash-set! lambdas (cadr node) node)
+                          (set! frames (cons (cons (cadr node) bound) frames))
+                          (walk (list-ref node 4))
+                          (set! frames (cdr frames))))]
+         [walk-all (lambda (es) (for-each walk es))]
+         [walk (lambda (e)
+                 (case (car e)
+                   [(at as) (walk (caddr e))]
+                   [(lref) (reference! (cadr e)) (hash-set! escapes (cadr e) #t)]
+                   [(lset)
+                    (let ([key (cadr e)] [v (caddr e)])
+                      (reference! key)
+                      (hash-set! assigned key #t)
+                      (hash-set! sets key (+ 1 (hash-ref sets key 0)))
+                      (cond [(lambda-node? v)
+                             (when (and (eq? (hash-ref bound-to key #f) 'false) (= (hash-ref sets key 0) 1))
+                               (hash-set! set-to key (cadr (unwrapped v))))
+                             (walk-lambda (unwrapped v))]
+                            [else (walk v)]))]
+                   [(gset) (walk (caddr e))]
+                   [(let)
+                    (for-each (lambda (b)
+                                (let ([key (car b)] [init (caddr b)])
+                                  (when (pair? (cdddr b)) (hash-set! names key (cadddr b)))
+                                  (cond [(lambda-node? init)
+                                         (hash-set! bound-to key (cadr (unwrapped init)))
+                                         (walk-lambda (unwrapped init))]
+                                        [(false-node? init) (hash-set! bound-to key 'false)]
+                                        [else (walk init)])))
+                              (cadr e))
+                    (for-each (lambda (b) (bind! (car b))) (cadr e))
+                    (walk (caddr e))]
+                   [(lambda) (walk-lambda e)]
+                   [(apply-value)
+                    (let ([h (head-local (cadr e))])
+                      (cond [h (reference! (car h))
+                               (when (cdr h) (hash-set! casts (car h) (cons (cdr h) (hash-ref casts (car h) '()))))]
+                            [else (walk (cadr e))]))
+                    (walk-all (caddr e))]
+                   [(seq select drop) (walk-all (cdr e))]
+                   [(if) (walk (cadr e)) (walk (caddr e)) (when (cadddr e) (walk (cadddr e)))]
+                   [(block loop br-if) (walk (caddr e))]
+                   [(br) (when (caddr e) (walk (caddr e)))]
+                   [(return throw-ref) (when (cadr e) (walk (cadr e)))]
+                   [(call throw) (walk-all (caddr e))]
+                   [(prim gc) (walk-all (cadddr e))]
+                   [(call-indirect) (walk (cadddr e)) (walk-all (list-ref e 4))]
+                   [(call-ref) (walk (caddr e)) (walk-all (cadddr e))]
+                   [(try)
+                    (for-each (lambda (c) (for-each bind! (caddr c)) (walk (cadddr c))) (cadr e))
+                    (walk (caddr e))]
+                   [else #f]))])
+      (let ([bound (make-hasheqv)])
+        (for-each (lambda (key) (hash-set! bound key #t)) params)
+        (set! frames (list (cons #f bound)))
+        (walk body))
+      ;; The known functions: each bound once to a lambda, by its let or by
+      ;; one set! of a variable its let bound to #f, never used as a value,
+      ;; and cast, where its calls cast it, only to its lambda's closure type.
+      (let* ([known-keys (filter (lambda (key)
+                                   (let* ([b (hash-ref bound-to key #f)] [n (hash-ref sets key 0)]
+                                          [l (if (eq? b 'false) (hash-ref set-to key #f) b)]
+                                          [node (and l (hash-ref lambdas l #f))])
+                                     (and node (not (hash-ref escapes key #f))
+                                          (if (eq? b 'false) (= n 1) (= n 0))
+                                          (let ([c (closure-type (map cdr (caddr node)) (cadddr node))])
+                                            (andmap (lambda (t) (eq? t c)) (hash-ref casts key '()))))))
+                                 (hash-keys bound-to))]
+             [known? (lambda (key) (memv key known-keys))]
+             [lambda-key-of (lambda (key) (let ([b (hash-ref bound-to key #f)]) (if (eq? b 'false) (hash-ref set-to key #f) b)))]
+             [free-of (lambda (lambda-key) (reverse (hash-ref free lambda-key '())))]
+             ;; What a known function captures: what its lambda captures,
+             ;; and what the known functions its lambda calls capture,
+             ;; until nothing more is found.
+             [captures (make-hasheqv)]
+             [add! (lambda (key x) (unless (memv x (hash-ref captures key '())) (hash-set! captures key (append (hash-ref captures key '()) (list x))) #t))]
+             [expanded (lambda (keys)
+                         (foldl (lambda (x acc)
+                                  (if (known? x)
+                                      (foldl (lambda (y acc) (if (memv y acc) acc (append acc (list y)))) acc (hash-ref captures x '()))
+                                      (if (memv x acc) acc (append acc (list x)))))
+                                '() keys))])
+        (for-each (lambda (key)
+                    (hash-set! captures key (filter (lambda (x) (not (known? x))) (free-of (lambda-key-of key)))))
+                  known-keys)
+        (let grow ()
+          (when (ormap (lambda (key)
+                         (ormap (lambda (x)
+                                  (and (known? x)
+                                       (ormap (lambda (y) (and (not (memv y (hash-ref captures key '()))) (add! key y)))
+                                              (hash-ref captures x '()))))
+                                (free-of (lambda-key-of key))))
+                       known-keys)
+            (grow)))
+        (let ([lambda-captures (make-hasheqv)]
+              [captured (make-hasheqv)]
+              [known-table (make-hasheqv)]
+              [boxed (make-hasheqv)])
+          (for-each (lambda (lambda-key)
+                      (for-each (lambda (x) (hash-set! captured x #t)) (free-of lambda-key))
+                      (hash-set! lambda-captures lambda-key (expanded (free-of lambda-key))))
+                    (hash-keys lambdas))
+          (for-each (lambda (key)
+                      (let ([lambda-key (lambda-key-of key)])
+                        (hash-set! known-table key
+                                   (known (hash-ref lambdas lambda-key) (hash-ref lambda-captures lambda-key) #f #f
+                                          (hash-ref names key 'f)))))
+                    known-keys)
+          (for-each (lambda (key) (when (and (hash-ref captured key #f) (not (known? key))) (hash-set! boxed key #t)))
+                    (hash-keys assigned))
+          (closures boxed known-table lambda-captures))))))

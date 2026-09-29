@@ -27,12 +27,13 @@
          data-info data-info-offset data-info-bytes
          make-type-info type-info-name type-info-kind type-info-fields set-type-info-fields!
          type-info-super type-info-final? type-info-group set-type-info-group! type-info-identity identify-group! same-type? func-type?
-         make-ref ref-type? ref-nullable? ref-heap type-info? abstract-heaps valtype<=? types<=? types=? fresh-key!)
+         make-ref ref-type? ref-nullable? ref-heap type-info? abstract-heaps valtype<=? types<=? types=? fresh-key!
+         closure-type closure-code box-type box-value-type)
 (require ops "ops.sub" lookup-prim prim-op-params prim-op-kind prim-names)
 (require cmp "compile.sub" compile-module set-syntax-lookup! set-syntax-types! set-current-source!)
 (require rd "reader.sub" read-file read-string-all)
 (require num "numbers.sub" content-hash)
-(require host "host.sub" export-index call-getter call-function indexed-transformer scope-map-new scope-map-add scope-map-clear error-string read-data)
+(require host "host.sub" export-index call-getter call-function indexed-transformer closure-transformer scope-map-new scope-map-add scope-map-clear error-string read-data)
 (require ser "serialize.sub" make-serializer serialize! serializer-bytes)
 
 (provide report-trap set-repository-root! set-package-root! set-cache-directory! compile-module-file module-linklet-list
@@ -61,7 +62,7 @@
      begin require require-unqualified provide freestanding set! let let* lambda if block loop br br-if
      return
      call-indirect call-ref ref.func func-index data-address data-size select drop unreachable nop
-     throw throw-ref try
+     throw throw-ref try closure
      i32.const i64.const f32.const f64.const
      quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing)
    (list app-sym datum-sym linklet-sym hole-sym fact-sym)
@@ -507,6 +508,10 @@
                      (let ([i (hash-ref type-index t #f)] [o (hash-ref type-owners t #f)])
                        (cond [i (list i)]
                              [o (list (unit-hash (car o)) (cdr o))]
+                             [(box-value-type t) (list 'box (encode (box-value-type t)))]
+                             [(closure-code t)
+                              (let ([sig (type-info-fields (closure-code t))])
+                                (list 'closure (encode (cdr (car sig))) (encode (cadr sig))))]
                              [else (raise-compile-error #f "internal: the type ~a belongs to no module" (type-info-name t))])))]
          [own-ref (lambda (info)
                     (list 'own (or (hash-ref own info #f)
@@ -617,9 +622,10 @@
                          [(eq? (car x) '%quote) (cons (cadr x) (decode (cddr x)))]
                          [else (cons (decode (car x)) (decode (cdr x)))]))]
          [type-at (lambda (r)
-                    (if (null? (cdr r))
-                        (shell (car r))
-                        (hash-ref (unit-types (unit-with-hash (car r))) (cadr r))))]
+                    (cond [(null? (cdr r)) (shell (car r))]
+                          [(eq? (car r) 'closure) (closure-type (decode (cadr r)) (decode (caddr r)))]
+                          [(eq? (car r) 'box) (box-type (decode (cadr r)))]
+                          [else (hash-ref (unit-types (unit-with-hash (car r))) (cadr r))]))]
          ;; Its i-th type, made the first time something names it: a
          ;; supertype is made before its subtypes, wherever it is listed.
          [shell (lambda (i)
@@ -1513,13 +1519,18 @@
   '((anyref . any) (eqref . eq) (i31ref . i31) (structref . struct) (arrayref . array)
     (funcref . func) (externref . extern) (exnref . exn)))
 
-;; A heap type: an abstract name, or a type declared with `type`.
+;; A heap type: an abstract name, a type declared with `type`, or
+;; (closure (t ... -> r ...)), the closure type of a signature (spec 5.3).
 (define (parse-heap s phase)
   (cond [(and (id? s) (memq (stx-e s) abstract-heaps)) (stx-e s)]
         [(id? s)
          (let ([m (type-meaning-of s phase)])
            (unless m (raise-compile-error s "~a is not a type" (stx-e s)))
            (cadr m))]
+        [(eq? (core-head s phase) 'closure)
+         (syntax-match s
+           [(_ signature) (let ([sig (parse-signature signature phase)]) (closure-type (car sig) (cdr sig)))]
+           [_ (raise-compile-error s "expected (closure (type ... -> type ...))")])]
         [else (raise-compile-error s "expected a heap type, got ~s" (stx->datum s))]))
 
 ;; A value type; or a hole, which a language's #%linklet fills (6.4), as
@@ -1591,10 +1602,16 @@
   (and (stx? s) (pair? (stx-e s)) (id? (car (stx-e s)))
        (transformer-of (meaning-of (car (stx-e s)) phase))))
 
-;; A type name or heap type: macro uses at its head expanded.
+;; A type name or heap type: macro uses at its head expanded, and the
+;; types in a closure type's signature.
 (define (expand-type-name s phase)
   (let ([t (type-macro-use s phase)])
-    (if t (expand-type-name (apply-macro (car (stx-e s)) t s phase #f) phase) s)))
+    (cond [t (expand-type-name (apply-macro (car (stx-e s)) t s phase #f) phase)]
+          [(eq? (core-head s phase) 'closure)
+           (syntax-match s
+             [(word signature) (stx-rewrap s (list word (expand-signature signature phase)))]
+             [_ (raise-compile-error s "expected (closure (type ... -> type ...))")])]
+          [else s])))
 
 ;; A value type.
 (define (expand-type s0 phase)
@@ -2192,9 +2209,13 @@
         (car cached)
         ;; A getter without an instance is in a unit still waiting.
         (let ([v (begin (unless (func-info-instance getter) (run-pending!))
-                        (call-getter (function-index st getter)))])
+                        (as-compile-time-value (call-getter (function-index st getter))))])
           (hash-set! (cstore-values st) getter (list v))
           v))))
+
+;; Value v as a compile-time value: a function value from syntax to
+;; syntax is a transformer that calls it (spec 6.3).
+(define (as-compile-time-value v) (or (closure-transformer v) v))
 
 ;; The transformer meaning m is bound to, if m is a compile-time value
 ;; that is a transformer; otherwise #f.
@@ -2257,7 +2278,7 @@
 ;; The compile-time value of getter, made by the expander: the getter,
 ;; whose unit is not compiled until the module's linklet is, is never
 ;; called in this compilation.
-(define (made-value! getter v) (hash-set! (cstore-values (comp-store current)) getter (list v)))
+(define (made-value! getter v) (hash-set! (cstore-values (comp-store current)) getter (list (as-compile-time-value v))))
 
 ;; Can the expander make the value of lowered expression e itself, with no
 ;; new code? Quoted data or syntax can, and so can a call, on such values,
@@ -2965,6 +2986,7 @@
       [(#%app) (syntax-match s [(_ f arg ...) (core-app s f arg phase)])]
       [(#%datum) (syntax-match s [(_ literal) (core-datum literal) (o literal)])]
       [(#%linklet) (raise-compile-error s "#%linklet is not a form: it names the hook for a unit's code (spec 6.5)")]
+      [(closure) (raise-compile-error s "closure is a type, (ref (closure (type ... -> type ...))), not an expression")]
       ;; A hole is left as it is, for the language's #%linklet (spec 6.5).
       [(#%hole) (core-headed s hole-sym)]
       [(quote) (syntax-match s [(_ datum) (o datum)])]
@@ -3248,6 +3270,10 @@
 
 (define (at s ast) (list 'at (stx-srcloc s) ast))
 
+;; Whether the form being lowered has a lambda or an application of a
+;; function value, which the compiler looks for closures in (core.sub).
+(define lowered-closures? #f)
+
 (define (not-expanded s)
   (raise-compile-error s "internal: not fully expanded code: ~s" (stx->datum s)))
 
@@ -3267,23 +3293,27 @@
                [body (cdr (parse-results (caddr options) phase))]
                [params (map (lambda (p t) (cons (local-key-of p phase) t)) param (func-info-params info))]
                ;; A (type T) clause first is in the info already.
-               [code (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase)])
+               [code (begin (set! lowered-closures? #f)
+                            (lower-seq (if (and (pair? body) (type-clause? (car body))) (cdr body) body) f phase))])
           (for-each filled-type (append (func-info-params info) (func-info-results info)))
           (when inline? (record-inline! info params code name))
           (when (cadr options) (function-value info))
-          (list (list 'func info params code)))])]
+          (list (list 'func info params code lowered-closures?)))])]
     [(global)
      (syntax-match f
        [(_ name _ init)
         (let ([info (cadr (meaning-of name phase))])
           (filled-type (global-info-type info))
-          (list (list 'global info (lower-expr init phase))))])]
+          (set! lowered-closures? #f)
+          (let ([e (lower-expr init phase)])
+            (list (list 'global info e lowered-closures?))))])]
     [(import #%fact) '()]
     [(type) (syntax-match f [(_ name _) (list (list 'type (type-of name phase)))])]
     [(rec) (syntax-match f [(_ (_ name _) ...) (map (lambda (n) (list 'type (type-of n phase))) name)])]
     [(data) (syntax-match f [(_ name . _) (list (list 'data (data-info-of name phase)))])]
     [(tag) (syntax-match f [(_ name _) (list (list 'tag (tag-info-of name phase)))])]
-    [else (list (list 'expr (lower-expr f phase)))]))
+    [else (set! lowered-closures? #f)
+          (let ([e (lower-expr f phase)]) (list (list 'expr e lowered-closures?)))]))
 
 (define (lower-seq forms where phase)
   (at where (cons 'seq (map (lambda (f) (lower-expr f phase)) forms))))
@@ -3362,6 +3392,8 @@
         [(throw) (for-each check (caddr e))]
         [(throw-ref) (check (cadr e))]
         [(try) (for-each (lambda (c) (check (cadddr c))) (cadr e)) (check (caddr e))]
+        [(lambda) (check (list-ref e 4))]
+        [(apply-value) (check (cadr e)) (for-each check (caddr e))]
         [else (raise-compile-error id "internal: lowered form ~a" (car e))]))
     (hash-set! (kernel-inlines lowering-kernel) info
                (list params (func-info-results info) body returns?
@@ -3426,8 +3458,13 @@
       [(lset) (list 'lset (local (cadr e)) (copy (caddr e)))]
       [(gref) (list 'gref (shift (cadr e)))]
       [(gset) (list 'gset (shift (cadr e)) (copy (caddr e)))]
-      [(let) (let ([bs (map (lambda (b) (list (local (car b)) (cadr b) (copy (caddr b)))) (cadr e))])
+      [(let) (let ([bs (map (lambda (b) (cons (local (car b)) (cons (cadr b) (cons (copy (caddr b)) (cdddr b))))) (cadr e))])
                (list 'let bs (copy (caddr e))))]
+      ;; A lambda copied has a key of its own, and its parameters new locals.
+      [(lambda)
+       (set! lowered-closures? #t)
+       (list 'lambda (fresh-key!) (map (lambda (p) (cons (local (car p)) (cdr p))) (caddr e)) (cadddr e) (copy (list-ref e 4)))]
+      [(apply-value) (list 'apply-value (copy (cadr e)) (map copy (caddr e)))]
       [(seq select drop) (cons (car e) (map copy (cdr e)))]
       [(if) (list 'if (copy (cadr e)) (copy (caddr e)) (copy? (cadddr e)))]
       [(block loop) (list (car e) (label (cadr e)) (copy (caddr e)))]
@@ -3521,11 +3558,11 @@
       [(#%app)
        (syntax-match s
          [(_ f arg ...)
-          (unless (function-name? f phase)
-            (raise-compile-error s "~aan application of a function value must be lowered to other kernel code before it is compiled (spec 5.3)"
-                                 (if (id? f) (format "~a is a variable, not a function: " (stx-e f)) "")))
-          (let ([info (func-info-of f phase)] [args (map lo arg)])
-            (or (inline-call info args) (list 'call info args)))])]
+          (if (function-name? f phase)
+              (let ([info (func-info-of f phase)] [args (map lo arg)])
+                (or (inline-call info args) (list 'call info args)))
+              (begin (set! lowered-closures? #t)
+                     (list 'apply-value (lo f) (map lo arg))))])]
       [(#%datum) (syntax-match s [(_ literal) (core-datum literal)])]
       [(quote) (syntax-match s [(_ datum) (list 'quote (stx->datum datum))])]
       [(quote-syntax) (syntax-match s [(_ datum) (list 'quote datum)])]
@@ -3552,12 +3589,21 @@
           (list 'let
                 (map (lambda (b)
                        (syntax-match b
-                         [(x init) (list (local-key-of x phase) #f (lo init))]
-                         [(x type init) (list (local-key-of x phase) (filled-type (parse-type type phase)) (lo init))]))
+                         [(x init) (list (local-key-of x phase) #f (lo init) (stx-e x))]
+                         [(x type init) (list (local-key-of x phase) (filled-type (parse-type type phase)) (lo init) (stx-e x))]))
                      binding)
                 (lower-seq body s phase))])]
+      ;; (lambda key params results body): a closure, which the compiler
+      ;; makes (spec 5.3); key is the lambda's own.
       [(lambda)
-       (raise-compile-error s "lambda: a lambda must be lowered to other kernel code before it is compiled (spec 5.3)")]
+       (syntax-match s
+         [(_ ((x type) ...) . rest)
+          (let ([rb (parse-results rest phase)])
+            (set! lowered-closures? #t)
+            (list 'lambda (fresh-key!)
+                  (map (lambda (x t) (cons (local-key-of x phase) (filled-type (parse-type t phase)))) x type)
+                  (map filled-type (car rb))
+                  (lower-seq (cdr rb) s phase)))])]
       [(#%hole) (unfilled-hole s)]
       [(begin) (syntax-match s [(_ e ...) (cons 'seq (map lo e))])]
       [(if) (syntax-match s

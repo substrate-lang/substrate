@@ -10,10 +10,9 @@
 ;; recursion group of a base and a final subtype per constructor, whose
 ;; fields, f0 ..., are the constructor's live ones, so a match tests which
 ;; constructor a value has with ref.test (spec 5.1). A function value is a
-;; closure: a struct whose first field is its code, a function of the
-;; closure and one argument, and whose others are what it captured. What
-;; is erased, a binder, argument or field of quantity -, a type, a proof's
-;; rewrite, is left out. A definition is a function of its live
+;; lambda of one argument, whose closure the kernel makes (spec 5.3).
+;; What is erased, a binder, argument or field of quantity -, a type, a
+;; proof's rewrite, is left out. A definition is a function of its live
 ;; parameters; an application of it to that many live arguments is a
 ;; direct call, and any other, as of a variable, applies closures, one
 ;; argument at a time: a definition given fewer is made a closure first,
@@ -42,7 +41,6 @@
 (define types '())
 (define used (make-hasheq))
 (define families (make-hasheq))
-(define closure-types #f)
 (define printers (make-hash))
 (define memo (make-hash))
 (define probes 0)
@@ -70,7 +68,6 @@
       (if (hash-ref used s #f) (loop (+ n 1)) (begin (hash-set! used s #t) s)))))
 
 (define (field j) (string->symbol (format "f~a" j)))
-(define (capture j) (string->symbol (format "c~a" j)))
 
 (define nothing '(ref.null eq))
 
@@ -97,27 +94,6 @@
 (define (variant k)
   (let* ([fam (book-fam book k)] [cs (AdtD-c (book-tld book fam))])
     (list-ref (cdr (family-types fam)) (let loop ([cs cs] [i 0]) (if (eq? (CtrD-k (car cs)) k) i (loop (cdr cs) (+ i 1)))))))
-
-;; The closure type and its code's type, (closure . code); and the
-;; closure type of n captures.
-(define (closure-type)
-  (or closure-types
-      (let ([c (fresh-global "closure")] [f (fresh-global "code")])
-        (set! types (cons `(rec (type ,c (sub (struct (field code (ref ,f)))))
-                                (type ,f (func ((ref ,c) eqref -> eqref))))
-                          types))
-        (set! closure-types (cons c f))
-        closure-types)))
-
-(define (closure-type-of n)
-  (let ([base (closure-type)])
-    (memoized (list 'closure n)
-              (lambda ()
-                (let ([t (fresh-global (format "closure~a" n))])
-                  (set! types (cons `(type ,t (sub final ,(car base) (struct (field code (ref ,(cdr base)))
-                                                                             ,@(map (lambda (j) `(field ,(capture j) eqref)) (range n)))))
-                                    types))
-                  t)))))
 
 ;; ---- what is live ----
 
@@ -155,14 +131,13 @@
 
 ;; ---- functions being made ----
 ;;
-;; A function has its locals, each probe's local, a symbol, or erased;
-;; the function it is in, if it is a closure's code, whose locals it
-;; captures as it uses them, each (local . outer); and the names it has
-;; used.
+;; A function has its locals, each probe's local, a symbol, or erased, and
+;; the function it is in, if it is a lambda, whose locals it can name: the
+;; names used are shared, so that no local shadows another's.
 
-(struct fn (parent locals [captures #:mutable] names))
+(struct fn (parent locals names))
 
-(define (new-fn parent) (fn parent (make-hasheqv) '() (make-hasheq)))
+(define (new-fn parent) (fn parent (make-hasheqv) (if parent (fn-names parent) (make-hasheq))))
 
 (define (probe k) (set! probes (+ probes 1)) (Var k probes #f #f))
 
@@ -180,13 +155,7 @@
 
 (define (lookup f p)
   (or (hash-ref (fn-locals f) (Var-i p) #f)
-      (let ([outer (if (fn-parent f) (lookup (fn-parent f) p) (lower-error "a variable out of scope"))])
-        (if (eq? outer 'erased)
-            'erased
-            (let ([c (local! f (Var-k p))])
-              (set-fn-captures! f (cons (cons c outer) (fn-captures f)))
-              (bind! f p c)
-              c)))))
+      (if (fn-parent f) (lookup (fn-parent f) p) (lower-error "a variable out of scope"))))
 
 (define (lower-error message . at) (raise-syntax-error 'bend message (if (and (pair? at) (car at)) (car at) where)))
 
@@ -253,11 +222,11 @@
       [(null? live) (expr f (cadr s) #f)]
       [else (apply-last f live)])))
 
-;; The last live application of a spine, which applies a closure.
+;; The last live application of a spine, which applies a closure, a
+;; function value of one argument (spec 5.3).
 (define (apply-last f live)
-  (let ([a (last live)] [c (local! f 'f)] [types (closure-type)])
-    `(let ([,c (ref.cast (ref ,(car types)) ,(expr f (App-f a) #f))])
-       (call-ref ,(cdr types) (struct.get ,(car types) code ,c) ,c ,(expr f (App-x a) #f)))))
+  (let ([a (last live)])
+    `(#%app (ref.cast (ref (closure (eqref -> eqref))) ,(expr f (App-f a) #f)) ,(expr f (App-x a) #f))))
 
 ;; t, of type T, applied to n arguments more, as lambdas of them.
 (define (eta t T n)
@@ -273,27 +242,11 @@
     `(let ,(filter (lambda (b) b) (map (lambda (p v) (and (cdr p) (list (cdr p) v))) ps vals))
        ,(code ((Let-f x) (map car ps))))))
 
-;; A closure of x, a function value of type ty: its code lifted, a
-;; function of the closure and x's argument.
+;; A closure of x, a function value of type ty: a lambda of x's argument,
+;; whose closure the kernel makes (spec 5.3).
 (define (closure f x ty)
-  (let* ([g (new-fn f)]
-         [types (closure-type)]
-         [self (local! g 'self)]
-         [arg (local! g (if (Lam? x) (Lam-k x) 'x))]
-         [b (body g x ty (list arg))]
-         [caps (reverse (fn-captures g))]
-         [name (fresh-global (format "~a.fn" (short current-def)))])
-    (if (null? caps)
-        (let ([value (fresh-global (format "~a.value" name))])
-          (lift! `(func (,name [,self (ref ,(car types))] [,arg eqref]) -> eqref (type ,(cdr types)) ,b))
-          (lift! `(global ,value (ref ,(car types)) (struct.new ,(car types) (ref.func ,name))))
-          value)
-        (let* ([t (closure-type-of (length caps))] [env (local! g 'env)])
-          (lift! `(func (,name [,self (ref ,(car types))] [,arg eqref]) -> eqref (type ,(cdr types))
-                    (let ([,env (ref.cast (ref ,t) ,self)])
-                      (let ,(map (lambda (c j) `[,(car c) (struct.get ,t ,(capture j) ,env)]) caps (range (length caps)))
-                        ,b))))
-          `(struct.new ,t (ref.func ,name) ,@(map cdr caps))))))
+  (let* ([g (new-fn f)] [arg (local! g (if (Lam? x) (Lam-k x) 'x))])
+    `(lambda ([,arg eqref]) -> eqref ,(body g x ty (list arg)))))
 
 ;; The definition whose code is being made, whose name its closures'
 ;; functions take.

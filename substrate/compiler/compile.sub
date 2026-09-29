@@ -12,16 +12,19 @@
 (require-unqualified substrate "../lib/substrate.sub")
 (require stx "stx.sub" raise-compile-error srcloc? srcloc-source srcloc-line srcloc-col)
 (require core "core.sub"
-         func-info? func-info-name func-info-params func-info-results func-info-instance
+         func-info func-info? func-info-name func-info-params func-info-results func-info-instance
          set-func-info-instance! func-info-export set-func-info-export! func-info-type
          global-info? global-info-name global-info-type global-info-mutable? global-info-instance
          set-global-info-instance! global-info-export set-global-info-export!
          tag-info-name tag-info-params tag-info-instance set-tag-info-instance! tag-info-export set-tag-info-export!
          data-info-offset data-info-bytes
-         type-info? type-info-name type-info-kind type-info-fields type-info-super type-info-final?
+         make-type-info type-info? type-info-name type-info-kind type-info-fields type-info-super type-info-final?
          type-info-group func-type?
          ref-type? make-ref ref-nullable? ref-heap numeric-type?
-         valtype<=? types<=? valtype-join valtype->string unpacked defaultable?)
+         valtype<=? types<=? valtype-join valtype->string unpacked defaultable?
+         closure-type closure-code box-type box-value-type identify-group!)
+(require cl "closures.sub" analyze-closures closures-boxed? closures-known-of closures-captures-of head-local
+         known-lambda known-captures known-info set-known-info! known-name known-lifted set-known-lifted!)
 (require ops "ops.sub" lookup-prim prim-op-kind prim-op-params prim-op-results prim-op-align)
 (require w "wasm.sub" wmodule encode-module)
 (require ser "serialize.sub" make-serializer serialize! serializer-bytes serializer-scope-table)
@@ -124,10 +127,11 @@
 (struct fctx (locals              ; hasheqv: key -> (index . type)
               [extra #:mutable]   ; types of locals after the params, reversed
               [next #:mutable]    ; next local index
-              results))           ; the function's result types
+              results             ; the function's result types
+              [analysis #:mutable])) ; what closures.sub decided of the function, or #f
 
 (define (new-fctx params results)
-  (let ([fc (fctx (make-hasheqv) '() 0 results)])
+  (let ([fc (fctx (make-hasheqv) '() 0 results #f)])
     (for-each (lambda (p) (add-local! fc (car p) (cdr p))) params)
     (set-fctx-extra! fc '())
     fc))
@@ -147,7 +151,10 @@
 
 (define (lookup-local fc key)
   (or (hash-ref (fctx-locals fc) key #f)
-      (fail "internal: unknown local ~a" key)))
+      (fail "internal: unknown local ~a in ~a" key compiling)))
+
+;; The name of the function being compiled, for internal errors.
+(define compiling #f)
 
 ;; kind: block | loop | if. type: the block's result type once known.
 (struct label (key kind [type #:mutable]))
@@ -174,7 +181,10 @@
                 [uses-memory #:mutable]    ; where code first needs a memory, or #f
                 [uses-table #:mutable]     ; where code first needs a table, or #f
                 [uses-gc #:mutable]        ; does code allocate or inspect GC objects?
-                [literals #:mutable]))     ; the quoted data, or #f
+                [literals #:mutable]       ; the quoted data, or #f
+                [pending #:mutable]        ; the functions lifted from lambdas, to compile, reversed
+                namer                      ; gives export names
+                [fname #:mutable]))        ; the name of the function being compiled
 
 (define (external? ms info-instance) (not (equal? info-instance (mstate-self ms))))
 
@@ -211,6 +221,72 @@
           (note-func! ms info)
           (set-mstate-fidx! ms (cons (cons info s) (mstate-fidx ms)))
           s))))
+
+;; ---- closures ----
+;;
+;; A lambda is a closure (core.sub): its code is lifted, a function of the
+;; closure and the lambda's parameters, compiled after the function it is
+;; in (pending), and the lambda itself makes the struct, with the values
+;; of the variables it captures in its fields. What closures.sub decided
+;; of the function is in its fctx: a boxed variable's local holds its box,
+;; which a read or an assignment goes through and its binder makes; a
+;; known function's calls are direct calls of its lifted code, given the
+;; variables it captures after the arguments.
+
+(define (boxed? fc key) (let ([a (fctx-analysis fc)]) (and a (closures-boxed? a key))))
+(define (known-of fc key) (let ([a (fctx-analysis fc)]) (and a (closures-known-of a key))))
+
+;; Code that puts local key, of type type, in a new box, in a new local
+;; that key names from now on.
+(define (box-local! fc key type)
+  (let* ([old (car (lookup-local fc key))] [box (box-type type)] [new (add-local! fc key (make-ref #f box))])
+    `((local.get ,old) (struct.new ,box) (local.set ,new))))
+
+;; The boxes of the boxed parameters among params, each (key . type).
+(define (box-params! fc params)
+  (apply append (map (lambda (p) (if (boxed? fc (car p)) (box-local! fc (car p) (cdr p)) '())) params)))
+
+;; A function lifted from a lambda, named after the function it is in:
+;; its info, given its parameter and result types and its declared type.
+(define (lifted-info ms base params results type)
+  (let ([name (string->symbol (format "~a.~a" (mstate-fname ms) base))])
+    (func-info name params results (mstate-self ms) ((mstate-namer ms) name) type)))
+
+;; A lifted function to compile: its info, its parameters, each (key .
+;; type), the lambda's own among them, its body, the analysis of the
+;; function it was in, and, for a closure's code, the closure's type and
+;; its captures, each (key . type), which the code reads from the
+;; closure's fields.
+(define (lift! ms info params own body analysis csub captures)
+  (set-mstate-pending! ms (cons (list info params own body analysis csub captures) (mstate-pending ms))))
+
+;; The function of known function k, made when first called or defined:
+;; it takes the lambda's parameters, then the variables it captures.
+(define (known-info! ms fc k)
+  (or (known-info k)
+      (let* ([node (known-lambda k)]
+             [captures (map (lambda (key) (cons key (cdr (lookup-local fc key)))) (known-captures k))]
+             [info (lifted-info ms (known-name k) (append (map cdr (caddr node)) (map cdr captures)) (cadddr node) #f)])
+        (set-known-info! k info)
+        info)))
+
+;; Known function k's code, lifted where its lambda is.
+(define (lift-known! ms fc k)
+  (let ([info (known-info! ms fc k)] [node (known-lambda k)])
+    (unless (known-lifted k)
+      (set-known-lifted! k #t)
+      (lift! ms info (append (caddr node) (map (lambda (key) (cons key (cdr (lookup-local fc key)))) (known-captures k)))
+             (caddr node) (list 'at current-loc (list-ref node 4)) (fctx-analysis fc) #f '()))))
+
+;; The type of a closure of closure type closure with captures of types
+;; types: a final subtype with a field per capture.
+(define (capture-type closure types)
+  (let ([t (make-type-info 'closure 'struct
+                           (cons (list 'code (make-ref #f (closure-code closure)) #f)
+                                 (map (lambda (ct i) (list (string->symbol (format "v~a" i)) ct #f)) types (range (length types))))
+                           closure #t #f)])
+    (identify-group! (list t))
+    t))
 
 ;; ---- expressions ----
 
@@ -396,6 +472,7 @@
                 (append `((block ,(blocktype (car ps)) ,code))
                         ;; The values, the last on the stack first.
                         (map (lambda (key) `(local.set ,(car (lookup-local fc key)))) (reverse (caddr (car cs))))
+                        (box-params! fc (map cons (caddr (car cs)) (car ps)))
                         (car (car rs))
                         (if (< i n) `((br ,(- n i))) '()))
                 (cdr rs) (cdr cs) (cdr ps))))))
@@ -447,11 +524,19 @@
                    [else `((,(const-op t) ,n))])
                  (list t) expected))]
       [(lref)
-       (let ([l (lookup-local fc (car args))])
-         (finish `((local.get ,(car l))) (list (cdr l)) expected))]
+       (let* ([l (lookup-local fc (car args))] [box (and (boxed? fc (car args)) (ref-heap (cdr l)))])
+         (if box
+             (finish `((local.get ,(car l)) (struct.get ,box 0)) (list (box-value-type box)) expected)
+             (finish `((local.get ,(car l))) (list (cdr l)) expected)))]
       [(lset)
-       (let ([l (lookup-local fc (car args))])
-         (finish (append (code-of (cadr args) (cdr l)) `((local.set ,(car l)))) '() expected))]
+       (let ([k (known-of fc (car args))])
+         (cond [k (lift-known! ms fc k) (finish '() '() expected)]
+               [else
+                (let* ([l (lookup-local fc (car args))] [box (and (boxed? fc (car args)) (ref-heap (cdr l)))])
+                  (if box
+                      (finish (append `((local.get ,(car l))) (code-of (cadr args) (box-value-type box)) `((struct.set ,box 0)))
+                              '() expected)
+                      (finish (append (code-of (cadr args) (cdr l)) `((local.set ,(car l)))) '() expected)))]))]
       [(gref)
        (let ([info (car args)])
          (note-global! ms info)
@@ -467,14 +552,24 @@
        (let ([init-code
               (apply append
                      (map (lambda (b)
-                            (let* ([key (car b)] [declared (cadr b)] [init (caddr b)]
-                                   [r (sub init (and declared (list declared)) #f)] [t (cdr r)])
-                              (unless (single? t)
-                                (fail "a let binding needs a single value, got ~a~a" (type->string t)
-                                      (if (eq? t 'bottom) "; give it a type" "")))
-                              (let ([i (add-local! fc key (car t))])
-                                (append (car r) `((local.set ,i))))))
+                            (let* ([key (car b)] [declared (cadr b)] [init (caddr b)] [k (known-of fc key)])
+                              (cond
+                                ;; A known function has no local: its lambda is its code,
+                                ;; lifted once every variable of the let is bound, since
+                                ;; it may capture one bound after it.
+                                [k '()]
+                                [else
+                                 (let* ([r (sub init (and declared (list declared)) #f)] [t (cdr r)])
+                                   (unless (single? t)
+                                     (fail "a let binding needs a single value, got ~a~a" (type->string t)
+                                           (if (eq? t 'bottom) "; give it a type" "")))
+                                   (if (boxed? fc key)
+                                       (let* ([box (box-type (car t))] [i (add-local! fc key (make-ref #f box))])
+                                         (append (car r) `((struct.new ,box) (local.set ,i))))
+                                       (let ([i (add-local! fc key (car t))])
+                                         (append (car r) `((local.set ,i))))))])))
                           (car args)))])
+         (for-each (lambda (b) (let ([k (known-of fc (car b))]) (when k (lift-known! ms fc k)))) (car args))
          (let ([r (sub (cadr args) expected tail?)])
            (cons (append init-code (car r)) (cdr r))))]
       [(seq)
@@ -607,6 +702,51 @@
          (cons (append (args-code ms fc labels (cadr args) (tag-info-params info)) `((throw ,info))) 'bottom))]
       [(throw-ref) (cons (append (code-of (car args) exnref) '((throw_ref))) 'bottom)]
       [(try) (compile-try ms fc labels (car args) (cadr args) expected tail?)]
+      ;; (lambda key params results body): a closure of the lambda's
+      ;; signature, of a subtype with a field per captured variable if it
+      ;; captures any; its code, lifted, takes the closure first.
+      [(lambda)
+       (let* ([key (car args)] [params (cadr args)] [results (caddr args)] [body (cadddr args)]
+              [a (or (fctx-analysis fc) (fail "internal: a lambda in a function that was not analyzed"))]
+              [captures (map (lambda (k) (cons k (cdr (lookup-local fc k)))) (closures-captures-of a key))]
+              [closure (closure-type (map cdr params) results)]
+              [csub (if (null? captures) closure (capture-type closure (map cdr captures)))]
+              [info (lifted-info ms 'lambda (cons (make-ref #f closure) (map cdr params)) results (closure-code closure))])
+         (lift! ms info (cons (cons key (make-ref #f closure)) params) params (list 'at current-loc body) a csub captures)
+         (set-mstate-uses-gc! ms #t)
+         (finish (append `((ref.func ,info))
+                         (apply append (map (lambda (c) `((local.get ,(car (lookup-local fc (car c)))))) captures))
+                         `((struct.new ,csub)))
+                 (list (make-ref #f csub)) expected))]
+      ;; (apply-value head args): a call of the code of head, a closure,
+      ;; given the closure; of a known function, a direct call of its
+      ;; code, given the variables it captures, whatever check the head
+      ;; makes of the variable (head-local).
+      [(apply-value)
+       (let* ([h (head-local (car args))]
+              [k (and h (known-of fc (car h)))])
+         (if k
+             ;; The captures go as they are, a boxed one as its box.
+             (let* ([info (known-info! ms fc k)] [results (func-info-results info)]
+                    [c (append (args-code ms fc labels (cadr args) (map cdr (caddr (known-lambda k))))
+                               (map (lambda (key) `(local.get ,(car (lookup-local fc key)))) (known-captures k)))])
+               (if (and tail? (types<=? results (fctx-results fc)))
+                   (cons (append c `((return_call ,info))) results)
+                   (finish (append c `((call ,info))) results expected)))
+             (let* ([r (sub (car args) #f #f)] [t (cdr r)]
+                    [code (and (single? t) (ref-type? (car t)) (closure-code (ref-heap (car t))))])
+               (unless code
+                 (fail "an application of ~a, which is not a function value: a function value has a closure type, (ref (closure (type ... -> type ...)))"
+                       (type->string t)))
+               (let* ([closure (ref-heap (car t))] [sig (type-info-fields code)] [results (cadr sig)]
+                      [tmp (temp-local! fc (car t))]
+                      [c (append (car r) `((local.tee ,tmp)) (if (ref-nullable? (car t)) '((ref.as_non_null)) '())
+                                 (args-code ms fc labels (cadr args) (cdr (car sig)))
+                                 `((local.get ,tmp) (struct.get ,closure 0)))])
+                 (set-mstate-uses-gc! ms #t)
+                 (if (and tail? (types<=? results (fctx-results fc)))
+                     (cons (append c `((return_call_ref ,code))) results)
+                     (finish (append c `((call_ref ,code))) results expected))))))]
       [(quote)
        ;; A quoted fixnum or #f is a constant, and so are '() and #t, which
        ;; are globals of the kernel module. Other data is an entry in the
@@ -636,6 +776,54 @@
         (set-mstate-literals! ms lits)
         lits)))
 
+;; ---- functions ----
+
+;; The analysis of a form's code (closures.sub), given its parameters'
+;; keys; #f if the form says it has no lambda or application of a
+;; function value, in the element at index flag, which the expander sets.
+(define (form-analysis form flag body params)
+  (let ([r (list-tail form flag)])
+    (if (and (pair? r) (not (car r))) #f (analyze-closures body params))))
+
+;; Function info compiled: (info signature local-types code). params are
+;; its parameters, each (key . type), own the lambda's own among them,
+;; whose boxed ones are put in boxes first; analysis is closures.sub's of
+;; the function it was in, or its own. A closure's code, of closure type
+;; csub, reads its captures from the closure's fields into locals first.
+(define (compile-function ms info params own body analysis csub captures)
+  (let ([fc (new-fctx params (func-info-results info))])
+    (set-fctx-analysis! fc analysis)
+    (set-mstate-fname! ms (func-info-name info))
+    (set! compiling (func-info-name info))
+    (set! current-loc #f)
+    (let* ([prologue
+            (if csub
+                (let ([env (temp-local! fc (make-ref #f csub))])
+                  (append `((local.get 0) (ref.cast #f ,csub) (local.set ,env))
+                          (apply append
+                                 (map (lambda (c i)
+                                        (let ([l (add-local! fc (car c) (cdr c))])
+                                          `((local.get ,env) (struct.get ,csub ,(+ i 1)) (local.set ,l))))
+                                      captures (range (length captures))))))
+                '())]
+           [boxing (box-params! fc own)]
+           [code (car (cx ms fc '() body (func-info-results info) #t))]
+           ;; The prologue follows the body's first location, the function's own.
+           [code (if (and (pair? code) (eq? (car (car code)) 'location))
+                     (cons (car code) (append prologue boxing (cdr code)))
+                     (append prologue boxing code))])
+      (list info (list 'func (map cdr params) (func-info-results info)) (reverse (fctx-extra fc)) code))))
+
+;; The functions lifted so far, compiled, in the order they were lifted;
+;; compiling one may lift more.
+(define (compile-pending! ms)
+  (let loop ([acc '()])
+    (if (null? (mstate-pending ms))
+        (reverse acc)
+        (let ([batch (reverse (mstate-pending ms))])
+          (set-mstate-pending! ms '())
+          (loop (foldl (lambda (e acc) (cons (apply compile-function ms e) acc)) acc batch))))))
+
 ;; ---- module ----
 
 ;; Is e a constant expression in wasm's sense (spec 5.2)? It may read
@@ -645,7 +833,7 @@
   (let loop ([e e])
     (case (car e)
       [(at as) (loop (caddr e))]
-      [(int float const ref-func) #t]
+      [(int float const ref-func lambda) #t]
       [(quote) (let ([d (cadr e)])
                  (or (fixnum? d) (eq? d #f) (and (datum-global d) #t)))]
       [(gref) (let ([g (cadr e)])
@@ -701,7 +889,7 @@
 ;; the global itself: an alist info -> code, in definition order. Any other
 ;; initializer runs in the start function, so its global must be mutable
 ;; and start with a default value.
-(define (constant-inits ms global-forms)
+(define (constant-inits ms global-forms analyses)
   (let loop ([fs global-forms] [earlier '()] [acc '()])
     (if (null? fs)
         (reverse acc)
@@ -709,8 +897,11 @@
           (set! current-loc (loc-of init))
           (cond
             [(and init (constant-expr? ms init earlier))
-             (let ([c (car (cx ms (new-fctx '() '()) '() init (list t) #f))])
-               (loop (cdr fs) (cons info earlier) (cons (cons info c) acc)))]
+             (let ([fc (new-fctx '() '())])
+               (set-fctx-analysis! fc (cdr (assq info analyses)))
+               (set-mstate-fname! ms (global-info-name info))
+               (let ([c (car (cx ms fc '() init (list t) #f))])
+                 (loop (cdr fs) (cons info earlier) (cons (cons info c) acc))))]
             [(not (global-info-mutable? info))
              (fail "global ~a is immutable, so its initializer must be a constant expression; declare it (mut ~a) to compute it when the module starts"
                    (global-info-name info) (valtype->string t))]
@@ -725,7 +916,8 @@
 ;; scope table of its quoted data (spec 3.5).
 (define (compile-module forms self)
   (set! current-loc #f)
-  (let* ([ms (mstate self '() '() '() '() '() #f #f #f #f)]
+  (let* ([export-name! (export-namer)]
+         [ms (mstate self '() '() '() '() '() #f #f #f #f '() export-name! #f)]
          [kind? (lambda (k) (lambda (f) (eq? (car f) k)))]
          [func-forms (filter (kind? 'func) forms)]
          [global-forms (filter (kind? 'global) forms)]
@@ -737,7 +929,6 @@
          [memory-form (findf (lambda (f) (memq (car f) '(memory memory-import))) forms)]
          [table-form (findf (lambda (f) (memq (car f) '(table table-import))) forms)]
          [imported? (lambda (form) (and form (memq (car form) '(memory-import table-import)) #t))]
-         [export-name! (export-namer)]
          [local (lambda (name)
                   (let ([f (findf (lambda (f) (eq? (func-info-name (cadr f)) name)) func-forms)])
                     (and f (cadr f))))]
@@ -759,16 +950,13 @@
                           (set-tag-info-instance! info self)
                           (set-tag-info-export! info (export-name! (tag-info-name info)))))
                       tag-forms))]
-         [constant-inits (constant-inits ms global-forms)]
+         [global-analyses (map (lambda (f) (cons (cadr f) (and (caddr f) (form-analysis f 3 (caddr f) '())))) global-forms)]
+         [constant-inits (constant-inits ms global-forms global-analyses)]
          ;; Function bodies.
          [compiled-funcs
           (map (lambda (f)
-                 (let* ([info (cadr f)] [params (caddr f)] [body (cadddr f)]
-                        [fc (new-fctx params (func-info-results info))])
-                   (set! current-loc #f)
-                   (let ([code (car (cx ms fc '() body (func-info-results info) #t))])
-                     (list info (list 'func (map cdr params) (func-info-results info))
-                           (reverse (fctx-extra fc)) code))))
+                 (let ([info (cadr f)] [params (caddr f)] [body (cadddr f)])
+                   (compile-function ms info params params body (form-analysis f 4 body (map car params)) #f '())))
                func-forms)]
          ;; Start function: run-time global inits and module-level
          ;; expressions, in source order.
@@ -781,11 +969,20 @@
                            (let ([info (cadr f)] [init (caddr f)])
                              (if (or (not init) (assq info constant-inits))
                                  '()
-                                 (append (car (cx ms start-fc '() init (list (global-info-type info)) #f))
-                                         `((global.set ,info)))))]
-                          [(expr) (car (cx ms start-fc '() (cadr f) '() #f))]
+                                 (begin
+                                   (set-fctx-analysis! start-fc (cdr (assq info global-analyses)))
+                                   (set-mstate-fname! ms (global-info-name info))
+                                   (append (car (cx ms start-fc '() init (list (global-info-type info)) #f))
+                                           `((global.set ,info))))))]
+                          [(expr)
+                           (set-fctx-analysis! start-fc (form-analysis f 2 (cadr f) '()))
+                           (set-mstate-fname! ms '__start)
+                           (car (cx ms start-fc '() (cadr f) '() #f))]
                           [else '()]))
                       forms))]
+         ;; The functions lifted from lambdas, compiled after the code they
+         ;; were lifted from.
+         [compiled-funcs (append compiled-funcs (compile-pending! ms))]
          ;; The quoted data, complete now that all code is compiled. Its
          ;; segment follows the module's own data segments.
          [literal-segment (and (mstate-literals ms) (serializer-bytes (literals-serializer (mstate-literals ms))))]
