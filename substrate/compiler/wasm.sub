@@ -12,7 +12,7 @@
 ;; Value types are resolved: i32 i64 f32 f64, or (ref nullable? heap) where
 ;; heap is an abstract heap type symbol or a type index.
 (require-unqualified substrate "../lib/substrate.sub")
-(require ops "ops.sub" lookup-prim prim-op-code prim-op-kind)
+(require ops "ops.sub" lookup-prim prim-op-code prim-op-kind prim-op-traps? prim-names)
 (require leb "leb128.sub" write-uleb write-sleb)
 (require num "numbers.sub" flonum-bits flonum32-bits)
 
@@ -132,36 +132,19 @@
 ;; Code carries the pseudo-instruction (location file line col), file #f
 ;; for none, which says where the instructions after it come from. The
 ;; asm records a location where an instruction that can call or trap
-;; starts at a new one, and the first location a body gives, at its start,
-;; is the function's own: those are where a backtrace's frames are, one
-;; that overflowed the stack at the body's start. The module's
-;; source-locations section lists them (spec 3.6).
+;; starts at a new one (note-location!), and the first location a body
+;; gives, at its start, is the function's own: those are where a
+;; backtrace's frames are, one that overflowed the stack at the body's
+;; start. The module's source-locations section lists them (spec 3.6).
 (define location-none (list #f 0 0))
 (define code-locations '())               ; (offset file line col), in the code section, reversed
 
-;; The instructions that can call or trap, but for memory's loads and
-;; stores.
-(define calls-or-traps
-  (make-hasheq
-   (map (lambda (op) (cons op #t))
-        '(unreachable call call_indirect return_call return_call_indirect call_ref return_call_ref
-          ref.cast ref.as_non_null struct.get struct.get_s struct.get_u struct.set
-          array.new array.new_default array.new_data array.get array.get_s array.get_u array.set
-          array.len array.fill array.copy i31.get_s i31.get_u
-          i32.div_s i32.div_u i32.rem_s i32.rem_u i64.div_s i64.div_u i64.rem_s i64.rem_u
-          i32.trunc_f32_s i32.trunc_f32_u i32.trunc_f64_s i32.trunc_f64_u
-          i64.trunc_f32_s i64.trunc_f32_u i64.trunc_f64_s i64.trunc_f64_u
-          memory.copy memory.fill))))
-
-(define (records-location? op)
-  (or (hash-ref calls-or-traps op #f)
-      (let ([p (lookup-prim op)]) (and p (eq? (prim-op-kind p) 'mem)))))
-
-(define (note-location! a op)
-  (unless (eq? (asm-pending a) (asm-current a))
-    (when (and (records-location? op) (not (equal? (asm-pending a) (asm-current a))))
-      (set-asm-locations! a (cons (cons (asm-size a) (asm-pending a)) (asm-locations a)))
-      (set-asm-current! a (asm-pending a)))))
+;; The asm records a location where an instruction that can call or trap
+;; (its encoding says which) starts at a new one.
+(define (note-location! a)
+  (unless (or (eq? (asm-pending a) (asm-current a)) (equal? (asm-pending a) (asm-current a)))
+    (set-asm-locations! a (cons (cons (asm-size a) (asm-pending a)) (asm-locations a)))
+    (set-asm-current! a (asm-pending a))))
 
 ;; The bytes of n as unsigned LEB128.
 (define (uleb-length n) (if (< n 128) 1 (+ 1 (uleb-length (arithmetic-shift n -7)))))
@@ -184,18 +167,73 @@
           (loop (cdr es) (car e)))))))
 
 ;; ---- instructions ----
+;;
+;; Each instruction's encoding: its opcode bytes, the kinds of its
+;; immediates, and whether it can call or trap, which records its
+;; location. An immediate is u, an unsigned LEB128; s, a signed one; f32
+;; or f64, a float's bits; catches, try_table's vector of catches; or a
+;; deferred field's kind (func, ref-func, global, type, tag, heap,
+;; valtype, blocktype), recorded for link-body. ref.test-null and
+;; ref.cast-null are ref.test and ref.cast to a nullable type. The
+;; primitive operators come from their table (ops.sub).
+(define encodings (make-hasheq))
 
-(define (gc! p n) (write-byte #xFB p) (write-uleb n p))
+;; (op byte kind ...) or (op (byte ...) kind ...), each; traps is plain,
+;; or traps for instructions that can call or trap.
+(define (defs! traps specs)
+  (for-each (lambda (s)
+              (hash-set! encodings (car s)
+                         (list (if (pair? (cadr s)) (cadr s) (list (cadr s))) (cddr s) (eq? traps 'traps))))
+            specs))
 
-;; A constant instruction, (i32.const n), (i64.const n), (f32.const x) or
-;; (f64.const x).
+;; GC instructions, prefixed 0xFB.
+(define (gc-defs! traps specs)
+  (defs! traps (map (lambda (s) (cons (car s) (cons (list #xFB (cadr s)) (cddr s)))) specs)))
+
+(defs! 'plain
+  '((nop #x01) (block #x02 blocktype) (loop #x03 blocktype) (if #x04 blocktype)
+    (throw #x08 tag) (throw_ref #x0A) (br #x0C u) (br_if #x0D u) (return #x0F)
+    (drop #x1A) (select #x1B) (select-typed (#x1C 1) valtype)
+    (local.get #x20 u) (local.set #x21 u) (local.tee #x22 u) (global.get #x23 global) (global.set #x24 global)
+    (i32.const #x41 s) (i64.const #x42 s) (f32.const #x43 f32) (f64.const #x44 f64)
+    (ref.null #xD0 heap) (ref.is_null #xD1) (ref.func #xD2 ref-func) (ref.eq #xD3)
+    (table.grow (#xFC 15) u) (table.size (#xFC 16) u)))
+(defs! 'traps
+  '((unreachable #x00) (try_table #x1F blocktype catches)
+    (call #x10 func) (call_indirect #x11 type u) (return_call #x12 func) (return_call_indirect #x13 type u)
+    (call_ref #x14 type) (return_call_ref #x15 type) (ref.as_non_null #xD4)))
+(gc-defs! 'plain
+  '((struct.new 0 type) (array.new_fixed 8 type u) (ref.test 20 heap) (ref.test-null 21 heap) (ref.i31 28)))
+(gc-defs! 'traps
+  '((struct.get 2 type u) (struct.get_s 3 type u) (struct.get_u 4 type u) (struct.set 5 type u)
+    (array.new 6 type) (array.new_default 7 type) (array.new_data 9 type u)
+    (array.get 11 type) (array.get_s 12 type) (array.get_u 13 type) (array.set 14 type)
+    (array.len 15) (array.fill 16 type) (array.copy 17 type type)
+    (ref.cast 22 heap) (ref.cast-null 23 heap) (i31.get_s 29) (i31.get_u 30)))
+
+(for-each (lambda (name)
+            (let ([p (lookup-prim name)])
+              (hash-set! encodings name (list (prim-op-code p) (if (eq? (prim-op-kind p) 'mem) '(u u) '()) (prim-op-traps? p)))))
+          (prim-names))
+
+;; The immediates args of kinds, written to p; a deferred field is
+;; recorded in asm a.
+(define (immediates! p a kinds args)
+  (for-each (lambda (kind arg)
+              (case kind
+                [(u) (write-uleb arg p)]
+                [(s) (write-sleb arg p)]
+                [(f32) (le-bytes! p (flonum32-bits arg) 4)]
+                [(f64) (le-bytes! p (flonum-bits arg) 8)]
+                [(catches) (write-uleb (length arg) p) (for-each (lambda (c) (catch! a c)) arg)]
+                [else (reloc! a kind arg)]))
+            kinds args))
+
+;; A constant instruction, written to p.
 (define (const! p i)
-  (case (car i)
-    [(i32.const) (write-byte #x41 p) (write-sleb (cadr i) p)]
-    [(i64.const) (write-byte #x42 p) (write-sleb (cadr i) p)]
-    [(f32.const) (write-byte #x43 p) (le-bytes! p (flonum32-bits (cadr i)) 4)]
-    [(f64.const) (write-byte #x44 p) (le-bytes! p (flonum-bits (cadr i)) 8)]
-    [else (error 'encode "not a constant instruction ~s" i)]))
+  (let ([e (hash-ref encodings (car i))])
+    (for-each (lambda (b) (write-byte b p)) (car e))
+    (immediates! p #f (cadr e) (cdr i))))
 
 ;; Instruction i, (op imm ...), assembled into a. An index is a key for
 ;; link-body: a function's, global's or tag's is the compiler's record of
@@ -204,90 +242,23 @@
 ;; constant are cells, settled later. An else is written once an
 ;; instruction follows it, so an empty else arm leaves nothing.
 (define (instr! a i)
-  (let ([op (car i)] [args (cdr i)] [p (asm-port a)])
-    (unless (memq op '(location end))
-      (when (asm-else-pending? a) (set-asm-else-pending?! a #f) (write-byte #x05 p))
-      (note-location! a op))
-    (case op
-      [(location)
+  (let ([op (car i)] [p (asm-port a)])
+    (cond
+      [(eq? op 'location)
        (when (and (not (asm-start a)) (= (file-position p) 0))
-         (set-asm-start! a args)
-         (set-asm-current! a args))
-       (set-asm-pending! a args)]
-      [(const-deferred) (reloc! a 'const (car args))]
-      [(unreachable) (write-byte #x00 p)]
-      [(nop) (write-byte #x01 p)]
-      [(block) (write-byte #x02 p) (reloc! a 'blocktype (car args))]
-      [(loop) (write-byte #x03 p) (reloc! a 'blocktype (car args))]
-      [(if) (write-byte #x04 p) (reloc! a 'blocktype (car args))]
-      [(else) (set-asm-else-pending?! a #t)]
-      [(end) (set-asm-else-pending?! a #f) (write-byte #x0B p)]
-      [(throw) (write-byte #x08 p) (reloc! a 'tag (car args))]
-      [(throw_ref) (write-byte #x0A p)]
-      ;; (try_table bt catches), each catch (catch tag label), (catch_ref
-      ;; tag label), (catch_all label) or (catch_all_ref label); the body
-      ;; follows, then end.
-      [(try_table)
-       (write-byte #x1F p)
-       (reloc! a 'blocktype (car args))
-       (write-uleb (length (cadr args)) p)
-       (for-each (lambda (c) (catch! a c)) (cadr args))]
-      [(br) (write-byte #x0C p) (write-uleb (car args) p)]
-      [(br_if) (write-byte #x0D p) (write-uleb (car args) p)]
-      [(return) (write-byte #x0F p)]
-      [(call) (write-byte #x10 p) (reloc! a 'func (car args))]
-      [(call_indirect) (write-byte #x11 p) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
-      [(return_call) (write-byte #x12 p) (reloc! a 'func (car args))]
-      [(return_call_indirect) (write-byte #x13 p) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
-      [(call_ref) (write-byte #x14 p) (reloc! a 'type (car args))]
-      [(return_call_ref) (write-byte #x15 p) (reloc! a 'type (car args))]
-      [(drop) (write-byte #x1A p)]
-      [(select) (write-byte #x1B p)]
-      [(select-typed) (write-byte #x1C p) (write-uleb 1 p) (reloc! a 'valtype (car args))]
-      [(local.get) (write-byte #x20 p) (write-uleb (car args) p)]
-      [(local.set) (write-byte #x21 p) (write-uleb (car args) p)]
-      [(local.tee) (write-byte #x22 p) (write-uleb (car args) p)]
-      [(global.get) (write-byte #x23 p) (reloc! a 'global (car args))]
-      [(global.set) (write-byte #x24 p) (reloc! a 'global (car args))]
-      [(i32.const i64.const f32.const f64.const) (const! p i)]
-      [(ref.null) (write-byte #xD0 p) (reloc! a 'heap (car args))]
-      [(ref.is_null) (write-byte #xD1 p)]
-      [(ref.func) (write-byte #xD2 p) (reloc! a 'ref-func (car args))]
-      [(ref.eq) (write-byte #xD3 p)]
-      [(ref.as_non_null) (write-byte #xD4 p)]
-      [(table.grow) (write-byte #xFC p) (write-uleb 15 p) (write-uleb (car args) p)]
-      [(table.size) (write-byte #xFC p) (write-uleb 16 p) (write-uleb (car args) p)]
-      ;; GC (0xFB prefix)
-      [(struct.new) (gc! p 0) (reloc! a 'type (car args))]
-      [(struct.get) (gc! p 2) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
-      [(struct.get_s) (gc! p 3) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
-      [(struct.get_u) (gc! p 4) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
-      [(struct.set) (gc! p 5) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
-      [(array.new) (gc! p 6) (reloc! a 'type (car args))]
-      [(array.new_default) (gc! p 7) (reloc! a 'type (car args))]
-      [(array.new_fixed) (gc! p 8) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
-      [(array.new_data) (gc! p 9) (reloc! a 'type (car args)) (write-uleb (cadr args) p)]
-      [(array.get) (gc! p 11) (reloc! a 'type (car args))]
-      [(array.get_s) (gc! p 12) (reloc! a 'type (car args))]
-      [(array.get_u) (gc! p 13) (reloc! a 'type (car args))]
-      [(array.set) (gc! p 14) (reloc! a 'type (car args))]
-      [(array.len) (gc! p 15)]
-      [(array.fill) (gc! p 16) (reloc! a 'type (car args))]
-      [(array.copy) (gc! p 17) (reloc! a 'type (car args)) (reloc! a 'type (cadr args))]
-      ;; (ref.test nullable? heap) / (ref.cast nullable? heap)
-      [(ref.test) (gc! p (if (car args) 21 20)) (reloc! a 'heap (cadr args))]
-      [(ref.cast) (gc! p (if (car args) 23 22)) (reloc! a 'heap (cadr args))]
-      [(ref.i31) (gc! p 28)]
-      [(i31.get_s) (gc! p 29)]
-      [(i31.get_u) (gc! p 30)]
+         (set-asm-start! a (cdr i))
+         (set-asm-current! a (cdr i)))
+       (set-asm-pending! a (cdr i))]
+      [(eq? op 'else) (set-asm-else-pending?! a #t)]
+      [(eq? op 'end) (set-asm-else-pending?! a #f) (write-byte #x0B p)]
       [else
-       (let ([prim (lookup-prim op)])
-         (unless prim (error 'encode "unknown instruction ~s" i))
-         (for-each (lambda (b) (write-byte b p)) (prim-op-code prim))
-         (when (eq? (prim-op-kind prim) 'mem)
-           ;; args: (align offset)
-           (write-uleb (car args) p)
-           (write-uleb (cadr args) p)))])))
+       (when (asm-else-pending? a) (set-asm-else-pending?! a #f) (write-byte #x05 p))
+       (if (eq? op 'const-deferred)
+           (reloc! a 'const (cadr i))
+           (let ([e (or (hash-ref encodings op #f) (error 'encode "unknown instruction ~s" i))])
+             (when (caddr e) (note-location! a))
+             (for-each (lambda (b) (write-byte b p)) (car e))
+             (immediates! p a (cadr e) (cdr i))))])))
 
 (define (catch! a c)
   (let ([p (asm-port a)])
