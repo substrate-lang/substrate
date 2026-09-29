@@ -12,12 +12,15 @@
 
 ;; Objects are written as they are met, each after the objects it is made
 ;; of. Equal objects, all immutable, are written once and shared, as Scheme
-;; allows of literals. A syntax object's scopes are written as indexes
-;; into the scope table, the scopes met so far in order (spec 3.5), so
-;; the bytes do not depend on the run that assigned the scopes.
-(struct serializer (out [count #:mutable] shared scopes [table #:mutable]))
+;; allows of literals: a fixnum, symbol or keyword is its own key, a pair
+;; is keyed by its parts' indexes, in a table per car, and the rest by
+;; their parts in a list. A syntax object's scopes are written as indexes into
+;; the scope table, the scopes met so far in order (spec 3.5), so the
+;; bytes do not depend on the run that assigned the scopes.
+(struct serializer (out [count #:mutable] shared fixnums atoms pairs scopes [table #:mutable]))
 
-(define (make-serializer) (serializer (open-output-bytes) 0 (make-hash) (make-hasheqv) '()))
+(define (make-serializer)
+  (serializer (open-output-bytes) 0 (make-hash) (make-hasheqv) (make-hasheq) (make-hasheqv) (make-hasheqv) '()))
 
 ;; The index of scope sc in the table, added if it is new.
 (define (scope-index! s sc)
@@ -30,15 +33,17 @@
 ;; The scope table: the run's scope for each index.
 (define (serializer-scope-table s) (reverse (serializer-table s)))
 
-;; Write an object with write!, unless one with the same key was; a key of
-;; #f is never shared. Returns its index.
-(define (object! s key write!)
-  (or (and key (hash-ref (serializer-shared s) key #f))
+;; Write an object with write!, unless one with the same key in table was.
+;; Returns its index.
+(define (object! s table key write!)
+  (or (hash-ref table key #f)
       (let ([i (serializer-count s)])
         (write!)
         (set-serializer-count! s (+ i 1))
-        (when key (hash-set! (serializer-shared s) key i))
+        (hash-set! table key i)
         i)))
+
+(define (shared! s key write!) (object! s (serializer-shared s) key write!))
 
 (define (bytes! p bs)
   (write-uleb (bytes-length bs) p)
@@ -51,20 +56,20 @@
   (let ([p (serializer-out s)])
     (let loop ([d d])
       (cond
-        [(eq? d #f) (object! s '(0) (lambda () (write-byte 0 p)))]
-        [(fixnum? d) (object! s (list 1 d) (lambda () (write-byte 1 p) (write-sleb d p)))]
+        [(eq? d #f) (shared! s '(0) (lambda () (write-byte 0 p)))]
+        [(fixnum? d) (object! s (serializer-fixnums s) d (lambda () (write-byte 1 p) (write-sleb d p)))]
         [(integer? d)
          ;; Beyond the fixnum range: a sign and a 64-bit magnitude.
          (let ([sign (if (integer-negative d) 1 0)]
                [magnitude (map (lambda (i) (integer-magnitude-byte d i)) (range 8))])
-           (object! s (cons 10 (cons sign magnitude))
+           (shared! s (cons 10 (cons sign magnitude))
                     (lambda ()
                       (write-byte 10 p)
                       (write-byte sign p)
                       (for-each (lambda (b) (write-byte b p)) magnitude))))]
-        [(eq? d #t) (object! s '(2) (lambda () (write-byte 2 p)))]
-        [(null? d) (object! s '(3) (lambda () (write-byte 3 p)))]
-        [(char? d) (object! s (list 4 d) (lambda () (write-byte 4 p) (write-uleb (char->integer d) p)))]
+        [(eq? d #t) (shared! s '(2) (lambda () (write-byte 2 p)))]
+        [(null? d) (shared! s '(3) (lambda () (write-byte 3 p)))]
+        [(char? d) (shared! s (list 4 d) (lambda () (write-byte 4 p) (write-uleb (char->integer d) p)))]
         ;; A list: its elements, its tail, then its pairs from the last,
         ;; the order recursion on car then cdr writes them in, without
         ;; that recursion's depth.
@@ -72,25 +77,28 @@
          (let spine ([l d] [cars '()])
            (if (pair? l)
                (spine (cdr l) (cons (loop (car l)) cars))
-               (foldl (lambda (a b) (object! s (list 5 a b) (lambda () (write-byte 5 p) (write-uleb a p) (write-uleb b p))))
+               (foldl (lambda (a b)
+                        (object! s (or (hash-ref (serializer-pairs s) a #f)
+                                       (let ([t (make-hasheqv)]) (hash-set! (serializer-pairs s) a t) t))
+                                 b (lambda () (write-byte 5 p) (write-uleb a p) (write-uleb b p))))
                       (loop l) cars)))]
-        [(symbol? d) (object! s (list 6 d) (lambda () (write-byte 6 p) (utf8! p (symbol->string d))))]
-        [(string? d) (object! s (list 7 d) (lambda () (write-byte 7 p) (utf8! p d)))]
-        [(bytes? d) (object! s (list 14 d) (lambda () (write-byte 14 p) (bytes! p d)))]
-        [(keyword? d) (object! s (list 13 d) (lambda () (write-byte 13 p) (utf8! p (keyword->string d))))]
+        [(symbol? d) (object! s (serializer-atoms s) d (lambda () (write-byte 6 p) (utf8! p (symbol->string d))))]
+        [(string? d) (shared! s (list 7 d) (lambda () (write-byte 7 p) (utf8! p d)))]
+        [(bytes? d) (shared! s (list 14 d) (lambda () (write-byte 14 p) (bytes! p d)))]
+        [(keyword? d) (object! s (serializer-atoms s) d (lambda () (write-byte 13 p) (utf8! p (keyword->string d))))]
         [(stx? d)
          (let* ([e (loop (stx-e d))] [sc (loop (map (lambda (x) (scope-index! s x)) (stx-scopes d)))]
                 [l (loop (stx-srcloc d))] [r (loop (stx-props d))])
-           (object! s (list 8 e sc l r)
+           (shared! s (list 8 e sc l r)
                     (lambda () (write-byte 8 p) (for-each (lambda (i) (write-uleb i p)) (list e sc l r)))))]
         [(srcloc? d)
          (let ([src (loop (srcloc-source d))]
                [fields (list (srcloc-line d) (srcloc-col d) (srcloc-pos d) (srcloc-span d))])
-           (object! s (cons 9 (cons src fields))
+           (shared! s (cons 9 (cons src fields))
                     (lambda () (write-byte 9 p) (write-uleb src p) (for-each (lambda (n) (write-sleb n p)) fields))))]
         [(number? d)
          (let ([bits (flonum-bits d)])
-           (object! s (list 11 bits)
+           (shared! s (list 11 bits)
                     (lambda ()
                       (write-byte 11 p)
                       (for-each (lambda (i) (write-byte (bitwise-and (arithmetic-shift bits (* -8 i)) 255) p))

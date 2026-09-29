@@ -137,6 +137,7 @@
     fc))
 
 (define (add-local! fc key type)
+  (note-type! current-ms type)
   (let ([i (fctx-next fc)])
     (hash-set! (fctx-locals fc) key (cons i type))
     (set-fctx-extra! fc (cons type (fctx-extra fc)))
@@ -184,25 +185,37 @@
                 [literals #:mutable]       ; the quoted data, or #f
                 [pending #:mutable]        ; the functions lifted from lambdas, to compile, reversed
                 namer                      ; gives export names
-                [fname #:mutable]))        ; the name of the function being compiled
+                [fname #:mutable]          ; the name of the function being compiled
+                [types #:mutable]          ; the declared types the code uses, reversed
+                noted                      ; and as a set
+                imported))                 ; the external infos noted so far, as a set
 
 (define (external? ms info-instance) (not (equal? info-instance (mstate-self ms))))
 
+;; An external definition the code uses is imported, once.
+(define (new-import? ms info)
+  (and (not (hash-ref (mstate-imported ms) info #f))
+       (begin (hash-set! (mstate-imported ms) info #t) #t)))
+
 (define (note-func! ms info)
-  (when (and (external? ms (func-info-instance info))
-             (not (memq info (mstate-func-imports ms))))
+  (when (and (external? ms (func-info-instance info)) (new-import? ms info))
     (set-mstate-func-imports! ms (cons info (mstate-func-imports ms)))))
 
 (define (note-global! ms info)
-  (when (and (global-info? info)
-             (external? ms (global-info-instance info))
-             (not (memq info (mstate-global-imports ms))))
+  (when (and (global-info? info) (external? ms (global-info-instance info)) (new-import? ms info))
     (set-mstate-global-imports! ms (cons info (mstate-global-imports ms)))))
 
 (define (note-tag! ms info)
-  (when (and (external? ms (tag-info-instance info))
-             (not (memq info (mstate-tag-imports ms))))
+  (when (and (external? ms (tag-info-instance info)) (new-import? ms info))
     (set-mstate-tag-imports! ms (cons info (mstate-tag-imports ms)))))
+
+;; The code uses declared type t, or a reference type to one: the module
+;; declares it (collect-types).
+(define (note-type! ms t)
+  (let ([t (if (ref-type? t) (ref-heap t) t)])
+    (when (and (type-info? t) (not (hash-ref (mstate-noted ms) t #f)))
+      (hash-set! (mstate-noted ms) t #t)
+      (set-mstate-types! ms (cons t (mstate-types ms))))))
 
 (define (note-memory! ms) (unless (mstate-uses-memory ms) (set-mstate-uses-memory! ms (or current-loc #t))))
 (define (note-table! ms) (unless (mstate-uses-table ms) (set-mstate-uses-table! ms (or current-loc #t))))
@@ -342,6 +355,7 @@
 (define (compile-gc ms fc labels op imms args expected)
   (let ([arg (lambda (i type) (code-of ms fc labels (list-ref args i) type))]
         [tref (lambda (t) (make-ref #t t))])
+    (for-each (lambda (i) (note-type! ms i)) imms)
     (case op
       [(struct.new)
        (let ([t (car imms)])
@@ -675,7 +689,7 @@
          (finish `((ref.func ,info)) (list (make-ref #f (func-info-type info))) expected))]
       [(call-ref)
        (let* ([t (car args)]
-              [code (args-code ms fc labels (caddr args) (car (type-info-fields t)))]
+              [code (begin (note-type! ms t) (args-code ms fc labels (caddr args) (car (type-info-fields t))))]
               [fcode (code-of (cadr args) (make-ref #t t))]
               [results (cadr (type-info-fields t))])
          (if (and tail? (types<=? results (fctx-results fc)))
@@ -689,6 +703,7 @@
        (let* ([ra (sub (car args) #f #f)] [ta (cdr ra)])
          (unless (single? ta) (fail "select needs single values, got ~a" (type->string ta)))
          (let ([cb (car (sub (cadr args) ta #f))] [ct (car (sub (caddr args) '(i32) #f))])
+           (note-type! ms (car ta))
            (finish (append (car ra) cb ct (if (ref-type? (car ta)) `((select-typed ,(car ta))) '((select))))
                    ta expected)))]
       [(drop)
@@ -712,6 +727,8 @@
               [closure (closure-type (map cdr params) results)]
               [csub (if (null? captures) closure (capture-type closure (map cdr captures)))]
               [info (lifted-info ms 'lambda (cons (make-ref #f closure) (map cdr params)) results (closure-code closure))])
+         (note-type! ms csub)
+         (note-type! ms (closure-code closure))
          (lift! ms info (cons (cons key (make-ref #f closure)) params) params (list 'at current-loc body) a csub captures)
          (set-mstate-uses-gc! ms #t)
          (finish (append `((ref.func ,info))
@@ -739,7 +756,7 @@
                  (fail "an application of ~a, which is not a function value: a function value has a closure type, (ref (closure (type ... -> type ...)))"
                        (type->string t)))
                (let* ([closure (ref-heap (car t))] [sig (type-info-fields code)] [results (cadr sig)]
-                      [tmp (temp-local! fc (car t))]
+                      [tmp (begin (note-type! ms code) (temp-local! fc (car t)))]
                       [c (append (car r) `((local.tee ,tmp)) (if (ref-nullable? (car t)) '((ref.as_non_null)) '())
                                  (args-code ms fc labels (cadr args) (cdr (car sig)))
                                  `((local.get ,tmp) (struct.get ,closure 0)))])
@@ -838,7 +855,7 @@
                  (or (fixnum? d) (eq? d #f) (and (datum-global d) #t)))]
       [(gref) (let ([g (cadr e)])
                 (and (not (global-info-mutable? g))
-                     (or (external? ms (global-info-instance g)) (and (memq g earlier) #t))))]
+                     (or (external? ms (global-info-instance g)) (hash-ref earlier g #f))))]
       [(prim) (and (memq (cadr e) '(i32.add i32.sub i32.mul i64.add i64.sub i64.mul))
                    (andmap loop (cadddr e)))]
       [(gc) (and (memq (cadr e) '(struct.new array.new array.new_default array.new_fixed ref.null ref.i31))
@@ -886,38 +903,42 @@
               (begin (hash-set! exported s #t) s)))))))
 
 ;; Global initializers (spec 5.2). A constant expression is compiled into
-;; the global itself: an alist info -> code, in definition order. Any other
-;; initializer runs in the start function, so its global must be mutable
-;; and start with a default value.
+;; the global itself: a table info -> code. Any other initializer runs in
+;; the start function, so its global must be mutable and start with a
+;; default value.
 (define (constant-inits ms global-forms analyses)
-  (let loop ([fs global-forms] [earlier '()] [acc '()])
-    (if (null? fs)
-        (reverse acc)
-        (let* ([info (cadr (car fs))] [init (caddr (car fs))] [t (global-info-type info)])
-          (set! current-loc (loc-of init))
-          (cond
-            [(and init (constant-expr? ms init earlier))
-             (let ([fc (new-fctx '() '())])
-               (set-fctx-analysis! fc (hash-ref analyses info))
-               (set-mstate-fname! ms (global-info-name info))
-               (let ([c (car (cx ms fc '() init (list t) #f))])
-                 (loop (cdr fs) (cons info earlier) (cons (cons info c) acc))))]
-            [(not (global-info-mutable? info))
-             (fail "global ~a is immutable, so its initializer must be a constant expression; declare it (mut ~a) to compute it when the module starts"
-                   (global-info-name info) (valtype->string t))]
-            [(not (defaultable? t))
-             (fail "global ~a: a global computed when the module starts must have a numeric or nullable reference type"
-                   (global-info-name info))]
-            [else (loop (cdr fs) (cons info earlier) acc)])))))
+  (let ([earlier (make-hasheq)] [constants (make-hasheq)])
+    (for-each (lambda (f)
+                (let* ([info (cadr f)] [init (caddr f)] [t (global-info-type info)])
+                  (set! current-loc (loc-of init))
+                  (cond
+                    [(and init (constant-expr? ms init earlier))
+                     (let ([fc (new-fctx '() '())])
+                       (set-fctx-analysis! fc (hash-ref analyses info))
+                       (set-mstate-fname! ms (global-info-name info))
+                       (hash-set! constants info (car (cx ms fc '() init (list t) #f))))]
+                    [(not (global-info-mutable? info))
+                     (fail "global ~a is immutable, so its initializer must be a constant expression; declare it (mut ~a) to compute it when the module starts"
+                           (global-info-name info) (valtype->string t))]
+                    [(not (defaultable? t))
+                     (fail "global ~a: a global computed when the module starts must have a numeric or nullable reference type"
+                           (global-info-name info))])
+                  (hash-set! earlier info #t)))
+              global-forms)
+    constants))
 
 ;; forms: fully expanded module forms. self: this module's instance name.
 ;; Assigns instance and export names to the infos it defines. Returns
 ;; (bytes imported-instance-names uses-gc? scope-table), the last the
 ;; scope table of its quoted data (spec 3.5).
+(define current-ms #f)
+
 (define (compile-module forms self)
   (set! current-loc #f)
   (let* ([export-name! (export-namer)]
-         [ms (mstate self '() '() '() '() '() #f #f #f #f '() export-name! #f)]
+         [ms (let ([m (mstate self '() '() '() '() '() #f #f #f #f '() export-name! #f '() (make-hasheq) (make-hasheq))])
+               (set! current-ms m)
+               m)]
          [kind? (lambda (k) (lambda (f) (eq? (car f) k)))]
          [func-forms (filter (kind? 'func) forms)]
          [global-forms (filter (kind? 'global) forms)]
@@ -967,7 +988,7 @@
                         (case (car f)
                           [(global)
                            (let ([info (cadr f)] [init (caddr f)])
-                             (if (or (not init) (assq info constant-inits))
+                             (if (or (not init) (hash-ref constant-inits info #f))
                                  '()
                                  (begin
                                    (set-fctx-analysis! start-fc (hash-ref global-analyses info))
@@ -1029,17 +1050,19 @@
           (let loop ([gs (append global-imports (map cadr global-forms) synths)] [i 0])
             (if (null? gs) i (begin (hash-set! global-index (car gs) i) (loop (cdr gs) (+ i 1)))))]
 
-         ;; GC types come first in the type section, dependencies first;
-         ;; function types follow as they are needed.
+         ;; GC types come first in the type section, dependencies first:
+         ;; the declared types, those the code uses (note-type!), and
+         ;; those of signatures, globals and tags. Function types follow
+         ;; as they are needed.
          [gc-types
           (collect-types (list (map cadr type-forms)
-                               (map (lambda (cf) (list (cadr cf) (caddr cf) (cadddr cf))) compiled-funcs)
-                               (fctx-extra start-fc) start-code
+                               (reverse (mstate-types ms))
+                               (map cadr compiled-funcs)
                                (map (lambda (info) (list (func-info-params info) (func-info-results info)
                                                          (func-info-type info)))
                                     func-imports)
                                (map (lambda (cf) (func-info-type (car cf))) compiled-funcs)
-                               (map global-info-type global-imports) (map cdr constant-inits)
+                               (map global-info-type global-imports)
                                (map (lambda (f) (global-info-type (cadr f))) global-forms)
                                (map tag-info-params (append tag-imports (map cadr tag-forms)))))]
          [gc-index
@@ -1147,8 +1170,8 @@
          [wglobals
           (append
            (map (lambda (f)
-                  (let* ([info (cadr f)] [t (global-info-type info)] [init (assq info constant-inits)])
-                    (list (rv t) (global-info-mutable? info) (if init (resolve (cdr init)) (zero-init t)))))
+                  (let* ([info (cadr f)] [t (global-info-type info)] [init (hash-ref constant-inits info #f)])
+                    (list (rv t) (global-info-mutable? info) (if init (resolve init) (zero-init t)))))
                 global-forms)
            (map (lambda (s) (if (eq? (synth-kind s) 'fidx)
                                 (list 'i32 #t '((i32.const 0)))

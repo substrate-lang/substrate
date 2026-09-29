@@ -40,6 +40,7 @@
          module-expanded-forms keep-expanded-forms! target-kernel-bytes target-kernel-interface compiled-file-bytes program-linklets register-queries!)
 
 (import %call-transformer "kernel" "%call-transformer" (eqref eqref -> eqref))
+(import local-binding-of "kernel" "local-binding" (eqref -> eqref))
 
 (define gc-forms
   '(struct.new struct.get struct.get_s struct.get_u struct.set
@@ -88,7 +89,11 @@
 (define scope-counter 0)
 (define base-installed? #f)
 (define registry (make-hash))                ; normalized path -> module
-(define installed (make-hash))               ; "path|shift" -> #t
+(define installed (make-hasheq))             ; module -> phase shift -> #t
+
+;; Table t's table for module m, made if it has none: a module's phase
+;; shifts.
+(define (shifts-of t m) (or (hash-ref t m #f) (let ([s (make-hasheqv)]) (hash-set! t m s) s)))
 
 ;; phase: an integer, or 'all. namespace: type or value (spec 6.1). key
 ;; identifies the binding to compiled code (local-binding, spec 2.3).
@@ -158,7 +163,9 @@
     (when current (own-scope! (comp-module current) sc))
     sc))
 
-(define (new-run-scope!) (set! scope-counter (+ scope-counter 1)) scope-counter)
+;; Scopes are even; a local binding form's (new-local-scope!) is odd, so
+;; that quote-syntax can prune the local ones from a literal (spec 6.2).
+(define (new-run-scope!) (set! scope-counter (+ scope-counter 2)) scope-counter)
 
 (define (own-scope! m sc)
   (let ([i (hash-count (unit-scopes m))])
@@ -173,13 +180,13 @@
         (hash-set! scope-owners sc (cons m i))
         sc)))
 
-;; The scopes of local binding forms: func, let, let*, block and loop.
-;; quote-syntax prunes them from its literal (spec 6.2).
-(define local-scopes (make-hasheqv))
+;; The scope of a local binding form, func, let, let*, block or loop: odd.
 (define (new-local-scope!)
-  (let ([sc (new-scope!)]) (hash-set! local-scopes sc #t) sc))
-(define (prune-local-scopes x)
-  (filter-scopes x (lambda (sc) (not (hash-has-key? local-scopes sc)))))
+  (set! scope-counter (+ scope-counter 2))
+  (let ([sc (+ scope-counter 1)])
+    (when current (own-scope! (comp-module current) sc))
+    sc))
+(define (prune-local-scopes x) (filter-scopes x even?))
 
 (define core-scope 0)
 
@@ -576,8 +583,15 @@
               (cons 'inlines inlines) (cons 'macros macros) (cons 'facts facts) (cons 'linklets linklets))))))
 
 ;; Scope references in an order that does not depend on the run, for a
-;; binding's scope set; loaded, a set is sorted by the run's numbers.
-(define (scope-ref<? a b) (string<? (format "~s" a) (format "~s" b)))
+;; binding's scope set: a module's copies first, then a module's own,
+;; then core and kernel-ids; loaded, a set is sorted by the run's numbers.
+(define (scope-ref<? a b)
+  (let ([ra (scope-ref-rank a)] [rb (scope-ref-rank b)])
+    (cond [(< ra rb) #t]
+          [(> ra rb) #f]
+          [(< ra 2) (or (string<? (cadr a) (cadr b)) (and (string=? (cadr a) (cadr b)) (< (caddr a) (caddr b))))]
+          [else #f])))
+(define (scope-ref-rank r) (cond [(eq? r 'core) 2] [(eq? r 'kernel-ids) 3] [(eq? (car r) 'm) 0] [else 1]))
 
 ;; Lowered form e without its source locations, for an inline body, whose
 ;; code takes the location of the call it is inlined at (spec 3.6).
@@ -1020,14 +1034,14 @@
 ;; shifts has bindings at the same phase from both; giving each phase
 ;; shift its own copy of the module scope keeps them apart. Phase shift 0
 ;; uses the module scope itself.
-(define shifted-scopes (make-hash))
+(define shifted-scopes (make-hasheq))        ; module -> phase shift -> scope
 (define (module-scope-at m s)
   (if (= s 0)
       (unit-scope m)
-      (let ([key (format "~a|~a" (unit-path m) s)])
-        (or (hash-ref shifted-scopes key #f)
+      (let ([shifts (shifts-of shifted-scopes m)])
+        (or (hash-ref shifts s #f)
             (let ([sc (new-run-scope!)])
-              (hash-set! shifted-scopes key sc)
+              (hash-set! shifts s sc)
               (hash-set! module-scope-origins sc (cons m s))
               sc)))))
 
@@ -1042,9 +1056,9 @@
 ;; modules it requires. Needed for m's macros: their templates carry m's
 ;; scopes.
 (define (install-module-bindings! m s)
-  (let ([key (format "~a|~a" (unit-path m) s)])
-    (unless (hash-has-key? installed key)
-      (hash-set! installed key #t)
+  (let ([shifts (shifts-of installed m)])
+    (unless (hash-has-key? shifts s)
+      (hash-set! shifts s #t)
       (unless (= s 0)
         (for-each (lambda (e)
                     (bind-raw! (car e) (shift-scopes (cadr e) s) (+ (caddr e) s)
@@ -1252,7 +1266,7 @@
            (lambda ()
              (compiled-linklet (compile-module (append (storage-forms 0) (lower-forms (unit-expanded m) 0))
                                                (linklet-name m 0 0)))))))
-    (hash-set! installed (format "~a|0" (unit-path m)) #t)
+    (hash-set! (shifts-of installed m) 0 #t)
     (set-unit-state! m 'done)
     (let ([form (comp-freestanding-form c)])
       (when form (check-freestanding! m form)))
@@ -2642,11 +2656,11 @@
 ;; not, as (module . shift): dependencies first, in the order of their
 ;; requires, each module once at each phase shift it is required at.
 (define (dependencies)
-  (let ([seen (make-hash)] [out '()])
+  (let ([seen (make-hasheq)] [out '()])
     (let visit ([m (comp-module current)] [shift 0])
-      (let ([k (format "~a|~a" (unit-path m) shift)])
-        (unless (hash-ref seen k #f)
-          (hash-set! seen k #t)
+      (let ([shifts (shifts-of seen m)])
+        (unless (hash-ref shifts shift #f)
+          (hash-set! shifts shift #t)
           (for-each (lambda (r) (visit (car r) (+ shift (cdr r)))) (unit-requires m))
           (set! out (cons (cons m shift) out)))))
     (reverse out)))
@@ -3519,27 +3533,28 @@
               (comp-definitions c))
     removed))
 
-(define (local-key-of id phase)
-  (let ([m (and (id? id) (meaning-of id phase))])
-    (unless (and m (eq? (car m) 'local)) (not-expanded id))
-    (cadr m)))
+;; The local variable id binds or refers to, from the property the
+;; expander put on it (spec 2.3), so that lowering resolves no local.
+(define (local-key-of id phase) (or (and (id? id) (local-binding-of id)) (not-expanded id)))
 
 (define (lower-expr s phase)
   (let ([e (stx-e s)])
     (at s
         (cond
           [(symbol? e)
-           (let ([m (meaning-of s phase)])
-             (case (and m (car m))
-               [(local) (list 'lref (cadr m))]
-               [(global) (check-not-removed (cadr m) s) (list 'gref (in-lowering-kernel (cadr m) s))]
-               ;; A function's name as an expression is its value (5.2).
-               [(func)
-                (let ([g (function-value (cadr m))])
-                  (unless g (not-expanded s))
-                  (check-not-removed g s)
-                  (list 'gref g))]
-               [else (not-expanded s)]))]
+           (let ([key (local-binding-of s)])
+             (if key
+                 (list 'lref key)
+                 (let ([m (meaning-of s phase)])
+                   (case (and m (car m))
+                     [(global) (check-not-removed (cadr m) s) (list 'gref (in-lowering-kernel (cadr m) s))]
+                     ;; A function's name as an expression is its value (5.2).
+                     [(func)
+                      (let ([g (function-value (cadr m))])
+                        (unless g (not-expanded s))
+                        (check-not-removed g s)
+                        (list 'gref g))]
+                     [else (not-expanded s)]))))]
           [(pair? e)
            (let* ([parts (stx->list s)]
                   [m (and parts (id? (car parts)) (meaning-of (car parts) phase))])
@@ -3577,11 +3592,12 @@
       [(set!)
        (syntax-match s
          [(_ x value)
-          (let ([m (meaning-of x phase)])
-            (case (and m (car m))
-              [(local) (list 'lset (cadr m) (lo value))]
-              [(global) (check-not-removed (cadr m) x)
-                        (list 'gset (in-lowering-kernel (cadr m) x) (lo value))]
+          (let ([key (local-binding-of x)] [m (and (id? x) (meaning-of x phase))])
+            (cond
+              [key (list 'lset key (lo value))]
+              [(and m (eq? (car m) 'global))
+               (check-not-removed (cadr m) x)
+               (list 'gset (in-lowering-kernel (cadr m) x) (lo value))]
               [else (not-expanded s)]))])]
       [(let)
        (syntax-match s
