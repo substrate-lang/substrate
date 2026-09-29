@@ -317,8 +317,8 @@ they trap.
   phase's code is compiled again as a whole, into the module's linklet for
   that phase. Other modules only ever use those.
 - What running at once costs: the expander compiles only new code. A
-  value that needs none it makes itself: quoted data or syntax, a fact
-  (6.6), a transformer that calls a function `define-syntax` names (6.3),
+  value that needs none it makes itself: quoted data or syntax, a
+  transformer that calls a function `define-syntax` names (6.3),
   and a call, on such values, of a function from values to a value that
   is already instantiated. Other code is compiled into a linklet of its
   own and instantiated. A `define-syntax` whose value is a `lambda` runs
@@ -1236,9 +1236,9 @@ example's facts do.
   language that reads them says so.
 - A module required at phase shift *s* has its facts at their phase
   plus *s*, as its bindings are (6.1).
-- A fact's datum or syntax is a compile-time value of the module's
-  phase+1 linklet, fetched as `syntax-local-value` fetches one (6.3),
-  and the module's interface holds its facts (3.7).
+- A fact's datum or syntax is data the module keeps, not code: its
+  interface holds its facts (3.7). Syntax in a fact seen at a phase
+  shift has its scopes shifted, as a linklet's literals are (3.5).
 - A fact is a claim a language made, not a checked one: a language that
   checks what facts say, such as a proof checker, derives it again.
 

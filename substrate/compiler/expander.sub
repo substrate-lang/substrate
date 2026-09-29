@@ -17,7 +17,7 @@
 (require stx "stx.sub"
          make-stx stx? stx-e stx-scopes stx-srcloc stx-props make-srcloc srcloc? srcloc-source
          id? stx->datum datum->stx stx->list stx-rewrap
-         scopes-add scopes-remove scopes-subset? add-scope flip-scope remove-scopes filter-scopes
+         scopes-add scopes-remove scopes-subset? add-scope flip-scope remove-scopes filter-scopes map-scopes
          raise-compile-error format-srcloc unlocated-error? located-error)
 (require core "core.sub"
          func-info func-info? func-info-name func-info-params func-info-results func-info-instance
@@ -112,8 +112,8 @@
 ;; stem and hash. path: its file, which its source locations name (3.6),
 ;; or (compiled file hash) for a module loaded from a compiled file (3.7).
 ;; facts: the facts it recorded, newest first, each (definition phase
-;; getter form): the definition it is about (fact-key), the phase, the
-;; getter of its datum or syntax, and, while it compiles, its #%fact form.
+;; value form): the definition it is about (fact-key), the phase, its
+;; datum or syntax, and, while it compiles, its #%fact form.
 (struct unit (path [name #:mutable] [hash #:mutable] [state #:mutable] linklets [requires #:mutable] [provides #:mutable]
               [entries #:mutable] [expanded #:mutable] [scope #:mutable] [program #:mutable]
               scopes                                  ; index -> the scopes its expansion made, in order
@@ -356,7 +356,7 @@
 (define cache-directory #f)
 (define (set-cache-directory! dir) (set! cache-directory dir))
 
-(define interface-format 7)
+(define interface-format 8)
 
 ;; Does the run have one kernel, the running and target kernels being one?
 (define (one-kernel?) (eq? running-kernel target-kernel))
@@ -484,8 +484,9 @@
 ;; the module's i-th, or (%type hash i), another module's; a definition is
 ;; (%info own i), the i-th of the infos section, (%info foreign instance
 ;; kind export), another module's, the kernel module's among them, or
-;; (%info shifted d k), definition d shifted by k (6.1); and a list that
-;; starts with %type, %info or %quote, such as a struct field named so,
+;; (%info shifted d k), definition d shifted by k (6.1); a syntax object,
+;; a fact's, is (%syntax e scopes srcloc props); and a list that starts
+;; with %type, %info, %syntax or %quote, such as a struct field named so,
 ;; has %quote put before it. load-module! reads them back with decode.
 ;; Its sections are an alist of quoted data, the first four saying what it
 ;; is of.
@@ -497,7 +498,9 @@
         ([encode (lambda (x)
                    (cond [(type-info? x) (cons '%type (type-ref x))]
                          [(or (func-info? x) (global-info? x) (tag-info? x) (data-info? x)) (cons '%info (info-ref x))]
-                         [(and (pair? x) (memq (car x) '(%type %info %quote))) (cons '%quote (cons (car x) (encode (cdr x))))]
+                         [(stx? x) (list '%syntax (encode (stx-e x)) (sort (map sref (stx-scopes x)) scope-ref<?) (stx-srcloc x)
+                                         (encode (stx-props x)))]
+                         [(and (pair? x) (memq (car x) '(%type %info %syntax %quote))) (cons '%quote (cons (car x) (encode (cdr x))))]
                          [(pair? x) (cons (encode (car x)) (encode (cdr x)))]
                          [else x]))]
          [type-ref (lambda (t)
@@ -610,6 +613,7 @@
                    (cond [(not (pair? x)) x]
                          [(eq? (car x) '%type) (type-at (cdr x))]
                          [(eq? (car x) '%info) (info-at (cdr x))]
+                         [(eq? (car x) '%syntax) (make-stx (decode (cadr x)) (sort (map sres (caddr x)) >) (cadddr x) (decode (list-ref x 4)))]
                          [(eq? (car x) '%quote) (cons (cadr x) (decode (cddr x)))]
                          [else (cons (decode (car x)) (decode (cdr x)))]))]
          [type-at (lambda (r)
@@ -2284,26 +2288,21 @@
                      (lambda () (call-function (function-index (comp-store current) (cadr e)) args))
                      (lambda () (set! api-where saved))))]))
 
-;; (#%fact id 'datum) or (#%fact id #'stx): the datum, or the syntax, as
-;; it is, recorded as a fact about the definition id refers to at phase
-;; (spec 6.6). It is a compile-time value of the module's phase+1
-;; linklet, which syntax-local-facts fetches as syntax-local-value
-;; fetches define-syntax's; while this module is expanded, the expander
-;; has it already (spec 3.1). The form, as fully expanded code holds it.
+;; (#%fact id 'datum) or (#%fact id #'stx): the datum, or the syntax as
+;; quote-syntax keeps it (spec 6.2), recorded as a fact about the
+;; definition id refers to at phase (spec 6.6): data the module keeps,
+;; which its interface holds (3.7). The form, as fully expanded code holds
+;; it.
 (define (fact! f phase)
   (syntax-match f
     [('#%fact (? id? id) written)
      (let* ([key (fact-key id phase)]
             [kind (fact-quote written phase)]
-            [name (string->symbol (string-append "__fact." (symbol->string (stx-e id))))]
-            [global (global-info name eqref #t #f #f)]
-            [getter (func-info name '() (list eqref) #f #f #f)]
-            [value (lower-expr (expand-expr (out f kind (cadr (stx->list written))) (+ phase 1)) (+ phase 1))]
+            [d (cadr (stx->list written))]
+            [value (if (eq? kind 'quote) (stx->datum d) (prune-local-scopes d))]
             [form (core-headed f fact-sym)]
             [m (comp-module current)])
-       (add-phase-forms! (+ phase 1) (list (list 'global global value) (list 'func getter '() (list 'gref global))))
-       (made-value! getter (plain-value value f))
-       (set-unit-facts! m (cons (list key phase getter form) (unit-facts m)))
+       (set-unit-facts! m (cons (list key phase value form) (unit-facts m)))
        form)]
     [_ (raise-compile-error f "expected (#%fact id 'datum) or (#%fact id #'syntax)")]))
 
@@ -2643,11 +2642,14 @@
            (map (lambda (d)
                   (let ([m (car d)] [shift (cdr d)])
                     (map (lambda (f)
-                           (list (string->symbol (format "~a" (unit-path m))) (cadr f)
-                                 (compile-time-value (comp-store current) (shift-info (caddr f) shift))))
+                           (list (string->symbol (format "~a" (unit-path m))) (cadr f) (shift-fact (caddr f) shift)))
                          (filter (lambda (f) (and (eq? (car f) key) (= (+ (cadr f) shift) api-phase)))
                                  (reverse (unit-facts m))))))
                 (dependencies)))))
+
+;; A fact's datum or syntax v, seen at phase shift k: its syntax's module
+;; scopes shifted, as a linklet's literals are (spec 3.5, 6.1).
+(define (shift-fact v k) (if (= k 0) v (map-scopes v (lambda (s) (shift-scopes s k)))))
 
 ;; ---- names (spec 6.7) ----
 
