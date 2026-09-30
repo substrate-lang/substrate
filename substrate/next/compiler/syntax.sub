@@ -50,7 +50,7 @@
          list-ref list-tail last take memq member assq assoc map for-each filter andmap ormap sort
          equal? datum-hash datum-ref datum-set! datum-get datum-put! arena-table make-table table-ref table-set! table-count
          make-record make-record-in record? record-kind record-pointer
-         symbol? bytes->symbol symbol-named string->symbol symbol->string symbol-bytes symbol-length
+         symbol? bytes->symbol symbol-named string->symbol symbol->string symbol-append symbol-bytes symbol-length
          keyword? bytes->keyword keyword->string
          string? bytes->string string-bytes string-length string=?
          integer? make-integer make-unsigned-integer integer-value integer-negative? fixnum? flonum? make-flonum flonum-value char? integer->char char->integer
@@ -58,7 +58,12 @@
          syntax-scopes syntax-srcloc syntax-props make-srcloc syntax-property syntax-property-set
          no-scopes scopes-change scopes-subset? scopes-filter map-scopes add-scope remove-scope flip-scope
          write-datum write-scoped write-to format-message buffer-add-utf-8!
-         compile-error raise-compile-error write-compile-error)
+         compile-error raise-compile-error write-compile-error
+         make-transformer make-function-transformer transformer? transformer-env call-transformer
+         raise-syntax-error local-binding set-queries! syntax-local-value free-identifier=? identifier-binding-kind
+         identifier-function-signature local-expand syntax-local-lift-definition syntax-local-introduce
+         syntax-local-facts identifier-name name-identifier
+         set-scope-map! literal-buffer deserialize)
 
 (memory from c)
 (table from c)
@@ -85,7 +90,10 @@
   [syntax [e (ptr cell)] [scopes (ptr scope-set)] [srcloc (ptr srcloc)] [props (ptr cell)] [pending (ptr change)]]
   ;; A record: a datum that stands for a struct of its user's, of a kind
   ;; that user numbers.
-  [record [kind u32] [pointer (ptr void)]])
+  [record [kind u32] [pointer (ptr void)]]
+  ;; A transformer (spec 2.1): a function pointer, its code, called with
+  ;; env and the syntax, or with the syntax alone if arity is 1.
+  [transformer [code u32] [env (ptr cell)] [arity u32]])
 
 (typedef datum (ptr cell))
 
@@ -590,6 +598,15 @@
 ;; A string of its name's bytes, which it shares.
 (define (symbol->string [s datum]) -> datum (make-cell (string (symbol-bytes s) (symbol-length s))))
 
+;; The symbol whose name is a's then b's.
+(define (symbol-append [a datum] [b datum]) -> datum
+  (let ([buf (make-buffer)] [s datum 0])
+    (buffer-add! (& buf) (symbol-bytes a) (symbol-length a))
+    (buffer-add! (& buf) (symbol-bytes b) (symbol-length b))
+    (set! s (intern (-> buf bytes) (-> buf length) 0))
+    (buffer-free! (& buf))
+    s))
+
 (define (keyword? [d datum]) -> i32 (match d [(keyword a b c) 1] [_ 0]))
 (define (bytes->keyword [p (ptr u8)] [n u32]) -> datum (intern p n 1))
 
@@ -940,6 +957,7 @@
     [(syntax e scopes loc props pending)
      (let ([x (keep (syntax-e d))] [l (keep-srcloc loc)] [ps (keep props)])
        (make-cell-in (& run-arena) (syntax x scopes l ps 0)))]
+    [(transformer code env arity) (let ([e (keep env)]) (make-cell-in (& run-arena) (transformer code e arity)))]
     [_ d]))
 
 (define (keep-srcloc [l (ptr srcloc)]) -> (ptr srcloc)
@@ -990,6 +1008,7 @@
     [(flonum low high) (write-flonum b (flonum-value d))]
     [(character c) (if (== how as-display) (buffer-add-utf-8! b c) (write-char b c))]
     [(record kind p) (buffer-add-string! b "#<record ") (write-u64 b kind) (buffer-add-byte! b 62)]
+    [(transformer code env arity) (buffer-add-string! b "#<transformer>")]
     [(syntax e scopes loc props pending)
      (cond [(== how with-scopes) (write-in b (syntax-e d) how 1) (write-scopes b scopes)]
            [in (write-in b e how 1)]
@@ -1171,3 +1190,224 @@
       (buffer-add-string! b "\n  in: ")
       (write-to b (syntax->datum blamed) as-write))
     (buffer-add-byte! b 10)))
+
+;; ==== the macro contract ====
+;;
+;; What the kernel module gives macros (spec 2.3), for syntax objects in
+;; memory: the functions above, and transformers, syntax errors, the
+;; expander's queries and quoted data. Compile-time code links to the
+;; running compiler's instance of this module, as it did to the kernel
+;; module's, so the compiler and every macro share its data and state.
+
+;; ---- transformers ----
+
+;; A transformer whose code, the index of a function from env and the
+;; syntax to syntax, the expander calls with env and a macro use (spec
+;; 2.1); and one whose code is called with the use alone.
+(define (make-transformer [code u32] [env datum]) -> datum (make-cell (transformer code env 2)))
+(define (make-function-transformer [code u32]) -> datum (make-cell (transformer code 0 1)))
+
+(define (transformer? [d datum]) -> i32 (match d [(transformer code env arity) 1] [_ 0]))
+
+;; The environment transformer t was made with: what a language keeps
+;; with a binding, which macros read with syntax-local-value.
+(define (transformer-env [t datum]) -> datum
+  (match t [(transformer code env arity) env] [_ (fail "expected a transformer")]))
+
+;; Transformer t called with syntax s.
+(define (call-transformer [t datum] [s datum]) -> datum
+  (match t
+    [(transformer code env arity)
+     (if (== arity 1)
+         (let ([f (cast (fn (datum) -> datum) code)]) (f s))
+         (let ([f (cast (fn (datum datum) -> datum) code)]) (f env s)))]
+    [_ (fail "expected a transformer")]))
+
+;; ---- syntax errors ----
+
+;; Throw a compile error with message, a string, blamed on stx. The
+;; message is prefixed with "name: ", or if name is #f with the name stx
+;; gives: an identifier's own, or that of the identifier heading a list.
+(define (raise-syntax-error [name datum] [message datum] [stx datum]) -> datum
+  (let ([who (if (symbol? name) name (named-by stx))])
+    (throw compile-error (if (== who 0) message (format-message "~a: ~a" `(,who ,message))) stx 0)
+    0))
+
+(define (named-by [stx datum]) -> datum
+  (cond [(identifier? stx) (syntax-e stx)]
+        [(and (syntax? stx) (pair? (syntax-e stx)) (identifier? (car (syntax-e stx)))) (syntax-e (car (syntax-e stx)))]
+        [else 0]))
+
+;; The local variable identifier id binds or refers to in fully expanded
+;; code (spec 6.4): an integer, or #f.
+(define (local-binding [id datum]) -> datum (syntax-property id (sym %local-binding)))
+
+;; ---- expander queries ----
+;;
+;; The compiler's expander answers the queries, through the functions it
+;; registers with set-queries!. Until it does, as in a program, a query
+;; traps.
+
+(define (no-expander [a datum]) -> datum (fail "an expander query was used outside the expander"))
+(define (no-expander-2 [a datum] [b datum]) -> datum (fail "an expander query was used outside the expander"))
+
+(define q-local-value (fn (datum) -> datum) no-expander)
+(define q-free-identifier=? (fn (datum datum) -> datum) no-expander-2)
+(define q-binding-kind (fn (datum) -> datum) no-expander)
+(define q-local-expand (fn (datum) -> datum) no-expander)
+(define q-lift (fn (datum) -> datum) no-expander)
+(define q-signature (fn (datum) -> datum) no-expander)
+(define q-introduce (fn (datum) -> datum) no-expander)
+(define q-local-facts (fn (datum) -> datum) no-expander)
+(define q-identifier-name (fn (datum) -> datum) no-expander)
+(define q-name-identifier (fn (datum) -> datum) no-expander)
+
+;; free-identifier=? answers #t or #f.
+(define (set-queries! [local-value (fn (datum) -> datum)] [free-identifier (fn (datum datum) -> datum)]
+                      [binding-kind (fn (datum) -> datum)] [local-exp (fn (datum) -> datum)] [lift (fn (datum) -> datum)]
+                      [signature (fn (datum) -> datum)] [introduce (fn (datum) -> datum)] [local-facts (fn (datum) -> datum)]
+                      [id-name (fn (datum) -> datum)] [name-id (fn (datum) -> datum)])
+  (set! q-local-value local-value)
+  (set! q-free-identifier=? free-identifier)
+  (set! q-binding-kind binding-kind)
+  (set! q-local-expand local-exp)
+  (set! q-lift lift)
+  (set! q-signature signature)
+  (set! q-introduce introduce)
+  (set! q-local-facts local-facts)
+  (set! q-identifier-name id-name)
+  (set! q-name-identifier name-id))
+
+;; The compile-time value define-syntax bound id to, or #f.
+(define (syntax-local-value [id datum]) -> datum (q-local-value id))
+
+;; Do a and b refer to the same bindings, as a value and as a type (6.1)?
+(define (free-identifier=? [a datum] [b datum]) -> i32 (!= (q-free-identifier=? a b) 0))
+
+;; What identifier id is bound to as a value, as a symbol: function,
+;; variable, macro, compile-time-value, data, tag, label or core; type if
+;; it is bound only as a type; #f if it is unbound.
+(define (identifier-binding-kind [id datum]) -> datum (q-binding-kind id))
+
+;; The signature of the function id is bound to, (t ... -> r ...); #f if
+;; id is not a function.
+(define (identifier-function-signature [id datum]) -> datum (q-signature id))
+
+;; Expression stx, expanded (spec 6.4).
+(define (local-expand [stx datum]) -> datum (q-local-expand stx))
+
+;; Add form to the module being expanded, before the form the running
+;; macro is expanding (6.4). Returns the form as given.
+(define (syntax-local-lift-definition [form datum]) -> datum (q-lift form))
+
+;; stx with the running macro's introduction scope flipped.
+(define (syntax-local-introduce [stx datum]) -> datum (q-introduce stx))
+
+;; The facts about the definition id refers to (6.5).
+(define (syntax-local-facts [id datum]) -> datum (q-local-facts id))
+
+;; The name of the definition id refers to, and the identifier a name
+;; refers to (6.6).
+(define (identifier-name [id datum]) -> datum (q-identifier-name id))
+(define (name-identifier [name datum]) -> datum (q-name-identifier name))
+
+;; ---- quoted data ----
+;;
+;; A linklet's quoted data, datums in memory, is serialized into one
+;; passive data segment (compiler/serialize.sub's format, the kernel's),
+;; which the linklet copies into literal-buffer and turns into a table of
+;; data with deserialize when it starts (spec 3.5). A syntax object's
+;; scopes are indexes into the linklet's scope table, which the compiler,
+;; when it instantiates the linklet, maps to the run's scopes first
+;; (set-scope-map!); a linklet a program runs gets no map, and its
+;; literals keep the indexes.
+
+(define scope-map (ptr u32) 0)
+(define scope-map-count u32 0)
+
+;; The run's scope for each index, n of them; or none, map 0.
+(define (set-scope-map! [map (ptr u32)] [n u32])
+  (set! scope-map map)
+  (set! scope-map-count n))
+
+;; n bytes in the current arena, for a linklet's quoted data.
+(define (literal-buffer [n u32]) -> (ptr u8) (cast (ptr u8) (alloc-in current n)))
+
+;; The bytes being read, and where.
+(define in-bytes (ptr u8) 0)
+(define in-at u32 0)
+
+(define (in-byte) -> u32
+  (let ([b (@ in-bytes in-at)])
+    (+= in-at 1)
+    b))
+
+(define (in-uleb) -> u64
+  (let ([n u64 0] [shift u64 0] [b u32 128])
+    (while (!= (bit-and b 128) 0)
+      (set! b (in-byte))
+      (set! n (bit-or n (<< (cast u64 (bit-and b 127)) shift)))
+      (+= shift 7))
+    n))
+
+(define (in-sleb) -> i64
+  (let ([n u64 0] [shift u64 0] [b u32 128] [ones u64 18446744073709551615])
+    (while (!= (bit-and b 128) 0)
+      (set! b (in-byte))
+      (set! n (bit-or n (<< (cast u64 (bit-and b 127)) shift)))
+      (+= shift 7))
+    (when (and (< shift 64) (!= (bit-and b 64) 0)) (set! n (bit-or n (<< ones shift))))
+    (cast i64 n)))
+
+(define (in-u64) -> u64
+  (let ([n u64 0])
+    (for ([i u64 0]) (< i 8) (+= i 1) (set! n (bit-or n (<< (cast u64 (in-byte)) (* i 8)))))
+    n))
+
+;; The objects that the n bytes at bytes describe, in order: a table of
+;; data in the current arena. A source location is its object too, which
+;; only the syntax objects that have it read.
+(define (deserialize [bytes (ptr u8)] [n u32]) -> (ptr datum)
+  (set! in-bytes bytes)
+  (set! in-at 0)
+  (let* ([count (cast u32 (in-uleb))] [objs (cast (ptr u32) (alloc-in current (* 4 (+ count 1))))])
+    (for ([i u32 0]) (< i count) (+= i 1) (set! (@ objs i) (in-entry objs)))
+    (cast (ptr datum) objs)))
+
+(define (in-object [objs (ptr u32)]) -> u32 (@ objs (cast u32 (in-uleb))))
+
+(define (in-entry [objs (ptr u32)]) -> u32
+  (let ([kind (in-byte)] [n u32 0] [p (ptr u8) 0])
+    (case kind
+      [(0) 0]
+      [(1) (cast u32 (make-integer (in-sleb)))]
+      [(2) (cast u32 (boolean 1))]
+      [(3) (cast u32 nil)]
+      [(4) (cast u32 (integer->char (cast u32 (in-uleb))))]
+      [(5) (let* ([a (in-object objs)] [d (in-object objs)]) (cast u32 (cons (cast datum a) (cast datum d))))]
+      [(6 7 13)
+       (set! n (cast u32 (in-uleb)))
+       (set! p (+ in-bytes in-at))
+       (+= in-at n)
+       (cast u32 (case kind [(6) (bytes->symbol p n)] [(7) (bytes->string p n)] [else (bytes->keyword p n)]))]
+      [(8)
+       (let* ([e (in-object objs)] [scopes (in-object objs)] [loc (in-object objs)] [props (in-object objs)])
+         (cast u32 (make-syntax (cast datum e) (scopes-of (cast datum scopes)) (cast (ptr srcloc) loc) (cast datum props))))]
+      [(9)
+       (let* ([source (in-object objs)] [line (in-sleb)] [col (in-sleb)] [pos (in-sleb)] [span (in-sleb)])
+         (cast u32 (make-srcloc (cast datum source) (cast u32 line) (cast u32 col) (cast u32 pos) (cast u32 span))))]
+      [(10)
+       (let* ([negative (in-byte)] [m (in-u64)])
+         (cast u32 (if negative (make-integer (- 0 (cast i64 m))) (make-unsigned-integer m))))]
+      [(11) (cast u32 (make-flonum (bits-f64 (cast i64 (in-u64)))))]
+      [else (fail "deserialize: an unknown kind of object") 0])))
+
+;; The scope set of a list of scope table indexes, each mapped to the
+;; run's scope if there is a map.
+(define (scopes-of [l datum]) -> (ptr scope-set)
+  (let ([s no-scopes] [i u32 0])
+    (while (pair? l)
+      (set! i (cast u32 (integer-value (car l))))
+      (set! s (scopes-change s (if (and (!= scope-map 0) (< i scope-map-count)) (@ scope-map i) i) 0))
+      (set! l (cdr l)))
+    s))

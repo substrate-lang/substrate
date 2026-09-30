@@ -29,24 +29,34 @@ same_program() {
 same=0
 later=0
 differ=0
+# The compiler runs with an empty cache: a module loaded from the cache
+# prints nothing while compiling, as a module compiled prints what its
+# compile-time code prints.
+cache="$out/cache"
 for f in "${files[@]}"; do
   n="${f//\//_}"
+  new="$out/$n.new" old="$out/$n.old"
   if [ "$mode" = expand ]; then
-    bin/sub expand "$f" > "$out/$n.old" 2>&1
-    HOST=build/subhost next/sub expand "$f" > "$out/$n.new" 2>&1
-    result=$(cmp -s "$out/$n.old" "$out/$n.new" && echo same)
+    HOST=build/subhost next/sub expand "$f" > "$new.txt" 2>&1
   else
-    old="$out/$n.old" new="$out/$n.new"
     rm -rf "${old:?}" "${new:?}"
-    bin/sub build "$f" -o "$old" > "$out/$n.old.txt" 2>&1
-    HOST=build/subhost next/sub build "$f" -o "$new" > "$out/$n.new.txt" 2>&1
-    result=$(cmp -s "$out/$n.old.txt" "$out/$n.new.txt" &&
-             { [ -s "$out/$n.old.txt" ] || same_program "$old" "$new"; } && echo same)
+    HOST=build/subhost next/sub build "$f" -o "$new" > "$new.txt" 2>&1
+  fi
+  if grep -qs "not yet in the new compiler" "$new.txt"; then
+    later=$((later + 1))
+    continue
+  fi
+  rm -rf "${cache:?}"
+  if [ "$mode" = expand ]; then
+    bin/sub expand "$f" -c "$cache" > "$old.txt" 2>&1
+    result=$(cmp -s "$old.txt" "$new.txt" && echo same)
+  else
+    bin/sub build "$f" -o "$old" -c "$cache" > "$old.txt" 2>&1
+    result=$(cmp -s "$old.txt" "$new.txt" && { [ -f "$old/program" ] || [ ! -f "$new/program" ]; } &&
+             { [ ! -f "$old/program" ] || same_program "$old" "$new"; } && echo same)
   fi
   if [ "$result" = same ]; then
     same=$((same + 1))
-  elif grep -qs "not yet in the new compiler" "$out/$n.new"*; then
-    later=$((later + 1))
   else
     differ=$((differ + 1))
     echo "differs: $f"

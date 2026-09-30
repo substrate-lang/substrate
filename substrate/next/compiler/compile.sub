@@ -22,7 +22,7 @@
 (require-unqualified w "wasm.sub")
 (require-unqualified ser "serialize.sub")
 
-(provide compile-module set-kernel-definitions! set-syntax-types! set-current-source!)
+(provide compile-module set-kernel-definitions! set-syntax-types! set-syntax-definitions! set-current-source!)
 
 (memory from c)
 (table from c)
@@ -55,14 +55,16 @@
 ;; func-info -> synth. uses-memory, uses-table: whether code needs a
 ;; memory or a table, and where it first did. uses-gc: does code allocate
 ;; or inspect GC objects? literals: the quoted data's serializer, or 0,
-;; and literals-table the synth holding its table. pending: the functions
+;; and literals-table the synth holding its table; datum-literals and
+;; datum-table likewise for data in memory. pending: the functions
 ;; lifted from lambdas, to compile, newest first. exported: the export
 ;; names given. fname: the name of the function being compiled. types:
 ;; the declared types the code uses, reversed, and noted, as a set.
 ;; imported: the external infos noted so far, as a set.
 (struct mstate [self datum] [func-imports datum] [global-imports datum] [tag-imports datum] [synths datum] [fidx datum]
         [uses-memory i32] [memory-loc (ptr srcloc)] [uses-table i32] [table-loc (ptr srcloc)] [uses-gc i32]
-        [literals (ptr serializer)] [literals-table datum] [pending (ptr lifted-fn)] [exported (ptr arena-table)]
+        [literals (ptr serializer)] [literals-table datum] [datum-literals (ptr serializer)] [datum-table datum]
+        [pending (ptr lifted-fn)] [exported (ptr arena-table)]
         [fname datum] [types datum] [noted (ptr arena-table)] [imported (ptr arena-table)])
 
 ;; A function compiled: its info, signature (func params results), the
@@ -111,6 +113,14 @@
 (define string-type datum 0)
 (define table-type datum 0)
 (define (set-syntax-types! [string datum] [table datum]) (set! string-type string) (set! table-type table))
+
+;; The functions of the running syntax module (syntax.sub) that build a
+;; linklet's quoted data in memory: literal-buffer and deserialize.
+(define literal-buffer-info datum 0)
+(define deserialize-info datum 0)
+(define (set-syntax-definitions! [buffer datum] [deserialize datum])
+  (set! literal-buffer-info buffer)
+  (set! deserialize-info deserialize))
 
 (define eqref datum (make-ref (boolean 1) (sym eq)))
 (define exnref datum (make-ref (boolean 1) (sym exn)))
@@ -371,6 +381,8 @@
     (set! (-> ms uses-gc) 0)
     (set! (-> ms literals) 0)
     (set! (-> ms literals-table) 0)
+    (set! (-> ms datum-literals) 0)
+    (set! (-> ms datum-table) 0)
     (set! (-> ms pending) 0)
     (set! (-> ms exported) (make-table))
     (set! (-> ms fname) 0)
@@ -983,6 +995,17 @@
       [(== kind (sym lambda)) (cx-lambda ms fc args expected)]
       [(== kind (sym apply-value)) (cx-apply ms fc labels args expected tail)]
       [(== kind (sym quote)) (cx-quote ms fc labels args expected tail)]
+      ;; (datum-quote d): datum d in memory, an i32, from the linklet's
+      ;; table of them; #f is 0.
+      [(== kind (sym datum-quote))
+       (let ([d (car args)])
+         (if (== d 0)
+             (emit! fc `(i32.const 0))
+             (let ([i (serialize! (module-datum-literals ms) d)])
+               (note-memory! ms)
+               (emit! fc `(global.get ,(-> ms datum-table)))
+               (emit! fc `(i32.load 2 ,(small (* 4 i))))))
+         (fit fc `(i32) expected))]
       [else (fail "internal: unknown kernel form ~s" (cons kind nil))])))
 
 (define (const-op [t datum]) -> datum
@@ -1130,6 +1153,17 @@
     (set! (-> ms literals) (make-serializer))
     (set! (-> ms literals-table) (new-synth! ms (sym literals) 0)))
   (-> ms literals))
+
+;; Quoted data in memory is serialized the same way into a segment of its
+;; own, after that of the other quoted data, which the running syntax
+;; module's deserialize turns into a table of data in memory when the
+;; module starts (syntax.sub). Its synth holds the table's address.
+(define (module-datum-literals [ms (ptr mstate)]) -> (ptr serializer)
+  (when (== (-> ms datum-literals) 0)
+    (when (== deserialize-info 0) (fail "internal: quoted data in memory needs the syntax module" nil))
+    (set! (-> ms datum-literals) (make-serializer))
+    (set! (-> ms datum-table) (new-synth! ms (sym datum-literals) 0)))
+  (-> ms datum-literals))
 
 ;; ---- functions ----
 
@@ -1328,7 +1362,9 @@
 ;; forms: fully expanded module forms. self: this module's instance name.
 ;; Assigns instance and export names to the infos it defines. Returns
 ;; (bytes imported-instance-names uses-gc? scope-table), the last the
-;; scope table of its quoted data (spec 3.5), in the current arena.
+;; scope table of its quoted data (spec 3.5), in the current arena: of
+;; its data in memory, if it has any, which the compiler maps when it
+;; instantiates the linklet; the other data's scopes it leaves unmapped.
 (define (compile-module [forms datum] [self datum]) -> datum
   (set! current-loc 0)
   (let* ([ms (new-mstate self)]
@@ -1347,7 +1383,8 @@
          [last (ptr compiled) 0]
          [start-fc (ptr fctx) 0]
          [setup (ptr asm) 0]
-         [literal-segment datum 0])
+         [literal-segment datum 0]
+         [datum-segment datum 0])
     (set! current-ms ms)
     (for-each (lambda ([f datum])
                 (set-func-info-instance! (cadr f) self)
@@ -1385,19 +1422,23 @@
     ;; were lifted from.
     (set! last (compile-pending! ms last))
     ;; The quoted data, complete now that all code is compiled. Its
-    ;; segment follows the module's own data segments.
+    ;; segment follows the module's own data segments, and that of the data
+    ;; in memory follows it.
     (when (!= (-> ms literals) 0) (set! literal-segment (serializer-bytes (-> ms literals))))
+    (when (!= (-> ms datum-literals) 0) (set! datum-segment (serializer-bytes (-> ms datum-literals))))
     ;; Table registration for func-index and quoted constants, in the
     ;; order the code above met them: the start function's first code.
     (set! setup (new-asm))
-    (for-each (lambda ([s datum]) (setup-code! ms setup s literal-segment (length data-forms) func-forms)) (reverse (-> ms synths)))
+    (for-each (lambda ([s datum])
+                (setup-code! ms setup start-fc s literal-segment datum-segment (length data-forms) func-forms))
+              (reverse (-> ms synths)))
     (when (and (-> ms uses-memory) (== memory-form 0))
       (raise-compile-error (-> ms memory-loc) `"this code uses memory, but the module defines none: add (memory pages)"))
     (when (and (not (null? data-forms)) (== memory-form 0))
       (fail "data needs a memory: add (memory pages)" nil))
     (when (and (-> ms uses-table) (== table-form 0))
       (raise-compile-error (-> ms table-loc) `"this code uses a table, but the module defines none: add (table size)"))
-    (link-module ms (-> first next) start-fc setup literal-segment global-forms data-forms type-forms tag-forms
+    (link-module ms (-> first next) start-fc setup literal-segment datum-segment global-forms data-forms type-forms tag-forms
                  memory-form table-form constants)))
 
 ;; Form f's code for the start function: a global's initializer that is
@@ -1416,19 +1457,41 @@
          (cx ms fc 0 (cadr f) nil 0)]))
 
 ;; Synth s's registration: a function's table index, or the table of the
-;; quoted data, made from its segment, the one after data-count others.
-(define (setup-code! [ms (ptr mstate)] [setup (ptr asm)] [s datum] [segment datum] [data-count u32] [func-forms datum])
+;; quoted data, made from its segment, the one after data-count others;
+;; or the table of the data in memory, from the segment after that,
+;; copied into memory first, which a local of the start function, fc's,
+;; points to.
+(define (setup-code! [ms (ptr mstate)] [setup (ptr asm)] [fc (ptr fctx)] [s datum] [segment datum] [datum-segment datum]
+                     [data-count u32] [func-forms datum])
   (let ([sy (synth-of s)])
-    (if (== (-> sy kind) (sym fidx))
-        (begin (instr! setup `(ref.func ,(-> sy info)))
-               (instr! setup `(i32.const 1))
-               (instr! setup `(table.grow 0))
-               (instr! setup `(global.set ,s)))
-        (begin (instr! setup `(i32.const 0))
-               (instr! setup `(i32.const ,(small (string-length segment))))
-               (instr! setup `(array.new_data ,string-type ,(small data-count)))
-               (instr! setup `(call ,(syntax-func ms func-forms (sym %deserialize))))
-               (instr! setup `(global.set ,s))))))
+    (cond
+      [(== (-> sy kind) (sym fidx))
+       (instr! setup `(ref.func ,(-> sy info)))
+       (instr! setup `(i32.const 1))
+       (instr! setup `(table.grow 0))
+       (instr! setup `(global.set ,s))]
+      [(== (-> sy kind) (sym literals))
+       (instr! setup `(i32.const 0))
+       (instr! setup `(i32.const ,(small (string-length segment))))
+       (instr! setup `(array.new_data ,string-type ,(small data-count)))
+       (instr! setup `(call ,(syntax-func ms func-forms (sym %deserialize))))
+       (instr! setup `(global.set ,s))]
+      [else
+       (let ([n (small (string-length datum-segment))] [at (small (temp-local! fc (sym i32)))]
+             [index (small (+ data-count (if (!= segment 0) 1 0)))])
+         (note-func! ms literal-buffer-info)
+         (note-func! ms deserialize-info)
+         (instr! setup `(i32.const ,n))
+         (instr! setup `(call ,literal-buffer-info))
+         (instr! setup `(local.tee ,at))
+         (instr! setup `(i32.const 0))
+         (instr! setup `(i32.const ,n))
+         (instr! setup `(memory.init ,index 0))
+         (instr! setup `(data.drop ,index))
+         (instr! setup `(local.get ,at))
+         (instr! setup `(i32.const ,n))
+         (instr! setup `(call ,deserialize-info))
+         (instr! setup `(global.set ,s)))])))
 
 ;; ---- linking ----
 
@@ -1530,8 +1593,8 @@
     (reverse acc)))
 
 (define (link-module [ms (ptr mstate)] [compiled (ptr compiled)] [start-fc (ptr fctx)] [setup (ptr asm)]
-                     [literal-segment datum] [global-forms datum] [data-forms datum] [type-forms datum] [tag-forms datum]
-                     [memory-form datum] [table-form datum] [constants (ptr arena-table)]) -> datum
+                     [literal-segment datum] [datum-segment datum] [global-forms datum] [data-forms datum] [type-forms datum]
+                     [tag-forms datum] [memory-form datum] [table-form datum] [constants (ptr arena-table)]) -> datum
   (let* ([lk (cast (ptr linker) (alloc-in (current-arena) (sizeof linker)))]
          [has-start (or (> (asm-size setup) 0) (> (asm-size (-> start-fc asm)) 0))]
          [func-imports (reverse (-> ms func-imports))]
@@ -1599,7 +1662,7 @@
                                        wglobals))))
               global-forms)
     (for-each (lambda ([s datum])
-                (set! wglobals (cons (if (== (-> (synth-of s) kind) (sym fidx))
+                (set! wglobals (cons (if (!= (-> (synth-of s) kind) (sym literals))
                                          `(i32 #t ,(linked-bytes (link lk (zero-asm (sym i32)) 0)))
                                          (let ([t (make-ref (boolean 1) table-type)])
                                            `(,(rv lk t) #t ,(linked-bytes (link lk (zero-asm t) 0)))))
@@ -1637,6 +1700,7 @@
     ;; ---- data ----
     (for-each (lambda ([f datum]) (set! datas (cons (cons (data-info-offset (cadr f)) (data-info-bytes (cadr f))) datas))) data-forms)
     (when (!= literal-segment 0) (set! datas (cons (cons 0 literal-segment) datas)))
+    (when (!= datum-segment 0) (set! datas (cons (cons 0 datum-segment) datas)))
     (set! datas (reverse datas))
     ;; ---- the module ----
     (set! (-> m types) (gc-type-entries lk gc-types))
@@ -1659,7 +1723,9 @@
     (buffer-free! (& out))
     `(,bytes ,(import-instances imports)
       ,(boolean (or (-> ms uses-gc) (any-gc-type? gc-types)))
-      ,(if (!= (-> ms literals) 0) (serializer-scope-table (-> ms literals)) nil))))
+      ,(cond [(!= (-> ms datum-literals) 0) (serializer-scope-table (-> ms datum-literals))]
+             [(!= (-> ms literals) 0) (serializer-scope-table (-> ms literals))]
+             [else nil]))))
 
 (define (any-gc-type? [ts datum]) -> i32
   (while (pair? ts)
