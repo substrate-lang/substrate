@@ -80,3 +80,40 @@ static void *kr_calloc(size_t count, size_t size) {
   if (p) __builtin_memset(p, 0, count * size);
   return p;
 }
+
+static void *kr_realloc(void *block, size_t n) {
+  if (!block) return kr_malloc(n);
+  size_t old = (((header *)block - 1)->size - 1) * sizeof(header);
+  void *p = kr_malloc(n);
+  if (p) { __builtin_memcpy(p, block, n < old ? n : old); kr_free(block); }
+  return p;
+}
+
+/* An arena, as the C example's runtime has it: memory given out by
+   moving a pointer, in chunks of 64 KiB or more from kr_malloc. */
+typedef struct chunk { struct chunk *previous; uint32_t size; } chunk;
+typedef struct { chunk *last; char *next, *end; } arena;
+
+static void arena_grow(arena *a, uint32_t n) {
+  uint32_t size = n > 65536 ? n : 65536;
+  chunk *c = kr_malloc(size + sizeof(chunk));
+  c->previous = a->last;
+  c->size = size;
+  a->last = c;
+  a->next = (char *)(c + 1);
+  a->end = a->next + size;
+}
+
+static void *arena_alloc(arena *a, uint32_t n) {
+  uint32_t size = (n + 7) & ~7u;
+  if (size > (uint32_t)(a->end - a->next)) arena_grow(a, size);
+  char *p = a->next;
+  a->next += size;
+  return p;
+}
+
+static void arena_free(arena *a) {
+  for (chunk *c = a->last; c;) { chunk *previous = c->previous; kr_free(c); c = previous; }
+  a->last = 0;
+  a->next = a->end = 0;
+}

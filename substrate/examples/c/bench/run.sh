@@ -2,10 +2,11 @@
 # Lifecycle: benchmark. The C example's benchmarks. Each NAME.sub is built
 # with bin/sub and run on build/subhost (wasmtime); NAME.c, the same
 # program in C, is built with clang -O2 natively, and for wasm, which the
-# wasmtime CLI runs. All three allocate with K&R's malloc (bench.h), and
-# must print the same result. Prints each benchmark's result, the least
-# time of N runs (default 3) of each, in ms, interleaved, and ours over
-# the others. In the dev shell:
+# wasmtime CLI runs, and for wasm without inlining, which our compiler
+# does not do for C functions. All allocate with K&R's malloc (bench.h),
+# and must print the same result. Prints each benchmark's result, the
+# least time of N runs (default 3) of each, in ms, interleaved, and ours
+# over the others. In the dev shell:
 #
 #   examples/c/bench/run.sh [N [NAME ...]]
 set -euo pipefail
@@ -26,14 +27,17 @@ for name in "${names[@]}"; do
   NIX_HARDENING_ENABLE= clang -O2 -o "$out/$name.native" "$here/$name.c"
   NIX_HARDENING_ENABLE= clang --target=wasm32 -O2 -ffreestanding -nostdlib -mbulk-memory -Wl,--no-entry \
     -o "$out/$name.wasm" "$here/$name.c" 2> "$out/$name.wasm.log" || { cat "$out/$name.wasm.log"; exit 1; }
+  NIX_HARDENING_ENABLE= clang --target=wasm32 -O2 -fno-inline -ffreestanding -nostdlib -mbulk-memory -Wl,--no-entry \
+    -o "$out/$name.noinline.wasm" "$here/$name.c" 2> "$out/$name.wasm.log" || { cat "$out/$name.wasm.log"; exit 1; }
 done
 
-variants=(ours native wasm)
+variants=(ours native wasm noinline)
 command_of() {
   case $1 in
     ours) echo "$root/build/subhost $out/$2" ;;
     native) echo "$out/$2.native" ;;
     wasm) echo "wasmtime run --invoke run $out/$2.wasm" ;;
+    noinline) echo "wasmtime run --invoke run $out/$2.noinline.wasm" ;;
   esac
 }
 
@@ -56,11 +60,11 @@ for ((i = 0; i < n; i++)); do
   done
 done
 
-printf "%-9s %-22s %9s %9s %9s %11s %9s\n" benchmark result ours native "c wasm" "ours/native" "ours/wasm"
+printf "%-9s %-20s %7s %7s %7s %9s %8s %8s %11s\n" benchmark result ours native "c wasm" "no inline" "/native" "/c wasm" "/no inline"
 for name in "${names[@]}"; do
   r="${result[ours.$name]}"
-  [ "$r" = "${result[native.$name]}" ] && [ "$r" = "${result[wasm.$name]}" ] ||
-    r="DIFFERS: ${result[ours.$name]} ${result[native.$name]} ${result[wasm.$name]}"
-  awk -v name="$name" -v r="$r" -v o="${best[ours.$name]}" -v c="${best[native.$name]}" -v w="${best[wasm.$name]}" \
-    'BEGIN { printf "%-9s %-22s %9.0f %9.0f %9.0f %11.2f %9.2f\n", name, r, o / 1000, c / 1000, w / 1000, o / c, o / w }'
+  [ "$r" = "${result[native.$name]}" ] && [ "$r" = "${result[wasm.$name]}" ] && [ "$r" = "${result[noinline.$name]}" ] ||
+    r="DIFFERS: ${result[ours.$name]} ${result[native.$name]} ${result[wasm.$name]} ${result[noinline.$name]}"
+  awk -v name="$name" -v r="$r" -v o="${best[ours.$name]}" -v c="${best[native.$name]}" -v w="${best[wasm.$name]}" -v i="${best[noinline.$name]}" \
+    'BEGIN { printf "%-9s %-20s %7.0f %7.0f %7.0f %9.0f %8.2f %8.2f %11.2f\n", name, r, o / 1000, c / 1000, w / 1000, i / 1000, o / c, o / w, o / i }'
 done
