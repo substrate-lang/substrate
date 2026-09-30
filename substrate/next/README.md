@@ -1,10 +1,11 @@
 # next
 
-An experiment: the compiler written in the C example's C
-(`examples/c`), so that reading, expanding and compiling need no GC. It is
-ported from `compiler/` file by file, and built by that compiler, which
-it leaves as it is: nothing in `compiler/`, `lib/` or `host/` changes for
-it.
+An experiment: the compiler written in a C-like Lisp, the C example's
+(`examples/c`) as the new compiler builds it (`c/`), so that reading,
+expanding and compiling need no GC. It is ported from `compiler/` file by
+file. It builds itself, from a seed, as the compiler does; the compiler
+built its first stage, and nothing in `compiler/`, `lib/` or `host/`
+changes for it.
 
 The stack it aims at is the wasm kernel, then a C-like Lisp, then
 Substrate as a library on it, able to drop into it, then Bend. Syntax
@@ -26,15 +27,15 @@ on them there.
   - `ops.sub`: `compiler/ops.sub`.
   - `expander.sub`: `compiler/expander.sub`, but for the cache and
     compiled files, which it says it does not do yet.
-  - `running.sub`: the running compiler's build, as the compiler reads
-    it until it can compile the kernel module itself (below).
+  - `running.sub`: the build that runs the compiler, as the compiler
+    reads it: its program's list of linklets, and a linklet's exports and
+    imports.
   - `leb128.sub`, `wasm.sub`, `closures.sub`, `serialize.sub` and
     `compile.sub`: the compiler's, into buffers and arenas.
   - `main.sub`: `compiler/main.sub`, with its `build`, `compile` and
     `expand` commands.
-- `c/`: the C-like Lisp as the new compiler builds it, `examples/c`'s
-  counterpart (plan, 4), which the kernel's tests of it (`tests/c`) run
-  on as they run on `examples/c`:
+- `c/`: the C-like Lisp, `examples/c` as the new compiler builds it,
+  which the compiler's sources are written in:
   - `lang.sub`: `examples/c/lang.sub`, its transformers in kernel code,
     function for function.
   - `runtime.sub`, `math.sub` and `c.sub`: `examples/c`'s.
@@ -43,17 +44,22 @@ on them there.
   - `kernel-forms.sub`: forms that kernel code is written with, `cond`,
     `and`, `or`, `when`, `unless` and `case`, and Racket's `for` forms on
     lists, as `lib/substrate-core.sub` gives Substrate its forms.
-- `sub`: runs the new compiler as `bin/sub` runs the compiler, which
-  builds it first when its sources changed: `next/sub build FILE`.
+- `seed/`: a build of the new compiler by itself, checked in, as `seed/`
+  is the compiler's.
+- `sub`: runs the new compiler as `bin/sub` runs the compiler; when its
+  sources changed, it first builds them with the seed, and them again
+  with that build, into `build/next/sub`: `next/sub build FILE`.
+- `bootstrap.sh`: the fixpoint: `build/next/sub` builds itself into the
+  same bytes; `next/bootstrap.sh seed` then makes it the seed.
 - `compare.sh`: every `.sub` file of the repository expanded, or built,
   by both compilers, which must give the same, a program's linklets byte
   for byte, but where the new compiler differs by design.
-- `tests/`: the new compiler's own tests, which it builds (`run.sh`).
-- `bench/`: the kernel's scope changes against the new syntax objects'
-  (`run.sh`).
-
-The tests of its parts, built by the compiler, are in `tests/next`,
-which `tests/run.sh` runs.
+- `tests/`: the new compiler's own tests, which it builds (`run.sh`): the
+  kernel's tests of compile-time code and of `syntax-match`, on the new
+  kernel module; the C example's tests (`tests/c`), on `c/`; and the
+  tests of its parts: its syntax objects, its reader, and what its
+  expander and back end give for the kernel's tests, which is what the
+  compiler gives.
 
 ## The kernel module
 
@@ -62,6 +68,7 @@ the kernel, syntax objects among them, and the functions of the macro
 contract (spec 2). The old compiler's, `compiler/kernel.sub`, has them as
 GC objects; the new compiler's is `kernel.sub`, with the data in memory,
 with the run-time modules it rests on, which give it its memory and
+allocator: `lib/print.sub`'s memory, and `c/`'s `sbrk`, stack and
 allocator. The GC kernel module is not part of the new compiler: the
 kernel language keeps wasm's GC types and instructions, and a language
 that wants GC data, as Substrate will, defines its own.
@@ -85,28 +92,25 @@ that wants GC data, as Substrate will, defines its own.
   allocator. `(require k kernel)` binds `kernel.sub`'s functions and tags,
   at any phase, and `(memory from k)` and `(table from k)` take its
   memory and table; a linklet at phase 1 or above that declares none
-  takes them too.
+  takes them too. The compiler is given the directory of the build that
+  runs it (`-r DIR`, which `next/sub` passes), whose program lists the
+  linklets the host registered, and reads `kernel.sub`'s functions from
+  its linklet there.
 - **A transformer** is a function pointer, an index in the shared table,
   to a function from syntax to syntax, `(i32) -> i32`, or from an
   environment and syntax, `(make-transformer (func-index code) env)`.
   `define-syntax` values are data too. The expander calls a macro
   directly, through the table.
 - **A program** that uses the kernel module carries the running build's
-  linklets of it.
-- **For now**, until the new compiler compiles the C-like Lisp, and so
-  `kernel.sub`, `next/sub` gives it the directory of its own build
-  (`-r DIR`), whose program lists the linklets the host registered;
-  `kernel.sub`'s functions are read from its linklet's bytes; and the
-  memory and allocator are `lib/print.sub`'s and `examples/c`'s, which
-  the old compiler builds the new one with. When the C-like Lisp is
-  ported (plan, 4), they move into the kernel module, and the new
-  compiler compiles `kernel.sub` itself as the old one compiles
-  `compiler/kernel.sub`.
+  linklets of it, but for those it compiled itself: when the compiler
+  builds itself, `kernel.sub` compiled from source has the running
+  kernel's name, the same module (spec 3.2), and the program has the
+  bytes this build compiled, while compile-time code still links to the
+  running build's kernel module.
 
 Code written for the old compiler's kernel module, its GC data and
-syntax objects, Substrate and the C example's `lang.sub` among it, does
-not run on the new compiler: those languages are to be built again on the
-C-like Lisp (plan, 4 and 5).
+syntax objects, Substrate among it, does not run on the new compiler:
+Substrate is to be built again on the C-like Lisp (plan, 5).
 
 ## Plan
 
@@ -125,12 +129,13 @@ C-like Lisp (plan, 4 and 5).
    gives the kernel's tests of it, ported to `tests/`, their output:
    `tests/syntax-match.sub`'s, and its error tests' messages.
 4. The C-like Lisp, `examples/c/lang.sub`, as macros on the kernel
-   module, written in kernel code at the bottom and in the C-like Lisp
-   above, with its run-time part in the kernel module; then the C
+   module, written in kernel code, as `lib/substrate-core.sub` writes
+   Substrate's, with its run-time part in the kernel module; then the C
    example's tests, and the compiler compiling itself, to a fixpoint,
-   the current build its first stage. So far: `c/lang.sub` has its
-   transformers in kernel code, and the C example's tests, in
-   `tests/c`, give their outputs and errors on it. Next, the compiler's
-   sources take the C-like Lisp from `c/`, `kernel.sub`'s own macros
-   become kernel code, and the compiler builds itself.
+   the current build its first stage. Done: `c/lang.sub` has its
+   transformers in kernel code; the C example's tests, in `tests/c`,
+   give their outputs and errors on it; the compiler's sources are
+   written in it, `kernel.sub`'s own macros in kernel code; and the
+   build the compiler made of them built them into a compiler that
+   builds itself into the same bytes, the seed.
 5. Substrate as a library on the C-like Lisp, then Bend.
