@@ -32,6 +32,10 @@ on them there.
     `compile.sub`: the compiler's, into buffers and arenas.
   - `main.sub`: `compiler/main.sub`, with its `build`, `compile` and
     `expand` commands.
+- `c/`: the C-like Lisp as the new compiler builds it, `examples/c`'s
+  counterpart (plan, 4). So far `syntax-match.sub`: `lib/substrate.sub`'s
+  patterns for syntax, in kernel code, on the kernel module's syntax
+  objects.
 - `sub`: runs the new compiler as `bin/sub` runs the compiler, which
   builds it first when its sources changed: `next/sub build FILE`.
 - `compare.sh`: every `.sub` file of the repository expanded, or built,
@@ -110,7 +114,9 @@ C-like Lisp (plan, 4 and 5).
    compile-time code, in the new kernel module (`tests/`), give their
    tests' output.
 3. `syntax-match`, from `lib/substrate.sub`'s patterns, on the kernel
-   module's syntax objects.
+   module's syntax objects. Done: `c/syntax-match.sub`, in kernel code,
+   gives the kernel's tests of it, ported to `tests/`, their output:
+   `tests/syntax-match.sub`'s, and its error tests' messages.
 4. The C-like Lisp, `examples/c/lang.sub`, as macros on the kernel
    module, written in kernel code at the bottom and in the C-like Lisp
    above, with its run-time part in the kernel module; then the C

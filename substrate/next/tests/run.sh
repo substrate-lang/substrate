@@ -8,8 +8,9 @@
 #   NAME.out   expected output of a successful run
 #   NAME.err   a line that must appear in the output of a failing one
 #
-# Most are the kernel's tests of compile-time code (tests/) on the new
-# compiler's kernel module (next/compiler/kernel.sub): their macros work
+# Most are the kernel's tests (tests/) of compile-time code and of
+# syntax-match (next/c/syntax-match.sub), on the new compiler's kernel
+# module (next/compiler/kernel.sub): their macros work
 # on data in memory, i32s, where they worked on GC objects, and their
 # outputs are those tests' own. next/tests/fixtures holds the modules they
 # require. OUT is where builds go (default build). In the dev shell:
