@@ -33,9 +33,16 @@ on them there.
   - `main.sub`: `compiler/main.sub`, with its `build`, `compile` and
     `expand` commands.
 - `c/`: the C-like Lisp as the new compiler builds it, `examples/c`'s
-  counterpart (plan, 4). So far `syntax-match.sub`: `lib/substrate.sub`'s
-  patterns for syntax, in kernel code, on the kernel module's syntax
-  objects.
+  counterpart (plan, 4), which the kernel's tests of it (`tests/c`) run
+  on as they run on `examples/c`:
+  - `lang.sub`: `examples/c/lang.sub`, its transformers in kernel code,
+    function for function.
+  - `runtime.sub`, `math.sub` and `c.sub`: `examples/c`'s.
+  - `syntax-match.sub`: `lib/substrate.sub`'s patterns for syntax, in
+    kernel code, on the kernel module's syntax objects.
+  - `kernel-forms.sub`: forms that kernel code is written with, `cond`,
+    `and`, `or`, `when`, `unless` and `case`, and Racket's `for` forms on
+    lists, as `lib/substrate-core.sub` gives Substrate its forms.
 - `sub`: runs the new compiler as `bin/sub` runs the compiler, which
   builds it first when its sources changed: `next/sub build FILE`.
 - `compare.sh`: every `.sub` file of the repository expanded, or built,
@@ -121,5 +128,9 @@ C-like Lisp (plan, 4 and 5).
    module, written in kernel code at the bottom and in the C-like Lisp
    above, with its run-time part in the kernel module; then the C
    example's tests, and the compiler compiling itself, to a fixpoint,
-   the current build its first stage.
+   the current build its first stage. So far: `c/lang.sub` has its
+   transformers in kernel code, and the C example's tests, in
+   `tests/c`, give their outputs and errors on it. Next, the compiler's
+   sources take the C-like Lisp from `c/`, `kernel.sub`'s own macros
+   become kernel code, and the compiler builds itself.
 5. Substrate as a library on the C-like Lisp, then Bend.

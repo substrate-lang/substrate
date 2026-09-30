@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Lifecycle: experimental. The new compiler's own tests: each
-# next/tests/*.sub built by the new compiler (next/sub) and run with a
+# next/tests/*.sub and next/tests/c/*.sub built by the new compiler
+# (next/sub), in its own directory, and run with a
 # host, build/subhost unless HOST names another (host/subhost.mjs runs
 # programs on Node's V8), which runs the compiler too. The output checked
 # is the build's, then the run's, as tests/run.sh checks it:
@@ -13,7 +14,9 @@
 # module (next/compiler/kernel.sub): their macros work
 # on data in memory, i32s, where they worked on GC objects, and their
 # outputs are those tests' own. next/tests/fixtures holds the modules they
-# require. OUT is where builds go (default build). In the dev shell:
+# require. next/tests/c has the C example's tests (tests/c), on the C-like
+# Lisp as the new compiler builds it (next/c). OUT is where builds go
+# (default build). In the dev shell:
 #
 #   next/tests/run.sh
 set -uo pipefail
@@ -26,12 +29,13 @@ mkdir -p "$builds"
 
 pass=0
 fail=0
-for t in next/tests/*.sub; do
+for t in next/tests/*.sub next/tests/c/*.sub; do
   name="$(basename "$t" .sub)"
-  base="next/tests/$name"
-  program="$builds/$name"
+  dir="$(dirname "$t")"
+  base="$dir/$name"
+  program="$builds/${dir#next/tests}/$name"
   rm -rf "${program:?}"
-  actual="$(cd next/tests && ../sub build "$name.sub" -o "$root/$program" 2>&1 && "$host" "$root/$program" 2>&1)"
+  actual="$(cd "$dir" && "$root/next/sub" build "$name.sub" -o "$root/$program" 2>&1 && "$host" "$root/$program" 2>&1)"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then
