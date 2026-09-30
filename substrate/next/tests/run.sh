@@ -8,12 +8,11 @@
 #   NAME.out   expected output of a successful run
 #   NAME.err   a line that must appear in the output of a failing one
 #
-# Most are the kernel's tests of compile-time code (tests/) in the syntax
-# module's contract (next/compiler/syntax.sub): their macros work on data
-# in memory, and their outputs are those tests' own, but for where the
-# forms that quote data in memory, longer than #' and #`, move an error's
-# column. next/tests/fixtures holds the modules they require. OUT is where
-# builds go (default build). In the dev shell:
+# Most are the kernel's tests of compile-time code (tests/) on the new
+# compiler's kernel module (next/compiler/kernel.sub): their macros work
+# on data in memory, i32s, where they worked on GC objects, and their
+# outputs are those tests' own. next/tests/fixtures holds the modules they
+# require. OUT is where builds go (default build). In the dev shell:
 #
 #   next/tests/run.sh
 set -uo pipefail
