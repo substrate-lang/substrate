@@ -89,7 +89,12 @@ that wants GC data, as Substrate will, defines its own.
 - **Compile-time code** links to the running compiler's instances of the
   kernel module, as the old compiler's links to its running kernel's
   (spec 1.4), so the compiler and every macro share its data, memory and
-  allocator. `(require k kernel)` binds `kernel.sub`'s functions and tags,
+  allocator: the kernel module's whole group, `kernel.sub` and the
+  run-time modules it rests on, at any phase shift, whether a module
+  requires it as `kernel` or requires them by path. So a macro can be
+  written in the C-like Lisp, a C function at phase 1 on the kernel
+  module's data (`tests/c-macros.sub`), as well as in kernel code.
+  `(require k kernel)` binds `kernel.sub`'s functions and tags,
   at any phase, and `(memory from k)` and `(table from k)` take its
   memory and table; a linklet at phase 1 or above that declares none
   takes them too. The compiler is given the directory of the build that
