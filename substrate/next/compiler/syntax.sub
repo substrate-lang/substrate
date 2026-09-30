@@ -1,7 +1,9 @@
-;; Lifecycle: example. Syntax objects in memory, written in the C
-;; example's C (lang.sub): the kernel's data and syntax objects (spec 2.2,
-;; 2.3), with its sets of scopes and their changes (spec 6.1), for an
-;; expander written in C, which needs no GC.
+;; Lifecycle: experimental. Part of the new compiler (next/), written in
+;; the C example's C (examples/c/lang.sub). Syntax objects in memory: the
+;; kernel's data and syntax objects (spec 2.2, 2.3), with its sets of
+;; scopes and their changes (spec 6.1), which compiler/kernel.sub has as
+;; GC objects, and what compiler/stx.sub has on them: scope changes to a
+;; datum, conversions, and compile errors.
 ;;
 ;; A datum is the address of a cell, or 0 for #f, as the kernel's #f is
 ;; null. A cell is a pair, the empty list, #t, a symbol, a keyword, a
@@ -38,12 +40,13 @@
 ;; long: a change to one made there is made at once, and keep makes a
 ;; syntax object's pending changes before it copies it.
 
-(require-unqualified c "c.sub")
+(require-unqualified c "../../examples/c/c.sub")
+(require-unqualified numbers "numbers.sub")
 (require print "../../lib/print.sub")
 
 (provide datum srcloc scope-set
          run-arena current-arena use-arena begin-module-arena end-module-arena keep
-         nil boolean boolean? null? pair? cons car cdr cadr cddr caddr cdddr list? length reverse append
+         nil boolean boolean? null? pair? cons car cdr cadr cddr caddr cdddr set-cdr! list? length reverse append
          symbol? bytes->symbol symbol-named string->symbol symbol->string symbol-bytes symbol-length
          keyword? bytes->keyword keyword->string
          string? bytes->string string-bytes string-length string=?
@@ -51,7 +54,8 @@
          syntax? identifier? make-syntax syntax-e syntax->list splice-list syntax->datum datum->syntax syntax-rewrap
          syntax-scopes syntax-srcloc make-srcloc syntax-property syntax-property-set
          no-scopes scopes-change scopes-subset? add-scope remove-scope flip-scope
-         write-datum write-scoped)
+         write-datum write-scoped write-to format-message buffer-add-utf-8!
+         compile-error raise-compile-error write-compile-error)
 
 (memory from c)
 (table from c)
@@ -185,7 +189,8 @@
 (define (caddr [p datum]) -> datum (car (cddr p)))
 (define (cdddr [p datum]) -> datum (cdr (cddr p)))
 
-;; Pair p made to end with d: for building a list from its start.
+;; Pair p made to end with d: for building a list from its start, before
+;; anything else has it.
 (define (set-cdr! [p datum] [d datum]) (match p [(pair a b) (set! b d)] [_ 0]))
 
 (define (list? [l datum]) -> i32
@@ -305,13 +310,11 @@
 (define (flonum? [d datum]) -> i32 (and (!= d 0) (match d [(flonum a b) 1] [_ 0])))
 
 (define (make-flonum [x f64]) -> datum
-  (let ([d (make-cell (flonum 0 0))])
-    (match d [(flonum low high) (set! (@ (cast (ptr f64) (& low))) x)] [_ 0])
-    d))
+  (let ([bits (f64-bits x)]) (make-cell (flonum (cast u32 bits) (cast u32 (>> bits 32))))))
 
 (define (flonum-value [d datum]) -> f64
   (unless (flonum? d) (fail "expected a flonum"))
-  (match d [(flonum low high) (@ (cast (ptr f64) (& low)))] [_ 0]))
+  (match d [(flonum low high) (bits-f64 (bit-or (cast i64 low) (<< (cast i64 high) 32)))] [_ 0]))
 
 (define (char? [d datum]) -> i32 (and (!= d 0) (match d [(character c) 1] [_ 0])))
 (define (integer->char [n u32]) -> datum (make-cell (character n)))
@@ -605,63 +608,72 @@
 
 ;; ---- writing ----
 ;;
-;; A datum as Substrate's write writes it (lib/substrate-core.sub): a
-;; syntax object as #<syntax d>, d its datum.
+;; A datum as Substrate's write or display writes it (lib/substrate-core.sub),
+;; into a buffer: a syntax object as #<syntax d>, d its datum.
 
-(define (write-datum [d datum]) (write-in d 0))
+;; How write-to writes: as write, or display, which writes a string's and
+;; a character's bytes as they are; or with scopes, which writes each
+;; syntax object as its datum followed by its scopes, as {3 1}, and looks
+;; inside with syntax-e, which makes its pending changes.
+(define as-write i32 0)
+(define as-display i32 1)
+(define with-scopes i32 2)
 
-;; A datum written so that its scopes show: each syntax object as its
-;; datum followed by its scopes, as {3 1}, and looked inside with syntax-e,
-;; which makes its pending changes.
-(define (write-scoped [d datum]) (write-in d 1))
+(define (write-datum [d datum]) (write-out d as-write))
+(define (write-scoped [d datum]) (write-out d with-scopes))
 
-(define (write-c [s (ptr u8)]) (print:write-bytes (cast i32 s) (strlen s)))
+(define (write-out [d datum] [how i32])
+  (let ([b (make-buffer)])
+    (write-to (& b) d how)
+    (print:write-bytes (cast i32 (-> b bytes)) (-> b length))
+    (buffer-free! (& b))))
 
-(define (write-name [p (ptr u8)] [n u32]) (print:write-bytes (cast i32 p) n))
+(define (write-to [b (ptr buffer)] [d datum] [how i32]) (write-in b d how 0))
 
-;; d, written; scoped is 1 as write-scoped writes, 2 inside a syntax
-;; object, which write-datum writes without its scopes, else 0.
-(define (write-in [d datum] [scoped i32])
+;; d, written into b as how says; in is 1 inside a syntax object, which
+;; write and display write without it.
+(define (write-in [b (ptr buffer)] [d datum] [how i32] [in i32])
   (when (== d 0)
-    (write-c "#f")
+    (buffer-add-string! b "#f")
     (return))
   (match d
-    [(pair a b) (write-pair d scoped)]
-    [empty (write-c "()")]
-    [true (write-c "#t")]
-    [(symbol name length next) (write-name name length)]
-    [(keyword name length next) (write-c "#:") (write-name name length)]
-    [(string bytes length) (write-string bytes length)]
+    [(pair x y) (write-pair b d how in)]
+    [empty (buffer-add-string! b "()")]
+    [true (buffer-add-string! b "#t")]
+    [(symbol name length next) (buffer-add! b name length)]
+    [(keyword name length next) (buffer-add-string! b "#:") (buffer-add! b name length)]
+    [(string bytes length)
+     (if (== how as-display) (buffer-add! b bytes length) (write-string b bytes length))]
     [(integer low high negative)
      (if negative
-         (begin (print:write-byte 45) (print:write-u64 (- 0 (integer-value d))))
-         (print:write-u64 (integer-value d)))]
-    [(flonum low high) (write-flonum (flonum-value d))]
-    [(character c) (write-char c)]
+         (begin (buffer-add-byte! b 45) (write-u64 b (- 0 (integer-value d))))
+         (write-u64 b (integer-value d)))]
+    [(flonum low high) (write-flonum b (flonum-value d))]
+    [(character c) (if (== how as-display) (buffer-add-utf-8! b c) (write-char b c))]
     [(syntax e scopes loc props pending)
-     (if (== scoped 1)
-         (begin (write-in (syntax-e d) 1) (write-scopes scopes))
-         (if (== scoped 2)
-             (write-in e 2)
-             (begin (write-c "#<syntax ") (write-in e 2) (write-c ">"))))]))
+     (if (== how with-scopes)
+         (begin (write-in b (syntax-e d) how 1) (write-scopes b scopes))
+         (if in
+             (write-in b e how 1)
+             (begin (buffer-add-string! b "#<syntax ") (write-in b e how 1) (buffer-add-byte! b 62))))]))
 
-(define (write-pair [d datum] [scoped i32])
+(define (write-pair [b (ptr buffer)] [d datum] [how i32] [in i32])
   (let ([prefix (abbreviation d)])
     (when (!= prefix 0)
-      (write-c prefix)
-      (write-in (cadr d) scoped)
+      (buffer-add-string! b prefix)
+      (write-in b (cadr d) how in)
       (return)))
-  (print:write-byte 40)
-  (write-in (car d) scoped)
+  (buffer-add-byte! b 40)
+  (write-in b (car d) how in)
   (let ([rest (cdr d)])
     (while (pair? rest)
-      (print:write-byte 32)
-      (write-in (car rest) scoped)
+      (buffer-add-byte! b 32)
+      (write-in b (car rest) how in)
       (set! rest (cdr rest)))
     (unless (null? rest)
-      (write-c " . ")
-      (write-in rest scoped)))
-  (print:write-byte 41))
+      (buffer-add-string! b " . ")
+      (write-in b rest how in)))
+  (buffer-add-byte! b 41))
 
 ;; The prefix a two-element list (quote x) and its kin are written with,
 ;; as they read: 'x, `x, ,x, ,@x, #'x, #`x, #,x and #,@x; else 0.
@@ -682,39 +694,43 @@
             (when (== head (symbol-named (@ names i))) (return (@ prefixes i))))
           0))))
 
-(define (write-scopes [s (ptr scope-set)])
-  (print:write-byte 123)
+(define (write-scopes [b (ptr buffer)] [s (ptr scope-set)])
+  (buffer-add-byte! b 123)
   (for ([i u32 0]) (< i (-> s count)) (+= i 1)
-    (when (> i 0) (print:write-byte 32))
-    (print:write-u64 (@ (-> s ids) i)))
-  (print:write-byte 125))
+    (when (> i 0) (buffer-add-byte! b 32))
+    (write-u64 b (@ (-> s ids) i)))
+  (buffer-add-byte! b 125))
+
+(define (write-u64 [b (ptr buffer)] [n u64])
+  (when (>= n 10) (write-u64 b (/ n 10)))
+  (buffer-add-byte! b (+ 48 (cast i32 (% n 10)))))
 
 ;; A string in double quotes, with ", \ and control characters escaped.
-(define (write-string [p (ptr u8)] [n u32])
-  (print:write-byte 34)
+(define (write-string [b (ptr buffer)] [p (ptr u8)] [n u32])
+  (buffer-add-byte! b 34)
   (for ([i u32 0]) (< i n) (+= i 1)
-    (let ([b (@ p i)])
-      (if (or (== b 34) (== b 92))
-          (begin (print:write-byte 92) (print:write-byte b))
-          (if (== b 10)
-              (write-c "\\n")
-              (if (== b 9)
-                  (write-c "\\t")
-                  (if (== b 13)
-                      (write-c "\\r")
-                      (if (or (< b 32) (== b 127))
-                          (begin (write-c "\\x") (write-hex b) (print:write-byte 59))
-                          (print:write-byte b))))))))
-  (print:write-byte 34))
+    (let ([c (@ p i)])
+      (if (or (== c 34) (== c 92))
+          (begin (buffer-add-byte! b 92) (buffer-add-byte! b c))
+          (if (== c 10)
+              (buffer-add-string! b "\\n")
+              (if (== c 9)
+                  (buffer-add-string! b "\\t")
+                  (if (== c 13)
+                      (buffer-add-string! b "\\r")
+                      (if (or (< c 32) (== c 127))
+                          (begin (buffer-add-string! b "\\x") (write-hex b c) (buffer-add-byte! b 59))
+                          (buffer-add-byte! b c))))))))
+  (buffer-add-byte! b 34))
 
-(define (write-hex [n u32])
-  (when (>= n 16) (write-hex (>> n 4)))
+(define (write-hex [b (ptr buffer)] [n u32])
+  (when (>= n 16) (write-hex b (>> n 4)))
   (let ([d (bit-and n 15)])
-    (print:write-byte (if (< d 10) (+ 48 d) (+ 87 d)))))
+    (buffer-add-byte! b (if (< d 10) (+ 48 d) (+ 87 d)))))
 
 ;; A character as #\c, or its name.
-(define (write-char [c u32])
-  (write-c "#\\")
+(define (write-char [b (ptr buffer)] [c u32])
+  (buffer-add-string! b "#\\")
   (let ([names (array (ptr u8) 9)] [codes (array u32 9)])
     (set! (@ names 0) "space") (set! (@ codes 0) 32)
     (set! (@ names 1) "newline") (set! (@ codes 1) 10)
@@ -727,97 +743,118 @@
     (set! (@ names 8) "delete") (set! (@ codes 8) 127)
     (for ([i 0]) (< i 9) (+= i 1)
       (when (== c (@ codes i))
-        (write-c (@ names i))
+        (buffer-add-string! b (@ names i))
         (return))))
   (if (< c 32)
-      (begin (print:write-byte 120) (write-hex c))
-      (write-utf-8 c)))
+      (begin (buffer-add-byte! b 120) (write-hex b c))
+      (buffer-add-utf-8! b c)))
 
-(define (write-utf-8 [c u32])
+;; A code point as UTF-8.
+(define (buffer-add-utf-8! [b (ptr buffer)] [c u32])
   (if (< c 128)
-      (print:write-byte c)
+      (buffer-add-byte! b c)
       (if (< c 2048)
-          (begin (print:write-byte (bit-or 192 (>> c 6))) (print:write-byte (bit-or 128 (bit-and c 63))))
+          (begin (buffer-add-byte! b (bit-or 192 (>> c 6))) (buffer-add-byte! b (bit-or 128 (bit-and c 63))))
           (if (< c 65536)
               (begin
-                (print:write-byte (bit-or 224 (>> c 12)))
-                (print:write-byte (bit-or 128 (bit-and (>> c 6) 63)))
-                (print:write-byte (bit-or 128 (bit-and c 63))))
+                (buffer-add-byte! b (bit-or 224 (>> c 12)))
+                (buffer-add-byte! b (bit-or 128 (bit-and (>> c 6) 63)))
+                (buffer-add-byte! b (bit-or 128 (bit-and c 63))))
               (begin
-                (print:write-byte (bit-or 240 (>> c 18)))
-                (print:write-byte (bit-or 128 (bit-and (>> c 12) 63)))
-                (print:write-byte (bit-or 128 (bit-and (>> c 6) 63)))
-                (print:write-byte (bit-or 128 (bit-and c 63))))))))
+                (buffer-add-byte! b (bit-or 240 (>> c 18)))
+                (buffer-add-byte! b (bit-or 128 (bit-and (>> c 12) 63)))
+                (buffer-add-byte! b (bit-or 128 (bit-and (>> c 6) 63)))
+                (buffer-add-byte! b (bit-or 128 (bit-and c 63))))))))
 
-;; 10^k, for k up to 22, which a double holds exactly.
-(define (ten-to [k i32]) -> f64
-  (let ([p f64 1])
-    (for ([i 0]) (< i k) (+= i 1) (set! p (* p 10)))
-    p))
+;; x as write writes it: +inf.0, -inf.0 or +nan.0; otherwise its shortest
+;; digits (flonum-digits), in fixed-point notation from 10^-3 up to 10^10,
+;; else in scientific notation, 1.5e10.
+(define (write-flonum [b (ptr buffer)] [x f64])
+  (let ([ds (array u8 24)] [n 0] [k 0])
+    (when (!= x x)
+      (buffer-add-string! b "+nan.0")
+      (return))
+    (when (== x (/ 1.0 0.0))
+      (buffer-add-string! b "+inf.0")
+      (return))
+    (when (== x (/ -1.0 0.0))
+      (buffer-add-string! b "-inf.0")
+      (return))
+    (when (< (f64-bits x) 0) (buffer-add-byte! b 45))
+    (when (== x 0)
+      (buffer-add-string! b "0.0")
+      (return))
+    (memset ds 0 24)
+    ;; x is 0.d1...dn times 10^k.
+    (set! k (flonum-digits (fabs x) ds))
+    (while (and (< n 24) (!= (@ ds n) 0)) (+= n 1))
+    (if (and (>= k -2) (<= k 10))
+        (if (<= k 0)
+            (begin
+              (buffer-add-string! b "0.")
+              (for ([i 0]) (< i (- k)) (+= i 1) (buffer-add-byte! b 48))
+              (buffer-add! b ds n))
+            (if (< k n)
+                (begin (buffer-add! b ds k) (buffer-add-byte! b 46) (buffer-add! b (+ ds k) (- n k)))
+                (begin
+                  (buffer-add! b ds n)
+                  (for ([i n]) (< i k) (+= i 1) (buffer-add-byte! b 48))
+                  (buffer-add-string! b ".0"))))
+        (begin
+          (buffer-add! b ds 1)
+          (when (> n 1)
+            (buffer-add-byte! b 46)
+            (buffer-add! b (+ ds 1) (- n 1)))
+          (buffer-add-byte! b 101)
+          (when (< k 1) (buffer-add-byte! b 45))
+          (write-u64 b (if (>= k 1) (- k 1) (- 1 k)))))))
 
-;; x as Substrate's write writes it: +nan.0, +inf.0 or -inf.0; else its
-;; digits, in fixed-point notation from 10^-3 up to 10^10, else in
-;; scientific notation, 1.5e10. Its digits are the fewest that read back
-;; as x, as Clinger's fast path finds them: for p from 1, the integer D
-;; of p digits nearest x over 10^q is x's if D times 10^q, one rounding of
-;; exact operands, is x. That needs D below 2^53 and 10^|q| exact, up to
-;; 10^22, as holds for the decimals code is written with. Otherwise x is
-;; written with 15 digits, which may not read back as x.
-(define (write-flonum [x f64])
-  (when (!= x x) (write-c "+nan.0") (return))
-  (when (== x (/ 1.0 0.0)) (write-c "+inf.0") (return))
-  (when (== x (/ -1.0 0.0)) (write-c "-inf.0") (return))
-  (when (or (< x 0) (and (== x 0) (< (/ 1.0 x) 0))) (print:write-byte 45))
-  (when (== x 0) (write-c "0.0") (return))
-  (let ([a (fabs x)] [k 0] [m f64 0] [y f64 0])
-    ;; a is about m times 10^k, m in [1, 10).
-    (set! m a)
-    (while (>= m 10) (set! m (/ m 10)) (+= k 1))
-    (while (< m 1) (set! m (* m 10)) (-= k 1))
-    (for ([p 1]) (<= p 17) (+= p 1)
-      (let ([q (- (+ k 1) p)])
-        (when (and (<= q 22) (>= q -22))
-          (let ([scale (ten-to (if (< q 0) (- q) q))])
-            (set! y (nearbyint (if (< q 0) (* a scale) (/ a scale))))
-            (when (and (< y 9007199254740992.0) (== a (if (< q 0) (/ y scale) (* y scale))))
-              (write-digits (cast u64 y) q)
-              (return))))))
-    (write-digits (cast u64 (nearbyint (over-ten-to a (- k 14)))) (- k 14))))
+;; ---- errors ----
+;;
+;; A compile error is a syntax error (spec 2.3): its message, a string;
+;; the syntax it blames, or #f; and where it is, or 0 for where that
+;; syntax is.
 
-;; a over 10^k, a rounding for each 10^22.
-(define (over-ten-to [a f64] [k i32]) -> f64
-  (while (>= k 22) (set! a (/ a 1e22)) (-= k 22))
-  (while (<= k -22) (set! a (* a 1e22)) (+= k 22))
-  (if (< k 0) (* a (ten-to (- k))) (/ a (ten-to k))))
+(exception compile-error datum datum (ptr srcloc))
 
-;; The number d times 10^q, d not 0, as write-flonum writes it.
-(define (write-digits [d u64] [q i32])
-  (let ([ds (array u8 24)] [n 0])
-    (while (!= d 0)
-      (set! (@ ds n) (+ 48 (cast i32 (% d 10))))
-      (+= n 1)
-      (set! d (/ d 10)))
-    ;; Most significant first, and no zeros at the end: the number is
-    ;; 0.ds times 10^k.
-    (for ([i 0]) (< i (/ n 2)) (+= i 1)
-      (let ([t (@ ds i)]) (set! (@ ds i) (@ ds (- n i 1))) (set! (@ ds (- n i 1)) t)))
-    (while (and (> n 1) (== (@ ds (- n 1)) 48)) (-= n 1) (+= q 1))
-    (let ([k (+ q n)])
-      (if (and (>= k -2) (<= k 10))
-          (if (<= k 0)
-              (begin
-                (write-c "0.")
-                (for ([i 0]) (< i (- k)) (+= i 1) (print:write-byte 48))
-                (write-name ds n))
-              (if (< k n)
-                  (begin (write-name ds k) (print:write-byte 46) (write-name (+ ds k) (- n k)))
-                  (begin
-                    (write-name ds n)
-                    (for ([i n]) (< i k) (+= i 1) (print:write-byte 48))
-                    (write-c ".0"))))
+;; Throw a compile error with message, located at loc and blaming no
+;; syntax.
+(define (raise-compile-error [loc (ptr srcloc)] [message datum])
+  (throw compile-error message 0 loc))
+
+;; Template, with each ~a in it the next of args as display writes it, and
+;; each ~s as write does: a string, in the current arena.
+(define (format-message [template (ptr u8)] [args datum]) -> datum
+  (let ([b (make-buffer)] [i u32 0] [n (strlen template)] [s datum 0])
+    (while (< i n)
+      (if (and (== (@ template i) 126) (< (+ i 1) n) (pair? args))
           (begin
-            (write-name ds 1)
-            (when (> n 1) (print:write-byte 46) (write-name (+ ds 1) (- n 1)))
-            (print:write-byte 101)
-            (when (< k 1) (print:write-byte 45))
-            (print:write-u64 (if (>= k 1) (- k 1) (- 1 k))))))))
+            (write-to (& b) (car args) (if (== (@ template (+ i 1)) 115) as-write as-display))
+            (set! args (cdr args))
+            (+= i 2))
+          (begin
+            (buffer-add-byte! (& b) (@ template i))
+            (+= i 1))))
+    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (buffer-free! (& b))
+    s))
+
+;; A compile error as the compiler reports it (compiler/stx.sub), into b:
+;; where it is, its location's or its syntax's, then its message, and the
+;; syntax it blames, if any.
+(define (write-compile-error [b (ptr buffer)] [message datum] [blamed datum] [loc (ptr srcloc)])
+  (let ([at (if (and (== loc 0) (syntax? blamed)) (syntax-srcloc blamed) loc)])
+    (if (== at 0)
+        (buffer-add-string! b "<unknown>")
+        (begin
+          (write-to b (-> at source) as-display)
+          (buffer-add-byte! b 58)
+          (write-u64 b (-> at line))
+          (buffer-add-byte! b 58)
+          (write-u64 b (+ (-> at col) 1))))
+    (buffer-add-string! b ": error: ")
+    (write-to b message as-display)
+    (when (syntax? blamed)
+      (buffer-add-string! b "\n  in: ")
+      (write-to b (syntax->datum blamed) as-write))
+    (buffer-add-byte! b 10)))

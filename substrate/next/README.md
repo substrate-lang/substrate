@@ -1,0 +1,39 @@
+# next
+
+An experiment: the compiler written in the C example's C
+(`examples/c`), so that reading, expanding and compiling need no GC. It is
+ported from `compiler/` file by file, and built by that compiler, which
+it leaves as it is: nothing in `compiler/`, `lib/` or `host/` changes for
+it.
+
+The stack it aims at is the wasm kernel, then a C-like Lisp, then
+Substrate as a library on it, able to drop into it, then Bend. Syntax
+objects live in the compiler's memory, and the macros of every layer work
+on them there.
+
+## Layout
+
+- `compiler/`, the new compiler, its files after `compiler/`'s:
+  - `syntax.sub`: syntax objects in memory, which `compiler/kernel.sub`
+    has as GC objects, with what `compiler/stx.sub` has on them.
+  - `numbers.sub`: `compiler/numbers.sub`, with the reading and writing of
+    decimals that the old compiler takes from Substrate.
+  - `host.sub`: `compiler/host.sub`, with reading files.
+  - `reader.sub`: `compiler/reader.sub`.
+- `bench/`: the kernel's scope changes against the new syntax objects'
+  (`run.sh`).
+
+Its tests are in `tests/next`, which `tests/run.sh` runs.
+
+## Plan
+
+1. Syntax objects, then the reader. Done: the reader reads the compiler's
+   and the libraries' files as `compiler/reader.sub` does, datum for
+   datum and location for location.
+2. The expander, compiling to wasm, and compile-time code and phases.
+   The kernel's tests are the check.
+3. The macro API: patterns and templates.
+4. The C-like Lisp as macros written in itself, ported from
+   `examples/c/lang.sub`; then the C example's tests, and the compiler
+   compiling itself.
+5. Substrate as a library on the C-like Lisp, then Bend.
