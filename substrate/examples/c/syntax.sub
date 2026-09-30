@@ -1,0 +1,823 @@
+;; Lifecycle: example. Syntax objects in memory, written in the C
+;; example's C (lang.sub): the kernel's data and syntax objects (spec 2.2,
+;; 2.3), with its sets of scopes and their changes (spec 6.1), for an
+;; expander written in C, which needs no GC.
+;;
+;; A datum is the address of a cell, or 0 for #f, as the kernel's #f is
+;; null. A cell is a pair, the empty list, #t, a symbol, a keyword, a
+;; string, an integer, a flonum, a character or a syntax object. The empty
+;; list and #t are one cell each, nil and (boolean 1); symbols and
+;; keywords are interned, so two of one name are one cell; so == compares
+;; data as the kernel's ref.eq does. A string is immutable UTF-8 bytes,
+;; whose length counts bytes. The functions of data are the kernel's,
+;; under its names, but for make-integer and make-flonum, and those of
+;; bytes in memory, such as bytes->symbol, whose names say so; like the
+;; kernel's, they trap when given a datum of the wrong kind.
+;;
+;; A syntax object is a datum, its scope set, its source location and its
+;; properties, as the kernel's is, and the scope changes pending for the
+;; syntax objects inside it: a change to a syntax object changes its own
+;; scopes at once, and syntax-e makes the pending ones one level down the
+;; first time something looks inside, so the syntax objects nothing looks
+;; inside are never made again, and changes that cancel, like the two
+;; flips of a macro's introduction scope, are never made (spec 6.1). A
+;; scope is a number below 2^30. A scope set holds its scopes greatest
+;; (newest) first, and is interned, so two sets of the same scopes are one
+;; set, compared with ==; and a change to a set is remembered, so the same
+;; change to the same set is worked out once.
+;;
+;; Memory. Cells are in arenas, by how long they last. What lasts the whole
+;; run is in the run's arena: symbols, keywords, scope sets, and what keep
+;; copies there, which is what the expander keeps past a module's
+;; compilation. What a module's compilation makes is in its module arena,
+;; freed when the module is compiled. The compilations of modules nest, a
+;; module's compiling the modules it requires, and so do their arenas.
+;; Cells are made in the current arena: the innermost module's, or the
+;; run's, or the one use-arena chose. No syntax object in the run's arena
+;; has changes pending, since making them would make cells that last less
+;; long: a change to one made there is made at once, and keep makes a
+;; syntax object's pending changes before it copies it.
+
+(require-unqualified c "c.sub")
+(require print "../../lib/print.sub")
+
+(provide datum srcloc scope-set
+         run-arena current-arena use-arena begin-module-arena end-module-arena keep
+         nil boolean boolean? null? pair? cons car cdr cadr cddr caddr cdddr list? length reverse append
+         symbol? bytes->symbol symbol-named string->symbol symbol->string symbol-bytes symbol-length
+         keyword? bytes->keyword keyword->string
+         string? bytes->string string-bytes string-length string=?
+         integer? make-integer make-unsigned-integer integer-value integer-negative? flonum? make-flonum flonum-value char? integer->char char->integer
+         syntax? identifier? make-syntax syntax-e syntax->list splice-list syntax->datum datum->syntax syntax-rewrap
+         syntax-scopes syntax-srcloc make-srcloc syntax-property syntax-property-set
+         no-scopes scopes-change scopes-subset? add-scope remove-scope flip-scope
+         write-datum write-scoped)
+
+(memory from c)
+(table from c)
+
+(import host-trap "host" "trap" (i32 i32 ->))
+
+;; ---- cells ----
+
+(variant cell
+  [pair [car (ptr cell)] [cdr (ptr cell)]]
+  [empty]
+  [true]
+  ;; next: the symbol or keyword interned after it whose name has the same
+  ;; hash.
+  [symbol [name (ptr u8)] [length u32] [next (ptr cell)]]
+  [keyword [name (ptr u8)] [length u32] [next (ptr cell)]]
+  [string [bytes (ptr u8)] [length u32]]
+  ;; An integer's 64 bits, low then high, so that a cell needs no 8-byte
+  ;; alignment; they are its two's complement if it is negative, and
+  ;; otherwise its value, below 2^64, as the kernel's.
+  [integer [low u32] [high u32] [negative u32]]
+  [flonum [low u32] [high u32]]
+  [character [code u32]]
+  [syntax [e (ptr cell)] [scopes (ptr scope-set)] [srcloc (ptr srcloc)] [props (ptr cell)] [pending (ptr change)]])
+
+(typedef datum (ptr cell))
+
+;; Trap with message, as the kernel's accessors do given a datum of the
+;; wrong kind.
+(define (fail [message (ptr u8)]) -> datum
+  (host-trap (cast i32 message) (strlen message))
+  0)
+
+;; A source location, as the kernel's: its file, a symbol, as errors name
+;; it; its line, from 1, and column, from 0; and its position and span, in
+;; characters.
+(struct srcloc [source datum] [line u32] [col u32] [pos u32] [span u32])
+
+;; count scopes, greatest first. next: the set interned after it whose
+;; scopes have the same hash.
+(struct scope-set [count u32] [next (ptr scope-set)] [ids (array u32 0)])
+
+;; A change to scope sets: scope added (kind 0), removed (1) or flipped
+;; (2); then the others of a list of them, each of another scope.
+(struct change [scope u32] [kind u32] [next (ptr change)])
+
+;; ---- arenas ----
+
+(define run-arena arena)
+
+;; A module's arena, and the one of the module whose compilation its
+;; compilation is in.
+(struct module-arena [arena arena] [outer (ptr module-arena)])
+
+(define innermost (ptr module-arena) 0)
+(define current (ptr arena) (& run-arena))
+
+(define (current-arena) -> (ptr arena) current)
+
+;; Make a the current arena: the arena that was.
+(define (use-arena [a (ptr arena)]) -> (ptr arena)
+  (let ([was current])
+    (set! current a)
+    was))
+
+(define (in-run-arena?) -> i32 (== current (& run-arena)))
+
+;; A module arena, made current, for a module's compilation.
+(define (begin-module-arena)
+  (let ([m (cast (ptr module-arena) (malloc (sizeof module-arena)))])
+    (set! (-> m arena) (make-arena))
+    (set! (-> m outer) innermost)
+    (set! innermost m)
+    (set! current (& (-> m arena)))))
+
+;; The innermost module arena freed, its module compiled, and the one
+;; around it current again, or the run's.
+(define (end-module-arena)
+  (let ([m innermost])
+    (arena-free (& (-> m arena)))
+    (set! innermost (-> m outer))
+    (set! current (if (== innermost 0) (& run-arena) (& (-> innermost arena))))
+    (free m)
+    ;; Its changes, remembered, are of sets that are gone from its syntax.
+    (hash-clear! (& changes-made))))
+
+;; n bytes, rounded up to a multiple of 8, from arena a: past its chunk's
+;; next free byte, or from arena-alloc when the chunk has no room.
+(define (alloc-in [a (ptr arena)] [n u32]) -> (ptr void)
+  (let ([p (-> a next)])
+    (set! n (bit-and (+ n 7) -8))
+    (if (> n (- (-> a end) p))
+        (arena-alloc a n)
+        (begin (set! (-> a next) (+ p n)) p))))
+
+(begin-for-syntax
+  (require-unqualified substrate "../../lib/substrate.sub")
+  ;; (make-cell c): a new cell in the current arena holding c, a case's
+  ;; construction; (make-cell-in a c), in arena a.
+  (define (make-cell-form s) (syntax-match s [(_ c) #`(make-cell-in current #,c)]))
+  (define (make-cell-in-form s)
+    (syntax-match s [(_ a c) #`(let ([p (cast datum (alloc-in #,a (sizeof cell)))]) (set! (@ p) #,c) p)])))
+
+(define-syntax make-cell make-cell-form)
+(define-syntax make-cell-in make-cell-in-form)
+
+;; ---- lists ----
+
+(define nil datum (make-cell-in (& run-arena) empty))
+(define true-cell datum (make-cell-in (& run-arena) true))
+
+;; #t if b is not 0, else #f.
+(define (boolean [b i32]) -> datum (if b true-cell 0))
+(define (boolean? [d datum]) -> i32 (or (== d 0) (== d true-cell)))
+(define (null? [d datum]) -> i32 (== d nil))
+
+(define (pair? [d datum]) -> i32 (and (!= d 0) (match d [(pair a b) 1] [_ 0])))
+
+(define (cons [a datum] [d datum]) -> datum (make-cell (pair a d)))
+
+(define (car [p datum]) -> datum
+  (when (== p 0) (return (fail "expected a pair")))
+  (match p [(pair a d) a] [_ (fail "expected a pair")]))
+
+(define (cdr [p datum]) -> datum
+  (when (== p 0) (return (fail "expected a pair")))
+  (match p [(pair a d) d] [_ (fail "expected a pair")]))
+
+(define (cadr [p datum]) -> datum (car (cdr p)))
+(define (cddr [p datum]) -> datum (cdr (cdr p)))
+(define (caddr [p datum]) -> datum (car (cddr p)))
+(define (cdddr [p datum]) -> datum (cdr (cddr p)))
+
+;; Pair p made to end with d: for building a list from its start.
+(define (set-cdr! [p datum] [d datum]) (match p [(pair a b) (set! b d)] [_ 0]))
+
+(define (list? [l datum]) -> i32
+  (while (pair? l) (set! l (cdr l)))
+  (== l nil))
+
+(define (length [l datum]) -> u32
+  (let ([n u32 0])
+    (while (pair? l) (+= n 1) (set! l (cdr l)))
+    n))
+
+(define (reverse [l datum]) -> datum
+  (let ([r nil])
+    (while (pair? l) (set! r (cons (car l) r)) (set! l (cdr l)))
+    r))
+
+;; a's elements, then b, shared.
+(define (append [a datum] [b datum]) -> datum
+  (let ([r (reverse a)])
+    (while (pair? r) (set! b (cons (car r) b)) (set! r (cdr r)))
+    b))
+
+;; ---- symbols, keywords and strings ----
+
+;; FNV-1a over the n bytes at p, never 0, so a hash table's key.
+(define (hash-bytes [p (ptr u8)] [n u32]) -> u64
+  (let ([h u64 14695981039346656037])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! h (* (bit-xor h (@ p i)) 1099511628211)))
+    (bit-or h 1)))
+
+(define (bytes=? [a (ptr u8)] [b (ptr u8)] [n u32]) -> i32
+  (for ([i u32 0]) (< i n) (+= i 1)
+    (when (!= (@ a i) (@ b i)) (return 0)))
+  1)
+
+;; Hash -> the latest symbol or keyword of a name with that hash.
+(define symbols hash-table)
+(define keywords hash-table)
+
+;; The symbol, or the keyword if kw is not 0, named by the n bytes at
+;; p: made the first time, in the run's arena, and the same after.
+(define (intern [p (ptr u8)] [n u32] [kw i32]) -> datum
+  (let* ([t (if kw (& keywords) (& symbols))] [key (hash-bytes p n)] [latest (cast datum (hash-ref t key))] [s latest])
+    (while (!= s 0)
+      (match s
+        [(symbol name length next) (when (and (== length n) (bytes=? name p n)) (return s)) (set! s next)]
+        [(keyword name length next) (when (and (== length n) (bytes=? name p n)) (return s)) (set! s next)]
+        [_ (set! s 0)]))
+    (let ([name (cast (ptr u8) (alloc-in (& run-arena) (+ n 1)))] [made datum 0])
+      (memcpy name p n)
+      (set! (@ name n) 0)
+      (set! made (if kw (make-cell-in (& run-arena) (keyword name n latest)) (make-cell-in (& run-arena) (symbol name n latest))))
+      (hash-set! t key (cast u32 made))
+      made)))
+
+(define (symbol? [d datum]) -> i32 (and (!= d 0) (match d [(symbol a b c) 1] [_ 0])))
+(define (bytes->symbol [p (ptr u8)] [n u32]) -> datum (intern p n 0))
+;; The symbol named by the C string s.
+(define (symbol-named [s (ptr u8)]) -> datum (intern s (strlen s) 0))
+(define (string->symbol [s datum]) -> datum (intern (string-bytes s) (string-length s) 0))
+
+;; Its name's bytes, followed by a 0.
+(define (symbol-bytes [s datum]) -> (ptr u8)
+  (unless (symbol? s) (fail "expected a symbol"))
+  (match s [(symbol name length next) name] [_ 0]))
+
+(define (symbol-length [s datum]) -> u32
+  (unless (symbol? s) (fail "expected a symbol"))
+  (match s [(symbol name length next) length] [_ 0]))
+
+;; A string of its name's bytes, which it shares.
+(define (symbol->string [s datum]) -> datum (make-cell (string (symbol-bytes s) (symbol-length s))))
+
+(define (keyword? [d datum]) -> i32 (and (!= d 0) (match d [(keyword a b c) 1] [_ 0])))
+(define (bytes->keyword [p (ptr u8)] [n u32]) -> datum (intern p n 1))
+
+(define (keyword->string [k datum]) -> datum
+  (unless (keyword? k) (fail "expected a keyword"))
+  (match k [(keyword name length next) (make-cell (string name length))] [_ 0]))
+
+(define (string? [d datum]) -> i32 (and (!= d 0) (match d [(string a b) 1] [_ 0])))
+
+;; A string of the n bytes at p, copied.
+(define (bytes->string [p (ptr u8)] [n u32]) -> datum
+  (let ([bytes (cast (ptr u8) (alloc-in current n))])
+    (memcpy bytes p n)
+    (make-cell (string bytes n))))
+
+(define (string-bytes [s datum]) -> (ptr u8)
+  (unless (string? s) (fail "expected a string"))
+  (match s [(string bytes length) bytes] [_ 0]))
+
+(define (string-length [s datum]) -> u32
+  (unless (string? s) (fail "expected a string"))
+  (match s [(string bytes length) length] [_ 0]))
+
+(define (string=? [a datum] [b datum]) -> i32
+  (and (== (string-length a) (string-length b)) (bytes=? (string-bytes a) (string-bytes b) (string-length a))))
+
+;; ---- numbers and characters ----
+
+(define (integer? [d datum]) -> i32 (and (!= d 0) (match d [(integer a b c) 1] [_ 0])))
+(define (make-integer [n i64]) -> datum (make-cell (integer (cast u32 n) (cast u32 (>> n 32)) (< n 0))))
+;; The integer n, from 0 to 2^64 - 1.
+(define (make-unsigned-integer [n u64]) -> datum (make-cell (integer (cast u32 n) (cast u32 (>> n 32)) 0)))
+
+;; Its 64-bit two's complement; with integer-negative? its exact value.
+(define (integer-value [d datum]) -> i64
+  (unless (integer? d) (fail "expected an integer"))
+  (match d [(integer low high negative) (bit-or (cast i64 low) (<< (cast i64 high) 32))] [_ 0]))
+
+(define (integer-negative? [d datum]) -> i32
+  (unless (integer? d) (fail "expected an integer"))
+  (match d [(integer low high negative) negative] [_ 0]))
+
+(define (flonum? [d datum]) -> i32 (and (!= d 0) (match d [(flonum a b) 1] [_ 0])))
+
+(define (make-flonum [x f64]) -> datum
+  (let ([d (make-cell (flonum 0 0))])
+    (match d [(flonum low high) (set! (@ (cast (ptr f64) (& low))) x)] [_ 0])
+    d))
+
+(define (flonum-value [d datum]) -> f64
+  (unless (flonum? d) (fail "expected a flonum"))
+  (match d [(flonum low high) (@ (cast (ptr f64) (& low)))] [_ 0]))
+
+(define (char? [d datum]) -> i32 (and (!= d 0) (match d [(character c) 1] [_ 0])))
+(define (integer->char [n u32]) -> datum (make-cell (character n)))
+
+(define (char->integer [d datum]) -> u32
+  (unless (char? d) (fail "expected a character"))
+  (match d [(character c) c] [_ 0]))
+
+;; ---- scope sets ----
+
+;; Hash -> the latest set of scopes with that hash; and (set, scope, kind)
+;; -> the set with that change made, while a module's cells last.
+(define scope-sets hash-table)
+(define changes-made hash-table)
+
+;; FNV-1a over the n words at p, never 0.
+(define (hash-words [p (ptr u32)] [n u32]) -> u64
+  (let ([h u64 14695981039346656037])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! h (* (bit-xor h (@ p i)) 1099511628211)))
+    (bit-or h 1)))
+
+;; The set of the n scopes at ids, greatest first: made the first time, in
+;; the run's arena, and the same after.
+(define (intern-scopes [ids (ptr u32)] [n u32]) -> (ptr scope-set)
+  (let* ([key (hash-words ids n)] [latest (cast (ptr scope-set) (hash-ref (& scope-sets) key))] [s latest])
+    (while (!= s 0)
+      (when (== (-> s count) n)
+        (let ([same 1])
+          (for ([i u32 0]) (and same (< i n)) (+= i 1)
+            (set! same (== (@ (-> s ids) i) (@ ids i))))
+          (when same (return s))))
+      (set! s (-> s next)))
+    (let ([made (cast (ptr scope-set) (alloc-in (& run-arena) (+ (sizeof scope-set) (* 4 n))))])
+      (set! (-> made count) n)
+      (set! (-> made next) latest)
+      (memcpy (-> made ids) ids (* 4 n))
+      (hash-set! (& scope-sets) key (cast u32 made))
+      made)))
+
+(define no-scopes (ptr scope-set) (intern-scopes 0 0))
+
+;; Where a changed set is worked out: room for room scopes.
+(define scratch (ptr u32) 0)
+(define scratch-room u32 0)
+
+(define (scratch-for [n u32]) -> (ptr u32)
+  (when (> n scratch-room)
+    (set! scratch-room (* 2 n))
+    (set! scratch (cast (ptr u32) (realloc scratch (* 4 scratch-room)))))
+  scratch)
+
+;; Set s with scope sc added (kind 0), removed (1) or flipped (2).
+(define (scopes-change [s (ptr scope-set)] [sc u32] [kind u32]) -> (ptr scope-set)
+  (let* ([key (bit-or (<< (cast u64 s) 32) (bit-or (<< sc 2) kind))]
+         [known (cast (ptr scope-set) (hash-ref (& changes-made) key))])
+    (if (!= known 0)
+        known
+        (let ([made (scopes-changed s sc kind)])
+          (hash-set! (& changes-made) key (cast u32 made))
+          made))))
+
+(define (scopes-changed [s (ptr scope-set)] [sc u32] [kind u32]) -> (ptr scope-set)
+  (let* ([n (-> s count)] [ids (-> s ids)] [i u32 0])
+    ;; i: where sc is, or would be.
+    (while (and (< i n) (> (@ ids i) sc)) (+= i 1))
+    (if (and (< i n) (== (@ ids i) sc))
+        (if (== kind 0)
+            s
+            (let ([out (scratch-for n)])
+              (memcpy out ids (* 4 i))
+              (memcpy (+ out i) (+ ids i 1) (* 4 (- n i 1)))
+              (intern-scopes out (- n 1))))
+        (if (== kind 1)
+            s
+            (let ([out (scratch-for (+ n 1))])
+              (memcpy out ids (* 4 i))
+              (set! (@ out i) sc)
+              (memcpy (+ out i 1) (+ ids i) (* 4 (- n i)))
+              (intern-scopes out (+ n 1)))))))
+
+;; Is every scope of a in b? Both are greatest first, so a scope of b
+;; less than a's next is past where that one would be.
+(define (scopes-subset? [a (ptr scope-set)] [b (ptr scope-set)]) -> i32
+  (let ([i u32 0] [j u32 0] [n (-> a count)] [m (-> b count)] [x (-> a ids)] [y (-> b ids)])
+    (while (< i n)
+      (when (or (>= j m) (> (@ x i) (@ y j))) (return 0))
+      (when (== (@ x i) (@ y j)) (+= i 1))
+      (+= j 1))
+    1))
+
+;; ---- changes to scopes ----
+;;
+;; As the kernel's (compiler/kernel.sub): a list of changes, at most one
+;; per scope, pending for the syntax objects inside a syntax object.
+
+(define (new-change [sc u32] [kind u32] [next (ptr change)]) -> (ptr change)
+  (let ([c (cast (ptr change) (alloc-in current (sizeof change)))])
+    (set! (-> c scope) sc)
+    (set! (-> c kind) kind)
+    (set! (-> c next) next)
+    c))
+
+;; Changes cs, then change kind to sc: an add or a remove replaces an
+;; earlier change to sc; a flip turns an add into a remove, a remove into
+;; an add, and undoes a flip.
+(define (changes-add [cs (ptr change)] [sc u32] [kind u32]) -> (ptr change)
+  (when (== cs 0) (return (new-change sc kind 0)))
+  (unless (== (-> cs scope) sc)
+    (return (new-change (-> cs scope) (-> cs kind) (changes-add (-> cs next) sc kind))))
+  (when (!= kind 2) (return (new-change sc kind (-> cs next))))
+  (if (== (-> cs kind) 2) (-> cs next) (new-change sc (- 1 (-> cs kind)) (-> cs next))))
+
+;; Changes cs, then the later ones.
+(define (changes-compose [cs (ptr change)] [later (ptr change)]) -> (ptr change)
+  (when (== cs 0) (return later))
+  (while (!= later 0)
+    (set! cs (changes-add cs (-> later scope) (-> later kind)))
+    (set! later (-> later next)))
+  cs)
+
+(define (scopes-apply [s (ptr scope-set)] [cs (ptr change)]) -> (ptr scope-set)
+  (while (!= cs 0)
+    (set! s (scopes-change s (-> cs scope) (-> cs kind)))
+    (set! cs (-> cs next)))
+  s)
+
+;; Syntax object s with changes cs made to its scopes and, pending, to
+;; the syntax objects in its datum; or, in the run's arena, made to them
+;; now.
+(define (change-all [s datum] [cs (ptr change)]) -> datum
+  (match s
+    [(syntax e scopes loc props pending)
+     (if (in-run-arena?)
+         (make-cell (syntax (push (push e pending) cs) (scopes-apply scopes cs) loc props 0))
+         (make-cell (syntax e (scopes-apply scopes cs) loc props (if (or (pair? e) (syntax? e)) (changes-compose pending cs) 0))))]
+    [_ s]))
+
+;; Datum d with changes cs made to the syntax objects in it outside any
+;; syntax object: a list is made again, of its elements with the changes
+;; made.
+(define (push [d datum] [cs (ptr change)]) -> datum
+  (when (or (== cs 0) (== d 0)) (return d))
+  (when (syntax? d) (return (change-all d cs)))
+  (unless (pair? d) (return d))
+  (let* ([head (cons (push (car d) cs) nil)] [last head] [rest (cdr d)])
+    (while (pair? rest)
+      (let ([p (cons (push (car rest) cs) nil)])
+        (set-cdr! last p)
+        (set! last p))
+      (set! rest (cdr rest)))
+    (set-cdr! last (if (syntax? rest) (change-all rest cs) rest))
+    head))
+
+;; d with scope sc added, removed or flipped in every syntax object in it.
+(define (add-scope [d datum] [sc u32]) -> datum (push d (new-change sc 0 0)))
+(define (remove-scope [d datum] [sc u32]) -> datum (push d (new-change sc 1 0)))
+(define (flip-scope [d datum] [sc u32]) -> datum (push d (new-change sc 2 0)))
+
+;; ---- syntax objects ----
+
+(define (syntax? [d datum]) -> i32 (and (!= d 0) (match d [(syntax a b c e f) 1] [_ 0])))
+
+(define (checked-syntax [s datum]) -> datum
+  (unless (syntax? s) (fail "expected a syntax object"))
+  s)
+
+(define (make-syntax [e datum] [scopes (ptr scope-set)] [loc (ptr srcloc)] [props datum]) -> datum
+  (make-cell (syntax e scopes loc props 0)))
+
+(define (make-srcloc [source datum] [line u32] [col u32] [pos u32] [span u32]) -> (ptr srcloc)
+  (let ([l (cast (ptr srcloc) (alloc-in current (sizeof srcloc)))])
+    (set! (-> l source) source)
+    (set! (-> l line) line)
+    (set! (-> l col) col)
+    (set! (-> l pos) pos)
+    (set! (-> l span) span)
+    l))
+
+;; Its datum, with the changes pending for the syntax objects in it made.
+(define (syntax-e [s datum]) -> datum
+  (match (checked-syntax s)
+    [(syntax e scopes loc props pending)
+     (when (!= pending 0)
+       (set! e (push e pending))
+       (set! pending 0))
+     e]
+    [_ 0]))
+
+;; Its datum as it is: pending changes do not change its shape.
+(define (datum-of [s datum]) -> datum (match s [(syntax e scopes loc props pending) e] [_ 0]))
+
+(define (identifier? [d datum]) -> i32 (and (syntax? d) (symbol? (datum-of d))))
+
+(define (syntax-scopes [s datum]) -> (ptr scope-set)
+  (match (checked-syntax s) [(syntax e scopes loc props pending) scopes] [_ 0]))
+
+(define (syntax-srcloc [s datum]) -> (ptr srcloc)
+  (match (checked-syntax s) [(syntax e scopes loc props pending) loc] [_ 0]))
+
+;; The elements of a syntax list, or d if it is a list already.
+(define (splice-list [d datum]) -> datum (if (syntax? d) (syntax-e d) d))
+
+;; The elements of a syntax list, or #f if d is not one.
+(define (syntax->list [d datum]) -> datum
+  (let ([e (splice-list d)])
+    (if (list? e) e 0)))
+
+(define (syntax->datum [d datum]) -> datum
+  (if (syntax? d)
+      (syntax->datum (datum-of d))
+      (if (pair? d) (cons (syntax->datum (car d)) (syntax->datum (cdr d))) d)))
+
+;; d, each datum in it that is not syntax made a syntax object with the
+;; scopes of ctx and the source location of loc, each a syntax object or
+;; #f for none.
+(define (datum->syntax [ctx datum] [d datum] [loc datum]) -> datum
+  (wrap d (if (syntax? ctx) (syntax-scopes ctx) no-scopes) (if (syntax? loc) (syntax-srcloc loc) 0)))
+
+(define (wrap [d datum] [scopes (ptr scope-set)] [loc (ptr srcloc)]) -> datum
+  (when (syntax? d) (return d))
+  (unless (pair? d) (return (make-syntax d scopes loc nil)))
+  (let* ([head (cons (wrap (car d) scopes loc) nil)] [last head] [rest (cdr d)])
+    (while (pair? rest)
+      (let ([p (cons (wrap (car rest) scopes loc) nil)])
+        (set-cdr! last p)
+        (set! last p))
+      (set! rest (cdr rest)))
+    (set-cdr! last (if (null? rest) nil (wrap rest scopes loc)))
+    (make-syntax head scopes loc nil)))
+
+;; A copy of s holding datum e, with its scopes, location and properties.
+(define (syntax-rewrap [s datum] [e datum]) -> datum
+  (match (checked-syntax s) [(syntax x scopes loc props pending) (make-syntax e scopes loc props)] [_ 0]))
+
+;; ---- properties ----
+;;
+;; A syntax object's properties are a list of (key . value), each key a
+;; datum compared with ==, so a symbol makes a good one.
+
+;; The value of property key, or #f.
+(define (syntax-property [s datum] [key datum]) -> datum
+  (let ([ps (match (checked-syntax s) [(syntax e scopes loc props pending) props] [_ 0])])
+    (while (pair? ps)
+      (when (== (car (car ps)) key) (return (cdr (car ps))))
+      (set! ps (cdr ps)))
+    0))
+
+;; A copy of s with property key's value value.
+(define (syntax-property-set [s datum] [key datum] [value datum]) -> datum
+  ;; A copy in the run's arena may have no changes pending.
+  (when (in-run-arena?) (syntax-e s))
+  (match (checked-syntax s)
+    [(syntax e scopes loc props pending)
+     (make-cell (syntax e scopes loc (cons (cons key value) (without key props)) pending))]
+    [_ 0]))
+
+(define (without [key datum] [ps datum]) -> datum
+  (if (pair? ps)
+      (if (== (car (car ps)) key) (without key (cdr ps)) (cons (car ps) (without key (cdr ps))))
+      ps))
+
+;; ---- keeping ----
+
+;; d, copied into the run's arena, to last past the compilation of the
+;; module whose arena it is in; with its syntax objects' pending changes
+;; made first, in that arena. Symbols, keywords, scope sets, nil and #t
+;; are in the run's arena already.
+(define (keep [d datum]) -> datum
+  (when (or (== d 0) (== d nil) (== d true-cell)) (return d))
+  (match d
+    [(pair a b) (let ([x (keep a)] [y (keep b)]) (make-cell-in (& run-arena) (pair x y)))]
+    [(string bytes length)
+     (let ([kept (cast (ptr u8) (alloc-in (& run-arena) length))])
+       (memcpy kept bytes length)
+       (make-cell-in (& run-arena) (string kept length)))]
+    [(integer low high negative) (make-cell-in (& run-arena) (integer low high negative))]
+    [(flonum low high) (make-cell-in (& run-arena) (flonum low high))]
+    [(character c) (make-cell-in (& run-arena) (character c))]
+    [(syntax e scopes loc props pending)
+     (let ([x (keep (syntax-e d))] [l (keep-srcloc loc)] [ps (keep props)])
+       (make-cell-in (& run-arena) (syntax x scopes l ps 0)))]
+    [_ d]))
+
+(define (keep-srcloc [l (ptr srcloc)]) -> (ptr srcloc)
+  (if (== l 0)
+      0
+      (let ([kept (cast (ptr srcloc) (alloc-in (& run-arena) (sizeof srcloc)))])
+        (set! (@ kept) (@ l))
+        kept)))
+
+;; ---- writing ----
+;;
+;; A datum as Substrate's write writes it (lib/substrate-core.sub): a
+;; syntax object as #<syntax d>, d its datum.
+
+(define (write-datum [d datum]) (write-in d 0))
+
+;; A datum written so that its scopes show: each syntax object as its
+;; datum followed by its scopes, as {3 1}, and looked inside with syntax-e,
+;; which makes its pending changes.
+(define (write-scoped [d datum]) (write-in d 1))
+
+(define (write-c [s (ptr u8)]) (print:write-bytes (cast i32 s) (strlen s)))
+
+(define (write-name [p (ptr u8)] [n u32]) (print:write-bytes (cast i32 p) n))
+
+;; d, written; scoped is 1 as write-scoped writes, 2 inside a syntax
+;; object, which write-datum writes without its scopes, else 0.
+(define (write-in [d datum] [scoped i32])
+  (when (== d 0)
+    (write-c "#f")
+    (return))
+  (match d
+    [(pair a b) (write-pair d scoped)]
+    [empty (write-c "()")]
+    [true (write-c "#t")]
+    [(symbol name length next) (write-name name length)]
+    [(keyword name length next) (write-c "#:") (write-name name length)]
+    [(string bytes length) (write-string bytes length)]
+    [(integer low high negative)
+     (if negative
+         (begin (print:write-byte 45) (print:write-u64 (- 0 (integer-value d))))
+         (print:write-u64 (integer-value d)))]
+    [(flonum low high) (write-flonum (flonum-value d))]
+    [(character c) (write-char c)]
+    [(syntax e scopes loc props pending)
+     (if (== scoped 1)
+         (begin (write-in (syntax-e d) 1) (write-scopes scopes))
+         (if (== scoped 2)
+             (write-in e 2)
+             (begin (write-c "#<syntax ") (write-in e 2) (write-c ">"))))]))
+
+(define (write-pair [d datum] [scoped i32])
+  (let ([prefix (abbreviation d)])
+    (when (!= prefix 0)
+      (write-c prefix)
+      (write-in (cadr d) scoped)
+      (return)))
+  (print:write-byte 40)
+  (write-in (car d) scoped)
+  (let ([rest (cdr d)])
+    (while (pair? rest)
+      (print:write-byte 32)
+      (write-in (car rest) scoped)
+      (set! rest (cdr rest)))
+    (unless (null? rest)
+      (write-c " . ")
+      (write-in rest scoped)))
+  (print:write-byte 41))
+
+;; The prefix a two-element list (quote x) and its kin are written with,
+;; as they read: 'x, `x, ,x, ,@x, #'x, #`x, #,x and #,@x; else 0.
+(define (abbreviation [d datum]) -> (ptr u8)
+  (let ([head (car d)] [rest (cdr d)])
+    (if (or (not (pair? rest)) (not (null? (cdr rest))) (not (symbol? head)))
+        0
+        (let ([names (array (ptr u8) 8)] [prefixes (array (ptr u8) 8)])
+          (set! (@ names 0) "quote") (set! (@ prefixes 0) "'")
+          (set! (@ names 1) "quasiquote") (set! (@ prefixes 1) "`")
+          (set! (@ names 2) "unquote") (set! (@ prefixes 2) ",")
+          (set! (@ names 3) "unquote-splicing") (set! (@ prefixes 3) ",@")
+          (set! (@ names 4) "quote-syntax") (set! (@ prefixes 4) "#'")
+          (set! (@ names 5) "quasisyntax") (set! (@ prefixes 5) "#`")
+          (set! (@ names 6) "unsyntax") (set! (@ prefixes 6) "#,")
+          (set! (@ names 7) "unsyntax-splicing") (set! (@ prefixes 7) "#,@")
+          (for ([i 0]) (< i 8) (+= i 1)
+            (when (== head (symbol-named (@ names i))) (return (@ prefixes i))))
+          0))))
+
+(define (write-scopes [s (ptr scope-set)])
+  (print:write-byte 123)
+  (for ([i u32 0]) (< i (-> s count)) (+= i 1)
+    (when (> i 0) (print:write-byte 32))
+    (print:write-u64 (@ (-> s ids) i)))
+  (print:write-byte 125))
+
+;; A string in double quotes, with ", \ and control characters escaped.
+(define (write-string [p (ptr u8)] [n u32])
+  (print:write-byte 34)
+  (for ([i u32 0]) (< i n) (+= i 1)
+    (let ([b (@ p i)])
+      (if (or (== b 34) (== b 92))
+          (begin (print:write-byte 92) (print:write-byte b))
+          (if (== b 10)
+              (write-c "\\n")
+              (if (== b 9)
+                  (write-c "\\t")
+                  (if (== b 13)
+                      (write-c "\\r")
+                      (if (or (< b 32) (== b 127))
+                          (begin (write-c "\\x") (write-hex b) (print:write-byte 59))
+                          (print:write-byte b))))))))
+  (print:write-byte 34))
+
+(define (write-hex [n u32])
+  (when (>= n 16) (write-hex (>> n 4)))
+  (let ([d (bit-and n 15)])
+    (print:write-byte (if (< d 10) (+ 48 d) (+ 87 d)))))
+
+;; A character as #\c, or its name.
+(define (write-char [c u32])
+  (write-c "#\\")
+  (let ([names (array (ptr u8) 9)] [codes (array u32 9)])
+    (set! (@ names 0) "space") (set! (@ codes 0) 32)
+    (set! (@ names 1) "newline") (set! (@ codes 1) 10)
+    (set! (@ names 2) "tab") (set! (@ codes 2) 9)
+    (set! (@ names 3) "return") (set! (@ codes 3) 13)
+    (set! (@ names 4) "nul") (set! (@ codes 4) 0)
+    (set! (@ names 5) "alarm") (set! (@ codes 5) 7)
+    (set! (@ names 6) "backspace") (set! (@ codes 6) 8)
+    (set! (@ names 7) "escape") (set! (@ codes 7) 27)
+    (set! (@ names 8) "delete") (set! (@ codes 8) 127)
+    (for ([i 0]) (< i 9) (+= i 1)
+      (when (== c (@ codes i))
+        (write-c (@ names i))
+        (return))))
+  (if (< c 32)
+      (begin (print:write-byte 120) (write-hex c))
+      (write-utf-8 c)))
+
+(define (write-utf-8 [c u32])
+  (if (< c 128)
+      (print:write-byte c)
+      (if (< c 2048)
+          (begin (print:write-byte (bit-or 192 (>> c 6))) (print:write-byte (bit-or 128 (bit-and c 63))))
+          (if (< c 65536)
+              (begin
+                (print:write-byte (bit-or 224 (>> c 12)))
+                (print:write-byte (bit-or 128 (bit-and (>> c 6) 63)))
+                (print:write-byte (bit-or 128 (bit-and c 63))))
+              (begin
+                (print:write-byte (bit-or 240 (>> c 18)))
+                (print:write-byte (bit-or 128 (bit-and (>> c 12) 63)))
+                (print:write-byte (bit-or 128 (bit-and (>> c 6) 63)))
+                (print:write-byte (bit-or 128 (bit-and c 63))))))))
+
+;; 10^k, for k up to 22, which a double holds exactly.
+(define (ten-to [k i32]) -> f64
+  (let ([p f64 1])
+    (for ([i 0]) (< i k) (+= i 1) (set! p (* p 10)))
+    p))
+
+;; x as Substrate's write writes it: +nan.0, +inf.0 or -inf.0; else its
+;; digits, in fixed-point notation from 10^-3 up to 10^10, else in
+;; scientific notation, 1.5e10. Its digits are the fewest that read back
+;; as x, as Clinger's fast path finds them: for p from 1, the integer D
+;; of p digits nearest x over 10^q is x's if D times 10^q, one rounding of
+;; exact operands, is x. That needs D below 2^53 and 10^|q| exact, up to
+;; 10^22, as holds for the decimals code is written with. Otherwise x is
+;; written with 15 digits, which may not read back as x.
+(define (write-flonum [x f64])
+  (when (!= x x) (write-c "+nan.0") (return))
+  (when (== x (/ 1.0 0.0)) (write-c "+inf.0") (return))
+  (when (== x (/ -1.0 0.0)) (write-c "-inf.0") (return))
+  (when (or (< x 0) (and (== x 0) (< (/ 1.0 x) 0))) (print:write-byte 45))
+  (when (== x 0) (write-c "0.0") (return))
+  (let ([a (fabs x)] [k 0] [m f64 0] [y f64 0])
+    ;; a is about m times 10^k, m in [1, 10).
+    (set! m a)
+    (while (>= m 10) (set! m (/ m 10)) (+= k 1))
+    (while (< m 1) (set! m (* m 10)) (-= k 1))
+    (for ([p 1]) (<= p 17) (+= p 1)
+      (let ([q (- (+ k 1) p)])
+        (when (and (<= q 22) (>= q -22))
+          (let ([scale (ten-to (if (< q 0) (- q) q))])
+            (set! y (nearbyint (if (< q 0) (* a scale) (/ a scale))))
+            (when (and (< y 9007199254740992.0) (== a (if (< q 0) (/ y scale) (* y scale))))
+              (write-digits (cast u64 y) q)
+              (return))))))
+    (write-digits (cast u64 (nearbyint (over-ten-to a (- k 14)))) (- k 14))))
+
+;; a over 10^k, a rounding for each 10^22.
+(define (over-ten-to [a f64] [k i32]) -> f64
+  (while (>= k 22) (set! a (/ a 1e22)) (-= k 22))
+  (while (<= k -22) (set! a (* a 1e22)) (+= k 22))
+  (if (< k 0) (* a (ten-to (- k))) (/ a (ten-to k))))
+
+;; The number d times 10^q, d not 0, as write-flonum writes it.
+(define (write-digits [d u64] [q i32])
+  (let ([ds (array u8 24)] [n 0])
+    (while (!= d 0)
+      (set! (@ ds n) (+ 48 (cast i32 (% d 10))))
+      (+= n 1)
+      (set! d (/ d 10)))
+    ;; Most significant first, and no zeros at the end: the number is
+    ;; 0.ds times 10^k.
+    (for ([i 0]) (< i (/ n 2)) (+= i 1)
+      (let ([t (@ ds i)]) (set! (@ ds i) (@ ds (- n i 1))) (set! (@ ds (- n i 1)) t)))
+    (while (and (> n 1) (== (@ ds (- n 1)) 48)) (-= n 1) (+= q 1))
+    (let ([k (+ q n)])
+      (if (and (>= k -2) (<= k 10))
+          (if (<= k 0)
+              (begin
+                (write-c "0.")
+                (for ([i 0]) (< i (- k)) (+= i 1) (print:write-byte 48))
+                (write-name ds n))
+              (if (< k n)
+                  (begin (write-name ds k) (print:write-byte 46) (write-name (+ ds k) (- n k)))
+                  (begin
+                    (write-name ds n)
+                    (for ([i n]) (< i k) (+= i 1) (print:write-byte 48))
+                    (write-c ".0"))))
+          (begin
+            (write-name ds 1)
+            (when (> n 1) (print:write-byte 46) (write-name (+ ds 1) (- n 1)))
+            (print:write-byte 101)
+            (when (< k 1) (print:write-byte 45))
+            (print:write-u64 (if (>= k 1) (- k 1) (- 1 k))))))))
