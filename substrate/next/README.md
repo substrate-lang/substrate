@@ -20,6 +20,16 @@ on them there.
     decimals that the old compiler takes from Substrate.
   - `host.sub`: `compiler/host.sub`, with reading files.
   - `reader.sub`: `compiler/reader.sub`.
+  - `core.sub`: `compiler/core.sub`, with its infos as C structs, each
+    with a record, a datum, that stands for it in lowered code.
+  - `ops.sub`: `compiler/ops.sub`.
+  - `expander.sub`: `compiler/expander.sub`, but for compile-time code,
+    which it says it does not do yet.
+  - `main.sub`: `compiler/main.sub`, with its `expand` command.
+- `sub`: runs the new compiler as `bin/sub` runs the compiler, which
+  builds it first when its sources changed: `next/sub expand FILE`.
+- `compare.sh`: every `.sub` file of the repository expanded by both
+  compilers, which must print the same.
 - `bench/`: the kernel's scope changes against the new syntax objects'
   (`run.sh`).
 
@@ -31,7 +41,10 @@ Its tests are in `tests/next`, which `tests/run.sh` runs.
    and the libraries' files as `compiler/reader.sub` does, datum for
    datum and location for location.
 2. The expander, compiling to wasm, and compile-time code and phases.
-   The kernel's tests are the check.
+   The kernel's tests are the check. The expander is done but for
+   compile-time code: what it expands, the kernel module and every file
+   of the repository that needs no compile-time code, it expands as the
+   compiler does, and its errors are the compiler's.
 3. The macro API: patterns and templates.
 4. The C-like Lisp as macros written in itself, ported from
    `examples/c/lang.sub`; then the C example's tests, and the compiler

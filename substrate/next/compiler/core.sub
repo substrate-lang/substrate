@@ -1,0 +1,401 @@
+;; Lifecycle: experimental. Part of the new compiler (next/), written in
+;; the C example's C: the compiler's core.sub.
+;;
+;; Records and types shared by the expander and the compiler.
+;;
+;; The compiler's input is made of lists, lowered code, which the expander
+;; builds as it expands a module's code:
+;;
+;;  module forms:
+;;    (func info ((key . type) ...) body)   (global info init-or-#f)
+;;    (memory pages)   (table size)   (data dinfo)   (type tinfo)   (tag tginfo)   (expr e)
+;;    (memory-import instance)   (table-import instance)
+;;  expressions:
+;;    (int n) (float x) (const type n)
+;;    (lref key) (lset key e) (gref ginfo) (gset ginfo e)
+;;    (let ((key type-or-#f init) ...) body)   (seq e ...)   (if c t e-or-#f)
+;;    (block key body) (loop key body) (br key e-or-#f) (br-if key c) (return e-or-#f)
+;;    (call finfo (arg ...))  (prim name offset-or-#f (arg ...))
+;;    (call-indirect (param ...) (result ...) idx (arg ...))  (func-index finfo)
+;;    (gc op (immediate ...) (arg ...))
+;;    (select a b c) (drop e) (unreachable) (nop) (quote datum)
+;;    (throw tginfo (arg ...))   (throw-ref e)
+;;    (try ((kind tginfo-or-#f (key ...) body) ...) body), kind catch,
+;;      catch-ref, catch-all or catch-all-ref, and key ... the variables
+;;      the clause binds
+;;
+;; Local and label keys are integers. Functions, globals, data, types and
+;; tags are referred to by their infos, which say which instance defines
+;; them: structs in the run's arena, each with the record that stands for
+;; it in data (syntax.sub), which the functions here take and give.
+;;
+;; Value types are i32, i64, f32, f64, or (ref nullable? heap), where heap
+;; is one of the abstract heap types (any eq i31 struct array func extern
+;; exn none nofunc noextern noexn) or a type-info.
+(require-unqualified c "../../examples/c/c.sub")
+(require-unqualified stx "syntax.sub")
+
+(provide func-info func-info? func-info-name func-info-params func-info-results
+         func-info-instance set-func-info-instance! func-info-export set-func-info-export! func-info-type
+         global-info global-info? global-info-name global-info-type global-info-mutable?
+         global-info-instance set-global-info-instance! global-info-export set-global-info-export!
+         tag-info tag-info? tag-info-name tag-info-params tag-info-instance set-tag-info-instance!
+         tag-info-export set-tag-info-export!
+         data-info data-info? data-info-name data-info-offset data-info-bytes
+         make-type-info type-info? type-info-name type-info-kind type-info-fields set-type-info-fields!
+         type-info-super type-info-final? type-info-group set-type-info-group! type-info-identity
+         identify-group! same-type? func-type?
+         ref-type? make-ref ref-nullable? ref-heap abstract-heaps numeric-type?
+         heap<=? valtype<=? types<=? types=? valtype-join valtype->string unpacked defaultable?
+         closure-type closure-code box-type box-value-type
+         fresh-key! reset-keys!)
+
+(memory from c)
+(table from c)
+
+;; ---- infos ----
+
+;; The kinds of their records.
+(define func-kind u32 1)
+(define global-kind u32 2)
+(define tag-kind u32 3)
+(define data-kind u32 4)
+(define type-kind u32 5)
+
+;; instance: the name of the instance that defines it, or #f while it is
+;; being compiled. export: the export (or import field) name. type: its
+;; declared function type (a type-info), or #f if it has only its
+;; signature.
+(struct func-record [self datum] [name datum] [params datum] [results datum] [instance datum] [export datum] [type datum])
+
+(struct global-record [self datum] [name datum] [type datum] [mutable datum] [instance datum] [export datum])
+
+;; A tag (spec 5.2): the types of its exceptions' values.
+(struct tag-record [self datum] [name datum] [params datum] [instance datum] [export datum])
+
+;; An active data segment: bytes placed at offset in the module's memory.
+(struct data-record [self datum] [name datum] [offset datum] [bytes datum])
+
+;; A declared type. kind is struct, array or func. A struct's fields are a
+;; list of (name storage mutable?); an array's are one (storage mutable?);
+;; a function type's are (params results). storage is a value type, or i8
+;; or i16. super: the declared supertype's type-info, or #f. final?:
+;; whether other types may declare it as their supertype. group: the
+;; type-infos of its recursion group in order, or #f if it is alone in one.
+;; identity: the type it is, once its group is declared (identify-group!),
+;; a number that two declarations of the same type share; 0 before.
+(struct type-record [self datum] [name datum] [kind datum] [fields datum] [super datum] [final datum] [group datum]
+        [identity u32])
+
+(define (new-record [kind u32] [size u32]) -> (ptr void)
+  (let ([p (alloc-in (& run-arena) size)])
+    (set! (@ (cast (ptr datum) p)) (make-record kind p))
+    p))
+
+(define (checked [d datum] [kind u32] [what (ptr u8)]) -> (ptr void)
+  (unless (record? d kind) (raise-compile-error 0 (format-message "internal: expected ~a" (cons (bytes->string what (strlen what)) nil))))
+  (record-pointer d))
+
+(define (func-of [d datum]) -> (ptr func-record) (cast (ptr func-record) (checked d func-kind "a function")))
+(define (global-of [d datum]) -> (ptr global-record) (cast (ptr global-record) (checked d global-kind "a global")))
+(define (tag-of [d datum]) -> (ptr tag-record) (cast (ptr tag-record) (checked d tag-kind "a tag")))
+(define (data-of [d datum]) -> (ptr data-record) (cast (ptr data-record) (checked d data-kind "data")))
+(define (type-of-info [d datum]) -> (ptr type-record) (cast (ptr type-record) (checked d type-kind "a type")))
+
+(define (func-info [name datum] [params datum] [results datum] [instance datum] [export datum] [type datum]) -> datum
+  (let ([f (cast (ptr func-record) (new-record func-kind (sizeof func-record)))])
+    (set! (-> f name) (keep name))
+    (set! (-> f params) (keep params))
+    (set! (-> f results) (keep results))
+    (set! (-> f instance) (keep instance))
+    (set! (-> f export) (keep export))
+    (set! (-> f type) type)
+    (-> f self)))
+
+(define (func-info? [d datum]) -> i32 (record? d func-kind))
+(define (func-info-name [d datum]) -> datum (-> (func-of d) name))
+(define (func-info-params [d datum]) -> datum (-> (func-of d) params))
+(define (func-info-results [d datum]) -> datum (-> (func-of d) results))
+(define (func-info-instance [d datum]) -> datum (-> (func-of d) instance))
+(define (func-info-export [d datum]) -> datum (-> (func-of d) export))
+(define (func-info-type [d datum]) -> datum (-> (func-of d) type))
+(define (set-func-info-instance! [d datum] [v datum]) (set! (-> (func-of d) instance) (keep v)))
+(define (set-func-info-export! [d datum] [v datum]) (set! (-> (func-of d) export) (keep v)))
+
+(define (global-info [name datum] [type datum] [mutable datum] [instance datum] [export datum]) -> datum
+  (let ([g (cast (ptr global-record) (new-record global-kind (sizeof global-record)))])
+    (set! (-> g name) (keep name))
+    (set! (-> g type) (keep type))
+    (set! (-> g mutable) mutable)
+    (set! (-> g instance) (keep instance))
+    (set! (-> g export) (keep export))
+    (-> g self)))
+
+(define (global-info? [d datum]) -> i32 (record? d global-kind))
+(define (global-info-name [d datum]) -> datum (-> (global-of d) name))
+(define (global-info-type [d datum]) -> datum (-> (global-of d) type))
+(define (global-info-mutable? [d datum]) -> datum (-> (global-of d) mutable))
+(define (global-info-instance [d datum]) -> datum (-> (global-of d) instance))
+(define (global-info-export [d datum]) -> datum (-> (global-of d) export))
+(define (set-global-info-instance! [d datum] [v datum]) (set! (-> (global-of d) instance) (keep v)))
+(define (set-global-info-export! [d datum] [v datum]) (set! (-> (global-of d) export) (keep v)))
+
+(define (tag-info [name datum] [params datum] [instance datum] [export datum]) -> datum
+  (let ([t (cast (ptr tag-record) (new-record tag-kind (sizeof tag-record)))])
+    (set! (-> t name) (keep name))
+    (set! (-> t params) (keep params))
+    (set! (-> t instance) (keep instance))
+    (set! (-> t export) (keep export))
+    (-> t self)))
+
+(define (tag-info? [d datum]) -> i32 (record? d tag-kind))
+(define (tag-info-name [d datum]) -> datum (-> (tag-of d) name))
+(define (tag-info-params [d datum]) -> datum (-> (tag-of d) params))
+(define (tag-info-instance [d datum]) -> datum (-> (tag-of d) instance))
+(define (tag-info-export [d datum]) -> datum (-> (tag-of d) export))
+(define (set-tag-info-instance! [d datum] [v datum]) (set! (-> (tag-of d) instance) (keep v)))
+(define (set-tag-info-export! [d datum] [v datum]) (set! (-> (tag-of d) export) (keep v)))
+
+(define (data-info [name datum] [offset datum] [bytes datum]) -> datum
+  (let ([d (cast (ptr data-record) (new-record data-kind (sizeof data-record)))])
+    (set! (-> d name) (keep name))
+    (set! (-> d offset) (keep offset))
+    (set! (-> d bytes) (keep bytes))
+    (-> d self)))
+
+(define (data-info? [d datum]) -> i32 (record? d data-kind))
+(define (data-info-name [d datum]) -> datum (-> (data-of d) name))
+(define (data-info-offset [d datum]) -> datum (-> (data-of d) offset))
+(define (data-info-bytes [d datum]) -> datum (-> (data-of d) bytes))
+
+(define (make-type-info [name datum] [kind datum] [fields datum] [super datum] [final datum] [group datum]) -> datum
+  (let ([t (cast (ptr type-record) (new-record type-kind (sizeof type-record)))])
+    (set! (-> t name) name)
+    (set! (-> t kind) kind)
+    (set! (-> t fields) (keep fields))
+    (set! (-> t super) super)
+    (set! (-> t final) final)
+    (set! (-> t group) (keep group))
+    (set! (-> t identity) 0)
+    (-> t self)))
+
+(define (type-info? [d datum]) -> i32 (record? d type-kind))
+(define (type-info-name [d datum]) -> datum (-> (type-of-info d) name))
+(define (type-info-kind [d datum]) -> datum (-> (type-of-info d) kind))
+(define (type-info-fields [d datum]) -> datum (-> (type-of-info d) fields))
+(define (type-info-super [d datum]) -> datum (-> (type-of-info d) super))
+(define (type-info-final? [d datum]) -> datum (-> (type-of-info d) final))
+(define (type-info-group [d datum]) -> datum (-> (type-of-info d) group))
+(define (type-info-identity [d datum]) -> u32 (-> (type-of-info d) identity))
+(define (set-type-info-fields! [d datum] [v datum]) (set! (-> (type-of-info d) fields) (keep v)))
+(define (set-type-info-group! [d datum] [v datum]) (set! (-> (type-of-info d) group) (keep v)))
+
+;; ---- type identity ----
+;;
+;; A declared type is what wasm makes it (spec 5.1): its recursion group's
+;; structure and its place in the group. Names, including field names, are
+;; not part of it. A group's canonical form lists its members' kinds,
+;; finality, supertypes and field or signature types, with a reference to a
+;; member as (member i) and to another group's type as (type id), id that
+;; type's identity. Identical forms get the same identities, so two
+;; declarations of one type, in any modules, are the same type.
+
+(define identity-count u32 0)
+(define identities hash-table)          ; form -> its members' identities
+
+;; Give the type-infos of a recursion group, in order, their identities.
+(define (identify-group! [members datum])
+  (let* ([form (map (lambda ([t datum]) -> datum (canonical-type t members)) members)]
+         [ids (datum-ref (& identities) form)])
+    (when (== ids 0)
+      (set! ids (map (lambda ([t datum]) -> datum (+= identity-count 1) (make-integer identity-count)) members))
+      (datum-set! (& identities) form ids))
+    (while (pair? members)
+      (set! (-> (type-of-info (car members)) identity) (cast u32 (integer-value (car ids))))
+      (set! members (cdr members))
+      (set! ids (cdr ids)))))
+
+(define (canonical-type [t datum] [members datum]) -> datum
+  (let ([fields (type-info-fields t)] [kind (type-info-kind t)])
+    `(,kind ,(type-info-final? t) ,(if (== (type-info-super t) 0) 0 (canonical-ref (type-info-super t) members))
+      ,(case kind
+         [((sym struct)) (map (lambda ([f datum]) -> datum `(,(canonical-storage (cadr f) members) ,(caddr f))) fields)]
+         [((sym array)) `(,(canonical-storage (car fields) members) ,(cadr fields))]
+         [else `(,(map (lambda ([v datum]) -> datum (canonical-valtype-in v members)) (car fields))
+                 ,(map (lambda ([v datum]) -> datum (canonical-valtype-in v members)) (cadr fields)))]))))
+
+(define (canonical-ref [u datum] [members datum]) -> datum
+  (let ([tail (memq u members)])
+    (cond [(!= tail 0) `(member ,(make-integer (- (length members) (length tail))))]
+          [(== (type-info-identity u) 0)
+           (raise-compile-error 0 (format-message "internal: a type outside the group has no identity yet: ~a" (cons (type-info-name u) nil)))
+           0]
+          [else `(type ,(make-integer (type-info-identity u)))])))
+
+(define (canonical-valtype-in [v datum] [members datum]) -> datum
+  (if (ref-type? v)
+      `(ref ,(ref-nullable? v) ,(let ([h (ref-heap v)]) (if (type-info? h) (canonical-ref h members) h)))
+      v))
+
+(define (canonical-storage [s datum] [members datum]) -> datum
+  (if (or (== s (sym i8)) (== s (sym i16))) s (canonical-valtype-in s members)))
+
+;; Are a and b the same type?
+(define (same-type? [a datum] [b datum]) -> i32
+  (or (== a b)
+      (let ([x (type-info-identity a)]) (and (!= x 0) (== x (type-info-identity b))))))
+
+;; ---- value types ----
+
+(define abstract-heaps datum `(any eq i31 struct array func extern exn none nofunc noextern noexn))
+
+(define (numeric-type? [t datum]) -> i32 (!= (memq t `(i32 i64 f32 f64)) 0))
+(define (ref-type? [t datum]) -> i32 (and (pair? t) (== (car t) (sym ref))))
+(define (make-ref [nullable datum] [heap datum]) -> datum `(ref ,nullable ,heap))
+(define (ref-nullable? [t datum]) -> datum (cadr t))
+(define (ref-heap [t datum]) -> datum (caddr t))
+
+;; A declared type is a subtype of itself, of the supertypes it names, and
+;; of the abstract types above them. Declared types are compared by
+;; identity: two declarations of the same type are one (spec 5.1).
+(define (heap<=? [a datum] [b datum]) -> i32
+  (cond [(== a b) 1]
+        [(and (type-info? a) (type-info? b) (same-type? a b)) 1]
+        [(== a (sym none)) (or (and (type-info? b) (not (func-type? b))) (!= (memq b `(any eq i31 struct array)) 0))]
+        [(== a (sym nofunc)) (or (== b (sym func)) (and (type-info? b) (func-type? b)))]
+        [(== a (sym noexn)) (== b (sym exn))]
+        [(== a (sym noextern)) (== b (sym extern))]
+        [(!= (memq a `(i31 struct array)) 0) (!= (memq b `(eq any)) 0)]
+        [(== a (sym eq)) (== b (sym any))]
+        ;; A declared function type is below func only: functions are not
+        ;; in the any hierarchy.
+        [(type-info? a)
+         (or (and (not (func-type? a)) (!= (memq b `(eq any)) 0))
+             (== b (type-info-kind a))
+             (and (!= (type-info-super a) 0) (heap<=? (type-info-super a) b)))]
+        [else 0]))
+
+(define (func-type? [t datum]) -> i32 (== (type-info-kind t) (sym func)))
+
+;; The least heap type above both a and b, or #f.
+(define (heap-join [a datum] [b datum]) -> datum
+  (cond [(heap<=? b a) a]
+        [(heap<=? a b) b]
+        [(type-info? a) (heap-join (if (!= (type-info-super a) 0) (type-info-super a) (type-info-kind a)) b)]
+        [(and (heap<=? a (sym eq)) (heap<=? b (sym eq))) (sym eq)]
+        [(and (heap<=? a (sym any)) (heap<=? b (sym any))) (sym any)]
+        [else 0]))
+
+(define (valtype<=? [a datum] [b datum]) -> i32
+  (if (and (ref-type? a) (ref-type? b))
+      (and (or (not (ref-nullable? a)) (ref-nullable? b)) (heap<=? (ref-heap a) (ref-heap b)))
+      (== a b)))
+
+(define (types<=? [as datum] [bs datum]) -> i32
+  (unless (== (length as) (length bs)) (return 0))
+  (while (pair? as)
+    (unless (valtype<=? (car as) (car bs)) (return 0))
+    (set! as (cdr as))
+    (set! bs (cdr bs)))
+  1)
+
+;; Are as and bs the same types? Two declarations of one type are (5.1).
+(define (types=? [as datum] [bs datum]) -> i32 (and (types<=? as bs) (types<=? bs as)))
+
+;; The least type both a and b fit, or #f.
+(define (valtype-join [a datum] [b datum]) -> datum
+  (cond [(valtype<=? a b) b]
+        [(valtype<=? b a) a]
+        [(and (ref-type? a) (ref-type? b))
+         (let ([h (heap-join (ref-heap a) (ref-heap b))])
+           (if (== h 0) 0 (make-ref (boolean (or (ref-nullable? a) (ref-nullable? b))) h)))]
+        [else 0]))
+
+(define (unpacked [storage datum]) -> datum (if (or (== storage (sym i8)) (== storage (sym i16))) (sym i32) storage))
+
+;; ---- closures and boxes ----
+;;
+;; A function value of signature (t ... -> r ...) is a closure (spec 5.3): a
+;; struct whose first field, code, is a function of the closure and the
+;; parameters. The closure type and its code's type are one recursion
+;; group, made once for each signature: two declarations of a signature's
+;; closure type, in any modules, are one type (5.1). A lambda that
+;; captures variables is of a final subtype with a field per variable,
+;; which the compiler declares (compile.sub). A captured variable that is
+;; also assigned lives in a box, a struct of one mutable field, one type
+;; per value type.
+
+(define closure-types hash-table)      ; canonical signature -> closure type
+(define closure-codes hash-table)      ; closure type -> its code type
+(define box-types hash-table)          ; canonical value type -> box type
+(define box-infos hash-table)          ; box type -> the type of its value
+
+;; Value type t as a datum that names its identity: two types with one
+;; canonical datum are one type.
+(define (canonical-valtype [t datum]) -> datum
+  (if (ref-type? t)
+      (let ([h (ref-heap t)])
+        `(ref ,(ref-nullable? t) ,(if (type-info? h) (make-integer (type-info-identity h)) h)))
+      t))
+
+;; The closure type of signature params -> results.
+(define (closure-type [params datum] [results datum]) -> datum
+  (let* ([key `(,(map (lambda ([v datum]) -> datum (canonical-valtype v)) params) ,(map (lambda ([v datum]) -> datum (canonical-valtype v)) results))]
+         [known (datum-ref (& closure-types) key)])
+    (if (!= known 0)
+        known
+        (let ([closure (make-type-info (sym closure) (sym struct) 0 0 0 0)]
+              [code (make-type-info (sym code) (sym func) 0 0 (boolean 1) 0)])
+          (set-type-info-fields! closure `((code ,(make-ref 0 code) #f)))
+          (set-type-info-fields! code `(,(cons (make-ref 0 closure) params) ,results))
+          (set-type-info-group! closure `(,closure ,code))
+          (set-type-info-group! code `(,closure ,code))
+          (identify-group! `(,closure ,code))
+          (datum-set! (& closure-types) key closure)
+          (hash-set! (& closure-codes) (cast u64 closure) (cast u32 code))
+          closure))))
+
+;; The code type of closure type t, or of a closure type it is a subtype
+;; of; #f if t is not one.
+(define (closure-code [t datum]) -> datum
+  (if (type-info? t)
+      (let ([code (cast datum (hash-ref (& closure-codes) (cast u64 t)))])
+        (cond [(!= code 0) code]
+              [(!= (type-info-super t) 0) (closure-code (type-info-super t))]
+              [else 0]))
+      0))
+
+;; The box type for values of type t.
+(define (box-type [t datum]) -> datum
+  (let* ([key (canonical-valtype t)] [known (datum-ref (& box-types) key)])
+    (if (!= known 0)
+        known
+        (let ([box (make-type-info (sym box) (sym struct) `((value ,t #t)) 0 (boolean 1) 0)])
+          (identify-group! `(,box))
+          (datum-set! (& box-types) key box)
+          (hash-set! (& box-infos) (cast u64 box) (cast u32 (keep t)))
+          box))))
+
+;; The type of the values box type t holds, or #f if t is not a box type.
+(define (box-value-type [t datum]) -> datum
+  (if (type-info? t) (cast datum (hash-ref (& box-infos) (cast u64 t))) 0))
+
+;; Can a local or global of this type start without an explicit value?
+(define (defaultable? [t datum]) -> i32 (or (numeric-type? t) (and (ref-type? t) (!= (ref-nullable? t) 0))))
+
+;; t as a string, for messages.
+(define (valtype->string [t datum]) -> datum
+  (cond [(symbol? t) (symbol->string t)]
+        [(ref-type? t)
+         (let ([h (ref-heap t)])
+           (if (and (!= (ref-nullable? t) 0) (!= (memq h `(any eq i31 struct array func extern exn)) 0))
+               (format-message "~aref" (cons h nil))
+               (format-message (if (!= (ref-nullable? t) 0) "(ref null ~a)" "(ref ~a)")
+                               (cons (if (type-info? h) (type-info-name h) h) nil))))]
+        [else (format-message "~a" (cons t nil))]))
+
+;; ---- keys ----
+
+(define key-counter i64 0)
+(define (reset-keys!) (set! key-counter 0))
+(define (fresh-key!) -> datum (+= key-counter 1) (make-integer key-counter))
