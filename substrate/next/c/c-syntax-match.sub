@@ -1,0 +1,246 @@
+;; Lifecycle: experimental. syntax-match for C code: syntax-match.sub's
+;; patterns (patterns.sub), compiled to C, on the kernel module's data as
+;; its type datum, for macros written in the C-like Lisp. A module takes it
+;; where it takes the C-like Lisp and kernel.sub, at phase 1 for macros:
+;;
+;;   (begin-for-syntax
+;;     (require-unqualified c ".../c.sub")
+;;     (require-unqualified kd ".../kernel.sub")
+;;     (require sm ".../c-syntax-match.sub" syntax-match _ ... ?))
+;;
+;; (syntax-match subject [pattern body ...] ...) is syntax-match.sub's but
+;; that its parts are C: the subject is a datum, each variable a datum
+;; local of the body, a check's predicate a function of a datum whose
+;; value is a truth, and the bodies' values join as an if's branches do.
+;; If no clause matches, it throws the kernel module's compile-error,
+;; blamed on the subject, with the message syntax-match.sub's gives.
+
+(require-unqualified c "c.sub")
+(require-unqualified kd "../compiler/kernel.sub")
+(require pt "patterns.sub" _ ... ?)
+(provide syntax-match _ ... ?)
+(memory from c)
+(table from c)
+
+;; ---- what the compiled code calls ----
+
+;; x's elements, if they are a pair: that pair; otherwise 0.
+(define (sm-list-pair [x datum]) -> datum (let ([m (splice-list x)]) (if (pair? m) m 0)))
+
+;; Does x match (datum v): is it v, or syntax whose datum is?
+(define (sm-datum-matches? [x datum] [v datum]) -> i32
+  (equal? (if (pair? v) (syntax->datum x) (splice-list x)) v))
+
+;; Does x match #'id: is it an identifier free-identifier=? to id?
+(define (sm-bound-matches? [x datum] [id datum]) -> i32 (and (identifier? x) (free-identifier=? x id)))
+
+;; The elements of list l, whose tails may be syntax lists, as a list; 0
+;; if it is not a proper list.
+(define (sm-elements-of [l datum]) -> datum
+  (let ([m (splice-list l)])
+    (cond [(null? m) nil]
+          [(list? m) m]
+          [(pair? m) (let ([r (sm-elements-of (cdr m))]) (if r (cons (car m) r) 0))]
+          [else 0])))
+
+;; List l after its first n elements, which it has, whose tails may be
+;; syntax lists.
+(define (sm-list-after [l datum] [n i32]) -> datum
+  (while (> n 0)
+    (set! l (cdr (splice-list l)))
+    (-= n 1))
+  l)
+
+;; The message of the error when no clause matches x, whose patterns have
+;; descriptions ds.
+(define (sm-no-match-message [ds datum] [x datum]) -> datum
+  (cast datum (pt:no-match-message (cast i32 ds) (cast i32 x))))
+
+(begin-for-syntax
+  (require k kernel)
+  (require pt "patterns.sub")
+
+  ;; ---- compiling patterns ----
+  ;;
+  ;; As syntax-match.sub compiles them, but to C: a test is a truth, and the
+  ;; clause (if test body next); p ... ending a list is a loop, and p ...
+  ;; followed by more of the list counts the elements that match p and tries
+  ;; the rest after as many as it can, then one fewer, and so on.
+
+  (global who (mut i32) 0)
+  (global temps (mut i32) 0)
+
+  (func (literal [d i32]) -> i32 (k:datum->syntax #'here d 0))
+
+  ;; A temporary: an identifier no other of this expansion is.
+  (func (temp [base i32]) -> i32
+    (set! temps (i32.add temps 1))
+    (k:datum->syntax #'here (k:string->symbol (k:format '"~a~a" `(,base ,(k:fixnum temps)))) 0))
+
+  (func (temps-for [l i32] [base i32]) -> i32
+    (if (k:null? l) '() (let ([t (temp base)]) (k:cons t (temps-for (k:cdr l) base)))))
+
+  ;; [x e] for each x of xs and e of es.
+  (func (bindings [xs i32] [es i32]) -> i32
+    (if (k:null? xs) '() (k:cons #`[#,(k:car xs) #,(k:car es)] (bindings (k:cdr xs) (k:cdr es)))))
+
+  ;; [x datum init] for each x of xs.
+  (func (datum-bindings [xs i32] [init i32]) -> i32
+    (if (k:null? xs) '() (k:cons #`[#,(k:car xs) datum #,init] (datum-bindings (k:cdr xs) init))))
+
+  ;; For a repeated pattern's variables i ..., each of vars, and their
+  ;; accumulators accs, the list of what each matched, the latest first:
+  ;; code that adds each variable's value to its accumulator, or if last,
+  ;; sets each variable to its accumulator's list, in order.
+  (func (acc-sets [is i32] [accs i32] [vars i32] [last i32]) -> i32
+    (if (k:null? is)
+        '()
+        (k:cons (if last
+                    #`(set! #,(pt:nth vars (k:car is)) (reverse #,(k:car accs)))
+                    #`(set! #,(k:car accs) (cons #,(pt:nth vars (k:car is)) #,(k:car accs))))
+                (acc-sets (k:cdr is) (k:cdr accs) vars last))))
+
+  ;; A test is C code whose value is a truth, or (always statement ...),
+  ;; which matched and sets variables.
+  (func (always? [t i32]) -> i32 (if (k:pair? t) (i32.eq (k:car t) 'always) 0))
+
+  (func (test-code [t i32]) -> i32 (if (always? t) #`(begin #,@(k:cdr t) 1) t))
+
+  ;; a, then b.
+  (func (both [a i32] [b i32]) -> i32
+    (if (always? a)
+        (if (always? b) (k:cons 'always (k:append (k:cdr a) (k:cdr b))) #`(begin #,@(k:cdr a) #,(test-code b)))
+        #`(if #,a #,(test-code b) 0)))
+
+  ;; The test of x, an identifier, against description d, setting vars,
+  ;; the pattern's variables' locals by index. values: the form's values.
+  (func (compile-test [d i32] [x i32] [vars i32] [values i32]) -> i32
+    (let ([kind (k:car d)])
+      (if (i32.eq kind 'var)
+          `(always ,#`(set! #,(pt:nth vars (k:cadr d)) #,x))
+          (if (i32.eq kind 'any)
+              '(always)
+              (if (i32.eq kind 'datum)
+                  #`(sm-datum-matches? #,x '#,(literal (k:cadr d)))
+                  (if (i32.eq kind 'bound)
+                      #`(sm-bound-matches? #,x #,(pt:nth values (k:cadr d)))
+                      (if (i32.eq kind 'check)
+                          (both #`(#,(pt:nth values (k:cadr d)) #,x) (compile-tests (k:cddr d) x vars values))
+                          (compile-elements (k:cadr d) (k:caddr d) x vars values))))))))
+
+  (func (compile-tests [ds i32] [x i32] [vars i32] [values i32]) -> i32
+    (if (k:null? ds)
+        '(always)
+        (if (k:null? (k:cdr ds))
+            (compile-test (k:car ds) x vars values)
+            (both (compile-test (k:car ds) x vars values) (compile-tests (k:cdr ds) x vars values)))))
+
+  ;; The elements es, then the tail, of r, a list or syntax list.
+  (func (compile-elements [es i32] [tail i32] [r i32] [vars i32] [values i32]) -> i32
+    (if (k:null? es)
+        (if (i32.eq (k:car tail) 'null)
+            #`(null? (splice-list #,r))
+            (compile-test tail r vars values))
+        (if (i32.eq (k:car (k:car es)) 'repeat)
+            (if (if (k:null? (k:cdr es)) (i32.eq (k:car tail) 'null) 0)
+                (compile-repeat (k:car es) r vars values)
+                (compile-backtrack (k:car es) (k:cdr es) tail r vars values))
+            (let ([m (temp '"m")] [a (temp '"a")] [d (temp '"d")])
+              #`(let ([#,m (sm-list-pair #,r)])
+                  (if #,m
+                      #,(if (i32.eq (k:car (k:car es)) 'any)
+                            #`(let ([#,d (cdr #,m)]) #,(test-code (compile-elements (k:cdr es) tail d vars values)))
+                            #`(let ([#,a (car #,m)] [#,d (cdr #,m)])
+                                #,(test-code (both (compile-test (k:car es) a vars values)
+                                                   (compile-elements (k:cdr es) tail d vars values)))))
+                      0))))))
+
+  ;; e, (repeat p (i ...)), matching every element of r to its end: its
+  ;; variables i ... set to the lists of what p matched.
+  (func (compile-repeat [e i32] [r i32] [vars i32] [values i32]) -> i32
+    (let ([p (k:cadr e)] [is (k:caddr e)])
+      (if (i32.eq (k:car p) 'var)
+          (let ([xs (temp '"xs")])
+            #`(let ([#,xs (sm-elements-of #,r)]) (if #,xs (begin (set! #,(pt:nth vars (k:cadr p)) #,xs) 1) 0)))
+          (if (i32.eq (k:car p) 'any)
+              #`(if (sm-elements-of #,r) 1 0)
+              (let* ([ok (temp '"ok")] [rest (temp '"r")] [m (temp '"m")] [a (temp '"a")] [accs (temps-for is '"acc")])
+                #`(let ([#,ok i32 0] [#,rest #,r] #,@(datum-bindings accs #'nil))
+                    (while 1
+                      (let ([#,m (splice-list #,rest)])
+                        (if (null? #,m) (begin #,@(acc-sets is accs vars 1) (set! #,ok 1) (break)))
+                        (if (not (pair? #,m)) (break))
+                        (let ([#,a (car #,m)])
+                          (if (not #,(test-code (compile-test p a vars values))) (break))
+                          #,@(acc-sets is accs vars 0)
+                          (set! #,rest (cdr #,m)))))
+                    #,ok))))))
+
+  ;; e, (repeat p (i ...)), followed by elements es and the tail, matching
+  ;; r: as many elements of r that match p as there can be while es and
+  ;; the tail match the rest, its variables i ... set to the lists of what
+  ;; p matched in them.
+  (func (compile-backtrack [e i32] [es i32] [tail i32] [r i32] [vars i32] [values i32]) -> i32
+    (let* ([p (k:cadr e)] [is (k:caddr e)]
+           [ok (temp '"ok")] [n (temp '"n")] [rest (temp '"r")] [m (temp '"m")] [a (temp '"a")] [after (temp '"after")]
+           [i (temp '"i")] [accs (temps-for is '"acc")])
+      #`(let ([#,ok i32 0] [#,n i32 0] [#,rest #,r])
+          ;; How many elements from the start match p.
+          (while 1
+            (let ([#,m (splice-list #,rest)])
+              (if (not (pair? #,m)) (break))
+              (let ([#,a (car #,m)])
+                (if (not #,(test-code (compile-test p a vars values))) (break))
+                (+= #,n 1)
+                (set! #,rest (cdr #,m)))))
+          ;; The rest after n of them, n from the most down to 0; then p
+          ;; matched again on those n, to set its variables.
+          (while 1
+            (let ([#,after (sm-list-after #,r #,n)])
+              (if #,(test-code (compile-elements es tail after vars values))
+                  (let ([#,i i32 0] [#,rest #,r] #,@(datum-bindings accs #'nil))
+                    (while (< #,i #,n)
+                      (let* ([#,m (splice-list #,rest)] [#,a (car #,m)])
+                        #,(test-code (compile-test p a vars values))
+                        #,@(acc-sets is accs vars 0)
+                        (set! #,rest (cdr #,m))
+                        (+= #,i 1)))
+                    #,@(acc-sets is accs vars 1)
+                    (set! #,ok 1)
+                    (break))))
+            (if (== #,n 0) (break))
+            (-= #,n 1))
+          #,ok)))
+
+  ;; Code that tries clauses cs, whose patterns have descriptions ds and
+  ;; variables varss, against x, in turn, and runs last if none matches.
+  (func (compile-clauses [cs i32] [ds i32] [varss i32] [x i32] [last i32] [values i32]) -> i32
+    (if (k:null? cs)
+        last
+        (let* ([vars (temps-for (k:car varss) '"v")]
+               [test (compile-test (k:car ds) x vars values)]
+               [body #`(let (#,@(bindings (k:car varss) vars)) #,@(k:cdr (k:car cs)))])
+          ;; A pattern that always matches leaves the clauses after it
+          ;; unreachable.
+          (if (always? test)
+              #`(let (#,@(datum-bindings vars #'0)) #,@(k:cdr test) #,body)
+              #`(let (#,@(datum-bindings vars #'0))
+                  (if #,test #,body #,(compile-clauses (k:cdr cs) (k:cdr ds) (k:cdr varss) x last values)))))))
+
+  ;; (syntax-match subject [pattern body ...] ...) expanded: the subject
+  ;; bound, then the clauses tried in turn, and if none matches the error
+  ;; for every description and the subject.
+  (func (syntax-match-form [stx i32]) -> i32
+    (set! who 'syntax-match)
+    (let* ([parts (k:syntax->list stx)]
+           [clauses (if (if parts (i32.ge_u (k:length parts) 3) 0)
+                        (pt:match-clauses (k:cddr parts) who)
+                        (k:raise-syntax-error who '"expected (syntax-match subject [pattern body ...] ...)" stx))]
+           [parsed (pt:parse-patterns (pt:clause-patterns clauses) who `(,#'_ ,#'... ,#'? ,#'quote ,#'quote-syntax))]
+           [x (temp '"s")])
+      #`(let ([#,x #,(k:cadr parts)])
+          #,(compile-clauses clauses (k:car parsed) (k:cadr parsed) x
+                             #`(throw compile-error (sm-no-match-message '#,(literal (k:car parsed)) #,x) #,x 0)
+                             (k:caddr parsed))))))
+
+(define-syntax syntax-match syntax-match-form)

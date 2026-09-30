@@ -37,13 +37,19 @@ on them there.
 - `c/`: the C-like Lisp, `examples/c` as the new compiler builds it,
   which the compiler's sources are written in:
   - `lang.sub`: `examples/c/lang.sub`, its transformers in kernel code,
-    function for function.
+    function for function. C code quotes data and syntax (`'d`, `#'x`),
+    typed as the kernel module's `datum`, with `kernel.sub`'s templates
+    `` `t `` and `` #`t ``.
   - `runtime.sub`, `math.sub` and `c.sub`: `examples/c`'s.
   - `syntax-match.sub`: `lib/substrate.sub`'s patterns for syntax, in
-    kernel code, on the kernel module's syntax objects.
+    kernel code, on the kernel module's syntax objects, its code kernel
+    code; `c-syntax-match.sub`, the same, its code C, for macros written
+    in C; `patterns.sub`, what the two share: the pattern words, the
+    parser and the error when no clause matches.
   - `kernel-forms.sub`: forms that kernel code is written with, `cond`,
     `and`, `or`, `when`, `unless` and `case`, and Racket's `for` forms on
-    lists, as `lib/substrate-core.sub` gives Substrate its forms.
+    lists, its `for` named `for/each`, as `lib/substrate-core.sub` gives
+    Substrate its forms.
 - `seed/`: a build of the new compiler by itself, checked in, as `seed/`
   is the compiler's.
 - `sub`: runs the new compiler as `bin/sub` runs the compiler; when its
@@ -143,4 +149,17 @@ Substrate is to be built again on the C-like Lisp (plan, 5).
    written in it, `kernel.sub`'s own macros in kernel code; and the
    build the compiler made of them built them into a compiler that
    builds itself into the same bytes, the seed.
-5. Substrate as a library on the C-like Lisp, then Bend.
+5. Substrate and Bend on the C-like Lisp, which is the base language:
+   the kernel's specification is what code compiles to, and C is what it
+   is written in, with the kernel's instructions in `func` bodies.
+   Macros are written in C, and need no GC; Substrate's values are wasm
+   GC objects, its run time in `func` bodies. In order:
+   1. C as a language for macros: quoted data and syntax in C code, and
+      `syntax-match` for C. Done: `tests/c-macros.sub`,
+      `tests/c-quote.sub`, and `tests/c/syntax-match.sub`, the kernel's
+      test of `syntax-match` in C, which gives its output.
+   2. Substrate's data, the old kernel module's GC data but syntax, and
+      its literals, made when a module starts.
+   3. Substrate's forms, and pattern macros for Substrate's users.
+   4. Numeric instructions and reference types in C code.
+   5. The typed example; then Bend, its checker first-order, in C.
