@@ -1,7 +1,7 @@
 ;; Lifecycle: experimental. Part of the new compiler (next/), written in
 ;; the C example's C: the compiler's expander.sub, but for compile-time
-;; code, begin-for-syntax, define-syntax and the macros they make, and the
-;; cache, which come later.
+;; code, begin-for-syntax, define-syntax and the macros they make, the
+;; cache and compiled files, which come later.
 ;;
 ;; Expander: syntax objects -> the compiler's input (core.sub), lowered
 ;; code, built as the code is expanded; or fully expanded code, syntax
@@ -11,17 +11,20 @@
 ;; phases compiles to one wasm module, a linklet (spec 3.1).
 ;;
 ;; Memory. What lasts the run is in the run's arena (syntax.sub): the
-;; bindings, the units, what they record, and the definitions (core.sub).
-;; What a module's expansion makes, its syntax and its lowered code, is in
-;; its module arena, freed when the module is done.
+;; bindings, the units, what they record, their linklets, and the
+;; definitions (core.sub). What a module's expansion and compilation make,
+;; its syntax, its lowered code and what compiling it needs, is in its
+;; module arena, freed when the module is done.
 (require-unqualified c "../../examples/c/c.sub")
 (require-unqualified stx "syntax.sub")
 (require-unqualified core "core.sub")
 (require-unqualified ops "ops.sub")
 (require-unqualified rd "reader.sub")
 (require-unqualified host "host.sub")
+(require-unqualified cmp "compile.sub")
 
-(provide set-repository-root! set-package-root! compile-module-file expand-module-file content-hash)
+(provide set-repository-root! set-package-root! compile-module-file expand-module-file content-hash
+         linklet program-linklets module-linklet-list target-kernel-bytes)
 
 (memory from c)
 (table from c)
@@ -111,7 +114,14 @@
 (define (meaning-namespace [meaning datum]) -> datum
   (if (and (!= meaning 0) (== (car meaning) (sym type))) (sym type) (sym value)))
 
-;; A compiled (or compiling) module. requires: list of (module . shift).
+;; One phase of a module, compiled: bytes, a string; the instance names it
+;; imports from (relative to the module at phase shift 0); whether it uses
+;; GC; and the scope table of its syntax literals (spec 3.5): the run's
+;; scope for each index. A module's linklets are a list, next.
+(struct linklet [phase i32] [bytes datum] [imports datum] [gc i32] [scopes datum] [next (ptr linklet)])
+
+;; A compiled (or compiling) module. linklets: its linklets, one per phase;
+;; phase 0's is its program's. requires: list of (module . shift).
 ;; provides: list of (symbol . meaning). entries: its module-level
 ;; bindings, the latest first. scope: its module scope. code: its lowered
 ;; phase-0 forms, while it compiles. hash: its identity, of its source and
@@ -122,7 +132,8 @@
 ;; datum or syntax. types and infos: the types and definitions it made,
 ;; newest first.
 (struct unit [self datum] [path datum] [name datum] [hash datum] [state datum] [requires datum] [provides datum]
-        [entries (ptr module-entry)] [code datum] [scope u32] [types datum] [infos datum] [facts datum])
+        [entries (ptr module-entry)] [code datum] [scope u32] [types datum] [infos datum] [facts datum]
+        [linklets (ptr linklet)])
 
 ;; A module-level binding of a module, which one that requires it at a
 ;; phase shift can install a shifted copy of.
@@ -145,6 +156,7 @@
     (set! (-> m types) nil)
     (set! (-> m infos) nil)
     (set! (-> m facts) nil)
+    (set! (-> m linklets) 0)
     (-> m self)))
 
 (define (unit-of [m datum]) -> (ptr unit) (cast (ptr unit) (record-pointer m)))
@@ -189,8 +201,11 @@
 ;;
 ;; compiler/kernel.sub under the repository's root: the kernel's data and
 ;; the functions on it (spec 2), which the compiler carries into the
-;; programs it writes. It is expanded once in a run, as a module whose
-;; instance is named kernel, which requires nothing.
+;; programs it writes. It is compiled once in a run, first, as a module
+;; whose one linklet is the kernel, its instance named kernel, which
+;; requires nothing. The source locations name it compiler/kernel.sub,
+;; whatever the root is: the compiler's bytes do not depend on where the
+;; repository is.
 
 (define repository-root datum 0)
 (define (set-repository-root! [root datum]) (set! repository-root (keep root)))
@@ -208,23 +223,31 @@
       (set! (-> (unit-of m) hash) (keep (content-hash (list1 text))))
       (begin-module-arena)
       (set! current (new-comp m))
-      (note-definitions! m (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0))
-      ;; What compiling it would give its definitions: the instance
-      ;; kernel, and exports of their own names.
-      (for-each (lambda ([info datum])
-                  (cond [(func-info? info)
-                         (set-func-info-instance! info `"kernel")
-                         (set-func-info-export! info (symbol->string (func-info-name info)))]
-                        [(tag-info? info)
-                         (set-tag-info-instance! info `"kernel")
-                         (set-tag-info-export! info (symbol->string (tag-info-name info)))]
-                        [(global-info? info)
-                         (set-global-info-instance! info `"kernel")
-                         (set-global-info-export! info (symbol->string (global-info-name info)))]))
-                (-> (unit-of m) infos))
+      (let* ([code (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0)]
+             [forms (append (storage-forms 0) code)])
+        (note-definitions! m forms)
+        (take-kernel-types! m)
+        (set-current-source! (string->symbol path))
+        (add-linklet! m 0 (compile-module forms `"kernel")))
+      (set-kernel-definitions! (-> (unit-of m) infos))
       (set! (-> (unit-of m) state) (sym done))
       (set! current saved)
       (end-module-arena))))
+
+;; The kernel module's string and table types, from its unit: quoted data
+;; is read with them (spec 3.5).
+(define (take-kernel-types! [m datum])
+  (let ([ts (-> (unit-of m) types)] [string datum 0] [table datum 0])
+    (while (pair? ts)
+      (when (== (type-info-name (car ts)) (sym %string)) (set! string (car ts)))
+      (when (== (type-info-name (car ts)) (sym %table)) (set! table (car ts)))
+      (set! ts (cdr ts)))
+    (set-syntax-types! string table)))
+
+;; The kernel's bytes, for programs.
+(define (target-kernel-bytes) -> datum
+  (ensure-kernel!)
+  (-> (unit-of kernel) linklets bytes))
 
 ;; The kernel module's function named name, which it must have.
 (define (kernel-function [name datum]) -> datum
@@ -532,9 +555,7 @@
     s))
 
 ;; Compile the module in file source (and, first, what it requires).
-;; Returns the module. Each module is compiled once per run. For now, a
-;; module is expanded and its provides resolved; compiling it to linklets
-;; comes with the compiler.
+;; Returns the module. Each module is compiled once per run.
 (define (compile-module-file [source datum]) -> datum
   (let* ([path (canonical-path source)] [key (cast u64 (string->symbol path))]
          [known (cast datum (hash-ref (& registry) key))])
@@ -546,7 +567,7 @@
              (hash-set! (& registry) key (cast u32 m))
              (begin-module-arena)
              (set! current (new-comp m))
-             (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0)
+             (set! (-> (unit-of m) code) (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0))
              (finish-module! text)
              (set! current saved)
              (end-module-arena)
@@ -580,7 +601,8 @@
     (set! to-syntax saved)
     out))
 
-;; Resolve the provides, and take the module's hash and name.
+;; Take the phase-0 code, resolve provides, take the module's hash and
+;; name, and compile the linklets.
 (define (finish-module! [text datum])
   (let ([m (the-module)] [items (reverse (-> current provide-ids))] [provides nil])
     ;; A provided name exports its binding in each namespace it has one.
@@ -603,7 +625,112 @@
     (set! (-> m name) (keep (format-message "~a.~a" `(,(file-stem (-> m path)) ,(-> m hash)))))
     (when (== (hash-ref (& units-by-hash) (cast u64 (string->symbol (-> m hash)))) 0)
       (hash-set! (& units-by-hash) (cast u64 (string->symbol (-> m hash))) (cast u32 (-> m self))))
-    (set! (-> m state) (sym done))))
+    (compile-linklets!)))
+
+;; ---- linklets ----
+
+;; The memory and table forms declared for phase (spec 3.3).
+(define (storage-forms [phase i32]) -> datum
+  (let ([mem (assoc (make-integer phase) (-> current memories))] [tbl (assoc (make-integer phase) (-> current tables))])
+    (append (if (!= mem 0) (list1 (cdr mem)) nil) (if (!= tbl 0) (list1 (cdr tbl)) nil))))
+
+;; Module m's phase linklet, as compile-module gave it: (bytes imports
+;; gc? scopes), kept.
+(define (add-linklet! [m datum] [phase i32] [compiled datum])
+  (let ([l (cast (ptr linklet) (alloc-in (& run-arena) (sizeof linklet)))] [u (unit-of m)])
+    (set! (-> l phase) phase)
+    (set! (-> l bytes) (keep (car compiled)))
+    (set! (-> l imports) (keep (cadr compiled)))
+    (set! (-> l gc) (!= (caddr compiled) 0))
+    (set! (-> l scopes) (keep (cadddr compiled)))
+    (set! (-> l next) (-> u linklets))
+    (set! (-> u linklets) l)))
+
+;; Module m's linklet of phase, or 0.
+(define (linklet-of [m datum] [phase i32]) -> (ptr linklet)
+  (let ([l (-> (unit-of m) linklets)])
+    (while (and (!= l 0) (!= (-> l phase) phase)) (set! l (-> l next)))
+    l))
+
+;; Compile the linklet of the module being compiled, its phase 0's; check
+;; (freestanding); done.
+(define (compile-linklets!)
+  (let* ([m (the-module)] [forms (append (storage-forms 0) (-> m code))])
+    (set-current-source! (string->symbol (-> m path)))
+    (add-linklet! (-> m self) 0 (compile-module forms (linklet-name (-> m self) 0 0)))
+    (note-definitions! (-> m self) forms)
+    (set! (-> m state) (sym done))
+    (let ([form (-> current freestanding-form)])
+      (when (!= form 0) (check-freestanding! (-> m self) form)))
+    (set! (-> m code) 0)))
+
+;; The modules whose linklets a program instantiates at run time: phase 0
+;; at phase shift 0, reached through phase-0 requires.
+(define (runtime-closure [m datum]) -> datum
+  (let ([todo (list1 m)] [seen nil])
+    (while (pair? todo)
+      (let ([mm (car todo)])
+        (set! todo (cdr todo))
+        (when (== (memq mm seen) 0)
+          (set! seen (cons mm seen))
+          (let ([imports (-> (linklet-of mm 0) imports)])
+            (while (pair? imports)
+              (let ([r (linklet-ref (car imports))])
+                (when (and (!= r 0) (== (integer-value (cadr r)) 0) (== (integer-value (caddr r)) 0))
+                  (set! todo (append todo (list1 (car r))))))
+              (set! imports (cdr imports)))))))
+    (reverse seen)))
+
+;; (freestanding): the program's run-time parts import only from the host
+;; and each other, and use no GC (spec 3.4).
+(define (check-freestanding! [m datum] [form datum])
+  (let ([ms (runtime-closure m)])
+    (while (pair? ms)
+      (let* ([mm (car ms)] [p (linklet-of mm 0)] [extra nil] [imports (-> p imports)])
+        (while (pair? imports)
+          (unless (or (string=? (car imports) `"host") (!= (linklet-ref (car imports)) 0))
+            (set! extra (cons (car imports) extra)))
+          (set! imports (cdr imports)))
+        (set! extra (reverse extra))
+        (unless (and (null? extra) (not (-> p gc)))
+          (fail-at form "this module is declared freestanding, but after expansion ~a ~a"
+                   `(,(if (== mm m) `"it" (format-message "the module ~a it requires" (list1 (-> (unit-of mm) name))))
+                     ,(if (pair? extra) (format-message "imports from ~a" (list1 extra)) `"uses GC objects")))))
+      (set! ms (cdr ms)))))
+
+;; The linklets m's program instantiates at run time, each after those it
+;; imports from, as (instance-name . bytes): phase-0 linklets at phase
+;; shift 0, and the kernel module if they use it. m's own comes last.
+(define (program-linklets [m datum]) -> datum
+  (let ([seen (make-table)] [out nil])
+    (set! out (visit-linklets m seen out))
+    (reverse out)))
+
+(define (visit-linklets [m datum] [seen (ptr arena-table)] [out datum]) -> datum
+  (let ([name (linklet-name m 0 0)])
+    (when (!= (datum-get seen name) 0) (return out))
+    (datum-put! seen name (boolean 1))
+    (let* ([p (linklet-of m 0)] [imports (-> p imports)])
+      (while (pair? imports)
+        (let ([imp (car imports)] [l (linklet-ref (car imports))])
+          (cond [(string=? imp `"kernel")
+                 (when (== (datum-get seen imp) 0)
+                   (datum-put! seen imp (boolean 1))
+                   (set! out (cons (cons imp (target-kernel-bytes)) out)))]
+                [(!= l 0)
+                 (unless (and (== (integer-value (cadr l)) 0) (== (integer-value (caddr l)) 0))
+                   (fail-at 0 "internal: a program imports from ~a" (list1 imp)))
+                 (set! out (visit-linklets (car l) seen out))]))
+        (set! imports (cdr imports)))
+      (cons (cons name (-> p bytes)) out))))
+
+;; (phase . bytes) for each linklet of m, in phase order.
+(define (module-linklet-list [m datum]) -> datum
+  (let ([l (-> (unit-of m) linklets)] [out nil])
+    (while (!= l 0)
+      (set! out (cons (cons (make-integer (-> l phase)) (-> l bytes)) out))
+      (set! l (-> l next)))
+    (sort out (lambda ([a datum] [b datum]) -> i32 (< (integer-value (car a)) (integer-value (car b)))))))
 
 ;; ==== module bodies ====
 
@@ -1352,9 +1479,21 @@
         (set! (-> current memories) (cons (cons (make-integer phase) form) (-> current memories)))
         (set! (-> current tables) (cons (cons (make-integer phase) form) (-> current tables))))))
 
+;; Instance names (spec 3.2): "<module>@<phase>+<shift>" for a module's
+;; linklet at a phase shift. The compiler reads a name back only through
+;; this table: name, a symbol -> (module phase shift).
+(define instance-refs hash-table)
+
 ;; The name of module m's phase-q linklet at phase shift t.
 (define (linklet-name [m datum] [q i32] [t i32]) -> datum
-  (format-message "~a@~a+~a" `(,(-> (unit-of m) name) ,(make-integer q) ,(make-integer t))))
+  (let* ([name (format-message "~a@~a+~a" `(,(-> (unit-of m) name) ,(make-integer q) ,(make-integer t)))]
+         [key (cast u64 (string->symbol name))])
+    (when (== (hash-ref (& instance-refs) key) 0)
+      (hash-set! (& instance-refs) key (cast u32 (keep `(,m ,(make-integer q) ,(make-integer t))))))
+    name))
+
+;; The module linklet an instance name names, as (module phase shift), or #f.
+(define (linklet-ref [name datum]) -> datum (cast datum (hash-ref (& instance-refs) (cast u64 (string->symbol name)))))
 
 ;; (freestanding): after expansion, the program needs nothing beyond the
 ;; host at run time (spec 3.4).

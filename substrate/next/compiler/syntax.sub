@@ -48,13 +48,14 @@
          run-arena current-arena use-arena begin-module-arena end-module-arena alloc-in keep
          nil boolean boolean? null? pair? cons car cdr cadr cddr caddr cdddr cadddr set-cdr! list? length reverse append sym quasiquote quoted
          list-ref list-tail last take memq member assq assoc map for-each filter andmap ormap sort
-         equal? datum-hash datum-ref datum-set! make-record record? record-kind record-pointer
+         equal? datum-hash datum-ref datum-set! datum-get datum-put! arena-table make-table table-ref table-set! table-count
+         make-record make-record-in record? record-kind record-pointer
          symbol? bytes->symbol symbol-named string->symbol symbol->string symbol-bytes symbol-length
          keyword? bytes->keyword keyword->string
          string? bytes->string string-bytes string-length string=?
-         integer? make-integer make-unsigned-integer integer-value integer-negative? flonum? make-flonum flonum-value char? integer->char char->integer
+         integer? make-integer make-unsigned-integer integer-value integer-negative? fixnum? flonum? make-flonum flonum-value char? integer->char char->integer
          syntax? identifier? make-syntax syntax-e syntax->list splice-list syntax->datum datum->syntax syntax-rewrap
-         syntax-scopes syntax-srcloc make-srcloc syntax-property syntax-property-set
+         syntax-scopes syntax-srcloc syntax-props make-srcloc syntax-property syntax-property-set
          no-scopes scopes-change scopes-subset? scopes-filter map-scopes add-scope remove-scope flip-scope
          write-datum write-scoped write-to format-message buffer-add-utf-8!
          compile-error raise-compile-error write-compile-error)
@@ -450,14 +451,94 @@
     (set! (-> e next) first)
     (hash-set! t h (cast u32 e))))
 
+;; ---- tables in an arena ----
+;;
+;; A hash table in the arena current when it is made, for what lasts no
+;; longer than that arena: nothing to free. Its keys are u64s but 0, its
+;; values u32s, 0 for none, as the runtime's hash-table has them; when it
+;; grows, its old slots stay in the arena until it is freed.
+(struct arena-table [arena (ptr arena)] [keys (ptr u64)] [values (ptr u32)] [count u32] [capacity u32] [shift u32])
+
+(define (make-table) -> (ptr arena-table)
+  (let ([t (cast (ptr arena-table) (alloc-in current (sizeof arena-table)))])
+    (set! (-> t arena) current)
+    (set! (-> t keys) 0)
+    (set! (-> t values) 0)
+    (set! (-> t count) 0)
+    (set! (-> t capacity) 0)
+    (set! (-> t shift) 0)
+    t))
+
+(define (table-count [t (ptr arena-table)]) -> u32 (-> t count))
+
+;; The value of key in t, or 0 if it has none.
+(define (table-ref [t (ptr arena-table)] [key u64]) -> u32
+  (if (== (-> t capacity) 0)
+      0
+      (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)]
+             [i (cast u32 (>> (* key 11400714819323198485) (-> t shift)))])
+        (while (!= (@ keys i) 0)
+          (when (== (@ keys i) key) (return (@ (-> t values) i)))
+          (set! i (bit-and (+ i 1) mask)))
+        0)))
+
+(define (table-set! [t (ptr arena-table)] [key u64] [value u32])
+  (when (>= (* 2 (+ (-> t count) 1)) (-> t capacity)) (table-grow t))
+  (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)]
+         [i (cast u32 (>> (* key 11400714819323198485) (-> t shift)))])
+    (while (!= (@ keys i) 0)
+      (when (== (@ keys i) key)
+        (set! (@ (-> t values) i) value)
+        (return))
+      (set! i (bit-and (+ i 1) mask)))
+    (set! (@ keys i) key)
+    (set! (@ (-> t values) i) value)
+    (+= (-> t count) 1)))
+
+;; t with twice the slots, or 16 at first.
+(define (table-grow [t (ptr arena-table)])
+  (let ([keys (-> t keys)] [values (-> t values)] [n (-> t capacity)])
+    (set! (-> t capacity) (if (== n 0) 16 (* 2 n)))
+    (set! (-> t shift) (if (== n 0) 60 (- (-> t shift) 1)))
+    (set! (-> t keys) (cast (ptr u64) (alloc-in (-> t arena) (* (-> t capacity) 8))))
+    (memset (-> t keys) 0 (* (-> t capacity) 8))
+    (set! (-> t values) (cast (ptr u32) (alloc-in (-> t arena) (* (-> t capacity) 4))))
+    (set! (-> t count) 0)
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (!= (@ keys i) 0) (table-set! t (@ keys i) (@ values i))))))
+
+;; datum-ref and datum-set! for a table t in an arena (make-table), which
+;; lasts no longer than it: key and value are kept as they are.
+(define (datum-get [t (ptr arena-table)] [key datum]) -> datum
+  (let ([e (cast (ptr entry) (table-ref t (datum-hash key)))])
+    (while (!= e 0)
+      (when (equal? (-> e key) key) (return (-> e value)))
+      (set! e (-> e next)))
+    0))
+
+(define (datum-put! [t (ptr arena-table)] [key datum] [value datum])
+  (let* ([h (datum-hash key)] [first (cast (ptr entry) (table-ref t h))] [e first])
+    (while (!= e 0)
+      (when (equal? (-> e key) key)
+        (set! (-> e value) value)
+        (return))
+      (set! e (-> e next)))
+    (set! e (cast (ptr entry) (alloc-in (-> t arena) (sizeof entry))))
+    (set! (-> e key) key)
+    (set! (-> e value) value)
+    (set! (-> e next) first)
+    (table-set! t h (cast u32 e))))
+
 ;; ---- records ----
 ;;
 ;; A record is the datum for a struct of its user's: one for each struct,
 ;; which the struct keeps, so == compares records as it does structs.
 ;; Records are made in the run's arena, as the structs they stand for
-;; last the run.
+;; last the run; or, with make-record-in, in the arena of a struct that
+;; lasts less, which keep then must not be given.
 
 (define (make-record [kind u32] [p (ptr void)]) -> datum (make-cell-in (& run-arena) (record kind p)))
+(define (make-record-in [a (ptr arena)] [kind u32] [p (ptr void)]) -> datum (make-cell-in a (record kind p)))
 (define (record? [d datum] [kind u32]) -> i32 (match d [(record k p) (== k kind)] [_ 0]))
 (define (record-kind [d datum]) -> u32 (match d [(record k p) k] [_ 0]))
 (define (record-pointer [d datum]) -> (ptr void) (match d [(record k p) p] [_ (fail "expected a record") 0]))
@@ -545,6 +626,13 @@
 
 (define (integer-negative? [d datum]) -> i32
   (match d [(integer low high negative) negative] [_ (fail "expected an integer") 0]))
+
+;; Is d an integer the kernel keeps as a fixnum, an i31: -2^30 to 2^30 - 1?
+(define (fixnum? [d datum]) -> i32
+  (match d
+    [(integer low high negative)
+     (let ([n (integer-value d)]) (if negative (>= n -1073741824) (and (>= n 0) (<= n 1073741823))))]
+    [_ 0]))
 
 (define (flonum? [d datum]) -> i32 (match d [(flonum a b) 1] [_ 0]))
 
@@ -764,6 +852,9 @@
 
 (define (syntax-srcloc [s datum]) -> (ptr srcloc)
   (match s [(syntax e scopes loc props pending) loc] [_ (fail "expected a syntax object") 0]))
+
+(define (syntax-props [s datum]) -> datum
+  (match s [(syntax e scopes loc props pending) props] [_ (fail "expected a syntax object")]))
 
 ;; The elements of a syntax list, or d if it is a list already.
 (define (splice-list [d datum]) -> datum (if (syntax? d) (syntax-e d) d))

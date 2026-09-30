@@ -1,0 +1,591 @@
+;; Lifecycle: experimental. Part of the new compiler (next/), written in
+;; the C example's C: the compiler's wasm.sub.
+;;
+;; Binary wasm encoder and assembler. The compiler assembles each body an
+;; instruction at a time (instr!), links it once the module's indices are
+;; known (link-body), and builds a module description, which this turns
+;; into bytes; nothing here knows about the kernel language.
+;;
+;; Instructions are lists (op imm ...), flat: a block, loop, if or
+;; try_table is opened by its instruction and closed by (end), with
+;; (else) between an if's arms; a block type is () | valtype | (type n).
+;; A source location is not an instruction here, but asm-location!.
+;;
+;; Value types are resolved: i32 i64 f32 f64, or (ref nullable? heap) where
+;; heap is an abstract heap type symbol or a type index.
+;;
+;; Memory. An asm, the code it records and the bodies linked from it are
+;; in the current arena, the module's; the bytes an asm assembles are in a
+;; buffer, freed once the asm is linked.
+(require-unqualified c "../../examples/c/c.sub")
+(require-unqualified stx "syntax.sub")
+(require-unqualified ops "ops.sub")
+(require-unqualified leb "leb128.sub")
+(require-unqualified numbers "numbers.sub")
+
+(provide wmodule encode-module asm new-asm asm-size instr! asm-location! link-body
+         linked linked-bytes code-location
+         cell cell? cell-value set-cell-value!)
+
+(memory from c)
+(table from c)
+
+;; types:   list of (func (param ...) (result ...)) | (struct ((storage mut?) ...))
+;;          | (array (storage mut?)) | (sub final? (supertypeidx ...) comptype)
+;;          | (rec entry ...), a recursion group of sub or comptype entries;
+;;          storage is a valtype, i8 or i16
+;; imports: list of (module field kind desc); kind func or tag: typeidx,
+;;          memory/table: (min max-or-#f), global: (valtype mutable?)
+;; funcs:   list of (typeidx locals body name), body linked (link-body)
+;; tables, memories: list of (min max-or-#f)
+;; tags:    list of typeidx, each a function type with no results
+;; globals: list of (valtype mutable? init-bytes), the bytes linked
+;; exports: list of (name kind idx)
+;; start:   funcidx or #f
+;; declared: funcidxs referenced by ref.func (declarative elem segment)
+;; datas:   list of (offset . bytes): an active segment in memory 0, or a
+;;          passive one if offset is #f
+;; names:   (module-name (funcidx . name) ...) for the name section, or #f
+(struct wmodule [types datum] [imports datum] [funcs datum] [tables datum] [memories datum] [tags datum]
+        [globals datum] [exports datum] [start datum] [declared datum] [datas datum] [names datum])
+
+;; The kinds of this module's records.
+(define cell-kind u32 30)
+(define linked-kind u32 31)
+
+;; ---- byte output ----
+
+(define (name! [p (ptr buffer)] [s datum])
+  (write-uleb p (string-length s))
+  (buffer-add! p (string-bytes s) (string-length s)))
+
+(define (vec! [p (ptr buffer)] [items datum] [item! (fn ((ptr buffer) datum))])
+  (write-uleb p (length items))
+  (while (pair? items)
+    (item! p (car items))
+    (set! items (cdr items))))
+
+;; Section id, whose body is in q, which is freed.
+(define (section! [p (ptr buffer)] [id i32] [q (ptr buffer)])
+  (buffer-add-byte! p id)
+  (write-uleb p (-> q length))
+  (buffer-add! p (-> q bytes) (-> q length))
+  (buffer-free! q))
+
+;; The low n bytes of x, little-endian.
+(define (le-bytes! [p (ptr buffer)] [x u64] [n u32])
+  (for ([i u32 0]) (< i n) (+= i 1) (buffer-add-byte! p (cast i32 (bit-and (>> x (* 8 i)) 255)))))
+
+(define (uleb! [p (ptr buffer)] [n datum]) (write-uleb p (cast u64 (integer-value n))))
+
+;; ---- types ----
+
+(define (heap! [p (ptr buffer)] [h datum])
+  (if (integer? h)
+      (write-sleb p (integer-value h))
+      (buffer-add-byte! p (case h
+                            [((sym func)) #x70] [((sym extern)) #x6F] [((sym any)) #x6E] [((sym eq)) #x6D]
+                            [((sym i31)) #x6C] [((sym struct)) #x6B] [((sym array)) #x6A] [((sym none)) #x71]
+                            [((sym noextern)) #x72] [((sym nofunc)) #x73] [((sym exn)) #x69] [((sym noexn)) #x74]
+                            [else (encode-fail "unknown heap type ~s" h) 0]))))
+
+(define (valtype! [p (ptr buffer)] [t datum])
+  (if (pair? t)
+      (begin (buffer-add-byte! p (if (!= (cadr t) 0) #x63 #x64))
+             (heap! p (caddr t)))
+      (buffer-add-byte! p (case t
+                            [((sym i32)) #x7F] [((sym i64)) #x7E] [((sym f32)) #x7D] [((sym f64)) #x7C]
+                            [((sym v128)) #x7B] [((sym funcref)) #x70] [((sym externref)) #x6F]
+                            [else (encode-fail "unknown value type ~s" t) 0]))))
+
+(define (encode-fail [template (ptr u8)] [x datum])
+  (raise-compile-error 0 (format-message "internal: encode: ~a" (cons (format-message template (cons x nil)) nil))))
+
+(define (storage! [p (ptr buffer)] [s datum])
+  (cond [(== s (sym i8)) (buffer-add-byte! p #x78)]
+        [(== s (sym i16)) (buffer-add-byte! p #x77)]
+        [else (valtype! p s)]))
+
+(define (field! [p (ptr buffer)] [f datum])
+  (storage! p (car f))
+  (buffer-add-byte! p (if (!= (cadr f) 0) 1 0)))
+
+(define (limits! [p (ptr buffer)] [lim datum])
+  (let ([min (car lim)] [max (cadr lim)])
+    (if (!= max 0)
+        (begin (buffer-add-byte! p 1) (uleb! p min) (uleb! p max))
+        (begin (buffer-add-byte! p 0) (uleb! p min)))))
+
+(define (blocktype! [p (ptr buffer)] [bt datum])
+  (cond [(null? bt) (buffer-add-byte! p #x40)]
+        [(and (pair? bt) (== (car bt) (sym type))) (write-sleb p (integer-value (cadr bt)))]
+        [else (valtype! p bt)]))
+
+;; ---- assembly ----
+;;
+;; Code is assembled as it is compiled, an instruction at a time (instr!),
+;; into an asm: its bytes, and the fields they cannot hold yet. A field
+;; the compiler resolves only once every function, global, type and tag
+;; has its index, or decides after the code that follows it, is deferred:
+;; the asm holds no bytes for it, but records a reloc, (offset kind key),
+;; and link-body writes it as (resolve kind key) says. The kinds are func,
+;; ref-func, global, type and tag, an index; heap, valtype and blocktype,
+;; written as those; and const, a whole constant instruction. A source
+;; location is recorded the same way, at the offset of the instruction
+;; it is of.
+(struct reloc [offset u32] [kind datum] [key datum] [next (ptr reloc)])
+
+;; A place in code and the source location it is of, or 0 for none.
+(struct code-location [offset u32] [loc (ptr srcloc)] [next (ptr code-location)])
+
+;; relocs and locations: newest first. pending: the location the code
+;; after now comes from; current: the last one recorded. start: the first
+;; location given before any code, once started. else-pending: an else to
+;; write before the next instruction, if any comes.
+(struct asm [out buffer] [relocs (ptr reloc)] [locations (ptr code-location)] [pending (ptr srcloc)]
+        [current (ptr srcloc)] [start (ptr srcloc)] [started i32] [else-pending i32])
+
+(define (new-asm) -> (ptr asm)
+  (let ([a (cast (ptr asm) (alloc-in (current-arena) (sizeof asm)))])
+    (set! (-> a out) (make-buffer))
+    (set! (-> a relocs) 0)
+    (set! (-> a locations) 0)
+    (set! (-> a pending) 0)
+    (set! (-> a current) 0)
+    (set! (-> a start) 0)
+    (set! (-> a started) 0)
+    (set! (-> a else-pending) 0)
+    a))
+
+(define (asm-size [a (ptr asm)]) -> u32 (-> a out length))
+
+;; A value the compiler settles later, which a deferred field holds: a
+;; block's type once its body is compiled, or a constant once the
+;; branches around it are. A record in the current arena.
+(struct cell-record [self datum] [value datum])
+
+(define (cell [v datum]) -> datum
+  (let ([c (cast (ptr cell-record) (alloc-in (current-arena) (sizeof cell-record)))])
+    (set! (-> c self) (make-record-in (current-arena) cell-kind c))
+    (set! (-> c value) v)
+    (-> c self)))
+
+(define (cell? [d datum]) -> i32 (record? d cell-kind))
+(define (cell-value [c datum]) -> datum (-> (cast (ptr cell-record) (record-pointer c)) value))
+(define (set-cell-value! [c datum] [v datum]) (set! (-> (cast (ptr cell-record) (record-pointer c)) value) v))
+
+(define (reloc! [a (ptr asm)] [kind datum] [key datum])
+  (let ([r (cast (ptr reloc) (alloc-in (current-arena) (sizeof reloc)))])
+    (set! (-> r offset) (asm-size a))
+    (set! (-> r kind) kind)
+    (set! (-> r key) key)
+    (set! (-> r next) (-> a relocs))
+    (set! (-> a relocs) r)))
+
+;; ---- source locations ----
+;;
+;; Code carries source locations (asm-location!), each saying where the
+;; instructions after it come from, 0 for none. The asm records a location
+;; where an instruction that can call or trap starts at a new one
+;; (note-location!), and the first location a body gives, at its start, is
+;; the function's own: those are where a backtrace's frames are, one that
+;; overflowed the stack at the body's start. The module's source-locations
+;; section lists them (spec 3.6).
+
+;; The locations in the code section, at their offsets there, newest
+;; first; then, at their offsets in the module, in order.
+(define code-locations (ptr code-location) 0)
+
+(define (new-location [offset u32] [loc (ptr srcloc)] [next (ptr code-location)]) -> (ptr code-location)
+  (let ([l (cast (ptr code-location) (alloc-in (current-arena) (sizeof code-location)))])
+    (set! (-> l offset) offset)
+    (set! (-> l loc) loc)
+    (set! (-> l next) next)
+    l))
+
+;; Do locations a and b name one place: one file, line and column?
+(define (same-location? [a (ptr srcloc)] [b (ptr srcloc)]) -> i32
+  (or (== a b)
+      (and (!= a 0) (!= b 0) (== (-> a source) (-> b source)) (== (-> a line) (-> b line)) (== (-> a col) (-> b col)))))
+
+;; The code after this comes from source location loc, or 0 for none.
+(define (asm-location! [a (ptr asm)] [loc (ptr srcloc)])
+  (when (and (not (-> a started)) (== (asm-size a) 0))
+    (set! (-> a start) loc)
+    (set! (-> a started) 1)
+    (set! (-> a current) loc))
+  (set! (-> a pending) loc))
+
+;; The asm records a location where an instruction that can call or trap
+;; (its encoding says which) starts at a new one.
+(define (note-location! [a (ptr asm)])
+  (unless (same-location? (-> a pending) (-> a current))
+    (set! (-> a locations) (new-location (asm-size a) (-> a pending) (-> a locations)))
+    (set! (-> a current) (-> a pending))))
+
+;; The source-locations section's body: the files the entries name, then
+;; the entries, each its offset from the one before, its file's index,
+;; line and column.
+(define (source-locations! [p (ptr buffer)] [entries (ptr code-location)])
+  (let ([files nil] [e entries] [n u32 0] [at u32 0])
+    (while (!= e 0)
+      (let ([l (-> e loc)])
+        (when (and (!= l 0) (== (memq (-> l source) files) 0)) (set! files (cons (-> l source) files))))
+      (+= n 1)
+      (set! e (-> e next)))
+    (set! files (reverse files))
+    (name! p `"source-locations")
+    (write-uleb p (length files))
+    (for-each (lambda ([f datum]) (name! p (symbol->string f))) files)
+    (write-uleb p n)
+    (set! e entries)
+    (while (!= e 0)
+      (let ([l (-> e loc)])
+        (write-uleb p (- (-> e offset) at))
+        (write-uleb p (if (!= l 0) (- (length files) (length (memq (-> l source) files))) 0))
+        (write-uleb p (if (!= l 0) (-> l line) 0))
+        (write-uleb p (if (!= l 0) (-> l col) 0))
+        (set! at (-> e offset))
+        (set! e (-> e next))))))
+
+;; ---- instructions ----
+;;
+;; Each instruction's encoding: its opcode bytes, the kinds of its
+;; immediates, and whether it can call or trap, which records its
+;; location. An immediate is u, an unsigned LEB128; s, a signed one; f32
+;; or f64, a float's bits; catches, try_table's vector of catches; or a
+;; deferred field's kind (func, ref-func, global, type, tag, heap,
+;; valtype, blocktype), recorded for link-body. ref.test-null and
+;; ref.cast-null are ref.test and ref.cast to a nullable type. The
+;; primitive operators come from their table (ops.sub).
+
+;; op, a symbol -> (bytes kinds traps?), made when the module starts.
+(define encodings hash-table)
+
+(define (encoding! [op datum] [bytes datum] [kinds datum] [traps i32])
+  (hash-set! (& encodings) (cast u64 op) (cast u32 `(,bytes ,kinds ,(boolean traps)))))
+
+;; (op byte kind ...) or (op (byte ...) kind ...), each; traps: whether
+;; they can call or trap.
+(define (defs! [traps i32] [specs datum])
+  (while (pair? specs)
+    (let ([s (car specs)])
+      (encoding! (car s) (if (pair? (cadr s)) (cadr s) (cons (cadr s) nil)) (cddr s) traps))
+    (set! specs (cdr specs))))
+
+;; GC instructions, prefixed 0xFB.
+(define (gc-defs! [traps i32] [specs datum])
+  (while (pair? specs)
+    (let ([s (car specs)])
+      (encoding! (car s) `(#xFB ,(cadr s)) (cddr s) traps))
+    (set! specs (cdr specs))))
+
+(define (define-encodings!)
+  (defs! 0 `((nop #x01) (block #x02 blocktype) (loop #x03 blocktype) (if #x04 blocktype)
+             (throw #x08 tag) (throw_ref #x0A) (br #x0C u) (br_if #x0D u) (return #x0F)
+             (drop #x1A) (select #x1B) (select-typed (#x1C 1) valtype)
+             (local.get #x20 u) (local.set #x21 u) (local.tee #x22 u) (global.get #x23 global) (global.set #x24 global)
+             (i32.const #x41 s) (i64.const #x42 s) (f32.const #x43 f32) (f64.const #x44 f64)
+             (ref.null #xD0 heap) (ref.is_null #xD1) (ref.func #xD2 ref-func) (ref.eq #xD3)
+             (table.grow (#xFC 15) u) (table.size (#xFC 16) u)))
+  (defs! 1 `((unreachable #x00) (try_table #x1F blocktype catches)
+             (call #x10 func) (call_indirect #x11 type u) (return_call #x12 func) (return_call_indirect #x13 type u)
+             (call_ref #x14 type) (return_call_ref #x15 type) (ref.as_non_null #xD4)))
+  (gc-defs! 0 `((struct.new 0 type) (array.new_fixed 8 type u) (ref.test 20 heap) (ref.test-null 21 heap) (ref.i31 28)))
+  (gc-defs! 1 `((struct.get 2 type u) (struct.get_s 3 type u) (struct.get_u 4 type u) (struct.set 5 type u)
+                (array.new 6 type) (array.new_default 7 type) (array.new_data 9 type u)
+                (array.get 11 type) (array.get_s 12 type) (array.get_u 13 type) (array.set 14 type)
+                (array.len 15) (array.fill 16 type) (array.copy 17 type type)
+                (ref.cast 22 heap) (ref.cast-null 23 heap) (i31.get_s 29) (i31.get_u 30)))
+  (for-each (lambda ([name datum])
+              (let ([p (lookup-prim name)])
+                (encoding! name (-> p code) (if (== (-> p kind) (sym mem)) `(u u) nil) (-> p traps))))
+            (prim-names)))
+
+(define defined i32 (begin (define-encodings!) 1))
+
+(define (encoding-of [op datum]) -> datum
+  (let ([e (cast datum (hash-ref (& encodings) (cast u64 op)))])
+    (when (== e 0) (encode-fail "unknown instruction ~s" op))
+    e))
+
+(define (add-bytes! [p (ptr buffer)] [bytes datum])
+  (while (pair? bytes)
+    (buffer-add-byte! p (cast i32 (integer-value (car bytes))))
+    (set! bytes (cdr bytes))))
+
+;; The immediates args of kinds, written to p; a deferred field is
+;; recorded in asm a.
+(define (immediates! [p (ptr buffer)] [a (ptr asm)] [kinds datum] [args datum])
+  (while (pair? kinds)
+    (let ([kind (car kinds)] [arg (car args)])
+      (cond [(== kind (sym u)) (uleb! p arg)]
+            [(== kind (sym s)) (write-sleb p (integer-value arg))]
+            [(== kind (sym f32)) (le-bytes! p (cast u64 (cast u32 (f32-bits (cast f32 (flonum-value arg))))) 4)]
+            [(== kind (sym f64)) (le-bytes! p (cast u64 (f64-bits (flonum-value arg))) 8)]
+            [(== kind (sym catches))
+             (write-uleb p (length arg))
+             (while (pair? arg)
+               (catch! a (car arg))
+               (set! arg (cdr arg)))]
+            [else (reloc! a kind arg)]))
+    (set! kinds (cdr kinds))
+    (set! args (cdr args))))
+
+;; A constant instruction, written to p.
+(define (const! [p (ptr buffer)] [i datum])
+  (let ([e (encoding-of (car i))])
+    (add-bytes! p (car e))
+    (immediates! p 0 (cadr e) (cdr i))))
+
+;; Instruction i, (op imm ...), assembled into a. An index is a key for
+;; link-body: a function's, global's or tag's is the compiler's record of
+;; it, a type's its record or the signature (func params results), a heap
+;; type a record or its abstract name. A block's type and a deferred
+;; constant are cells, settled later. An else is written once an
+;; instruction follows it, so an empty else arm leaves nothing.
+(define (instr! [a (ptr asm)] [i datum])
+  (let ([op (car i)] [p (& (-> a out))])
+    (cond [(== op (sym else)) (set! (-> a else-pending) 1)]
+          [(== op (sym end)) (set! (-> a else-pending) 0) (buffer-add-byte! p #x0B)]
+          [else
+           (when (-> a else-pending)
+             (set! (-> a else-pending) 0)
+             (buffer-add-byte! p #x05))
+           (if (== op (sym const-deferred))
+               (reloc! a (sym const) (cadr i))
+               (let ([e (encoding-of op)])
+                 (when (!= (caddr e) 0) (note-location! a))
+                 (add-bytes! p (car e))
+                 (immediates! p a (cadr e) (cdr i))))])))
+
+(define (catch! [a (ptr asm)] [c datum])
+  (let ([p (& (-> a out))] [kind (car c)])
+    (cond [(== kind (sym catch)) (buffer-add-byte! p 0) (reloc! a (sym tag) (cadr c)) (uleb! p (caddr c))]
+          [(== kind (sym catch_ref)) (buffer-add-byte! p 1) (reloc! a (sym tag) (cadr c)) (uleb! p (caddr c))]
+          [(== kind (sym catch_all)) (buffer-add-byte! p 2) (uleb! p (cadr c))]
+          [else (buffer-add-byte! p 3) (uleb! p (cadr c))])))
+
+;; ---- linking ----
+
+;; A body, linked: its bytes, a string; its start location; and the
+;; locations recorded, at their offsets in the bytes, in order. A record
+;; in the current arena.
+(struct linked [self datum] [bytes datum] [start (ptr srcloc)] [locations (ptr code-location)])
+
+(define (linked-of [d datum]) -> (ptr linked) (cast (ptr linked) (record-pointer d)))
+(define (linked-bytes [d datum]) -> datum (-> (linked-of d) bytes))
+
+(define (reverse-relocs [r (ptr reloc)]) -> (ptr reloc)
+  (let ([out (ptr reloc) 0] [next (ptr reloc) 0])
+    (while (!= r 0)
+      (set! next (-> r next))
+      (set! (-> r next) out)
+      (set! out r)
+      (set! r next))
+    out))
+
+(define (reverse-locations [l (ptr code-location)]) -> (ptr code-location)
+  (let ([out (ptr code-location) 0] [next (ptr code-location) 0])
+    (while (!= l 0)
+      (set! next (-> l next))
+      (set! (-> l next) out)
+      (set! out l)
+      (set! l next))
+    out))
+
+;; Asm a, then asm b unless it is 0, linked in sequence as the bytes of
+;; one body: each deferred field written as (resolve kind key) gives it,
+;; an index, a heap type, a value type, a block type or a constant
+;; instruction by its kind. Their buffers are freed. Returns the body, a
+;; linked record: a's start location, and the locations recorded, at
+;; their offsets in the bytes.
+(define (link-body [a (ptr asm)] [b (ptr asm)] [resolve (closure (datum datum) -> datum)]) -> datum
+  (let ([q (make-buffer)] [notes (ptr code-location) 0]
+        [l (cast (ptr linked) (alloc-in (current-arena) (sizeof linked)))])
+    (set! notes (link-segment! (& q) a resolve notes))
+    (when (!= b 0)
+      ;; A later segment's first location is where its code starts.
+      (when (-> b started) (set! notes (new-location (-> q length) (-> b start) notes)))
+      (set! notes (link-segment! (& q) b resolve notes)))
+    (set! (-> l self) (make-record-in (current-arena) linked-kind l))
+    (set! (-> l bytes) (bytes->string (-> q bytes) (-> q length)))
+    (set! (-> l start) (-> a start))
+    (set! (-> l locations) (reverse-locations notes))
+    (buffer-free! (& q))
+    (-> l self)))
+
+;; Asm a's bytes, its deferred fields written, onto q; each location it
+;; recorded is noted, newest first onto notes, at its offset in q.
+(define (link-segment! [q (ptr buffer)] [a (ptr asm)] [resolve (closure (datum datum) -> datum)] [notes (ptr code-location)])
+  -> (ptr code-location)
+  (let ([raw (-> a out bytes)] [n (asm-size a)] [pos u32 0]
+        [relocs (reverse-relocs (-> a relocs))] [locs (reverse-locations (-> a locations))] [next u32 0])
+    (set! (-> a relocs) 0)
+    (set! (-> a locations) 0)
+    (while 1
+      (set! next (cond [(and (!= relocs 0) (!= locs 0)) (if (< (-> relocs offset) (-> locs offset)) (-> relocs offset) (-> locs offset))]
+                       [(!= relocs 0) (-> relocs offset)]
+                       [(!= locs 0) (-> locs offset)]
+                       [else n]))
+      (when (< pos next) (buffer-add! q (+ raw pos) (- next pos)))
+      (set! pos next)
+      ;; A deferred field at the offset of an instruction's location
+      ;; belongs to the instruction before it.
+      (cond [(and (!= relocs 0) (== (-> relocs offset) next))
+             (deferred! q relocs resolve)
+             (set! relocs (-> relocs next))]
+            [(and (!= locs 0) (== (-> locs offset) next))
+             (set! notes (new-location (-> q length) (-> locs loc) notes))
+             (set! locs (-> locs next))]
+            [else
+             (buffer-free! (& (-> a out)))
+             (return notes)]))))
+
+(define (deferred! [q (ptr buffer)] [r (ptr reloc)] [resolve (closure (datum datum) -> datum)])
+  (let* ([kind (-> r kind)] [v (resolve kind (-> r key))])
+    (cond [(!= (memq kind `(func ref-func global type tag)) 0) (uleb! q v)]
+          [(== kind (sym heap)) (heap! q v)]
+          [(== kind (sym valtype)) (valtype! q v)]
+          [(== kind (sym blocktype)) (blocktype! q v)]
+          [(== kind (sym const)) (const! q v)])))
+
+;; ---- module ----
+
+(define (type-entry! [p (ptr buffer)] [t datum])
+  (let ([kind (car t)])
+    (cond [(== kind (sym func)) (buffer-add-byte! p #x60) (vec! p (cadr t) valtype!) (vec! p (caddr t) valtype!)]
+          [(== kind (sym struct)) (buffer-add-byte! p #x5F) (vec! p (cadr t) field!)]
+          [(== kind (sym array)) (buffer-add-byte! p #x5E) (field! p (cadr t))]
+          ;; A final type with no supertype is written as its comptype alone.
+          [(== kind (sym sub))
+           (let ([final (cadr t)] [supers (caddr t)])
+             (unless (and (!= final 0) (null? supers))
+               (buffer-add-byte! p (if (!= final 0) #x4F #x50))
+               (vec! p supers uleb!))
+             (type-entry! p (cadddr t)))]
+          ;; A recursion group: one entry, but each member has its own type index.
+          [(== kind (sym rec)) (buffer-add-byte! p #x4E) (vec! p (cdr t) type-entry!)]
+          [else (encode-fail "unknown type ~s" t)])))
+
+(define (import! [p (ptr buffer)] [imp datum])
+  (name! p (car imp))
+  (name! p (cadr imp))
+  (let ([kind (caddr imp)] [desc (cadddr imp)])
+    (cond [(== kind (sym func)) (buffer-add-byte! p 0) (uleb! p desc)]
+          [(== kind (sym table)) (buffer-add-byte! p 1) (buffer-add-byte! p #x70) (limits! p desc)]
+          [(== kind (sym memory)) (buffer-add-byte! p 2) (limits! p desc)]
+          [(== kind (sym global)) (buffer-add-byte! p 3) (valtype! p (car desc)) (buffer-add-byte! p (if (!= (cadr desc) 0) 1 0))]
+          [else (buffer-add-byte! p 4) (buffer-add-byte! p 0) (uleb! p desc)])))
+
+(define (global! [p (ptr buffer)] [g datum])
+  (valtype! p (car g))
+  (buffer-add-byte! p (if (!= (cadr g) 0) 1 0))
+  (let ([init (caddr g)]) (buffer-add! p (string-bytes init) (string-length init)))
+  (buffer-add-byte! p #x0B))
+
+(define (export! [p (ptr buffer)] [e datum])
+  (name! p (car e))
+  (buffer-add-byte! p (case (cadr e)
+                        [((sym func)) 0] [((sym table)) 1] [((sym memory)) 2] [((sym global)) 3] [else 4]))
+  (uleb! p (caddr e)))
+
+(define (func-type! [p (ptr buffer)] [f datum]) (uleb! p (car f)))
+(define (table! [p (ptr buffer)] [t datum]) (buffer-add-byte! p #x70) (limits! p t))
+(define (tag! [p (ptr buffer)] [t datum]) (buffer-add-byte! p 0) (uleb! p t))
+
+(define (local-group! [p (ptr buffer)] [g datum]) (uleb! p (cdr g)) (valtype! p (car g)))
+
+;; A function's entry: its locals, then its body, linked. The locations,
+;; the start's at offset 0, are kept for the code section, at their
+;; offsets in it.
+(define (code! [p (ptr buffer)] [f datum])
+  (let* ([l (linked-of (caddr f))] [q (make-buffer)] [shift u32 0] [base u32 0])
+    (vec! (& q) (group-locals (cadr f)) local-group!)
+    (set! shift (-> q length))
+    (buffer-add! (& q) (string-bytes (-> l bytes)) (string-length (-> l bytes)))
+    (buffer-add-byte! (& q) #x0B)
+    (write-uleb p (-> q length))
+    (set! base (-> p length))
+    (set! code-locations (new-location base (-> l start) code-locations))
+    (let ([e (-> l locations)])
+      (while (!= e 0)
+        (set! code-locations (new-location (+ base shift (-> e offset)) (-> e loc) code-locations))
+        (set! e (-> e next))))
+    (buffer-add! p (-> q bytes) (-> q length))
+    (buffer-free! (& q))))
+
+(define (data! [p (ptr buffer)] [d datum])
+  (if (!= (car d) 0)
+      (begin (buffer-add-byte! p 0)              ; active, memory 0
+             (const! p `(i32.const ,(car d)))
+             (buffer-add-byte! p #x0B))
+      (buffer-add-byte! p 1))                    ; passive
+  (let ([bytes (cdr d)])
+    (write-uleb p (string-length bytes))
+    (buffer-add! p (string-bytes bytes) (string-length bytes))))
+
+(define (function-name! [p (ptr buffer)] [n datum]) (uleb! p (car n)) (name! p (cdr n)))
+
+;; Module m's bytes, onto p.
+(define (encode-module [m (ptr wmodule)] [p (ptr buffer)])
+  (let ([q (make-buffer)])
+    (buffer-add! p (array-of u8 #x00 #x61 #x73 #x6D #x01 #x00 #x00 #x00) 8)
+    (unless (null? (-> m types)) (set! q (make-buffer)) (vec! (& q) (-> m types) type-entry!) (section! p 1 (& q)))
+    (unless (null? (-> m imports)) (set! q (make-buffer)) (vec! (& q) (-> m imports) import!) (section! p 2 (& q)))
+    (unless (null? (-> m funcs)) (set! q (make-buffer)) (vec! (& q) (-> m funcs) func-type!) (section! p 3 (& q)))
+    (unless (null? (-> m tables)) (set! q (make-buffer)) (vec! (& q) (-> m tables) table!) (section! p 4 (& q)))
+    (unless (null? (-> m memories)) (set! q (make-buffer)) (vec! (& q) (-> m memories) limits!) (section! p 5 (& q)))
+    (unless (null? (-> m tags)) (set! q (make-buffer)) (vec! (& q) (-> m tags) tag!) (section! p 13 (& q)))
+    (unless (null? (-> m globals)) (set! q (make-buffer)) (vec! (& q) (-> m globals) global!) (section! p 6 (& q)))
+    (unless (null? (-> m exports)) (set! q (make-buffer)) (vec! (& q) (-> m exports) export!) (section! p 7 (& q)))
+    (when (!= (-> m start) 0) (set! q (make-buffer)) (uleb! (& q) (-> m start)) (section! p 8 (& q)))
+    (unless (null? (-> m declared))
+      (set! q (make-buffer))
+      (write-uleb (& q) 1)
+      (buffer-add-byte! (& q) 3)                 ; declarative, elemkind + funcidx vector
+      (buffer-add-byte! (& q) #x00)
+      (vec! (& q) (-> m declared) uleb!)
+      (section! p 9 (& q)))
+    ;; The data count, which code referring to segments needs.
+    (unless (null? (-> m datas)) (set! q (make-buffer)) (write-uleb (& q) (length (-> m datas))) (section! p 12 (& q)))
+    ;; The code section, written here to know where each body is: the
+    ;; source locations give offsets in the module.
+    (set! code-locations 0)
+    (set! q (make-buffer))
+    (vec! (& q) (-> m funcs) code!)
+    (let ([start (+ (-> p length) 1 (uleb-length (-> q length)))] [l (ptr code-location) 0])
+      (if (null? (-> m funcs))
+          (buffer-free! (& q))
+          (section! p 10 (& q)))
+      (set! code-locations (reverse-locations code-locations))
+      (set! l code-locations)
+      (while (!= l 0)
+        (+= (-> l offset) start)
+        (set! l (-> l next))))
+    (unless (null? (-> m datas)) (set! q (make-buffer)) (vec! (& q) (-> m datas) data!) (section! p 11 (& q)))
+    (let ([names (-> m names)])
+      (when (!= names 0)
+        (let ([sub (make-buffer)])
+          (set! q (make-buffer))
+          (name! (& q) `"name")
+          (name! (& sub) (car names))
+          (section! (& q) 0 (& sub))
+          (set! sub (make-buffer))
+          (vec! (& sub) (cdr names) function-name!)
+          (section! (& q) 1 (& sub))
+          (section! p 0 (& q)))))
+    (when (!= code-locations 0)
+      (set! q (make-buffer))
+      (source-locations! (& q) code-locations)
+      (section! p 0 (& q)))))
+
+;; Run-length group consecutive equal local types: ((type . count) ...)
+(define (group-locals [types datum]) -> datum
+  (let ([acc nil])
+    (while (pair? types)
+      (if (and (pair? acc) (equal? (car (car acc)) (car types)))
+          (set! acc (cons (cons (car (car acc)) (make-integer (+ (integer-value (cdr (car acc))) 1))) (cdr acc)))
+          (set! acc (cons (cons (car types) (make-integer 1)) acc)))
+      (set! types (cdr types)))
+    (reverse acc)))
