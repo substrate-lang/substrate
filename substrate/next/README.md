@@ -50,6 +50,11 @@ on them there.
     `and`, `or`, `when`, `unless` and `case`, and Racket's `for` forms on
     lists, its `for` named `for/each`, as `lib/substrate-core.sub` gives
     Substrate its forms.
+- `substrate/`: Substrate as the new compiler builds it, on the C-like
+  Lisp (plan, 5):
+  - `data.sub`: its data, `compiler/kernel.sub`'s but for its syntax
+    objects, as wasm GC objects; and its `quote`, which makes a datum as
+    its value, once, when the module that quotes it starts.
 - `seed/`: a build of the new compiler by itself, checked in, as `seed/`
   is the compiler's.
 - `sub`: runs the new compiler as `bin/sub` runs the compiler; when its
@@ -159,7 +164,8 @@ Substrate is to be built again on the C-like Lisp (plan, 5).
       `tests/c-quote.sub`, and `tests/c/syntax-match.sub`, the kernel's
       test of `syntax-match` in C, which gives its output.
    2. Substrate's data, the old kernel module's GC data but syntax, and
-      its literals, made when a module starts.
+      its literals, made when a module starts. Done: `substrate/data.sub`
+      (`tests/substrate/data.sub`).
    3. Substrate's forms, and pattern macros for Substrate's users.
    4. Numeric instructions and reference types in C code.
    5. The typed example; then Bend, its checker first-order, in C.

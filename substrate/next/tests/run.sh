@@ -16,7 +16,8 @@
 # outputs are those tests' own. next/tests/fixtures holds the modules they
 # require. next/tests/c has the C example's tests (tests/c), on the C-like
 # Lisp as the new compiler builds it (next/c). OUT is where builds go
-# (default build). In the dev shell:
+# (default build); next/tests/substrate has the tests of Substrate as the
+# new compiler builds it (next/substrate). In the dev shell:
 #
 #   next/tests/run.sh
 set -uo pipefail
@@ -29,7 +30,7 @@ mkdir -p "$builds"
 
 pass=0
 fail=0
-for t in next/tests/*.sub next/tests/c/*.sub; do
+for t in next/tests/*.sub next/tests/c/*.sub next/tests/substrate/*.sub; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
   base="$dir/$name"
