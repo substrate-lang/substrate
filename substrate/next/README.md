@@ -84,12 +84,17 @@ on them there.
     terms as bytes and the names they refer to, and the name of its
     function, which is made as soon as the definition is checked.
   - `lower.sub`: `examples/bend/lower.sub`, the code of definitions and
-    of `print`, in kernel code on cells in linear memory, where the
-    example's are wasm GC structs: a cell is its constructor's number
-    then its live fields, a closure its function's index in the table
-    then the values it captures.
-  - `runtime.sub`: what that code runs with: cells, from a bump
-    allocator that frees nothing yet, and writing a Nat.
+    of `print`, in kernel code on values in linear memory, as Bend2's
+    runtime has them, where the example's are wasm GC structs: a value
+    is a 64-bit term, a Nat or a constructor of no field packed in it,
+    else a node of its live fields; a definition whose values are proofs
+    or types has no code. A term is made a function's code, then kernel
+    code that owns each value once, as Bend's quantities allow: a value
+    used again is shared, one not used is dropped, and a match frees the
+    node it takes, or reuses it for a constructor it builds.
+  - `runtime.sub`: what that code runs with: nodes, from lists of the
+    freed ones of each size; sharing, a count of owners off the node,
+    made the first time a value is shared; dropping; and writing a Nat.
   - `base.sub`: `examples/bend/base.sub`.
 - `seed/`: a build of the new compiler by itself, checked in, as `seed/`
   is the compiler's.

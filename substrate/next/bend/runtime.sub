@@ -1,43 +1,168 @@
 ;; Lifecycle: experimental. What a program of Bend as the new compiler
 ;; builds it (next/bend) runs with, besides its own code, in the C-like
-;; Lisp: cells in linear memory, made by bump allocation and never freed,
-;; for now, as Bend's affine types will say when one can be; and what a
-;; print, whose code lower.sub makes, writes with. A module whose Bend
-;; definitions have code requires this one as %bend-rt, and shares its
-;; memory and table.
+;; Lisp: its memory, as Bend2's runtime keeps it (bend2/comp.ts, BendRT
+;; section 5), and what a print, whose code lower.sub makes, writes with.
+;; A module whose Bend definitions have code requires this one as
+;; %bend-rt, and shares its memory and table.
+;;
+;; A value is a term, a u64 (lower.sub): bit 63 says it is shared; bits
+;; 56-62 are its tag, 0 a constructor with no live field, 1 a Nat, both
+;; packed in the word, 2 a node of fields, 3 a closure; bits 32-55 its
+;; aux, a node's constructor number in the low 12 bits and its fields'
+;; count in the high 12, a closure's code's index in the table; bits 0-31
+;; the node's address. A node is its fields, each a term, a word each,
+;; and nothing else: a closure's node is the count of the values it
+;; captures, then them. Nodes come from lists of the freed ones of each
+;; size, or from chunks of 1 MiB, and go back to the lists.
+;;
+;; There is no collector: a value has one owner, which a match takes it
+;; from, its node freed, or which drops it, all it holds freed, unless
+;; it is shared. The first share of a value gives it a redirect, a word
+;; holding its node's address, high, and its count of owners, low, and
+;; the term points there instead, keeping its tag and aux; so a value
+;; never shared has no count anywhere. Where Bend2 gives each field of a
+;; type that some binder shares a count when it is built, here a match
+;; on a shared node gives its fields another owner each, in place, as it
+;; takes them: the code is single-threaded, and no analysis of the whole
+;; program says which types are shared.
 
 (require-unqualified c "../c/c.sub")
 (require print "../../lib/print.sub")
 (memory from c)
 (table from c)
 
-(provide alloc write-byte write-nat newline)
+(provide node free-node share take drop node-of live write-byte newline write-nat)
 
-;; Where the next cell goes, and the end of the chunk it is in.
+;; ---- terms ----
+
+(define (shared? [t u64]) -> i32 (!= (>> t 63) 0))
+(define (tag-of [t u64]) -> u32 (cast u32 (bit-and (>> t 56) 127)))
+(define (loc-of [t u64]) -> (ptr u64) (cast (ptr u64) (cast u32 t)))
+
+;; Does t own nothing in memory: a packed term, or a closure of nothing?
+(define (trivial? [t u64]) -> i32
+  (and (not (shared? t)) (or (< (tag-of t) 2) (== (cast u32 t) 0))))
+
+;; ---- nodes ----
+
+;; The freed nodes of each size up to 32 words, each list linked through
+;; its nodes' first words; the chunk new ones come from; and how many
+;; nodes and redirects are in use.
+(define lists (array (ptr u64) 33))
 (define next (ptr u8) 0)
 (define end (ptr u8) 0)
+(define live-count i32 0)
 
-;; A new cell of n bytes, a multiple of 4: its address. Cells come from
-;; chunks of 1 MiB, or of n bytes if n is more.
-(define (alloc [n u32]) -> i32
-  (when (> (+ next n) end)
-    (let ([size (if (> n 1048576) n 1048576)])
-      (set! next (cast (ptr u8) (malloc size)))
-      (set! end (+ next size))))
-  (let ([p next])
-    (+= next n)
-    (cast i32 p)))
+;; A node of n words: its address.
+(define (node [n u32]) -> i32
+  (+= live-count 1)
+  (if (> n 32)
+      (cast i32 (malloc (* n 8)))
+      (let ([p (@ lists n)])
+        (if (!= p 0)
+            (begin
+              (set! (@ lists n) (cast (ptr u64) (cast u32 (@ p 0))))
+              (cast i32 p))
+            (let ([size (* n 8)])
+              (when (> (+ next size) end)
+                (set! next (cast (ptr u8) (malloc 1048576)))
+                (set! end (+ next 1048576)))
+              (let ([q next])
+                (+= next size)
+                (cast i32 q)))))))
+
+;; Node a, of n words, freed; none if a is 0.
+(define (free-node [a i32] [n u32])
+  (unless (== a 0)
+    (-= live-count 1)
+    (if (> n 32)
+        (free (cast (ptr void) a))
+        (let ([p (cast (ptr u64) a)])
+          (set! (@ p 0) (cast u64 (cast u32 (@ lists n))))
+          (set! (@ lists n) p)))))
+
+;; How many nodes and redirects are in use.
+(define (live) -> i32 live-count)
+
+;; ---- owners ----
+
+;; t with k owners more: a packed term as it is; a shared one with its
+;; count raised; another given a redirect, its count k + 1.
+(define (share [t u64] [k u32]) -> u64
+  (cond [(shared? t)
+         (let ([r (loc-of t)])
+           (set! (@ r 0) (+ (@ r 0) k))
+           t)]
+        [(trivial? t) t]
+        [else
+         (let ([r (node 1)])
+           (set! (@ (cast (ptr u64) r) 0) (bit-or (<< (cast u64 (cast u32 t)) 32) (cast u64 (+ k 1))))
+           (bit-or (bit-and t 9223372032559808512) (bit-or 9223372036854775808 (cast u64 (cast u32 r)))))]))
+
+;; The node of shared term t, of n fields, which a match takes, its own:
+;; t's, if t's owner was its last; else a copy, t's fields each given
+;; another owner, in t's node too, and t's owner gone. So a match always
+;; owns the node it takes, which it frees or reuses.
+(define (take [t u64] [n u32]) -> i32
+  (let* ([r (loc-of t)] [w (@ r 0)] [nd (cast (ptr u64) (cast u32 (>> w 32)))])
+    (if (== (cast u32 w) 1)
+        (begin (free-node (cast i32 r) 1) (cast i32 nd))
+        (let ([c (cast (ptr u64) (node n))])
+          (for ([j u32 0]) (< j n) (+= j 1)
+            (set! (@ nd j) (share (@ nd j) 1))
+            (set! (@ c j) (@ nd j)))
+          (set! (@ r 0) (- w 1))
+          (cast i32 c)))))
+
+;; The address of t's node, shared or not, for a print, which reads it.
+(define (node-of [t u64]) -> i32
+  (if (shared? t) (cast i32 (>> (@ (loc-of t) 0) 32)) (cast i32 t)))
+
+;; t's owner gone: if it was its last, its node freed, and all it holds
+;; dropped, a stack of what is left to drop kept as it goes.
+(define stack (ptr u64) 0)
+(define room u32 0)
+
+(define (drop [t u64])
+  (let ([top u32 0])
+    (push! top t)
+    (+= top 1)
+    (while (> top 0)
+      (-= top 1)
+      (let ([u (@ stack top)] [go 1])
+        (when (shared? u)
+          (let* ([r (loc-of u)] [w (@ r 0)])
+            (if (> (cast u32 w) 1)
+                (begin (set! (@ r 0) (- w 1)) (set! go 0))
+                (begin
+                  (set! u (bit-or (bit-and u 9223372032559808512) (>> w 32)))
+                  (free-node (cast i32 r) 1)))))
+        (when (and go (not (trivial? u)))
+          (let ([nd (loc-of u)] [n u32 0] [from u32 0])
+            (if (== (tag-of u) 2)
+                (set! n (cast u32 (bit-and (>> u 44) 4095)))
+                (begin (set! n (+ (cast u32 (@ nd 0)) 1)) (set! from 1)))
+            (for ([j u32 from]) (< j n) (+= j 1)
+              (unless (trivial? (@ nd j))
+                (push! top (@ nd j))
+                (+= top 1)))
+            (free-node (cast i32 nd) n)))))))
+
+;; Room for t at top of the stack, which grows, and t there.
+(define (push! [top u32] [t u64])
+  (when (>= top room)
+    (set! room (if (== room 0) 64 (* room 2)))
+    (set! stack (cast (ptr u64) (realloc stack (* room 8)))))
+  (set! (@ stack top) t))
+
+;; ---- printing ----
 
 (define (write-byte [b i32]) (print:write-byte b))
 (define (newline) (print:newline))
 
-;; The Nat at x, as the example writes it: Zero, or (nat n). Its Succ is
-;; constructor 1, its field the predecessor.
-(define (write-nat [x i32])
-  (let ([n u64 0] [c (cast (ptr i32) x)])
-    (while (== (@ c 0) 1)
-      (+= n 1)
-      (set! c (cast (ptr i32) (@ c 1))))
+;; The Nat t, as the example writes it: Zero, or (nat n).
+(define (write-nat [t u64])
+  (let ([n (bit-and t 281474976710655)])
     (if (== n 0)
         (begin (write-byte 90) (write-byte 101) (write-byte 114) (write-byte 111))
         (begin

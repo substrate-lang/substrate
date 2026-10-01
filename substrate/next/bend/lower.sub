@@ -1,32 +1,36 @@
 ;; Lifecycle: experimental. The lowering of Bend as the new compiler builds
 ;; it (next/bend): examples/bend/lower.sub, which follows Bend's compiler
-;; (bend2/comp.ts, its JavaScript lane: js_expr, js_func), but to code in
-;; linear memory: a module's checked definitions to kernel code, as data,
-;; which bend.sub turns into syntax. A symbol in the code means what it
-;; means in the module it is lifted into, where bend.sub has required
-;; runtime.sub as %bend-rt; syntax in it, the function of a definition, is
-;; kept as it is.
+;; (bend2/comp.ts), but to code in linear memory, whose values are owned
+;; as Bend2's runtime owns them: a module's checked definitions to kernel
+;; code, as data, which bend.sub turns into syntax. A symbol in the code
+;; means what it means in the module it is lifted into, where bend.sub has
+;; required runtime.sub as %bend-rt; syntax in it, the function of a
+;; definition, is kept as it is.
 ;;
-;; Every value is an i32, the address of a cell in linear memory: a
-;; datatype's value its constructor's number in its family, then its live
-;; fields, each a value; a function value a closure, the table index of its
-;; code, a function of the closure and its argument, then the values it
-;; captures. Cells come from %bend-rt:alloc and are never freed, for now.
-;; What is erased, a binder, argument or field of quantity -, a type, a
-;; proof's rewrite, is left out, and where a value is needed for it, it is
-;; 0. A definition is a function of its live parameters; an application of
-;; it to that many live arguments is a direct call, and any other, as of a
-;; variable, applies closures, one argument at a time: a definition given
-;; fewer is made a closure first, by eta-expansion. Where
-;; examples/bend/lower.sub has the kernel make a closure of a lambda, here
-;; a closure's function is lifted and its captured values found as its
-;; body is made (lookup).
+;; Every value is a term, an i64 (runtime.sub): a constructor with no live
+;; field, packed, its number in its family; a Nat, of a family of a Zero
+;; and a Succ of one, packed, its count; another constructor, a node of
+;; its live fields; a function value, a closure, the table index of its
+;; code, a function of the closure and its argument, at a node of the
+;; values it captures. What is erased, a binder, argument or field of
+;; quantity -, a type, a proof's rewrite, is left out, and where a value is
+;; needed for it, it is 0. A definition is a function of its live
+;; parameters; an application of it to that many live arguments is a
+;; direct call, and any other, as of a variable, applies closures, one
+;; argument at a time: a definition given fewer is made a closure first,
+;; by eta-expansion. A closure's function is lifted, and its captured
+;; values found as its body is made (lookup).
 ;;
 ;; A checked term is annotated with each node's type, which says what is
 ;; erased. Its binders are opened with probes, variables of ids of their
 ;; own, which the function being made maps to its locals. The code is made
-;; in the current arena, the module's, from a checked term in core.sub's
-;; scratch arena.
+;; in two steps: a term to a function's code, below (ir), whose variables
+;; are its locals; then that to kernel code, each variable owned, used
+;; once on each path through the code: a use but the last of a variable
+;; on the way shares its value, one never used is dropped, and a match on
+;; a node frees it, or gives it to a constructor of as many fields on the
+;; way, which reuses it. The code is made in the current arena, from a
+;; checked term in core.sub's scratch arena.
 
 (require-unqualified c "../c/c.sub")
 (require-unqualified kd "../compiler/kernel.sub")
@@ -56,7 +60,8 @@
   (set! forms nil)
   (set! used (make-table))
   (set! printers (make-table))
-  (set! erasures (make-table)))
+  (set! erasures (make-table))
+  (set! nats (make-table)))
 
 ;; The forms the pieces made so far need, not taken before, in order.
 (define (lowered-forms!) -> datum
@@ -85,15 +90,33 @@
   (+= locals 1)
   (string->symbol (format-message "~a.~a" `(,k ,(make-integer locals)))))
 
-(define (int [n u32]) -> datum (make-integer n))
-(define (i32-const [n u32]) -> datum `(i32.const ,(int n)))
-(define nothing datum `(i32.const 0))
+(define (int [n i64]) -> datum (make-integer n))
+(define (i32-const [n i64]) -> datum `(i32.const ,(int n)))
+(define (i64-const [n i64]) -> datum `(i64.const ,(int n)))
 
 ;; An error in the code of the definition being lowered, or about what,
 ;; written at loc.
 (define (lower-error [message datum] [what datum] [loc (ptr srcloc)]) -> datum
   (raise-syntax-error (sym bend) message (if (!= loc 0) (datum->syntax 0 what (make-syntax what no-scopes loc nil)) (where)))
   0)
+
+(define (c-text [p (ptr u8)]) -> datum (bytes->string p (strlen p)))
+
+;; ---- the term word ----
+
+;; A Nat's 0, and the tags of a node and of a closure, in place.
+(define nat-zero i64 72057594037927936)
+(define node-tag i64 144115188075855872)
+(define closure-tag i64 216172782113783808)
+
+;; The term of constructor number v with no live field, and the high bits
+;; of one with n, whose node's address is its low bits.
+(define (packed [v u32]) -> i64 (<< (cast i64 v) 32))
+(define (node-bits [v u32] [n u32]) -> i64 (bit-or node-tag (bit-or (<< (cast i64 n) 44) (<< (cast i64 v) 32))))
+
+;; Kernel code for term t's constructor number, and its code's table index.
+(define (variant-code [t datum]) -> datum `(i32.and (i32.wrap_i64 (i64.shr_u ,t (i64.const 32))) (i32.const 4095)))
+(define (index-code [t datum]) -> datum `(i32.and (i32.wrap_i64 (i64.shr_u ,t (i64.const 32))) (i32.const 16777215)))
 
 ;; ---- erased definitions ----
 ;;
@@ -132,12 +155,36 @@
   (let* ([c (book-ctr k)] [ds (domains (ctrd-T c))])
     (list-tail ds (- (length ds) (ctrd-n c)))))
 
+(define (live-fields [k datum]) -> u32
+  (let ([fs (fields k)] [n u32 0])
+    (while (pair? fs)
+      (unless (== (dom-q (car fs)) 0) (+= n 1))
+      (set! fs (cdr fs)))
+    n))
+
 ;; Constructor k's number in its family.
-(define (variant [k datum]) -> u32
+(define (number-of [k datum]) -> u32
   (let ([d (book-tld (book-fam k))])
     (for ([j u32 0]) (< j (adtd-nc d)) (+= j 1)
       (when (== (ctrd-k (@ (adtd-cs d) j)) k) (return j)))
     0))
+
+;; Is family k a Nat's: no parameters, a constructor of no field, then
+;; one of a live field of the family itself?
+(define nats (ptr arena-table) 0)
+
+(define (nat-family? [k datum]) -> i32
+  (let ([known (table-ref nats (cast u64 k))])
+    (if (!= known 0)
+        (== known 1)
+        (let ([d (book-tld k)] [e i32 0])
+          (when (and (AdtD? d) (== (adtd-n d) 0) (== (adtd-nc d) 2)
+                     (== (ctrd-n (@ (adtd-cs d) 0)) 0) (== (ctrd-n (@ (adtd-cs d) 1)) 1))
+            (let ([fd (car (fields (ctrd-k (@ (adtd-cs d) 1))))])
+              (when (!= (dom-q fd) 0)
+                (let ([ft (term-wnf (dom-T fd))]) (set! e (and (ADT? ft) (== (adt-k ft) k)))))))
+          (table-set! nats (cast u64 k) (if e 1 2))
+          e))))
 
 ;; Which of definition k's n parameters are live, a list of 1 and 0, those
 ;; past its type's domains live.
@@ -155,14 +202,45 @@
       (set! flags (cdr flags)))
     n))
 
+;; ---- a function's code ----
+;;
+;; What a term's code does, its variables a function's locals, each a
+;; symbol, before what owns what is said: a variable; a term word; a call
+;; of a definition's function; an application of a closure; a Nat's
+;; successor; a constructor's node, of its term's high bits; a closure
+;; of a lifted function, of the variables it captures; a value bound; a
+;; match on a variable, by constructor, each branch's fields bound, and
+;; what the others do; or a fault.
+
+(variant ir
+  [Use [v datum]]
+  [Lit [x i64]]
+  [Call [f datum] [n u32] [xs (ptr (ptr ir))]]
+  [Apply [g (ptr ir)] [x (ptr ir)]]
+  [Succ [x (ptr ir)]]
+  [Make [bits i64] [n u32] [xs (ptr (ptr ir))]]
+  [Close [f datum] [n u32] [vs (ptr datum)]]
+  [Bind [v datum] [x (ptr ir)] [then (ptr ir)]]
+  [Case [s datum] [nat i32] [n u32] [bs (ptr (ptr branch))] [other (ptr ir)]]
+  [Fail])
+
+(struct branch [number u32] [n u32] [vs (ptr datum)] [then (ptr ir)])
+
+(define (new-ir [c ir]) -> (ptr ir)
+  (let ([p (cast (ptr ir) (alloc-in (current-arena) (sizeof ir)))]) (set! (@ p) c) p))
+
+(define (lit [x i64]) -> (ptr ir) (new-ir (Lit x)))
+
+(define (ir-array [n u32]) -> (ptr (ptr ir)) (cast (ptr (ptr ir)) (alloc-in (current-arena) (* (+ n 1) 4))))
+(define (sym-array [n u32]) -> (ptr datum) (cast (ptr datum) (alloc-in (current-arena) (* (+ n 1) 4))))
+
 ;; ---- functions being made ----
 ;;
-;; A function has its locals, each probe's local, or the code that reads
-;; it, or erased; and the function it is in, if it is a closure's, whose
-;; locals it captures as it finds them: self, its closure, and the parent's
-;; code for each value captured, in order.
+;; A function has its locals, each probe's variable, or erased; and the
+;; function it is in, if it is a closure's, whose variables it captures as
+;; it finds them: those, the latest first, and its own for them.
 
-(struct lfn [parent (ptr lfn)] [locals (ptr arena-table)] [self datum] [captures datum] [ncap u32])
+(struct lfn [parent (ptr lfn)] [locals (ptr arena-table)] [captured datum] [caps datum] [ncap u32])
 
 (define erased datum (sym %erased))
 
@@ -170,8 +248,8 @@
   (let ([f (cast (ptr lfn) (alloc-in (current-arena) (sizeof lfn)))])
     (set! (-> f parent) parent)
     (set! (-> f locals) (make-table))
-    (set! (-> f self) 0)
-    (set! (-> f captures) nil)
+    (set! (-> f captured) nil)
+    (set! (-> f caps) nil)
     (set! (-> f ncap) 0)
     f))
 
@@ -181,14 +259,13 @@
 
 (define (bind! [f (ptr lfn)] [p (ptr term)] [v datum]) (table-set! (-> f locals) (cast u64 (cast u32 (var-i p))) (cast u32 v)))
 
-;; A probe bound to a new local of f: the probe, and the local.
 (define (erased! [f (ptr lfn)] [k datum]) -> (ptr term)
   (let ([p (probe k)])
     (bind! f p erased)
     p))
 
-;; The code of probe p in f: its local; or, in a closure, the parent's value
-;; captured, read from the closure; or erased.
+;; The variable of probe p in f; or, in a closure, its own for the
+;; parent's, which it captures; or erased.
 (define (lookup [f (ptr lfn)] [p (ptr term)]) -> datum
   (let ([v (cast datum (table-ref (-> f locals) (cast u64 (cast u32 (var-i p)))))])
     (cond [(!= v 0) v]
@@ -197,13 +274,12 @@
            (let ([pv (lookup (-> f parent) p)])
              (if (== pv erased)
                  pv
-                 (let ([e `(i32.load ,(-> f self) ,(int (* 4 (+ (-> f ncap) 1))))])
-                   (set! (-> f captures) (cons pv (-> f captures)))
+                 (let ([c (local! (var-k p))])
+                   (set! (-> f captured) (cons pv (-> f captured)))
+                   (set! (-> f caps) (cons c (-> f caps)))
                    (+= (-> f ncap) 1)
-                   (bind! f p e)
-                   e)))])))
-
-(define (c-text [p (ptr u8)]) -> datum (bytes->string p (strlen p)))
+                   (bind! f p c)
+                   c)))])))
 
 ;; ---- terms ----
 
@@ -227,34 +303,39 @@
         [(Lam? x) (!= (all-q (ty-all ty)) 0)]
         [else 0]))
 
-;; t as an expression, in function f, of type ty or its annotation's.
-(define (expr [f (ptr lfn)] [t (ptr term)] [ty (ptr term)]) -> datum
+;; t as an expression's code, in function f, of type ty or its
+;; annotation's.
+(define (expr-ir [f (ptr lfn)] [t (ptr term)] [ty (ptr term)]) -> (ptr ir)
   (let* ([pl (peel t ty)] [x (-> pl x)] [xty (-> pl ty)])
     (cond
-      [(Var? x) (let ([v (lookup f x)]) (if (== v erased) nothing v))]
-      [(or (Ref? x) (App? x)) (spine-expr f x)]
-      [(Ctr? x) (construct f x)]
-      [(Let? x) (let-code f x xty nil 0)]
+      [(Var? x) (let ([v (lookup f x)]) (if (== v erased) (lit 0) (new-ir (Use v))))]
+      [(or (Ref? x) (App? x)) (spine-ir f x)]
+      [(Ctr? x) (construct-ir f x)]
+      [(Let? x) (let-ir f x xty nil 0)]
       [(Hol? x)
-       (lower-error (format-message "(? ~a) is a hole, which cannot run: fill it" (list1 (hol-k x))) `(? ,(hol-k x)) (term-s x))]
-      [(function? x xty) (closure f x xty)]
+       (lower-error (format-message "(? ~a) is a hole, which cannot run: fill it" (list1 (hol-k x))) `(? ,(hol-k x)) (term-s x))
+       0]
+      [(function? x xty) (closure-ir f x xty)]
       [(Lam? x)
        (let* ([all (ty-all xty)] [p (erased! f (lam-k x))])
-         (expr f (body-apply (lam-bd x) p) (body-apply (all-bd all) p)))]
-      [else nothing])))
+         (expr-ir f (body-apply (lam-bd x) p) (body-apply (all-bd all) p)))]
+      [else (lit 0)])))
 
-;; Constructor x's cell: its number, then its live fields.
-(define (construct [f (ptr lfn)] [x (ptr term)]) -> datum
-  (let* ([k (ctr-k x)] [fs (fields k)] [c (local! (sym c))] [stores nil] [m u32 0])
+;; Constructor x's value: its family's Nat, or packed, or a node of its
+;; live fields.
+(define (construct-ir [f (ptr lfn)] [x (ptr term)]) -> (ptr ir)
+  (let* ([k (ctr-k x)] [v (number-of k)] [fs (fields k)] [n u32 0] [xs (ir-array (ctr-n x))])
     (for ([j u32 0]) (< j (ctr-n x)) (+= j 1)
       (when (!= (dom-q (car fs)) 0)
-        (+= m 1)
-        (set! stores (cons `(i32.store ,c ,(expr f (@ (ctr-x x) j) 0) ,(int (* 4 m))) stores)))
+        (set! (@ xs n) (expr-ir f (@ (ctr-x x) j) 0))
+        (+= n 1))
       (set! fs (cdr fs)))
-    `(let ([,c (%bend-rt:alloc ,(i32-const (* 4 (+ m 1))))])
-       (i32.store ,c ,(i32-const (variant k)))
-       ,@(reverse stores)
-       ,c)))
+    (cond [(nat-family? (book-fam k))
+           (if (== n 0)
+               (lit nat-zero)
+               (let ([a (@ xs 0)]) (match a [(Lit y) (lit (+ y 1))] [_ (new-ir (Succ a))])))]
+          [(== n 0) (lit (packed v))]
+          [else (new-ir (Make (node-bits v n) n xs))])))
 
 ;; An application: its head, the annotated head, and its App nodes,
 ;; innermost first.
@@ -271,7 +352,7 @@
     (set! (-> out apps) apps)
     out))
 
-(define (spine-expr [f (ptr lfn)] [t (ptr term)]) -> datum
+(define (spine-ir [f (ptr lfn)] [t (ptr term)]) -> (ptr ir)
   (let* ([sp (spine t)] [head (-> sp head)] [apps (-> sp apps)] [napps (length apps)]
          [d (if (Ref? head) (book-tld (ref-k head)) 0)]
          [def (if (and (DefD? d) (!= (defd-v d) 0)) d 0)]
@@ -289,80 +370,81 @@
     (cond
       [(!= def 0)
        (let ([need (count-live (params-live (ref-k head)))] [n (length live)])
-         (cond [(and (>= n need) (erased-def? (ref-k head))) nothing]
+         (cond [(and (>= n need) (erased-def? (ref-k head))) (lit 0)]
                [(== n need)
-                `(#%app ,(code-of (ref-k head)) ,@(map (lambda ([a datum]) -> datum (expr f (app-x (cast (ptr term) a)) 0)) live))]
+                (let ([xs (ir-array n)] [a live] [j u32 0])
+                  (while (pair? a)
+                    (set! (@ xs j) (expr-ir f (app-x (cast (ptr term) (car a))) 0))
+                    (+= j 1)
+                    (set! a (cdr a)))
+                  (new-ir (Call (code-of (ref-k head)) n xs)))]
                [(> n need) (apply-last f live)]
                [else
                 (let ([xs (term-array napps)] [a apps])
                   (for ([j u32 0]) (< j napps) (+= j 1)
                     (set! (@ xs j) (app-x (cast (ptr term) (car a))))
                     (set! a (cdr a)))
-                  (expr f (eta t (tele-fill (defd-T def) xs napps 0 0) (- (defd-n def) napps)) 0))]))]
-      [(Ref? head) nothing]
-      [(null? live) (expr f (-> sp h) 0)]
+                  (expr-ir f (eta t (tele-fill (defd-T def) xs napps 0 0) (- (defd-n def) napps)) 0))]))]
+      [(Ref? head) (lit 0)]
+      [(null? live) (expr-ir f (-> sp h) 0)]
       [else (apply-last f live)])))
 
-;; The last live application of a spine, which applies a closure: its
-;; code, from the closure's first word, given the closure and the
-;; argument.
-(define (apply-last [f (ptr lfn)] [live datum]) -> datum
-  (let ([a (cast (ptr term) (car (reverse live)))] [g (local! (sym g))])
-    `(let ([,g ,(expr f (app-f a) 0)])
-       (call-indirect (i32 i32 -> i32) (i32.load ,g) ,g ,(expr f (app-x a) 0)))))
+;; The last live application of a spine, which applies a closure.
+(define (apply-last [f (ptr lfn)] [live datum]) -> (ptr ir)
+  (let ([a (cast (ptr term) (car (reverse live)))])
+    (new-ir (Apply (expr-ir f (app-f a) 0) (expr-ir f (app-x a) 0)))))
 
 ;; A let: its live values bound, then its body, as an expression of type
-;; ty, or, if args is a list, a function's body given args.
-(define (let-code [f (ptr lfn)] [x (ptr term)] [ty (ptr term)] [args datum] [tail i32]) -> datum
+;; ty, or, if tail, a function's body given args.
+(define (let-ir [f (ptr lfn)] [x (ptr term)] [ty (ptr term)] [args datum] [tail i32]) -> (ptr ir)
   (let ([n u32 0] [ks (ptr datum) 0] [qs (ptr u32) 0] [vs (ptr (ptr term)) 0] [bd (ptr body) 0])
     (match x [(Let ln lks _ lqs lvs _ lbd _) (set! n ln) (set! ks lks) (set! qs lqs) (set! vs lvs) (set! bd lbd)] [_ 0])
-    (let ([ps (term-array n)] [binds nil])
+    (let ([ps (term-array n)] [names (sym-array n)] [vals (ir-array n)] [r (ptr ir) 0])
       (for ([j u32 0]) (< j n) (+= j 1)
         (if (== (@ qs j) 0)
-            (set! (@ ps j) (erased! f (@ ks j)))
-            (let ([v (expr f (@ vs j) 0)] [p (probe (@ ks j))] [l (local! (@ ks j))])
+            (begin (set! (@ ps j) (erased! f (@ ks j))) (set! (@ names j) 0))
+            (let ([p (probe (@ ks j))] [l (local! (@ ks j))])
+              (set! (@ vals j) (expr-ir f (@ vs j) 0))
               (bind! f p l)
               (set! (@ ps j) p)
-              (set! binds (cons `[,l ,v] binds)))))
+              (set! (@ names j) l))))
       (let ([b (body-apply-n bd ps)])
-        `(let ,(reverse binds) ,(if tail (body-code f b ty args) (expr f b ty)))))))
+        (set! r (if tail (body-ir f b ty args) (expr-ir f b ty))))
+      (for ([j u32 n]) (> j 0) (-= j 1)
+        (unless (== (@ names (- j 1)) 0)
+          (set! r (new-ir (Bind (@ names (- j 1)) (@ vals (- j 1)) r)))))
+      r)))
 
 ;; A closure of x, a function value of type ty: its function lifted, a
 ;; function of the closure and the argument, made first, so that what it
-;; captures is known; then the closure, its code and those values.
-(define (closure [f (ptr lfn)] [x (ptr term)] [ty (ptr term)]) -> datum
-  (let* ([g (new-lfn f)] [self (local! (sym self))] [arg (local! (if (Lam? x) (lam-k x) (sym x)))]
-         [name (fresh-global (sym closure))] [c (local! (sym c))] [stores nil] [j u32 0])
-    (set! (-> g self) self)
-    (lift! `(func (,name [,self i32] [,arg i32]) -> i32 ,(body-code g x ty (list1 arg))))
-    (let ([cs (reverse (-> g captures))])
-      (while (pair? cs)
-        (+= j 1)
-        (set! stores (cons `(i32.store ,c ,(car cs) ,(int (* 4 j))) stores))
-        (set! cs (cdr cs))))
-    `(let ([,c (%bend-rt:alloc ,(i32-const (* 4 (+ (-> g ncap) 1))))])
-       (i32.store ,c (func-index ,name))
-       ,@(reverse stores)
-       ,c)))
+;; captures is known; then the closure, of those values.
+(define (closure-ir [f (ptr lfn)] [x (ptr term)] [ty (ptr term)]) -> (ptr ir)
+  (let* ([g (new-lfn f)] [arg (local! (if (Lam? x) (lam-k x) (sym x)))] [name (fresh-global (sym closure))]
+         [b (body-ir g x ty (list1 arg))] [n (-> g ncap)] [vs (sym-array n)] [cs (reverse (-> g captured))])
+    (for ([j u32 0]) (< j n) (+= j 1)
+      (set! (@ vs j) (car cs))
+      (set! cs (cdr cs)))
+    (lift! (closure-func name (reverse (-> g caps)) n arg b))
+    (new-ir (Close name n vs))))
 
 ;; t, of type ty, as the body of a function whose live arguments not yet
-;; taken are args, locals: a lambda takes one, if its binder is live, and
-;; a match takes its scrutinee and gives its case the constructor's live
-;; fields (bend.ts's js_func).
-(define (body-code [f (ptr lfn)] [t (ptr term)] [ty (ptr term)] [args datum]) -> datum
+;; taken are args, variables: a lambda takes one, if its binder is live,
+;; and a match takes its scrutinee and gives its case the constructor's
+;; live fields (bend.ts's js_func).
+(define (body-ir [f (ptr lfn)] [t (ptr term)] [ty (ptr term)] [args datum]) -> (ptr ir)
   (let* ([pl (peel t ty)] [x (-> pl x)] [xty (-> pl ty)])
     (cond
-      [(and (null? args) (function? x xty)) (expr f x xty)]
+      [(and (null? args) (function? x xty)) (expr-ir f x xty)]
       [(Lam? x)
        (let* ([all (ty-all xty)] [p (probe (lam-k x))])
          (if (!= (all-q all) 0)
-             (begin (bind! f p (car args)) (body-code f (body-apply (lam-bd x) p) (body-apply (all-bd all) p) (cdr args)))
-             (begin (bind! f p erased) (body-code f (body-apply (lam-bd x) p) (body-apply (all-bd all) p) args))))]
-      [(Efq? x) `(unreachable)]
-      [(Mat? x) (match-code f x xty args)]
-      [(Let? x) (let-code f x xty args 1)]
-      [(pair? args) (body-code f (eta x xty 1) xty args)]
-      [else (expr f x xty)])))
+             (begin (bind! f p (car args)) (body-ir f (body-apply (lam-bd x) p) (body-apply (all-bd all) p) (cdr args)))
+             (begin (bind! f p erased) (body-ir f (body-apply (lam-bd x) p) (body-apply (all-bd all) p) args))))]
+      [(Efq? x) (new-ir (Fail))]
+      [(Mat? x) (match-ir f x xty args)]
+      [(Let? x) (let-ir f x xty args 1)]
+      [(pair? args) (body-ir f (eta x xty 1) xty args)]
+      [else (expr-ir f x xty)])))
 
 ;; A lambda-match's cases, each Mat node, in order, and what the last
 ;; one's m is.
@@ -378,37 +460,263 @@
     (set! (-> out rest) cur)
     out))
 
-(define (match-code [f (ptr lfn)] [x (ptr term)] [ty (ptr term)] [args datum]) -> datum
+(define (match-ir [f (ptr lfn)] [x (ptr term)] [ty (ptr term)] [args datum]) -> (ptr ir)
   (let* ([all (ty-all ty)] [adt (term-wnf (all-A all))] [total (adtd-nc (book-adt adt 0))]
-         [cs (cases x)] [arms (-> cs arms)] [s (car args)]
-         [rest (if (< (length arms) total) (body-code f (-> cs rest) 0 args) 0)]
-         [codes (map (lambda ([m datum]) -> datum
-                       (let ([mt (cast (ptr term) m)]) (case-code f (mat-k mt) (mat-h mt) s (cdr args))))
-                     arms)])
-    (arms-code arms codes rest s)))
+         [cs (cases x)] [arms (-> cs arms)] [na (length arms)]
+         [bs (cast (ptr (ptr branch)) (alloc-in (current-arena) (* (+ na 1) 4)))] [j u32 0])
+    (while (pair? arms)
+      (let ([mt (cast (ptr term) (car arms))])
+        (set! (@ bs j) (branch-ir f (mat-k mt) (mat-h mt) (cdr args))))
+      (+= j 1)
+      (set! arms (cdr arms)))
+    (new-ir (Case (car args) (nat-family? (adt-k adt)) na bs (if (< na total) (body-ir f (-> cs rest) 0 args) 0)))))
 
-;; An if per arm, its constructor's number tested, the last arm's code
-;; alone if rest is 0.
-(define (arms-code [arms datum] [codes datum] [rest datum] [s datum]) -> datum
-  (cond [(null? arms) (if (!= rest 0) rest `(unreachable))]
-        [(and (null? (cdr arms)) (== rest 0)) (car codes)]
-        [else `(if (i32.eq (i32.load ,s) ,(i32-const (variant (mat-k (cast (ptr term) (car arms))))))
-                   ,(car codes)
-                   ,(arms-code (cdr arms) (cdr codes) rest s))]))
-
-;; Case h of constructor k, for scrutinee s: its live fields bound.
-(define (case-code [f (ptr lfn)] [k datum] [h (ptr term)] [s datum] [rest datum]) -> datum
-  (let ([fs (fields k)] [binds nil] [xs nil] [m u32 0])
+;; Case h of constructor k: its live fields bound, then the rest of the
+;; arguments.
+(define (branch-ir [f (ptr lfn)] [k datum] [h (ptr term)] [rest datum]) -> (ptr branch)
+  (let ([fs (fields k)] [xs nil] [n u32 0] [b (cast (ptr branch) (alloc-in (current-arena) (sizeof branch)))])
     (while (pair? fs)
       (unless (== (dom-q (car fs)) 0)
-        (+= m 1)
-        (let ([x (local! (dom-k (car fs)))])
-          (set! xs (cons x xs))
-          (set! binds (cons `[,x (i32.load ,s ,(int (* 4 m)))] binds))))
+        (set! xs (cons (local! (dom-k (car fs))) xs))
+        (+= n 1))
       (set! fs (cdr fs)))
-    (if (null? xs)
-        (body-code f h 0 rest)
-        `(let ,(reverse binds) ,(body-code f h 0 (append (reverse xs) rest))))))
+    (set! xs (reverse xs))
+    (set! (-> b number) (number-of k))
+    (set! (-> b n) n)
+    (set! (-> b vs) (sym-array n))
+    (let ([l xs])
+      (for ([i u32 0]) (< i n) (+= i 1)
+        (set! (@ (-> b vs) i) (car l))
+        (set! l (cdr l))))
+    (set! (-> b then) (body-ir f h 0 (append xs rest)))
+    b))
+
+;; ---- owning ----
+;;
+;; A function's code made kernel code, gamma the variables it owns, each
+;; once, all of which it uses on its way or drops: those its code does
+;; not use are dropped as it starts; one that more than one part of an
+;; expression uses is shared, as many times more, before any of them
+;; runs; a match takes its scrutinee. A node a match takes, its own, is a
+;; spare, which the first constructor of as many fields on the way reuses;
+;; one no constructor reuses is freed where the way ends.
+
+(struct spare [at datum] [n u32] [used i32] [next (ptr spare)])
+
+(define (new-spare [at datum] [n u32] [next (ptr spare)]) -> (ptr spare)
+  (let ([s (cast (ptr spare) (alloc-in (current-arena) (sizeof spare)))])
+    (set! (-> s at) at)
+    (set! (-> s n) n)
+    (set! (-> s used) 0)
+    (set! (-> s next) next)
+    s))
+
+;; The spares of sp not used, again, for a way of their own.
+(define (pending [sp (ptr spare)]) -> (ptr spare)
+  (if (== sp 0)
+      0
+      (let ([rest (pending (-> sp next))])
+        (if (-> sp used) rest (new-spare (-> sp at) (-> sp n) rest)))))
+
+;; Does c use v?
+(define (uses? [c (ptr ir)] [v datum]) -> i32
+  (match c
+    [(Use x) (== x v)]
+    [(Call _ n xs) (uses-any? xs n v)]
+    [(Apply g x) (or (uses? g v) (uses? x v))]
+    [(Succ x) (uses? x v)]
+    [(Make _ n xs) (uses-any? xs n v)]
+    [(Close _ n vs)
+     (for ([j u32 0]) (< j n) (+= j 1) (when (== (@ vs j) v) (return 1)))
+     0]
+    [(Bind _ x r) (or (uses? x v) (uses? r v))]
+    [(Case s _ n bs o)
+     (when (== s v) (return 1))
+     (for ([j u32 0]) (< j n) (+= j 1) (when (uses? (-> (@ bs j) then) v) (return 1)))
+     (and (!= o 0) (uses? o v))]
+    [_ 0]))
+
+(define (uses-any? [xs (ptr (ptr ir))] [n u32] [v datum]) -> i32
+  (for ([j u32 0]) (< j n) (+= j 1) (when (uses? (@ xs j) v) (return 1)))
+  0)
+
+(define (used-by [gamma datum] [c (ptr ir)]) -> datum
+  (let ([out nil])
+    (while (pair? gamma)
+      (when (uses? c (car gamma)) (set! out (cons (car gamma) out)))
+      (set! gamma (cdr gamma)))
+    (reverse out)))
+
+(define (drop-code [v datum]) -> datum `(#%app %bend-rt:drop ,v))
+
+(define (sequence [pre datum] [e datum]) -> datum (if (null? pre) e `(begin ,@pre ,e)))
+
+;; c's kernel code, owning gamma, with spares sp, at the end of its way
+;; if tail.
+(define (emit [c (ptr ir)] [gamma datum] [sp (ptr spare)] [tail i32]) -> datum
+  (let ([live nil] [drops nil])
+    (while (pair? gamma)
+      (if (uses? c (car gamma))
+          (set! live (cons (car gamma) live))
+          (set! drops (cons (drop-code (car gamma)) drops)))
+      (set! gamma (cdr gamma)))
+    (sequence (reverse drops) (emit-live c (reverse live) sp tail))))
+
+;; The kernel code of parts xs, which own gamma, all of which they use:
+;; the shares, then each part's code.
+(define (emit-parts [xs (ptr (ptr ir))] [n u32] [gamma datum] [sp (ptr spare)]) -> datum
+  (let ([shares nil] [codes nil] [g gamma])
+    (while (pair? g)
+      (let ([k i64 0])
+        (for ([j u32 0]) (< j n) (+= j 1) (when (uses? (@ xs j) (car g)) (+= k 1)))
+        (when (> k 1)
+          (set! shares (cons `(set! ,(car g) (#%app %bend-rt:share ,(car g) ,(i32-const (- k 1)))) shares))))
+      (set! g (cdr g)))
+    (for ([j u32 0]) (< j n) (+= j 1)
+      (set! codes (cons (emit (@ xs j) (used-by gamma (@ xs j)) sp 0) codes)))
+    (cons (reverse shares) (reverse codes))))
+
+;; Where the way ends, the spares no constructor on it reused freed
+;; first.
+(define (finish [e datum] [sp (ptr spare)] [tail i32]) -> datum
+  (let ([frees nil])
+    (when tail
+      (while (!= sp 0)
+        (unless (-> sp used)
+          (set! frees (cons `(#%app %bend-rt:free-node ,(-> sp at) ,(i32-const (-> sp n))) frees)))
+        (set! sp (-> sp next))))
+    (sequence frees e)))
+
+;; A node of n words for a constructor: a spare's, if one is free.
+(define (alloc-code [n u32] [sp (ptr spare)]) -> datum
+  (while (!= sp 0)
+    (when (and (not (-> sp used)) (== (-> sp n) n))
+      (set! (-> sp used) 1)
+      (return (-> sp at)))
+    (set! sp (-> sp next)))
+  `(#%app %bend-rt:node ,(i32-const n)))
+
+(define (emit-live [c (ptr ir)] [gamma datum] [sp (ptr spare)] [tail i32]) -> datum
+  (match c
+    [(Use v) (finish v sp tail)]
+    [(Lit x) (finish (i64-const x) sp tail)]
+    [(Fail) `(unreachable)]
+    [(Call fn n xs)
+     (let ([pc (emit-parts xs n gamma sp)])
+       (finish (sequence (car pc) `(#%app ,fn ,@(cdr pc))) sp tail))]
+    [(Apply g x)
+     (let* ([xs (ir-array 2)] [cv (local! (sym g))] [av (local! (sym x))])
+       (set! (@ xs 0) g)
+       (set! (@ xs 1) x)
+       (let ([pc (emit-parts xs 2 gamma sp)])
+         (finish (sequence (car pc)
+                           `(let ([,cv ,(cadr pc)])
+                              (let ([,av ,(caddr pc)])
+                                (call-indirect (i64 i64 -> i64) ,(index-code cv) ,cv ,av))))
+                 sp tail)))]
+    [(Succ x) (finish `(i64.add ,(emit x gamma sp 0) (i64.const 1)) sp tail)]
+    [(Make bits n xs)
+     (let* ([nd (local! (sym nd))] [at (alloc-code n sp)] [pc (emit-parts xs n gamma sp)] [stores nil] [es (cdr pc)])
+       (for ([j u32 0]) (< j n) (+= j 1)
+         (set! stores (cons (store-code nd j (car es)) stores))
+         (set! es (cdr es)))
+       (finish (sequence (car pc)
+                         `(let ([,nd ,at])
+                            ,@(reverse stores)
+                            (i64.or ,(i64-const bits) (i64.extend_i32_u ,nd))))
+               sp tail))]
+    [(Close fn n vs)
+     (let ([word `(i64.or ,(i64-const closure-tag) (i64.shl (i64.extend_i32_u (func-index ,fn)) (i64.const 32)))])
+       (if (== n 0)
+           (finish word sp tail)
+           (let ([nd (local! (sym nd))] [stores nil])
+             (for ([j u32 0]) (< j n) (+= j 1)
+               (set! stores (cons (store-code nd (+ j 1) (@ vs j)) stores)))
+             (finish `(let ([,nd (#%app %bend-rt:node ,(i32-const (+ n 1)))])
+                        (i64.store ,nd ,(i64-const n))
+                        ,@(reverse stores)
+                        (i64.or ,word (i64.extend_i32_u ,nd)))
+                     sp tail))))]
+    [(Bind v x r)
+     (let ([xs (ir-array 2)] [shares nil] [g gamma])
+       (while (pair? g)
+         (when (and (uses? x (car g)) (uses? r (car g)))
+           (set! shares (cons `(set! ,(car g) (#%app %bend-rt:share ,(car g) (i32.const 1))) shares)))
+         (set! g (cdr g)))
+       (sequence (reverse shares)
+                 `(let ([,v ,(emit x (used-by gamma x) sp 0)])
+                    ,(emit r (cons v (used-by gamma r)) sp tail))))]
+    [(Case s nat n bs o) (emit-case s nat n bs o gamma sp)]))
+
+(define (store-code [nd datum] [j u32] [e datum]) -> datum
+  (if (== j 0) `(i64.store ,nd ,e) `(i64.store ,nd ,e ,(int (* 8 j)))))
+
+(define (load-code [base datum] [j u32]) -> datum
+  (if (== j 0) `(i64.load ,base) `(i64.load ,base ,(int (* 8 j)))))
+
+;; A match on s, which owns gamma, s among them: each branch's way its
+;; own, its spares those not yet used and, for a node it takes, that
+;; node.
+(define (emit-case [s datum] [nat i32] [n u32] [bs (ptr (ptr branch))] [o (ptr ir)] [gamma datum] [sp (ptr spare)]) -> datum
+  (let ([rest nil] [tg (local! (sym tag))] [codes nil] [tests nil] [tagged i32 0])
+    (let ([g gamma]) (while (pair? g) (unless (== (car g) s) (set! rest (cons (car g) rest))) (set! g (cdr g))))
+    (set! rest (reverse rest))
+    (for ([j u32 0]) (< j n) (+= j 1)
+      (let ([b (@ bs j)])
+        ;; The last branch, with no other code, is not tested; a test of
+        ;; constructor 0 of no field is of the term 0, its packed word.
+        (set! tests (cons (cond [nat (if (== (-> b number) 0) `(i64.eq ,s ,(i64-const nat-zero)) `(i64.ne ,s ,(i64-const nat-zero)))]
+                                [(and (== (-> b number) 0) (== (-> b n) 0)) `(i64.eqz ,s)]
+                                [else
+                                 (unless (and (== j (- n 1)) (== o 0)) (set! tagged 1))
+                                 `(i32.eq ,tg ,(i32-const (-> b number)))])
+                          tests))
+        (set! codes (cons (branch-code s nat b rest (pending sp)) codes))))
+    (let ([chain (if (!= o 0) (emit o gamma (pending sp) 1) 0)])
+      (set! codes (reverse codes))
+      (set! tests (reverse tests))
+      (let ([dispatch (if-chain tests codes chain)])
+        (if tagged `(let ([,tg ,(variant-code s)]) ,dispatch) dispatch)))))
+
+;; The ifs of tests, each running its code, the last code alone if there
+;; is no other code.
+(define (if-chain [tests datum] [codes datum] [other datum]) -> datum
+  (cond [(null? codes) (if (!= other 0) other `(unreachable))]
+        [(and (null? (cdr codes)) (== other 0)) (car codes)]
+        [else `(if ,(car tests) ,(car codes) ,(if-chain (cdr tests) (cdr codes) other))]))
+
+;; Branch b of a match on s: its fields bound, and its way.
+(define (branch-code [s datum] [nat i32] [b (ptr branch)] [rest datum] [sp (ptr spare)]) -> datum
+  (let ([n (-> b n)] [vs (-> b vs)] [fvs nil])
+    (for ([j u32 n]) (> j 0) (-= j 1) (set! fvs (cons (@ vs (- j 1)) fvs)))
+    (cond
+      [(== n 0) (emit (-> b then) rest sp 1)]
+      [nat
+       `(let ([,(@ vs 0) (i64.sub ,s (i64.const 1))])
+          ,(emit (-> b then) (cons (@ vs 0) rest) sp 1))]
+      [else
+       (let ([a (local! (sym node))] [loads nil])
+         (for ([j u32 0]) (< j n) (+= j 1)
+           (set! loads (cons `[,(@ vs j) ,(load-code a j)] loads)))
+         `(let ([,a (if (i64.lt_s ,s (i64.const 0)) (#%app %bend-rt:take ,s ,(i32-const n)) (i32.wrap_i64 ,s))])
+            (let ,(reverse loads)
+              ,(emit (-> b then) (append fvs rest) (new-spare a n sp) 1))))])))
+
+;; A closure's function: its captured values read, its node freed, then
+;; its body, which owns them and its argument.
+(define (closure-func [name datum] [caps datum] [n u32] [arg datum] [b (ptr ir)]) -> datum
+  (let ([self (local! (sym self))] [nd (local! (sym nd))] [loads nil] [l caps] [j u32 1])
+    (while (pair? l)
+      (set! loads (cons `[,(car l) ,(load-code nd j)] loads))
+      (+= j 1)
+      (set! l (cdr l)))
+    `(func (,name [,self i64] [,arg i64]) -> i64
+       ,(if (== n 0)
+            (emit b (list1 arg) 0 1)
+            `(let ([,nd (i32.wrap_i64 ,self)])
+               (let ,(reverse loads)
+                 (#%app %bend-rt:free-node ,nd ,(i32-const (+ n 1)))
+                 ,(emit b (cons arg caps) 0 1)))))))
 
 ;; ---- definitions ----
 
@@ -423,18 +731,19 @@
     (reverse out)))
 
 ;; The body of a definition's function, of type T and checked value e,
-;; given its live parameters.
+;; given its live parameters, which it owns.
 (define (def-body [T (ptr term)] [e (ptr term)] [params datum]) -> datum
-  (body-code (new-lfn 0) (higher e) T params))
+  (emit (body-ir (new-lfn 0) (higher e) T params) params 0 1))
 
 ;; ---- print ----
 ;;
 ;; A print writes a value, and a newline, as the example writes terms: a
-;; constructor's name and its fields, a Nat as (nat n), a proof as refl.
-;; What writes a value of a type is a function made for the type, as
-;; Bend's show_main makes a descriptor for its main's. A function, a type,
-;; or a datatype with an erased field, or one whose type depends on
-;; another, cannot be written.
+;; constructor's name and its fields, a Nat as (nat n), a proof as refl;
+;; then drops it. What writes a value of a type is a function made for the
+;; type, as Bend's show_main makes a descriptor for its main's, which
+;; reads the value and leaves it. A function, a type, or a datatype with
+;; an erased field, or one whose type depends on another, cannot be
+;; written.
 
 ;; The type being printed, shown, for errors.
 (define printed datum 0)
@@ -442,7 +751,11 @@
 ;; The code of a print of checked term e, of type T.
 (define (print-code [e (ptr term)] [T (ptr term)]) -> datum
   (set! printed (term-show-string (term-lower (term-wnf T) 0)))
-  `(begin (#%app ,(printer T) ,(expr (new-lfn 0) (higher e) T)) (#%app %bend-rt:newline)))
+  (let ([v (local! (sym v))])
+    `(let ([,v ,(emit (expr-ir (new-lfn 0) (higher e) T) nil 0 0)])
+       (#%app ,(printer T) ,v)
+       (#%app %bend-rt:drop ,v)
+       (#%app %bend-rt:newline))))
 
 ;; The function that writes values of type T, made the first time.
 (define (printer [T (ptr term)]) -> datum
@@ -468,37 +781,47 @@
 
 (define (printer-func [name datum] [t (ptr term)] [shown datum]) -> datum
   (cond
-    [(Eql? t) `(func (,name [v i32]) ,@(write-text `"refl"))]
+    [(Eql? t) `(func (,name [v i64]) ,@(write-text `"refl"))]
     [(ADT? t)
      (let ([d (book-tld (adt-k t))])
        (unless (AdtD? d) (refuse shown))
-       (if (nat? d)
-           `(func (,name [v i32]) (#%app %bend-rt:write-nat v))
-           (let ([arms nil])
-             (for ([j u32 0]) (< j (adtd-nc d)) (+= j 1)
-               (let* ([c (@ (adtd-cs d) j)]
-                      [ds (domains (tele-fill (ctrd-T c) (adt-x t) (adt-n t) 0 0))]
-                      [fs (list-tail ds (- (length ds) (ctrd-n c)))]
-                      [writes nil] [m u32 0])
-                 (while (pair? fs)
-                   (when (== (dom-q (car fs)) 0) (refuse shown))
-                   (+= m 1)
-                   (set! writes (cons `(#%app ,(printer (dom-T (car fs))) (i32.load v ,(int (* 4 m))))
-                                      (cons `(#%app %bend-rt:write-byte (i32.const 32)) writes)))
-                   (set! fs (cdr fs)))
-                 (set! arms (cons (if (== m 0)
-                                      `(begin ,@(write-text (short (ctrd-k c))))
-                                      `(begin ,@(write-text (format-message "(~a" (list1 (short (ctrd-k c)))))
-                                              ,@(reverse writes)
-                                              (#%app %bend-rt:write-byte (i32.const 41))))
-                                  arms))))
-             `(func (,name [v i32]) ,(printer-arms (reverse arms) 0)))))]
+       (cond
+         [(and (nat? d) (nat-family? (adt-k t))) `(func (,name [v i64]) (#%app %bend-rt:write-nat v))]
+         [(nat-family? (adt-k t))
+          (let ([z (short (ctrd-k (@ (adtd-cs d) 0)))] [s (short (ctrd-k (@ (adtd-cs d) 1)))])
+            `(func (,name [v i64])
+               (if (i64.eq v ,(i64-const nat-zero))
+                   (begin ,@(write-text z))
+                   (begin ,@(write-text (format-message "(~a " (list1 s)))
+                          (#%app ,name (i64.sub v (i64.const 1)))
+                          (#%app %bend-rt:write-byte (i32.const 41))))))]
+         [else
+          (let ([arms nil])
+            (for ([j u32 0]) (< j (adtd-nc d)) (+= j 1)
+              (let* ([c (@ (adtd-cs d) j)]
+                     [ds (domains (tele-fill (ctrd-T c) (adt-x t) (adt-n t) 0 0))]
+                     [fs (list-tail ds (- (length ds) (ctrd-n c)))]
+                     [writes nil] [m u32 0])
+                (while (pair? fs)
+                  (when (== (dom-q (car fs)) 0) (refuse shown))
+                  (set! writes (cons `(#%app ,(printer (dom-T (car fs))) ,(load-code `b m))
+                                     (cons `(#%app %bend-rt:write-byte (i32.const 32)) writes)))
+                  (+= m 1)
+                  (set! fs (cdr fs)))
+                (set! arms (cons (if (== m 0)
+                                     `(begin ,@(write-text (short (ctrd-k c))))
+                                     `(let ([b (#%app %bend-rt:node-of v)])
+                                        ,@(write-text (format-message "(~a" (list1 (short (ctrd-k c)))))
+                                        ,@(reverse writes)
+                                        (#%app %bend-rt:write-byte (i32.const 41))))
+                                 arms))))
+            `(func (,name [v i64]) (let ([tag ,(variant-code `v)]) ,(printer-arms (reverse arms) 0))))]))]
     [else (refuse shown)]))
 
 (define (printer-arms [arms datum] [j u32]) -> datum
   (cond [(null? arms) `(unreachable)]
         [(null? (cdr arms)) (car arms)]
-        [else `(if (i32.eq (i32.load v) ,(i32-const j)) ,(car arms) ,(printer-arms (cdr arms) (+ j 1)))]))
+        [else `(if (i32.eq tag ,(i32-const j)) ,(car arms) ,(printer-arms (cdr arms) (+ j 1)))]))
 
 ;; Is datatype d Nat, Zero and Succ?
 (define (nat? [d (ptr tld)]) -> i32
