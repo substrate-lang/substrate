@@ -16,7 +16,9 @@
 # on data in memory, i32s, where they worked on GC objects, and their
 # outputs are those tests' own. next/tests/fixtures holds the modules they
 # require. next/tests/c has the C example's tests (tests/c), on the C-like
-# Lisp as the new compiler builds it (next/c); next/tests/substrate has the
+# Lisp as the new compiler builds it (next/c); next/tests/bend has the
+# tests of Bend as the new compiler builds it (next/bend), and
+# next/tests/substrate has the
 # tests of Substrate as the new compiler builds it (next/substrate). Then,
 # as tests/run.sh does, the cache (spec 3.7): each program built again
 # from it is the same, and a stale entry is not used. OUT is where builds
@@ -55,7 +57,7 @@ mkdir -p "$builds/compiled"
    -m "$root/$builds/compiled/geometry.subc" -c "$cache" > /dev/null) ||
   { echo "FAIL building next/tests/fixtures/geometry.sub as a compiled file"; fail=$((fail + 1)); }
 
-tests=(next/tests/*.sub next/tests/c/*.sub next/tests/substrate/*.sub)
+tests=(next/tests/*.sub next/tests/c/*.sub next/tests/substrate/*.sub next/tests/bend/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"

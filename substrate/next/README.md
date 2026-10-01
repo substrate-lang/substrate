@@ -68,6 +68,17 @@ on them there.
     `syntax-rules`, which compile into C at its phase 1, not with
     Substrate code: Substrate does not run at compile time, and has no
     syntax objects among its values.
+- `bend/`: Bend as the new compiler builds it, `examples/bend` ported to
+  the C-like Lisp (plan, 5):
+  - `core.sub`: `examples/bend/core.sub`, the checker, function for
+    function, its terms variants in arenas and its binders' bodies data,
+    where the example's are Substrate closures; a definition is checked
+    in an arena of its own, freed when it is done.
+  - `bend.sub`: `examples/bend/bend.sub`'s forms, which read a term from
+    its syntax, where the example expands it and reads the expansion back;
+    a definition's fact holds its terms as bytes and the names they refer
+    to. Not yet: templates, `print`, and the code of definitions.
+  - `base.sub`: `examples/bend/base.sub`.
 - `seed/`: a build of the new compiler by itself, checked in, as `seed/`
   is the compiler's.
 - `sub`: runs the new compiler as `bin/sub` runs the compiler, keeping

@@ -1,0 +1,1878 @@
+;; Lifecycle: experimental. The kernel of Bend as the new compiler builds
+;; it (next/bend): examples/bend/core.sub, a port of Bend2's (bend2/bend.ts,
+;; from Term to Valid), written in the C-like Lisp and run at compile
+;; time, function for function. Its terms; flattening matches into
+;; lambda-matches; weak head and strong normal forms; comparison;
+;; bidirectional checking with quantities and descent; and validating a
+;; module's definitions in order. bend.sub parses a module's definitions
+;; into terms and gives them to it one at a time, as it reads them, and it
+;; raises a syntax error at the first term that does not check.
+;;
+;; A term is a variant in an arena, where examples/bend/core.sub's is a
+;; struct. A binder's body is, in a term's first-order form, a term whose
+;; variables are Var with the binder's id; in its higher-order form, which
+;; the kernel works on, a body: data that gives the body for a bound
+;; value, where examples/bend/core.sub has a function. A Clo body is the
+;; first-order body with an environment, the values of the variables bound
+;; around it, and instantiating it is term-higher of it with the bound
+;; value added; the others stand for the functions examples/bend/core.sub
+;; makes as it works: Ext for lhs-ext's, Snf for a strong normal form's
+;; binder and Goal for a match case's goal. A name is its definition's
+;; (spec 6.6), a symbol. Every node has s, the source location it came
+;; from, or 0, where errors are located. A quantity is 0 (-), 1 (one use)
+;; or 2 (+).
+;;
+;; Memory. A module's book, its definitions' types and values, is in the
+;; arena of the module being compiled, the kernel module's current one
+;; when bend.sub starts a definition; what checking it makes is in a
+;; scratch arena, made current while it is checked and freed when bend.sub
+;; is done with the definition (end-check!). Lists are the kernel module's,
+;; their elements pointers to terms, patterns or rows cast to datum.
+
+(require-unqualified c "../c/c.sub")
+(require-unqualified kd "../compiler/kernel.sub")
+(memory from c)
+(table from c)
+
+(provide term Var Ref Sub Let Typ Qnt Qua Min All Lam App ADT Ctr Mat Efq Eql Rfl Rwt Hol Ann Match
+         pat PVar PCtr row new-term new-pat new-row term-array
+         Var? Ref? All? Lam? App? ADT? Ctr? Ann? Match? term-s term-strip term-force
+         short term-show-string flatten-definition canonical higher
+         tld AdtD CtrD DefD book-start! set-lookup! book-tld book-ctr ctrd-k ctrd-n ctrd-T adtd-n defd-n defd-T defd-v
+         validate-adt! validate-def! validate-fill! infer-closed begin-check! end-check! where!
+         fresh! reset-fresh! bend-error-at in-module-arena! check-in-scratch! new-tld
+         cursor enc-start! enc-names enc-u enc-i enc-sym enc-term dec-byte dec-u dec-i dec-sym dec-term)
+
+;; ---- terms ----
+
+(variant term
+  ;; x: i its binder's id, or -1 a share cell, -2 a filled one; v its value.
+  [Var [k datum] [i i32] [v (ptr term)] [s (ptr srcloc)]]
+  ;; A definition, by name.
+  [Ref [k datum] [s (ptr srcloc)]]
+  ;; x <- v; f: v, a term, or p, a pattern, for the variable i in f.
+  [Sub [i i32] [v (ptr term)] [p (ptr pat)] [f (ptr term)] [s (ptr srcloc)]]
+  ;; x y = v w; f: n names ks, ids is, quantities qs and values vs; the
+  ;; body f, first-order, or bd, higher-order.
+  [Let [n u32] [ks (ptr datum)] [is (ptr i32)] [qs (ptr u32)] [vs (ptr (ptr term))] [f (ptr term)] [bd (ptr body)]
+       [s (ptr srcloc)]]
+  ;; Kind(g)
+  [Typ [g (ptr term)] [s (ptr srcloc)]]
+  ;; Quant
+  [Qnt [s (ptr srcloc)]]
+  ;; &0 &1 &2
+  [Qua [q u32] [s (ptr srcloc)]]
+  ;; a <&> b
+  [Min [a (ptr term)] [b (ptr term)] [s (ptr srcloc)]]
+  ;; @q x:A -> B, its body f first-order or bd higher-order
+  [All [q u32] [k datum] [i i32] [A (ptr term)] [f (ptr term)] [bd (ptr body)] [s (ptr srcloc)]]
+  ;; x => f
+  [Lam [k datum] [i i32] [f (ptr term)] [bd (ptr body)] [s (ptr srcloc)]]
+  ;; f(x)
+  [App [f (ptr term)] [x (ptr term)] [s (ptr srcloc)]]
+  ;; D<x ...>, n of them, less its constructors r, a list of names
+  [ADT [k datum] [n u32] [x (ptr (ptr term))] [r datum] [s (ptr srcloc)]]
+  ;; K{x ...}
+  [Ctr [k datum] [n u32] [x (ptr (ptr term))] [s (ptr srcloc)]]
+  ;; \{K: h; m}
+  [Mat [k datum] [h (ptr term)] [m (ptr term)] [s (ptr srcloc)]]
+  ;; \{}
+  [Efq [s (ptr srcloc)]]
+  ;; {a == b : T}
+  [Eql [a (ptr term)] [b (ptr term)] [T (ptr term)] [s (ptr srcloc)]]
+  ;; {==}
+  [Rfl [s (ptr srcloc)]]
+  ;; %e : p; f
+  [Rwt [e (ptr term)] [p (ptr term)] [f (ptr term)] [s (ptr srcloc)]]
+  ;; ?k
+  [Hol [k datum] [s (ptr srcloc)]]
+  ;; {x : T}
+  [Ann [x (ptr term)] [T (ptr term)] [s (ptr srcloc)]]
+  ;; A definition's body before its matches are flattened: a match of the
+  ;; terms e by the rows r, each a row.
+  [Match [e datum] [r datum] [s (ptr srcloc)]])
+
+;; A row of a match: its patterns ps, each a pat, and its body.
+(struct row [ps datum] [body (ptr term)])
+
+(variant pat
+  [PVar [k datum] [i i32] [s (ptr srcloc)]]
+  [PCtr [k datum] [x datum] [s (ptr srcloc)]])
+
+;; What the variables bound around a first-order term are: each id
+;; bound to a value v, or to a pattern p, a term made where it is used, of
+;; the variables of penv.
+(struct bound [id i32] [v (ptr term)] [p (ptr pat)] [penv (ptr bound)] [next (ptr bound)])
+
+;; A context: each id bound around a term, its quantity q, name k and type
+;; T.
+(struct ctx [i i32] [q u32] [k datum] [T (ptr term)] [next (ptr ctx)])
+
+;; A higher-order binder's body (above): a first-order body f with its
+;; environment, of one binder i or a let's n, is; lhs extended by
+;; constructor k's n fields, xs given so far (lhs-ext); a strong normal
+;; form's, inner's normalized; and a match case's goal (check-match).
+(variant body
+  [Clo [f (ptr term)] [ev (ptr bound)] [i i32]]
+  [Clos [f (ptr term)] [ev (ptr bound)] [n u32] [is (ptr i32)]]
+  [Ext [lhs (ptr term)] [k datum] [n u32] [xs datum]]
+  [Snf [inner (ptr body)]]
+  [Goal [c (ptr body)] [n u32] [xs datum] [t (ptr term)] [k datum] [cx (ptr ctx)] [s (ptr srcloc)]])
+
+;; What checking passes around, declared before the functions that take it:
+;; a usage, each id with its uses, the latest first (quantities and usage);
+;; checked arguments, with their uses and what their telescope leaves
+;; (tele-check); a telescope's domains and its tip (tele-unbind); and a
+;; definition's left-hand side, and what inferring and checking give
+;; (checking).
+(struct use [id i32] [q u32] [next (ptr use)])
+(struct telc [tms (ptr (ptr term))] [us (ptr use)] [tel (ptr term)])
+(struct unbound [doms datum] [n u32] [tip (ptr term)])
+(struct lhsx [t (ptr term)] [n i32] [def datum] [nq u32] [qs (ptr u32)] [u i32])
+(struct inf [tm (ptr term)] [ty (ptr term)] [us (ptr use)])
+(struct chk [tm (ptr term)] [us (ptr use)])
+
+(define (alloc [n u32]) -> (ptr void) (alloc-in (current-arena) n))
+
+(define (new-term [t term]) -> (ptr term)
+  (let ([p (cast (ptr term) (alloc (sizeof term)))]) (set! (@ p) t) p))
+
+(define (new-pat [q pat]) -> (ptr pat)
+  (let ([p (cast (ptr pat) (alloc (sizeof pat)))]) (set! (@ p) q) p))
+
+(define (new-body [b body]) -> (ptr body)
+  (let ([p (cast (ptr body) (alloc (sizeof body)))]) (set! (@ p) b) p))
+
+(define (new-row [ps datum] [b (ptr term)]) -> (ptr row)
+  (let ([r (cast (ptr row) (alloc (sizeof row)))])
+    (set! (-> r ps) ps)
+    (set! (-> r body) b)
+    r))
+
+(define (term-array [n u32]) -> (ptr (ptr term)) (cast (ptr (ptr term)) (alloc (* n 4))))
+
+(define (term-of [d datum]) -> (ptr term) (cast (ptr term) d))
+(define (pat-of [d datum]) -> (ptr pat) (cast (ptr pat) d))
+(define (row-of [d datum]) -> (ptr row) (cast (ptr row) d))
+(define (as-datum [t (ptr term)]) -> datum (cast datum t))
+
+;; Stop: something the port does not expect.
+(define (internal [what (ptr u8)]) -> (ptr term)
+  (raise-compile-error 0 (format-message "internal: bend: ~a" (list1 (bytes->string what (strlen what)))))
+  0)
+
+(define (list1 [x datum]) -> datum (cons x nil))
+
+(define (term-s [t (ptr term)]) -> (ptr srcloc)
+  (match t
+    [(Var _ _ _ s) s] [(Ref _ s) s] [(Sub _ _ _ _ s) s] [(Let _ _ _ _ _ _ _ s) s] [(Typ _ s) s] [(Qnt s) s]
+    [(Qua _ s) s] [(Min _ _ s) s] [(All _ _ _ _ _ _ s) s] [(Lam _ _ _ _ s) s] [(App _ _ s) s] [(ADT _ _ _ _ s) s]
+    [(Ctr _ _ _ s) s] [(Mat _ _ _ s) s] [(Efq s) s] [(Eql _ _ _ s) s] [(Rfl s) s] [(Rwt _ _ _ s) s] [(Hol _ s) s]
+    [(Ann _ _ s) s] [(Match _ _ s) s]))
+
+(define (Var? [t (ptr term)]) -> i32 (match t [(Var _ _ _ _) 1] [_ 0]))
+(define (Ref? [t (ptr term)]) -> i32 (match t [(Ref _ _) 1] [_ 0]))
+(define (Sub? [t (ptr term)]) -> i32 (match t [(Sub _ _ _ _ _) 1] [_ 0]))
+(define (Typ? [t (ptr term)]) -> i32 (match t [(Typ _ _) 1] [_ 0]))
+(define (Qnt? [t (ptr term)]) -> i32 (match t [(Qnt _) 1] [_ 0]))
+(define (Qua? [t (ptr term)]) -> i32 (match t [(Qua _ _) 1] [_ 0]))
+(define (Min? [t (ptr term)]) -> i32 (match t [(Min _ _ _) 1] [_ 0]))
+(define (All? [t (ptr term)]) -> i32 (match t [(All _ _ _ _ _ _ _) 1] [_ 0]))
+(define (Lam? [t (ptr term)]) -> i32 (match t [(Lam _ _ _ _ _) 1] [_ 0]))
+(define (App? [t (ptr term)]) -> i32 (match t [(App _ _ _) 1] [_ 0]))
+(define (ADT? [t (ptr term)]) -> i32 (match t [(ADT _ _ _ _ _) 1] [_ 0]))
+(define (Ctr? [t (ptr term)]) -> i32 (match t [(Ctr _ _ _ _) 1] [_ 0]))
+(define (Mat? [t (ptr term)]) -> i32 (match t [(Mat _ _ _ _) 1] [_ 0]))
+(define (Efq? [t (ptr term)]) -> i32 (match t [(Efq _) 1] [_ 0]))
+(define (Eql? [t (ptr term)]) -> i32 (match t [(Eql _ _ _ _) 1] [_ 0]))
+(define (Rfl? [t (ptr term)]) -> i32 (match t [(Rfl _) 1] [_ 0]))
+(define (Rwt? [t (ptr term)]) -> i32 (match t [(Rwt _ _ _ _) 1] [_ 0]))
+(define (Hol? [t (ptr term)]) -> i32 (match t [(Hol _ _) 1] [_ 0]))
+(define (Ann? [t (ptr term)]) -> i32 (match t [(Ann _ _ _) 1] [_ 0]))
+(define (Match? [t (ptr term)]) -> i32 (match t [(Match _ _ _) 1] [_ 0]))
+(define (PVar? [p (ptr pat)]) -> i32 (match p [(PVar _ _ _) 1] [_ 0]))
+
+;; A quantity term of q?
+(define (qua-is? [t (ptr term)] [q u32]) -> i32 (match t [(Qua tq _) (== tq q)] [_ 0]))
+
+(define (var-k [t (ptr term)]) -> datum (match t [(Var k _ _ _) k] [_ 0]))
+(define (var-i [t (ptr term)]) -> i32 (match t [(Var _ i _ _) i] [_ -3]))
+(define (var-v [t (ptr term)]) -> (ptr term) (match t [(Var _ _ v _) v] [_ 0]))
+(define (ref-k [t (ptr term)]) -> datum (match t [(Ref k _) k] [_ 0]))
+(define (typ-g [t (ptr term)]) -> (ptr term) (match t [(Typ g _) g] [_ 0]))
+(define (qua-q [t (ptr term)]) -> u32 (match t [(Qua q _) q] [_ 3]))
+(define (min-a [t (ptr term)]) -> (ptr term) (match t [(Min a _ _) a] [_ 0]))
+(define (min-b [t (ptr term)]) -> (ptr term) (match t [(Min _ b _) b] [_ 0]))
+(define (all-q [t (ptr term)]) -> u32 (match t [(All q _ _ _ _ _ _) q] [_ 3]))
+(define (all-k [t (ptr term)]) -> datum (match t [(All _ k _ _ _ _ _) k] [_ 0]))
+(define (all-i [t (ptr term)]) -> i32 (match t [(All _ _ i _ _ _ _) i] [_ 0]))
+(define (all-A [t (ptr term)]) -> (ptr term) (match t [(All _ _ _ A _ _ _) A] [_ 0]))
+(define (all-bd [t (ptr term)]) -> (ptr body) (match t [(All _ _ _ _ _ bd _) bd] [_ 0]))
+(define (lam-k [t (ptr term)]) -> datum (match t [(Lam k _ _ _ _) k] [_ 0]))
+(define (lam-bd [t (ptr term)]) -> (ptr body) (match t [(Lam _ _ _ bd _) bd] [_ 0]))
+(define (app-f [t (ptr term)]) -> (ptr term) (match t [(App f _ _) f] [_ 0]))
+(define (app-x [t (ptr term)]) -> (ptr term) (match t [(App _ x _) x] [_ 0]))
+(define (app-s [t (ptr term)]) -> (ptr srcloc) (match t [(App _ _ s) s] [_ 0]))
+(define (adt-k [t (ptr term)]) -> datum (match t [(ADT k _ _ _ _) k] [_ 0]))
+(define (adt-n [t (ptr term)]) -> u32 (match t [(ADT _ n _ _ _) n] [_ 0]))
+(define (adt-x [t (ptr term)]) -> (ptr (ptr term)) (match t [(ADT _ _ x _ _) x] [_ 0]))
+(define (adt-r [t (ptr term)]) -> datum (match t [(ADT _ _ _ r _) r] [_ 0]))
+(define (ctr-k [t (ptr term)]) -> datum (match t [(Ctr k _ _ _) k] [_ 0]))
+(define (ctr-n [t (ptr term)]) -> u32 (match t [(Ctr _ n _ _) n] [_ 0]))
+(define (ctr-x [t (ptr term)]) -> (ptr (ptr term)) (match t [(Ctr _ _ x _) x] [_ 0]))
+(define (mat-k [t (ptr term)]) -> datum (match t [(Mat k _ _ _) k] [_ 0]))
+(define (mat-h [t (ptr term)]) -> (ptr term) (match t [(Mat _ h _ _) h] [_ 0]))
+(define (mat-m [t (ptr term)]) -> (ptr term) (match t [(Mat _ _ m _) m] [_ 0]))
+(define (eql-a [t (ptr term)]) -> (ptr term) (match t [(Eql a _ _ _) a] [_ 0]))
+(define (eql-b [t (ptr term)]) -> (ptr term) (match t [(Eql _ b _ _) b] [_ 0]))
+(define (eql-T [t (ptr term)]) -> (ptr term) (match t [(Eql _ _ T _) T] [_ 0]))
+(define (rwt-e [t (ptr term)]) -> (ptr term) (match t [(Rwt e _ _ _) e] [_ 0]))
+(define (rwt-p [t (ptr term)]) -> (ptr term) (match t [(Rwt _ p _ _) p] [_ 0]))
+(define (rwt-f [t (ptr term)]) -> (ptr term) (match t [(Rwt _ _ f _) f] [_ 0]))
+(define (hol-k [t (ptr term)]) -> datum (match t [(Hol k _) k] [_ 0]))
+(define (ann-x [t (ptr term)]) -> (ptr term) (match t [(Ann x _ _) x] [_ 0]))
+(define (ann-T [t (ptr term)]) -> (ptr term) (match t [(Ann _ T _) T] [_ 0]))
+(define (pat-k [p (ptr pat)]) -> datum (match p [(PVar k _ _) k] [(PCtr k _ _) k]))
+(define (pat-i [p (ptr pat)]) -> i32 (match p [(PVar _ i _) i] [_ -1]))
+(define (pat-x [p (ptr pat)]) -> datum (match p [(PCtr _ x _) x] [_ nil]))
+(define (pattern-s [p (ptr pat)]) -> (ptr srcloc) (match p [(PVar _ _ s) s] [(PCtr _ _ s) s]))
+
+;; ---- the two forms of a term ----
+
+(define (env-bind [ev (ptr bound)] [i i32] [x (ptr term)]) -> (ptr bound)
+  (let ([e (cast (ptr bound) (alloc (sizeof bound)))])
+    (set! (-> e id) i)
+    (set! (-> e v) x)
+    (set! (-> e p) 0)
+    (set! (-> e penv) 0)
+    (set! (-> e next) ev)
+    e))
+
+(define (env-bind-pattern [ev (ptr bound)] [i i32] [p (ptr pat)]) -> (ptr bound)
+  (let ([e (cast (ptr bound) (alloc (sizeof bound)))])
+    (set! (-> e id) i)
+    (set! (-> e v) 0)
+    (set! (-> e p) p)
+    (set! (-> e penv) ev)
+    (set! (-> e next) ev)
+    e))
+
+(define (env-find [ev (ptr bound)] [i i32]) -> (ptr bound)
+  (while (!= ev 0)
+    (when (== (-> ev id) i) (return ev))
+    (set! ev (-> ev next)))
+  0)
+
+;; First-order term t in its higher-order form: ev gives the value of
+;; each id bound around t. A variable no binder around binds is a
+;; reference, as in Bend. A use of a variable bound to a variable, as a
+;; binder opened is, keeps its own location, so an error about it is
+;; located at it.
+(define (term-higher [t (ptr term)] [ev (ptr bound)]) -> (ptr term)
+  (match t
+    [(Var k i v s)
+     (if (< i 0)
+         t
+         (let ([b (env-find ev i)])
+           (cond [(== b 0) (new-term (Ref k s))]
+                 [(!= (-> b p) 0) (term-higher (pattern-term (-> b p) s) (-> b penv))]
+                 [else (let ([x (-> b v)])
+                         (if (and (!= s 0) (Var? x) (>= (var-i x) 0) (== (var-v x) 0))
+                             (new-term (Var (var-k x) (var-i x) 0 s))
+                             x))])))]
+    [(Sub i v p f _)
+     (term-higher f (if (!= p 0) (env-bind-pattern ev i p) (env-bind ev i (term-higher v ev))))]
+    [(Let n ks is qs vs f _ s)
+     (let ([ws (term-array n)])
+       (for ([j u32 0]) (< j n) (+= j 1) (set! (@ ws j) (term-higher (@ vs j) ev)))
+       (new-term (Let n ks is qs ws f (new-body (Clos f ev n is)) s)))]
+    [(All q k i A f _ s) (new-term (All q k i (term-higher A ev) f (new-body (Clo f ev i)) s))]
+    [(Lam k i f _ s) (new-term (Lam k i f (new-body (Clo f ev i)) s))]
+    [(Typ g s) (new-term (Typ (term-higher g ev) s))]
+    [(Min a b s) (new-term (Min (term-higher a ev) (term-higher b ev) s))]
+    [(App f x s) (new-term (App (term-higher f ev) (term-higher x ev) s))]
+    [(ADT k n x r s) (new-term (ADT k n (higher-each x n ev) r s))]
+    [(Ctr k n x s) (new-term (Ctr k n (higher-each x n ev) s))]
+    [(Mat k h m s) (new-term (Mat k (term-higher h ev) (term-higher m ev) s))]
+    [(Eql a b T s) (new-term (Eql (term-higher a ev) (term-higher b ev) (term-higher T ev) s))]
+    [(Rwt e p f s) (new-term (Rwt (term-higher e ev) (term-higher p ev) (term-higher f ev) s))]
+    [(Ann x T s) (new-term (Ann (term-higher x ev) (term-higher T ev) s))]
+    [_ t]))
+
+(define (higher-each [xs (ptr (ptr term))] [n u32] [ev (ptr bound)]) -> (ptr (ptr term))
+  (let ([ws (term-array n)])
+    (for ([j u32 0]) (< j n) (+= j 1) (set! (@ ws j) (term-higher (@ xs j) ev)))
+    ws))
+
+;; A closed first-order term, higher-order.
+(define (higher [t (ptr term)]) -> (ptr term) (term-higher t 0))
+
+;; Body b given x for its binder, or a let's xs for its binders.
+(define (body-apply [b (ptr body)] [x (ptr term)]) -> (ptr term)
+  (match b
+    [(Clo f ev i) (term-higher f (env-bind ev i x))]
+    [(Ext lhs k n xs) (lhs-ext lhs k (- n 1) (cons (as-datum x) xs))]
+    [(Snf inner) (term-snf (body-apply inner x))]
+    [(Goal c n xs t k cx s) (mat-goal (body-apply c x) (- n 1) (cons (as-datum x) xs) t k cx s)]
+    [_ (internal "a binder of no body")]))
+
+(define (body-apply-n [b (ptr body)] [xs (ptr (ptr term))]) -> (ptr term)
+  (match b
+    [(Clos f ev n is)
+     (let ([e ev])
+       (for ([j u32 0]) (< j n) (+= j 1) (set! e (env-bind e (@ is j) (@ xs j))))
+       (term-higher f e))]
+    [_ (internal "a let of no body")]))
+
+;; Higher-order term t in its first-order form, its binders numbered by
+;; depth from d.
+(define (term-lower [t (ptr term)] [d i32]) -> (ptr term)
+  (let ([u (term-force t)])
+    (match u
+      [(Var k i _ s) (new-term (Var k i 0 s))]
+      [(Let n ks _ qs vs _ bd s)
+       (let ([xs (term-array n)] [js (cast (ptr i32) (alloc (* n 4)))] [ws (term-array n)]
+             [ks2 (cast (ptr datum) (alloc (* n 4)))] [qs2 (cast (ptr u32) (alloc (* n 4)))])
+         (for ([j u32 0]) (< j n) (+= j 1)
+           (set! (@ js j) (+ d (cast i32 j)))
+           (set! (@ ks2 j) (@ ks j))
+           (set! (@ qs2 j) (@ qs j))
+           (set! (@ xs j) (new-term (Var (@ ks j) (+ d (cast i32 j)) 0 0)))
+           (set! (@ ws j) (term-lower (@ vs j) d)))
+         (new-term (Let n ks2 js qs2 ws (term-lower (body-apply-n bd xs) (+ d (cast i32 n))) 0 s)))]
+      [(All q k _ A _ bd s)
+       (new-term (All q k d (term-lower A d) (term-lower (body-apply bd (new-term (Var k d 0 0))) (+ d 1)) 0 s))]
+      [(Lam k _ _ bd s) (new-term (Lam k d (term-lower (body-apply bd (new-term (Var k d 0 0))) (+ d 1)) 0 s))]
+      [(Typ g s) (new-term (Typ (term-lower g d) s))]
+      [(Min a b s) (new-term (Min (term-lower a d) (term-lower b d) s))]
+      [(App f x s) (new-term (App (term-lower f d) (term-lower x d) s))]
+      [(ADT k n x r s) (new-term (ADT k n (lower-each x n d) r s))]
+      [(Ctr k n x s) (new-term (Ctr k n (lower-each x n d) s))]
+      [(Mat k h m s) (new-term (Mat k (term-lower h d) (term-lower m d) s))]
+      [(Eql a b T s) (new-term (Eql (term-lower a d) (term-lower b d) (term-lower T d) s))]
+      [(Rwt e p f s) (new-term (Rwt (term-lower e d) (term-lower p d) (term-lower f d) s))]
+      [(Ann x T s) (new-term (Ann (term-lower x d) (term-lower T d) s))]
+      ;; A leaf copied, so that the term is all where it is made.
+      [_ (new-term (@ u))])))
+
+(define (lower-each [xs (ptr (ptr term))] [n u32] [d i32]) -> (ptr (ptr term))
+  (let ([ws (term-array n)])
+    (for ([j u32 0]) (< j n) (+= j 1) (set! (@ ws j) (term-lower (@ xs j) d)))
+    ws))
+
+;; A first-order term, from bend.sub, its binders numbered by depth, as a
+;; module's book and facts hold it.
+(define (canonical [t (ptr term)]) -> (ptr term) (term-lower (higher t) 0))
+
+;; f applied to x: a beta step, if f is a lambda.
+(define (term-apply [f (ptr term)] [x (ptr term)] [s (ptr srcloc)]) -> (ptr term)
+  (let ([g (term-strip f)])
+    (match g
+      [(Lam _ _ _ bd _) (body-apply bd x)]
+      [_ (new-term (App g x s))])))
+
+;; t's head, then its arguments, in order: a list.
+(define (term-unapply [t (ptr term)]) -> datum
+  (let ([xs nil])
+    (while (App? t)
+      (set! xs (cons (as-datum (app-x t)) xs))
+      (set! t (app-f t)))
+    (cons (as-datum t) xs)))
+
+;; t in a share cell, which the machine fills with its weak head normal
+;; form the first time it is forced, so shared work runs once.
+(define (term-cell [t (ptr term)] [k datum]) -> (ptr term)
+  (if (and (Var? t) (< (var-i t) 0)) t (new-term (Var k -1 t (term-s t)))))
+
+(define (term-force [t (ptr term)]) -> (ptr term)
+  (while (and (Var? t) (!= (var-v t) 0)) (set! t (var-v t)))
+  t)
+
+(define (term-strip [t (ptr term)]) -> (ptr term)
+  (set! t (term-force t))
+  (while (Ann? t) (set! t (term-force (ann-x t))))
+  t)
+
+;; ---- flattening matches ----
+;;
+;; A definition's body, its parameters pending, as Bend's parser flattens
+;; it (bend.ts, Flatten): a match compiles into lambda-matches at the
+;; binders it scrutinizes, a parameter or a field bound before, closing
+;; the binders before it as lambdas first; the first row wins, and the
+;; cases no row covers become \{}. A pattern is put for a variable by a
+;; Sub, which term-higher resolves. fresh! gives fresh ids.
+
+(define fresh-count i32 0)
+(define (fresh!) -> i32 (+= fresh-count 1) fresh-count)
+(define (reset-fresh! [n i32]) (set! fresh-count n))
+
+(define (body-flatten [b (ptr term)] [vars datum]) -> (ptr term)
+  (cond [(Match? b) (match-flatten b vars)]
+        [(null? vars) b]
+        [else (let ([v (pat-of (car vars))])
+                (new-term (Lam (pat-k v) (pat-i v) (body-flatten b (cdr vars)) 0 (pattern-s v))))]))
+
+(define (pattern-term [q (ptr pat)] [s (ptr srcloc)]) -> (ptr term)
+  (match q
+    [(PVar k i qs) (new-term (Var k i 0 (if (!= s 0) s qs)))]
+    [(PCtr k x qs)
+     (let* ([n (length x)] [xs (term-array n)] [l x])
+       (for ([j u32 0]) (< j n) (+= j 1)
+         (set! (@ xs j) (pattern-term (pat-of (car l)) s))
+         (set! l (cdr l)))
+       (new-term (Ctr k n xs (if (!= s 0) s qs))))]))
+
+;; Body b with pattern v put for the variable i.
+(define (body-sub [b (ptr term)] [i i32] [v (ptr pat)]) -> (ptr term)
+  (if (Match? b)
+      (let ([es nil] [rows nil] [s (term-s b)] [l nil])
+        (match b [(Match e r _) (set! es e) (set! rows r)] [_ 0])
+        (set! l nil)
+        (while (pair? es)
+          (let ([e (term-of (car es))])
+            (set! l (cons (as-datum (cond [(not (Var? e)) (new-term (Sub i 0 v e 0))]
+                                          [(== (var-i e) i) (pattern-term v (term-s e))]
+                                          [else e]))
+                          l)))
+          (set! es (cdr es)))
+        (set! es (reverse l))
+        (set! l nil)
+        (while (pair? rows)
+          (let ([r (row-of (car rows))])
+            (set! l (cons (cast datum (new-row (-> r ps) (body-sub (-> r body) i v))) l)))
+          (set! rows (cdr rows)))
+        (new-term (Match es (reverse l) s)))
+      (new-term (Sub i 0 v b 0))))
+
+(define (match-flatten [m (ptr term)] [vars datum]) -> (ptr term)
+  (let ([es nil] [rs nil] [s (term-s m)])
+    (match m [(Match e r _) (set! es e) (set! rs r)] [_ 0])
+    (cond
+      [(and (null? es) (pair? rs)) (body-flatten (-> (row-of (car rs)) body) vars)]
+      [(null? es) (flatten-error s "a case (this match has no row to return)")]
+      [(null? vars)
+       (let ([e (term-of (car es))])
+         (while (Sub? e) (match e [(Sub _ _ _ f _) (set! e f)] [_ 0]))
+         (cond [(Var? e)
+                (bend-error-at (var-k e) (term-s e) "expected match scrutinees in binder order (this variable is unbound, consumed, or out of order: reorder the match)")]
+               [(Ctr? e) (flatten-error s "an undestructed scrutinee (this value is already a constructor: bind its fields directly)")]
+               [else (flatten-error-term e "a parameter or field scrutinee (a match cannot scrutinize a computed value: give it its own def)")]))]
+      [else
+       (let* ([x (pat-of (car vars))]
+              [scu (term-of (car es))]
+              [c (first-constructor rs)]
+              [v (if (Var? scu) (var-pattern vars (var-i scu)) 0)])
+         (cond
+           [(and (!= v 0) (== c 0) (pair? rs))
+            (let ([l nil] [rows rs])
+              (while (pair? rows)
+                (let* ([r (row-of (car rows))] [p0 (pat-of (car (-> r ps)))])
+                  (unless (PVar? p0)
+                    (flatten-error (pattern-s p0) "a variable pattern (this column has no constructor row)"))
+                  (set! l (cons (cast datum (new-row (cdr (-> r ps)) (body-sub (-> r body) (pat-i p0) v))) l)))
+                (set! rows (cdr rows)))
+              (match-flatten (new-term (Match (cdr es) (reverse l) s)) vars))]
+           [(== v x)
+            (if (== c 0)
+                (new-term (Efq s))
+                (let* ([xs (fresh-fields (pat-x c))]
+                       [kx (new-pat (PCtr (pat-k c) xs (pattern-s x)))]
+                       [ps (case-rows rs c x xs kx)]
+                       [pt (match-flatten (new-term (Match (append (pattern-terms xs) (cdr es)) ps s)) (append xs (cdr vars)))]
+                       [dt (match-flatten (new-term (Match es (other-rows rs c) s)) vars)])
+                  (new-term (Mat (pat-k c) pt dt (pattern-s c)))))]
+           [else (new-term (Lam (pat-k x) (pat-i x) (match-flatten m (cdr vars)) 0 (pattern-s x)))]))])))
+
+;; The constructor pattern first in the first column of rows rs, or 0.
+(define (first-constructor [rs datum]) -> (ptr pat)
+  (while (pair? rs)
+    (let ([p (pat-of (car (-> (row-of (car rs)) ps)))])
+      (unless (PVar? p) (return p)))
+    (set! rs (cdr rs)))
+  0)
+
+;; The variable of vars whose id is i, or 0.
+(define (var-pattern [vars datum] [i i32]) -> (ptr pat)
+  (while (pair? vars)
+    (when (== (pat-i (pat-of (car vars))) i) (return (pat-of (car vars))))
+    (set! vars (cdr vars)))
+  0)
+
+;; Constructor pattern c's fields as variables: each a variable kept, and
+;; each other pattern a fresh variable _n.
+(define (fresh-fields [ps datum]) -> datum
+  (let ([out nil])
+    (while (pair? ps)
+      (let ([q (pat-of (car ps))])
+        (set! out (cons (cast datum (if (PVar? q)
+                                        q
+                                        (let ([i (fresh!)])
+                                          (new-pat (PVar (string->symbol (format-message "_~a" (list1 (make-integer i))))
+                                                         i (pattern-s q))))))
+                        out)))
+      (set! ps (cdr ps)))
+    (reverse out)))
+
+(define (pattern-terms [ps datum]) -> datum
+  (let ([out nil])
+    (while (pair? ps)
+      (set! out (cons (as-datum (pattern-term (pat-of (car ps)) 0)) out))
+      (set! ps (cdr ps)))
+    (reverse out)))
+
+;; The rows of rs for constructor c's case, its fields xs and kx, c over
+;; them, put for scrutinee variable x.
+(define (case-rows [rs datum] [c (ptr pat)] [x (ptr pat)] [xs datum] [kx (ptr pat)]) -> datum
+  (let ([out nil] [n (length xs)])
+    (while (pair? rs)
+      (let* ([r (row-of (car rs))] [p0 (pat-of (car (-> r ps)))] [rest (cdr (-> r ps))])
+        (cond
+          [(PVar? p0)
+           (set! out (cons (cast datum (new-row (append xs rest) (body-sub (body-sub (-> r body) (pat-i p0) x) (pat-i x) kx)))
+                           out))]
+          [(!= (pat-k p0) (pat-k c)) 0]
+          [(!= (length (pat-x p0)) n)
+           (flatten-error (pattern-s p0)
+                          (bytes-of (format-message "a ~a pattern with ~a field~a"
+                                                    `(,(short (pat-k c)) ,(make-integer n) ,(if (== n 1) `"" `"s")))))]
+          [else (set! out (cons (cast datum (new-row (append (pat-x p0) rest) (body-sub (-> r body) (pat-i x) kx))) out))]))
+      (set! rs (cdr rs)))
+    (reverse out)))
+
+;; The rows of rs for the cases but c's.
+(define (other-rows [rs datum] [c (ptr pat)]) -> datum
+  (let ([out nil])
+    (while (pair? rs)
+      (let ([p0 (pat-of (car (-> (row-of (car rs)) ps)))])
+        (when (or (PVar? p0) (!= (pat-k p0) (pat-k c))) (set! out (cons (car rs) out))))
+      (set! rs (cdr rs)))
+    (reverse out)))
+
+;; A definition's value, from its body and its parameters vars, each a
+;; PVar: the body flattened, its patterns put for its variables, and its
+;; binders numbered by depth.
+(define (flatten-definition [b (ptr term)] [vars datum]) -> (ptr term)
+  (canonical (body-flatten b vars)))
+
+(define (flatten-error [at (ptr srcloc)] [message (ptr u8)]) -> (ptr term)
+  (bend-error-at (sym _) at (bytes-of (format-message "expected ~a" (list1 (bytes->string message (strlen message))))))
+  0)
+
+(define (flatten-error-term [t (ptr term)] [message (ptr u8)]) -> (ptr term)
+  (raise-syntax-error (sym bend) (format-message "expected ~a" (list1 (bytes->string message (strlen message))))
+                      (blame t 0 0))
+  0)
+
+;; The bytes of string s, followed by a 0, as a C string.
+(define (bytes-of [s datum]) -> (ptr u8)
+  (let ([p (cast (ptr u8) (alloc (+ (string-length s) 1)))])
+    (memcpy p (string-bytes s) (string-length s))
+    (set! (@ p (string-length s)) 0)
+    p))
+
+;; ---- quantities and usage ----
+;;
+;; Quantities add sequentially, two live uses saturating to many, and join
+;; across branches by their maximum. A usage maps a variable's id to how
+;; it was used.
+
+(define (quant-add [a u32] [b u32]) -> u32 (cond [(== a 0) b] [(== b 0) a] [else 2]))
+(define (quant-join [a u32] [b u32]) -> u32 (if (> a b) a b))
+(define (quant-dem [q u32] [qt u32]) -> u32 (if (== q 0) 0 qt))
+(define (quant-show [q u32]) -> (ptr u8) (case q [(0) "-"] [(1) ""] [else "+"]))
+
+
+(define (new-use [id i32] [q u32] [next (ptr use)]) -> (ptr use)
+  (let ([u (cast (ptr use) (alloc (sizeof use)))])
+    (set! (-> u id) id)
+    (set! (-> u q) q)
+    (set! (-> u next) next)
+    u))
+
+(define (uses-get [u (ptr use)] [k i32]) -> u32
+  (while (!= u 0)
+    (when (== (-> u id) k) (return (-> u q)))
+    (set! u (-> u next)))
+  0)
+
+(define (uses-has? [u (ptr use)] [k i32]) -> i32
+  (while (!= u 0)
+    (when (== (-> u id) k) (return 1))
+    (set! u (-> u next)))
+  0)
+
+;; a and b, each id's uses combined by add, or else by join.
+(define (uses-union [a (ptr use)] [b (ptr use)] [add i32]) -> (ptr use)
+  (if (== b 0)
+      a
+      (let ([out (ptr use) 0] [u a])
+        (while (!= u 0)
+          (let ([q (-> u q)])
+            (when (uses-has? b (-> u id))
+              (let ([y (uses-get b (-> u id))]) (set! q (if add (quant-add q y) (quant-join q y)))))
+            (set! out (new-use (-> u id) q out)))
+          (set! u (-> u next)))
+        (set! u b)
+        (while (!= u 0)
+          (unless (uses-has? a (-> u id)) (set! out (new-use (-> u id) (-> u q) out)))
+          (set! u (-> u next)))
+        out)))
+
+(define (uses-add [a (ptr use)] [b (ptr use)]) -> (ptr use) (uses-union a b 1))
+
+(define (uses-del [u (ptr use)] [k i32]) -> (ptr use)
+  (if (not (uses-has? u k))
+      u
+      (let ([out (ptr use) 0])
+        (while (!= u 0)
+          (unless (== (-> u id) k) (set! out (new-use (-> u id) (-> u q) out)))
+          (set! u (-> u next)))
+        out)))
+
+;; Binder k, at s, of quantity q, used u.
+(define (quant-used [cx (ptr ctx)] [k datum] [q u32] [u u32] [s (ptr srcloc)])
+  (unless (== (quant-join u q) q)
+    (bend-error cx (format-message "~a~a" `(,(c-text (quant-show q)) ,k)) 0
+                (if (== u 2)
+                    (format-message "~a (consumed more than once)" (list1 k))
+                    (format-message "~a~a" `(,(c-text (quant-show u)) ,k)))
+                0 0 (if (!= s 0) (make-syntax k no-scopes s nil) 0))))
+
+(define (c-text [p (ptr u8)]) -> datum (bytes->string p (strlen p)))
+
+;; ---- contexts ----
+
+(define (ctx-bind [cx (ptr ctx)] [i i32] [q u32] [k datum] [T (ptr term)]) -> (ptr ctx)
+  (let ([e (cast (ptr ctx) (alloc (sizeof ctx)))])
+    (set! (-> e i) i)
+    (set! (-> e q) q)
+    (set! (-> e k) k)
+    (set! (-> e T) T)
+    (set! (-> e next) (ctx-without cx i))
+    e))
+
+;; cx without an entry for i.
+(define (ctx-without [cx (ptr ctx)] [i i32]) -> (ptr ctx)
+  (if (== (ctx-get cx i) 0)
+      cx
+      (let ([out (ptr ctx) 0] [last (ptr ctx) 0])
+        (while (!= cx 0)
+          (unless (== (-> cx i) i)
+            (let ([e (cast (ptr ctx) (alloc (sizeof ctx)))])
+              (set! (@ e) (@ cx))
+              (set! (-> e next) 0)
+              (if (== last 0) (set! out e) (set! (-> last next) e))
+              (set! last e)))
+          (set! cx (-> cx next)))
+        out)))
+
+(define (ctx-get [cx (ptr ctx)] [i i32]) -> (ptr ctx)
+  (while (!= cx 0)
+    (when (== (-> cx i) i) (return cx))
+    (set! cx (-> cx next)))
+  0)
+
+(define (ctx-length [cx (ptr ctx)]) -> i32
+  (let ([n 0])
+    (while (!= cx 0) (+= n 1) (set! cx (-> cx next)))
+    n))
+
+;; Is a live variable of cx of a datatype with no constructors? Then the
+;; code in cx is unreachable.
+(define (ctx-dead? [cx (ptr ctx)]) -> i32
+  (while (!= cx 0)
+    (unless (== (-> cx q) 0)
+      (let ([t (term-wnf (-> cx T))])
+        (when (and (ADT? t) (== (adtd-nc (book-adt t cx)) 0)) (return 1))))
+    (set! cx (-> cx next)))
+  0)
+
+;; ---- the book ----
+;;
+;; What the kernel knows of definitions, by name: a datatype, its
+;; parameters n, the first g that are quantities, its type T, and its
+;; constructors; a constructor, its fields n and its type T, over its
+;; family's parameters and its fields; a definition, its parameters n, its
+;; type T, and its value v, or 0 while it is declared and stuck. Each its
+;; terms higher-order. Another module's are what bend.sub's lookup gives,
+;; from the facts about them, looked up once.
+
+(variant tld
+  [AdtD [n u32] [g u32] [T (ptr term)] [nc u32] [cs (ptr (ptr tld))]]
+  [CtrD [k datum] [n u32] [T (ptr term)]]
+  [DefD [n u32] [T (ptr term)] [v (ptr term)]])
+
+(define (adtd-n [d (ptr tld)]) -> u32 (match d [(AdtD n _ _ _ _) n] [_ 0]))
+(define (adtd-T [d (ptr tld)]) -> (ptr term) (match d [(AdtD _ _ T _ _) T] [_ 0]))
+(define (adtd-nc [d (ptr tld)]) -> u32 (match d [(AdtD _ _ _ nc _) nc] [_ 0]))
+(define (adtd-cs [d (ptr tld)]) -> (ptr (ptr tld)) (match d [(AdtD _ _ _ _ cs) cs] [_ 0]))
+(define (ctrd-k [d (ptr tld)]) -> datum (match d [(CtrD k _ _) k] [_ 0]))
+(define (ctrd-n [d (ptr tld)]) -> u32 (match d [(CtrD _ n _) n] [_ 0]))
+(define (ctrd-T [d (ptr tld)]) -> (ptr term) (match d [(CtrD _ _ T) T] [_ 0]))
+(define (defd-n [d (ptr tld)]) -> u32 (match d [(DefD n _ _) n] [_ 0]))
+(define (defd-T [d (ptr tld)]) -> (ptr term) (match d [(DefD _ T _) T] [_ 0]))
+(define (defd-v [d (ptr tld)]) -> (ptr term) (match d [(DefD _ _ v) v] [_ 0]))
+(define (AdtD? [d (ptr tld)]) -> i32 (match d [(AdtD _ _ _ _ _) 1] [_ 0]))
+(define (CtrD? [d (ptr tld)]) -> i32 (match d [(CtrD _ _ _) 1] [_ 0]))
+(define (DefD? [d (ptr tld)]) -> i32 (match d [(DefD _ _ _) 1] [_ 0]))
+
+(define (new-tld [d tld]) -> (ptr tld)
+  (let ([p (cast (ptr tld) (alloc (sizeof tld)))]) (set! (@ p) d) p))
+
+;; The module's definitions, by name: its datatypes and definitions; its
+;; constructors; and those of other modules looked up so far, each, or
+;; none, 1.
+(define tlds (ptr arena-table) 0)
+(define ctrs (ptr arena-table) 0)
+(define others (ptr arena-table) 0)
+(define lookup (fn (datum) -> (ptr tld)) 0)
+
+;; The book of the module being compiled, empty: tables in its arena.
+(define (book-start!)
+  (when (== tlds 0)
+    (set! tlds (make-table))
+    (set! ctrs (make-table))
+    (set! others (make-table))
+    (set! shorts (make-table))))
+
+(define (set-lookup! [f (fn (datum) -> (ptr tld))]) (set! lookup f))
+
+(define (imported [k datum]) -> (ptr tld)
+  (let ([t (cast (ptr tld) (table-ref others (cast u64 k)))])
+    (cond [(== t 0)
+           (let ([saved (use-arena module-arena)] [d (if (== lookup 0) 0 (lookup k))])
+             (use-arena saved)
+             (table-set! others (cast u64 k) (if (== d 0) 1 (cast u32 d)))
+             d)]
+          [(== (cast u32 t) 1) 0]
+          [else t])))
+
+(define (book-tld [k datum]) -> (ptr tld)
+  (let ([t (cast (ptr tld) (table-ref tlds (cast u64 k)))])
+    (if (!= t 0)
+        t
+        (let ([d (imported k)]) (if (or (AdtD? d) (DefD? d)) d 0)))))
+
+(define (book-ctr [k datum]) -> (ptr tld)
+  (let ([t (cast (ptr tld) (table-ref ctrs (cast u64 k)))])
+    (if (!= t 0)
+        t
+        (let ([d (imported k)]) (if (CtrD? d) d 0)))))
+
+;; The family of constructor k.
+(define (book-fam [k datum]) -> datum
+  (let ([t (term-strip (ctrd-T (book-ctr k)))] [d 0])
+    (while (All? t)
+      (set! t (term-strip (body-apply (all-bd t) (new-term (Var (all-k t) d 0 0)))))
+      (+= d 1))
+    (if (ADT? t) (adt-k t) k)))
+
+;; The datatype t, an ADT node, is of, less the constructors it removes.
+(define (book-adt [t (ptr term)] [cx (ptr ctx)]) -> (ptr tld)
+  (let ([d (book-tld (adt-k t))] [r (adt-r t)])
+    (unless (AdtD? d)
+      (bend-error cx (format-message "a declared datatype (unknown: ~a)" (list1 (short (adt-k t)))) 0 0 0 t 0))
+    (if (null? r)
+        d
+        (let ([cs (cast (ptr (ptr tld)) (alloc (* (adtd-nc d) 4)))] [n u32 0])
+          (for ([j u32 0]) (< j (adtd-nc d)) (+= j 1)
+            (let ([c (@ (adtd-cs d) j)])
+              (when (== (memq (ctrd-k c) r) 0)
+                (set! (@ cs n) c)
+                (+= n 1))))
+          (new-tld (AdtD (adtd-n d) (match d [(AdtD _ g _ _ _) g] [_ 0]) (adtd-T d) n cs))))))
+
+(define (ctrs-find [d (ptr tld)] [k datum]) -> (ptr tld)
+  (for ([j u32 0]) (< j (adtd-nc d)) (+= j 1)
+    (when (== (ctrd-k (@ (adtd-cs d) j)) k) (return (@ (adtd-cs d) j))))
+  0)
+
+;; The constructors of datatype d, their short names joined by spaces.
+(define (ctrs-shown [d (ptr tld)]) -> datum
+  (let ([b (make-buffer)] [s datum 0])
+    (for ([j u32 0]) (< j (adtd-nc d)) (+= j 1)
+      (when (> j 0) (buffer-add-byte! (& b) 32))
+      (add-datum! (& b) (short (ctrd-k (@ (adtd-cs d) j)))))
+    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (buffer-free! (& b))
+    s))
+
+;; ---- arenas ----
+
+;; The arena of the module being compiled, and the scratch arena a
+;; definition is checked in.
+(define module-arena (ptr arena) 0)
+(define scratch arena)
+
+;; Start a definition: its book's terms are made in the module's arena,
+;; its checks in scratch (check-in-scratch!) until end-check!.
+(define (begin-check!) (set! module-arena (current-arena)))
+(define (check-in-scratch!) (use-arena (& scratch)))
+(define (in-module-arena!) (use-arena module-arena))
+(define (end-check!)
+  (use-arena module-arena)
+  (arena-free (& scratch)))
+
+;; ---- errors ----
+;;
+;; A term that does not check raises a syntax error, as Bend's Err: what
+;; was expected and what was observed, a term or a string, the context,
+;; and where. The definition being validated is where an error without
+;; syntax of its own is, and the book what the terms shown are normalized
+;; with, as Bend's are.
+
+(define current-where datum 0)
+(define book-active i32 0)
+
+(define (where! [stx datum]) (set! current-where stx))
+
+;; Term t shown, normalized, its binders numbered from d.
+(define (shown [t (ptr term)] [d i32]) -> datum
+  (term-show-string (term-lower (if book-active (term-snf t) t) d)))
+
+;; An error: what was expected, es or et, and observed, os or ot, a string
+;; or a term, in cx, about at-term, a term, or at, syntax, or the
+;; definition.
+(define (bend-error [cx (ptr ctx)] [es datum] [et (ptr term)] [os datum] [ot (ptr term)] [at-term (ptr term)] [at datum])
+  (let* ([n (ctx-length cx)]
+         [b (make-buffer)]
+         [sorted (sort-ctx cx)])
+    (buffer-add-string! (& b) "expected ")
+    (add-datum! (& b) (if (!= et 0) (shown et n) es))
+    (when (or (!= os 0) (!= ot 0))
+      (buffer-add-string! (& b) "\n  observed ")
+      (add-datum! (& b) (if (!= ot 0) (shown ot n) os)))
+    (when (pair? sorted)
+      (buffer-add-string! (& b) "\n context:")
+      (while (pair? sorted)
+        (let ([e (cast (ptr ctx) (car sorted))])
+          (buffer-add-string! (& b) "\n  ")
+          (add-datum! (& b) (-> e k))
+          (buffer-add-string! (& b) " : ")
+          (add-datum! (& b) (shown (-> e T) (-> e i))))
+        (set! sorted (cdr sorted))))
+    (let ([message (bytes->string (-> b bytes) (-> b length))])
+      (buffer-free! (& b))
+      (raise-syntax-error (sym bend) message (if (!= at 0) at (blame at-term n 1))))))
+
+;; The entries of cx, by id.
+(define (sort-ctx [cx (ptr ctx)]) -> datum
+  (let ([l nil])
+    (while (!= cx 0)
+      (set! l (cons (cast datum cx) l))
+      (set! cx (-> cx next)))
+    (sort l (lambda ([a datum] [b datum]) -> i32 (< (-> (cast (ptr ctx) a) i) (-> (cast (ptr ctx) b) i))))))
+
+;; What an error is about: term t, shown, its binders numbered from d,
+;; located where it is, or where the definition is; or the definition,
+;; if t is 0.
+(define (blame [t (ptr term)] [d i32] [lower i32]) -> datum
+  (if (== t 0)
+      current-where
+      (let ([loc (term-s t)])
+        (make-syntax (string->symbol (term-show-string (if lower (term-lower t d) t))) no-scopes
+                     (if (!= loc 0) loc (if (!= current-where 0) (syntax-srcloc current-where) 0))
+                     nil))))
+
+;; An error, message, about the name k at loc, or the definition.
+(define (bend-error-at [k datum] [loc (ptr srcloc)] [message (ptr u8)]) -> (ptr term)
+  (raise-syntax-error (sym bend) (c-text message) (if (!= loc 0) (make-syntax k no-scopes loc nil) current-where))
+  0)
+
+(define (add-datum! [b (ptr buffer)] [d datum])
+  (cond [(string? d) (buffer-add! b (string-bytes d) (string-length d))]
+        [(symbol? d) (buffer-add! b (symbol-bytes d) (symbol-length d))]
+        [else (write-to b d 1)]))
+
+;; The name k as the user wrote it: its symbol, without its file.
+(define shorts (ptr arena-table) 0)
+
+(define (short [k datum]) -> datum
+  (let ([known (table-ref shorts (cast u64 k))])
+    (if (!= known 0)
+        (cast datum known)
+        (let* ([p (symbol-bytes k)] [n (symbol-length k)] [i u32 0] [s datum 0] [saved (use-arena module-arena)])
+          (while (and (< i n) (!= (@ p i) 58)) (+= i 1))
+          (set! s (if (< i n) (bytes->string (+ p i 1) (- n i 1)) (bytes->string p n)))
+          (use-arena saved)
+          (table-set! shorts (cast u64 k) (cast u32 s))
+          s))))
+
+;; First-order term t written as the example writes it: a variable by its
+;; binder's name.
+(define (term-show-string [t (ptr term)]) -> datum
+  (let ([b (make-buffer)] [s datum 0])
+    (term-write (& b) t)
+    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (buffer-free! (& b))
+    s))
+
+(define (term-write [b (ptr buffer)] [t (ptr term)])
+  (match t
+    [(Var k _ _ _) (add-datum! b k)]
+    [(App _ _ _)
+     (let ([hx (term-unapply t)])
+       (buffer-add-byte! b 40)
+       (term-write b (term-of (car hx)))
+       (write-each b (cdr hx))
+       (buffer-add-byte! b 41))]
+    [(Ref k _) (add-datum! b (short k))]
+    [(Lam k _ f _ _)
+     (buffer-add-string! b "(fn (")
+     (add-datum! b k)
+     (buffer-add-string! b ") ")
+     (term-write b f)
+     (buffer-add-byte! b 41)]
+    [(Ctr k n x _)
+     (let ([m (nat-number t)])
+       (cond [(== m 0) (buffer-add-string! b "Zero")]
+             [(> m 0) (buffer-add-string! b "(nat ") (write-to b (make-integer m) 1) (buffer-add-byte! b 41)]
+             [(== n 0) (add-datum! b (short k))]
+             [else (buffer-add-byte! b 40) (add-datum! b (short k)) (write-array b x n) (buffer-add-byte! b 41)]))]
+    [(All _ _ _ _ _ _ _)
+     ;; Arrows joined, and a domain bound to _ written alone.
+     (buffer-add-string! b "(->")
+     (let ([u t])
+       (while (All? u)
+         (match u
+           [(All q k _ A f _ _)
+            (buffer-add-byte! b 32)
+            (if (and (== k (sym _)) (== q 1))
+                (term-write b A)
+                (begin
+                  (buffer-add-byte! b 91)
+                  (buffer-add-string! b (quant-show q))
+                  (add-datum! b k)
+                  (buffer-add-string! b " : ")
+                  (term-write b A)
+                  (buffer-add-byte! b 93)))
+            (set! u f)]
+           [_ 0]))
+       (buffer-add-byte! b 32)
+       (term-write b u)
+       (buffer-add-byte! b 41))]
+    [(ADT k n x r _)
+     (unless (null? r) (buffer-add-byte! b 40))
+     (if (== n 0)
+         (add-datum! b (short k))
+         (begin (buffer-add-byte! b 40) (add-datum! b (short k)) (write-array b x n) (buffer-add-byte! b 41)))
+     (unless (null? r)
+       (buffer-add-string! b " #:without")
+       (let ([l r])
+         (while (pair? l)
+           (buffer-add-byte! b 32)
+           (add-datum! b (short (car l)))
+           (set! l (cdr l))))
+       (buffer-add-byte! b 41))]
+    [(Typ g _)
+     (let ([h (term-strip g)])
+       (cond [(qua-is? h 1) (buffer-add-string! b "Type")]
+             [(qua-is? h 2) (buffer-add-string! b "Data")]
+             [else (buffer-add-string! b "(Kind ") (term-write b g) (buffer-add-byte! b 41)]))]
+    [(Qnt _) (buffer-add-string! b "Quant")]
+    [(Qua q _) (buffer-add-string! b (case q [(0) "&0"] [(1) "&1"] [else "&2"]))]
+    [(Min a c _) (buffer-add-string! b "(meet ") (term-write b a) (buffer-add-byte! b 32) (term-write b c) (buffer-add-byte! b 41)]
+    [(Mat k h m _)
+     (buffer-add-string! b "(split ")
+     (add-datum! b (short k))
+     (buffer-add-byte! b 32)
+     (term-write b h)
+     (buffer-add-byte! b 32)
+     (term-write b m)
+     (buffer-add-byte! b 41)]
+    [(Efq _) (buffer-add-string! b "(absurd)")]
+    [(Eql a c T _)
+     (buffer-add-string! b "(== ")
+     (term-write b a)
+     (buffer-add-byte! b 32)
+     (term-write b c)
+     (buffer-add-byte! b 32)
+     (term-write b T)
+     (buffer-add-byte! b 41)]
+    [(Rfl _) (buffer-add-string! b "refl")]
+    [(Rwt e p f _)
+     (buffer-add-string! b "(rewrite ")
+     (term-write b e)
+     (buffer-add-byte! b 32)
+     (term-write b p)
+     (buffer-add-byte! b 32)
+     (term-write b f)
+     (buffer-add-byte! b 41)]
+    [(Hol k _) (buffer-add-string! b "(? ") (add-datum! b k) (buffer-add-byte! b 41)]
+    [(Ann x T _) (buffer-add-string! b "(the ") (term-write b T) (buffer-add-byte! b 32) (term-write b x) (buffer-add-byte! b 41)]
+    [(Let n ks _ _ vs f _ _)
+     (buffer-add-string! b "(let (")
+     (for ([j u32 0]) (< j n) (+= j 1)
+       (when (> j 0) (buffer-add-byte! b 32))
+       (buffer-add-byte! b 91)
+       (add-datum! b (@ ks j))
+       (buffer-add-byte! b 32)
+       (term-write b (@ vs j))
+       (buffer-add-byte! b 93))
+     (buffer-add-string! b ") ")
+     (term-write b f)
+     (buffer-add-byte! b 41)]
+    [(Sub _ _ _ f _) (term-write b f)]
+    [_ (buffer-add-byte! b 63)]))
+
+(define (write-each [b (ptr buffer)] [l datum])
+  (while (pair? l)
+    (buffer-add-byte! b 32)
+    (term-write b (term-of (car l)))
+    (set! l (cdr l))))
+
+(define (write-array [b (ptr buffer)] [x (ptr (ptr term))] [n u32])
+  (for ([j u32 0]) (< j n) (+= j 1)
+    (buffer-add-byte! b 32)
+    (term-write b (@ x j))))
+
+;; A chain of Succ ending in Zero, as its length, written (nat n), and
+;; Zero alone as Zero; or -1.
+(define (nat-number [t (ptr term)]) -> i64
+  (let ([n i64 0])
+    (while 1
+      (cond [(and (Ctr? t) (== (ctr-n t) 0) (named? (ctr-k t) "Zero")) (return n)]
+            [(and (Ctr? t) (== (ctr-n t) 1) (named? (ctr-k t) "Succ"))
+             (+= n 1)
+             (set! t (term-strip (@ (ctr-x t) 0)))]
+            [else (return -1)]))
+    n))
+
+;; Is name k's short name s?
+(define (named? [k datum] [s (ptr u8)]) -> i32
+  (let ([n (short k)] [m (strlen s)])
+    (and (== (string-length n) m) (== (memcmp (string-bytes n) s m) 0))))
+
+;; ---- weak head normal form ----
+;;
+;; A stack machine (bend.ts, WNF): sound, weak, idempotent, partial exactly
+;; on terms with no weak head normal form. A saturated definition unfolds;
+;; a stuck one gives back its reference applied, which lhs, its left-hand
+;; side so far, rebuilds. A term entering a spine becomes a share cell,
+;; which the machine fills with its weak head normal form, so shared work
+;; runs once. A rewrite steps to its body when its evidence reaches refl.
+;; It runs as a loop, in main or back, as examples/bend/core.sub's main
+;; and back call each other.
+
+(variant frame
+  ;; _(x)
+  [FApp [x (ptr term)] [s (ptr srcloc)]]
+  ;; \{K: h; m}(_), lhs the left-hand side before it
+  [FMat [t (ptr term)] [e (ptr term)] [lhs (ptr wlhs)] [s (ptr srcloc)]]
+  ;; a share cell being filled, a its annotation
+  [FVar [l (ptr term)] [a (ptr term)]]
+  ;; _ <&> b
+  [FMna [b (ptr term)] [s (ptr srcloc)]]
+  ;; a <&> _
+  [FMnb [a (ptr term)] [s (ptr srcloc)]])
+
+(struct stack [f frame] [next (ptr stack)])
+
+;; A left-hand side, and how many parameters remain: tm; p's applied to x;
+;; or p's extended by constructor k's m fields.
+(variant wlhs
+  [LTerm [t (ptr term)] [n i32]]
+  [LApp [p (ptr wlhs)] [x (ptr term)] [s (ptr srcloc)] [n i32]]
+  [LExt [p (ptr wlhs)] [k datum] [m u32] [n i32]])
+
+(define (new-wlhs [w wlhs]) -> (ptr wlhs)
+  (let ([p (cast (ptr wlhs) (alloc (sizeof wlhs)))]) (set! (@ p) w) p))
+
+(define (wlhs-n [w (ptr wlhs)]) -> i32 (match w [(LTerm _ n) n] [(LApp _ _ _ n) n] [(LExt _ _ _ n) n]))
+
+(define (lhs-build [w (ptr wlhs)]) -> (ptr term)
+  (match w
+    [(LTerm t _) t]
+    [(LApp p x s _) (term-apply (lhs-build p) x s)]
+    [(LExt p k m _) (lhs-ext (lhs-build p) k m nil)]))
+
+(define (push [st (ptr stack)] [f frame]) -> (ptr stack)
+  (let ([p (cast (ptr stack) (alloc (sizeof stack)))])
+    (set! (-> p f) f)
+    (set! (-> p next) st)
+    p))
+
+(define (app-on-top? [st (ptr stack)]) -> i32
+  (and (!= st 0) (match (& (-> st f)) [(FApp _ _) 1] [_ 0])))
+
+;; The applications on top of the stack, up to n.
+(define (apps [st (ptr stack)] [n u32]) -> u32
+  (let ([run u32 0])
+    (while (and (< run n) (app-on-top? st))
+      (+= run 1)
+      (set! st (-> st next)))
+    run))
+
+;; t with its parts in share cells, as a filled cell holds it.
+(define (cell-parts [t (ptr term)]) -> (ptr term)
+  (let ([u (sym _)])
+    (match t
+      [(Ctr k n x s) (new-term (Ctr k n (cells x n) s))]
+      [(ADT k n x r s) (new-term (ADT k n (cells x n) r s))]
+      [(All q k i A f bd s) (new-term (All q k i (term-cell A u) f bd s))]
+      [(Mat k h m s) (new-term (Mat k (term-cell h u) (term-cell m u) s))]
+      [(Eql a b T s) (new-term (Eql (term-cell a u) (term-cell b u) (term-cell T u) s))]
+      [(Min a b s) (new-term (Min (term-cell a u) (term-cell b u) s))]
+      [(Typ g s) (new-term (Typ (term-cell g u) s))]
+      [_ t])))
+
+(define (cells [x (ptr (ptr term))] [n u32]) -> (ptr (ptr term))
+  (let ([ws (term-array n)])
+    (for ([j u32 0]) (< j n) (+= j 1) (set! (@ ws j) (term-cell (@ x j) (sym _))))
+    ws))
+
+(define (term-wnf [t0 (ptr term)]) -> (ptr term)
+  (let ([frs (ptr stack) 0] [lhs (ptr wlhs) 0] [tm t0] [back i32 0])
+    (while 1
+      (if (not back)
+          (match tm
+            [(Var _ i v _)
+             (if (== v 0)
+                 (begin (set! lhs 0) (set! back 1))
+                 (let ([value v])
+                   (when (== i -1) (set! frs (push frs (FVar tm (if (Ann? value) value 0)))))
+                   (set! lhs 0)
+                   (set! tm value)))]
+            [(Ann x _ _) (set! tm x)]
+            [(Min a b s) (let ([first a]) (set! frs (push frs (FMna b s))) (set! tm first))]
+            [(Let n ks _ _ vs _ bd _)
+             (let ([xs (term-array n)] [bdy bd])
+               (for ([j u32 0]) (< j n) (+= j 1) (set! (@ xs j) (term-cell (@ vs j) (@ ks j))))
+               (set! tm (body-apply-n bdy xs)))]
+            [(App f x s)
+             (let ([head f])
+               (set! frs (push frs (FApp (term-cell x (sym _)) s)))
+               (set! lhs 0)
+               (set! tm head))]
+            [(Lam _ _ _ bd _)
+             (if (not (app-on-top? frs))
+                 (begin (set! lhs 0) (set! back 1))
+                 (let ([bdy bd] [fx (frame-x frs)] [fs (frame-s frs)])
+                   (set! frs (-> frs next))
+                   (cond [(and (!= lhs 0) (== (wlhs-n lhs) 0)) (set! lhs 0)]
+                         [(!= lhs 0) (set! lhs (new-wlhs (LApp lhs fx fs (- (wlhs-n lhs) 1))))])
+                   (set! tm (body-apply bdy fx))))]
+            [(Mat _ _ _ _)
+             (if (not (app-on-top? frs))
+                 (begin (set! lhs 0) (set! back 1))
+                 (let ([fx (frame-x frs)] [fs (frame-s frs)])
+                   (set! frs (-> frs next))
+                   (set! frs (push frs (FMat tm fx lhs fs)))
+                   (set! lhs 0)
+                   (set! tm fx)))]
+            [(Efq _)
+             (when (and (!= lhs 0) (> (wlhs-n lhs) 0) (app-on-top? frs)) (set! tm (lhs-build lhs)))
+             (set! lhs 0)
+             (set! back 1)]
+            [(Rwt e _ f _)
+             (let ([bdy f])
+               (if (Rfl? (term-wnf e)) (set! tm bdy) (begin (set! lhs 0) (set! back 1))))]
+            [(Ref k s)
+             (let ([d (book-tld k)] [name k] [loc s])
+               (cond [(== d 0) (set! lhs 0) (set! back 1)]
+                     [(AdtD? d)
+                      (when (== (adtd-n d) 0) (set! tm (new-term (ADT name 0 0 nil loc))))
+                      (set! lhs 0)
+                      (set! back 1)]
+                     [(or (< (apps frs (defd-n d)) (defd-n d)) (== (defd-v d) 0)) (set! lhs 0) (set! back 1)]
+                     [else (set! lhs (new-wlhs (LTerm tm (cast i32 (defd-n d))))) (set! tm (defd-v d))]))]
+            [_ (set! lhs 0) (set! back 1)])
+          (begin
+            (when (== frs 0) (return tm))
+            (let ([top frs])
+              (set! frs (-> frs next))
+              (match (& (-> top f))
+                [(FVar l a)
+                 (let ([t (cell-parts tm)])
+                   (fill-cell! l (if (!= a 0) (new-term (Ann t (term-cell (ann-T a) (sym _)) (term-s a))) t))
+                   (set! tm t)
+                   (set! back 0))]
+                [(FApp x s) (set! tm (term-apply tm x s))]
+                [(FMna b s)
+                 (cond [(qua-is? tm 2) (set! tm b) (set! back 0)]
+                       [(qua-is? tm 0) 0]
+                       [else (set! frs (push frs (FMnb tm s))) (set! tm b) (set! back 0)])]
+                [(FMnb a s)
+                 (set! tm (cond [(qua-is? tm 2) a]
+                                [(or (not (Qua? tm)) (and (qua-is? tm 1) (not (Qua? a)))) (new-term (Min a tm s))]
+                                [else tm]))]
+                [(FMat t e fl s)
+                 (if (Ctr? tm)
+                     (let ([w t] [ck (ctr-k tm)] [done 0])
+                       (while (not done)
+                         (match w
+                           [(Ann x _ _) (set! w x)]
+                           [(Mat k h m _)
+                            (if (== k ck)
+                                (let ([n (ctr-n tm)] [arm h])
+                                  (set! lhs (if (!= fl 0) (new-wlhs (LExt fl k n (+ (- (wlhs-n fl) 1) (cast i32 n)))) 0))
+                                  (let ([j n])
+                                    (while (> j 0)
+                                      (-= j 1)
+                                      (set! frs (push frs (FApp (term-cell (@ (ctr-x tm) j) (sym _)) 0)))))
+                                  (set! tm arm)
+                                  (set! back 0)
+                                  (set! done 1))
+                                (set! w m))]
+                           [(Efq _) (set! tm (term-apply (if (!= fl 0) (lhs-build fl) t) e s)) (set! done 1)]
+                           [_ (set! lhs fl) (set! frs (push frs (FApp tm 0))) (set! tm w) (set! back 0) (set! done 1)])))
+                     (set! tm (term-apply (if (!= fl 0) (lhs-build fl) t) e s)))])))))
+    tm))
+
+(define (frame-x [st (ptr stack)]) -> (ptr term) (match (& (-> st f)) [(FApp x _) x] [_ 0]))
+(define (frame-s [st (ptr stack)]) -> (ptr srcloc) (match (& (-> st f)) [(FApp _ s) s] [_ 0]))
+
+(define (fill-cell! [l (ptr term)] [t (ptr term)])
+  (match l [(Var _ i v _) (set! v t) (set! i -2)] [_ 0]))
+
+;; ---- strong normal form ----
+
+(define (term-snf [t (ptr term)]) -> (ptr term)
+  (let ([u (term-wnf t)])
+    (match u
+      [(Var k i _ s) (new-term (Var k i 0 s))]
+      [(Typ g s) (new-term (Typ (term-snf g) s))]
+      [(Min a b s) (new-term (Min (term-snf a) (term-snf b) s))]
+      [(All q k i A f bd s) (new-term (All q k i (term-snf A) f (new-body (Snf bd)) s))]
+      [(Lam k i f bd s) (new-term (Lam k i f (new-body (Snf bd)) s))]
+      [(App f x s) (new-term (App (if (Ref? f) f (term-snf f)) (term-snf x) s))]
+      [(ADT k n x r s) (new-term (ADT k n (snf-each x n) r s))]
+      [(Ctr k n x s) (new-term (Ctr k n (snf-each x n) s))]
+      [(Mat k h m s) (new-term (Mat k (term-snf h) (term-snf m) s))]
+      [(Eql a b T s) (new-term (Eql (term-snf a) (term-snf b) (term-snf T) s))]
+      [(Rwt e p f s) (new-term (Rwt (term-snf e) (term-snf p) (term-snf f) s))]
+      [_ u])))
+
+(define (snf-each [x (ptr (ptr term))] [n u32]) -> (ptr (ptr term))
+  (let ([ws (term-array n)])
+    (for ([j u32 0]) (< j n) (+= j 1) (set! (@ ws j) (term-snf (@ x j))))
+    ws))
+
+;; ---- comparison ----
+;;
+;; (term-compare mode a b dep): a fits b (bend.ts, Compare). Mode 1, le,
+;; is conversion, directional only at kinds and at datatypes less their
+;; constructors, and a function type's domains swapped; mode 0, eq, what
+;; flows both ways, is exact, and stays eq all the way down.
+
+(define (term-compare [mode i32] [lt (ptr term)] [rt (ptr term)] [dep i32]) -> i32
+  (when (== lt rt) (return 1))
+  (let ([ta (term-wnf lt)] [tb (term-wnf rt)])
+    (when (== ta tb) (return 1))
+    (when (or (Lam? ta) (Lam? tb))
+      (let ([x (new-term (Var (if (Lam? ta) (lam-k ta) (lam-k tb)) dep 0 0))])
+        (return (term-compare mode (term-apply ta x 0) (term-apply tb x 0) (+ dep 1)))))
+    (match ta
+      [(Var _ i _ _) (and (Var? tb) (== i (var-i tb)))]
+      [(Ref k _) (and (Ref? tb) (== k (ref-k tb)))]
+      [(Typ g _)
+       (and (Typ? tb)
+            (if (== mode 0)
+                (term-compare 0 g (typ-g tb) dep)
+                (let ([gw (term-wnf g)] [hw (term-wnf (typ-g tb))])
+                  (cond [(or (qua-is? gw 2) (and (Qua? hw) (not (qua-is? hw 2)))) 1]
+                        [(Min? gw) (and (term-compare 1 (new-term (Typ (min-a gw) 0)) tb dep)
+                                        (term-compare 1 (new-term (Typ (min-b gw) 0)) tb dep))]
+                        [(Min? hw) (or (term-compare 1 ta (new-term (Typ (min-a hw) 0)) dep)
+                                       (term-compare 1 ta (new-term (Typ (min-b hw) 0)) dep))]
+                        [else (term-compare 1 gw hw dep)]))))]
+      [(Qnt _) (Qnt? tb)]
+      [(Qua q _) (and (Qua? tb) (== q (qua-q tb)))]
+      [(Min x y _) (and (Min? tb) (term-compare 0 x (min-a tb) dep) (term-compare 0 y (min-b tb) dep))]
+      [(All q k _ A _ bd _)
+       (let ([x (new-term (Var k dep 0 0))])
+         (and (All? tb) (== q (all-q tb))
+              (term-compare mode (all-A tb) A dep)
+              (term-compare mode (body-apply bd x) (body-apply (all-bd tb) x) (+ dep 1))))]
+      [(App f x _) (and (App? tb) (term-compare 0 f (app-f tb) dep) (term-compare 0 x (app-x tb) dep))]
+      [(ADT k n x r _)
+       (and (ADT? tb) (== k (adt-k tb)) (== n (adt-n tb))
+            (or (!= mode 0) (== (length r) (length (adt-r tb))))
+            (all-in? (adt-r tb) r)
+            (each-eq? x (adt-x tb) n dep))]
+      [(Ctr k n x _) (and (Ctr? tb) (== k (ctr-k tb)) (== n (ctr-n tb)) (each-eq? x (ctr-x tb) n dep))]
+      [(Mat k h m _) (and (Mat? tb) (== k (mat-k tb)) (term-compare 0 h (mat-h tb) dep) (term-compare 0 m (mat-m tb) dep))]
+      [(Efq _) (Efq? tb)]
+      [(Eql x y T _)
+       (and (Eql? tb) (term-compare 0 x (eql-a tb) dep) (term-compare 0 y (eql-b tb) dep) (term-compare 0 T (eql-T tb) dep))]
+      [(Rfl _) (Rfl? tb)]
+      [(Hol k _) (and (Hol? tb) (== k (hol-k tb)))]
+      [(Rwt e p f _)
+       (and (Rwt? tb) (term-compare 0 e (rwt-e tb) dep) (term-compare 0 p (rwt-p tb) dep) (term-compare 0 f (rwt-f tb) dep))]
+      [_ 0])))
+
+(define (each-eq? [x (ptr (ptr term))] [y (ptr (ptr term))] [n u32] [dep i32]) -> i32
+  (for ([j u32 0]) (< j n) (+= j 1)
+    (unless (term-compare 0 (@ x j) (@ y j) dep) (return 0)))
+  1)
+
+;; Is every name of l in m?
+(define (all-in? [l datum] [m datum]) -> i32
+  (while (pair? l)
+    (when (== (memq (car l) m) 0) (return 0))
+    (set! l (cdr l)))
+  1)
+
+;; ---- descent ----
+
+;; How argument arg of a self-call compares with column col of the
+;; definition's left-hand side: 0 if unchanged, 1 if a strict subterm, 2
+;; otherwise. An erased column is unchanged.
+(define (term-descend [q u32] [arg (ptr term)] [col (ptr term)]) -> i32
+  (when (== q 0) (return 0))
+  (let ([a (term-strip arg)] [p (term-strip col)])
+    (match p
+      [(Var _ i _ _) (if (and (Var? a) (== (var-i a) i)) 0 2)]
+      [(Ctr k n x _)
+       (when (and (Ctr? a) (== (ctr-k a) k) (== (ctr-n a) n))
+         (let ([ord 0] [j u32 0])
+           (while (and (< j n) (!= ord 2))
+             (let ([f (term-descend 1 (@ (ctr-x a) j) (@ x j))])
+               (unless (== f 0) (set! ord f)))
+             (+= j 1))
+           (unless (== ord 2) (return ord))))
+       (for ([j u32 0]) (< j n) (+= j 1)
+         (unless (== (term-descend 1 a (@ x j)) 2) (return 1)))
+       2]
+      [_ 2])))
+
+;; The left-hand side lhs extended by constructor k's n fields: a function
+;; of the fields giving lhs applied to k{fields}, xs those given so far.
+(define (lhs-ext [lhs (ptr term)] [k datum] [n u32] [xs datum]) -> (ptr term)
+  (if (== n 0)
+      (let* ([l (reverse xs)] [m (length l)] [ys (term-array m)])
+        (for ([j u32 0]) (< j m) (+= j 1)
+          (set! (@ ys j) (term-of (car l)))
+          (set! l (cdr l)))
+        (term-apply lhs (new-term (Ctr k m ys 0)) 0))
+      (new-term (Lam (sym _) 0 0 (new-body (Ext lhs k n xs)) 0))))
+
+;; ---- telescopes ----
+
+(define (tele-head [tel (ptr term)] [cx (ptr ctx)] [s (ptr srcloc)]) -> (ptr term)
+  (let ([t (term-wnf tel)])
+    (unless (All? t)
+      (bend-error cx (c-text "unreachable (a telescope binds its parameters and fields)") 0 0 0 0
+                  (if (!= s 0) (make-syntax (sym _) no-scopes s nil) 0)))
+    t))
+
+(define (tele-fill [tel (ptr term)] [xs (ptr (ptr term))] [n u32] [cx (ptr ctx)] [s (ptr srcloc)]) -> (ptr term)
+  (for ([j u32 0]) (< j n) (+= j 1)
+    (set! tel (body-apply (all-bd (tele-head tel cx s)) (@ xs j))))
+  tel)
+
+;; Arguments xs checked along telescope tel: the checked arguments, their
+;; uses, and what tel leaves.
+
+(define (tele-check [lhs (ptr lhsx)] [tel (ptr term)] [xs (ptr (ptr term))] [n u32] [qt u32] [cx (ptr ctx)] [d i32]
+                    [s (ptr srcloc)]) -> telc
+  (let ([out telc] [tms (term-array n)] [us (ptr use) 0])
+    (for ([j u32 0]) (< j n) (+= j 1)
+      (let* ([t (tele-head tel cx s)]
+             [c (term-check lhs (@ xs j) (quant-dem (all-q t) qt) (all-A t) cx d)])
+        (set! tel (body-apply (all-bd t) (@ xs j)))
+        (set! (@ tms j) (-> c tm))
+        (set! us (uses-add us (-> c us)))))
+    (set! (-> out tms) tms)
+    (set! (-> out us) us)
+    (set! (-> out tel) tel)
+    out))
+
+;; Telescope T's domains, each a ctx entry (q k A, i its position), and
+;; what it ends in.
+
+(define (tele-unbind [T (ptr term)]) -> unbound
+  (let ([out unbound] [doms nil] [n u32 0] [t (term-wnf T)])
+    (while (All? t)
+      (let ([e (cast (ptr ctx) (alloc (sizeof ctx)))])
+        (set! (-> e i) (cast i32 n))
+        (set! (-> e q) (all-q t))
+        (set! (-> e k) (all-k t))
+        (set! (-> e T) (all-A t))
+        (set! (-> e next) 0)
+        (set! doms (cons (cast datum e) doms)))
+      (set! t (term-wnf (body-apply (all-bd t) (new-term (Var (all-k t) (cast i32 n) 0 0)))))
+      (+= n 1))
+    (set! (-> out doms) (reverse doms))
+    (set! (-> out n) n)
+    (set! (-> out tip) t)
+    out))
+
+;; ---- checking ----
+;;
+;; One bidirectional pass (bend.ts, Check). qt is the demand: 0 checks
+;; dead, 1 live. us, the usage measured, is checked against each binder's
+;; quantity where it closes. A checked term comes back first-order, each
+;; node annotated with its type. lhs is the definition's own equation,
+;; rebuilt as the walk goes, so that a live self-call can be checked to
+;; descend: its term t, the parameters n still to come, the definition
+;; def, its parameters' quantities qs, and u, whether it is a template's.
+
+
+(define (new-lhs [t (ptr term)] [n i32] [def datum] [nq u32] [qs (ptr u32)] [u i32]) -> (ptr lhsx)
+  (let ([l (cast (ptr lhsx) (alloc (sizeof lhsx)))])
+    (set! (-> l t) t)
+    (set! (-> l n) n)
+    (set! (-> l def) def)
+    (set! (-> l nq) nq)
+    (set! (-> l qs) qs)
+    (set! (-> l u) u)
+    l))
+
+(define (type-cell [ty (ptr term)]) -> (ptr term) (new-term (Var (sym _) -1 ty 0)))
+
+(define (inferred [tm (ptr term)] [ty (ptr term)] [us (ptr use)]) -> inf
+  (let ([r inf])
+    (set! (-> r tm) (new-term (Ann tm (type-cell ty) 0)))
+    (set! (-> r ty) ty)
+    (set! (-> r us) us)
+    r))
+
+(define (checked [tm (ptr term)] [ty (ptr term)] [us (ptr use)]) -> chk
+  (let ([r chk])
+    (set! (-> r tm) (new-term (Ann tm (type-cell ty) 0)))
+    (set! (-> r us) us)
+    r))
+
+(define (lhs-kind [lhs (ptr lhsx)] [q u32]) -> u32 (if (and (-> lhs u) (== q 2)) 1 q))
+(define (type-of [q u32]) -> (ptr term) (new-term (Typ (new-term (Qua q 0)) 0)))
+
+(define (typeless-show [tm (ptr term)] [cx (ptr ctx)]) -> datum
+  (format-message "non-inferrable term '~a'" (list1 (shown tm (ctx-length cx)))))
+
+(define (term-infer [lhs (ptr lhsx)] [tm (ptr term)] [qt u32] [cx (ptr ctx)] [d i32] [sp datum]) -> inf
+  (match tm
+    [(Var k i v s)
+     (if (and (< i 0) (!= v 0))
+         (term-infer lhs (term-force tm) qt cx d sp)
+         (let ([ann (ctx-get cx i)])
+           (when (== ann 0) (bend-error cx (c-text "a bound variable") 0 0 tm tm 0))
+           (inferred (new-term (Var k i 0 s)) (-> ann T) (new-use i qt 0))))]
+    [(Ref k s)
+     (let ([d0 (book-tld k)] [live (!= qt 0)] [self (== k (-> lhs def))])
+       (when (== d0 0) (bend-error cx (c-text "a defined name") 0 0 tm tm 0))
+       (when (and live self (not (-> lhs u)))
+         (let ([cols (cdr (term-unapply (-> lhs t)))] [args sp] [j u32 0] [ord 0])
+           (while (and (== ord 0) (pair? cols) (pair? args))
+             (set! ord (term-descend (if (< j (-> lhs nq)) (@ (-> lhs qs) j) 1) (term-of (car args)) (term-of (car cols))))
+             (set! cols (cdr cols))
+             (set! args (cdr args))
+             (+= j 1))
+           (unless (== ord 1)
+             (bend-error cx (c-text "a decreasing self-call (arguments are read left to right: each passed unchanged until one shrinks)")
+                         0 0 tm tm 0))))
+       (when (and live (not self) (DefD? d0) (== (defd-v d0) 0))
+         (bend-error cx (c-text "a filled definition (an unfilled law is a dead claim: live code cannot use it)") 0 0 tm tm 0))
+       (when (and (not (and live self)) (AdtD? d0) (> (adtd-n d0) 0))
+         (bend-error cx (format-message "a family instance (write (~a ...))" (list1 (short k))) 0 0 tm tm 0))
+       (inferred (new-term (Ref k s)) (if (AdtD? d0) (adtd-T d0) (defd-T d0)) 0))]
+    [(Typ g s)
+     (let ([c (term-check lhs g 0 (new-term (Qnt s)) cx d)])
+       (inferred (new-term (Typ (-> c tm) s)) (type-of 1) 0))]
+    [(Qnt _) (inferred tm (type-of 1) 0)]
+    [(Qua _ s) (inferred tm (new-term (Qnt s)) 0)]
+    [(Min a b s)
+     (let ([ca (term-check lhs a qt (new-term (Qnt s)) cx d)] [cb (term-check lhs b qt (new-term (Qnt s)) cx d)])
+       (inferred (new-term (Min (-> ca tm) (-> cb tm) s)) (new-term (Qnt s)) (uses-add (-> ca us) (-> cb us))))]
+    [(All q k _ A _ bd s)
+     (let* ([bcx (ctx-bind cx d q k A)]
+            [ca (term-check lhs A 0 (type-of (lhs-kind lhs q)) cx d)]
+            [cb (term-check lhs (body-apply bd (new-term (Var k d 0 0))) 0 (type-of 1) bcx (+ d 1))])
+       (inferred (new-term (All q k d (-> ca tm) (-> cb tm) 0 s)) (type-of 1) 0))]
+    [(App f x s)
+     (if (Lam? f)
+         (term-infer lhs (body-apply (lam-bd f) x) qt cx d sp)
+         (let* ([fi (term-infer lhs f qt cx d (cons (as-datum x) sp))]
+                [fw (term-wnf (-> fi ty))])
+           (unless (All? fw) (bend-error cx (c-text "a function type") 0 0 (-> fi ty) tm 0))
+           (let ([xc (term-check lhs x (quant-dem (all-q fw) qt) (all-A fw) cx d)])
+             (inferred (new-term (App (-> fi tm) (-> xc tm) s)) (body-apply (all-bd fw) x) (uses-add (-> fi us) (-> xc us))))))]
+    [(ADT k n x r s)
+     (let ([adt (book-adt tm cx)])
+       (unless (== n (adtd-n adt))
+         (bend-error cx (format-message "~a with ~a parameter~a"
+                                        `(,(short k) ,(make-integer (adtd-n adt)) ,(if (== (adtd-n adt) 1) `"" `"s")))
+                     0 0 tm tm 0))
+       (let ([c (tele-check lhs (adtd-T adt) x n qt cx d s)])
+         (inferred (new-term (ADT k n (-> c tms) r s)) (-> c tel) (-> c us))))]
+    [(Eql a b T s)
+     (let ([ct (term-check lhs T 0 (type-of 1) cx d)]
+           [ca (term-check lhs a 0 T cx d)]
+           [cb (term-check lhs b 0 T cx d)])
+       (inferred (new-term (Eql (-> ca tm) (-> cb tm) (-> ct tm) s)) (type-of 2) 0))]
+    [(Ann x T s)
+     (term-check lhs T 0 (type-of 1) cx d)
+     (let ([c (term-check lhs x qt T cx d)] [r inf])
+       (set! (-> r tm) (-> c tm))
+       (set! (-> r ty) T)
+       (set! (-> r us) (-> c us))
+       r)]
+    [_
+     (when (and (Ctr? tm) (== (book-ctr (ctr-k tm)) 0))
+       (bend-error cx (c-text "a declared constructor") 0 0 tm tm 0))
+     (bend-error cx (c-text "an annotated term (cannot infer)") 0 0 tm tm 0)
+     (inferred tm tm 0)]))
+
+(define (term-check [lhs (ptr lhsx)] [tm (ptr term)] [qt u32] [ty (ptr term)] [cx (ptr ctx)] [d i32]) -> chk
+  (match tm
+    [(Var _ i v _)
+     (if (and (< i 0) (!= v 0))
+         (term-check lhs (term-force tm) qt ty cx d)
+         (check-any lhs tm qt ty cx d))]
+    [(Lam k _ _ bd s)
+     (let ([t (term-wnf ty)])
+       (unless (All? t) (bend-error cx 0 ty (typeless-show tm cx) 0 tm 0))
+       (let* ([x (new-term (Var k d 0 0))]
+              [flhs (if (> (-> lhs n) 0)
+                        (new-lhs (term-apply (-> lhs t) x 0) (- (-> lhs n) 1) (-> lhs def) (-> lhs nq) (-> lhs qs) (-> lhs u))
+                        lhs)]
+              [c (term-check flhs (body-apply bd x) qt (body-apply (all-bd t) x) (ctx-bind cx d (all-q t) k (all-A t)) (+ d 1))])
+         (quant-used cx k (all-q t) (uses-get (-> c us) d) s)
+         (checked (new-term (Lam k d (-> c tm) 0 s)) ty (uses-del (-> c us) d))))]
+    [(Let n ks _ qs vs _ bd s) (check-let lhs tm qt ty cx d)]
+    [(Ctr k n x s)
+     (let ([t (term-wnf ty)])
+       (unless (ADT? t)
+         (if (!= (book-ctr k) 0)
+             (bend-error cx 0 ty 0 (new-term (Ref (book-fam k) s)) tm 0)
+             (bend-error cx 0 ty (typeless-show tm cx) 0 tm 0)))
+       (let* ([adt (book-adt t cx)] [ctr (ctrs-find adt k)])
+         (when (== ctr 0)
+           (if (!= (book-ctr k) 0)
+               (bend-error cx 0 ty 0 (new-term (Ref (book-fam k) s)) tm 0)
+               (bend-error cx (format-message "a declared constructor (~a declares ~a)" `(,(short (adt-k t)) ,(ctrs-shown adt)))
+                           0 0 tm tm 0)))
+         (unless (== n (ctrd-n ctr))
+           (bend-error cx (format-message "~a with ~a field~a"
+                                          `(,(short k) ,(make-integer (ctrd-n ctr)) ,(if (== (ctrd-n ctr) 1) `"" `"s")))
+                       0 0 tm tm 0))
+         (let ([c (tele-check lhs (tele-fill (ctrd-T ctr) (adt-x t) (adt-n t) cx s) x n qt cx d s)])
+           (checked (new-term (Ctr k n (-> c tms) s)) ty (-> c us)))))]
+    [(Mat _ _ _ _) (check-match lhs tm qt ty cx d)]
+    [(Efq _) (check-match lhs tm qt ty cx d)]
+    [(Rfl _)
+     (let ([t (term-wnf ty)])
+       (unless (Eql? t) (bend-error cx 0 ty (typeless-show tm cx) 0 tm 0))
+       (unless (term-compare 0 (eql-a t) (eql-b t) d) (bend-error cx 0 (eql-a t) 0 (eql-b t) tm 0))
+       (checked tm ty 0))]
+    [(Hol k _)
+     (unless (== k (sym TODO)) (bend-error cx 0 ty 0 tm tm 0))
+     (checked tm ty 0)]
+    [(Rwt e p f s)
+     (let* ([ei (term-infer lhs e qt cx d nil)] [ew (term-wnf (-> ei ty))])
+       (unless (Eql? ew)
+         (bend-error cx (c-text "an equation (== a b T)") 0 0 (-> ei ty) (if (!= (term-s e) 0) e tm) 0))
+       (let* ([ptype (motive-type ew s)]
+              [pc (term-check lhs p 0 ptype cx d)]
+              [bgoal (term-apply (term-apply p (eql-b ew) 0) e 0)])
+         (unless (term-compare 1 bgoal ty d) (bend-error cx 0 ty 0 bgoal tm 0))
+         (let ([fc (term-check lhs f qt (term-apply (term-apply p (eql-a ew) 0) (new-term (Rfl s)) 0) cx d)])
+           (checked (new-term (Rwt (-> ei tm) (-> pc tm) (-> fc tm) s)) ty (uses-add (-> ei us) (-> fc us))))))]
+    [_ (check-any lhs tm qt ty cx d)]))
+
+;; The type of a rewrite's motive, of equation ew (== a b T): (-> [_ : T]
+;; [e : (== a _ T)] Type), as a first-order body with a and T in its
+;; environment.
+(define (motive-type [ew (ptr term)] [s (ptr srcloc)]) -> (ptr term)
+  (let* ([ev (env-bind (env-bind 0 3 (eql-a ew)) 4 (eql-T ew))]
+         [inner (new-term (All 1 (sym e) 2
+                               (new-term (Eql (new-term (Var (sym a) 3 0 0)) (new-term (Var (sym _) 1 0 0)) (new-term (Var (sym T) 4 0 0)) 0))
+                               (type-of 1) 0 s))])
+    (new-term (All 1 (sym _) 1 (eql-T ew) inner (new-body (Clo inner ev 1)) s))))
+
+(define (check-let [lhs (ptr lhsx)] [tm (ptr term)] [qt u32] [ty (ptr term)] [cx (ptr ctx)] [d i32]) -> chk
+  (let ([n u32 0] [ks (ptr datum) 0] [qs (ptr u32) 0] [vs (ptr (ptr term)) 0] [bd (ptr body) 0] [s (ptr srcloc) 0])
+    (match tm [(Let ln lks _ lqs lvs _ lbd ls) (set! n ln) (set! ks lks) (set! qs lqs) (set! vs lvs) (set! bd lbd) (set! s ls)]
+           [_ 0])
+    (let ([vx (term-array n)] [us (ptr use) 0] [fcx cx])
+      (for ([j u32 0]) (< j n) (+= j 1)
+        (let ([vi (term-infer lhs (@ vs j) (quant-dem (@ qs j) qt) cx d nil)])
+          (term-check lhs (-> vi ty) 0 (type-of (lhs-kind lhs (@ qs j))) cx d)
+          (set! (@ vx j) (-> vi tm))
+          (set! us (uses-add us (-> vi us)))
+          (set! fcx (ctx-bind fcx (+ d (cast i32 j)) (@ qs j) (@ ks j) (-> vi ty)))))
+      (let ([xs (term-array n)] [is (cast (ptr i32) (alloc (* n 4)))])
+        (for ([j u32 0]) (< j n) (+= j 1)
+          (set! (@ is j) (+ d (cast i32 j)))
+          (set! (@ xs j) (new-term (Var (@ ks j) (+ d (cast i32 j)) (@ vs j) 0))))
+        (let* ([c (term-check lhs (body-apply-n bd xs) qt ty fcx (+ d (cast i32 n)))] [fu (-> c us)])
+          (for ([j u32 0]) (< j n) (+= j 1)
+            (quant-used cx (@ ks j) (@ qs j) (uses-get fu (+ d (cast i32 j))) s)
+            (set! fu (uses-del fu (+ d (cast i32 j)))))
+          (checked (new-term (Let n ks is qs vx (-> c tm) 0 s)) ty (uses-add us fu)))))))
+
+(define (check-any [lhs (ptr lhsx)] [tm (ptr term)] [qt u32] [ty (ptr term)] [cx (ptr ctx)] [d i32]) -> chk
+  (let ([xi (term-infer lhs tm qt cx d nil)] [r chk])
+    (unless (term-compare 1 (-> xi ty) ty d) (bend-error cx 0 ty 0 (-> xi ty) tm 0))
+    (set! (-> r tm) (-> xi tm))
+    (set! (-> r us) (-> xi us))
+    r))
+
+;; A lambda-match or \{}, against @q s:D<p ...> -> P: each constructor's
+;; case, given its fields, and the rest, given the datatype less it.
+(define (check-match [lhs (ptr lhsx)] [tm (ptr term)] [qt u32] [ty (ptr term)] [cx (ptr ctx)] [d i32]) -> chk
+  (let ([t (term-wnf ty)] [s (term-s tm)])
+    (unless (All? t) (bend-error cx 0 ty (typeless-show tm cx) 0 tm 0))
+    (when (and (!= qt 0) (== (all-q t) 0))
+      (bend-error cx (c-text "a live scrutinee (a - scrutinee matches only in a dead region)") 0 0 0 tm 0))
+    (let ([a (term-wnf (all-A t))])
+      (unless (ADT? a) (bend-error cx (c-text "a datatype") 0 0 (all-A t) tm 0))
+      (let ([rem (book-adt a cx)])
+        (if (Efq? tm)
+            (begin
+              (unless (or (== (adtd-nc rem) 0) (ctx-dead? cx))
+                (bend-error cx (format-message "cases for ~a" (list1 (ctrs-shown rem))) 0 0 tm tm 0))
+              (checked tm ty 0))
+            (let* ([k (mat-k tm)] [ctr (ctrs-find rem k)])
+              (when (== ctr 0)
+                (bend-error cx (format-message "a constructor of ~a (missing, or already matched)" (list1 (short (adt-k a))))
+                            0 0 tm tm 0))
+              (let* ([goal (mat-goal (tele-fill (ctrd-T ctr) (adt-x a) (adt-n a) cx s) (ctrd-n ctr) nil t k cx s)]
+                     [hlhs (if (> (-> lhs n) 0)
+                               (new-lhs (lhs-ext (-> lhs t) k (ctrd-n ctr) nil) (+ (- (-> lhs n) 1) (cast i32 (ctrd-n ctr)))
+                                        (-> lhs def) (-> lhs nq) (-> lhs qs) (-> lhs u))
+                               lhs)]
+                     [hc (term-check hlhs (mat-h tm) qt goal cx d)]
+                     [mgoal (new-term (All (all-q t) (all-k t) (all-i t)
+                                           (new-term (ADT (adt-k a) (adt-n a) (adt-x a) (append (adt-r a) (list1 k)) s))
+                                           0 (all-bd t) s))]
+                     [mc (term-check lhs (mat-m tm) qt mgoal cx d)])
+                (checked (new-term (Mat k (-> hc tm) (-> mc tm) s)) ty (uses-union (-> hc us) (-> mc us) 0)))))))))
+
+;; A match case's goal: constructor k's fields, from cur, n of them left
+;; and xs given, then t's body at k{xs}.
+(define (mat-goal [cur (ptr term)] [n u32] [xs datum] [t (ptr term)] [k datum] [cx (ptr ctx)] [s (ptr srcloc)]) -> (ptr term)
+  (if (== n 0)
+      (let* ([l (reverse xs)] [m (length l)] [ys (term-array m)])
+        (for ([j u32 0]) (< j m) (+= j 1)
+          (set! (@ ys j) (term-of (car l)))
+          (set! l (cdr l)))
+        (body-apply (all-bd t) (new-term (Ctr k m ys s))))
+      (let* ([c (tele-head cur cx s)]
+             [dem (case (all-q c) [(0) 0] [(1) (all-q t)] [else (quant-add (all-q t) (all-q t))])])
+        (new-term (All dem (all-k c) (all-i c) (all-A c) 0 (new-body (Goal (all-bd c) n xs t k cx s)) s)))))
+
+;; ---- validating a module's definitions ----
+;;
+;; bend.sub gives a module's definitions to the validate functions one at
+;; a time, in order (bend.ts, book_valid), as it reads them: a datatype
+;; (validate-adt!), a definition or law (validate-def!), and a fill
+;; (validate-fill!), with its syntax, where!. Each checks against the
+;; book, what came before it, so a reference forward is undefined. A
+;; definition is declared, stuck, until its body checks. Its terms are
+;; first-order, canonical, in the module's arena; the book holds them
+;; higher-order, made there too, before checking starts in scratch. A
+;; definition with a value gives it back checked, elaborated with each
+;; node's type, as the lowering compiles it (bend.ts's Def e); it is in
+;; scratch, until end-check!.
+
+;; Datatype k: n parameters, the first g quantities, type T, and its
+;; constructors, each (k n T) as CtrD tlds, nc of them.
+(define (validate-adt! [k datum] [n u32] [g u32] [T (ptr term)] [cs (ptr (ptr tld))] [nc u32])
+  (let ([adt (new-tld (AdtD n g T nc cs))])
+    (table-set! tlds (cast u64 k) (cast u32 adt))
+    (for ([j u32 0]) (< j nc) (+= j 1) (table-set! ctrs (cast u64 (ctrd-k (@ cs j))) (cast u32 (@ cs j))))
+    (check-in-scratch!)
+    (set! book-active 1)
+    (term-check (new-lhs (new-term (Ref k 0)) 0 k 0 0 0) T 0 (type-of 1) 0 0)
+    (let* ([u (tele-unbind T)] [kind (-> u tip)])
+      (unless (Typ? kind)
+        (bend-error 0 (format-message "a kind (type ~a is (Kind g))" (list1 (short k))) 0 0 kind kind 0))
+      (for ([j u32 0]) (< j nc) (+= j 1)
+        (let ([c (@ cs j)] [tel (ctrd-T (@ cs j))] [cx (ptr ctx) 0] [dd u32 0])
+          (while (< dd (+ n (ctrd-n c)))
+            (let* ([t (tele-head tel cx 0)]
+                   [goal (if (and (>= dd n) (== (all-q t) 1)) kind (type-of (all-q t)))])
+              (term-check (new-lhs (new-term (Ref (ctrd-k c) 0)) 0 (ctrd-k c) 0 0 0) (all-A t) 0 goal cx (cast i32 dd))
+              (set! tel (body-apply (all-bd t) (new-term (Var (all-k t) (cast i32 dd) 0 0))))
+              (set! cx (ctx-bind cx (cast i32 dd) (all-q t) (all-k t) (all-A t)))
+              (+= dd 1)))
+          (let ([tip (term-wnf tel)])
+            (unless (and (ADT? tip) (== (adt-k tip) k) (== (adt-n tip) n) (null? (adt-r tip)) (own-params? tip n))
+              (bend-error cx (format-message "a telescope tipped at ~a applied to its own parameters" (list1 (short k)))
+                          0 0 tip 0 0))))))
+    (set! book-active 0)))
+
+;; Are ADT tip's arguments its first n binders, in order?
+(define (own-params? [tip (ptr term)] [n u32]) -> i32
+  (for ([j u32 0]) (< j n) (+= j 1)
+    (let ([x (term-wnf (@ (adt-x tip) j))])
+      (unless (and (Var? x) (== (var-i x) (cast i32 j))) (return 0))))
+  1)
+
+;; Definition k checked: its type, then its value v, if it has one, which
+;; comes back checked; 0 for a law.
+(define (validate-def! [k datum] [n u32] [T (ptr term)] [v (ptr term)]) -> (ptr term)
+  (table-set! tlds (cast u64 k) (cast u32 (new-tld (DefD n T 0))))
+  (let ([done (new-tld (DefD n T v))])
+    (check-in-scratch!)
+    (set! book-active 1)
+    (term-check (new-lhs (new-term (Ref k 0)) 0 k 0 0 0) T 0 (type-of 1) 0 0)
+    (if (== v 0)
+        (begin (set! book-active 0) 0)
+        (let* ([u (tele-unbind T)] [qs (cast (ptr u32) (alloc (* (+ n 1) 4)))] [doms (-> u doms)])
+          (for ([j u32 0]) (< j n) (+= j 1)
+            (set! (@ qs j) (if (pair? doms) (-> (cast (ptr ctx) (car doms)) q) 1))
+            (when (pair? doms) (set! doms (cdr doms))))
+          (let ([c (term-check (new-lhs (new-term (Ref k 0)) (cast i32 n) k n qs 0) v 1 T 0 0)])
+            (table-set! tlds (cast u64 k) (cast u32 done))
+            (set! book-active 0)
+            (-> c tm))))))
+
+;; A fill of law k, its value v: k's law checked filled.
+(define (validate-fill! [k datum] [v (ptr term)]) -> (ptr term)
+  (let ([law (book-tld k)])
+    (unless (and (DefD? law) (== (defd-v law) 0))
+      (bend-error 0 (format-message "a law to fill (~a is not one, or is filled already)" (list1 (short k))) 0 0 0 0 0))
+    (validate-def! k (defd-n law) (defd-T law) v)))
+
+;; Closed term t, higher-order, its type inferred against the book: its
+;; checked form, then its type, a list of two; errors at where!'s syntax,
+;; unless t's own location says.
+(define (infer-closed [t (ptr term)]) -> datum
+  (check-in-scratch!)
+  (set! book-active 1)
+  (let ([i (term-infer (new-lhs (new-term (Ref (sym _) 0)) 0 (sym _) 0 0 0) t 1 0 0 nil)])
+    (set! book-active 0)
+    `(,(as-datum (-> i tm)) ,(as-datum (-> i ty)))))
+
+;; ---- terms as bytes ----
+;;
+;; A module's facts (bend.sub) hold its definitions' terms, first-order and
+;; without their locations, as bytes: each node its kind, a byte, then its
+;; parts; a count or quantity as LEB128, an id zigzagged first, and a name
+;; as its number among the names the bytes refer to, each once, which the
+;; fact holds after the bytes, so that the serializer writes each name
+;; once for the module. enc-start! begins a fact's bytes, and
+;; enc-names gives its names after; a cursor reads bytes, with the
+;; names they refer to.
+
+(struct cursor [p (ptr u8)] [end (ptr u8)] [names (ptr datum)])
+
+;; The names of the bytes being written, the latest first, and how many.
+(define enc-list datum 0)
+(define enc-count u32 0)
+
+(define (enc-start!)
+  (set! enc-list nil)
+  (set! enc-count 0))
+
+(define (enc-names) -> datum (reverse enc-list))
+
+(define (enc-u [b (ptr buffer)] [n u32])
+  (while (>= n 128)
+    (buffer-add-byte! b (cast i32 (bit-or (bit-and n 127) 128)))
+    (set! n (>> n 7)))
+  (buffer-add-byte! b (cast i32 n)))
+
+(define (enc-i [b (ptr buffer)] [n i32]) (enc-u b (cast u32 (bit-xor (<< n 1) (>> n 31)))))
+
+;; Name k, by its number, given it the first time.
+(define (enc-sym [b (ptr buffer)] [k datum])
+  (let ([l enc-list] [i enc-count])
+    (while (pair? l)
+      (-= i 1)
+      (when (== (car l) k)
+        (enc-u b i)
+        (return))
+      (set! l (cdr l)))
+    (set! enc-list (cons k enc-list))
+    (enc-u b enc-count)
+    (+= enc-count 1)))
+
+(define (enc-each [b (ptr buffer)] [x (ptr (ptr term))] [n u32])
+  (for ([j u32 0]) (< j n) (+= j 1) (enc-term b (@ x j))))
+
+(define (enc-term [b (ptr buffer)] [t (ptr term)])
+  (match t
+    [(Var k i _ _) (buffer-add-byte! b 0) (enc-sym b k) (enc-i b i)]
+    [(Ref k _) (buffer-add-byte! b 1) (enc-sym b k)]
+    [(Let n ks is qs vs f _ _)
+     (buffer-add-byte! b 2)
+     (enc-u b n)
+     (for ([j u32 0]) (< j n) (+= j 1)
+       (enc-sym b (@ ks j))
+       (enc-i b (@ is j))
+       (enc-u b (@ qs j))
+       (enc-term b (@ vs j)))
+     (enc-term b f)]
+    [(Typ g _) (buffer-add-byte! b 3) (enc-term b g)]
+    [(Qnt _) (buffer-add-byte! b 4)]
+    [(Qua q _) (buffer-add-byte! b 5) (enc-u b q)]
+    [(Min a c _) (buffer-add-byte! b 6) (enc-term b a) (enc-term b c)]
+    [(All q k i A f _ _) (buffer-add-byte! b 7) (enc-u b q) (enc-sym b k) (enc-i b i) (enc-term b A) (enc-term b f)]
+    [(Lam k i f _ _) (buffer-add-byte! b 8) (enc-sym b k) (enc-i b i) (enc-term b f)]
+    [(App f x _) (buffer-add-byte! b 9) (enc-term b f) (enc-term b x)]
+    [(ADT k n x r _)
+     (buffer-add-byte! b 10)
+     (enc-sym b k)
+     (enc-u b n)
+     (enc-each b x n)
+     (enc-u b (length r))
+     (let ([l r]) (while (pair? l) (enc-sym b (car l)) (set! l (cdr l))))]
+    [(Ctr k n x _) (buffer-add-byte! b 11) (enc-sym b k) (enc-u b n) (enc-each b x n)]
+    [(Mat k h m _) (buffer-add-byte! b 12) (enc-sym b k) (enc-term b h) (enc-term b m)]
+    [(Efq _) (buffer-add-byte! b 13)]
+    [(Eql a c T _) (buffer-add-byte! b 14) (enc-term b a) (enc-term b c) (enc-term b T)]
+    [(Rfl _) (buffer-add-byte! b 15)]
+    [(Rwt e p f _) (buffer-add-byte! b 16) (enc-term b e) (enc-term b p) (enc-term b f)]
+    [(Hol k _) (buffer-add-byte! b 17) (enc-sym b k)]
+    [(Ann x T _) (buffer-add-byte! b 18) (enc-term b x) (enc-term b T)]
+    [_ (internal "a term with no bytes")]))
+
+(define (dec-byte [c (ptr cursor)]) -> u32
+  (let ([b (@ (-> c p))])
+    (+= (-> c p) 1)
+    b))
+
+(define (dec-u [c (ptr cursor)]) -> u32
+  (let ([n u32 0] [shift u32 0] [b u32 128])
+    (while (!= (bit-and b 128) 0)
+      (set! b (dec-byte c))
+      (set! n (bit-or n (<< (bit-and b 127) shift)))
+      (+= shift 7))
+    n))
+
+(define (dec-i [c (ptr cursor)]) -> i32
+  (let ([u (dec-u c)]) (bit-xor (cast i32 (>> u 1)) (- 0 (cast i32 (bit-and u 1))))))
+
+(define (dec-sym [c (ptr cursor)]) -> datum (@ (-> c names) (dec-u c)))
+
+(define (dec-each [c (ptr cursor)] [n u32]) -> (ptr (ptr term))
+  (let ([xs (term-array n)])
+    (for ([j u32 0]) (< j n) (+= j 1) (set! (@ xs j) (dec-term c)))
+    xs))
+
+(define (dec-term [c (ptr cursor)]) -> (ptr term)
+  (case (dec-byte c)
+    [(0) (let* ([k (dec-sym c)] [i (dec-i c)]) (new-term (Var k i 0 0)))]
+    [(1) (new-term (Ref (dec-sym c) 0))]
+    [(2)
+     (let* ([n (dec-u c)] [ks (cast (ptr datum) (alloc (* n 4)))] [is (cast (ptr i32) (alloc (* n 4)))]
+            [qs (cast (ptr u32) (alloc (* n 4)))] [vs (term-array n)])
+       (for ([j u32 0]) (< j n) (+= j 1)
+         (set! (@ ks j) (dec-sym c))
+         (set! (@ is j) (dec-i c))
+         (set! (@ qs j) (dec-u c))
+         (set! (@ vs j) (dec-term c)))
+       (new-term (Let n ks is qs vs (dec-term c) 0 0)))]
+    [(3) (new-term (Typ (dec-term c) 0))]
+    [(4) (new-term (Qnt 0))]
+    [(5) (new-term (Qua (dec-u c) 0))]
+    [(6) (let* ([a (dec-term c)] [b (dec-term c)]) (new-term (Min a b 0)))]
+    [(7) (let* ([q (dec-u c)] [k (dec-sym c)] [i (dec-i c)] [A (dec-term c)] [f (dec-term c)]) (new-term (All q k i A f 0 0)))]
+    [(8) (let* ([k (dec-sym c)] [i (dec-i c)] [f (dec-term c)]) (new-term (Lam k i f 0 0)))]
+    [(9) (let* ([f (dec-term c)] [x (dec-term c)]) (new-term (App f x 0)))]
+    [(10)
+     (let* ([k (dec-sym c)] [n (dec-u c)] [x (dec-each c n)] [m (dec-u c)] [r nil])
+       (for ([j u32 0]) (< j m) (+= j 1) (set! r (cons (dec-sym c) r)))
+       (new-term (ADT k n x (reverse r) 0)))]
+    [(11) (let* ([k (dec-sym c)] [n (dec-u c)] [x (dec-each c n)]) (new-term (Ctr k n x 0)))]
+    [(12) (let* ([k (dec-sym c)] [h (dec-term c)] [m (dec-term c)]) (new-term (Mat k h m 0)))]
+    [(13) (new-term (Efq 0))]
+    [(14) (let* ([a (dec-term c)] [b (dec-term c)] [T (dec-term c)]) (new-term (Eql a b T 0)))]
+    [(15) (new-term (Rfl 0))]
+    [(16) (let* ([e (dec-term c)] [p (dec-term c)] [f (dec-term c)]) (new-term (Rwt e p f 0)))]
+    [(17) (new-term (Hol (dec-sym c) 0))]
+    [(18) (let* ([x (dec-term c)] [T (dec-term c)]) (new-term (Ann x T 0)))]
+    [else (internal "bytes of no term")]))
