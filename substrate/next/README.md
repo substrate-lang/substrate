@@ -88,7 +88,11 @@ on them there.
     runtime has them, where the example's are wasm GC structs: a value
     is a 64-bit term, a Nat or a constructor of no field packed in it,
     else a node of its live fields; a definition whose values are proofs
-    or types has no code. A term is made a function's code, then kernel
+    or types has no code. A small datatype whose fields are words, not
+    recursive, is flat: a value of it is up to 8 words, its constructor's
+    number and fields, passed and given as several values, and boxed into
+    its node only where one term is held, as a node's field or a
+    closure's argument. A term is made a function's code, then kernel
     code that owns each value once, as Bend's quantities allow: a value
     used again is shared, one not used is dropped, and a match frees the
     node it takes, or reuses it for a constructor it builds.
