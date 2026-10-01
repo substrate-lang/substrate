@@ -68,6 +68,9 @@
   (set! forms nil)
   (set! used (make-table))
   (set! tried (make-table))
+  ;; The names the module's memory and table are exported by.
+  (table-set! used (cast u64 (sym memory)) 1)
+  (table-set! used (cast u64 (sym table)) 1)
   (set! printers (make-table))
   (set! erasures (make-table))
   (set! nats (make-table))
@@ -1217,14 +1220,21 @@
 ;; A match on s, which owns gamma, s among them: each branch's way its
 ;; own, its spares those not yet used and, for a node it takes, that
 ;; node. A flat value's match, kind 3, is on its variables s, the first
-;; its constructor's number if its family has more than one.
+;; its constructor's number if its family has more than one. A match of
+;; switch-ways ways or more is a switch on its constructor's number, and
+;; a chain of a Nat's, one on its count (nat-chain); a smaller one tests
+;; each branch in turn.
+(define switch-ways u32 4)
+
 (define (emit-case [s datum] [kind i32] [n u32] [bs (ptr (ptr branch))] [o (ptr ir)] [gamma datum] [sp (ptr spare)]) -> datum
-  (let ([rest nil] [tg (local! (sym tag))] [codes nil] [tests nil] [tagged i32 0] [nat (== kind 1)])
+  (let ([rest nil] [tg (local! (sym tag))] [codes nil] [tests nil] [numbers nil] [tagged i32 0] [nat (== kind 1)])
     (let ([g gamma])
       (while (pair? g)
         (unless (or (== (car g) s) (and (pair? s) (!= (memq (car g) s) 0))) (set! rest (cons (car g) rest)))
         (set! g (cdr g))))
     (set! rest (reverse rest))
+    (when nat
+      (let ([c (nat-chain s n bs o rest sp)]) (when (!= c 0) (return c))))
     (for ([j u32 0]) (< j n) (+= j 1)
       (let ([b (@ bs j)])
         ;; The last branch, with no other code, is not tested; a test of
@@ -1236,12 +1246,17 @@
                                  (unless (and (== j (- n 1)) (== o 0)) (set! tagged 1))
                                  `(i32.eq ,tg ,(i32-const (-> b number)))])
                           tests))
+        (set! numbers (cons (int (-> b number)) numbers))
         (set! codes (cons (branch-code s kind b rest (pending sp)) codes))))
     (let ([chain (if (!= o 0) (emit o gamma (pending sp) 1) 0)])
       (set! codes (reverse codes))
       (set! tests (reverse tests))
-      (let ([dispatch (if-chain tests codes chain)])
-        (if tagged `(let ([,tg ,(variant-code s)]) ,dispatch) dispatch)))))
+      (if (and (or (== kind 0) (== kind 3)) (>= (+ n (if (!= o 0) 1 0)) switch-ways))
+          (if (== kind 3)
+              (switch-code `(i32.wrap_i64 ,(car s)) (reverse numbers) codes chain 0)
+              `(let ([,tg ,(variant-code s)]) ,(switch-code tg (reverse numbers) codes chain 0)))
+          (let ([dispatch (if-chain tests codes chain)])
+            (if tagged `(let ([,tg ,(variant-code s)]) ,dispatch) dispatch))))))
 
 ;; The ifs of tests, each running its code, the last code alone if there
 ;; is no other code.
@@ -1249,6 +1264,126 @@
   (cond [(null? codes) (if (!= other 0) other `(unreachable))]
         [(and (null? (cdr codes)) (== other 0)) (car codes)]
         [else `(if ,(car tests) ,(car codes) ,(if-chain (cdr tests) (cdr codes) other))]))
+
+;; A switch on index, an i32: each of codes runs for its number, in
+;; numbers, and other for any other number, or, if there is no other
+;; code, the last code does. Each case is its block's, after the block,
+;; and returns, as a match ends its function's way; the other code is
+;; past them all. If each code is a number, it is a table's (const-table).
+;; bounded says index is at most past the numbers by one.
+(define (switch-code [index datum] [numbers datum] [codes datum] [other datum] [bounded i32]) -> datum
+  (when (== other 0)
+    (set! other (car (reverse codes)))
+    (set! codes (reverse (cdr (reverse codes))))
+    (set! numbers (reverse (cdr (reverse numbers)))))
+  (let ([labels nil] [lf (local! (sym other))] [entries nil] [top i64 0] [l numbers])
+    (while (pair? l)
+      (when (>= (integer-value (car l)) top) (set! top (+ (integer-value (car l)) 1)))
+      (set! l (cdr l)))
+    (when (and (const-code? other) (all-const? codes))
+      (return (const-table index numbers codes other top bounded)))
+    (set! l codes)
+    (while (pair? l)
+      (set! labels (cons (local! (sym case)) labels))
+      (set! l (cdr l)))
+    (set! labels (reverse labels))
+    (for ([i i64 0]) (< i top) (+= i 1)
+      (let ([e lf] [ns numbers] [ls labels])
+        (while (pair? ns)
+          (when (== (integer-value (car ns)) i) (set! e (car ls)))
+          (set! ns (cdr ns))
+          (set! ls (cdr ls)))
+        (set! entries (cons e entries))))
+    (let ([b `(block ,(car labels) (br-table ,(reverse entries) ,lf ,index))] [ls labels] [cs codes])
+      (while (pair? cs)
+        (set! b `(block ,(if (pair? (cdr ls)) (cadr ls) lf) ,b (return ,(car cs))))
+        (set! ls (cdr ls))
+        (set! cs (cdr cs)))
+      `(begin ,b ,other))))
+
+;; Is code a number, (i64.const n)? Is each of codes?
+(define (const-code? [code datum]) -> i32 (and (pair? code) (== (car code) (sym i64.const))))
+
+(define (all-const? [codes datum]) -> i32
+  (while (pair? codes)
+    (unless (const-code? (car codes)) (return 0))
+    (set! codes (cdr codes)))
+  1)
+
+;; A switch of numbers alone: the number at index in a table of each
+;; number up to top the code's for it, or other's, then other's, past
+;; them, in memory the module takes as it starts (runtime.sub's static),
+;; as a string literal's bytes are.
+(define (const-table [index datum] [numbers datum] [codes datum] [other datum] [top i64] [bounded i32]) -> datum
+  (let ([g (fresh-global (sym constants))] [p (local! (sym p))] [ix (local! (sym i))] [stores nil])
+    (for ([i i64 0]) (<= i top) (+= i 1)
+      (let ([v other] [ns numbers] [cs codes])
+        (while (pair? ns)
+          (when (== (integer-value (car ns)) i) (set! v (car cs)))
+          (set! ns (cdr ns))
+          (set! cs (cdr cs)))
+        (set! stores (cons (store-code p (cast u32 i) v) stores))))
+    (lift! `(global ,g (mut i32)
+              (let ([,p (#%app %bend-rt:static ,(i32-const (* 8 (+ top 1))))])
+                ,@(reverse stores)
+                ,p)))
+    `(i64.load (i32.add ,g (i32.shl ,(if bounded
+                                          index
+                                          `(let ([,ix ,index]) (if (i32.lt_u ,ix ,(i32-const top)) ,ix ,(i32-const top))))
+                                     (i32.const 3))))))
+
+;; A chain of matches on a Nat s, each but the first on the one before's
+;; predecessor, which nothing else uses, of each a Zero and a Succ branch,
+;; of nat-levels levels or more, as a match on Nat numbers is: a switch
+;; on s's count, each level's Zero branch its case, and past them the last
+;; level's Succ branch, whose predecessor is s less the levels; or, if s's
+;; match is not one, 0.
+(define nat-levels u32 3)
+
+(define (nat-chain [s datum] [n u32] [bs (ptr (ptr branch))] [o (ptr ir)] [rest datum] [sp (ptr spare)]) -> datum
+  (let ([zeros nil] [k i64 0] [succ (ptr branch) 0] [go i32 (nat-level? n bs o)])
+    (unless go (return 0))
+    (while go
+      (let ([sc (branch-of bs n 1)])
+        (set! zeros (cons (cast datum (-> (branch-of bs n 0) then)) zeros))
+        (+= k 1)
+        (set! succ sc)
+        (set! go 0)
+        (match (-> sc then)
+          [(Case ts tkind tn tbs to)
+           (when (and (== tkind 1) (== ts (@ (-> sc vs) 0)) (nat-level? tn tbs to) (not (branches-use? tn tbs ts)))
+             (set! n tn)
+             (set! bs tbs)
+             (set! o to)
+             (set! go 1))]
+          [_ 0])))
+    (when (< k nat-levels) (return 0))
+    (let ([p (@ (-> succ vs) 0)] [codes nil] [numbers nil] [z (reverse zeros)] [j i64 0])
+      (while (pair? z)
+        (set! codes (cons (emit (cast (ptr ir) (car z)) rest (pending sp) 1) codes))
+        (set! numbers (cons (int j) numbers))
+        (+= j 1)
+        (set! z (cdr z)))
+      (switch-code `(if (i64.lt_u ,s ,(i64-const (+ nat-zero k))) (i32.wrap_i64 ,s) ,(i32-const k))
+                   (reverse numbers) (reverse codes)
+                   (let ([d (emit (-> succ then) (cons p rest) (pending sp) 1)])
+                     (if (uses? (-> succ then) p) `(let ([,p (i64.sub ,s ,(i64-const k))]) ,d) d))
+                   1))))
+
+;; Does a Nat's match of branches bs, n of them, and other code o, have
+;; a Zero and a Succ branch and no other code?
+(define (nat-level? [n u32] [bs (ptr (ptr branch))] [o (ptr ir)]) -> i32
+  (and (== o 0) (!= (branch-of bs n 0) 0) (!= (branch-of bs n 1) 0)))
+
+;; The branch of bs, n of them, of constructor number v, or 0.
+(define (branch-of [bs (ptr (ptr branch))] [n u32] [v u32]) -> (ptr branch)
+  (for ([j u32 0]) (< j n) (+= j 1) (when (== (-> (@ bs j) number) v) (return (@ bs j))))
+  0)
+
+;; Does a branch of bs, n of them, use v?
+(define (branches-use? [n u32] [bs (ptr (ptr branch))] [v datum]) -> i32
+  (for ([j u32 0]) (< j n) (+= j 1) (when (uses? (-> (@ bs j) then) v) (return 1)))
+  0)
 
 ;; Branch b of a match on s: its fields bound, and its way.
 (define (branch-code [s datum] [kind i32] [b (ptr branch)] [rest datum] [sp (ptr spare)]) -> datum

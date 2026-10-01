@@ -92,10 +92,12 @@ on them there.
     recursive, is flat: a value of it is up to 8 words, its constructor's
     number and fields, passed and given as several values, and boxed into
     its node only where one term is held, as a node's field or a
-    closure's argument. A term is made a function's code, then kernel
-    code that owns each value once, as Bend's quantities allow: a value
-    used again is shared, one not used is dropped, and a match frees the
-    node it takes, or reuses it for a constructor it builds.
+    closure's argument. A match of many ways, or on Nat numbers, is a
+    switch, one jump, or, if each way gives a number, a table's. A term
+    is made a function's code, then kernel code that owns each value
+    once, as Bend's quantities allow: a value used again is shared, one
+    not used is dropped, and a match frees the node it takes, or reuses
+    it for a constructor it builds.
   - `runtime.sub`: what that code runs with: nodes, from lists of the
     freed ones of each size; sharing, a count of owners off the node,
     made the first time a value is shared; dropping; and writing a Nat.
