@@ -172,6 +172,11 @@ that wants GC data, as Substrate will, defines its own.
   bytes this build compiled, while compile-time code still links to the
   running build's kernel module.
 
+The new compiler adds to the kernel language, for code it compiles
+better: `(values e ...)`, several values, and a `let` binding of them,
+`[(x ...) init]` or `[(x ...) (type ...) init]`, so that a function of
+several results can be called for them (`tests/let-values.sub`).
+
 Code written for the old compiler's kernel module, its GC data and
 syntax objects, `lib/` among it, does not run on the new compiler:
 Substrate is built again in `substrate/` (plan, 5).
