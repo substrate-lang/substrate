@@ -73,11 +73,21 @@ on them there.
   - `core.sub`: `examples/bend/core.sub`, the checker, function for
     function, its terms variants in arenas and its binders' bodies data,
     where the example's are Substrate closures; a definition is checked
-    in an arena of its own, freed when it is done.
-  - `bend.sub`: `examples/bend/bend.sub`'s forms, which read a term from
-    its syntax, where the example expands it and reads the expansion back;
-    a definition's fact holds its terms as bytes and the names they refer
-    to. Not yet: templates, `print`, and the code of definitions.
+    in an arena of its own, freed when it is done, and a template's
+    instance, checked while the definition that applies it is read, in
+    one of its own above it.
+  - `bend.sub`: `examples/bend/bend.sub`'s forms, templates and `print`
+    among them, which read a term from its syntax, where the example
+    expands it and reads the expansion back; a definition's fact holds its
+    terms as bytes and the names they refer to, and the name of its
+    function, which is made as soon as the definition is checked.
+  - `lower.sub`: `examples/bend/lower.sub`, the code of definitions and
+    of `print`, in kernel code on cells in linear memory, where the
+    example's are wasm GC structs: a cell is its constructor's number
+    then its live fields, a closure its function's index in the table
+    then the values it captures.
+  - `runtime.sub`: what that code runs with: cells, from a bump
+    allocator that frees nothing yet, and writing a Nat.
   - `base.sub`: `examples/bend/base.sub`.
 - `seed/`: a build of the new compiler by itself, checked in, as `seed/`
   is the compiler's.
@@ -95,9 +105,10 @@ on them there.
   kernel module; the C example's tests (`tests/c`), on `c/`; the
   Substrate tests of `tests/` (`tests/substrate`), on `substrate/`, with
   their outputs, but for those of Substrate's syntax objects and its code
-  at compile time; and the tests of its parts: its syntax objects, its
-  reader, and what its expander and back end give for the kernel's tests,
-  which is what the compiler gives. Then, as `tests/run.sh` checks the
+  at compile time; the Bend tests of `tests/` and `examples/bend.sub`
+  (`tests/bend`), on `bend/`; and the tests of its parts: its syntax
+  objects, its reader, and what its expander and back end give for the
+  kernel's tests, which is what the compiler gives. Then, as `tests/run.sh` checks the
   compiler's, the cache: every program built again from it is byte for
   byte the same, and a stale entry is not used; and `compiled-import.sub`
   requires a compiled file.
@@ -200,5 +211,11 @@ Substrate is built again in `substrate/` (plan, 5).
       `substrate/core.sub` and `substrate/substrate.sub`; the Substrate
       tests of `tests/` give their outputs on them (`tests/substrate`),
       their macros written with `syntax-rules`.
-   4. Numeric instructions and reference types in C code.
-   5. The typed example; then Bend, its checker first-order, in C.
+   4. Bend, its checker first-order, in C, compiling to linear memory.
+      Done: `bend/`; the Bend tests of `tests/` (`tests/bend`) and
+      `examples/bend.sub` (`tests/bend/example.sub`) give their outputs
+      and errors on it. Bend2's `proofs_3200` benchmark, checked and
+      compiled, builds in 2.9 s on V8 and 3.3 s natively, where the
+      example takes 12.7 s.
+   5. Numeric instructions and reference types in C code; then the typed
+      example.

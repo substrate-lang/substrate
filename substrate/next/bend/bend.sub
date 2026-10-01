@@ -1,9 +1,10 @@
 ;; Lifecycle: experimental. Bend as the new compiler builds it (next/bend):
 ;; examples/bend/bend.sub, a port of Bend2's dependently typed, affine
 ;; language (bend2/bend.ts), in s-expressions, whose kernel, core.sub,
-;; checks each module's definitions while it compiles. Its macros are
-;; written in the C-like Lisp, on the kernel module's syntax objects. A
-;; module takes these forms with require-unqualified:
+;; checks each module's definitions while it compiles, and which lower.sub
+;; makes kernel code, on cells in linear memory. Its macros are written in
+;; the C-like Lisp, on the kernel module's syntax objects. A module takes
+;; these forms with require-unqualified:
 ;;
 ;;   (type (D p ...) K [C field ...] ...)    a datatype, of kind K, whose
 ;;   (type D K [C field ...] ...)            parameters p are [q x : A],
@@ -15,6 +16,8 @@
 ;;                                           type, and stuck until
 ;;   (def (f x ...) body)                    fills it, here or in a module
 ;;                                           that requires this one
+;;   (def (f [~ t : A] ... [q x : A] ...) R body)
+;;                                           a template (below)
 ;;
 ;; A binder's quantity q is -, erased, + for many uses, or nothing for one.
 ;; A body is a term or (match x ... [(pattern ...) body] ...), whose
@@ -42,8 +45,9 @@
 ;;   (the T x), (? name)     an annotation, and a hole
 ;;   (nat n)                 the Nat n, of the Succ and Zero in scope
 ;;
-;; Not yet here, as examples/bend/bend.sub has them: templates, print, and
-;; the code of definitions, which the module runs.
+;; and, in kernel code, (f a ...), a call of definition f with its live
+;; arguments, and (print e), which writes the value of term e and a
+;; newline, as terms are written here.
 ;;
 ;; How it works. type, def and law bind each name they define to a
 ;; transformer, bend-name, so that a name is its definition's (spec 6.6);
@@ -60,6 +64,14 @@
 ;; 6.5), its terms as bytes (core.sub), which is how another module finds
 ;; it. An error shows the term it is about as it is written here, at the
 ;; place it was written.
+;;
+;; A definition with a value is a function of its live parameters, made
+;; as soon as it is checked (lower.sub) and lifted, where the example
+;; makes its body once the module's definitions are read; a fact about the
+;; definition holds the function's name, which is how code in any module
+;; calls it. The module's first Bend form requires runtime.sub, whose
+;; memory and table the code shares, by its path from the module's: a
+;; module outside the package root cannot, for now, if this file is in it.
 
 (require-unqualified c "../c/c.sub")
 (memory from c)
@@ -69,13 +81,14 @@
          [let bend-let] [split bend-split] [absurd bend-absurd] [== bend-eql] [refl bend-refl]
          [rewrite bend-rewrite] [the bend-the] [? bend-hole] [nat bend-nat] [Kind bend-kind] [meet bend-meet]
          [Type bend-Type] [Data bend-Data] [Quant bend-Quant] [&0 bend-q0] [&1 bend-q1] [&2 bend-q2]
-         [#%datum bend-datum])
+         [print bend-print] [#%datum bend-datum])
 
 (begin-for-syntax
   (require-unqualified c "../c/c.sub")
   (require-unqualified kd "../compiler/kernel.sub")
   (require sm "../c/c-syntax-match.sub" syntax-match _ ... ?)
   (require-unqualified core "core.sub")
+  (require-unqualified lower "lower.sub")
 
   ;; An error about stx: form with args, as format-message writes them.
   (define (bend-fail [stx datum] [form (ptr u8)] [args datum]) -> (ptr term)
@@ -137,6 +150,7 @@
             [(1) (let* ([n (dec-u (& c))] [g (dec-u (& c))]) (return (new-kind 2 n g)))]
             [(2) (dec-sym (& c)) (return (new-kind 3 (dec-u (& c)) 0))]
             [(3) (return (new-kind 1 0 0))]
+            [(5) (return (new-kind 4 (dec-u (& c)) 0))]
             [else 0]))
         (set! fs (cdr fs)))
       0))
@@ -189,6 +203,14 @@
       (set! home (current-arena))
       (book-start!)
       (set-lookup! lookup)
+      (set-rewrite! template-call)
+      (set! templates (make-table))
+      (set! instances (make-table))
+      (set! counts (make-table))
+      (set! required (make-table))
+      (set! codes (make-table))
+      (lower-start! code-of)
+      (set! gen (syntax-local-introduce (datum->syntax #'here (sym bend) 0)))
       (set! keywords (make-table))
       (set! kinds (make-table))
       (set! ids (make-table))
@@ -269,6 +291,7 @@
     (let ([name (-> info name)])
       (case (-> info what)
         [(1) (apps (loc e) (new-term (Ref name (loc h))) args ev)]
+        [(4) (set! template-read 1) (apps (loc e) (new-term (Ref name (loc h))) args ev)]
         [(2)
          (if (and (null? args) (> (-> info n) 0))
              (new-term (Ref name (loc e)))
@@ -386,7 +409,7 @@
         (let* ([sp (cast (ptr spec) (car specs))] [i (fresh!)] [named (!= (-> sp x) 0)]
                [k (if named (syntax-e (-> sp x)) (sym _))])
           (when (== (-> sp q) 3)
-            (bend-fail (-> sp x) "expected ~~ only on a def's first parameters, which make it a template" nil))
+            (bend-fail (-> sp x) "expected ~ only on a def's first parameters, which make it a template" nil))
           (new-term (All (-> sp q) k i (read-term (-> sp A) ev)
                          (read-arrow (cdr specs) B (bind ev k i (not named)) s) 0
                          (if named (loc (-> sp x)) s))))))
@@ -514,24 +537,44 @@
   ;; module's, and checked (core.sub's validate functions), then its fact
   ;; made, as bytes: a datatype's (1 n g T c ...), each of its constructors
   ;; c (k n T), a constructor's (2 k n T), a definition's or law's (3 n T 1
-  ;; v) or (3 n T 0), and a fill's (4 v).
+  ;; v code) or (3 n T 0), a fill's (4 v code), code the name of its
+  ;; function; a template's (5 m n T v), its terms with their locations;
+  ;; and an instance of a template, made by this module, about the
+  ;; template: (6 key name), key its arguments' bytes.
 
   (define (fact [id datum] [b (ptr buffer)]) -> datum
     (let ([s (bytes->string (-> b bytes) (-> b length))])
       (buffer-free! b)
       #`(#%fact #,id '#,(datum->syntax #'here (cons s (enc-names)) 0))))
 
-  ;; A def's or law's parameters, each a binder.
-  (define (def-specs [bs datum]) -> datum
-    (let ([out nil])
+  ;; A def's or law's parameters, each a binder: a def's first ~ ones are
+  ;; a template's, and a ~ after them is an erased parameter, as in Bend;
+  ;; a law has none.
+  (define (def-specs [bs datum] [law i32]) -> datum
+    (let ([out nil] [leading 1])
       (while (pair? bs)
         (let ([s (bind-spec (car bs))])
           (when (== s 0) (bend-fail (car bs) "expected a parameter: [q x : A]" nil))
-          (when (== (-> s q) 3) (bend-fail (car bs) "templates are not yet in next/bend" nil))
+          (when (== (-> s q) 3)
+            (when law (bend-fail (car bs) "expected ~ only on a def's first parameters, which make it a template" nil))
+            (unless leading (set! (-> s q) 0)))
+          (unless (== (-> s q) 3) (set! leading 0))
           (set! out (cons (cast datum s) out)))
         (set! bs (cdr bs)))
       (reverse out)))
 
+  ;; How many of specs, from the first, are a template's; and each erased.
+  (define (leading-templates [specs datum]) -> u32
+    (let ([m u32 0])
+      (while (and (pair? specs) (== (-> (cast (ptr spec) (car specs)) q) 3))
+        (+= m 1)
+        (set! specs (cdr specs)))
+      m))
+
+  (define (erase-templates! [specs datum])
+    (while (pair? specs)
+      (let ([sp (cast (ptr spec) (car specs))]) (when (== (-> sp q) 3) (set! (-> sp q) 0)))
+      (set! specs (cdr specs))))
   ;; A definition's value, read: from its parameters xs, identifiers, and
   ;; its body, the body flattened (core.sub), its parameters bound.
   (define (read-value [xs datum] [body datum]) -> (ptr term)
@@ -563,8 +606,11 @@
                    (identifier? (car (syntax->list (cadr l)))))
         (bend-fail s "expected (def (f [q x : A] ...) R body), or (def (f x ...) body) to fill a law" nil))
       (let ([head (syntax->list (cadr l))])
-        (cond [(and (== (length l) 3) (all-identifiers? (cdr head))) (fill-info s (car head) (cdr head) (caddr l))]
-              [(== (length l) 4) #`(begin (define-syntax #,(car head) bend-name) (def-info #,s))]
+        (cond [(and (== (length l) 3) (all-identifiers? (cdr head))) (with-runtime s (fill-info s (car head) (cdr head) (caddr l)))]
+              [(== (length l) 4)
+               (with-runtime s (if (> (leading-templates (def-specs (cdr head) 0)) 0)
+                                   #`(begin (define-syntax #,(car head) bend-name) (template-info #,s))
+                                   #`(begin (define-syntax #,(car head) bend-name) (def-info #,s))))]
               [else (bend-fail s "expected (def (f [q x : A] ...) R body), or (def (f x ...) body) to fill a law" nil)
                     s]))))
 
@@ -582,12 +628,14 @@
       (where! s)
       (check-in-scratch!)
       (reset-fresh! 0)
-      (let* ([specs (def-specs (cdr head))] [n (length specs)]
+      (set! template-read 0)
+      (let* ([specs (def-specs (cdr head) 0)] [n (length specs)]
              [T0 (read-arrow specs (caddr l) 0 (loc s))]
-             [v (read-value (spec-names specs) (cadddr l))]
-             [T (canonical T0)]
-             [b (make-buffer)])
-        (validate-def! name n (higher T) (higher v))
+             [v (resolved (read-value (spec-names specs) (cadddr l)))]
+             [T (resolved (canonical T0))]
+             [b (make-buffer)]
+             [Th (higher T)]
+             [code (function! name n Th (validate-def! name n Th (higher v)))])
         (end-check!)
         (enc-start!)
         (buffer-add-byte! (& b) 3)
@@ -595,6 +643,7 @@
         (enc-term (& b) T)
         (buffer-add-byte! (& b) 1)
         (enc-term (& b) v)
+        (enc-sym (& b) code)
         (fact f (& b)))))
 
   ;; (law (f [q x : A] ...) R): f bound, then its type read and checked.
@@ -604,7 +653,7 @@
       (unless (and (!= l 0) (== (length l) 3) (syntax->list (cadr l)) (pair? (syntax->list (cadr l)))
                    (identifier? (car (syntax->list (cadr l)))))
         (bend-fail s "expected (law (f [q x : A] ...) R)" nil))
-      #`(begin (define-syntax #,(car (syntax->list (cadr l))) bend-name) (law-info #,s))))
+      (with-runtime s #`(begin (define-syntax #,(car (syntax->list (cadr l))) bend-name) (law-info #,s)))))
 
   (define (law-info-form [stx datum]) -> datum
     (let* ([s (cadr (syntax->list stx))] [l (syntax->list s)] [head (syntax->list (cadr l))] [f (car head)]
@@ -614,9 +663,10 @@
       (where! s)
       (check-in-scratch!)
       (reset-fresh! 0)
-      (let* ([specs (def-specs (cdr head))] [n (length specs)]
+      (set! template-read 0)
+      (let* ([specs (def-specs (cdr head) 1)] [n (length specs)]
              [T0 (read-arrow specs (caddr l) 0 (loc s))]
-             [T (begin (in-module-arena!) (canonical T0))]
+             [T (begin (in-module-arena!) (resolved (canonical T0)))]
              [b (make-buffer)])
         (validate-def! name n (higher T) 0)
         (end-check!)
@@ -635,13 +685,117 @@
       (where! s)
       (check-in-scratch!)
       (reset-fresh! 0)
-      (let ([v (read-value xs body)] [b (make-buffer)])
-        (validate-fill! (-> info name) (higher v))
+      (set! template-read 0)
+      (let* ([name (-> info name)] [v (resolved (read-value xs body))] [b (make-buffer)] [law (book-tld name)]
+             [code (function! name (defd-n law) (defd-T law) (validate-fill! name (higher v)))])
         (end-check!)
         (enc-start!)
         (buffer-add-byte! (& b) 4)
         (enc-term (& b) v)
+        (enc-sym (& b) code)
         (fact f (& b)))))
+
+  ;; ---- code ----
+  ;;
+  ;; A definition's function is made as soon as it is checked: every
+  ;; definition its value's live code uses is checked and filled before it
+  ;; (core.sub). It is lowered in core.sub's scratch arena, then copied into
+  ;; the module's and lifted. Every piece of code is made in one context,
+  ;; gen: bend.sub's scopes and one of the module's own, so the names it
+  ;; defines and uses are the same names; another module's functions are
+  ;; named by their definitions (spec 6.6). The module requires the
+  ;; runtime, %bend-rt, with its first Bend definition, and the code
+  ;; shares its memory and table.
+
+  (define gen datum 0)
+  (define runtime-required i32 0)
+  ;; The function of each definition, by name: this module's, a symbol in
+  ;; gen; another's, an identifier.
+  (define codes (ptr arena-table) 0)
+
+  (define (generated [d datum]) -> datum (syntax-local-introduce (datum->syntax gen d #'here)))
+
+  ;; form, Bend form s's output, after the require of the runtime,
+  ;; %bend-rt, whose memory and table the module takes, if s is its first.
+  (define (with-runtime [s datum] [form datum]) -> datum
+    (if runtime-required
+        form
+        (begin
+          (set! runtime-required 1)
+          #`(begin #,(generated `(begin (require %bend-rt ,(runtime-path s)) (memory from %bend-rt) (table from %bend-rt)))
+                   #,form))))
+
+  ;; The path of runtime.sub, which is in this file's directory, from the
+  ;; module being compiled, where its require is (spec 6.2): this file's
+  ;; path, the start of the name of a definition of its (spec 6.6), after
+  ;; a .. for each directory of the module's path, from where the module
+  ;; is located; both are relative to the package root, unless this
+  ;; file's is absolute.
+  (define (runtime-path [s datum]) -> datum
+    (let* ([name (identifier-name #'bend-type)] [p (symbol-bytes name)] [n (symbol-length name)] [i u32 0] [dir u32 0]
+           [loc (syntax-srcloc s)] [up (make-buffer)])
+      (while (and (< i n) (!= (@ p i) #\:))
+        (when (== (@ p i) #\/) (set! dir (+ i 1)))
+        (+= i 1))
+      (unless (or (== loc 0) (== (@ p 0) #\/))
+        (let ([q (symbol-bytes (-> loc source))])
+          (for ([j u32 0]) (< j (symbol-length (-> loc source))) (+= j 1)
+            (when (== (@ q j) #\/) (buffer-add! (& up) "../" 3)))))
+      (format-message "~a~aruntime.sub" `(,(bytes->string (-> up bytes) (-> up length)) ,(bytes->string p dir)))))
+
+  (define (lift-code! [form datum]) (syntax-local-lift-definition (generated form)))
+
+  ;; Code d, made in scratch, in the current arena: its pairs, integers and
+  ;; strings copied.
+  (define (copy-code [d datum]) -> datum
+    (cond [(pair? d) (cons (copy-code (car d)) (copy-code (cdr d)))]
+          [(integer? d) (make-integer (integer-value d))]
+          [(string? d) (bytes->string (string-bytes d) (string-length d))]
+          [else d]))
+
+  ;; The function of definition name, of n parameters, of type T, whose
+  ;; checked value is e: lowered, copied, lifted; the name of the function,
+  ;; which the definition's fact holds.
+  (define (function! [name datum] [n u32] [T (ptr term)] [e (ptr term)]) -> datum
+    (let ([fsym (fresh-global (string->symbol (short name)))])
+      (table-set! codes (cast u64 name) (cast u32 fsym))
+      (let* ([params (def-params T n)] [code (def-body T e params)] [helpers (lowered-forms!)])
+        (in-module-arena!)
+        (lift-code! (copy-code `(begin ,@helpers
+                                       (func (,fsym ,@(map (lambda ([p datum]) -> datum `[,p i32]) params)) -> i32 ,code))))
+        (identifier-name (datum->syntax gen fsym 0)))))
+
+  ;; The function of definition name, for the code: a symbol of this
+  ;; module's, or another module's, as an identifier, which lookup records
+  ;; from the facts about name.
+  (define (code-of [name datum]) -> datum
+    (when (== (table-ref codes (cast u64 name)) 0) (book-tld name))
+    (let ([c (cast datum (table-ref codes (cast u64 name)))])
+      (when (== c 0)
+        (bend-fail (where) "~a has no code: it is a law no module has filled, or a datatype" (list1 (short name))))
+      c))
+
+  (define (code! [name datum] [code datum]) (table-set! codes (cast u64 name) (cast u32 (name-identifier code))))
+
+  ;; (print e), in kernel code: e's value written, and a newline. e is a
+  ;; term, read here, whose type says how to write its value (lower.sub).
+  (define (bend-print-form [s datum]) -> datum
+    (start!)
+    (let ([l (syntax->list s)])
+      (unless (and (!= l 0) (== (length l) 2)) (bend-fail s "expected (print e)" nil))
+      (begin-check!)
+      (where! s)
+      (check-in-scratch!)
+      (reset-fresh! 0)
+      (set! template-read 0)
+      (let* ([r (infer-closed (higher (resolved (read-term (cadr l) 0))))]
+             [code (print-code (cast (ptr term) (car r)) (cast (ptr term) (cadr r)))]
+             [helpers (lowered-forms!)])
+        (in-module-arena!)
+        (let ([out (copy-code code)] [hs (copy-code helpers)])
+          (end-check!)
+          (unless (null? hs) (lift-code! `(begin ,@hs)))
+          (generated out)))))
 
   ;; (type (D p ...) K [C field ...] ...), or (type D K ...): D and each C
   ;; bound, then (type-info ...), which reads their types.
@@ -656,7 +810,7 @@
           (let ([c (constructor-name (car cs))])
             (set! binds (cons #`(define-syntax #,c bend-name) binds)))
           (set! cs (cdr cs)))
-        #`(begin #,@(reverse binds) (type-info #,s)))))
+        (with-runtime s #`(begin #,@(reverse binds) (type-info #,s))))))
 
   ;; A constructor's name: C of [C field ...], or C alone.
   (define (constructor-name [c datum]) -> datum
@@ -711,6 +865,7 @@
       (where! s)
       (check-in-scratch!)
       (reset-fresh! 0)
+      (set! template-read 0)
       (let* ([T0 (read-arrow ps (caddr l) 0 (loc s))]
              [tip (if (null? ps) d #`(#,d #,@(spec-names ps)))]
              [cts (term-array nc)] [c cs])
@@ -719,12 +874,12 @@
           (set! c (cdr c)))
         (in-module-arena!)
         ;; The canonical types in the module's arena, cts read in scratch.
-        (let ([T (canonical T0)] [ctrs (cast (ptr (ptr tld)) (alloc-in (current-arena) (* nc 4)))] [b (make-buffer)]
+        (let ([T (resolved (canonical T0))] [ctrs (cast (ptr (ptr tld)) (alloc-in (current-arena) (* nc 4)))] [b (make-buffer)]
               [facts nil] [read cts])
           (set! cts (term-array nc))
           (set! c cs)
           (for ([j u32 0]) (< j nc) (+= j 1)
-            (set! (@ cts j) (canonical (@ read j)))
+            (set! (@ cts j) (resolved (canonical (@ read j))))
             (set! (@ ctrs j) (new-tld (CtrD (identifier-name (constructor-name (car c))) (length (constructor-fields (car c)))
                                             (higher (@ cts j)))))
             (set! c (cdr c)))
@@ -753,6 +908,202 @@
             (set! c (cdr c)))
           #`(begin #,@(reverse facts))))))
 
+  ;; ---- templates ----
+  ;;
+  ;; A def whose first parameters are [~ x : A] is a template, as in Bend:
+  ;; not a definition, which is checked and compiled, but its instances
+  ;; are, each a definition of the rest of its parameters. An application
+  ;; of a template gives it its template arguments first, closed terms;
+  ;; its instance at them is the template's type and value with them put
+  ;; for its template parameters, and it is shared by every application at
+  ;; the same arguments: an instance's own recursion reaches it. A lambda
+  ;; argument applied in the template is put in place, as Bend puts it, so
+  ;; the instance calls no closure (core.sub). A template is read, and
+  ;; kept, with the applications of templates in it left for its
+  ;; instances; another module reads it from a fact about it, which holds
+  ;; its terms' locations, so that an error in an instance is located in
+  ;; the template. Once a definition is read, each application of a
+  ;; template in it is of an instance, made then, and checked, at once:
+  ;; its name is a global's, lifted, with a fact about it, as a def's,
+  ;; and a fact about the template says the instance's arguments and
+  ;; name, so a module that requires this one uses it too.
+
+  (struct tmpl [m u32] [n u32] [T (ptr term)] [v (ptr term)] [where datum])
+
+  ;; This module's templates, and those found in facts, by name.
+  (define templates (ptr arena-table) 0)
+  ;; Whether a term read since the definition started applies a template.
+  (define template-read i32 0)
+
+  (define (new-tmpl [m u32] [n u32] [T (ptr term)] [v (ptr term)] [where datum]) -> (ptr tmpl)
+    (let ([t (cast (ptr tmpl) (alloc-in home (sizeof tmpl)))])
+      (set! (-> t m) m)
+      (set! (-> t n) n)
+      (set! (-> t T) T)
+      (set! (-> t v) v)
+      (set! (-> t where) where)
+      t))
+
+  ;; (template-info form): template f, of m template parameters of n, its
+  ;; type and value read, not checked, and kept.
+  (define (template-info-form [stx datum]) -> datum
+    (let* ([s (cadr (syntax->list stx))] [l (syntax->list s)] [head (syntax->list (cadr l))] [f (car head)]
+           [name (identifier-name f)] [specs (def-specs (cdr head) 0)] [m (leading-templates specs)] [n (length specs)])
+      (kind! name 4 m 0)
+      (erase-templates! specs)
+      (begin-check!)
+      (where! s)
+      (check-in-scratch!)
+      (reset-fresh! 0)
+      (let* ([T0 (read-arrow specs (caddr l) 0 (loc s))]
+             [v (read-value (spec-names specs) (cadddr l))]
+             [T (canonical T0)]
+             [b (make-buffer)])
+        (end-check!)
+        (table-set! templates (cast u64 name) (cast u32 (new-tmpl m n T v s)))
+        (enc-start!)
+        (buffer-add-byte! (& b) 5)
+        (enc-u (& b) m)
+        (enc-u (& b) n)
+        (enc-located (& b) T)
+        (enc-located (& b) v)
+        (fact f (& b)))))
+
+  ;; Template k, or 0 if k is not one.
+  (define (template-of [k datum]) -> (ptr tmpl)
+    (let ([known (cast (ptr tmpl) (table-ref templates (cast u64 k)))] [nk (ptr kind) 0])
+      (when (!= known 0) (return known))
+      (set! nk (name-kind k))
+      (when (or (== nk 0) (!= (-> nk what) 4)) (return 0))
+      (let ([fs (name-facts k)] [t (ptr tmpl) 0] [saved (use-arena home)])
+        (while (pair? fs)
+          (let ([c (cursor-of (car fs))])
+            (when (== (dec-byte (& c)) 5)
+              (set! (-> c locs) 1)
+              (let* ([m (dec-u (& c))] [n (dec-u (& c))] [T (dec-term (& c))] [v (dec-term (& c))])
+                (set! t (new-tmpl m n T v 0)))))
+          (set! fs (cdr fs)))
+        (use-arena saved)
+        (table-set! templates (cast u64 k) (cast u32 t))
+        t)))
+
+  ;; t, a term just read, in the module's arena, each application of a
+  ;; template in it of its instance, if the definition applies one.
+  (define (resolved [t (ptr term)]) -> (ptr term)
+    (if template-read
+        (let* ([saved (use-arena home)] [r (rewrite-calls t)])
+          (use-arena saved)
+          r)
+        t))
+
+  ;; An application t of k to the n terms xs, rewritten (core.sub): if k
+  ;; is a template, of its instance at its first arguments, which it
+  ;; takes; else 0.
+  (define (template-call [k datum] [xs (ptr (ptr term))] [n u32] [t (ptr term)]) -> (ptr term)
+    (let ([tp (template-of k)])
+      (if (== tp 0)
+          0
+          (let ([m (-> tp m)])
+            (when (< n m)
+              (call-fail t "expected ~a applied to its ~a template argument~a first" `(,(short k) ,(make-integer m) ,(plural m))))
+            (for ([j u32 0]) (< j m) (+= j 1)
+              (unless (closed? (@ xs j) 0)
+                (call-fail t "expected closed template arguments to ~a: this one uses a local variable, which only a run-time argument can"
+                           (list1 (short k)))))
+            (let ([name (instance k tp xs)])
+              (took! m)
+              (new-term (Ref name (term-s t))))))))
+
+  ;; An error about application t, written as the example writes terms.
+  (define (call-fail [t (ptr term)] [form (ptr u8)] [args datum])
+    (raise-syntax-error (sym bend) (format-message form args)
+                        (if (== (term-s t) 0)
+                            (where)
+                            (make-syntax (string->symbol (term-show-string t)) no-scopes (term-s t) nil))))
+
+  ;; The instances this module made, and those of the modules it
+  ;; requires, by key, each its name; how many of each template this
+  ;; module made; and, for each template of another module, the instances
+  ;; the facts about it name, by key, read once.
+  (define instances (ptr arena-table) 0)
+  (define counts (ptr arena-table) 0)
+  (define required (ptr arena-table) 0)
+
+  ;; The name of template k's instance at xs, made if no module made it.
+  (define (instance [k datum] [tp (ptr tmpl)] [xs (ptr (ptr term))]) -> datum
+    (let ([b (make-buffer)] [key datum 0] [known datum 0])
+      (buffer-add! (& b) (symbol-bytes k) (symbol-length k))
+      (buffer-add-byte! (& b) 0)
+      (for ([j u32 0]) (< j (-> tp m)) (+= j 1) (term-key! (& b) (@ xs j)))
+      (set! key (bytes->symbol (-> b bytes) (-> b length)))
+      (buffer-free! (& b))
+      (set! known (cast datum (table-ref instances (cast u64 key))))
+      (when (and (== known 0) (== (-> tp where) 0)) (set! known (required-instance k key)))
+      (if (!= known 0) known (make-instance k tp xs key))))
+
+  (define (required-instance [k datum] [key datum]) -> datum
+    (let ([t (cast (ptr arena-table) (table-ref required (cast u64 k)))])
+      (when (== t 0)
+        (let ([saved (use-arena home)] [fs (name-facts k)])
+          (set! t (make-table))
+          (while (pair? fs)
+            (let ([c (cursor-of (car fs))])
+              (when (== (dec-byte (& c)) 6)
+                (let* ([n (dec-u (& c))] [kk (bytes->symbol (-> c p) n)])
+                  (+= (-> c p) n)
+                  (table-set! t (cast u64 kk) (cast u32 (dec-sym (& c)))))))
+            (set! fs (cdr fs)))
+          (table-set! required (cast u64 k) (cast u32 t))
+          (use-arena saved)))
+      (cast datum (table-ref t (cast u64 key)))))
+
+  ;; A new instance of template k at xs, k~i: its global lifted, whose name
+  ;; is the instance's, then its type and value instantiated, their
+  ;; applications of templates made of instances, and checked, at a level
+  ;; of its own (core.sub), and its function lifted. As in Bend,
+  ;; arguments written in more than 2048 characters make none: a template
+  ;; whose recursion grows its arguments stops there.
+  (define (make-instance [k datum] [tp (ptr tmpl)] [xs (ptr (ptr term))] [key datum]) -> datum
+    (let ([m (-> tp m)] [size u32 0])
+      (for ([j u32 0]) (< j m) (+= j 1) (+= size (+ 1 (string-length (term-show-string (@ xs j))))))
+      (when (> size 2048)
+        (bend-fail (where) "expected the template arguments of ~a to stop growing: each call makes an instance" (list1 (short k))))
+      (let* ([i (table-ref counts (cast u64 k))]
+             [sym (fresh-global (string->symbol (format-message "~a~a~a" `(,(short k) "~" ,(make-integer i)))))]
+             [n (- (-> tp n) m)])
+        (table-set! counts (cast u64 k) (+ i 1))
+        (lift-code! `(global ,sym i32 (i32.const 0)))
+        (let ([name (identifier-name (datum->syntax gen sym 0))]
+              [T (term-instantiate (-> tp T) xs m)]
+              [v (term-instantiate (-> tp v) xs m)])
+          (table-set! instances (cast u64 key) (cast u32 name))
+          (when (or (== T 0) (== v 0))
+            (bend-fail (if (!= (-> tp where) 0) (-> tp where) (where))
+                       "expected ~a's template parameters to be its first, and not matched" (list1 (short k))))
+          (set! T (rewrite-calls T))
+          (set! v (rewrite-calls v))
+          (begin-check!)
+          (when (!= (-> tp where) 0) (where! (-> tp where)))
+          (reset-fresh! 0)
+          (let* ([Th (higher T)] [code (function! name n Th (validate-def! name n Th (higher v)))] [b (make-buffer)])
+            (end-check!)
+            (enc-start!)
+            (buffer-add-byte! (& b) 3)
+            (enc-u (& b) n)
+            (enc-term (& b) T)
+            (buffer-add-byte! (& b) 1)
+            (enc-term (& b) v)
+            (enc-sym (& b) code)
+            (syntax-local-lift-definition (fact (generated sym) (& b)))
+            (enc-start!)
+            (set! b (make-buffer))
+            (buffer-add-byte! (& b) 6)
+            (enc-u (& b) (symbol-length key))
+            (buffer-add! (& b) (symbol-bytes key) (symbol-length key))
+            (enc-sym (& b) name)
+            (syntax-local-lift-definition (fact (syntax-local-introduce (name-identifier k)) (& b)))
+            name)))))
+
   ;; ---- other modules' definitions ----
 
   ;; What the modules this one requires say of name, from the facts about
@@ -766,7 +1117,7 @@
           (cond [(and (== kind 4) (== fill 0)) (set! fill (car fs))]
                 [(and (!= kind 4) (== info 0)) (set! info (car fs))]))
         (set! fs (cdr fs)))
-      (if (== info 0) 0 (tld-of info fill))))
+      (if (== info 0) 0 (tld-of name info fill))))
 
   ;; A cursor at a fact's value, its bytes and then the names they refer
   ;; to (core.sub).
@@ -774,6 +1125,7 @@
     (let ([c cursor] [s (car v)] [names (cdr v)] [n (length (cdr v))])
       (set! (-> c p) (string-bytes s))
       (set! (-> c end) (+ (string-bytes s) (string-length s)))
+      (set! (-> c locs) 0)
       (set! (-> c names) (cast (ptr datum) (alloc-in (current-arena) (* (+ n 1) 4))))
       (for ([j u32 0]) (< j n) (+= j 1)
         (set! (@ (-> c names) j) (car names))
@@ -782,7 +1134,7 @@
 
   (define (decoded [c (ptr cursor)]) -> (ptr term) (higher (dec-term c)))
 
-  (define (tld-of [info datum] [fill datum]) -> (ptr tld)
+  (define (tld-of [name datum] [info datum] [fill datum]) -> (ptr tld)
     (let ([c (cursor-of info)])
       (case (dec-byte (& c))
         [(1)
@@ -794,21 +1146,27 @@
            (new-tld (AdtD n g T nc cs)))]
         [(2) (let* ([k (dec-sym (& c))] [m (dec-u (& c))] [ct (decoded (& c))]) (new-tld (CtrD k m ct)))]
         [(3)
-         (let* ([n (dec-u (& c))] [T (decoded (& c))] [has (dec-byte (& c))]
-                [v (cond [has (decoded (& c))]
-                         [(!= fill 0) (let ([fc (cursor-of fill)]) (dec-byte (& fc)) (decoded (& fc)))]
-                         [else 0])])
+         (let* ([n (dec-u (& c))] [T (decoded (& c))] [has (dec-byte (& c))] [v (ptr term) 0])
+           (cond [has (set! v (decoded (& c))) (code! name (dec-sym (& c)))]
+                 [(!= fill 0)
+                  (let ([fc (cursor-of fill)])
+                    (dec-byte (& fc))
+                    (set! v (decoded (& fc)))
+                    (code! name (dec-sym (& fc))))])
            (new-tld (DefD n T v)))]
         [else 0])))
 
   ;; ---- names and keywords ----
 
   ;; The transformer every name a module defines is bound to: a name is
-  ;; read as a term, not expanded, so a use of one outside a term is an
-  ;; error, for now.
+  ;; read as a term, not expanded; in kernel code, a definition applied,
+  ;; (f a ...), is a call of its function, which takes its live arguments.
   (define (bend-name [s datum]) -> datum
-    (bend-fail s "expected a Bend name only in a Bend term: kernel code calls no Bend definition yet" nil)
-    s)
+    (start!)
+    (let* ([l (syntax->list s)] [applied (and (!= l 0) (pair? l))] [info (classify (if applied (car l) s))])
+      (unless (and applied (== (-> info what) 1))
+        (bend-fail s "expected, in kernel code, a definition called with its live arguments, (f x ...), or (print e)" nil))
+      (generated `(#%app ,(code-of (-> info name)) ,@(cdr l)))))
 
   (define (keyword-alone [s datum]) -> datum
     (bend-fail s "expected this form of Bend's only in a Bend term" nil)
@@ -822,8 +1180,10 @@
 (define-syntax type-info type-info-form)
 (define-syntax bend-def bend-def-form)
 (define-syntax def-info def-info-form)
+(define-syntax template-info template-info-form)
 (define-syntax bend-law bend-law-form)
 (define-syntax law-info law-info-form)
+(define-syntax bend-print bend-print-form)
 (define-syntax bend-match keyword-alone)
 (define-syntax bend-fn keyword-alone)
 (define-syntax bend-arrow keyword-alone)
