@@ -8,6 +8,7 @@
 #
 #   NAME.out   expected output of a successful run
 #   NAME.err   a line that must appear in the output of a failing one
+#   NAME.args  the run's command-line arguments, on one line
 #
 # Most are the kernel's tests (tests/) of compile-time code and of
 # syntax-match (next/c/syntax-match.sub), on the new compiler's kernel
@@ -36,7 +37,10 @@ for t in next/tests/*.sub next/tests/c/*.sub next/tests/substrate/*.sub; do
   base="$dir/$name"
   program="$builds/${dir#next/tests}/$name"
   rm -rf "${program:?}"
-  actual="$(cd "$dir" && "$root/next/sub" build "$name.sub" -o "$root/$program" 2>&1 && "$host" "$root/$program" 2>&1)"
+  args=()
+  if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
+  actual="$(cd "$dir" && "$root/next/sub" build "$name.sub" -o "$root/$program" 2>&1 &&
+            "$host" "$root/$program" ${args[@]+"${args[@]}"} 2>&1)"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then
@@ -54,6 +58,15 @@ for t in next/tests/*.sub next/tests/c/*.sub next/tests/substrate/*.sub; do
     fail=$((fail + 1))
     echo "FAIL $base: $problem"
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
+  fi
+done
+# A module compiles to the same bytes whatever the run compiled before it
+# (spec 3.5): substrate/order-a and order-b require the same two modules in
+# either order.
+for f in "$builds"/substrate/order-a/order-[mn].*.wasm; do
+  if ! cmp -s "$f" "$builds/substrate/order-b/$(basename "$f")"; then
+    fail=$((fail + 1))
+    echo "FAIL next/tests/substrate/order-b: $(basename "$f") differs from order-a's"
   fi
 done
 echo "$pass passed, $fail failed"

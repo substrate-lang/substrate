@@ -38,7 +38,8 @@ on them there.
   which the compiler's sources are written in:
   - `lang.sub`: `examples/c/lang.sub`, its transformers in kernel code,
     function for function. C code quotes data and syntax (`'d`, `#'x`),
-    typed as the kernel module's `datum`, with `kernel.sub`'s templates
+    typed as the kernel module's `datum`, as the module of the function
+    or global that quotes it names it, with `kernel.sub`'s templates
     `` `t `` and `` #`t ``.
   - `runtime.sub`, `math.sub` and `c.sub`: `examples/c`'s.
   - `syntax-match.sub`: `lib/substrate.sub`'s patterns for syntax, in
@@ -53,8 +54,16 @@ on them there.
 - `substrate/`: Substrate as the new compiler builds it, on the C-like
   Lisp (plan, 5):
   - `data.sub`: its data, `compiler/kernel.sub`'s but for its syntax
-    objects, as wasm GC objects; and its `quote`, which makes a datum as
-    its value, once, when the module that quotes it starts.
+    objects, as wasm GC objects; its `quote`, which makes a datum as its
+    value, once, when the module that quotes it starts; and its
+    `quasiquote`.
+  - `core.sub`: `lib/substrate-core.sub`, its transformers kernel code on
+    the kernel module's data, its run-time functions on `data.sub`'s.
+  - `substrate.sub`: `lib/substrate.sub`, its forms and `match` written
+    in C. A module written in Substrate defines macros with patterns,
+    `syntax-rules`, which compile into C at its phase 1, not with
+    Substrate code: Substrate does not run at compile time, and has no
+    syntax objects among its values.
 - `seed/`: a build of the new compiler by itself, checked in, as `seed/`
   is the compiler's.
 - `sub`: runs the new compiler as `bin/sub` runs the compiler; when its
@@ -67,10 +76,12 @@ on them there.
   for byte, but where the new compiler differs by design.
 - `tests/`: the new compiler's own tests, which it builds (`run.sh`): the
   kernel's tests of compile-time code and of `syntax-match`, on the new
-  kernel module; the C example's tests (`tests/c`), on `c/`; and the
-  tests of its parts: its syntax objects, its reader, and what its
-  expander and back end give for the kernel's tests, which is what the
-  compiler gives.
+  kernel module; the C example's tests (`tests/c`), on `c/`; the
+  Substrate tests of `tests/` (`tests/substrate`), on `substrate/`, with
+  their outputs, but for those of Substrate's syntax objects and its code
+  at compile time; and the tests of its parts: its syntax objects, its
+  reader, and what its expander and back end give for the kernel's tests,
+  which is what the compiler gives.
 
 ## The kernel module
 
@@ -125,8 +136,8 @@ that wants GC data, as Substrate will, defines its own.
   running build's kernel module.
 
 Code written for the old compiler's kernel module, its GC data and
-syntax objects, Substrate among it, does not run on the new compiler:
-Substrate is to be built again on the C-like Lisp (plan, 5).
+syntax objects, `lib/` among it, does not run on the new compiler:
+Substrate is built again in `substrate/` (plan, 5).
 
 ## Plan
 
@@ -166,6 +177,9 @@ Substrate is to be built again on the C-like Lisp (plan, 5).
    2. Substrate's data, the old kernel module's GC data but syntax, and
       its literals, made when a module starts. Done: `substrate/data.sub`
       (`tests/substrate/data.sub`).
-   3. Substrate's forms, and pattern macros for Substrate's users.
+   3. Substrate's forms, and pattern macros for Substrate's users. Done:
+      `substrate/core.sub` and `substrate/substrate.sub`; the Substrate
+      tests of `tests/` give their outputs on them (`tests/substrate`),
+      their macros written with `syntax-rules`.
    4. Numeric instructions and reference types in C code.
    5. The typed example; then Bend, its checker first-order, in C.
