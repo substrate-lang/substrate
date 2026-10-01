@@ -1,6 +1,5 @@
 ;; Lifecycle: experimental. Part of the new compiler (next/), written in
-;; the C-like Lisp (next/c): the compiler's expander.sub, but for the cache and
-;; compiled files, which come later.
+;; the C-like Lisp (next/c): the compiler's expander.sub.
 ;;
 ;; Expander: syntax objects -> the compiler's input (core.sub), lowered
 ;; code, built as the code is expanded; or fully expanded code, syntax
@@ -27,9 +26,10 @@
 (require-unqualified host "host.sub")
 (require-unqualified cmp "compile.sub")
 (require-unqualified running "running.sub")
+(require-unqualified ser "serialize.sub")
 
 (provide set-repository-root! set-package-root! set-running-directory! compile-module-file expand-module-file
-         content-hash linklet program-linklets module-linklet-list trap-report)
+         content-hash linklet program-linklets module-linklet-list trap-report set-cache-directory! compiled-file-bytes)
 
 (memory from c)
 (table from c)
@@ -135,10 +135,13 @@
 ;; (3.6). facts: the facts it recorded, newest first, each (definition
 ;; phase value): the definition it is about (fact-key), the phase, and its
 ;; datum or syntax. types and infos: the types and definitions it made,
-;; newest first.
+;; newest first. scope-count and type-count: how many scopes its
+;; expansion made and types it declared, each numbered in it, so that an
+;; interface can name them (the cache). A module loaded from a compiled
+;; file has (compiled file hash) for its path (3.7).
 (struct unit [self datum] [path datum] [name datum] [hash datum] [state datum] [requires datum] [provides datum]
         [entries (ptr module-entry)] [code datum] [scope u32] [types datum] [infos datum] [facts datum]
-        [linklets (ptr linklet)])
+        [linklets (ptr linklet)] [scope-count u32] [type-count u32])
 
 ;; A module-level binding of a module, which one that requires it at a
 ;; phase shift can install a shifted copy of.
@@ -162,6 +165,8 @@
     (set! (-> m infos) nil)
     (set! (-> m facts) nil)
     (set! (-> m linklets) 0)
+    (set! (-> m scope-count) 0)
+    (set! (-> m type-count) 0)
     (-> m self)))
 
 (define (unit-of [m datum]) -> (ptr unit) (cast (ptr unit) (record-pointer m)))
@@ -206,9 +211,19 @@
 
 ;; Scopes are even; a local binding form's (new-local-scope!) is odd, so
 ;; that quote-syntax can prune the local ones from a literal (spec 6.2).
-(define (new-scope!) -> u32 (new-run-scope!))
+;; A scope of the module being expanded is numbered in it (own-scope!); a
+;; module scope's copy for a phase shift, and the kernel ids' scope,
+;; belong to the run.
+(define (new-scope!) -> u32
+  (let ([sc (new-run-scope!)])
+    (when (!= current 0) (own-scope! (-> current module) sc))
+    sc))
 (define (new-run-scope!) -> u32 (+= scope-counter 2) scope-counter)
-(define (new-local-scope!) -> u32 (+= scope-counter 2) (+ scope-counter 1))
+(define (new-local-scope!) -> u32
+  (+= scope-counter 2)
+  (let ([sc (+ scope-counter 1)])
+    (when (!= current 0) (own-scope! (-> current module) sc))
+    sc))
 
 (define (even-scope? [sc u32]) -> i32 (== (% sc 2) 0))
 (define (even-scopes [s (ptr scope-set)]) -> (ptr scope-set) (scopes-filter s even-scope?))
@@ -310,6 +325,7 @@
            [bytes datum 0] [exports datum 0] [provides nil] [m datum 0])
       (when (== name 0) (fail-at 0 "~a/program lists no kernel module" (list1 running-directory)))
       (set! running-names (keep (program-names program)))
+      (set! compiler-hash (keep (content-hash running-names)))
       (set! kernel-instance (keep name))
       (set! kernel-group (keep (group-of name)))
       (set! bytes (running-bytes name))
@@ -788,13 +804,15 @@
     (free p)
     s))
 
-;; Compile the module in file source (and, first, what it requires).
-;; Returns the module. Each module is compiled once per run.
+;; Compile the module in file source (and, first, what it requires), or
+;; load it from the cache. Returns the module. Each module is compiled
+;; once per run.
 (define (compile-module-file [source datum]) -> datum
   (let* ([path (canonical-path source)] [key (cast u64 (string->symbol path))]
-         [known (cast datum (hash-ref (& registry) key))])
+         [known (cast datum (hash-ref (& registry) key))] [cached datum 0])
     (cond [(and (!= known 0) (== (-> (unit-of known) state) (sym done))) known]
           [(!= known 0) (fail-at 0 "cyclic require: ~a requires itself" (list1 path))]
+          [(begin (set! cached (load-cached path)) (!= cached 0)) cached]
           [else
            (let* ([text (source-text (package-file path) path)] [m (new-unit path (provisional-name path))] [saved current])
              (hash-set! (& registry) key (cast u32 m))
@@ -916,11 +934,14 @@
         (add-linklet! (-> m self) p (compile-module forms (linklet-name (-> m self) p 0)))
         (note-definitions! (-> m self) forms))
       (set! phases (cdr phases)))
+    ;; Its functions' values, resolved now for its interface (5.2).
+    (for-each (lambda ([f datum]) (when (and (func-info? f) (has-value? f)) (function-value f))) (-> m infos))
     (hash-set! (& installed) (shift-key (-> m self) 0) 1)
     (set! (-> m state) (sym done))
     (let ([form (-> current freestanding-form)])
       (when (!= form 0) (check-freestanding! (-> m self) form)))
-    (set! (-> m code) 0)))
+    (set! (-> m code) 0)
+    (store-cached! (-> m self))))
 
 ;; The modules whose linklets a program instantiates at run time: phase 0
 ;; at phase shift 0, reached through phase-0 requires.
@@ -1010,6 +1031,710 @@
       (set! out (cons (cons (make-integer (-> l phase)) (-> l bytes)) out))
       (set! l (-> l next)))
     (sort out (lambda ([a datum] [b datum]) -> i32 (< (integer-value (car a)) (integer-value (car b)))))))
+
+;; ==== the cache ====
+;;
+;; With a cache directory (build -c DIR), a module compiled once is loaded
+;; from the cache while its source and its requires are as they were
+;; (spec 3.7): its interface, what the expander keeps of a module it
+;; compiled, its linklets inside, as quoted data in the kernel's format
+;; (spec 3.5). An interface starts with what it is of: the interface
+;; format, the compiler, and the module and its requires, by hash. The
+;; compiler is the running one, by the names of its build's linklets,
+;; which carry the hashes of its modules (spec 3.2): where the compiler's
+;; cache is of its kernel, this one's is of the whole compiler, which
+;; changes as it is written, so that a change to how it compiles is not
+;; hidden by modules compiled before. So the cache needs -r, which names
+;; the running build.
+
+(define cache-directory datum 0)
+(define (set-cache-directory! [dir datum]) (set! cache-directory (keep dir)))
+
+(define interface-format i64 1)
+
+;; The running compiler, by the hash of its build's linklet names, read
+;; with the kernel module (ensure-kernel!).
+(define compiler-hash datum 0)
+
+;; The compiler the cache is for, when there is a cache directory and the
+;; running build is known; else #f.
+(define (cache-compiler) -> datum
+  (if (or (== cache-directory 0) (== running-directory 0))
+      0
+      (begin (ensure-kernel!) compiler-hash)))
+
+(define (cache-file [name datum]) -> datum (string-append-2 cache-directory (string-append-2 `"/" name)))
+
+;; Datum d in the kernel's data format, a string.
+(define (data-bytes [d datum]) -> datum
+  (let ([s (make-serializer)])
+    (serialize! s d)
+    (serializer-bytes s)))
+
+;; The datum in the file at path, as data-bytes wrote it: the last of its
+;; objects, which serialize! writes after those it is made of; or #f if
+;; there is no such file.
+(define (read-data [path datum]) -> datum
+  (let ([s (file-string path)])
+    (if (or (== s 0) (== (string-length s) 0))
+        0
+        (let ([p (string-bytes s)] [count u64 0] [shift u64 0] [i u32 0] [b u32 128])
+          (while (and (!= (bit-and b 128) 0) (< i (string-length s)))
+            (set! b (@ p i))
+            (+= i 1)
+            (set! count (bit-or count (<< (cast u64 (bit-and b 127)) shift)))
+            (+= shift 7))
+          (if (== count 0) 0 (@ (deserialize p (string-length s)) (cast u32 (- count 1))))))))
+
+;; d written to the file at path: 1, or 0 if it cannot be.
+(define (write-data [path datum] [d datum]) -> i32
+  (let ([name (make-buffer)] [bytes (data-bytes d)] [ok i32 0])
+    (buffer-add! (& name) (string-bytes path) (string-length path))
+    (buffer-add-byte! (& name) 0)
+    (set! ok (write-file-bytes (-> name bytes) (string-bytes bytes) (string-length bytes)))
+    (buffer-free! (& name))
+    ok))
+
+;; Section key of interface d.
+(define (section [d datum] [key datum]) -> datum (cdr (assq key d)))
+
+;; Is d an interface of this format, by this compiler?
+(define (current-interface? [d datum]) -> i32
+  (and (pair? d) (!= (assq (sym format) d) 0)
+       (equal? (section d (sym format)) (make-integer interface-format))
+       (equal? (section d (sym compiler)) compiler-hash)))
+
+;; The module at path, from the cache, if the cache has one for it that
+;; is of this format and compiler, and of the source and requires as they
+;; are now; else #f. The source is checked first, with the hashes its
+;; requires had; then the requires are compiled or loaded in order, as
+;; they would be, until one is not as it was. What it reads is in an
+;; arena of its own.
+(define (load-cached [path datum]) -> datum
+  (if (== (cache-compiler) 0)
+      0
+      (begin
+        (begin-module-arena)
+        (let ([m (load-cached-in path)])
+          (end-module-arena)
+          m))))
+
+(define (load-cached-in [path datum]) -> datum
+  (let* ([hash (read-data (cache-file (string-append-2 (content-hash (list1 path)) `".path")))]
+         [ds (if (string? hash) (read-data (cache-file (string-append-2 hash `".subc"))) 0)]
+         [d (if (pair? ds) (car ds) 0)]
+         [key (cast u64 (string->symbol path))]
+         [requires datum 0] [known datum 0] [m datum 0])
+    (unless (current-interface? d) (return 0))
+    (set! requires (section d (sym requires)))            ; each (path hash shift)
+    (unless (string=? (module-hash path (source-text (package-file path) path)
+                                   (map (lambda ([r datum]) -> datum (cdr r)) requires))
+                      hash)
+      (return 0))
+    ;; A cycle through the requires is an error, as when compiling.
+    (hash-set! (& registry) key (cast u32 (new-unit path path)))
+    (while (pair? requires)
+      (unless (string=? (-> (unit-of (module-of (car (car requires)))) hash) (cadr (car requires)))
+        (hash-set! (& registry) key 0)
+        (return 0))
+      (set! requires (cdr requires)))
+    ;; A module a compiled file brought is the one the run has (3.7).
+    (set! known (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol hash)))))
+    (set! m (if (!= known 0) known (load-compiled-module d path)))
+    (hash-set! (& registry) key (cast u32 m))
+    m))
+
+;; The module a recorded require names: the module in a file, compiled
+;; or loaded as it would be, or the entry of a compiled file.
+(define (module-of [spec datum]) -> datum
+  (if (pair? spec) (load-compiled-file (cadr spec)) (compile-module-file spec)))
+
+;; Write module m to the cache: its interface, in a file of its own, then
+;; the index entry for its path, which names the module there by hash. A
+;; cache that cannot be written is passed over.
+(define (store-cached! [m datum])
+  (when (!= (cache-compiler) 0)
+    (let ([u (unit-of m)])
+      (when (write-data (cache-file (string-append-2 (-> u hash) `".subc")) (list1 (write-interface m)))
+        (write-data (cache-file (string-append-2 (content-hash (list1 (-> u path))) `".path")) (-> u hash))))))
+
+;; ---- compiled files ----
+;;
+;; A compiled file (spec 3.7) holds modules, each its interface with its
+;; linklets inside: those a module requires before it, the entry last.
+;; The cache's files hold one module each; build -m writes a program's
+;; closure to one, for (require name (compiled file)).
+
+;; The bytes of the compiled file of module m and its requires.
+(define (compiled-file-bytes [m datum]) -> datum
+  (ensure-kernel!)
+  (data-bytes (map (lambda ([x datum]) -> datum (write-interface x)) (module-closure m))))
+
+;; Module m and every module it requires, at any phase shift,
+;; transitively, each once, after those it requires.
+(define (module-closure [m datum]) -> datum
+  (let ([seen (make-table)] [out nil])
+    (set! out (closure-visit m seen out))
+    (reverse out)))
+
+(define (closure-visit [m datum] [seen (ptr arena-table)] [out datum]) -> datum
+  (when (!= (table-ref seen (cast u64 m)) 0) (return out))
+  (table-set! seen (cast u64 m) 1)
+  (let ([rs (-> (unit-of m) requires)])
+    (while (pair? rs)
+      (set! out (closure-visit (car (car rs)) seen out))
+      (set! rs (cdr rs))))
+  (cons m out))
+
+;; The entry of the compiled file at path, its modules loaded in order,
+;; but for those this run has made already.
+(define (load-compiled-file [path datum]) -> datum
+  (ensure-kernel!)
+  (begin-module-arena)
+  (let ([ds (read-data path)] [entry datum 0])
+    (unless (pair? ds) (fail-at 0 "no compiled file ~a" (list1 path)))
+    (while (pair? ds)
+      (let* ([d (car ds)] [hash (if (and (pair? d) (!= (assq (sym hash) d) 0)) (section d (sym hash)) 0)]
+             [known (if (string? hash) (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol hash)))) 0)])
+        (set! entry (if (!= known 0) known (load-compiled-module d `(compiled ,path ,hash)))))
+      (set! ds (cdr ds)))
+    (end-module-arena)
+    entry))
+
+;; Module d of a compiled file or the cache, loaded, its requires being
+;; modules this run has; known by path. It must be of this interface
+;; format and compiler.
+(define (load-compiled-module [d datum] [path datum]) -> datum
+  (unless (and (pair? d) (!= (assq (sym format) d) 0) (equal? (section d (sym format)) (make-integer interface-format)))
+    (fail-at 0 "the compiled module ~a is of another interface format" (list1 path)))
+  (unless (current-interface? d)
+    (fail-at 0 "the compiled module ~a was compiled by another compiler" (list1 path)))
+  (let ([m (new-unit path (section d (sym name)))])
+    (set! (-> (unit-of m) requires)
+          (keep (map (lambda ([r datum]) -> datum
+                       (let ([req (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol (cadr r)))))])
+                         (when (== req 0)
+                           (fail-at 0 "the compiled module ~a requires ~a, which is not with it" `(,path ,(cadr r))))
+                         (cons req (caddr r))))
+                     (section d (sym requires)))))
+    (load-module! m d)
+    m))
+
+;; ---- interfaces ----
+;;
+;; An interface names what belongs to a run relative to modules, by hash.
+;; A scope is core, kernel-ids, (m hash shift), a module scope's copy for
+;; a phase shift, or (s hash index), the index-th scope a module's
+;; expansion made. The other sections hold the module's data as the
+;; expander keeps it, written with encode: a type in them is (%type i),
+;; the module's i-th, (%type hash i), another module's, or a closure,
+;; code or box type, by what it is of; a definition is (%info own i), the
+;; i-th of the infos section, (%info foreign instance kind export),
+;; another module's, (%info kernel kind export), the kernel module's, or
+;; (%info shifted d k), definition d shifted by k (6.1); a syntax object
+;; is (%syntax e scopes srcloc props), its srcloc (source line col pos
+;; span) or #f; and a list that starts with %type, %info, %syntax or
+;; %quote, such as a struct field named so, has %quote put before it.
+;; load-module! reads them back with decode. Its sections are an alist of
+;; quoted data, the first three saying what it is of.
+
+;; Each scope a module's expansion made, by its number in the module, and
+;; each type it declared, by its number among its types.
+(define scope-owners hash-table)            ; scope -> its module
+(define scope-numbers hash-table)           ; scope -> its number
+(define module-scopes hash-table)           ; (module . number) -> scope
+(define type-owners hash-table)             ; type -> its module
+(define type-numbers hash-table)            ; type -> its number
+(define module-types hash-table)            ; (module . number) -> type
+
+(define (own-scope! [m datum] [sc u32])
+  (let ([u (unit-of m)])
+    (hash-set! (& scope-owners) (scope-key sc) (cast u32 m))
+    (hash-set! (& scope-numbers) (scope-key sc) (-> u scope-count))
+    (hash-set! (& module-scopes) (shift-key m (-> u scope-count)) sc)
+    (+= (-> u scope-count) 1)))
+
+;; Scope i of module m: made now, if m was loaded from the cache.
+(define (unit-scope-at [m datum] [i u32]) -> u32
+  (let ([sc (hash-ref (& module-scopes) (shift-key m i))])
+    (when (== sc 0)
+      (set! sc (new-run-scope!))
+      (hash-set! (& scope-owners) (scope-key sc) (cast u32 m))
+      (hash-set! (& scope-numbers) (scope-key sc) i)
+      (hash-set! (& module-scopes) (shift-key m i) sc))
+    sc))
+
+(define (own-type! [m datum] [t datum])
+  (when (== (hash-ref (& type-owners) (cast u64 t)) 0)
+    (let ([u (unit-of m)])
+      (hash-set! (& type-owners) (cast u64 t) (cast u32 m))
+      (hash-set! (& type-numbers) (cast u64 t) (-> u type-count))
+      (hash-set! (& module-types) (shift-key m (-> u type-count)) (cast u32 t))
+      (+= (-> u type-count) 1))))
+
+(define (unit-type [m datum] [i u32]) -> datum (cast datum (hash-ref (& module-types) (shift-key m i))))
+
+(define (unit-type-list [m datum]) -> datum
+  (let ([out nil] [n (-> (unit-of m) type-count)])
+    (while (> n 0)
+      (-= n 1)
+      (set! out (cons (unit-type m n) out)))
+    out))
+
+(define (unit-with-hash [hash datum]) -> datum
+  (let ([m (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol hash))))])
+    (when (== m 0) (fail-at 0 "the cache is inconsistent: no module ~a" (list1 hash)))
+    m))
+
+(define (info-kind [info datum]) -> datum
+  (cond [(func-info? info) (sym func)] [(global-info? info) (sym global)] [else (sym tag)]))
+
+(define (info-export [info datum]) -> datum
+  (cond [(func-info? info) (func-info-export info)] [(global-info? info) (global-info-export info)] [else (tag-info-export info)]))
+
+;; The definition of kind with export name export in the instance named
+;; instance, one of a module's linklets, or #f. A module's definitions
+;; are indexed at the first search, by "instance kind export".
+(define definition-indexes hash-table)      ; module -> (ptr arena-table)
+
+(define (definition-key [instance datum] [kind datum] [export datum]) -> u64
+  (cast u64 (string->symbol (format-message "~a ~a ~a" `(,instance ,kind ,export)))))
+
+(define (find-info [instance datum] [kind datum] [export datum]) -> datum
+  (let ([m (instance-unit instance)] [index (ptr arena-table) 0])
+    (when (== m 0) (return 0))
+    (set! index (cast (ptr arena-table) (hash-ref (& definition-indexes) (cast u64 m))))
+    (when (== index 0)
+      (let ([saved (use-arena (& run-arena))] [infos (-> (unit-of m) infos)])
+        (set! index (make-table))
+        (while (pair? infos)
+          (let ([info (car infos)])
+            (table-set! index (definition-key (info-instance info) (info-kind info) (info-export info)) (cast u32 info)))
+          (set! infos (cdr infos)))
+        (use-arena saved))
+      (hash-set! (& definition-indexes) (cast u64 m) (cast u32 index)))
+    (cast datum (table-ref index (definition-key instance kind export)))))
+
+;; The kernel module's definition of kind with export name export.
+(define (kernel-definition [kind datum] [export datum]) -> datum
+  (ensure-kernel!)
+  (let ([p (assq (string->symbol export) (-> (unit-of kernel) provides))])
+    (unless (and (!= p 0) (== (car (cdr p)) kind))
+      (fail-at 0 "the cache is inconsistent: the kernel module has no ~a ~a" `(,kind ,export)))
+    (cadr (cdr p))))
+
+;; ---- writing an interface ----
+
+;; The module whose interface is being written, and its own definitions
+;; so far: info -> its number + 1, and the list of them, the latest first.
+(define writing datum 0)
+(define own-numbers (ptr arena-table) 0)
+(define own-list datum 0)
+(define own-count u32 0)
+
+(define (write-interface [m datum]) -> datum
+  (let ([u (unit-of m)] [infos datum 0] [types (unit-type-list m)])
+    (set! writing m)
+    (set! own-numbers (make-table))
+    (set! own-list nil)
+    (set! own-count 0)
+    ;; Every definition, in order, before what else is referred to.
+    (for-each (lambda ([info datum]) (own-ref info)) (reverse (-> u infos)))
+    (let* ([linklets (linklet-forms m)]
+           [provides (map (lambda ([p datum]) -> datum (cons (car p) (encode (cdr p)))) (-> u provides))]
+           [entries (entry-forms m)]
+           [own (reverse (-> u infos))]
+           [value-forms (filter-out-false
+                    (map (lambda ([f datum]) -> datum
+                           (if (and (func-info? f) (has-value? f))
+                               (let ([g (function-value f)]) (if (!= g 0) (encode `(,f ,g)) 0))
+                               0))
+                         own))]
+           [inline-forms (filter-out-false
+                     (map (lambda ([f datum]) -> datum
+                            (let ([b (cast datum (hash-ref (& inlines) (cast u64 f)))])
+                              (if (== b 0)
+                                  0
+                                  (encode `(,f ,(car b) ,(cadr b) ,(caddr b) ,(cadddr b)
+                                            ,(map (lambda ([p datum]) -> datum (car p)) (list-ref b 4)))))))
+                          own))]
+           [macro-forms (filter-out-false
+                    (map (lambda ([f datum]) -> datum
+                           (if (== (cast datum (hash-ref (& macro-modules) (cast u64 f))) m) (encode (list1 f)) 0))
+                         own))]
+           [type-forms (map (lambda ([t datum]) -> datum
+                              `(,(type-info-name t) ,(type-info-kind t) ,(type-info-final? t)
+                                ,(encode (type-info-super t)) ,(encode (type-info-fields t))))
+                            types)]
+           [groups (group-forms types)]
+           [fact-forms (map (lambda ([f datum]) -> datum `(,(encode (car f)) ,(cadr f) ,(encode (caddr f))))
+                       (reverse (-> u facts)))]
+           [require-forms (map (lambda ([r datum]) -> datum
+                            `(,(-> (unit-of (car r)) path) ,(-> (unit-of (car r)) hash) ,(cdr r)))
+                          (-> u requires))])
+      ;; Last, as the other sections may refer to definitions of its own.
+      (set! infos (map (lambda ([info datum]) -> datum (encode (info->list info))) (reverse own-list)))
+      (set! writing 0)
+      `((format . ,(make-integer interface-format)) (compiler . ,compiler-hash) (hash . ,(-> u hash))
+        (definitions . ,(make-integer (length (-> u infos)))) (requires . ,require-forms) (name . ,(-> u name))
+        (types . ,type-forms) (groups . ,groups) (infos . ,infos) (provides . ,provides) (entries . ,entries)
+        (values . ,value-forms) (inlines . ,inline-forms) (macros . ,macro-forms) (facts . ,fact-forms) (linklets . ,linklets)))))
+
+(define (filter-out-false [l datum]) -> datum (filter (lambda ([x datum]) -> i32 (!= x 0)) l))
+
+;; Module m's linklets, in phase order: (phase bytes imports gc? scopes).
+(define (linklet-forms [m datum]) -> datum
+  (let ([l (-> (unit-of m) linklets)] [out nil])
+    (while (!= l 0)
+      (set! out (cons `(,(make-integer (-> l phase)) ,(-> l bytes) ,(-> l imports) ,(boolean (-> l gc))
+                        ,(map (lambda ([sc datum]) -> datum (scope-ref (cast u32 (integer-value sc)))) (-> l scopes)))
+                      out))
+      (set! l (-> l next)))
+    (sort out (lambda ([a datum] [b datum]) -> i32 (< (integer-value (car a)) (integer-value (car b)))))))
+
+;; Module m's module-level bindings, the oldest first: (symbol scopes
+;; phase meaning).
+(define (entry-forms [m datum]) -> datum
+  (let ([e (-> (unit-of m) entries)] [out nil])
+    (while (!= e 0)
+      (set! out (cons `(,(-> e symbol) ,(scope-refs (-> e scopes)) ,(make-integer (-> e phase)) ,(encode (-> e binding meaning)))
+                      out))
+      (set! e (-> e next)))
+    out))
+
+;; The recursion groups of types, a module's in order, as lists of their
+;; members' numbers; a group's members are consecutive.
+(define (group-forms [types datum]) -> datum
+  (let ([out nil] [i i64 0] [ts types])
+    (while (pair? ts)
+      (let ([g (type-info-group (car ts))])
+        (if (and (!= g 0) (== (car g) (car ts)))
+            (let ([n (length g)] [members nil])
+              (for ([k u32 0]) (< k n) (+= k 1) (set! members (cons (make-integer (+ i (cast i64 k))) members)))
+              (set! out (cons (reverse members) out))
+              (+= i (cast i64 n))
+              (set! ts (list-tail ts n)))
+            (begin (+= i 1) (set! ts (cdr ts))))))
+    (reverse out)))
+
+(define (tag-symbol? [x datum]) -> i32 (or (object-tag? x) (== x (sym %quote))))
+(define (object-tag? [x datum]) -> i32 (or (== x (sym %type)) (== x (sym %info)) (== x (sym %syntax))))
+
+;; x with what belongs to the run named relative to modules (above).
+(define (encode [x datum]) -> datum
+  (cond [(pair? x)
+         ;; A list's spine is walked, as encode of its cdr would be.
+         (let ([head nil] [last datum 0] [l x] [p datum 0])
+           (while (pair? l)
+             (set! p (if (tag-symbol? (car l)) `(%quote ,(car l)) (list1 (encode (car l)))))
+             (if (== last 0) (set! head p) (set-cdr! last p))
+             (set! last (if (pair? (cdr p)) (cdr p) p))
+             (set! l (cdr l)))
+           (set-cdr! last (encode l))
+           head)]
+        [(syntax? x)
+         `(%syntax ,(encode (syntax-e x)) ,(scope-refs (syntax-scopes x)) ,(srcloc-form (syntax-srcloc x))
+                   ,(encode (syntax-props x)))]
+        [(type-info? x) (cons (sym %type) (type-ref x))]
+        [(or (func-info? x) (global-info? x) (tag-info? x) (data-info? x)) (cons (sym %info) (info-ref x))]
+        [else x]))
+
+(define (srcloc-form [l (ptr srcloc)]) -> datum
+  (if (== l 0)
+      0
+      `(,(-> l source) ,(make-integer (-> l line)) ,(make-integer (-> l col)) ,(make-integer (-> l pos))
+        ,(make-integer (-> l span)))))
+
+(define (type-ref [t datum]) -> datum
+  (let ([owner (cast datum (hash-ref (& type-owners) (cast u64 t)))]
+        [i (make-integer (hash-ref (& type-numbers) (cast u64 t)))])
+    (cond [(== owner writing) (list1 i)]
+          [(!= owner 0) `(,(-> (unit-of owner) hash) ,i)]
+          [(!= (box-value-type t) 0) `(box ,(encode (box-value-type t)))]
+          [(!= (closure-code t) 0)
+           (let ([sig (type-info-fields (closure-code t))])
+             `(closure ,(encode (cdr (car sig))) ,(encode (cadr sig))))]
+          [(!= (code-closure t) 0) `(code ,(encode (code-closure t)))]
+          [else (fail-at 0 "internal: the type ~a belongs to no module" (list1 (type-info-name t))) 0])))
+
+;; The closure type whose code type t is, or #f: its first parameter is
+;; the closure.
+(define (code-closure [t datum]) -> datum
+  (let ([fields (type-info-fields t)])
+    (if (and (== (type-info-kind t) (sym func)) (pair? (car fields)) (ref-type? (car (car fields))))
+        (let ([c (ref-heap (car (car fields)))])
+          (if (and (type-info? c) (== (closure-code c) t)) c 0))
+        0)))
+
+(define (info-ref [info datum]) -> datum
+  (let ([origin (cast datum (hash-ref (& shift-origins) (cast u64 info)))] [instance (info-instance info)] [owner datum 0])
+    (cond [(!= origin 0) `(shifted ,(encode (car origin)) ,(cdr origin))]
+          [(kernel-definition? info) `(kernel ,(info-kind info) ,(info-export info))]
+          [(data-info? info) (own-ref info)]
+          [else
+           (set! owner (if (string? instance) (instance-unit instance) 0))
+           (if (and (!= owner 0) (!= owner writing))
+               `(foreign ,instance ,(info-kind info) ,(info-export info))
+               (own-ref info))])))
+
+(define (own-ref [info datum]) -> datum
+  (let ([i (table-ref own-numbers (cast u64 info))])
+    (when (== i 0)
+      (set! own-list (cons info own-list))
+      (+= own-count 1)
+      (set! i own-count)
+      (table-set! own-numbers (cast u64 info) i))
+    `(own ,(make-integer (- i 1)))))
+
+;; Definition info as a list, (kind field ...), its fields in the order its
+;; constructor takes them; and the definition such a list describes.
+(define (info->list [info datum]) -> datum
+  (cond [(func-info? info)
+         `(func ,(func-info-name info) ,(func-info-params info) ,(func-info-results info) ,(func-info-instance info)
+                ,(func-info-export info) ,(func-info-type info))]
+        [(global-info? info)
+         `(global ,(global-info-name info) ,(global-info-type info) ,(global-info-mutable? info) ,(global-info-instance info)
+                  ,(global-info-export info))]
+        [(tag-info? info) `(tag ,(tag-info-name info) ,(tag-info-params info) ,(tag-info-instance info) ,(tag-info-export info))]
+        [else `(data ,(data-info-name info) ,(data-info-offset info) ,(data-info-bytes info))]))
+
+(define (list->info [l datum]) -> datum
+  (case (car l)
+    [((sym func)) (func-info (list-ref l 1) (list-ref l 2) (list-ref l 3) (list-ref l 4) (list-ref l 5) (list-ref l 6))]
+    [((sym global)) (global-info (list-ref l 1) (list-ref l 2) (list-ref l 3) (list-ref l 4) (list-ref l 5))]
+    [((sym tag)) (tag-info (list-ref l 1) (list-ref l 2) (list-ref l 3) (list-ref l 4))]
+    [else (data-info (list-ref l 1) (list-ref l 2) (list-ref l 3))]))
+
+(define (scope-ref [sc u32]) -> datum
+  (let ([origin (scope-origin sc)] [owner (cast datum (hash-ref (& scope-owners) (scope-key sc)))])
+    (cond [(== sc core-scope) (sym core)]
+          [(and (!= kernel-id-scopes 0) (== sc (@ (-> kernel-id-scopes ids) 0))) (sym kernel-ids)]
+          [(!= origin 0) `(m ,(-> (unit-of (car origin)) hash) ,(cdr origin))]
+          [(!= owner 0) `(s ,(-> (unit-of owner) hash) ,(make-integer (hash-ref (& scope-numbers) (scope-key sc))))]
+          [else (fail-at 0 "internal: scope ~a belongs to no module" (list1 (make-integer sc))) 0])))
+
+;; A scope set's scopes, in an order that does not depend on the run.
+(define (scope-refs [s (ptr scope-set)]) -> datum
+  (let ([out nil])
+    (for ([i u32 0]) (< i (-> s count)) (+= i 1) (set! out (cons (scope-ref (@ (-> s ids) i)) out)))
+    (sort out (lambda ([a datum] [b datum]) -> i32 (scope-ref<? a b)))))
+
+;; A module's copies first, then a module's own, then core and kernel-ids;
+;; each by its module's hash, then its number.
+(define (scope-ref<? [a datum] [b datum]) -> i32
+  (let ([ra (scope-ref-rank a)] [rb (scope-ref-rank b)])
+    (cond [(!= ra rb) (< ra rb)]
+          [(>= ra 2) 0]
+          [else
+           (let ([c (string-compare (cadr a) (cadr b))])
+             (or (< c 0) (and (== c 0) (< (integer-value (caddr a)) (integer-value (caddr b))))))])))
+
+(define (scope-ref-rank [r datum]) -> i32
+  (cond [(== r (sym core)) 2] [(== r (sym kernel-ids)) 3] [(== (car r) (sym m)) 0] [else 1]))
+
+;; -1, 0 or 1, as string a is before, the same as or after string b.
+(define (string-compare [a datum] [b datum]) -> i32
+  (let* ([n (string-length a)] [k (string-length b)] [c (memcmp (string-bytes a) (string-bytes b) (if (< n k) n k))])
+    (cond [(< c 0) -1] [(> c 0) 1] [(< n k) -1] [(> n k) 1] [else 0])))
+
+;; ---- loading an interface ----
+
+;; The module being loaded: its type forms, its types as they are made,
+;; and its definitions, each by number.
+(define loading datum 0)
+(define loaded-type-forms (ptr datum) 0)
+(define loaded-types (ptr datum) 0)
+(define loaded-infos (ptr datum) 0)
+
+;; The elements of list l in a new array of n, in the current arena.
+(define (array-of [l datum] [n u32]) -> (ptr datum)
+  (let ([a (cast (ptr datum) (alloc-in (current-arena) (* 4 (+ n 1))))] [i u32 0])
+    (while (< i n)
+      (set! (@ a i) (if (pair? l) (car l) 0))
+      (when (pair? l) (set! l (cdr l)))
+      (+= i 1))
+    a))
+
+;; Load module m from its interface d, as if it had been compiled in this
+;; run.
+(define (load-module! [m datum] [d datum])
+  (let* ([u (unit-of m)] [type-forms (section d (sym types))] [infos (section d (sym infos))]
+         [nt (length type-forms)] [ni (length infos)]
+         [definitions (cast u32 (integer-value (section d (sym definitions))))])
+    (set! (-> u name) (keep (section d (sym name))))
+    (set! (-> u hash) (keep (section d (sym hash))))
+    (hash-set! (& units-by-hash) (cast u64 (string->symbol (-> u hash))) (cast u32 m))
+    (set! (-> u scope) (new-run-scope!))
+    (hash-set! (& module-scope-origins) (scope-key (-> u scope)) (cast u32 (keep (cons m (make-integer 0)))))
+    (set! loading m)
+    (set! loaded-type-forms (array-of type-forms nt))
+    (set! loaded-types (array-of nil nt))
+    (set! loaded-infos (array-of nil ni))
+    ;; Types, in any order: each made, then its fields, which may name any
+    ;; of them, then their groups and identities.
+    (for ([i u32 0]) (< i nt) (+= i 1) (type-shell i))
+    (for ([i u32 0]) (< i nt) (+= i 1)
+      (set-type-info-fields! (@ loaded-types i) (decode (list-ref (@ loaded-type-forms i) 4))))
+    (for-each (lambda ([g datum])
+                (let ([members (map (lambda ([i datum]) -> datum (@ loaded-types (cast u32 (integer-value i)))) g)])
+                  (for-each (lambda ([t datum]) (set-type-info-group! t members)) members)))
+              (section d (sym groups)))
+    (for ([i u32 0]) (< i nt) (+= i 1) (identify! (@ loaded-types i)))
+    (for ([i u32 0]) (< i nt) (+= i 1)
+      (own-type! m (@ loaded-types i))
+      (set! (-> u types) (keep-cons (@ loaded-types i) (-> u types))))
+    ;; Its linklets, their names known.
+    (for-each (lambda ([l datum])
+                (let ([phase (cast i32 (integer-value (car l)))])
+                  (add-linklet! m phase `(,(cadr l) ,(caddr l) ,(cadddr l)
+                                          ,(map (lambda ([r datum]) -> datum (make-integer (scope-at r))) (list-ref l 4))))
+                  (linklet-name m phase 0)))
+              (section d (sym linklets)))
+    ;; Definitions: the first are its own, as note-definitions! notes them;
+    ;; the rest are what else its sections refer to.
+    (for ([i u32 0]) (< i ni) (+= i 1)
+      (let ([info (list->info (decode (car infos)))])
+        (set! (@ loaded-infos i) info)
+        (when (< i definitions) (set! (-> u infos) (keep-cons info (-> u infos)))))
+      (set! infos (cdr infos)))
+    ;; Its bindings, provides, function values, inline bodies, macros and
+    ;; facts.
+    (for-each (lambda ([e datum])
+                (let* ([scopes (scope-set-of (cadr e))] [phase (cast i32 (integer-value (caddr e)))]
+                       [b (bind-raw! (car e) scopes phase (decode (cadddr e)))]
+                       [me (cast (ptr module-entry) (alloc-in (& run-arena) (sizeof module-entry)))])
+                  (set! (-> me symbol) (car e))
+                  (set! (-> me scopes) scopes)
+                  (set! (-> me phase) phase)
+                  (set! (-> me binding) b)
+                  (set! (-> me next) (-> u entries))
+                  (set! (-> u entries) me)))
+              (section d (sym entries)))
+    (set! (-> u provides) (keep (map (lambda ([p datum]) -> datum (cons (car p) (decode (cdr p)))) (section d (sym provides)))))
+    (for-each (lambda ([v datum])
+                (let ([x (decode v)]) (hash-set! (& function-values) (cast u64 (car x)) (cast u32 (cadr x)))))
+              (section d (sym values)))
+    (for-each (lambda ([v datum]) (load-inline! (decode v))) (section d (sym inlines)))
+    (for-each (lambda ([g datum]) (hash-set! (& macro-modules) (cast u64 (decode (car g))) (cast u32 m)))
+              (section d (sym macros)))
+    (let ([facts (map (lambda ([f datum]) -> datum (decode f)) (section d (sym facts)))])
+      (set! (-> u facts) (keep (reverse facts)))
+      (for-each (lambda ([f datum]) (index-fact! m f)) (reverse (-> u facts))))
+    (set! loading 0)
+    (set! (-> u state) (sym done))
+    ;; As its requires would have when it was compiled: its own bindings
+    ;; are made, and its requires' installed at their shifts.
+    (install-module-bindings! m 0)))
+
+;; An inline body, x (info params results body returns? assigned-keys),
+;; kept as record-inline! keeps one.
+(define (load-inline! [x datum])
+  (let* ([saved (use-arena (& run-arena))] [params (keep (cadr x))]
+         [assigned (filter (lambda ([p datum]) -> i32 (!= (member (car p) (list-ref x 5)) 0)) params)]
+         [b `(,params ,(keep (caddr x)) ,(keep (cadddr x)) ,(list-ref x 4) ,assigned)])
+    (use-arena saved)
+    (hash-set! (& inlines) (cast u64 (car x)) (cast u32 b))))
+
+;; Its i-th type, made the first time something names it: a supertype is
+;; made before its subtypes, wherever it is listed.
+(define (type-shell [i u32]) -> datum
+  (let ([t (@ loaded-types i)])
+    (if (!= t 0)
+        t
+        (let* ([f (@ loaded-type-forms i)] [super (decode (cadddr f))]
+               [new (make-type-info (car f) (cadr f) 0 super (caddr f) 0)])
+          (set! (@ loaded-types i) new)
+          new))))
+
+;; The identity of t's group, once the groups of the types its members
+;; name have theirs; wasm allows no cycle between groups.
+(define (identify! [t datum])
+  (when (== (type-info-identity t) 0)
+    (let ([group (if (!= (type-info-group t) 0) (type-info-group t) (list1 t))] [members datum 0] [refs datum 0])
+      (set! members group)
+      (while (pair? members)
+        (set! refs (type-references (car members)))
+        (while (pair? refs)
+          (when (== (memq (car refs) group) 0) (identify! (car refs)))
+          (set! refs (cdr refs)))
+        (set! members (cdr members)))
+      (identify-group! group))))
+
+;; The declared types type t names: its supertype, and those its fields or
+;; signature refer to.
+(define (type-references [t datum]) -> datum
+  (let* ([fs (type-info-fields t)] [kind (type-info-kind t)]
+         [vals (cond [(== kind (sym struct)) (map (lambda ([f datum]) -> datum (cadr f)) fs)]
+                     [(== kind (sym array)) (list1 (car fs))]
+                     [else (append (car fs) (cadr fs))])]
+         [out (if (!= (type-info-super t) 0) (list1 (type-info-super t)) nil)])
+    (while (pair? vals)
+      (let ([v (car vals)])
+        (when (and (ref-type? v) (type-info? (ref-heap v))) (set! out (cons (ref-heap v) out))))
+      (set! vals (cdr vals)))
+    out))
+
+;; x as encode wrote it, read back.
+(define (decode [x datum]) -> datum
+  (if (not (pair? x))
+      x
+      (case (car x)
+        [((sym %type)) (type-at (cdr x))]
+        [((sym %info)) (info-at (cdr x))]
+        [((sym %syntax))
+         (make-syntax (decode (cadr x)) (scope-set-of (caddr x)) (srcloc-of (cadddr x)) (decode (list-ref x 4)))]
+        [else
+         ;; A list's spine is walked: a tail that starts with %type, %info or
+         ;; %syntax is an object, and %quote quotes the next element.
+         (let ([head nil] [last datum 0] [l x] [p datum 0])
+           (while (and (pair? l) (not (object-tag? (car l))))
+             (if (== (car l) (sym %quote))
+                 (begin (set! p (list1 (cadr l))) (set! l (cddr l)))
+                 (begin (set! p (list1 (decode (car l)))) (set! l (cdr l))))
+             (if (== last 0) (set! head p) (set-cdr! last p))
+             (set! last p))
+           (set-cdr! last (decode l))
+           head)])))
+
+(define (srcloc-of [d datum]) -> (ptr srcloc)
+  (if (== d 0)
+      0
+      (make-srcloc (car d) (cast u32 (integer-value (cadr d))) (cast u32 (integer-value (caddr d)))
+                   (cast u32 (integer-value (cadddr d))) (cast u32 (integer-value (list-ref d 4))))))
+
+(define (type-at [r datum]) -> datum
+  (cond [(null? (cdr r)) (type-shell (cast u32 (integer-value (car r))))]
+        [(== (car r) (sym closure)) (closure-type (decode (cadr r)) (decode (caddr r)))]
+        [(== (car r) (sym code)) (closure-code (decode (cadr r)))]
+        [(== (car r) (sym box)) (box-type (decode (cadr r)))]
+        [else
+         (let ([t (unit-type (unit-with-hash (car r)) (cast u32 (integer-value (cadr r))))])
+           (when (== t 0) (fail-at 0 "the cache is inconsistent: no type ~a of ~a" `(,(cadr r) ,(car r))))
+           t)]))
+
+(define (info-at [r datum]) -> datum
+  (case (car r)
+    [((sym own)) (@ loaded-infos (cast u32 (integer-value (cadr r))))]
+    [((sym shifted)) (shift-info (decode (cadr r)) (cast u32 (integer-value (caddr r))))]
+    [((sym kernel)) (kernel-definition (cadr r) (caddr r))]
+    [else
+     (let ([info (find-info (cadr r) (caddr r) (cadddr r))])
+       (when (== info 0)
+         (fail-at 0 "the cache is inconsistent: no ~a ~a in ~a" `(,(caddr r) ,(cadddr r) ,(cadr r))))
+       info)]))
+
+(define (scope-at [r datum]) -> u32
+  (cond [(== r (sym core)) core-scope]
+        [(== r (sym kernel-ids)) (kernel-id-scope)]
+        [(== (car r) (sym m)) (module-scope-at (unit-with-hash (cadr r)) (cast u32 (integer-value (caddr r))))]
+        [else (unit-scope-at (unit-with-hash (cadr r)) (cast u32 (integer-value (caddr r))))]))
+
+(define (scope-set-of [refs datum]) -> (ptr scope-set)
+  (let ([s no-scopes])
+    (while (pair? refs)
+      (set! s (scopes-change s (scope-at (car refs)) 0))
+      (set! refs (cdr refs)))
+    s))
 
 ;; ==== module bodies ====
 
@@ -1663,7 +2388,7 @@
           (no-match f "(require name source item ...)")))
     (let* ([name (cadr l)] [source (caddr l)]
            [provided (cond [(string? (syntax-e source)) (require-module! f name source phase)]
-                           [(pair? (syntax-e source)) (fail-at source "compiled files are not yet in the new compiler" nil)]
+                           [(pair? (syntax-e source)) (require-compiled! f name source phase)]
                            [else (require-kernel! name phase)])])
       (for-each (lambda ([p datum]) (bind-import! (qualified name (car p)) phase (cdr p))) provided)
       (when all
@@ -1724,6 +2449,11 @@
 ;; its macros. Returns what it provides, as seen from phase.
 (define (require-module! [f datum] [name datum] [spec datum] [phase i32]) -> datum
   (require-unit! name (compile-module-file (module-path-of f spec)) phase))
+
+;; (require name (compiled file) item ...): the entry of the compiled
+;; file, loaded with its requires (spec 3.7).
+(define (require-compiled! [f datum] [name datum] [spec datum] [phase i32]) -> datum
+  (require-unit! name (load-compiled-file (canonical-path (module-path-of f (cadr (syntax-e spec))))) phase))
 
 ;; Module m, required as name at phase: recorded; what it provides, as
 ;; seen from phase. A module required at a phase above 0 comes with
@@ -2240,7 +2970,7 @@
   (let ([u (unit-of m)])
     (for-each (lambda ([f datum])
                 (case (car f)
-                  [((sym type)) (set! (-> u types) (keep-cons (cadr f) (-> u types)))]
+                  [((sym type)) (set! (-> u types) (keep-cons (cadr f) (-> u types))) (own-type! m (cadr f))]
                   [((sym func) (sym global) (sym tag)) (set! (-> u infos) (keep-cons (cadr f) (-> u infos)))]))
               forms)))
 
@@ -2561,8 +3291,13 @@
 (define kernel-id-scopes (ptr scope-set) 0)
 (define kernel-ids hash-table)
 
-(define (kernel-id [name datum]) -> datum
+;; The kernel ids' scope, made the first time it is needed.
+(define (kernel-id-scope) -> u32
   (when (== kernel-id-scopes 0) (set! kernel-id-scopes (scopes-change no-scopes (new-run-scope!) 0)))
+  (@ (-> kernel-id-scopes ids) 0))
+
+(define (kernel-id [name datum]) -> datum
+  (kernel-id-scope)
   (let ([known (cast datum (hash-ref (& kernel-ids) (cast u64 name)))])
     (if (!= known 0)
         known
@@ -3312,7 +4047,7 @@
   (if (null? params)
       nil
       (let* ([p (car params)] [a (unlocated (car args))])
-        (if (and (== (car a) (sym lref)) (== (memq p assigned) 0)
+        (if (and (== (car a) (sym lref)) (== (assoc (car p) assigned) 0)
                  (not (ormap (lambda ([later datum]) -> i32 (assigns? later (cadr a))) (cdr args))))
             (begin
               (hash-set! keys (cast u64 (integer-value (car p))) (cast u32 `(as (,(cdr p)) ,a)))

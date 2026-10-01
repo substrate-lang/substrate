@@ -25,15 +25,19 @@ on them there.
   - `core.sub`: `compiler/core.sub`, with its infos as C structs, each
     with a record, a datum, that stands for it in lowered code.
   - `ops.sub`: `compiler/ops.sub`.
-  - `expander.sub`: `compiler/expander.sub`, but for the cache and
-    compiled files, which it says it does not do yet.
+  - `expander.sub`: `compiler/expander.sub`, with its cache and compiled
+    files (spec 3.7), whose interfaces are of the running compiler, by
+    the names of its build's linklets, which carry the hashes of its
+    modules, where the compiler's are of its kernel: a change to how the
+    new compiler compiles is not hidden by modules an earlier build
+    compiled.
   - `running.sub`: the build that runs the compiler, as the compiler
     reads it: its program's list of linklets, and a linklet's exports and
     imports.
   - `leb128.sub`, `wasm.sub`, `closures.sub`, `serialize.sub` and
     `compile.sub`: the compiler's, into buffers and arenas.
-  - `main.sub`: `compiler/main.sub`, with its `build`, `compile` and
-    `expand` commands.
+  - `main.sub`: `compiler/main.sub`, with its `build` (`-m` included),
+    `compile` and `expand` commands, and its cache, `-c DIR`.
 - `c/`: the C-like Lisp, `examples/c` as the new compiler builds it,
   which the compiler's sources are written in:
   - `lang.sub`: `examples/c/lang.sub`, its transformers in kernel code,
@@ -66,9 +70,10 @@ on them there.
     syntax objects among its values.
 - `seed/`: a build of the new compiler by itself, checked in, as `seed/`
   is the compiler's.
-- `sub`: runs the new compiler as `bin/sub` runs the compiler; when its
-  sources changed, it first builds them with the seed, and them again
-  with that build, into `build/next/sub`: `next/sub build FILE`.
+- `sub`: runs the new compiler as `bin/sub` runs the compiler, keeping
+  compiled modules in `build/next/cache`; when its sources changed, it
+  first builds them with the seed, and them again with that build, into
+  `build/next/sub`: `next/sub build FILE`.
 - `bootstrap.sh`: the fixpoint: `build/next/sub` builds itself into the
   same bytes; `next/bootstrap.sh seed` then makes it the seed.
 - `compare.sh`: every `.sub` file of the repository expanded, or built,
@@ -81,7 +86,10 @@ on them there.
   their outputs, but for those of Substrate's syntax objects and its code
   at compile time; and the tests of its parts: its syntax objects, its
   reader, and what its expander and back end give for the kernel's tests,
-  which is what the compiler gives.
+  which is what the compiler gives. Then, as `tests/run.sh` checks the
+  compiler's, the cache: every program built again from it is byte for
+  byte the same, and a stale entry is not used; and `compiled-import.sub`
+  requires a compiled file.
 
 ## The kernel module
 
