@@ -1,0 +1,382 @@
+;; Lifecycle: experimental. Closures for Substrate on cells (next/cells),
+;; at compile time, in the C-like Lisp: the kernel's lambda makes a GC
+;; closure, so Substrate makes its own, a record in memory (runtime.sub),
+;; by converting a function's body once it is fully expanded. core.sub
+;; wraps each function's body in substrate-body, whose expansion in the
+;; module's second pass calls convert-body here:
+;;
+;; 1. The body is expanded (local-expand). A Substrate lambda in it has
+;;    expanded to the kernel's lambda form, left as a mark for this pass:
+;;    core.sub's lambda asks in-pass? first.
+;; 2. A variable that some lambda captures and that is assigned anywhere
+;;    is boxed: its binding makes a box, its uses unbox it, and its
+;;    assignments set the box, so the lambda and the code around it share
+;;    it. Variables are told apart by local-binding (spec 2.3).
+;; 3. Each lambda, innermost first, is lifted to a module-level function
+;;    of the closure and its parameters, which reads the captured
+;;    variables from the closure, and replaced by code that makes the
+;;    closure with their values, boxes as they are.
+;;
+;; A lambda outside such a body, in kernel code, is converted alone
+;; (convert-lambda): it captures the variables around it by value, boxed
+;; if it assigns them, so its calls share them with each other but not
+;; with the code around it. The names this pass makes are ctx's, the
+;; module of core.sub, so that they mean the runtime's functions there.
+
+(require-unqualified c "../c/c.sub")
+(require-unqualified kd "../compiler/kernel.sub")
+
+(provide convert-body convert-lambda in-pass?)
+
+(memory from c)
+(table from c)
+
+;; Whether a body is being expanded for conversion.
+(define passing i32 0)
+(define (in-pass?) -> i32 passing)
+
+;; The context the names of forms and runtime functions are made in.
+(define ctx datum 0)
+
+;; The variables assigned, and those captured by a lambda, by id.
+(define assigned (ptr arena-table) 0)
+(define captured (ptr arena-table) 0)
+
+(define counter i32 0)
+
+;; ---- names and forms ----
+
+(define (key [id i32]) -> u64 (cast u64 (+ id 1)))
+
+;; The id of variable x, or -1 if x is not a local variable.
+(define (id-of [x datum]) -> i32
+  (if (identifier? x)
+      (let ([b (local-binding x)]) (if (== b 0) -1 (cast i32 (integer-value b))))
+      -1))
+
+(define (mark! [t (ptr arena-table)] [id i32])
+  (when (!= id -1) (table-set! t (key id) 1)))
+
+(define (marked? [t (ptr arena-table)] [id i32]) -> i32
+  (and (!= id -1) (!= (table-ref t (key id)) 0)))
+
+(define (boxed? [id i32]) -> i32 (and (marked? assigned id) (marked? captured id)))
+
+(define (named [name datum] [loc datum]) -> datum (datum->syntax ctx name loc))
+
+(define (fresh [base (ptr u8)] [loc datum]) -> datum
+  (+= counter 1)
+  (named (string->symbol (format-message "~a.~a" (cons (bytes->string base (strlen base)) (cons (make-integer counter) nil)))) loc))
+
+;; Is s a form whose head is the identifier named name?
+(define (form? [s datum] [name datum]) -> i32
+  (let ([e (splice-list s)])
+    (and (pair? e) (identifier? (car e)) (== (syntax-e (car e)) name))))
+
+;; A form's elements, as a list of syntax.
+(define (parts [s datum]) -> datum (syntax->list s))
+
+(define (list2 [a datum] [b datum]) -> datum (cons a (cons b nil)))
+(define (list3 [a datum] [b datum] [c datum]) -> datum (cons a (cons b (cons c nil))))
+
+;; Is form s one whose inside is data, not code?
+(define (data-form? [s datum]) -> i32
+  (or (form? s (sym quote)) (form? s (sym quote-syntax)) (form? s (sym #%datum))))
+
+;; Is s a form whose elements are code?
+(define (code-form? [s datum]) -> i32
+  (and (syntax? s) (pair? (syntax-e s)) (not (data-form? s))))
+
+;; ---- lambdas: their parts ----
+
+;; (lambda (param ...) [-> result] body ...): the parameters, the result
+;; clause, (-> result) or (), and the body, as (params result body).
+(define (lambda-parts [s datum]) -> datum
+  (let* ([ps (parts s)] [params (cadr ps)] [rest (cddr ps)] [result nil])
+    (when (and (pair? rest) (identifier? (car rest)) (== (syntax-e (car rest)) (sym ->)))
+      (set! result (list2 (car rest) (cadr rest)))
+      (set! rest (cddr rest)))
+    (list3 params result rest)))
+
+;; A parameter's name: x of [x type].
+(define (param-name [p datum]) -> datum (car (parts p)))
+
+;; A let binding's name, type clause (a list, or ()), and init.
+(define (binding-name [b datum]) -> datum (car (parts b)))
+(define (binding-init [b datum]) -> datum (last (parts b)))
+(define (binding-type [b datum]) -> datum
+  (let ([l (parts b)]) (if (== (length l) 3) (cons (cadr l) nil) nil)))
+
+;; The variables a try clause binds: (catch tag (x ...) ...), (catch-ref
+;; tag (x ... e) ...), (catch-all-ref (e) ...); none for catch-all.
+(define (clause-binders [c datum]) -> datum
+  (let ([l (parts c)] [h (syntax-e (car (parts c)))])
+    (cond [(or (== h (sym catch)) (== h (sym catch-ref))) (parts (caddr l))]
+          [(== h (sym catch-all-ref)) (parts (cadr l))]
+          [else nil])))
+
+(define (clause-body [c datum]) -> datum
+  (let ([l (parts c)] [h (syntax-e (car (parts c)))])
+    (cond [(or (== h (sym catch)) (== h (sym catch-ref))) (cdddr l)]
+          [(== h (sym catch-all-ref)) (cddr l)]
+          [else (cdr l)])))
+
+;; ---- what a body binds, assigns and captures ----
+
+;; Every variable bound in s, and its labels, marked in t.
+(define (mark-bound! [s datum] [t (ptr arena-table)])
+  (cond [(data-form? s) (begin)]
+        [(form? s (sym let))
+         (let ([bs (parts (cadr (parts s)))])
+           (while (pair? bs)
+             (mark! t (id-of (binding-name (car bs))))
+             (mark-bound! (binding-init (car bs)) t)
+             (set! bs (cdr bs))))
+         (mark-each! (cddr (parts s)) t)]
+        [(form? s (sym lambda))
+         (let* ([lp (lambda-parts s)] [ps (parts (car lp))])
+           (while (pair? ps)
+             (mark! t (id-of (param-name (car ps))))
+             (set! ps (cdr ps)))
+           (mark-each! (caddr lp) t))]
+        [(form? s (sym try))
+         (let ([cs (parts (cadr (parts s)))])
+           (while (pair? cs)
+             (let ([xs (clause-binders (car cs))])
+               (while (pair? xs)
+                 (mark! t (id-of (car xs)))
+                 (set! xs (cdr xs))))
+             (mark-each! (clause-body (car cs)) t)
+             (set! cs (cdr cs))))
+         (mark-each! (cddr (parts s)) t)]
+        [(or (form? s (sym block)) (form? s (sym loop)))
+         (mark! t (id-of (cadr (parts s))))
+         (mark-each! (cddr (parts s)) t)]
+        [(code-form? s) (mark-each! (parts s) t)]))
+
+(define (mark-each! [l datum] [t (ptr arena-table)])
+  (while (pair? l)
+    (mark-bound! (car l) t)
+    (set! l (cdr l))))
+
+;; The free variables of s: each referenced local variable not bound in
+;; it, as (id . identifier), the first reference, in order of first
+;; reference, onto acc, latest first. bound: the variables bound in s;
+;; seen: those found so far.
+(define (free-refs [s datum] [bound (ptr arena-table)] [seen (ptr arena-table)] [acc datum]) -> datum
+  (cond [(data-form? s) acc]
+        [(identifier? s)
+         (let ([id (id-of s)])
+           (if (and (!= id -1) (not (marked? bound id)) (not (marked? seen id)))
+               (begin (mark! seen id) (cons (cons (make-integer id) s) acc))
+               acc))]
+        ;; The label of a branch is not a variable.
+        [(or (form? s (sym br)) (form? s (sym br-if))) (free-refs-each (cddr (parts s)) bound seen acc)]
+        [(code-form? s) (free-refs-each (parts s) bound seen acc)]
+        [else acc]))
+
+(define (free-refs-each [l datum] [bound (ptr arena-table)] [seen (ptr arena-table)] [acc datum]) -> datum
+  (while (pair? l)
+    (set! acc (free-refs (car l) bound seen acc))
+    (set! l (cdr l)))
+  acc)
+
+(define (free-of [s datum]) -> datum
+  (let ([bound (make-table)] [seen (make-table)])
+    (mark-bound! s bound)
+    (reverse (free-refs s bound seen nil))))
+
+;; What s assigns and what its lambdas capture, marked in assigned and
+;; captured.
+(define (gather! [s datum])
+  (cond [(data-form? s) (begin)]
+        [(form? s (sym set!))
+         (mark! assigned (id-of (cadr (parts s))))
+         (gather! (caddr (parts s)))]
+        [(form? s (sym lambda))
+         (let ([rs (free-of s)])
+           (while (pair? rs)
+             (mark! captured (cast i32 (integer-value (car (car rs)))))
+             (set! rs (cdr rs))))
+         (gather-each! (caddr (lambda-parts s)))]
+        [(code-form? s) (gather-each! (parts s))]))
+
+(define (gather-each! [l datum])
+  (while (pair? l)
+    (gather! (car l))
+    (set! l (cdr l))))
+
+;; ---- rewriting ----
+;;
+;; env: for each variable in scope, by id, (boxed . name): whether it is
+;; boxed, and the identifier its uses are written with, which in a lifted
+;; function is the name the captured value is read into.
+
+(define (lookup [env datum] [id i32]) -> datum
+  (while (pair? env)
+    (when (== (cast i32 (integer-value (car (car env)))) id) (return (cdr (car env))))
+    (set! env (cdr env)))
+  0)
+
+(define (bind [env datum] [id i32] [boxed i32] [name datum]) -> datum
+  (cons (cons (make-integer id) (cons (make-integer boxed) name)) env))
+
+(define (entry-boxed? [e datum]) -> i32 (!= (integer-value (car e)) 0))
+(define (entry-name [e datum]) -> datum (cdr e))
+
+;; s rewritten under env.
+(define (rewrite [s datum] [env datum]) -> datum
+  (cond [(data-form? s) s]
+        [(identifier? s)
+         (let ([e (lookup env (id-of s))])
+           (cond [(== e 0) s]
+                 [(entry-boxed? e) (datum->syntax ctx (list2 (named (sym rt:unbox) s) (entry-name e)) s)]
+                 [else (entry-name e)]))]
+        [(form? s (sym set!))
+         (let* ([l (parts s)] [x (cadr l)] [v (rewrite (caddr l) env)] [e (lookup env (id-of x))])
+           (cond [(== e 0) (syntax-rewrap s (list3 (car l) x v))]
+                 [(entry-boxed? e) (datum->syntax ctx (list3 (named (sym rt:set-box!) s) (entry-name e) v) s)]
+                 [else (syntax-rewrap s (list3 (car l) (entry-name e) v))]))]
+        [(form? s (sym let)) (rewrite-let s env)]
+        [(form? s (sym lambda)) (rewrite-lambda s env)]
+        [(form? s (sym try)) (rewrite-try s env)]
+        [(code-form? s) (syntax-rewrap s (rewrite-each (parts s) env))]
+        [else s]))
+
+(define (rewrite-each [l datum] [env datum]) -> datum
+  (let ([acc nil])
+    (while (pair? l)
+      (set! acc (cons (rewrite (car l) env) acc))
+      (set! l (cdr l)))
+    (reverse acc)))
+
+;; [x i32 (make-box v)], located at loc.
+(define (box-binding [x datum] [v datum] [loc datum]) -> datum
+  (datum->syntax ctx (list3 x (named (sym i32) loc) (list2 (named (sym rt:make-box) loc) v)) loc))
+
+;; (let ([x init] ...) body ...): a boxed variable's binding makes the
+;; box.
+(define (rewrite-let [s datum] [env datum]) -> datum
+  (let* ([l (parts s)] [bs (parts (cadr l))] [inner env] [news nil])
+    (while (pair? bs)
+      (let* ([b (car bs)] [x (binding-name b)] [id (id-of x)] [init (rewrite (binding-init b) env)])
+        (cond [(boxed? id)
+               (set! inner (bind inner id 1 x))
+               (set! news (cons (box-binding x init b) news))]
+              [else
+               (set! inner (bind inner id 0 x))
+               (set! news (cons (syntax-rewrap b (cons x (append (binding-type b) (cons init nil)))) news))]))
+      (set! bs (cdr bs)))
+    (syntax-rewrap s (cons (car l) (cons (syntax-rewrap (cadr l) (reverse news)) (rewrite-each (cddr l) inner))))))
+
+(define (rewrite-try [s datum] [env datum]) -> datum
+  (let* ([l (parts s)] [cs (parts (cadr l))] [out nil])
+    (while (pair? cs)
+      (let* ([c (car cs)] [inner env] [xs (clause-binders c)] [cl (parts c)] [body (clause-body c)] [n (length body)])
+        (while (pair? xs)
+          (set! inner (bind inner (id-of (car xs)) 0 (car xs)))
+          (set! xs (cdr xs)))
+        (set! out (cons (syntax-rewrap c (append (take cl (- (length cl) n)) (rewrite-each body inner))) out)))
+      (set! cs (cdr cs)))
+    (syntax-rewrap s (cons (car l) (cons (syntax-rewrap (cadr l) (reverse out)) (rewrite-each (cddr l) env))))))
+
+;; A lambda: lifted as a function of the closure and its parameters,
+;; reading each captured variable from the closure into a name of its
+;; own; in its place, code making the closure from the variables' values,
+;; or boxes, where it is.
+(define (rewrite-lambda [s datum] [env datum]) -> datum
+  (let* ([lp (lambda-parts s)] [params (car lp)] [result (cadr lp)] [body (caddr lp)]
+         [frees (free-of s)] [name (fresh "lambda" s)] [self (fresh "self" s)]
+         [inner nil] [reads nil] [values nil] [preludes nil] [i u32 0] [ps (parts params)])
+    ;; Each captured variable: inside, read from the closure; outside,
+    ;; its value as the environment names it, by value if it names none.
+    (while (pair? frees)
+      (let* ([r (car frees)] [id (cast i32 (integer-value (car r)))] [x (cdr r)] [e (lookup env id)]
+             [cv (fresh "captured" x)] [boxed (boxed? id)])
+        (set! inner (bind inner id boxed cv))
+        (set! reads (cons (datum->syntax ctx (list3 cv (named (sym i32) x) (list3 (named (sym rt:closure-ref) x) self (make-integer i))) x) reads))
+        (set! values (cons (cond [(!= e 0) (entry-name e)]
+                                 [boxed (datum->syntax ctx (list2 (named (sym rt:make-box) x) x) x)]
+                                 [else x])
+                           values))
+        (+= i 1))
+      (set! frees (cdr frees)))
+    ;; Each parameter: itself, or if boxed a box of it.
+    (while (pair? ps)
+      (let* ([x (param-name (car ps))] [id (id-of x)])
+        (cond [(boxed? id)
+               (let ([bx (fresh "box" x)])
+                 (set! inner (bind inner id 1 bx))
+                 (set! preludes (cons (box-binding bx x x) preludes)))]
+              [else (set! inner (bind inner id 0 x))]))
+      (set! ps (cdr ps)))
+    (let* ([body2 (rewrite-each body inner)]
+           [wrapped (if (null? preludes) body2 (cons (datum->syntax ctx (cons (named (sym let) s) (cons (reverse preludes) body2)) s) nil))]
+           [read (cons (datum->syntax ctx (cons (named (sym let) s) (cons (reverse reads) wrapped)) s) nil)]
+           [func (datum->syntax ctx (cons (named (sym func) s)
+                                          (cons (cons name (cons (datum->syntax ctx (list2 self (named (sym i32) s)) s) (parts params)))
+                                                (append result read)))
+                                s)]
+           [c (fresh "closure" s)] [k u32 0] [sets nil] [vs (reverse values)]
+           [make (list3 (named (sym rt:make-closure) s) (datum->syntax ctx (list2 (named (sym func-index) s) name) s) (make-integer i))])
+      (syntax-local-lift-definition func)
+      ;; (let ([c (make-closure (func-index name) n)]) (closure-set! c i v) ... c)
+      (while (pair? vs)
+        (set! sets (cons (datum->syntax ctx (cons (named (sym rt:closure-set!) s) (list3 c (make-integer k) (car vs))) s) sets))
+        (+= k 1)
+        (set! vs (cdr vs)))
+      (datum->syntax ctx (cons (named (sym let) s)
+                               (cons (cons (datum->syntax ctx (list2 c make) s) nil)
+                                     (append (reverse sets) (cons c nil))))
+                     s))))
+
+;; ---- entry points ----
+
+(define (reset! [c datum])
+  (set! ctx c)
+  (set! assigned (make-table))
+  (set! captured (make-table)))
+
+;; The body forms of a function with parameters params, converted: one
+;; expression.
+(define (convert-body [c datum] [params datum] [forms datum]) -> datum
+  (let ([expanded nil] [env nil] [preludes nil] [l forms])
+    (set! passing 1)
+    (while (pair? l)
+      (set! expanded (cons (local-expand (car l)) expanded))
+      (set! l (cdr l)))
+    (set! expanded (reverse expanded))
+    (set! l params)
+    (set! params nil)
+    (while (pair? l)
+      (set! params (cons (local-expand (car l)) params))
+      (set! l (cdr l)))
+    (set! params (reverse params))
+    (set! passing 0)
+    (reset! c)
+    (gather-each! expanded)
+    (set! l params)
+    (while (pair? l)
+      (let* ([x (car l)] [id (id-of x)])
+        (cond [(boxed? id)
+               (let ([bx (fresh "box" x)])
+                 (set! env (bind env id 1 bx))
+                 (set! preludes (cons (box-binding bx x x) preludes)))]
+              [else (set! env (bind env id 0 x))]))
+      (set! l (cdr l)))
+    (let* ([loc (if (pair? forms) (car forms) c)]
+           [body (rewrite-each expanded env)])
+      (if (null? preludes)
+          (datum->syntax ctx (cons (named (sym begin) loc) body) loc)
+          (datum->syntax ctx (cons (named (sym let) loc) (cons (reverse preludes) body)) loc)))))
+
+;; A lambda s, the kernel's form, outside a body: expanded and converted
+;; on its own.
+(define (convert-lambda [c datum] [s datum]) -> datum
+  (let ([expanded datum 0])
+    (set! passing 1)
+    (set! expanded (local-expand s))
+    (set! passing 0)
+    (reset! c)
+    (gather! expanded)
+    (rewrite expanded nil)))
