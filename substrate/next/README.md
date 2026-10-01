@@ -30,7 +30,9 @@ on them there.
     the names of its build's linklets, which carry the hashes of its
     modules, where the compiler's are of its kernel: a change to how the
     new compiler compiles is not hidden by modules an earlier build
-    compiled.
+    compiled. A require's path is relative to the file the path is
+    written in, so a require a macro makes names a file from the macro's
+    own, where the compiler's names one from the module it expands.
   - `running.sub`: the build that runs the compiler, as the compiler
     reads it: its program's list of linklets, and a linklet's exports and
     imports.
