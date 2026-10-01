@@ -70,6 +70,25 @@ on them there.
     `syntax-rules`, which compile into C at its phase 1, not with
     Substrate code: Substrate does not run at compile time, and has no
     syntax objects among its values.
+- `cells/`: an experiment on `substrate/`: Substrate with its values the
+  kernel module's cells (plan, 6), so that a program needs no GC and
+  Substrate's data at compile time is the kernel module's, syntax
+  objects included, and its macros are written in Substrate again:
+  - `runtime.sub`: what Substrate's code runs with, in the C-like Lisp:
+    closures, boxes, vectors, byte strings, structs, hash tables, ports
+    and exceptions as records of the kernel module's, their blocks in
+    memory; calls, errors, handlers, writing and the host. Nothing is
+    reclaimed: cells and blocks are made in the current arena, a
+    module's while it is compiled and the run's in a program.
+  - `lower.sub`: closures without the kernel's, in the C-like Lisp at
+    compile time: a function's body, once expanded, has each variable
+    some lambda captures and some code assigns boxed, and each lambda
+    lifted to a function of the closure and its parameters.
+  - `core.sub`: `substrate/core.sub` on i32 values and the runtime, and
+    `define-syntax` whose transformer is Substrate code.
+  - `substrate.sub`: `lib/substrate.sub`'s forms, `syntax-match` and
+    `match`, written in Substrate at phase 1, as they were; `rules.sub`:
+    `syntax-rules`, in C, which `define-syntax` sends it to.
 - `bend/`: Bend as the new compiler builds it, `examples/bend` ported to
   the C-like Lisp (plan, 5):
   - `core.sub`: `examples/bend/core.sub`, the checker, function for
@@ -120,7 +139,8 @@ on them there.
   kernel module; the C example's tests (`tests/c`), on `c/`; the
   Substrate tests of `tests/` (`tests/substrate`), on `substrate/`, with
   their outputs, but for those of Substrate's syntax objects and its code
-  at compile time; the Bend tests of `tests/` and `examples/bend.sub`
+  at compile time, and those and the typed example on `cells/`
+  (`tests/cells`); the Bend tests of `tests/` and `examples/bend.sub`
   (`tests/bend`), on `bend/`; and the tests of its parts: its syntax
   objects, its reader, and what its expander and back end give for the
   kernel's tests, which is what the compiler gives. Then, as `tests/run.sh` checks the
@@ -242,3 +262,16 @@ Substrate is built again in `substrate/` (plan, 5).
       example takes 12.7 s.
    5. Numeric instructions and reference types in C code; then the typed
       example.
+6. Substrate on cells, `cells/`: Substrate's values the kernel module's
+   cells, in memory, so that a program needs no GC, and Substrate's data
+   at compile time is the kernel module's, syntax objects included, so
+   that its macros are written in Substrate, as `lib/substrate.sub`'s
+   were, and a macro written in Substrate calls a function written in C
+   on its syntax (`tests/cells/c-interop.sub`). Done, without
+   reclamation: the Substrate tests, those of Substrate at compile time
+   among them, and the typed example (`tests/cells/typed.sub`, a type
+   checker written in Substrate as a macro) give their outputs and errors
+   on it, with the kernel module as it is. Next: the kernel module's
+   cells sized per case, with a count and a permanent bit, and immediate
+   fixnums; then Substrate's lowering owning each value, with `dup` and
+   `drop` as Bend's, so that a program frees what it is done with.
