@@ -271,7 +271,12 @@ Substrate is built again in `substrate/` (plan, 5).
    reclamation: the Substrate tests, those of Substrate at compile time
    among them, and the typed example (`tests/cells/typed.sub`, a type
    checker written in Substrate as a macro) give their outputs and errors
-   on it, with the kernel module as it is. Next: the kernel module's
-   cells sized per case, with a count and a permanent bit, and immediate
-   fixnums; then Substrate's lowering owning each value, with `dup` and
-   `drop` as Bend's, so that a program frees what it is done with.
+   on it, with the kernel module as it was. Then the kernel module: a
+   word before each cell with a permanent bit and a count of owners,
+   cells sized by their case, cells and records on the heap, owned, in a
+   program that frees (`enable-freeing!`, which the runtime calls as a
+   program starts and the compiler never), `dup` and `drop`, a dropper
+   per record kind, and fixnums in the datum itself; the compiler
+   builds itself in the same time. Next: Substrate's lowering owning
+   each value, with `dup` and `drop` as Bend's, so that a program frees
+   what it is done with.
