@@ -21,7 +21,10 @@
 ;; call, with no closure. Its value (spec 5.2, #:value) is a closure made
 ;; once, in a global, whose code checks the number of arguments and calls
 ;; the function. The small functions here that most code calls, such as
-;; car, null? and +, are inline.
+;; car, null? and +, are inline. A function owns its arguments, which a
+;; call gives it, unless its define marks them #:borrow, as the
+;; primitives that only read theirs do; lower.sub owns each value, so a
+;; program frees what it is done with.
 ;;
 ;; A module written in Substrate takes the runtime with its first
 ;; definition: core.sub's define, struct or define-syntax requires
@@ -37,6 +40,8 @@
          [struct substrate-struct] [define-syntax substrate-define-syntax] transformer as-transformer substrate-body
          ;; equivalence and predicates
          eq? eqv? equal? not boolean? procedure?
+         ;; the heap
+         live-cells
          ;; pairs and lists
          cons car cdr caar cadr cdar cddr caddr cdddr cadddr pair? null? list? list length
          reverse append apply unsafe-car unsafe-cdr
@@ -139,16 +144,16 @@
 
   ;; ---- bodies ----
 
-  ;; (substrate-body (x ...) body ...): the body of a function whose
-  ;; parameters are x ..., converted (lower.sub) once the module's second
-  ;; pass expands it.
+  ;; (substrate-body (x ...) (b ...) body ...): the body of a function
+  ;; whose parameters are x ..., of which b ... are borrowed, converted
+  ;; (lower.sub) once the module's second pass expands it.
   (func (substrate-body [stx i32]) -> i32
     (let ([parts (k:syntax->list stx)])
-      (convert-body #'here (k:syntax->list (k:cadr parts)) (k:cddr parts))))
+      (convert-body #'here (k:syntax->list (k:cadr parts)) (k:syntax->list (k:caddr parts)) (k:cdddr parts))))
 
   ;; (substrate-expr e): expression e, a global's value say, converted.
   (func (substrate-expr [stx i32]) -> i32
-    (convert-body #'here '() (k:cdr (k:syntax->list stx))))
+    (convert-body #'here '() '() (k:cdr (k:syntax->list stx))))
 
   ;; ---- define, lambda, calls, literals ----
 
@@ -177,6 +182,18 @@
                                       #`(rt:extra-arg #,(number (i32.sub i 4))))]
             (param-inits (k:cdr ps) (i32.add i 1))))
 
+  ;; a0 a1 a2 a3, those below n as 0: the rest parameter's list takes the
+  ;; arguments from n on, and the parameters before it the others.
+  (func (slots-from [n i32]) -> i32
+    (let ([l '()] [i 4])
+      (block done
+        (loop next
+          (br-if done (i32.eqz i))
+          (set! i (i32.sub i 1))
+          (set! l (k:cons (if (i32.lt_s i n) #'0 (nth (k:syntax->list #'(a0 a1 a2 a3)) i)) l))
+          (br next)))
+      l))
+
   ;; The first of clauses cs, each (params body ...), that takes nargs
   ;; arguments, or an error naming name. single: there is one clause, whose
   ;; error says what it takes.
@@ -189,7 +206,7 @@
            [inits (k:append (param-inits (k:car p) 0)
                             (if (i32.eqz rest)
                                 '()
-                                (k:cons #`[#,rest i32 (rt:rest-arguments #,(number n) nargs a0 a1 a2 a3)] '())))])
+                                (k:cons #`[#,rest i32 (rt:rest-arguments #,(number n) nargs #,@(slots-from n))] '())))])
       #`(if #,(if (i32.eqz rest) #`(i32.eq nargs #,(number n)) #`(i32.ge_u nargs #,(number n)))
             (let (#,@inits) #,@(k:cdr c))
             #,(if single
@@ -236,31 +253,54 @@
   ;; (known-function). (define f (case-lambda clause ...)) with a clause
   ;; of fixed parameters: a known function running the first such clause,
   ;; whose value is the whole case-lambda. #:inline after (define (f x ...)
-  ;; or after (define f makes the known function inline (spec 5.2).
-  ;; (define (f x ... . rest) body ...), and a lambda or case-lambda with no
-  ;; fixed parameters: a closure in a global. (define x e): a variable.
+  ;; or after (define f makes the known function inline (spec 5.2), and
+  ;; #:borrow (x ...) makes the known function read those parameters
+  ;; without owning them (lower.sub): for a primitive that neither keeps
+  ;; nor gives back its arguments. (define (f x ... . rest) body ...), and
+  ;; a lambda or case-lambda with no fixed parameters: a closure in a
+  ;; global. (define x e): a variable.
   (func (substrate-define [stx i32]) -> i32
     (with-runtime stx (define-form stx)))
 
   (func (define-form [stx i32]) -> i32
     (let* ([parts (k:syntax->list stx)]
-           [inline (if (k:pair? (k:cddr parts)) (i32.eq (k:syntax-e (k:caddr parts)) '#:inline) 0)]
-           [body (if inline (k:cdddr parts) (k:cddr parts))])
+           [opts (define-options (k:cddr parts) 0 '#f)]
+           [inline (k:car opts)]
+           [borrowed (k:cadr opts)]
+           [body (k:caddr opts)])
       (if (k:identifier? (k:cadr parts))
           (let* ([name (k:cadr parts)] [e (k:car body)] [fixed (fixed-lambda e)] [clauses (case-lambda-of e)]
                  [k (if (i32.eqz clauses) '#f (first-fixed clauses))])
             (if (i32.eqz (i32.eqz fixed))
-                (return (known-function name (k:car fixed) (k:cdr fixed) '#f inline)))
-            (if (i32.eqz (i32.eqz k)) (return (known-case-lambda name clauses k inline e)))
+                (return (known-function name (k:car fixed) (k:cdr fixed) '#f inline borrowed)))
+            (if (i32.eqz (i32.eqz k)) (return (known-case-lambda name clauses k inline borrowed e)))
             (if inline (k:raise-syntax-error 'define '"only a function with fixed parameters can be #:inline" stx))
+            (if borrowed (k:raise-syntax-error 'define '"only a function with fixed parameters can borrow them" stx))
             (let ([f (kernel-lambda-of e name)])
               (return (if (i32.eqz f)
                           #`(global #,name (mut i32) (substrate-expr #,e))
                           #`(global #,name (mut i32) (substrate-expr #,f))))))
       (let* ([head (k:splice-list (k:cadr parts))] [name (k:car head)] [p (parse-params (k:cdr head))])
-        (if (i32.eqz (k:cdr p)) (return (known-function name (k:car p) body '#f inline)))
+        (if (i32.eqz (k:cdr p)) (return (known-function name (k:car p) body '#f inline borrowed)))
         (if inline (k:raise-syntax-error 'define '"only a function with fixed parameters can be #:inline" stx))
+        (if borrowed (k:raise-syntax-error 'define '"only a function with fixed parameters can borrow them" stx))
         #`(global #,name (mut i32) (substrate-expr #,(kernel-lambda (k:cons (k:cons (k:cdr head) body) '()) name 1 stx)))))))
+
+  ;; The options after a define's head, #:inline and #:borrow (x ...), in
+  ;; any order, and the body after them: (inline borrowed body), borrowed
+  ;; the list, or #f if none.
+  (func (define-options [forms i32] [inline i32] [borrowed i32]) -> i32
+    (if (k:pair? forms)
+        (let ([o (k:syntax-e (k:car forms))])
+          (if (i32.eq o '#:inline) (return (define-options (k:cdr forms) 1 borrowed)))
+          (if (i32.eq o '#:borrow)
+              (begin
+                (if (i32.eqz (k:pair? (k:cdr forms)))
+                    (k:raise-syntax-error 'define '"expected the borrowed parameters, (x ...), after #:borrow" (k:car forms)))
+                (if (i32.eqz (k:syntax->list (k:cadr forms)))
+                    (k:raise-syntax-error 'define '"expected the borrowed parameters, (x ...), after #:borrow" (k:cadr forms)))
+                (return (define-options (k:cddr forms) inline (k:cadr forms)))))))
+    (k:cons inline (k:cons borrowed (k:cons forms '()))))
 
   ;; The clauses of e if it is (case-lambda clause ...); #f otherwise.
   (func (case-lambda-of [e i32]) -> i32
@@ -291,10 +331,10 @@
   ;; name, a case-lambda with clauses cs, of which clause k has fixed
   ;; parameters: the known function runs clause k, and its value is the
   ;; case-lambda, whose clause k calls the function.
-  (func (known-case-lambda [name i32] [cs i32] [k i32] [inline i32] [where i32]) -> i32
+  (func (known-case-lambda [name i32] [cs i32] [k i32] [inline i32] [borrowed i32] [where i32]) -> i32
     (let* ([params (k:car (parse-params (k:car k)))]
            [calling (replace-clause cs k (k:cons (k:car k) (k:cons #`(#,name #,@params) '())))])
-      (known-function name params (k:cdr k) (kernel-lambda calling name 0 where) inline)))
+      (known-function name params (k:cdr k) (kernel-lambda calling name 0 where) inline borrowed)))
 
   (func (replace-clause [cs i32] [k i32] [new i32]) -> i32
     (if (k:null? cs) (return '()))
@@ -312,25 +352,65 @@
       (set! p (parse-params (k:cadr parts)))
       (if (i32.eqz (k:cdr p)) (k:cons (k:car p) (k:cddr parts)) '#f)))
 
-  ;; Known function name, taking params and running body: a kernel
-  ;; function, inline if inline, whose value (spec 5.2, #:value) is a
-  ;; closure made once, in a global: of the kernel lambda if given, else
-  ;; of code that checks the number of arguments and calls the function.
-  (func (known-function [name i32] [params i32] [body i32] [closure i32] [inline i32]) -> i32
-    (let ([n (k:length params)] [value (hidden-name name '".value")] [code (hidden-name name '".code")])
+  ;; Known function name, taking params, of which borrowed (a list, or #f)
+  ;; are read without being owned, and running body: a kernel function,
+  ;; inline if inline, with a fact saying it is a Substrate function and
+  ;; which parameters it borrows (lower.sub), whose value (spec 5.2,
+  ;; #:value) is a closure made once, in a global: of the kernel lambda if
+  ;; given, else of code that checks the number of arguments and calls the
+  ;; function, dropping the closure, which it owns, and after the call the
+  ;; borrowed arguments.
+  (func (known-function [name i32] [params i32] [body i32] [closure i32] [inline i32] [borrowed i32]) -> i32
+    (let ([n (k:length params)] [value (hidden-name name '".value")] [code (hidden-name name '".code")]
+          [bs (if borrowed (k:syntax->list borrowed) '())])
+      (check-borrowed bs params)
       #`(begin
           (func (#,name #,@(i32-params params)) #,@(if inline (k:syntax->list #'(#:inline)) '())
-            #:value #,value -> i32 (substrate-body (#,@params) #,@body))
+            #:value #,value -> i32 (substrate-body (#,@params) (#,@bs) #,@body))
+          (#%fact #,name '(substrate-function #,@(borrow-flags params bs)))
           #,@(if (i32.eqz closure)
                  (k:cons #`(func (#,code [self i32] [nargs i32] [a0 i32] [a1 i32] [a2 i32] [a3 i32]) -> i32
+                             (drop-value self)
                              (if (i32.eq nargs #,(number n))
-                                 (#,name #,@(arguments-from 0 n))
+                                 #,(wrapper-call name n params bs)
                                  (rt:arity-error '#,name #,(number n) 0 nargs)))
                          '())
                  '())
           (global #,value (mut i32) #,(if (i32.eqz closure)
                                    #`(rt:make-closure (func-index #,code) 0)
                                    #`(substrate-expr #,closure))))))
+
+  ;; Each of bs must name one of params.
+  (func (check-borrowed [bs i32] [params i32]) -> i32
+    (if (k:null? bs) (return 0))
+    (if (i32.eqz (borrowed? (k:car bs) params))
+        (k:raise-syntax-error 'define '"#:borrow names a parameter the function does not have" (k:car bs)))
+    (check-borrowed (k:cdr bs) params))
+
+  ;; Is x named among the identifiers l?
+  (func (borrowed? [x i32] [l i32]) -> i32
+    (if (k:null? l) (return 0))
+    (if (i32.eq (k:syntax-e x) (k:syntax-e (k:car l))) (return 1))
+    (borrowed? x (k:cdr l)))
+
+  ;; 1 for each parameter in bs, 0 for the others.
+  (func (borrow-flags [params i32] [bs i32]) -> i32
+    (if (k:null? params) '() (k:cons (if (borrowed? (k:car params) bs) #'1 #'0) (borrow-flags (k:cdr params) bs))))
+
+  ;; The call of name from its value's code; with borrowed parameters, its
+  ;; result kept while the borrowed arguments are dropped.
+  (func (wrapper-call [name i32] [n i32] [params i32] [bs i32]) -> i32
+    (let ([call #`(#,name #,@(arguments-from 0 n))])
+      (if (k:null? bs)
+          call
+          #`(let ([r i32 #,call]) #,@(borrowed-drops params bs 0) r))))
+
+  (func (borrowed-drops [params i32] [bs i32] [i i32]) -> i32
+    (if (k:null? params) (return '()))
+    (let ([rest (borrowed-drops (k:cdr params) bs (i32.add i 1))])
+      (if (borrowed? (k:car params) bs)
+          (k:cons #`(drop-value #,(k:car (arguments-from i (i32.add i 1)))) rest)
+          rest)))
 
   ;; The name of id with suffix, as an identifier of this macro's, so no
   ;; other code can refer to it.
@@ -630,13 +710,16 @@
            [prefix (k:string-append (k:symbol->string (k:syntax-e name)) '"-")]
            [get (accessor-name name spec)]
            [rest (accessors name (k:cdr specs) all-mutable (i32.add i 1))]
-           [getter #`(substrate-define (#,get v) (rt:struct-ref (rt:struct-arg v D '#,get) #,(number i)))])
+           [getter #`(substrate-define (#,get v) #:borrow (v)
+                       (rt:struct-arg v D '#,get)
+                       (rt:struct-ref v #,(number i)))])
       (if (i32.eqz (i32.or all-mutable (i32.eqz (k:identifier? spec))))
           (return (k:cons getter rest)))
       (let ([set (named-after field (k:string-append '"set-" prefix) '"!")])
         (k:cons getter
-                (k:cons #`(substrate-define (#,set v x)
-                            (rt:struct-set! (rt:struct-arg v D '#,set) #,(number i) x)
+                (k:cons #`(substrate-define (#,set v x) #:borrow (v)
+                            (rt:struct-arg v D '#,set)
+                            (rt:struct-set! v #,(number i) x)
                             '#f)
                         rest)))))
 )
@@ -662,30 +745,51 @@
 ;;
 ;; Their bodies are kernel code: literals are wasm numbers unless quoted,
 ;; a value is an i32, and a call of a closure goes through the runtime.
+;; lower.sub owns their values: a parameter listed after #:borrow is only
+;; read, its caller keeping the value, as most primitives' are; a value
+;; read from the kernel module's data or the runtime's is dup'd where the
+;; function must own it, and a value the function owns is dropped where
+;; it is done with it. A kernel function here that a Substrate body calls
+;; says what it gives with a foreign fact (lower.sub): owned, borrowed,
+;; raw for a count or a flag, and the arguments it takes ownership of.
+;; A -arg function of the runtime's checks a value and gives it back as
+;; it is, so a body uses one as a check, in statement position.
+
+;; A reference of the program's own to d, and one given up: nothing for
+;; a fixnum, nil or #t, or a permanent cell (kernel.sub).
+(func (dup-value [d i32]) #:inline -> i32 (if (i32.and d 1) d (kd:dup d)))
+(#%fact dup-value '(foreign owned))
+(func (drop-value [d i32]) #:inline (if (i32.eqz (i32.and d 1)) (kd:drop d)))
 
 (func (bool [x i32]) #:inline -> i32 (if x '#t 0))
+(#%fact bool '(foreign owned))
 (func (fix [n i32]) #:inline -> i32 (kd:make-integer (i64.extend_i32_s n)))
+(#%fact fix '(foreign owned))
 
 ;; For kernel code holding Substrate values: the fixnum of an i32, and the
 ;; i32 of a fixnum.
 (func (fixnum [n i32]) -> i32 (fix n))
+(#%fact fixnum '(foreign owned))
 (func (fixnum-value [v i32]) -> i32 (rt:fixnum-value-of v))
+(#%fact fixnum-value '(foreign raw))
+
+;; How many cells of the heap the program holds (kernel.sub): what it has
+;; made and not yet freed.
+(substrate-define (live-cells) (fix (kd:live-cells)))
 
 ;; ---- equivalence and predicates ----
 
-(substrate-define (eq? a b) #:inline (bool (i32.eq a b)))
-(substrate-define (eqv? a b) (bool (rt:eqv? a b)))
-(substrate-define (equal? a b) (bool (rt:equal-values? a b)))
-(substrate-define (not x) #:inline (bool (i32.eqz x)))
-(substrate-define (boolean? x) (bool (i32.or (i32.eqz x) (kd:boolean? x))))
-(substrate-define (procedure? x) (bool (rt:procedure? x)))
+(substrate-define (eq? a b) #:inline #:borrow (a b) (bool (i32.eq a b)))
+(substrate-define (eqv? a b) #:borrow (a b) (bool (rt:eqv? a b)))
+(substrate-define (equal? a b) #:borrow (a b) (bool (rt:equal-values? a b)))
+(substrate-define (not x) #:inline #:borrow (x) (bool (i32.eqz x)))
+(substrate-define (boolean? x) #:borrow (x) (bool (i32.or (i32.eqz x) (kd:boolean? x))))
+(substrate-define (procedure? x) #:borrow (x) (bool (rt:procedure? x)))
 
 ;; ---- pairs and lists ----
 
-(func (not-a-pair [who i32] [v i32]) -> i32 (rt:wrong-type who '"a pair" v))
-
-;; The length of list l, for function who, and l reversed: each walks l
-;; once, and stops with the error if it is not a list.
+;; The length of list l, for function who: walks l, and stops with the
+;; error if it is not a list.
 (func (list-length [l i32] [who i32]) -> i32
   (let ([n 0] [t l])
     (block done
@@ -696,93 +800,114 @@
         (br next)))
     (if (i32.eqz (kd:null? t)) (drop (rt:wrong-type who '"a list" l)))
     n))
+(#%fact list-length '(foreign raw))
 
+;; l reversed, a new list sharing its elements, for function who, which
+;; stops with the error if l is not a list.
 (func (reverse-list [l i32] [who i32]) -> i32
   (let ([acc '()] [t l])
     (block done
       (loop next
         (br-if done (i32.eqz (kd:pair? t)))
-        (set! acc (kd:cons (kd:car t) acc))
+        (set! acc (kd:cons (dup-value (kd:car t)) acc))
         (set! t (kd:cdr t))
         (br next)))
     (if (i32.eqz (kd:null? t)) (drop (rt:wrong-type who '"a list" l)))
     acc))
+(#%fact reverse-list '(foreign owned))
 
-;; a's elements, then b, shared.
+;; a's elements, shared, then b, which the result takes.
 (func (append-2 [a i32] [b i32]) -> i32
-  (let ([r (reverse-list a '"append")])
+  (let ([r (reverse-list a '"append")] [t 0])
+    (set! t r)
     (block done
       (loop next
-        (br-if done (i32.eqz (kd:pair? r)))
-        (set! b (kd:cons (kd:car r) b))
-        (set! r (kd:cdr r))
+        (br-if done (i32.eqz (kd:pair? t)))
+        (set! b (kd:cons (dup-value (kd:car t)) b))
+        (set! t (kd:cdr t))
         (br next)))
+    (drop-value r)
     b))
+(#%fact append-2 '(foreign owned 1))
 
 (substrate-define (cons a d) #:inline (kd:cons a d))
-(substrate-define (car p) #:inline (if (kd:pair? p) (kd:unsafe-car p) (not-a-pair 'car p)))
-(substrate-define (cdr p) #:inline (if (kd:pair? p) (kd:unsafe-cdr p) (not-a-pair 'cdr p)))
-(func (car-of [p i32] [who i32]) #:inline -> i32 (if (kd:pair? p) (kd:unsafe-car p) (not-a-pair who p)))
-(func (cdr-of [p i32] [who i32]) #:inline -> i32 (if (kd:pair? p) (kd:unsafe-cdr p) (not-a-pair who p)))
-(substrate-define (caar p) (car-of (car-of p 'caar) 'caar))
-(substrate-define (cadr p) (car-of (cdr-of p 'cadr) 'cadr))
-(substrate-define (cdar p) (cdr-of (car-of p 'cdar) 'cdar))
-(substrate-define (cddr p) (cdr-of (cdr-of p 'cddr) 'cddr))
-(substrate-define (caddr p) (car-of (cdr-of (cdr-of p 'caddr) 'caddr) 'caddr))
-(substrate-define (cdddr p) (cdr-of (cdr-of (cdr-of p 'cdddr) 'cdddr) 'cdddr))
-(substrate-define (cadddr p) (car-of (cdr-of (cdr-of (cdr-of p 'cadddr) 'cadddr) 'cadddr) 'cadddr))
-(substrate-define (pair? x) #:inline (bool (kd:pair? x)))
-(substrate-define (null? x) #:inline (bool (kd:null? x)))
-(substrate-define (list? x) (bool (kd:list? x)))
+(substrate-define (car p) #:inline #:borrow (p) (if (kd:pair? p) (kd:unsafe-car p) (rt:wrong-type 'car '"a pair" p)))
+(substrate-define (cdr p) #:inline #:borrow (p) (if (kd:pair? p) (kd:unsafe-cdr p) (rt:wrong-type 'cdr '"a pair" p)))
+;; The car and cdr of p, read where they are, for function who.
+(func (car-of [p i32] [who i32]) #:inline -> i32 (if (kd:pair? p) (kd:unsafe-car p) (rt:wrong-type who '"a pair" p)))
+(#%fact car-of '(foreign borrowed))
+(func (cdr-of [p i32] [who i32]) #:inline -> i32 (if (kd:pair? p) (kd:unsafe-cdr p) (rt:wrong-type who '"a pair" p)))
+(#%fact cdr-of '(foreign borrowed))
+(substrate-define (caar p) #:borrow (p) (car-of (car-of p 'caar) 'caar))
+(substrate-define (cadr p) #:borrow (p) (car-of (cdr-of p 'cadr) 'cadr))
+(substrate-define (cdar p) #:borrow (p) (cdr-of (car-of p 'cdar) 'cdar))
+(substrate-define (cddr p) #:borrow (p) (cdr-of (cdr-of p 'cddr) 'cddr))
+(substrate-define (caddr p) #:borrow (p) (car-of (cdr-of (cdr-of p 'caddr) 'caddr) 'caddr))
+(substrate-define (cdddr p) #:borrow (p) (cdr-of (cdr-of (cdr-of p 'cdddr) 'cdddr) 'cdddr))
+(substrate-define (cadddr p) #:borrow (p) (car-of (cdr-of (cdr-of (cdr-of p 'cadddr) 'cadddr) 'cadddr) 'cadddr))
+(substrate-define (pair? x) #:inline #:borrow (x) (bool (kd:pair? x)))
+(substrate-define (null? x) #:inline #:borrow (x) (bool (kd:null? x)))
+(substrate-define (list? x) #:borrow (x) (bool (kd:list? x)))
 (substrate-define (list-function . xs) xs)
-(substrate-define (length l) (fix (list-length l '"length")))
-(substrate-define (reverse l) (reverse-list l '"reverse"))
+(substrate-define (length l) #:borrow (l) (fix (list-length l '"length")))
+(substrate-define (reverse l) #:borrow (l) (reverse-list l '"reverse"))
 (func (unsafe-car [p i32]) #:inline -> i32 (kd:unsafe-car p))
+(#%fact unsafe-car '(foreign borrowed))
 (func (unsafe-cdr [p i32]) #:inline -> i32 (kd:unsafe-cdr p))
+(#%fact unsafe-cdr '(foreign borrowed))
 
-;; The lists appended; the last is shared.
+;; The lists of ls appended: each but the last copied, sharing its
+;; elements, before the last, which is shared whole.
 (func (append-all [ls i32]) -> i32
-  (let ([l (kd:reverse ls)] [acc '()])
-    (set! acc (kd:car l))
+  (let ([l (reverse-list ls '"append")] [acc 0] [t 0])
+    (set! acc (dup-value (kd:car l)))
+    (set! t (kd:cdr l))
     (block done
       (loop next
-        (set! l (kd:cdr l))
-        (br-if done (kd:null? l))
-        (set! acc (append-2 (kd:car l) acc))
+        (br-if done (kd:null? t))
+        (set! acc (append-2 (kd:car t) acc))
+        (set! t (kd:cdr t))
         (br next)))
+    (drop-value l)
     acc))
+(#%fact append-all '(foreign owned))
 
-(substrate-define append
+(substrate-define append #:borrow (a)
   (substrate-case-lambda
     [(a b) (append-2 a b)]
     [() '()]
     [(a . rest) (append-all (kd:cons a rest))]))
 
+;; (apply f a ... l): f called with the a ... and the elements of l.
 (substrate-define (apply f first . more) (rt:apply-list f (rt:spread (kd:cons first more))))
 
 ;; ---- numbers ----
 
-(substrate-define (number? x) (bool (i32.or (kd:integer? x) (kd:flonum? x))))
-(substrate-define (integer? x) (bool (kd:integer? x)))
+(substrate-define (number? x) #:borrow (x) (bool (i32.or (kd:integer? x) (kd:flonum? x))))
+(substrate-define (integer? x) #:borrow (x) (bool (kd:integer? x)))
 ;; An integer in the fixnum range, -2^30 to 2^30 - 1.
-(substrate-define (fixnum? x) (bool (kd:fixnum? x)))
+(substrate-define (fixnum? x) #:borrow (x) (bool (kd:fixnum? x)))
 
-;; op: 0 +, 1 -, 2 *, 3 bitwise-and, 4 bitwise-ior, 5 bitwise-xor: a, then
-;; op with each element of l in turn.
+;; op: 0 +, 1 -, 2 *, 3 bitwise-and, 4 bitwise-ior, 5 bitwise-xor: a,
+;; which it takes, then op with each element of l in turn.
 (func (fold-op [op i32] [a i32] [l i32]) -> i32
   (block done
     (loop next
       (br-if done (i32.eqz (kd:pair? l)))
-      (set! a (arith op a (kd:car l)))
+      (let ([r (arith op a (kd:car l))])
+        (drop-value a)
+        (set! a r))
       (set! l (kd:cdr l))
       (br next)))
   a)
+(#%fact fold-op '(foreign owned 1))
 
 (func (arith [op i32] [a i32] [b i32]) -> i32
   (if (i32.eq op 0) (return (rt:add a b)))
   (if (i32.eq op 1) (return (rt:sub a b)))
   (if (i32.eq op 2) (return (rt:mul a b)))
   (rt:bitwise op a b))
+(#%fact arith '(foreign owned))
 
 ;; Does a compare by op, as numbers, characters or strings by kind, with
 ;; each element of l, and each with the next?
@@ -799,59 +924,62 @@
         (set! l (kd:cdr l))
         (br next)))
     (bool ok)))
+(#%fact chain '(foreign owned))
 
-(substrate-define + #:inline
+(substrate-define + #:inline #:borrow (a b)
   (substrate-case-lambda
     [(a b) (rt:add a b)]
     [() '0]
     [(a) (rt:add a '0)]
     [(a b . more) (fold-op 0 (rt:add a b) more)]))
 
-(substrate-define - #:inline
+(substrate-define - #:inline #:borrow (a b)
   (substrate-case-lambda
     [(a b) (rt:sub a b)]
     [(a) (rt:sub '0 a)]
     [(a b . more) (fold-op 1 (rt:sub a b) more)]))
 
-(substrate-define * #:inline
+(substrate-define * #:inline #:borrow (a b)
   (substrate-case-lambda
     [(a b) (rt:mul a b)]
     [() '1]
     [(a) (rt:mul a '1)]
     [(a b . more) (fold-op 2 (rt:mul a b) more)]))
 
-(substrate-define (quotient a b) (rt:quo a b))
-(substrate-define (remainder a b) (rt:rem a b))
-(substrate-define (modulo a b) (rt:floor-remainder a b))
+(substrate-define (quotient a b) #:borrow (a b) (rt:quo a b))
+(substrate-define (remainder a b) #:borrow (a b) (rt:rem a b))
+(substrate-define (modulo a b) #:borrow (a b) (rt:floor-remainder a b))
 
-(substrate-define < #:inline
+(substrate-define < #:inline #:borrow (a b)
   (substrate-case-lambda
     [(a b) (bool (rt:compare 0 a b))]
     [(a . more) (chain 0 0 a more)]))
-(substrate-define > #:inline
+(substrate-define > #:inline #:borrow (a b)
   (substrate-case-lambda
     [(a b) (bool (rt:compare 1 a b))]
     [(a . more) (chain 0 1 a more)]))
-(substrate-define <= #:inline
+(substrate-define <= #:inline #:borrow (a b)
   (substrate-case-lambda
     [(a b) (bool (rt:compare 2 a b))]
     [(a . more) (chain 0 2 a more)]))
-(substrate-define >= #:inline
+(substrate-define >= #:inline #:borrow (a b)
   (substrate-case-lambda
     [(a b) (bool (rt:compare 3 a b))]
     [(a . more) (chain 0 3 a more)]))
-(substrate-define = #:inline
+(substrate-define = #:inline #:borrow (a b)
   (substrate-case-lambda
     [(a b) (bool (rt:compare 4 a b))]
     [(a . more) (chain 0 4 a more)]))
 
-(substrate-define (zero? a) (bool (i64.eqz (rt:int-value a 'zero?))))
-(substrate-define (positive? a) (bool (i64.gt_s (rt:int-value a 'positive?) (i64.const 0))))
-(substrate-define (negative? a) (bool (i64.lt_s (rt:int-value a 'negative?) (i64.const 0))))
-(substrate-define (even? a) (bool (i64.eqz (i64.and (rt:int-value a 'even?) (i64.const 1)))))
-(substrate-define (odd? a) (bool (i64.ne (i64.and (rt:int-value a 'odd?) (i64.const 1)) (i64.const 0))))
-(substrate-define (abs a) (if (i64.lt_s (rt:int-value a '"abs") (i64.const 0)) (rt:sub '0 a) a))
+(substrate-define (zero? a) #:borrow (a) (bool (i64.eqz (rt:int-value a 'zero?))))
+(substrate-define (positive? a) #:borrow (a) (bool (i64.gt_s (rt:int-value a 'positive?) (i64.const 0))))
+(substrate-define (negative? a) #:borrow (a) (bool (i64.lt_s (rt:int-value a 'negative?) (i64.const 0))))
+(substrate-define (even? a) #:borrow (a) (bool (i64.eqz (i64.and (rt:int-value a 'even?) (i64.const 1)))))
+(substrate-define (odd? a) #:borrow (a) (bool (i64.ne (i64.and (rt:int-value a 'odd?) (i64.const 1)) (i64.const 0))))
+(substrate-define (abs a) #:borrow (a) (if (i64.lt_s (rt:int-value a '"abs") (i64.const 0)) (rt:sub '0 a) a))
 
+;; The least (op 0) or greatest (op 1) of a and the elements of l, read
+;; where they are.
 (func (extreme [a i32] [l i32] [op i32]) -> i32
   (drop (rt:int-value a (if (i32.eq op 0) '"min" '"max")))
   (block done
@@ -860,35 +988,36 @@
       (if (rt:compare (if (i32.eq op 0) 1 0) a (kd:car l)) (set! a (kd:car l)))
       (set! l (kd:cdr l))
       (br next)))
-  a)
+  (dup-value a))
+(#%fact extreme '(foreign owned))
 
 (substrate-define (min a . more) (extreme a more 0))
 (substrate-define (max a . more) (extreme a more 1))
 
-(substrate-define bitwise-and
+(substrate-define bitwise-and #:borrow (a b)
   (substrate-case-lambda
     [(a b) (rt:bitwise 3 a b)]
     [() '-1]
     [(a . more) (fold-op 3 (rt:bitwise 3 a '-1) more)]))
-(substrate-define bitwise-ior
+(substrate-define bitwise-ior #:borrow (a b)
   (substrate-case-lambda
     [(a b) (rt:bitwise 4 a b)]
     [() '0]
     [(a . more) (fold-op 4 (rt:bitwise 4 a '0) more)]))
-(substrate-define bitwise-xor
+(substrate-define bitwise-xor #:borrow (a b)
   (substrate-case-lambda
     [(a b) (rt:bitwise 5 a b)]
     [() '0]
     [(a . more) (fold-op 5 (rt:bitwise 5 a '0) more)]))
-(substrate-define (bitwise-not a) (kd:make-integer (i64.xor (rt:int-value a '"bitwise-not") (i64.const -1))))
-(substrate-define (arithmetic-shift a k) (rt:shift a k))
+(substrate-define (bitwise-not a) #:borrow (a) (kd:make-integer (i64.xor (rt:int-value a '"bitwise-not") (i64.const -1))))
+(substrate-define (arithmetic-shift a k) #:borrow (a k) (rt:shift a k))
 
-(substrate-define number->string
+(substrate-define number->string #:borrow (n)
   (substrate-case-lambda
     [(n) (rt:number-string-of n '10)]
     [(n radix) (rt:number-string-of n radix)]))
 
-(substrate-define string->number
+(substrate-define string->number #:borrow (s)
   (substrate-case-lambda
     [(s) (rt:parse-number (rt:string-arg s '"string->number") (i64.const 10))]
     [(s radix) (rt:parse-number (rt:string-arg s '"string->number") (rt:radix-value radix '"string->number"))]))
@@ -898,133 +1027,133 @@
 ;; Classification and case are ASCII's; other characters are neither
 ;; letters, digits nor whitespace.
 
-(substrate-define (char? x) (bool (kd:char? x)))
-(substrate-define (char->integer c) (fix (rt:char-arg c '"char->integer")))
-(substrate-define (integer->char n)
+(substrate-define (char? x) #:borrow (x) (bool (kd:char? x)))
+(substrate-define (char->integer c) #:borrow (c) (fix (rt:char-arg c '"char->integer")))
+(substrate-define (integer->char n) #:borrow (n)
   (let ([x (rt:int-value n '"integer->char")])
     (if (i32.or (i64.gt_u x (i64.const 1114111)) (i32.and (i64.ge_u x (i64.const 55296)) (i64.le_u x (i64.const 57343))))
         (return (rt:wrong-type '"integer->char" '"a Unicode scalar value" n)))
     (kd:integer->char (i32.wrap_i64 x))))
-(substrate-define char=?
+(substrate-define char=? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:char-compare 4 a b))] [(a . more) (chain 1 4 a more)]))
-(substrate-define char<?
+(substrate-define char<? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:char-compare 0 a b))] [(a . more) (chain 1 0 a more)]))
-(substrate-define char>?
+(substrate-define char>? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:char-compare 1 a b))] [(a . more) (chain 1 1 a more)]))
-(substrate-define char<=?
+(substrate-define char<=? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:char-compare 2 a b))] [(a . more) (chain 1 2 a more)]))
-(substrate-define char>=?
+(substrate-define char>=? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:char-compare 3 a b))] [(a . more) (chain 1 3 a more)]))
 
 (func (ascii-letter? [c i32]) -> i32
   (i32.or (i32.and (i32.ge_u c 65) (i32.le_u c 90)) (i32.and (i32.ge_u c 97) (i32.le_u c 122))))
+(#%fact ascii-letter? '(foreign raw))
 
-(substrate-define (char-alphabetic? c) (bool (ascii-letter? (rt:char-arg c '"char-alphabetic?"))))
-(substrate-define (char-numeric? c)
+(substrate-define (char-alphabetic? c) #:borrow (c) (bool (ascii-letter? (rt:char-arg c '"char-alphabetic?"))))
+(substrate-define (char-numeric? c) #:borrow (c)
   (let ([x (rt:char-arg c '"char-numeric?")]) (bool (i32.and (i32.ge_u x 48) (i32.le_u x 57)))))
-(substrate-define (char-whitespace? c)
+(substrate-define (char-whitespace? c) #:borrow (c)
   (let ([x (rt:char-arg c '"char-whitespace?")])
     (bool (i32.or (i32.eq x 32) (i32.and (i32.ge_u x 9) (i32.le_u x 13))))))
-(substrate-define (char-upcase c)
+(substrate-define (char-upcase c) #:borrow (c)
   (let ([x (rt:char-arg c '"char-upcase")])
     (if (i32.and (i32.ge_u x 97) (i32.le_u x 122)) (kd:integer->char (i32.sub x 32)) c)))
-(substrate-define (char-downcase c)
+(substrate-define (char-downcase c) #:borrow (c)
   (let ([x (rt:char-arg c '"char-downcase")])
     (if (i32.and (i32.ge_u x 65) (i32.le_u x 90)) (kd:integer->char (i32.add x 32)) c)))
-(substrate-define (char-utf-8-length c) (fix (rt:utf8-length (rt:char-arg c '"char-utf-8-length"))))
+(substrate-define (char-utf-8-length c) #:borrow (c) (fix (rt:utf8-length (rt:char-arg c '"char-utf-8-length"))))
 
 ;; ---- strings and symbols ----
 ;;
 ;; Strings are the kernel module's: immutable UTF-8, indexed by byte.
 
-(substrate-define (symbol<? a b)
+(substrate-define (symbol<? a b) #:borrow (a b)
   (bool (i32.lt_s (rt:string-order (kd:symbol->string (rt:symbol-arg a '"symbol<?"))
                                    (kd:symbol->string (rt:symbol-arg b '"symbol<?")))
                   0)))
 
-(substrate-define (string? x) (bool (kd:string? x)))
-(substrate-define (symbol? x) (bool (kd:symbol? x)))
-(substrate-define string=?
+(substrate-define (string? x) #:borrow (x) (bool (kd:string? x)))
+(substrate-define (symbol? x) #:borrow (x) (bool (kd:symbol? x)))
+(substrate-define string=? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:string-compare 4 a b))] [(a . more) (chain 2 4 a more)]))
-(substrate-define string<?
+(substrate-define string<? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:string-compare 0 a b))] [(a . more) (chain 2 0 a more)]))
-(substrate-define string>?
+(substrate-define string>? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:string-compare 1 a b))] [(a . more) (chain 2 1 a more)]))
-(substrate-define string<=?
+(substrate-define string<=? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:string-compare 2 a b))] [(a . more) (chain 2 2 a more)]))
-(substrate-define string>=?
+(substrate-define string>=? #:borrow (a b)
   (substrate-case-lambda [(a b) (bool (rt:string-compare 3 a b))] [(a . more) (chain 2 3 a more)]))
 
 ;; A new string, even for one argument or none.
 (substrate-define (string-append . strings) (rt:string-append-list strings '"string-append"))
 
-(substrate-define (symbol->string x) (kd:symbol->string (rt:symbol-arg x '"symbol->string")))
-(substrate-define (string->symbol x) (kd:string->symbol (rt:string-arg x '"string->symbol")))
-(substrate-define (keyword? x) (bool (kd:keyword? x)))
-(substrate-define (keyword->string k)
+(substrate-define (symbol->string x) #:borrow (x) (kd:symbol->string (rt:symbol-arg x '"symbol->string")))
+(substrate-define (string->symbol x) #:borrow (x) (kd:string->symbol (rt:string-arg x '"string->symbol")))
+(substrate-define (keyword? x) #:borrow (x) (bool (kd:keyword? x)))
+(substrate-define (keyword->string k) #:borrow (k)
   (if (i32.eqz (kd:keyword? k)) (return (rt:wrong-type '"keyword->string" '"a keyword" k)))
   (kd:keyword->string k))
-(substrate-define (string->keyword x) (kd:string->keyword (rt:string-arg x '"string->keyword")))
+(substrate-define (string->keyword x) #:borrow (x) (kd:string->keyword (rt:string-arg x '"string->keyword")))
 
 ;; err-byte, for characters UTF-8 cannot encode, is never used, since every
 ;; string is UTF-8.
-(substrate-define string->bytes/utf-8
+(substrate-define string->bytes/utf-8 #:borrow (s)
   (substrate-case-lambda
     [(s) (rt:string->bytes-of s '"string->bytes/utf-8")]
     [(s err-byte) (rt:string->bytes-of s '"string->bytes/utf-8")]))
-(substrate-define bytes->string/utf-8
+(substrate-define bytes->string/utf-8 #:borrow (v)
   (substrate-case-lambda
     [(v) (rt:bytes->string-of v '#f '#f '#f '"bytes->string/utf-8")]
     [(v err) (rt:bytes->string-of v err '#f '#f '"bytes->string/utf-8")]
     [(v err start) (rt:bytes->string-of v err start '#f '"bytes->string/utf-8")]
     [(v err start end) (rt:bytes->string-of v err start end '"bytes->string/utf-8")]))
-(substrate-define (string->list s) (rt:string->list-of s '"string->list"))
-(substrate-define (list->string chars) (rt:list->string-of chars '"list->string"))
+(substrate-define (string->list s) #:borrow (s) (rt:string->list-of s '"string->list"))
+(substrate-define (list->string chars) #:borrow (chars) (rt:list->string-of chars '"list->string"))
 (substrate-define (string . chars) (rt:list->string-of chars '"string"))
 
 ;; Byte-indexed operations: the UTF-8 length, a byte, the character
 ;; starting at a byte index, and the substring between byte indexes.
-(substrate-define (string-utf-8-length s) #:inline
+(substrate-define (string-utf-8-length s) #:inline #:borrow (s)
   (fix (kd:string-length (rt:string-arg s 'string-utf-8-length))))
-(substrate-define (string-utf-8-byte s k) #:inline
-  (let ([x (rt:string-arg s 'string-utf-8-byte)])
-    (fix (kd:string-byte x (rt:index-of k (kd:string-length x) 'string-utf-8-byte)))))
-(substrate-define (string-ref/utf-8 s k) (rt:string-ref-char s k))
-(substrate-define substring/utf-8
+(substrate-define (string-utf-8-byte s k) #:inline #:borrow (s k)
+  (rt:string-arg s 'string-utf-8-byte)
+  (fix (kd:string-byte s (rt:index-of k (kd:string-length s) 'string-utf-8-byte))))
+(substrate-define (string-ref/utf-8 s k) #:borrow (s k) (rt:string-ref-char s k))
+(substrate-define substring/utf-8 #:borrow (s start end)
   (substrate-case-lambda
     [(s start end) (rt:substring-of s start end '"substring/utf-8")]
     [(s start) (rt:substring-of s start '#f '"substring/utf-8")]))
 
 ;; ---- boxes ----
 
-(func (box-arg [b i32] [who i32]) #:inline -> i32 (if (rt:box? b) b (not-a-box b who)))
-(func (not-a-box [b i32] [who i32]) -> i32 (rt:wrong-type who '"a box" b))
-
 (substrate-define (box v) (rt:make-box v))
-(substrate-define (box? x) (bool (rt:box? x)))
-(substrate-define (unbox b) (rt:unbox (box-arg b '"unbox")))
-(substrate-define (set-box! b v) (rt:set-box! (box-arg b '"set-box!") v) '#f)
+(substrate-define (box? x) #:borrow (x) (bool (rt:box? x)))
+(substrate-define (unbox b) #:borrow (b) (if (rt:box? b) (rt:unbox b) (rt:wrong-type '"unbox" '"a box" b)))
+(substrate-define (set-box! b v) #:borrow (b)
+  (if (rt:box? b) (rt:set-box! b v) (drop (rt:wrong-type '"set-box!" '"a box" b)))
+  '#f)
 
 ;; ---- vectors ----
 
-(substrate-define (vector? x) (bool (rt:vector? x)))
+(substrate-define (vector? x) #:borrow (x) (bool (rt:vector? x)))
 (substrate-define (vector . xs) (rt:list->vector xs '"vector"))
-(substrate-define make-vector
+(substrate-define make-vector #:borrow (n)
   (substrate-case-lambda
     [(n fill) (rt:make-vector (rt:count-of n '"make-vector") fill)]
     [(n) (rt:make-vector (rt:count-of n '"make-vector") '#f)]))
-(substrate-define (vector-length v) (fix (rt:vector-length (rt:vector-arg v '"vector-length"))))
-(substrate-define (vector-ref v k)
-  (let ([a (rt:vector-arg v '"vector-ref")])
-    (rt:vector-ref a (rt:index-of k (rt:vector-length a) '"vector-ref"))))
-(substrate-define (vector-set! v k x)
-  (let ([a (rt:vector-arg v '"vector-set!")])
-    (rt:vector-set! a (rt:index-of k (rt:vector-length a) '"vector-set!") x)
-    '#f))
-(substrate-define (vector->list v) (rt:vector->list (rt:vector-arg v '"vector->list")))
-(substrate-define (list->vector l) (rt:list->vector l '"list->vector"))
-(substrate-define (vector-fill! v x) (rt:vector-fill! (rt:vector-arg v '"vector-fill!") x) '#f)
-(substrate-define vector-copy
+(substrate-define (vector-length v) #:borrow (v) (fix (rt:vector-length (rt:vector-arg v '"vector-length"))))
+(substrate-define (vector-ref v k) #:borrow (v k)
+  (rt:vector-arg v '"vector-ref")
+  (rt:vector-ref v (rt:index-of k (rt:vector-length v) '"vector-ref")))
+(substrate-define (vector-set! v k x) #:borrow (v k)
+  (rt:vector-arg v '"vector-set!")
+  (rt:vector-set! v (rt:index-of k (rt:vector-length v) '"vector-set!") x)
+  '#f)
+(substrate-define (vector->list v) #:borrow (v) (rt:vector->list (rt:vector-arg v '"vector->list")))
+(substrate-define (list->vector l) #:borrow (l) (rt:list->vector l '"list->vector"))
+(substrate-define (vector-fill! v x) #:borrow (v) (rt:vector-fill! (rt:vector-arg v '"vector-fill!") x) '#f)
+(substrate-define vector-copy #:borrow (v)
   (substrate-case-lambda
     [(v) (rt:vector-copy v '#f '#f '"vector-copy")]
     [(v start) (rt:vector-copy v start '#f '"vector-copy")]
@@ -1032,28 +1161,28 @@
 
 ;; ---- byte strings ----
 
-(substrate-define (bytes? x) (bool (rt:bytes? x)))
+(substrate-define (bytes? x) #:borrow (x) (bool (rt:bytes? x)))
 (substrate-define (bytes . bs) (rt:bytes-of-list bs '"bytes"))
-(substrate-define make-bytes
+(substrate-define make-bytes #:borrow (n)
   (substrate-case-lambda
     [(n) (rt:make-bytes (rt:count-of n '"make-bytes") 0)]
     [(n fill) (rt:make-bytes (rt:count-of n '"make-bytes") (rt:byte-arg fill '"make-bytes"))]))
-(substrate-define (bytes-length v) (fix (rt:bytes-length (rt:bytes-arg v '"bytes-length"))))
-(substrate-define (bytes-ref v k)
-  (let ([a (rt:bytes-arg v '"bytes-ref")])
-    (fix (rt:bytes-ref a (rt:index-of k (rt:bytes-length a) '"bytes-ref")))))
-(substrate-define (bytes-set! v k b)
-  (let ([a (rt:bytes-arg v '"bytes-set!")])
-    (rt:bytes-set! a (rt:index-of k (rt:bytes-length a) '"bytes-set!") (rt:byte-arg b '"bytes-set!"))
-    '#f))
-(substrate-define (bytes-copy v) (rt:subbytes v '#f '#f '"bytes-copy"))
-(substrate-define subbytes
+(substrate-define (bytes-length v) #:borrow (v) (fix (rt:bytes-length (rt:bytes-arg v '"bytes-length"))))
+(substrate-define (bytes-ref v k) #:borrow (v k)
+  (rt:bytes-arg v '"bytes-ref")
+  (fix (rt:bytes-ref v (rt:index-of k (rt:bytes-length v) '"bytes-ref"))))
+(substrate-define (bytes-set! v k b) #:borrow (v k b)
+  (rt:bytes-arg v '"bytes-set!")
+  (rt:bytes-set! v (rt:index-of k (rt:bytes-length v) '"bytes-set!") (rt:byte-arg b '"bytes-set!"))
+  '#f)
+(substrate-define (bytes-copy v) #:borrow (v) (rt:subbytes v '#f '#f '"bytes-copy"))
+(substrate-define subbytes #:borrow (v start)
   (substrate-case-lambda
     [(v start) (rt:subbytes v start '#f '"subbytes")]
     [(v start end) (rt:subbytes v start end '"subbytes")]))
-(substrate-define (bytes->list v) (rt:bytes->list (rt:bytes-arg v '"bytes->list")))
-(substrate-define (list->bytes l) (rt:list->bytes l))
-(substrate-define bytes-copy!
+(substrate-define (bytes->list v) #:borrow (v) (rt:bytes->list (rt:bytes-arg v '"bytes->list")))
+(substrate-define (list->bytes l) #:borrow (l) (rt:list->bytes l))
+(substrate-define bytes-copy! #:borrow (to at from)
   (substrate-case-lambda
     [(to at from) (rt:bytes-copy! to at from '#f '#f)]
     [(to at from start) (rt:bytes-copy! to at from start '#f)]
@@ -1068,104 +1197,114 @@
   (substrate-case-lambda [() (rt:make-hash-table 1)] [(assocs) (rt:make-table-from 1 assocs '"make-hasheqv")]))
 (substrate-define make-hash
   (substrate-case-lambda [() (rt:make-hash-table 2)] [(assocs) (rt:make-table-from 2 assocs '"make-hash")]))
-(substrate-define (hash? x) (bool (rt:table? x)))
-(substrate-define (hash-count t) (fix (rt:hash-count t '"hash-count")))
+(substrate-define (hash? x) #:borrow (x) (bool (rt:table? x)))
+(substrate-define (hash-count t) #:borrow (t) (fix (rt:hash-count t '"hash-count")))
 
-(substrate-define hash-ref
+(substrate-define hash-ref #:borrow (t k failure)
   (substrate-case-lambda
     [(t k failure) (rt:hash-ref-value t k failure 1 '"hash-ref")]
     [(t k) (rt:hash-ref-value t k '#f 0 '"hash-ref")]))
 
-(substrate-define (hash-has-key? t k) (bool (rt:hash-has-key? t k '"hash-has-key?")))
-(substrate-define (hash-set! t k v) (rt:hash-set-value! t k v '"hash-set!") '#f)
+(substrate-define (hash-has-key? t k) #:borrow (t k) (bool (rt:hash-has-key? t k '"hash-has-key?")))
+(substrate-define (hash-set! t k v) #:borrow (t) (rt:hash-set-value! t k v '"hash-set!") '#f)
 
 ;; Set k's value to (updater value), value being k's value or, if it has
-;; none, failure's result, as for hash-ref. updater may change the table.
+;; none, failure's result, as for hash-ref, reading t, k, updater and
+;; failure. updater may change the table.
 (func (hash-update* [t i32] [k i32] [updater i32] [failure i32] [has-failure i32]) -> i32
-  (let ([v (rt:call-closure updater 1 (rt:hash-ref-value t k failure has-failure '"hash-update!") 0 0 0)])
-    (rt:hash-set-value! t k v '"hash-update!")
+  (let ([v (rt:call-closure (dup-value updater) 1 (rt:hash-ref-value t k failure has-failure '"hash-update!") 0 0 0)])
+    (rt:hash-set-value! t (dup-value k) v '"hash-update!")
     '#f))
+(#%fact hash-update* '(foreign owned))
 
-(substrate-define hash-update!
+(substrate-define hash-update! #:borrow (t k updater)
   (substrate-case-lambda
     [(t k updater) (hash-update* t k updater '#f 0)]
     [(t k updater failure) (hash-update* t k updater failure 1)]))
 
-(substrate-define (hash-remove! t k) (rt:hash-remove! t k '"hash-remove!") '#f)
-(substrate-define (hash-clear! t) (rt:hash-clear! t '"hash-clear!") '#f)
-(substrate-define (hash-keys t) (rt:table-walk t 0 '"hash-keys"))
-(substrate-define (hash-values t) (rt:table-walk t 1 '"hash-values"))
-(substrate-define (hash->list t) (rt:table-walk t 2 '"hash->list"))
+(substrate-define (hash-remove! t k) #:borrow (t k) (rt:hash-remove! t k '"hash-remove!") '#f)
+(substrate-define (hash-clear! t) #:borrow (t) (rt:hash-clear! t '"hash-clear!") '#f)
+(substrate-define (hash-keys t) #:borrow (t) (rt:table-walk t 0 '"hash-keys"))
+(substrate-define (hash-values t) #:borrow (t) (rt:table-walk t 1 '"hash-values"))
+(substrate-define (hash->list t) #:borrow (t) (rt:table-walk t 2 '"hash->list"))
 
-;; (f key value) for each entry.
-(substrate-define (hash-for-each t f)
-  (let ([l (rt:table-walk t 2 '"hash-for-each")])
+;; (f key value) for each entry, reading t and f.
+(func (hash-for-each* [t i32] [f i32]) -> i32
+  (let ([l (rt:table-walk t 2 '"hash-for-each")] [p 0])
+    (set! p l)
     (block done
       (loop next
-        (br-if done (i32.eqz (kd:pair? l)))
-        (drop (rt:call-closure f 2 (kd:car (kd:car l)) (kd:cdr (kd:car l)) 0 0))
-        (set! l (kd:cdr l))
+        (br-if done (i32.eqz (kd:pair? p)))
+        (drop-value (rt:call-closure (dup-value f) 2 (dup-value (kd:car (kd:car p))) (dup-value (kd:cdr (kd:car p))) 0 0))
+        (set! p (kd:cdr p))
         (br next)))
+    (drop-value l)
     '#f))
+(#%fact hash-for-each* '(foreign owned))
+
+(substrate-define (hash-for-each t f) #:borrow (t f) (hash-for-each* t f))
 
 ;; ---- exceptions ----
 
 (substrate-define (raise v) (rt:raise-value v))
-(substrate-define (call-with-handlers preds procs thunk) (rt:call-with-handlers preds procs thunk))
-(substrate-define (dynamic-wind pre thunk post) (rt:dynamic-wind pre thunk post))
-(substrate-define (exn? v) (bool (rt:exn? v)))
-(substrate-define (exn-message v) (rt:exn-message v))
-(substrate-define (syntax-error? v) (bool (rt:syntax-error? v)))
-(substrate-define (syntax-error-message v) (rt:exn-message v))
-(substrate-define (syntax-error-syntax v) (rt:syntax-error-syntax v))
+(substrate-define (call-with-handlers preds procs thunk) #:borrow (preds procs thunk) (rt:call-with-handlers preds procs thunk))
+(substrate-define (dynamic-wind pre thunk post) #:borrow (pre thunk post) (rt:dynamic-wind pre thunk post))
+(substrate-define (exn? v) #:borrow (v) (bool (rt:exn? v)))
+(substrate-define (exn-message v) #:borrow (v) (rt:exn-message v))
+(substrate-define (syntax-error? v) #:borrow (v) (bool (rt:syntax-error? v)))
+(substrate-define (syntax-error-message v) #:borrow (v) (rt:exn-message v))
+(substrate-define (syntax-error-syntax v) #:borrow (v) (rt:syntax-error-syntax v))
 
 ;; ---- syntax ----
 ;;
 ;; The kernel module's functions (spec 2.3) as Substrate functions, for
 ;; macros written in Substrate: predicates give #t or #f; and a procedure
-;; as a transformer (as-transformer), whose code applies it.
+;; as a transformer (as-transformer), whose code applies it. They are for
+;; compile time, when nothing is freed: syntax shares what it is made of
+;; without counting owners, so at run time what they make is kept.
 
 (substrate-define (as-transformer v) (if (rt:procedure? v) (rt:transformer-of v) v))
 
-(func (not-syntax [x i32] [who i32]) -> i32 (rt:wrong-type who '"a syntax object" x))
-(func (syntax-arg [x i32] [who i32]) #:inline -> i32 (if (kd:syntax? x) x (not-syntax x who)))
+;; x, which must be a syntax object, for function who.
+(func (syntax-arg [x i32] [who i32]) #:inline -> i32 (if (kd:syntax? x) x (rt:wrong-type who '"a syntax object" x)))
+(#%fact syntax-arg '(foreign borrowed))
 
-(substrate-define (syntax? x) (bool (kd:syntax? x)))
-(substrate-define (identifier? x) (bool (kd:identifier? x)))
-(substrate-define (syntax-e x) (kd:syntax-e (syntax-arg x '"syntax-e")))
-(substrate-define (syntax->list x) (kd:syntax->list x))
-(substrate-define (syntax->datum x) (kd:syntax->datum x))
-(substrate-define datum->syntax
+(substrate-define (syntax? x) #:borrow (x) (bool (kd:syntax? x)))
+(substrate-define (identifier? x) #:borrow (x) (bool (kd:identifier? x)))
+(substrate-define (syntax-e x) #:borrow (x) (kd:syntax-e (syntax-arg x '"syntax-e")))
+(substrate-define (syntax->list x) #:borrow (x) (kd:syntax->list x))
+(substrate-define (syntax->datum x) #:borrow (x) (kd:syntax->datum x))
+(substrate-define datum->syntax #:borrow (ctx d)
   (substrate-case-lambda
     [(ctx d) (kd:datum->syntax ctx d 0)]
     [(ctx d loc) (kd:datum->syntax ctx d loc)]))
-(substrate-define (syntax-rewrap x e) (kd:syntax-rewrap (syntax-arg x '"syntax-rewrap") e))
+(substrate-define (syntax-rewrap x e) #:borrow (x e) (kd:syntax-rewrap (syntax-arg x '"syntax-rewrap") e))
 ;; (syntax-property x key) reads a property, and
 ;; (syntax-property x key value) returns a copy of x with it set.
-(substrate-define syntax-property
+(substrate-define syntax-property #:borrow (x key)
   (substrate-case-lambda
     [(x key) (kd:syntax-property (syntax-arg x '"syntax-property") key)]
     [(x key value) (kd:syntax-property-set (syntax-arg x '"syntax-property") key value)]))
-(substrate-define (free-identifier=? a b) (bool (kd:free-identifier=? a b)))
-(substrate-define (syntax-local-value id) (kd:syntax-local-value id))
-(substrate-define (identifier-binding-kind id) (kd:identifier-binding-kind id))
-(substrate-define (identifier-function-signature id) (kd:identifier-function-signature id))
-(substrate-define (local-expand x) (kd:local-expand x))
-(substrate-define (transformer? x) (bool (kd:transformer? x)))
-(substrate-define (transformer-env t)
+(substrate-define (free-identifier=? a b) #:borrow (a b) (bool (kd:free-identifier=? a b)))
+(substrate-define (syntax-local-value id) #:borrow (id) (kd:syntax-local-value id))
+(substrate-define (identifier-binding-kind id) #:borrow (id) (kd:identifier-binding-kind id))
+(substrate-define (identifier-function-signature id) #:borrow (id) (kd:identifier-function-signature id))
+(substrate-define (local-expand x) #:borrow (x) (kd:local-expand x))
+(substrate-define (transformer? x) #:borrow (x) (bool (kd:transformer? x)))
+(substrate-define (transformer-env t) #:borrow (t)
   (if (i32.eqz (kd:transformer? t)) (return (rt:wrong-type '"transformer-env" '"a transformer" t)))
   (kd:transformer-env t))
-(substrate-define (syntax-local-lift-definition form) (kd:syntax-local-lift-definition form))
-(substrate-define (syntax-local-introduce x) (kd:syntax-local-introduce x))
-(substrate-define (syntax-local-facts id) (kd:syntax-local-facts id))
-(substrate-define (identifier-name id) (kd:identifier-name id))
-(substrate-define (name-identifier n) (kd:name-identifier n))
-(substrate-define (local-binding id) (kd:local-binding id))
-(substrate-define (splice-list x) (kd:splice-list x))
-(substrate-define (syntax-source x) (kd:syntax-source (syntax-arg x '"syntax-source")))
-(substrate-define (syntax-line x) (kd:syntax-line (syntax-arg x '"syntax-line")))
-(substrate-define (syntax-column x) (kd:syntax-column (syntax-arg x '"syntax-column")))
-(substrate-define raise-syntax-error
+(substrate-define (syntax-local-lift-definition form) #:borrow (form) (kd:syntax-local-lift-definition form))
+(substrate-define (syntax-local-introduce x) #:borrow (x) (kd:syntax-local-introduce x))
+(substrate-define (syntax-local-facts id) #:borrow (id) (kd:syntax-local-facts id))
+(substrate-define (identifier-name id) #:borrow (id) (kd:identifier-name id))
+(substrate-define (name-identifier n) #:borrow (n) (kd:name-identifier n))
+(substrate-define (local-binding id) #:borrow (id) (kd:local-binding id))
+(substrate-define (splice-list x) #:borrow (x) (kd:splice-list x))
+(substrate-define (syntax-source x) #:borrow (x) (kd:syntax-source (syntax-arg x '"syntax-source")))
+(substrate-define (syntax-line x) #:borrow (x) (kd:syntax-line (syntax-arg x '"syntax-line")))
+(substrate-define (syntax-column x) #:borrow (x) (kd:syntax-column (syntax-arg x '"syntax-column")))
+(substrate-define raise-syntax-error #:borrow (name message)
   (substrate-case-lambda
     [(name message) (kd:raise-syntax-error name message 0) '#f]
     [(name message x) (kd:raise-syntax-error name message x) '#f]))
@@ -1176,46 +1315,55 @@
 ;; standard output, or to the port they are given: a bytes port, from
 ;; open-output-bytes, keeps what is written to it, for get-output-bytes.
 
-(substrate-define write
+(substrate-define write #:borrow (x)
   (substrate-case-lambda
     [(x) (rt:write-to-port x (rt:stdout-port) 0) '#f]
     [(x p) (rt:write-to-port x (rt:port-arg p '"write") 0) '#f]))
-(substrate-define display
+(substrate-define display #:borrow (x)
   (substrate-case-lambda
     [(x) (rt:write-to-port x (rt:stdout-port) 1) '#f]
     [(x p) (rt:write-to-port x (rt:port-arg p '"display") 1) '#f]))
 (substrate-define newline
   (substrate-case-lambda
     [() (rt:write-byte-to (rt:stdout-port) 10) (rt:port-flush (rt:stdout-port)) '#f]
-    [(p) (let ([q (rt:port-arg p '"newline")]) (rt:write-byte-to q 10) (rt:port-flush q)) '#f]))
+    [(p) (rt:port-arg p '"newline") (rt:write-byte-to p 10) (rt:port-flush p) '#f]))
 
 (func (write-byte* [b i32] [p i32]) -> i32
   (rt:write-byte-to p (rt:byte-arg b '"write-byte"))
   (rt:port-flush p)
   '#f)
+(#%fact write-byte* '(foreign owned))
 
 (func (write-bytes* [v i32] [p i32]) -> i32
   (rt:write-to-port (rt:bytes-arg v '"write-bytes") p 1)
   '#f)
+(#%fact write-bytes* '(foreign owned))
 
-(substrate-define write-byte
+(substrate-define write-byte #:borrow (b p)
   (substrate-case-lambda
     [(b p) (write-byte* b (rt:port-arg p '"write-byte"))]
     [(b) (write-byte* b (rt:stdout-port))]))
-(substrate-define write-bytes
+(substrate-define write-bytes #:borrow (v p)
   (substrate-case-lambda
     [(v p) (write-bytes* v (rt:port-arg p '"write-bytes"))]
     [(v) (write-bytes* v (rt:stdout-port))]))
 
 (substrate-define (open-output-bytes) (rt:new-port -1))
-(substrate-define (get-output-bytes p) (rt:port-bytes (rt:port-arg p '"get-output-bytes")))
+(substrate-define (get-output-bytes p) #:borrow (p) (rt:port-bytes (rt:port-arg p '"get-output-bytes")))
 ;; The number of bytes written to bytes port p.
-(substrate-define (file-position p) (fix (rt:port-length (rt:port-arg p '"file-position"))))
-;; (proc port) with a new bytes port; what it writes there, as bytes.
-(substrate-define (call-with-output-bytes proc)
+(substrate-define (file-position p) #:borrow (p) (fix (rt:port-length (rt:port-arg p '"file-position"))))
+
+;; (proc port) with a new bytes port, reading proc; what proc writes
+;; there, as bytes.
+(func (call-with-output-bytes* [proc i32]) -> i32
   (let ([p (rt:new-port -1)])
-    (drop (rt:call-closure proc 1 p 0 0 0))
-    (rt:port-bytes p)))
+    (drop-value (rt:call-closure (dup-value proc) 1 (dup-value p) 0 0 0))
+    (let ([r (rt:port-bytes p)])
+      (drop-value p)
+      r)))
+(#%fact call-with-output-bytes* '(foreign owned))
+
+(substrate-define (call-with-output-bytes proc) #:borrow (proc) (call-with-output-bytes* proc))
 
 (substrate-define (format form . args) (rt:format-value form args))
 (substrate-define (printf form . args) (rt:write-format-to (rt:stdout-port) '"printf" form args) '#f)
@@ -1229,12 +1377,12 @@
 
 ;; ---- the host: files, the command line, instantiating code ----
 
-(substrate-define (file->bytes path) (rt:file->bytes path))
-(substrate-define (file-exists? path) (bool (rt:file-exists? path)))
-(substrate-define (file->string path) (rt:file->string path))
-(substrate-define (display-to-file v path) (rt:display-to-file v path))
+(substrate-define (file->bytes path) #:borrow (path) (rt:file->bytes path))
+(substrate-define (file-exists? path) #:borrow (path) (bool (rt:file-exists? path)))
+(substrate-define (file->string path) #:borrow (path) (rt:file->string path))
+(substrate-define (display-to-file v path) #:borrow (v path) (rt:display-to-file v path))
 (substrate-define (current-command-line-arguments) (rt:command-line-arguments))
-(substrate-define instantiate
+(substrate-define instantiate #:borrow (name code imports)
   (substrate-case-lambda
     [(name code imports) (rt:instantiate-code name code imports)]
     [(name code) (rt:instantiate-code name code '())]))

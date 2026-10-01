@@ -77,13 +77,19 @@ on them there.
   - `runtime.sub`: what Substrate's code runs with, in the C-like Lisp:
     closures, boxes, vectors, byte strings, structs, hash tables, ports
     and exceptions as records of the kernel module's, their blocks in
-    memory; calls, errors, handlers, writing and the host. Nothing is
-    reclaimed: cells and blocks are made in the current arena, a
-    module's while it is compiled and the run's in a program.
-  - `lower.sub`: closures without the kernel's, in the C-like Lisp at
-    compile time: a function's body, once expanded, has each variable
-    some lambda captures and some code assigns boxed, and each lambda
-    lifted to a function of the closure and its parameters.
+    memory; calls, errors, handlers, writing and the host. In a program,
+    cells and blocks are made on the heap, owned, and a record's dropper
+    frees its block with what it holds; while a module is compiled they
+    are made in its arena, and nothing is reclaimed.
+  - `lower.sub`: closures without the kernel's, and ownership, in the
+    C-like Lisp at compile time. A function's body, once expanded, has
+    each variable some lambda captures and some code assigns boxed; a
+    local function that is only called lifted to a function of the
+    variables it captures and its arguments, called directly; and each
+    other lambda lifted to a function of the closure and its parameters.
+    Its values are owned: the last use of a variable moves its value, an
+    earlier use dups it, a variable never used again is dropped, and so
+    a program frees what it is done with (`tests/cells/live-cells.sub`).
   - `core.sub`: `substrate/core.sub` on i32 values and the runtime, and
     `define-syntax` whose transformer is Substrate code.
   - `substrate.sub`: `lib/substrate.sub`'s forms, `syntax-match` and
@@ -277,6 +283,25 @@ Substrate is built again in `substrate/` (plan, 5).
    program that frees (`enable-freeing!`, which the runtime calls as a
    program starts and the compiler never), `dup` and `drop`, a dropper
    per record kind, and fixnums in the datum itself; the compiler
-   builds itself in the same time. Next: Substrate's lowering owning
-   each value, with `dup` and `drop` as Bend's, so that a program frees
-   what it is done with.
+   builds itself in the same time. Then the lowering owning each value
+   (`lower.sub`): a function owns its parameters, unless `core.sub`
+   marks them `#:borrow`, as the primitives that only read theirs are,
+   and what it returns; the last use of a variable moves its value, an
+   earlier use dups it, a variable never used is dropped where it is
+   bound, a branch drops what only the other branch uses, and `set!`
+   drops what it replaces; what a function of the runtime's or the
+   kernel module's gives and takes, the pass reads from facts. A local
+   function that is only called is a kernel function of the variables
+   it captures, called directly, so a loop makes no closure and no box.
+   After each check of `tests/cells/live-cells.sub` no more cells are
+   in use than before it. On wasmtime a program on cells runs faster
+   than on `substrate/` with its GC: a list benchmark in 1.3 s against
+   2.1 s, one of closures, structs and a hash table in 0.32 s against
+   0.65 s; on V8, whose GC is fast, slower: 1.1 s against 0.16 s and
+   0.27 s against 0.07 s, so the cost is the runtime's own, a malloc and
+   a free per cell, a call per dup and drop, and the drop's stack, not
+   the host's. The typed example builds in 1.0 s, 0.7 s before the
+   pass. Next: the allocator and the drop's fast paths; the pass's time
+   at compile time; and what still leaks: a value a raise unwinds past,
+   and a closure that refers to itself through a box, as a letrec's that
+   escapes does.

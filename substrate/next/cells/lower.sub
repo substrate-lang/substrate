@@ -1,27 +1,61 @@
-;; Lifecycle: experimental. Closures for Substrate on cells (next/cells),
-;; at compile time, in the C-like Lisp: the kernel's lambda makes a GC
-;; closure, so Substrate makes its own, a record in memory (runtime.sub),
-;; by converting a function's body once it is fully expanded. core.sub
-;; wraps each function's body in substrate-body, whose expansion in the
-;; module's second pass calls convert-body here:
+;; Lifecycle: experimental. Closures and ownership for Substrate on cells
+;; (next/cells), at compile time, in the C-like Lisp. Substrate's values
+;; are the kernel module's cells, each with a count of owners (kernel.sub,
+;; dup and drop), so a program frees what it is done with, and the kernel's
+;; lambda makes a GC closure, so Substrate makes its own, a record in
+;; memory (runtime.sub). Both come from one pass over a function's body
+;; once it is fully expanded. core.sub wraps each function's body in
+;; substrate-body, whose expansion in the module's second pass calls
+;; convert-body here:
 ;;
 ;; 1. The body is expanded (local-expand). A Substrate lambda in it has
 ;;    expanded to the kernel's lambda form, left as a mark for this pass:
 ;;    core.sub's lambda asks in-pass? first.
-;; 2. A variable that some lambda captures and that is assigned anywhere
-;;    is boxed: its binding makes a box, its uses unbox it, and its
-;;    assignments set the box, so the lambda and the code around it share
-;;    it. Variables are told apart by local-binding (spec 2.3).
-;; 3. Each lambda, innermost first, is lifted to a module-level function
-;;    of the closure and its parameters, which reads the captured
-;;    variables from the closure, and replaced by code that makes the
-;;    closure with their values, boxes as they are.
+;; 2. The body is read (scan!): which variables are assigned, which some
+;;    lambda captures, and which are local functions: a variable bound to
+;;    a lambda, or to a literal and then assigned the lambda once, as
+;;    letrec and a named let expand, and only ever called, outside any
+;;    other closure. A variable that some lambda captures and that is
+;;    assigned anywhere is boxed: its binding makes a box, its uses unbox
+;;    it, and its assignments set the box, so the lambda and the code
+;;    around it share it. Variables are told apart by local-binding (spec
+;;    2.3).
+;; 3. The code is rewritten (rw), owning its values. A local function is
+;;    lifted to a module-level function of the variables it captures and
+;;    its arguments, and each call of it is a direct call; it has no
+;;    closure, and no box. Any other lambda, innermost first, is lifted to
+;;    a module-level function of the closure and its parameters, which
+;;    reads the captured variables from the closure, and replaced by code
+;;    that makes the closure with their values, boxes as they are.
+;;
+;; Ownership. A value has owners: the variables, closures, boxes, pairs
+;; and records that hold it, counted in its cell. A function owns its
+;; parameters and the value it returns; a closure owns itself and its
+;; captured values; a call of a function gives it the arguments. So in a
+;; body, the last use of a variable moves its value, an earlier use dups
+;; it, a variable never used is dropped where it is bound, a branch drops
+;; the variables only the other branch uses, set! drops the value it
+;; replaces, and a value in statement position is dropped. A parameter
+;; core.sub marks #:borrow is not owned: its caller keeps the value and
+;; the function only reads it. What a function gives, and what it does
+;; with its arguments, the pass reads from facts (spec 6.5): core.sub
+;; records (substrate-function b ...) for each Substrate function, b 1
+;; for a borrowed parameter; runtime.sub and core.sub record (foreign
+;; kind i ...) for a function of the kernel's or the C-like Lisp's whose
+;; result is kind, owned, borrowed, raw (not a value), void or diverges,
+;; and which takes ownership of arguments i ...; and C records (c-function
+;; types result) for every function, from which a result that is a datum
+;; is owned if runtime.sub's and borrowed otherwise. The kernel module's
+;; functions, which have no facts, are listed here (kernel-kind). A
+;; function of the kernel's about which nothing is known gives a value
+;; this pass takes a reference of its own to.
 ;;
 ;; A lambda outside such a body, in kernel code, is converted alone
-;; (convert-lambda): it captures the variables around it by value, boxed
-;; if it assigns them, so its calls share them with each other but not
-;; with the code around it. The names this pass makes are ctx's, the
-;; module of core.sub, so that they mean the runtime's functions there.
+;; (convert-lambda): it captures the variables around it by value, which
+;; must be Substrate values, boxed if it assigns them, so its calls share
+;; them with each other but not with the code around it. The names this
+;; pass makes are ctx's, the module of core.sub, so that they mean the
+;; runtime's functions there.
 
 (require-unqualified c "../c/c.sub")
 (require-unqualified kd "../compiler/kernel.sub")
@@ -38,11 +72,35 @@
 ;; The context the names of forms and runtime functions are made in.
 (define ctx datum 0)
 
-;; The variables assigned, and those captured by a lambda, by id.
-(define assigned (ptr arena-table) 0)
-(define captured (ptr arena-table) 0)
-
 (define counter i32 0)
+
+;; The functions lifted so far, latest first: lifted together once the
+;; body is converted, since the kernel declares all of one lifted form's
+;; functions before it expands any, and local functions call each other.
+(define lifts datum 0)
+
+;; ---- what the analysis finds, by variable id ----
+
+(define assigned (ptr arena-table) 0)      ; assigned anywhere
+(define captured (ptr arena-table) 0)      ; free in some lambda
+(define set-count (ptr arena-table) 0)     ; how many set!s
+(define set-rhs (ptr arena-table) 0)       ; the lambda its one set! gives it
+(define candidate (ptr arena-table) 0)     ; the lambda a local function may run
+(define other-refs (ptr arena-table) 0)    ; references that are not calls
+(define bind-chain (ptr arena-table) 0)    ; the lambdas its binding is in, innermost first
+(define direct (ptr arena-table) 0)        ; a local function
+(define direct-caps (ptr arena-table) 0)   ; the variables a local function captures
+
+;; Lambdas, by index from 1: the mark, the local function it defines if
+;; any, and its free variables.
+(define lambda-count i32 0)
+(define lambda-index (ptr arena-table) 0)
+(define marker-of (ptr arena-table) 0)
+(define marker-owner (ptr arena-table) 0)
+(define marker-free (ptr arena-table) 0)
+
+;; Each call of a variable: (id . chain), the lambdas it is in.
+(define call-sites datum 0)
 
 ;; ---- names and forms ----
 
@@ -60,7 +118,17 @@
 (define (marked? [t (ptr arena-table)] [id i32]) -> i32
   (and (!= id -1) (!= (table-ref t (key id)) 0)))
 
-(define (boxed? [id i32]) -> i32 (and (marked? assigned id) (marked? captured id)))
+(define (count! [t (ptr arena-table)] [id i32])
+  (when (!= id -1) (table-set! t (key id) (+ (table-ref t (key id)) 1))))
+
+(define (put! [t (ptr arena-table)] [id i32] [d datum])
+  (when (!= id -1) (table-set! t (key id) (cast u32 d))))
+
+(define (get [t (ptr arena-table)] [id i32]) -> datum
+  (if (== id -1) 0 (cast datum (table-ref t (key id)))))
+
+(define (boxed? [id i32]) -> i32
+  (and (marked? assigned id) (marked? captured id) (not (marked? direct id))))
 
 (define (named [name datum] [loc datum]) -> datum (datum->syntax ctx name loc))
 
@@ -76,8 +144,10 @@
 ;; A form's elements, as a list of syntax.
 (define (parts [s datum]) -> datum (syntax->list s))
 
+(define (list1 [a datum]) -> datum (cons a nil))
 (define (list2 [a datum] [b datum]) -> datum (cons a (cons b nil)))
 (define (list3 [a datum] [b datum] [c datum]) -> datum (cons a (cons b (cons c nil))))
+(define (list4 [a datum] [b datum] [c datum] [d datum]) -> datum (cons a (cons b (cons c (cons d nil)))))
 
 ;; Is form s one whose inside is data, not code?
 (define (data-form? [s datum]) -> i32
@@ -86,6 +156,31 @@
 ;; Is s a form whose elements are code?
 (define (code-form? [s datum]) -> i32
   (and (syntax? s) (pair? (syntax-e s)) (not (data-form? s))))
+
+(define (lambda-form? [s datum]) -> i32 (form? s (sym lambda)))
+
+;; Does list l of integers hold id?
+(define (has-id? [l datum] [id i32]) -> i32
+  (while (pair? l)
+    (when (== (cast i32 (integer-value (car l))) id) (return 1))
+    (set! l (cdr l)))
+  0)
+
+(define (add-id [l datum] [id i32]) -> datum
+  (if (has-id? l id) l (cons (make-integer id) l)))
+
+(define (union-ids [a datum] [b datum]) -> datum
+  (while (pair? b)
+    (set! a (add-id a (cast i32 (integer-value (car b)))))
+    (set! b (cdr b)))
+  a)
+
+;; The error message at s.
+(define (fail [message datum] [s datum]) -> i32
+  (raise-syntax-error (sym substrate) message s)
+  0)
+
+(define (fail-datum [message datum] [s datum]) -> datum (cast datum (fail message s)))
 
 ;; ---- lambdas: their parts ----
 
@@ -121,7 +216,19 @@
           [(== h (sym catch-all-ref)) (cddr l)]
           [else (cdr l)])))
 
-;; ---- what a body binds, assigns and captures ----
+;; A call of a closure, as core.sub's app writes it: (call-indirect sig
+;; (#%app rt:closure-code x) x n a0 a1 a2 a3). The id of x, or -1.
+(define (call-head-id [s datum]) -> i32
+  (unless (form? s (sym call-indirect)) (return -1))
+  (let ([l (parts s)])
+    (unless (== (length l) 9) (return -1))
+    (let ([code (caddr l)] [head (cadddr l)])
+      (unless (and (form? code (sym #%app)) (== (length (parts code)) 3)) (return -1))
+      (unless (and (identifier? (cadr (parts code))) (== (syntax-e (cadr (parts code))) (sym rt:closure-code))) (return -1))
+      (let ([id (id-of head)])
+        (if (and (!= id -1) (== (id-of (caddr (parts code))) id)) id -1)))))
+
+;; ---- what a body binds ----
 
 ;; Every variable bound in s, and its labels, marked in t.
 (define (mark-bound! [s datum] [t (ptr arena-table)])
@@ -133,7 +240,7 @@
              (mark-bound! (binding-init (car bs)) t)
              (set! bs (cdr bs))))
          (mark-each! (cddr (parts s)) t)]
-        [(form? s (sym lambda))
+        [(lambda-form? s)
          (let* ([lp (lambda-parts s)] [ps (parts (car lp))])
            (while (pair? ps)
              (mark! t (id-of (param-name (car ps))))
@@ -186,149 +293,1022 @@
     (mark-bound! s bound)
     (reverse (free-refs s bound seen nil))))
 
-;; What s assigns and what its lambdas capture, marked in assigned and
-;; captured.
-(define (gather! [s datum])
-  (cond [(data-form? s) (begin)]
-        [(form? s (sym set!))
-         (mark! assigned (id-of (cadr (parts s))))
-         (gather! (caddr (parts s)))]
-        [(form? s (sym lambda))
-         (let ([rs (free-of s)])
-           (while (pair? rs)
-             (mark! captured (cast i32 (integer-value (car (car rs)))))
-             (set! rs (cdr rs))))
-         (gather-each! (caddr (lambda-parts s)))]
-        [(code-form? s) (gather-each! (parts s))]))
-
-(define (gather-each! [l datum])
-  (while (pair? l)
-    (gather! (car l))
-    (set! l (cdr l))))
-
-;; ---- rewriting ----
-;;
-;; env: for each variable in scope, by id, (boxed . name): whether it is
-;; boxed, and the identifier its uses are written with, which in a lifted
-;; function is the name the captured value is read into.
-
-(define (lookup [env datum] [id i32]) -> datum
-  (while (pair? env)
-    (when (== (cast i32 (integer-value (car (car env)))) id) (return (cdr (car env))))
-    (set! env (cdr env)))
-  0)
-
-(define (bind [env datum] [id i32] [boxed i32] [name datum]) -> datum
-  (cons (cons (make-integer id) (cons (make-integer boxed) name)) env))
-
-(define (entry-boxed? [e datum]) -> i32 (!= (integer-value (car e)) 0))
-(define (entry-name [e datum]) -> datum (cdr e))
-
-;; s rewritten under env.
-(define (rewrite [s datum] [env datum]) -> datum
-  (cond [(data-form? s) s]
-        [(identifier? s)
-         (let ([e (lookup env (id-of s))])
-           (cond [(== e 0) s]
-                 [(entry-boxed? e) (datum->syntax ctx (list2 (named (sym rt:unbox) s) (entry-name e)) s)]
-                 [else (entry-name e)]))]
-        [(form? s (sym set!))
-         (let* ([l (parts s)] [x (cadr l)] [v (rewrite (caddr l) env)] [e (lookup env (id-of x))])
-           (cond [(== e 0) (syntax-rewrap s (list3 (car l) x v))]
-                 [(entry-boxed? e) (datum->syntax ctx (list3 (named (sym rt:set-box!) s) (entry-name e) v) s)]
-                 [else (syntax-rewrap s (list3 (car l) (entry-name e) v))]))]
-        [(form? s (sym let)) (rewrite-let s env)]
-        [(form? s (sym lambda)) (rewrite-lambda s env)]
-        [(form? s (sym try)) (rewrite-try s env)]
-        [(code-form? s) (syntax-rewrap s (rewrite-each (parts s) env))]
-        [else s]))
-
-(define (rewrite-each [l datum] [env datum]) -> datum
+;; The ids of l, a list of (id . identifier).
+(define (ids-of [l datum]) -> datum
   (let ([acc nil])
     (while (pair? l)
-      (set! acc (cons (rewrite (car l) env) acc))
+      (set! acc (cons (car (car l)) acc))
       (set! l (cdr l)))
     (reverse acc)))
 
-;; [x i32 (make-box v)], located at loc.
-(define (box-binding [x datum] [v datum] [loc datum]) -> datum
-  (datum->syntax ctx (list3 x (named (sym i32) loc) (list2 (named (sym rt:make-box) loc) v)) loc))
+;; ---- the analysis ----
 
-;; (let ([x init] ...) body ...): a boxed variable's binding makes the
-;; box.
-(define (rewrite-let [s datum] [env datum]) -> datum
-  (let* ([l (parts s)] [bs (parts (cadr l))] [inner env] [news nil])
+;; The index of lambda mark m, given when first asked.
+(define (index-of-lambda [m datum]) -> i32
+  (let ([k (cast i32 (table-ref lambda-index (cast u64 m)))])
+    (when (== k 0)
+      (+= lambda-count 1)
+      (set! k lambda-count)
+      (table-set! lambda-index (cast u64 m) (cast u32 k))
+      (table-set! marker-of (cast u64 k) (cast u32 m)))
+    k))
+
+(define (lambda-at [k i32]) -> datum (cast datum (table-ref marker-of (cast u64 k))))
+
+;; What s binds, assigns, captures and calls, in the lambdas chain
+;; (indexes, innermost first).
+(define (scan! [s datum] [chain datum])
+  (cond [(data-form? s) (begin)]
+        [(identifier? s) (count! other-refs (id-of s))]
+        [(!= (call-head-id s) -1)
+         (set! call-sites (cons (cons (make-integer (call-head-id s)) chain) call-sites))
+         (scan-each! (cdr (cdddr (parts s))) chain)]
+        [(form? s (sym set!))
+         (let* ([l (parts s)] [id (id-of (cadr l))] [rhs (caddr l)])
+           (mark! assigned id)
+           (count! set-count id)
+           (when (lambda-form? rhs) (put! set-rhs id rhs))
+           (scan! rhs chain))]
+        [(form? s (sym let)) (scan-let! s chain)]
+        [(lambda-form? s)
+         (let* ([k (index-of-lambda s)] [inner (cons (make-integer k) chain)] [lp (lambda-parts s)]
+                [ps (parts (car lp))] [rs (free-of s)])
+           (table-set! marker-free (cast u64 k) (cast u32 (ids-of rs)))
+           (while (pair? rs)
+             (mark! captured (cast i32 (integer-value (car (car rs)))))
+             (set! rs (cdr rs)))
+           (while (pair? ps)
+             (put! bind-chain (id-of (param-name (car ps))) inner)
+             (set! ps (cdr ps)))
+           (scan-each! (caddr lp) inner))]
+        [(form? s (sym try))
+         (let ([cs (parts (cadr (parts s)))])
+           (while (pair? cs)
+             (let ([xs (clause-binders (car cs))])
+               (while (pair? xs)
+                 (put! bind-chain (id-of (car xs)) chain)
+                 (set! xs (cdr xs))))
+             (scan-each! (clause-body (car cs)) chain)
+             (set! cs (cdr cs))))
+         (scan-each! (cddr (parts s)) chain)]
+        [(or (form? s (sym br)) (form? s (sym br-if))) (scan-each! (cddr (parts s)) chain)]
+        [(or (form? s (sym block)) (form? s (sym loop))) (scan-each! (cddr (parts s)) chain)]
+        [(code-form? s) (scan-each! (parts s) chain)]))
+
+(define (scan-each! [l datum] [chain datum])
+  (while (pair? l)
+    (scan! (car l) chain)
+    (set! l (cdr l))))
+
+;; (let ([x init] ...) body ...): x bound to a lambda, or to a literal
+;; and given a lambda by a set! among the body's forms, may be a local
+;; function.
+(define (scan-let! [s datum] [chain datum])
+  (let* ([l (parts s)] [bs (parts (cadr l))] [body (cddr l)])
     (while (pair? bs)
-      (let* ([b (car bs)] [x (binding-name b)] [id (id-of x)] [init (rewrite (binding-init b) env)])
-        (cond [(boxed? id)
-               (set! inner (bind inner id 1 x))
-               (set! news (cons (box-binding x init b) news))]
-              [else
-               (set! inner (bind inner id 0 x))
-               (set! news (cons (syntax-rewrap b (cons x (append (binding-type b) (cons init nil)))) news))]))
+      (let* ([b (car bs)] [x (binding-name b)] [id (id-of x)] [init (binding-init b)])
+        (put! bind-chain id chain)
+        (cond [(lambda-form? init) (candidate! id init)]
+              [(data-form? init)
+               (let ([forms body])
+                 (while (pair? forms)
+                   (let ([f (car forms)])
+                     (when (and (form? f (sym set!)) (== (id-of (cadr (parts f))) id) (lambda-form? (caddr (parts f))))
+                       (candidate! id (caddr (parts f)))))
+                   (set! forms (cdr forms))))])
+        (scan! init chain))
       (set! bs (cdr bs)))
-    (syntax-rewrap s (cons (car l) (cons (syntax-rewrap (cadr l) (reverse news)) (rewrite-each (cddr l) inner))))))
+    (scan-each! body chain)))
 
-(define (rewrite-try [s datum] [env datum]) -> datum
+(define (candidate! [id i32] [m datum])
+  (put! candidate id m)
+  (table-set! marker-owner (cast u64 (index-of-lambda m)) (cast u32 (+ id 1))))
+
+;; The local functions: each candidate that is only called, every call
+;; in its own lambda, in the body it is bound in, or in another local
+;; function's lambda, until that holds of all of them.
+(define (find-direct!)
+  (let ([ids nil] [sites call-sites] [changed 1])
+    ;; Each candidate that is only called, and assigned at most the once.
+    (while (pair? sites)
+      (let* ([id (cast i32 (integer-value (car (car sites))))] [m (get candidate id)])
+        (when (and (!= m 0) (not (marked? direct id)) (not (marked? other-refs id))
+                   (or (and (== (table-ref set-count (key id)) 0) (not (data-form? m)))
+                       (and (== (table-ref set-count (key id)) 1) (== (get set-rhs id) m))))
+          (mark! direct id)
+          (set! ids (add-id ids id))))
+      (set! sites (cdr sites)))
+    (while changed
+      (set! changed 0)
+      (set! sites call-sites)
+      (while (pair? sites)
+        (let* ([id (cast i32 (integer-value (car (car sites))))] [chain (cdr (car sites))])
+          (when (and (marked? direct id) (not (direct-call-ok? id chain)))
+            (table-set! direct (key id) 0)
+            (set! changed 1)))
+        (set! sites (cdr sites))))
+    (set! sites ids)
+    (while (pair? sites)
+      (let ([id (cast i32 (integer-value (car sites)))])
+        (when (marked? direct id)
+          (put! direct-caps id (own-free id))))
+      (set! sites (cdr sites)))
+    (close-caps!)))
+
+;; Is a call of local function id, in the lambdas chain, direct: every
+;; lambda from its binding's to the call its own or a local function's?
+(define (direct-call-ok? [id i32] [chain datum]) -> i32
+  (let* ([own (index-of-lambda (get candidate id))] [bound (get bind-chain id)] [n (- (length chain) (length bound))])
+    (while (> n 0)
+      (let* ([k (cast i32 (integer-value (car chain)))] [owner (cast i32 (table-ref marker-owner (cast u64 k)))])
+        (unless (or (== k own) (and (!= owner 0) (marked? direct (- owner 1)))) (return 0)))
+      (set! chain (cdr chain))
+      (-= n 1))
+    1))
+
+;; The variables local function id's lambda refers to, other than local
+;; functions.
+(define (own-free [id i32]) -> datum
+  (let ([l (cast datum (table-ref marker-free (cast u64 (index-of-lambda (get candidate id)))))] [acc nil])
+    (while (pair? l)
+      (let ([v (cast i32 (integer-value (car l)))])
+        (unless (or (== v id) (marked? direct v)) (set! acc (add-id acc v))))
+      (set! l (cdr l)))
+    acc))
+
+;; Each local function captures what the local functions it calls, bound
+;; outside it, capture, until nothing changes.
+(define (close-caps!)
+  (let ([changed 1])
+    (while changed
+      (set! changed 0)
+      (let ([sites call-sites])
+        (while (pair? sites)
+          (let* ([z (cast i32 (integer-value (car (car sites))))] [chain (cdr (car sites))])
+            (when (marked? direct z)
+              ;; Each local function whose lambda the call is in.
+              (while (pair? chain)
+                (let* ([k (cast i32 (integer-value (car chain)))] [owner (cast i32 (table-ref marker-owner (cast u64 k)))])
+                  (when (and (!= owner 0) (marked? direct (- owner 1)) (!= (- owner 1) z))
+                    (let* ([x (- owner 1)] [before (get direct-caps x)] [after (add-caps before (get direct-caps z) (lambda-at k) x)])
+                      (unless (== (length before) (length after))
+                        (put! direct-caps x after)
+                        (set! changed 1)))))
+                (set! chain (cdr chain)))))
+          (set! sites (cdr sites)))))))
+
+;; caps with those of more not bound in lambda m and not x.
+(define (add-caps [caps datum] [more datum] [m datum] [x i32]) -> datum
+  (let ([bound (make-table)])
+    (mark-bound! m bound)
+    (while (pair? more)
+      (let ([v (cast i32 (integer-value (car more)))])
+        (unless (or (== v x) (marked? bound v)) (set! caps (add-id caps v))))
+      (set! more (cdr more)))
+    caps))
+
+;; ---- uses ----
+
+;; Does s use variable id: refer to it, or call a local function that
+;; captures it?
+(define (uses? [s datum] [id i32]) -> i32
+  (cond [(data-form? s) 0]
+        [(identifier? s)
+         (let ([v (id-of s)])
+           (cond [(== v -1) 0]
+                 [(== v id) 1]
+                 [(marked? direct v) (has-id? (get direct-caps v) id)]
+                 [else 0]))]
+        ;; The lambda a local function is given is not run here.
+        [(form? s (sym set!))
+         (let* ([l (parts s)] [x (id-of (cadr l))])
+           (cond [(marked? direct x) 0]
+                 [(uses? (caddr l) id) 1]
+                 [else (and (boxed? id) (== x id))]))]
+        [(form? s (sym let))
+         (let ([bs (parts (cadr (parts s)))])
+           (while (pair? bs)
+             (when (and (not (marked? direct (id-of (binding-name (car bs))))) (uses? (binding-init (car bs)) id)) (return 1))
+             (set! bs (cdr bs)))
+           (uses-any? (cddr (parts s)) id))]
+        [(or (form? s (sym br)) (form? s (sym br-if))) (uses-any? (cddr (parts s)) id)]
+        [(code-form? s) (uses-any? (parts s) id)]
+        [else 0]))
+
+(define (uses-any? [l datum] [id i32]) -> i32
+  (while (pair? l)
+    (when (uses? (car l) id) (return 1))
+    (set! l (cdr l)))
+  0)
+
+;; The variables s uses, onto acc.
+(define (uses-into [s datum] [acc datum]) -> datum
+  (cond [(data-form? s) acc]
+        [(identifier? s)
+         (let ([v (id-of s)])
+           (cond [(== v -1) acc]
+                 [(marked? direct v) (union-ids acc (get direct-caps v))]
+                 [else (add-id acc v)]))]
+        [(form? s (sym set!))
+         (let* ([l (parts s)] [id (id-of (cadr l))])
+           (cond [(marked? direct id) acc]
+                 [(boxed? id) (add-id (uses-into (caddr l) acc) id)]
+                 [else (uses-into (caddr l) acc)]))]
+        [(form? s (sym let))
+         (let ([bs (parts (cadr (parts s)))])
+           (while (pair? bs)
+             (unless (marked? direct (id-of (binding-name (car bs))))
+               (set! acc (uses-into (binding-init (car bs)) acc)))
+             (set! bs (cdr bs)))
+           (uses-each-into (cddr (parts s)) acc))]
+        [(or (form? s (sym br)) (form? s (sym br-if))) (uses-each-into (cddr (parts s)) acc)]
+        [(code-form? s) (uses-each-into (parts s) acc)]
+        [else acc]))
+
+(define (uses-each-into [l datum] [acc datum]) -> datum
+  (while (pair? l)
+    (set! acc (uses-into (car l) acc))
+    (set! l (cdr l)))
+  acc)
+
+;; ---- the environment ----
+;;
+;; For each variable in scope, by id: (id boxed kind name): whether it is
+;; boxed; its kind; and the identifier its uses are written with, which
+;; in a lifted function is the name the captured value is read into, and
+;; for a local function the lifted function's name.
+
+(define k-owned i32 0)      ; owns its value
+(define k-slot i32 1)       ; an argument of a closure's code: owned, moved once, never dropped
+(define k-raw i32 2)        ; a value this pass does not own: nothing is done to it
+(define k-borrowed i32 3)   ; a parameter marked #:borrow: its caller owns the value
+(define k-direct i32 4)     ; a local function
+
+(define (lookup [env datum] [id i32]) -> datum
+  (when (== id -1) (return 0))
+  (while (pair? env)
+    (when (== (cast i32 (integer-value (car (car env)))) id) (return (car env)))
+    (set! env (cdr env)))
+  0)
+
+(define (bind [env datum] [id i32] [boxed i32] [kind i32] [name datum]) -> datum
+  (cons (list4 (make-integer id) (make-integer boxed) (make-integer kind) name) env))
+
+(define (entry-boxed? [e datum]) -> i32 (!= (integer-value (cadr e)) 0))
+(define (entry-kind [e datum]) -> i32 (cast i32 (integer-value (caddr e))))
+(define (entry-name [e datum]) -> datum (cadddr e))
+
+;; Does entry e own its value?
+(define (entry-owns? [e datum]) -> i32
+  (or (== (entry-kind e) k-owned) (== (entry-kind e) k-slot)))
+
+;; ---- kinds of expressions ----
+;;
+;; What an expression gives: a value it owns, a value owned by another (a
+;; variable's or a box's, say), a value this pass does not own (a count,
+;; or a function's about which nothing is known), a literal, which is
+;; permanent, nothing, or no return.
+
+(define e-owned i32 0)
+(define e-borrowed i32 1)
+(define e-raw i32 2)
+(define e-lit i32 3)
+(define e-void i32 4)
+(define e-div i32 5)
+
+;; What a function gives and takes: (substrate? result borrowed-or-consumed),
+;; for a Substrate function the flags of its borrowed parameters, for
+;; another the positions of the arguments it takes ownership of.
+(struct callee [substrate i32] [result i32] [positions datum] [known i32] [kernel i32] [typed i32])
+
+(define (callee-of [f datum]) -> (ptr callee)
+  (let ([c (cast (ptr callee) (alloc-in (current-arena) (sizeof callee)))])
+    (set! (-> c substrate) 0)
+    (set! (-> c result) e-raw)
+    (set! (-> c positions) nil)
+    (set! (-> c known) 0)
+    (set! (-> c kernel) 0)
+    (set! (-> c typed) 0)
+    (read-facts! c f)
+    (when (and (not (-> c known)) (identifier? f) (!= (id-of f) -1))
+      (fail '"a variable is called directly" f))
+    (unless (-> c known) (kernel-kind! c f))
+    c))
+
+;; The symbol of a result kind.
+(define (kind-named [k datum]) -> i32
+  (cond [(== k (sym owned)) e-owned]
+        [(== k (sym borrowed)) e-borrowed]
+        [(== k (sym raw)) e-raw]
+        [(== k (sym void)) e-void]
+        [(== k (sym diverges)) e-div]
+        [else -1]))
+
+;; Is C type t the datum type, (ptr (struct ... cell))?
+(define (datum-type? [t datum]) -> i32
+  (and (pair? t) (== (car t) (sym ptr)) (pair? (cdr t)) (pair? (cadr t))
+       (== (car (cadr t)) (sym struct)) (== (last (cadr t)) (sym cell))))
+
+;; Does string s end with the C string suffix?
+(define (ends-with? [s datum] [suffix (ptr u8)]) -> i32
+  (let ([n (string-length s)] [m (strlen suffix)])
+    (and (>= n m) (== (memcmp (+ (string-bytes s) (- n m)) suffix m) 0))))
+
+;; c filled from the facts about f, a foreign fact first, then a Substrate
+;; function's, then C's.
+(define (read-facts! [c (ptr callee)] [f datum])
+  ;; The kernel module's definitions have no facts: asking is an error,
+  ;; which tells them apart.
+  (let ([fs (try (syntax-local-facts f) [catch compile-error (m x l) (begin (set! (-> c kernel) 1) nil)])]
+        [cfact datum 0] [sfact datum 0])
+    (while (pair? fs)
+      (let* ([entry (car fs)] [v (syntax->datum (caddr entry))])
+        (when (pair? v)
+          (cond [(== (car v) (sym foreign))
+                 (set! (-> c known) 1)
+                 (set! (-> c result) (kind-named (cadr v)))
+                 (when (< (-> c result) 0) (fail '"a foreign fact names an unknown kind of result" f))
+                 (set! (-> c positions) (cddr v))
+                 (return)]
+                [(== (car v) (sym substrate-function)) (set! sfact v)]
+                [(== (car v) (sym c-function)) (set! cfact entry)])))
+      (set! fs (cdr fs)))
+    (cond [(!= sfact 0)
+           (set! (-> c known) 1)
+           (set! (-> c substrate) 1)
+           (set! (-> c result) e-owned)
+           (set! (-> c positions) (cdr sfact))]
+          [(!= cfact 0)
+           ;; The kernel module's own, kernel.sub's, are known by name
+           ;; (kernel-kind!), the C fact giving what an unlisted one gives.
+           (let* ([v (syntax->datum (caddr cfact))] [r (caddr v)] [path (symbol->string (car cfact))])
+             (if (ends-with? path "compiler/kernel.sub")
+                 (set! (-> c kernel) 1)
+                 (set! (-> c known) 1))
+             (set! (-> c typed) 1)
+             (set! (-> c result)
+                   (cond [(== r (sym void)) e-void]
+                         [(datum-type? r) (if (ends-with? path "cells/runtime.sub") e-owned e-borrowed)]
+                         [else e-raw])))])))
+
+;; The kernel module's functions a Substrate body may call, by name, with
+;; what each gives, and the arguments it takes (cons both); and a kernel
+;; function of some module's about which nothing is known. A function
+;; that makes syntax, or a list of a syntax object's parts, shares what
+;; it is given without counting, so its result is borrowed: taken at run
+;; time, it would be kept, never freed; at compile time nothing is.
+(define (kernel-kind! [c (ptr callee)] [f datum])
+  (let ([n (if (and (identifier? f) (-> c kernel)) (bare-name (syntax-e f)) 0)])
+    (set! (-> c known) 1)
+    (cond [(== n (sym cons)) (set! (-> c result) e-owned) (set! (-> c positions) (list2 (make-integer 0) (make-integer 1)))]
+          [(or (== n (sym dup)) (== n (sym make-integer)) (== n (sym integer->char))
+               (== n (sym symbol->string)) (== n (sym keyword->string))
+               (== n (sym string->symbol)) (== n (sym string->keyword))
+               (== n (sym local-binding)) (== n (sym syntax-line)) (== n (sym syntax-column)))
+           (set! (-> c result) e-owned)]
+          [(or (== n (sym car)) (== n (sym cdr)) (== n (sym unsafe-car)) (== n (sym unsafe-cdr))
+               (== n (sym syntax-e)) (== n (sym splice-list)) (== n (sym syntax-property))
+               (== n (sym syntax-local-value)) (== n (sym transformer-env)) (== n (sym syntax-source))
+               (== n (sym identifier-binding-kind))
+               (== n (sym datum->syntax)) (== n (sym syntax-rewrap)) (== n (sym syntax-property-set))
+               (== n (sym syntax->list)) (== n (sym syntax->datum)) (== n (sym local-expand))
+               (== n (sym syntax-local-introduce)) (== n (sym syntax-local-facts))
+               (== n (sym identifier-function-signature)) (== n (sym identifier-name))
+               (== n (sym name-identifier)) (== n (sym syntax-local-lift-definition)))
+           (set! (-> c result) e-borrowed)]
+          [(or (== n (sym pair?)) (== n (sym null?)) (== n (sym list?)) (== n (sym boolean?))
+               (== n (sym integer?)) (== n (sym flonum?)) (== n (sym fixnum?)) (== n (sym char?))
+               (== n (sym string?)) (== n (sym symbol?)) (== n (sym keyword?)) (== n (sym syntax?))
+               (== n (sym identifier?)) (== n (sym transformer?)) (== n (sym free-identifier=?))
+               (== n (sym string-length)) (== n (sym string-byte)) (== n (sym live-cells))
+               (== n (sym length)))
+           (set! (-> c result) e-raw)]
+          [(== n (sym raise-syntax-error)) (set! (-> c result) e-div)]
+          [(== n (sym drop)) (set! (-> c result) e-void)]
+          ;; An unlisted function of kernel.sub's: as its C fact says.
+          [(-> c typed) (begin)]
+          [else
+           ;; A function about which nothing is known: a value of another's
+           ;; if it gives one.
+           (let ([sig (identifier-function-signature f)])
+             (while (and (pair? sig) (!= (car sig) (sym ->))) (set! sig (cdr sig)))
+             (set! (-> c result) (if (and (pair? sig) (pair? (cdr sig))) e-borrowed e-void)))])))
+
+;; Symbol n without a qualifier, kd:cons's cons: the name after its colon.
+(define (bare-name [n datum]) -> datum
+  (let* ([s (symbol->string n)] [p (string-bytes s)] [len (string-length s)] [i u32 0])
+    (while (< i len)
+      (when (== (@ p i) 58)
+        (return (string->symbol (bytes->string (+ p (+ i 1)) (- len (+ i 1))))))
+      (+= i 1))
+    n))
+
+;; Does the callee take ownership of argument i (from 0)?
+(define (takes? [c (ptr callee)] [i i32]) -> i32
+  (if (-> c substrate)
+      (let ([l (-> c positions)] [k i])
+        (while (and (> k 0) (pair? l)) (set! l (cdr l)) (-= k 1))
+        (or (null? l) (== (integer-value (car l)) 0)))
+      (has-id? (-> c positions) i)))
+
+;; Is identifier x a global variable or a function with a value?
+(define (global? [x datum]) -> i32
+  (let ([k (identifier-binding-kind x)])
+    (or (== k (sym variable)) (== k (sym function)))))
+
+;; Two kinds in the branches of one if.
+(define (join-kinds [a i32] [b i32] [s datum]) -> i32
+  (cond [(== a b) a]
+        [(== a e-div) b]
+        [(== b e-div) a]
+        [(== a e-lit) b]
+        [(== b e-lit) a]
+        [(== a e-void) b]
+        [(== b e-void) a]
+        [(and (== a e-owned) (== b e-borrowed)) e-owned]
+        [(and (== a e-borrowed) (== b e-owned)) e-owned]
+        [else (fail '"one branch gives a value the program owns and the other one it does not" s)]))
+
+;; The kind of s, under env; live: the variables used after it.
+(define (kind-of [s datum] [env datum] [live datum]) -> i32
+  (cond [(data-form? s) e-lit]
+        [(identifier? s)
+         (let ([e (lookup env (id-of s))])
+           (cond [(!= e 0)
+                  (let ([k (entry-kind e)])
+                    (cond [(or (== k k-owned) (== k k-slot)) e-owned]
+                          [(== k k-raw) e-raw]
+                          [(== k k-borrowed) e-borrowed]
+                          [else (fail '"a local function is used as a value" s)]))]
+                 [(!= (id-of s) -1) e-borrowed]
+                 [(global? s) e-borrowed]
+                 [else e-raw]))]
+        [(form? s (sym set!)) e-void]
+        [(form? s (sym begin))
+         (let ([l (cdr (parts s))])
+           (if (null? l) e-void (kind-of (last l) env live)))]
+        [(form? s (sym let))
+         (let ([body (cddr (parts s))])
+           (if (null? body) e-void (kind-of (last body) (let-env s env) live)))]
+        [(form? s (sym if))
+         (let ([l (cdr (parts s))])
+           (if (== (length l) 3)
+               (join-kinds (kind-of (cadr l) env live) (kind-of (caddr l) env live) s)
+               e-void))]
+        [(lambda-form? s) e-owned]
+        [(form? s (sym try))
+         (let ([body (cddr (parts s))])
+           (if (null? body) e-void (kind-of (last body) env live)))]
+        [(or (form? s (sym return)) (form? s (sym br)) (form? s (sym br-if)) (form? s (sym unreachable))
+             (form? s (sym throw)) (form? s (sym throw-ref)))
+         e-div]
+        [(or (form? s (sym drop)) (form? s (sym nop))) e-void]
+        [(form? s (sym call-indirect)) e-owned]
+        [(form? s (sym #%app))
+         (let* ([l (cdr (parts s))] [c (callee-of (car l))])
+           (if (and (== (-> c result) e-borrowed) (cleanup? (cdr l) c env live)) e-owned (-> c result)))]
+        [(or (form? s (sym block)) (form? s (sym loop)))
+         (fail '"a Substrate body cannot hold a block or loop of the kernel's; write it as a kernel function" s)]
+        [(code-form? s) e-raw]
+        [else e-raw]))
+
+;; The environment inside let s: its variables bound, each of the kind its
+;; init gives, as rw-let binds them.
+(define (let-env [s datum] [env datum]) -> datum
+  (let ([bs (parts (cadr (parts s)))] [inner env])
+    (while (pair? bs)
+      (let* ([b (car bs)] [id (id-of (binding-name b))])
+        (unless (marked? direct id)
+          (set! inner (bind inner id (boxed? id) (variable-kind (binding-init b) env nil b) (binding-name b)))))
+      (set! bs (cdr bs)))
+    inner))
+
+;; The kind of a variable whose init is s: raw for a value this pass does
+;; not own, owned otherwise.
+(define (variable-kind [s datum] [env datum] [live datum] [where datum]) -> i32
+  (let ([k (kind-of s env live)])
+    (cond [(== k e-raw) k-raw]
+          [(== k e-void) (fail '"this expression gives no value" where)]
+          [else k-owned])))
+
+;; Would the arguments args of a call of c, under env with live, leave
+;; anything to drop after the call: a value made for it, or a variable
+;; used for the last time?
+(define (cleanup? [args datum] [c (ptr callee)] [env datum] [live datum]) -> i32
+  (let ([i 0])
+    (while (pair? args)
+      (let ([a (car args)])
+        (unless (takes? c i)
+          (let ([e (lookup env (id-of a))])
+            (cond [(identifier? a)
+                   (when (and (!= e 0) (entry-owns? e) (not (has-id? live (id-of a))) (not (uses-any? (cdr args) (id-of a))))
+                     (return 1))]
+                  [(== (kind-of a env (uses-each-into (cdr args) live)) e-owned) (return 1)]))))
+      (+= i 1)
+      (set! args (cdr args)))
+    0))
+
+;; ---- rewriting ----
+
+(define m-owned i32 0)   ; the value, owned
+(define m-any i32 1)     ; the value as the expression gives it, for a use within one operation
+(define m-stmt i32 2)    ; no value: dropped if owned
+
+(define (dup-code [e datum] [loc datum]) -> datum
+  (datum->syntax ctx (list2 (named (sym dup-value) loc) e) loc))
+
+(define (drop-code [e datum] [loc datum]) -> datum
+  (datum->syntax ctx (list2 (named (sym drop-value) loc) e) loc))
+
+(define (unbox-code [x datum] [loc datum]) -> datum
+  (datum->syntax ctx (list2 (named (sym rt:unbox) loc) x) loc))
+
+;; (begin pre ... e), or e alone.
+(define (sequence-code [pre datum] [e datum] [loc datum]) -> datum
+  (if (null? pre) e (datum->syntax ctx (cons (named (sym begin) loc) (append pre (list1 e))) loc)))
+
+;; (let (bindings) body ...), or the body alone if there are none.
+(define (let-code [bindings datum] [body datum] [loc datum]) -> datum
+  (cond [(and (null? bindings) (== (length body) 1)) (car body)]
+        [(null? bindings) (datum->syntax ctx (cons (named (sym begin) loc) body) loc)]
+        [else (datum->syntax ctx (cons (named (sym let) loc) (cons (datum->syntax ctx bindings loc) body)) loc)]))
+
+(define (binding-code [x datum] [init datum] [loc datum]) -> datum
+  (datum->syntax ctx (list3 x (named (sym i32) loc) init) loc))
+
+;; [x type init], type the kernel type of expression e: a value's is i32;
+;; a call of a function whose result is another type, that type.
+(define (typed-binding-code [x datum] [e datum] [init datum] [loc datum]) -> datum
+  (datum->syntax ctx (list3 x (named (expression-type e) loc) init) loc))
+
+(define (expression-type [e datum]) -> datum
+  (if (and (form? e (sym #%app)) (identifier? (cadr (parts e))) (== (id-of (cadr (parts e))) -1))
+      (let ([sig (identifier-function-signature (cadr (parts e)))])
+        (while (and (pair? sig) (!= (car sig) (sym ->))) (set! sig (cdr sig)))
+        (if (and (pair? sig) (pair? (cdr sig)) (symbol? (cadr sig))) (cadr sig) (sym i32)))
+      (sym i32)))
+
+;; The drops of the owned variables among ids, under env, except those
+;; in keep.
+(define (drops-of [ids datum] [keep datum] [env datum] [loc datum]) -> datum
+  (let ([acc nil])
+    (while (pair? ids)
+      (let* ([id (cast i32 (integer-value (car ids)))] [e (lookup env id)])
+        (when (and (!= e 0) (== (entry-kind e) k-owned) (not (has-id? keep id)))
+          (set! acc (cons (drop-code (entry-name e) loc) acc))))
+      (set! ids (cdr ids)))
+    (reverse acc)))
+
+;; A use of variable id, with entry e, in mode, when live says what is
+;; used after.
+(define (use-of [e datum] [id i32] [loc datum] [live datum] [mode i32]) -> datum
+  (let* ([k (entry-kind e)] [x (entry-name e)] [alive (has-id? live id)])
+    (cond [(== k k-direct) (fail-datum '"a local function is used as a value" loc)]
+          [(== k k-raw) (if (== mode m-stmt) 0 (if (entry-boxed? e) (unbox-code x loc) x))]
+          [(== k k-borrowed)
+           (cond [(== mode m-stmt) 0]
+                 [(entry-boxed? e) (if (== mode m-owned) (dup-code (unbox-code x loc) loc) (unbox-code x loc))]
+                 [(== mode m-owned) (dup-code x loc)]
+                 [else x])]
+          ;; Owned, or a slot.
+          [(== mode m-stmt) (if (or alive (== k k-slot)) 0 (drop-code x loc))]
+          [(entry-boxed? e)
+           (cond [(== mode m-any) (unbox-code x loc)]
+                 [alive (dup-code (unbox-code x loc) loc)]
+                 ;; The box dies here: its value, then the box dropped.
+                 [else (let ([t (fresh "value" loc)])
+                         (let-code (list1 (binding-code t (dup-code (unbox-code x loc) loc) loc))
+                                   (list2 (drop-code x loc) t) loc))])]
+          [(== mode m-any) x]
+          [alive (dup-code x loc)]
+          [else x])))
+
+;; A use of variable id, with entry e, as what holds its value: the box if
+;; it is boxed, owned, for a closure or a local function to hold.
+(define (use-as-holder [e datum] [id i32] [loc datum] [live datum]) -> datum
+  (if (entry-boxed? e)
+      (if (has-id? live id) (dup-code (entry-name e) loc) (entry-name e))
+      (use-of e id loc live m-owned)))
+
+;; s rewritten under env, in mode, live being the variables used after
+;; it; 0 for nothing, in statement mode.
+(define (rw [s datum] [env datum] [live datum] [mode i32]) -> datum
+  (cond [(data-form? s) (if (== mode m-stmt) 0 s)]
+        [(identifier? s)
+         (let ([e (lookup env (id-of s))])
+           (cond [(!= e 0) (use-of e (id-of s) s live mode)]
+                 [(== mode m-stmt) 0]
+                 [(and (== mode m-owned) (or (!= (id-of s) -1) (global? s))) (dup-code s s)]
+                 [else s]))]
+        [(form? s (sym set!)) (rw-set s env live)]
+        [(form? s (sym begin)) (rw-sequence (cdr (parts s)) env live mode s)]
+        [(form? s (sym let)) (rw-let s env live mode)]
+        [(form? s (sym if)) (rw-if s env live mode)]
+        [(lambda-form? s) (if (== mode m-stmt) 0 (rw-lambda s env live))]
+        [(form? s (sym try)) (rw-try s env live mode)]
+        [(form? s (sym return)) (rw-return s env live)]
+        ;; The kernel's drop of a value: of one the program owns, its drop.
+        [(form? s (sym drop))
+         (let ([e (cadr (parts s))])
+           (if (== (kind-of e env live) e-owned)
+               (drop-code (rw e env live m-owned) s)
+               (syntax-rewrap s (list2 (car (parts s)) (rw e env live m-any)))))]
+        [(!= (call-head-id s) -1) (rw-closure-call s env live mode)]
+        [(form? s (sym call-indirect)) (rw-call s (parts s) 0 0 env live mode)]
+        [(form? s (sym #%app))
+         (let ([c (callee-of (cadr (parts s)))])
+           (rw-call s (parts s) 2 c env live mode))]
+        [(or (form? s (sym func-index)) (form? s (sym data-address)) (form? s (sym data-size))
+             (form? s (sym i32.const)) (form? s (sym i64.const)) (form? s (sym f32.const)) (form? s (sym f64.const))
+             (form? s (sym ref.func)) (form? s (sym nop)) (form? s (sym unreachable)))
+         (if (and (== mode m-stmt) (not (form? s (sym unreachable)))) 0 s)]
+        [(or (form? s (sym block)) (form? s (sym loop)))
+         (fail-datum '"a Substrate body cannot hold a block or loop of the kernel's; write it as a kernel function" s)]
+        [(or (form? s (sym br)) (form? s (sym br-if)))
+         (fail-datum '"a Substrate body cannot branch to a label of the kernel's" s)]
+        ;; An operator of wasm's, or a form of the kernel's with operands:
+        ;; its operands are read, and its value is not one of the program's.
+        [(code-form? s) (rw-call s (parts s) 1 0 env live mode)]
+        [else (if (== mode m-stmt) 0 s)]))
+
+;; The forms of a sequence, the last in mode, the others statements.
+(define (rw-sequence [forms datum] [env datum] [live datum] [mode i32] [loc datum]) -> datum
+  (let ([out (rw-forms forms env live mode)])
+    (cond [(null? out) (if (== mode m-stmt) 0 (datum->syntax ctx (list1 (named (sym begin) loc)) loc))]
+          [(null? (cdr out)) (car out)]
+          [else (datum->syntax ctx (cons (named (sym begin) loc) out) loc)])))
+
+;; The rewritten forms of a sequence, statements that are nothing left
+;; out.
+(define (rw-forms [forms datum] [env datum] [live datum] [mode i32]) -> datum
+  (let ([out nil])
+    (while (pair? forms)
+      (let* ([rest (cdr forms)]
+             [code (if (null? rest)
+                       (rw (car forms) env live mode)
+                       (rw (car forms) env (uses-each-into rest live) m-stmt))])
+        (when (!= code 0) (set! out (cons code out))))
+      (set! forms (cdr forms)))
+    (reverse out)))
+
+;; (set! x e)
+(define (rw-set [s datum] [env datum] [live datum]) -> datum
+  (let* ([l (parts s)] [x (cadr l)] [v (caddr l)] [id (id-of x)] [e (lookup env id)])
+    (cond [(and (!= e 0) (== (entry-kind e) k-direct)) 0]
+          [(and (!= e 0) (entry-boxed? e))
+           ;; The box takes the value, dropping the old; the box variable
+           ;; itself may die here.
+           (let* ([name (entry-name e)]
+                  [set (datum->syntax ctx (list3 (named (sym rt:set-box!) s) name (value v env (add-id live id))) s)])
+             (if (has-id? live id) set (sequence-code (list1 set) (drop-code name s) s)))]
+          [(and (!= e 0) (== (entry-kind e) k-raw))
+           (when (== (kind-of v env live) e-owned) (fail '"a variable holding a value the program does not own cannot be given one it owns" s))
+           (syntax-rewrap s (list3 (car l) (entry-name e) (rw v env live m-any)))]
+          [(and (!= e 0) (== (entry-kind e) k-borrowed)) (fail-datum '"a borrowed parameter cannot be assigned" s)]
+          [(!= e 0)
+           ;; Owned: the old value is moved into e if e uses it, else
+           ;; dropped; the new one dropped at once if never used.
+           (let* ([name (entry-name e)] [pre nil] [post nil]
+                  [set (syntax-rewrap s (list3 (car l) name (value v env (remove-id live id))))])
+             (unless (uses? v id) (set! pre (list1 (drop-code name s))))
+             (unless (has-id? live id) (set! post (list1 (drop-code name s))))
+             (if (null? post)
+                 (sequence-code pre set s)
+                 (datum->syntax ctx (cons (named (sym begin) s) (append pre (cons set post))) s)))]
+          [else
+           ;; A global: the old value dropped once the new is made.
+           (let ([t (fresh "value" s)])
+             (let-code (list1 (binding-code t (value v env live) s))
+                       (list2 (drop-code x s) (syntax-rewrap s (list3 (car l) x t)))
+                       s))])))
+
+(define (remove-id [l datum] [id i32]) -> datum
+  (let ([acc nil])
+    (while (pair? l)
+      (unless (== (cast i32 (integer-value (car l))) id) (set! acc (cons (car l) acc)))
+      (set! l (cdr l)))
+    (reverse acc)))
+
+;; s as an owned value.
+(define (value [s datum] [env datum] [live datum]) -> datum
+  (let ([k (kind-of s env live)])
+    (cond [(== k e-raw) (fail-datum '"a value the program does not own is used where it must own one: make it with dup-value" s)]
+          [(== k e-void) (fail-datum '"this expression gives no value" s)]
+          [else (rw s env live m-owned)])))
+
+;; (let ([x init] ...) body ...): a local function's binding is dropped,
+;; its lambda lifted; a boxed variable's binding makes the box; a variable
+;; the body never uses is dropped first.
+(define (rw-let [s datum] [env datum] [live datum] [mode i32]) -> datum
+  (let* ([l (parts s)] [bs (parts (cadr l))] [body (cddr l)] [inner env] [news nil] [bound nil]
+         [body-uses (uses-each-into body nil)])
+    ;; The local functions first, named, so that each can call the others.
+    (while (pair? bs)
+      (let ([id (id-of (binding-name (car bs)))])
+        (when (marked? direct id) (set! inner (bind inner id 0 k-direct (fresh "lambda" (car bs))))))
+      (set! bs (cdr bs)))
+    (set! bs (parts (cadr l)))
+    (while (pair? bs)
+      (let* ([b (car bs)] [x (binding-name b)] [id (id-of x)] [init (binding-init b)]
+             [after (uses-each-into (cdr bs) (union-ids live (remove-bound body-uses bs)))])
+        (cond [(marked? direct id)
+               (lift-direct id (get candidate id) inner (entry-name (lookup inner id)))]
+              [(boxed? id)
+               (when (== (kind-of init env after) e-raw)
+                 (fail '"a variable holding a value the program does not own cannot be assigned and captured by a lambda" b))
+               (set! inner (bind inner id 1 k-owned x))
+               (set! bound (add-id bound id))
+               (set! news (cons (binding-code x (datum->syntax ctx (list2 (named (sym rt:make-box) b) (value init env after)) b) b) news))]
+              [else
+               (let ([kind (variable-kind init env after b)])
+                 (set! inner (bind inner id 0 kind x))
+                 (set! bound (add-id bound id))
+                 (set! news (cons (syntax-rewrap b (cons x (append (binding-type b) (list1 (if (== kind k-raw) (rw init env after m-any) (value init env after))))))
+                                  news)))]))
+      (set! bs (cdr bs)))
+    (let* ([drops (drops-of bound body-uses inner s)]
+           [forms (append drops (rw-forms body inner live mode))])
+      (cond [(and (null? forms) (== mode m-stmt) (null? news)) 0]
+            [(null? forms) (let-code (reverse news) (list1 (datum->syntax ctx (list1 (named (sym begin) s)) s)) s)]
+            [else (let-code (reverse news) forms s)]))))
+
+;; ids without the variables bound by bindings bs.
+(define (remove-bound [ids datum] [bs datum]) -> datum
+  (while (pair? bs)
+    (set! ids (remove-id ids (id-of (binding-name (car bs)))))
+    (set! bs (cdr bs)))
+  ids)
+
+;; (if test then [else]): a value made for the test is dropped before the
+;; branches, which drop what only the other uses.
+(define (rw-if [s datum] [env datum] [live datum] [mode i32]) -> datum
+  (let* ([l (cdr (parts s))] [test (car l)] [a (cadr l)] [b (if (pair? (cddr l)) (caddr l) 0)]
+         [ua (uses-into a nil)] [ub (if (== b 0) nil (uses-into b nil))]
+         [live-test (union-ids (union-ids live ua) ub)]
+         [pre nil] [test-code datum 0])
+    (cond [(and (identifier? test) (!= (lookup env (id-of test)) 0))
+           (set! test-code (use-of (lookup env (id-of test)) (id-of test) test live-test m-any))
+           (let ([e (lookup env (id-of test))])
+             (when (and (entry-owns? e) (not (has-id? live-test (id-of test))) (== (entry-kind e) k-owned))
+               (set! pre (list1 (drop-code (entry-name e) test)))))]
+          [(== (kind-of test env live-test) e-owned)
+           (let ([t (fresh "test" test)])
+             (set! pre (list2 (binding-code t (rw test env live-test m-owned) test) (drop-code t test)))
+             (set! test-code t))]
+          [else (set! test-code (rw test env live-test m-any))])
+    (let* ([drops-a (drops-of ub (union-ids live ua) env a)]
+           [drops-b (drops-of ua (union-ids live ub) env (if (== b 0) s b))]
+           [code-a (branch a drops-a env live mode)]
+           [code-b (if (== b 0)
+                       (if (null? drops-b) 0 (datum->syntax ctx (cons (named (sym begin) s) drops-b) s))
+                       (branch b drops-b env live mode))]
+           [form (datum->syntax ctx (if (== code-b 0)
+                                        (list3 (car (parts s)) test-code code-a)
+                                        (list4 (car (parts s)) test-code code-a code-b))
+                                s)])
+      (if (null? pre)
+          form
+          (if (pair? (cdr pre))
+              (let-code (list1 (car pre)) (list2 (cadr pre) form) s)
+              (sequence-code pre form s))))))
+
+;; A branch: its drops, then its code.
+(define (branch [s datum] [drops datum] [env datum] [live datum] [mode i32]) -> datum
+  (let ([code (rw s env live mode)])
+    (cond [(and (== code 0) (null? drops)) (datum->syntax ctx (list1 (named (sym begin) s)) s)]
+          [(== code 0) (datum->syntax ctx (cons (named (sym begin) s) drops) s)]
+          [else (sequence-code drops code s)])))
+
+(define (rw-try [s datum] [env datum] [live datum] [mode i32]) -> datum
   (let* ([l (parts s)] [cs (parts (cadr l))] [out nil])
     (while (pair? cs)
       (let* ([c (car cs)] [inner env] [xs (clause-binders c)] [cl (parts c)] [body (clause-body c)] [n (length body)])
         (while (pair? xs)
-          (set! inner (bind inner (id-of (car xs)) 0 (car xs)))
+          (set! inner (bind inner (id-of (car xs)) 0 k-raw (car xs)))
           (set! xs (cdr xs)))
-        (set! out (cons (syntax-rewrap c (append (take cl (- (length cl) n)) (rewrite-each body inner))) out)))
+        (set! out (cons (syntax-rewrap c (append (take cl (- (length cl) n)) (rw-forms body inner live mode))) out)))
       (set! cs (cdr cs)))
-    (syntax-rewrap s (cons (car l) (cons (syntax-rewrap (cadr l) (reverse out)) (rewrite-each (cddr l) env))))))
+    (syntax-rewrap s (cons (car l) (cons (syntax-rewrap (cadr l) (reverse out)) (rw-forms (cddr l) env live mode))))))
 
-;; A lambda: lifted as a function of the closure and its parameters,
-;; reading each captured variable from the closure into a name of its
-;; own; in its place, code making the closure from the variables' values,
-;; or boxes, where it is.
-(define (rewrite-lambda [s datum] [env datum]) -> datum
+;; (return e): the variables still alive that e does not use are dropped
+;; first.
+(define (rw-return [s datum] [env datum] [live datum]) -> datum
+  (let* ([l (parts s)] [e (if (pair? (cdr l)) (cadr l) 0)]
+         [uses (if (== e 0) nil (uses-into e nil))]
+         [drops (drops-of live uses env s)]
+         [code (if (== e 0) (syntax-rewrap s (list1 (car l))) (syntax-rewrap s (list2 (car l) (value e env nil))))])
+    (sequence-code drops code s)))
+
+;; ---- calls ----
+;;
+;; A call's operands are evaluated in order. One in a position the callee
+;; takes ownership of is given as an owned value; another is read where it
+;; is: a value made for it is held in a temporary and dropped after the
+;; call, and so is a variable used for the last time. Once one operand
+;; needs a temporary, every operand that is not a variable or a literal
+;; is held in one, so they still run in order.
+
+;; How the call takes operand i: 1 to own it, 0 to read it, 2 as it is.
+;; kind: 0 call-indirect, whose head (operand 2, after the signature and
+;; the code) it owns; 1 an operator, which reads all; 2 a direct call of c.
+(define (operand-mode [kind i32] [c (ptr callee)] [i i32]) -> i32
+  (cond [(== kind 0) (cond [(<= i 1) 2] [(== i 2) 0] [(== i 3) 1] [(== i 4) 2] [else 1])]
+        [(== kind 1) (if (== i 0) 2 0)]
+        [else (cond [(<= i 1) 2] [(takes? c (- i 2)) 1] [else 0])]))
+
+;; A direct call of a function or operator: s, whose parts are l; kind as
+;; operand-mode says; the callee c, or 0.
+(define (rw-call [s datum] [l datum] [kind i32] [c (ptr callee)] [env datum] [live datum] [mode i32]) -> datum
+  (let* ([result (cond [(== kind 2) (-> c result)] [(== kind 0) e-owned] [else e-raw])]
+         [n (length l)] [temps nil] [any-temp 0] [i 0] [ops l] [out nil] [drops nil])
+    ;; Does any operand need a temporary?
+    (while (pair? ops)
+      (let ([o (car ops)])
+        (when (and (== (operand-mode kind c i) 0) (not (identifier? o)) (not (data-form? o))
+                   (== (kind-of o env (uses-each-into (cdr ops) live)) e-owned))
+          (set! any-temp 1)))
+      (+= i 1)
+      (set! ops (cdr ops)))
+    (set! i 0)
+    (set! ops l)
+    (while (pair? ops)
+      (let* ([o (car ops)] [om (operand-mode kind c i)] [after (uses-each-into (cdr ops) live)])
+        (cond [(== om 2) (set! out (cons o out))]
+              [(== om 1) (set! out (cons (value o env after) out))]
+              [(identifier? o)
+               (let ([e (lookup env (id-of o))])
+                 (set! out (cons (if (== e 0) (rw o env after m-any) (use-of e (id-of o) o after m-any)) out))
+                 (when (and (!= e 0) (== (entry-kind e) k-owned) (not (has-id? after (id-of o))))
+                   (set! drops (cons (drop-code (entry-name e) o) drops))))]
+              [(data-form? o) (set! out (cons o out))]
+              [(== (kind-of o env after) e-owned)
+               (let ([t (fresh "arg" o)])
+                 (set! temps (cons (binding-code t (rw o env after m-owned) o) temps))
+                 (set! drops (cons (drop-code t o) drops))
+                 (set! out (cons t out)))]
+              ;; Held in order with the others; an operator's operands,
+              ;; whose type this pass does not know, stay in place.
+              [(and any-temp (form? o (sym #%app)))
+               (let ([t (fresh "arg" o)])
+                 (set! temps (cons (typed-binding-code t o (rw o env after m-any) o) temps))
+                 (set! out (cons t out)))]
+              [else (set! out (cons (rw o env after m-any) out))]))
+      (+= i 1)
+      (set! ops (cdr ops)))
+    (let* ([call (syntax-rewrap s (reverse out))]
+           [drops (reverse drops)]
+           [temps (reverse temps)])
+      (cond [(and (null? drops) (null? temps))
+             (cond [(and (== mode m-stmt) (== result e-owned)) (drop-code call s)]
+                   [(and (== mode m-owned) (== result e-borrowed)) (dup-code call s)]
+                   [(and (== mode m-owned) (== result e-raw)) (fail-datum '"a value the program does not own is used where it must own one: make it with dup-value" s)]
+                   [(and (== mode m-owned) (== result e-void)) (fail-datum '"this expression gives no value" s)]
+                   [else call])]
+            ;; A call that never returns: nothing after it.
+            [(== result e-div) (let-code temps (list1 call) s)]
+            ;; The call, its temporaries dropped after; its result, if it
+            ;; has one, kept meanwhile, made owned if borrowed, since what
+            ;; it borrows from may be dropped.
+            [(or (== result e-void) (== mode m-stmt))
+             (let ([body (cons (if (and (== mode m-stmt) (== result e-owned)) (drop-code call s) call) drops)])
+               (let-code temps body s))]
+            [else
+             (let ([r (fresh "result" s)])
+               (let-code temps
+                         (list1 (let-code (list1 (typed-binding-code r s (if (== result e-borrowed) (dup-code call s) call) s))
+                                          (append drops (list1 r)) s))
+                         s))]))))
+
+;; A call of a closure: (call-indirect sig (#%app rt:closure-code x) x n
+;; a0 a1 a2 a3): of a local function, the direct call of its lifted
+;; function with the variables it captures; else as any call-indirect.
+(define (rw-closure-call [s datum] [env datum] [live datum] [mode i32]) -> datum
+  (let* ([id (call-head-id s)] [e (lookup env id)])
+    (if (and (!= e 0) (== (entry-kind e) k-direct))
+        (let* ([l (parts s)] [args (cdr (cdddr l))] [caps (get direct-caps id)] [out nil] [cs caps])
+          ;; Each captured variable, as an owned value, then the arguments.
+          (while (pair? cs)
+            (let* ([v (cast i32 (integer-value (car cs)))] [ce (lookup env v)]
+                   [after (union-ids (uses-each-into args live) (cdr cs))])
+              (when (== ce 0) (fail '"a local function's captured variable is not in scope at its call" s))
+              (set! out (cons (use-as-holder ce v s after) out)))
+            (set! cs (cdr cs)))
+          (let ([i 0])
+            (while (pair? args)
+              (let ([after (uses-each-into (cdr args) live)])
+                (set! out (cons (if (== i 0) (car args) (value (car args) env after)) out)))
+              (+= i 1)
+              (set! args (cdr args))))
+          (let ([call (datum->syntax ctx (cons (named (sym #%app) s) (cons (entry-name e) (reverse out))) s)])
+            (if (== mode m-stmt) (drop-code call s) call)))
+        (rw-call s (parts s) 0 0 env live mode))))
+
+;; ---- lambdas ----
+
+;; The parameters of a lambda mark, (nargs a0 a1 a2 a3) as core.sub writes
+;; them, bound: nargs a count, the others slots.
+(define (bind-mark-params [env datum] [ps datum]) -> datum
+  (let ([i 0])
+    (while (pair? ps)
+      (let ([x (param-name (car ps))])
+        (set! env (bind env (id-of x) 0 (if (== i 0) k-raw k-slot) x)))
+      (+= i 1)
+      (set! ps (cdr ps)))
+    env))
+
+;; The local functions of env, for the lifted function's environment.
+(define (direct-entries [env datum]) -> datum
+  (let ([acc nil])
+    (while (pair? env)
+      (when (== (entry-kind (car env)) k-direct) (set! acc (cons (car env) acc)))
+      (set! env (cdr env)))
+    (reverse acc)))
+
+;; Local function id, with lambda m: lifted as the function name of the
+;; variables it captures and the lambda's parameters. env holds the local
+;; functions it may call, itself among them.
+(define (lift-direct [id i32] [m datum] [env datum] [name datum])
+  (let* ([lp (lambda-parts m)] [params (car lp)] [result (cadr lp)] [body (caddr lp)]
+         [caps (get direct-caps id)] [inner (direct-entries env)] [cparams nil])
+    (while (pair? caps)
+      (let* ([v (cast i32 (integer-value (car caps)))] [cv (fresh "captured" m)])
+        (set! inner (bind inner v (boxed? v) k-owned cv))
+        (set! cparams (cons (datum->syntax ctx (list2 cv (named (sym i32) m)) m) cparams)))
+      (set! caps (cdr caps)))
+    (set! inner (bind-mark-params inner (parts params)))
+    (let ([func (datum->syntax ctx (cons (named (sym func) m)
+                                         (cons (cons name (append (reverse cparams) (parts params)))
+                                               (append result (list1 (body-code body inner m)))))
+                               m)])
+      (set! lifts (cons func lifts)))))
+
+;; The body forms of a function, under env, as one expression: the owned
+;; variables it never uses dropped first.
+(define (body-code [forms datum] [env datum] [loc datum]) -> datum
+  (let* ([uses (uses-each-into forms nil)] [drops nil] [e env])
+    (while (pair? e)
+      (let ([entry (car e)])
+        (when (and (== (entry-kind entry) k-owned) (not (has-id? uses (cast i32 (integer-value (car entry))))))
+          (set! drops (cons (drop-code (entry-name entry) loc) drops))))
+      (set! e (cdr e)))
+    ;; A begin, located at loc, even for one form: an error in the body
+    ;; is then reported there.
+    (datum->syntax ctx (cons (named (sym begin) loc) (append drops (rw-forms forms env nil m-owned))) loc)))
+
+;; A lambda that is a closure: lifted as a function of the closure and its
+;; parameters, reading each captured variable from the closure into a
+;; name of its own, as its own, and dropping the closure; in its place,
+;; code making the closure from the variables' values, or boxes, where it
+;; is. A variable with no entry is one of kernel code around the lambda,
+;; captured by value, which must be a Substrate value.
+(define (rw-lambda [s datum] [env datum] [live datum]) -> datum
   (let* ([lp (lambda-parts s)] [params (car lp)] [result (cadr lp)] [body (caddr lp)]
          [frees (free-of s)] [name (fresh "lambda" s)] [self (fresh "self" s)]
-         [inner nil] [reads nil] [values nil] [preludes nil] [i u32 0] [ps (parts params)])
-    ;; Each captured variable: inside, read from the closure; outside,
-    ;; its value as the environment names it, by value if it names none.
+         [inner nil] [reads nil] [capture-ids nil] [i u32 0] [ps (parts params)] [preludes nil])
     (while (pair? frees)
-      (let* ([r (car frees)] [id (cast i32 (integer-value (car r)))] [x (cdr r)] [e (lookup env id)]
-             [cv (fresh "captured" x)] [boxed (boxed? id)])
-        (set! inner (bind inner id boxed cv))
-        (set! reads (cons (datum->syntax ctx (list3 cv (named (sym i32) x) (list3 (named (sym rt:closure-ref) x) self (make-integer i))) x) reads))
-        (set! values (cons (cond [(!= e 0) (entry-name e)]
-                                 [boxed (datum->syntax ctx (list2 (named (sym rt:make-box) x) x) x)]
-                                 [else x])
-                           values))
+      (let* ([r (car frees)] [id (cast i32 (integer-value (car r)))] [x (cdr r)] [cv (fresh "captured" x)])
+        (when (marked? direct id) (fail '"a closure refers to a local function" x))
+        (set! inner (bind inner id (boxed? id) k-owned cv))
+        (set! reads (cons (binding-code cv (dup-code (datum->syntax ctx (list3 (named (sym rt:closure-ref) x) self (make-integer i)) x) x) x) reads))
+        (set! capture-ids (cons (cons (make-integer id) x) capture-ids))
         (+= i 1))
       (set! frees (cdr frees)))
-    ;; Each parameter: itself, or if boxed a box of it.
-    (while (pair? ps)
-      (let* ([x (param-name (car ps))] [id (id-of x)])
-        (cond [(boxed? id)
-               (let ([bx (fresh "box" x)])
-                 (set! inner (bind inner id 1 bx))
-                 (set! preludes (cons (box-binding bx x x) preludes)))]
-              [else (set! inner (bind inner id 0 x))]))
-      (set! ps (cdr ps)))
-    (let* ([body2 (rewrite-each body inner)]
-           [wrapped (if (null? preludes) body2 (cons (datum->syntax ctx (cons (named (sym let) s) (cons (reverse preludes) body2)) s) nil))]
-           [read (cons (datum->syntax ctx (cons (named (sym let) s) (cons (reverse reads) wrapped)) s) nil)]
+    (set! capture-ids (reverse capture-ids))
+    ;; The parameters: a mark's, nargs and slots; or, for a lambda of
+    ;; kernel code with parameters of its own, owned, each boxed if
+    ;; assigned and captured.
+    (if (and (pair? ps) (== (syntax-e (param-name (car ps))) (sym nargs)))
+        (set! inner (bind-mark-params inner ps))
+        (while (pair? ps)
+          (let* ([x (param-name (car ps))] [id (id-of x)])
+            (if (boxed? id)
+                (let ([bx (fresh "box" x)])
+                  (set! inner (bind inner id 1 k-owned bx))
+                  (set! preludes (cons (binding-code bx (datum->syntax ctx (list2 (named (sym rt:make-box) x) x) x) x) preludes)))
+                (set! inner (bind inner id 0 k-owned x))))
+          (set! ps (cdr ps))))
+    (let* ([inner-body (if (null? preludes)
+                           (body-code body inner s)
+                           (let-code (reverse preludes) (list1 (body-code body inner s)) s))]
+           [read (let-code (reverse reads) (list2 (drop-code self s) inner-body) s)]
            [func (datum->syntax ctx (cons (named (sym func) s)
                                           (cons (cons name (cons (datum->syntax ctx (list2 self (named (sym i32) s)) s) (parts params)))
-                                                (append result read)))
+                                                (append result (list1 read))))
                                 s)]
-           [c (fresh "closure" s)] [k u32 0] [sets nil] [vs (reverse values)]
+           [c (fresh "closure" s)] [k u32 0] [sets nil] [vs capture-ids]
            [make (list3 (named (sym rt:make-closure) s) (datum->syntax ctx (list2 (named (sym func-index) s) name) s) (make-integer i))])
-      (syntax-local-lift-definition func)
+      (set! lifts (cons func lifts))
       ;; (let ([c (make-closure (func-index name) n)]) (closure-set! c i v) ... c)
       (while (pair? vs)
-        (set! sets (cons (datum->syntax ctx (cons (named (sym rt:closure-set!) s) (list3 c (make-integer k) (car vs))) s) sets))
+        (let* ([id (cast i32 (integer-value (car (car vs))))] [x (cdr (car vs))] [e (lookup env id)]
+               [after (union-ids live (ids-of (cdr vs)))]
+               [v (cond [(!= e 0) (use-as-holder e id x after)]
+                        [(boxed? id) (datum->syntax ctx (list2 (named (sym rt:make-box) x) (dup-code x x)) x)]
+                        [else (dup-code x x)])])
+          (set! sets (cons (datum->syntax ctx (cons (named (sym rt:closure-set!) s) (list3 c (make-integer k) v)) s) sets)))
         (+= k 1)
         (set! vs (cdr vs)))
-      (datum->syntax ctx (cons (named (sym let) s)
-                               (cons (cons (datum->syntax ctx (list2 c make) s) nil)
-                                     (append (reverse sets) (cons c nil))))
-                     s))))
+      (let-code (list1 (binding-code c (datum->syntax ctx make s) s)) (append (reverse sets) (list1 c)) s))))
 
 ;; ---- entry points ----
 
@@ -344,11 +1324,31 @@
 (define (reset! [c datum])
   (set! ctx c)
   (set! assigned (make-table))
-  (set! captured (make-table)))
+  (set! captured (make-table))
+  (set! set-count (make-table))
+  (set! set-rhs (make-table))
+  (set! candidate (make-table))
+  (set! other-refs (make-table))
+  (set! bind-chain (make-table))
+  (set! direct (make-table))
+  (set! direct-caps (make-table))
+  (set! lambda-count 0)
+  (set! lambda-index (make-table))
+  (set! marker-of (make-table))
+  (set! marker-owner (make-table))
+  (set! marker-free (make-table))
+  (set! call-sites nil)
+  (set! lifts nil))
 
-;; The body forms of a function with parameters params, converted: one
-;; expression.
-(define (convert-body [c datum] [params datum] [forms datum]) -> datum
+;; The functions lifted while converting, lifted, as one form.
+(define (lift-all! [loc datum])
+  (when (pair? lifts)
+    (syntax-local-lift-definition (datum->syntax ctx (cons (named (sym begin) loc) (reverse lifts)) loc))
+    (set! lifts nil)))
+
+;; The body forms of a function with parameters params, of which borrowed
+;; are not owned, converted: one expression.
+(define (convert-body [c datum] [params datum] [borrowed datum] [forms datum]) -> datum
   (let ([expanded nil] [env nil] [preludes nil] [l forms])
     (while (pair? l)
       (set! expanded (cons (expand-marked (car l)) expanded))
@@ -361,26 +1361,38 @@
       (set! l (cdr l)))
     (set! params (reverse params))
     (reset! c)
-    (gather-each! expanded)
+    (scan-each! expanded nil)
+    (find-direct!)
     (set! l params)
     (while (pair? l)
-      (let* ([x (car l)] [id (id-of x)])
+      (let* ([x (car l)] [id (id-of x)] [b (borrowed-param? x borrowed)])
         (cond [(boxed? id)
                (let ([bx (fresh "box" x)])
-                 (set! env (bind env id 1 bx))
-                 (set! preludes (cons (box-binding bx x x) preludes)))]
-              [else (set! env (bind env id 0 x))]))
+                 (set! env (bind env id 1 k-owned bx))
+                 (set! preludes (cons (binding-code bx (datum->syntax ctx (list2 (named (sym rt:make-box) x) (if b (dup-code x x) x)) x) x) preludes)))]
+              [else (set! env (bind env id 0 (if b k-borrowed k-owned) x))]))
       (set! l (cdr l)))
     (let* ([loc (if (pair? forms) (car forms) c)]
-           [body (rewrite-each expanded env)])
+           [body (body-code expanded env loc)])
+      (lift-all! loc)
       (if (null? preludes)
-          (datum->syntax ctx (cons (named (sym begin) loc) body) loc)
-          (datum->syntax ctx (cons (named (sym let) loc) (cons (reverse preludes) body)) loc)))))
+          body
+          (let-code (reverse preludes) (list1 body) loc)))))
+
+;; Is parameter x among the identifiers borrowed?
+(define (borrowed-param? [x datum] [borrowed datum]) -> i32
+  (while (pair? borrowed)
+    (when (== (syntax-e (car borrowed)) (syntax-e x)) (return 1))
+    (set! borrowed (cdr borrowed)))
+  0)
 
 ;; A lambda s, the kernel's form, outside a body: expanded and converted
 ;; on its own.
 (define (convert-lambda [c datum] [s datum]) -> datum
   (let ([expanded (expand-marked s)])
     (reset! c)
-    (gather! expanded)
-    (rewrite expanded nil)))
+    (scan! expanded nil)
+    (find-direct!)
+    (let ([code (rw expanded nil nil m-owned)])
+      (lift-all! s)
+      code)))
