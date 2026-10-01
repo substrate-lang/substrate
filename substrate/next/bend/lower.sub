@@ -62,6 +62,9 @@
   (set! printers (make-table))
   (set! erasures (make-table))
   (set! nats (make-table))
+  (set! plain (make-table))
+  (set! plain-families (make-table))
+  (set! words (make-table))
   (prims-start! prefix))
 
 ;; The forms the pieces made so far need, not taken before, in order.
@@ -242,6 +245,101 @@
       [else `(#%app %bend-rt:word-u32 ,a)])))
 
 
+;; ---- nodes ----
+;;
+;; A node of n words comes from runtime.sub's list of freed ones of n, if
+;; it has one, and goes back to it, here, in the code, as Bend2 inlines
+;; them; the runtime makes a new one, or one of more than 32 words.
+
+;; Kernel code for a new node of n words: its address.
+(define (node-code [n u32]) -> datum
+  (if (> n 32)
+      `(#%app %bend-rt:node ,(i32-const n))
+      (let ([p (local! (sym node))])
+        `(let ([,p (i32.load %bend-rt:lists ,(int (* 4 n)))])
+           (if (i32.eqz ,p)
+               (#%app %bend-rt:node ,(i32-const n))
+               (begin
+                 (i32.store %bend-rt:lists (i32.wrap_i64 (i64.load ,p)) ,(int (* 4 n)))
+                 (i32.store %bend-rt:live-count (i32.add (i32.load %bend-rt:live-count) (i32.const 1)))
+                 ,p))))))
+
+;; Kernel code that frees node a, a variable, of n words.
+(define (free-code [a datum] [n u32]) -> datum
+  (if (> n 32)
+      `(#%app %bend-rt:free-node ,a ,(i32-const n))
+      `(begin
+         (i64.store ,a (i64.extend_i32_u (i32.load %bend-rt:lists ,(int (* 4 n)))))
+         (i32.store %bend-rt:lists ,a ,(int (* 4 n)))
+         (i32.store %bend-rt:live-count (i32.sub (i32.load %bend-rt:live-count) (i32.const 1))))))
+
+;; ---- plain values ----
+;;
+;; A value of a type whose values own nothing in memory, a U32, a Nat, or
+;; a datatype whose constructors have no live field, as Bool, is plain:
+;; sharing and dropping it do nothing, so the code does neither. A
+;; variable is known plain where its type is known: a parameter's, a
+;; lambda's binder's, a field's, unless a parameter of its datatype gives
+;; it. Another value is tested at run time, as its term says: below a
+;; node's tag, it owns nothing.
+
+;; Each plain variable -> 1; each family -> 1 if plain, 2 if not.
+(define plain (ptr arena-table) 0)
+(define plain-families (ptr arena-table) 0)
+
+
+;; Is constructor k one of a single live field, a U32? Its value is
+;; packed too, as Bend2 packs one of a word-sized field: its number, then
+;; the U32's 32 bits.
+(define words (ptr arena-table) 0)
+
+(define (word-ctor? [k datum]) -> i32
+  (let ([known (table-ref words (cast u64 k))])
+    (if (!= known 0)
+        (== known 1)
+        (let ([fs (fields k)] [n u32 0] [e i32 0])
+          (while (pair? fs)
+            (unless (== (dom-q (car fs)) 0)
+              (+= n 1)
+              (let ([ft (term-wnf (dom-T (car fs)))]) (set! e (and (ADT? ft) (== (adt-k ft) u32-family)))))
+            (set! fs (cdr fs)))
+          (set! e (and e (== n 1)))
+          (table-set! words (cast u64 k) (if e 1 2))
+          e))))
+(define (plain-family? [k datum]) -> i32
+  (let ([known (table-ref plain-families (cast u64 k))])
+    (if (!= known 0)
+        (== known 1)
+        (let ([d (book-tld k)] [e i32 0])
+          (cond [(or (nat-family? k) (== k u32-family)) (set! e 1)]
+                [(AdtD? d)
+                 (set! e 1)
+                 (for ([j u32 0]) (< j (adtd-nc d)) (+= j 1)
+                   (unless (or (== (live-fields (ctrd-k (@ (adtd-cs d) j))) 0) (word-ctor? (ctrd-k (@ (adtd-cs d) j)))) (set! e 0)))])
+          (table-set! plain-families (cast u64 k) (if e 1 2))
+          e))))
+
+(define (plain-type? [T (ptr term)]) -> i32
+  (if (== T 0)
+      0
+      (let ([t (term-wnf T)])
+        (cond [(ADT? t) (plain-family? (adt-k t))]
+              [else (or (Eql? t) (Typ? t) (Qnt? t))]))))
+
+(define (plain! [v datum] [T (ptr term)]) (when (plain-type? T) (table-set! plain (cast u64 v) 1)))
+(define (plain? [v datum]) -> i32 (!= (table-ref plain (cast u64 v)) 0))
+
+;; Kernel code that drops v; and that shares it k times more: nothing for
+;; a plain one, a test of its term for another.
+(define (drop-code [v datum]) -> datum
+  (if (plain? v) 0 `(if (i64.ge_u ,v ,(i64-const node-tag)) (#%app %bend-rt:drop ,v))))
+
+(define (share-code [v datum] [k i64]) -> datum
+  (if (plain? v) 0 `(if (i64.ge_u ,v ,(i64-const node-tag)) (set! ,v (#%app %bend-rt:share ,v ,(i32-const k))))))
+
+;; l with c in front, unless c is 0.
+(define (cons-code [c datum] [l datum]) -> datum (if (== c 0) l (cons c l)))
+
 ;; ---- what is live ----
 
 ;; The domains of type T, each a ctx (q k T).
@@ -323,12 +421,13 @@
   [Apply [g (ptr ir)] [x (ptr ir)]]
   [Succ [x (ptr ir)]]
   [Make [bits i64] [n u32] [xs (ptr (ptr ir))]]
+  [Pack [bits i64] [x (ptr ir)]]
   [Close [f datum] [n u32] [vs (ptr datum)]]
   [Bind [v datum] [x (ptr ir)] [then (ptr ir)]]
   [Case [s datum] [kind i32] [n u32] [bs (ptr (ptr branch))] [other (ptr ir)]]
   [Fail])
 
-(struct branch [number u32] [n u32] [vs (ptr datum)] [then (ptr ir)])
+(struct branch [number u32] [n u32] [word i32] [vs (ptr datum)] [then (ptr ir)])
 
 (define (new-ir [c ir]) -> (ptr ir)
   (let ([p (cast (ptr ir) (alloc-in (current-arena) (sizeof ir)))]) (set! (@ p) c) p))
@@ -379,6 +478,7 @@
              (if (== pv erased)
                  pv
                  (let ([c (local! (var-k p))])
+                   (when (plain? pv) (table-set! plain (cast u64 c) 1))
                    (set! (-> f captured) (cons pv (-> f captured)))
                    (set! (-> f caps) (cons c (-> f caps)))
                    (+= (-> f ncap) 1)
@@ -443,6 +543,7 @@
            (if (== n 0)
                (lit nat-zero)
                (let ([a (@ xs 0)]) (match a [(Lit y) (lit (+ y 1))] [_ (new-ir (Succ a))])))]
+          [(word-ctor? k) (let ([a (@ xs 0)]) (match a [(Lit y) (lit (bit-or (packed v) y))] [_ (new-ir (Pack (packed v) a))]))]
           [(== n 0) (lit (packed v))]
           [else (new-ir (Make (node-bits v n) n xs))])))
 
@@ -548,7 +649,8 @@
       [(Lam? x)
        (let* ([all (ty-all xty)] [p (probe (lam-k x))])
          (if (!= (all-q all) 0)
-             (begin (bind! f p (car args)) (body-ir f (body-apply (lam-bd x) p) (body-apply (all-bd all) p) (cdr args)))
+             (begin (bind! f p (car args)) (plain! (car args) (all-A all))
+                    (body-ir f (body-apply (lam-bd x) p) (body-apply (all-bd all) p) (cdr args)))
              (begin (bind! f p erased) (body-ir f (body-apply (lam-bd x) p) (body-apply (all-bd all) p) args))))]
       [(Efq? x) (new-ir (Fail))]
       [(Mat? x) (match-ir f x xty args)]
@@ -589,10 +691,12 @@
     (while (pair? fs)
       (unless (== (dom-q (car fs)) 0)
         (set! xs (cons (local! (dom-k (car fs))) xs))
+        (plain! (car xs) (dom-T (car fs)))
         (+= n 1))
       (set! fs (cdr fs)))
     (set! xs (reverse xs))
     (set! (-> b number) (number-of k))
+    (set! (-> b word) (word-ctor? k))
     (set! (-> b n) n)
     (set! (-> b vs) (sym-array n))
     (let ([l xs])
@@ -638,6 +742,7 @@
     [(Apply g x) (or (uses? g v) (uses? x v))]
     [(Succ x) (uses? x v)]
     [(Make _ n xs) (uses-any? xs n v)]
+    [(Pack _ x) (uses? x v)]
     [(Close _ n vs)
      (for ([j u32 0]) (< j n) (+= j 1) (when (== (@ vs j) v) (return 1)))
      0]
@@ -659,7 +764,7 @@
       (set! gamma (cdr gamma)))
     (reverse out)))
 
-(define (drop-code [v datum]) -> datum `(#%app %bend-rt:drop ,v))
+
 
 (define (sequence [pre datum] [e datum]) -> datum (if (null? pre) e `(begin ,@pre ,e)))
 
@@ -670,7 +775,7 @@
     (while (pair? gamma)
       (if (uses? c (car gamma))
           (set! live (cons (car gamma) live))
-          (set! drops (cons (drop-code (car gamma)) drops)))
+          (set! drops (cons-code (drop-code (car gamma)) drops)))
       (set! gamma (cdr gamma)))
     (sequence (reverse drops) (emit-live c (reverse live) sp tail))))
 
@@ -682,7 +787,7 @@
       (let ([k i64 0])
         (for ([j u32 0]) (< j n) (+= j 1) (when (uses? (@ xs j) (car g)) (+= k 1)))
         (when (> k 1)
-          (set! shares (cons `(set! ,(car g) (#%app %bend-rt:share ,(car g) ,(i32-const (- k 1)))) shares))))
+          (set! shares (cons-code (share-code (car g) (- k 1)) shares))))
       (set! g (cdr g)))
     (for ([j u32 0]) (< j n) (+= j 1)
       (set! codes (cons (emit (@ xs j) (used-by gamma (@ xs j)) sp 0) codes)))
@@ -695,7 +800,7 @@
     (when tail
       (while (!= sp 0)
         (unless (-> sp used)
-          (set! frees (cons `(#%app %bend-rt:free-node ,(-> sp at) ,(i32-const (-> sp n))) frees)))
+          (set! frees (cons (free-code (-> sp at) (-> sp n)) frees)))
         (set! sp (-> sp next))))
     (sequence frees e)))
 
@@ -706,7 +811,7 @@
       (set! (-> sp used) 1)
       (return (-> sp at)))
     (set! sp (-> sp next)))
-  `(#%app %bend-rt:node ,(i32-const n)))
+  (node-code n))
 
 (define (emit-live [c (ptr ir)] [gamma datum] [sp (ptr spare)] [tail i32]) -> datum
   (match c
@@ -730,6 +835,7 @@
                                 (call-indirect (i64 i64 -> i64) ,(index-code cv) ,cv ,av))))
                  sp tail)))]
     [(Succ x) (finish `(i64.add ,(emit x gamma sp 0) (i64.const 1)) sp tail)]
+    [(Pack bits x) (finish `(i64.or ,(i64-const bits) ,(emit x gamma sp 0)) sp tail)]
     [(Make bits n xs)
      (let* ([nd (local! (sym nd))] [at (alloc-code n sp)] [pc (emit-parts xs n gamma sp)] [stores nil] [es (cdr pc)])
        (for ([j u32 0]) (< j n) (+= j 1)
@@ -747,7 +853,7 @@
            (let ([nd (local! (sym nd))] [stores nil])
              (for ([j u32 0]) (< j n) (+= j 1)
                (set! stores (cons (store-code nd (+ j 1) (@ vs j)) stores)))
-             (finish `(let ([,nd (#%app %bend-rt:node ,(i32-const (+ n 1)))])
+             (finish `(let ([,nd ,(node-code (+ n 1))])
                         (i64.store ,nd ,(i64-const n))
                         ,@(reverse stores)
                         (i64.or ,word (i64.extend_i32_u ,nd)))
@@ -756,7 +862,7 @@
      (let ([xs (ir-array 2)] [shares nil] [g gamma])
        (while (pair? g)
          (when (and (uses? x (car g)) (uses? r (car g)))
-           (set! shares (cons `(set! ,(car g) (#%app %bend-rt:share ,(car g) (i32.const 1))) shares)))
+           (set! shares (cons-code (share-code (car g) 1) shares)))
          (set! g (cdr g)))
        (sequence (reverse shares)
                  `(let ([,v ,(emit x (used-by gamma x) sp 0)])
@@ -806,6 +912,9 @@
     (for ([j u32 n]) (> j 0) (-= j 1) (set! fvs (cons (@ vs (- j 1)) fvs)))
     (cond
       [(== n 0) (emit (-> b then) rest sp 1)]
+      [(-> b word)
+       `(let ([,(@ vs 0) (i64.and ,s (i64.const 4294967295))])
+          ,(emit (-> b then) (cons (@ vs 0) rest) sp 1))]
       [(== kind 1)
        `(let ([,(@ vs 0) (i64.sub ,s (i64.const 1))])
           ,(emit (-> b then) (cons (@ vs 0) rest) sp 1))]
@@ -833,7 +942,7 @@
             (emit b (list1 arg) 0 1)
             `(let ([,nd (i32.wrap_i64 ,self)])
                (let ,(reverse loads)
-                 (#%app %bend-rt:free-node ,nd ,(i32-const (+ n 1)))
+                 ,(free-code nd (+ n 1))
                  ,(emit b (cons arg caps) 0 1)))))))
 
 ;; ---- definitions ----
@@ -924,16 +1033,16 @@
               (let* ([c (@ (adtd-cs d) j)]
                      [ds (domains (tele-fill (ctrd-T c) (adt-x t) (adt-n t) 0 0))]
                      [fs (list-tail ds (- (length ds) (ctrd-n c)))]
-                     [writes nil] [m u32 0])
+                     [writes nil] [m u32 0] [word (word-ctor? (ctrd-k c))])
                 (while (pair? fs)
                   (when (== (dom-q (car fs)) 0) (refuse shown))
-                  (set! writes (cons `(#%app ,(printer (dom-T (car fs))) ,(load-code `b m))
+                  (set! writes (cons `(#%app ,(printer (dom-T (car fs))) ,(if word `(i64.and v (i64.const 4294967295)) (load-code `b m)))
                                      (cons `(#%app %bend-rt:write-byte (i32.const 32)) writes)))
                   (+= m 1)
                   (set! fs (cdr fs)))
                 (set! arms (cons (if (== m 0)
                                      `(begin ,@(write-text (short (ctrd-k c))))
-                                     `(let ([b (#%app %bend-rt:node-of v)])
+                                     `(let ([b ,(if word `(i32.const 0) `(#%app %bend-rt:node-of v))])
                                         ,@(write-text (format-message "(~a" (list1 (short (ctrd-k c)))))
                                         ,@(reverse writes)
                                         (#%app %bend-rt:write-byte (i32.const 41))))
