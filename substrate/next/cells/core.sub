@@ -34,7 +34,7 @@
 (provide [define substrate-define] [lambda substrate-lambda] [case-lambda substrate-case-lambda]
          [set! substrate-set!] [#%app app] [#%datum datum]
          [if substrate-if] [let substrate-let] [let* substrate-let*] letrec
-         [struct substrate-struct] substrate-body
+         [struct substrate-struct] [define-syntax substrate-define-syntax] substrate-body
          ;; equivalence and predicates
          eq? eqv? equal? not boolean? procedure?
          ;; pairs and lists
@@ -66,7 +66,13 @@
          write display newline write-byte write-bytes open-output-bytes get-output-bytes
          call-with-output-bytes file-position printf eprintf format error
          ;; exceptions
-         raise call-with-handlers dynamic-wind exn? exn-message
+         raise call-with-handlers dynamic-wind exn? exn-message syntax-error? syntax-error-message syntax-error-syntax
+         ;; syntax, for macros written in Substrate
+         syntax? identifier? syntax-e syntax->list syntax->datum datum->syntax syntax-rewrap syntax-property
+         free-identifier=? syntax-local-value identifier-binding-kind identifier-function-signature local-expand
+         transformer? transformer-env syntax-local-lift-definition syntax-local-introduce syntax-local-facts
+         identifier-name name-identifier local-binding splice-list syntax-source syntax-line syntax-column
+         raise-syntax-error
          ;; the host: files, the command line, instantiating code
          file->bytes file->string file-exists? display-to-file current-command-line-arguments instantiate exit)
 
@@ -78,6 +84,12 @@
 (begin-for-syntax
   (require k kernel)
   (require lower "lower.sub" convert-body convert-lambda in-pass?)
+  (require rt "runtime.sub")
+
+  ;; v, a define-syntax's value, as a transformer if it is a procedure: a
+  ;; function at phase 1, so that the code define-syntax emits, at phase 1,
+  ;; names it by this module's scopes.
+  (func (as-transformer [v i32]) -> i32 (if (rt:procedure? v) (rt:transformer-of v) v))
 
   (func (named? [x i32] [name i32]) -> i32
     (if (k:identifier? x) (i32.eq (k:syntax-e x) name) 0))
@@ -480,6 +492,37 @@
           #,@(assignments bs)
           (let () #,@(k:cddr parts)))))
 
+  ;; (define-syntax (name stx) body ...): name bound to a transformer that
+  ;; runs body, Substrate code at phase 1, so the module must take
+  ;; Substrate at phase 1 too, with (begin-for-syntax (require-unqualified
+  ;; substrate ".../substrate.sub")). (define-syntax name f), f a function,
+  ;; is the kernel's. Any other (define-syntax name e) binds name to e's
+  ;; value, made a transformer if it is a procedure (as-transformer).
+  (func (substrate-define-syntax [stx i32]) -> i32
+    (with-runtime stx (define-syntax-form stx)))
+
+  (func (define-syntax-form [stx i32]) -> i32
+    (let* ([parts (k:syntax->list stx)] [head (k:cadr parts)])
+      (if (k:identifier? head)
+          (let ([rhs (k:caddr parts)])
+            (if (k:identifier? rhs)
+                #`(define-syntax #,head #,rhs)
+                (transformer-global head rhs)))
+          ;; The lambda is the use's: Substrate's, if the module takes
+          ;; Substrate at phase 1, where this module's lambda is not bound.
+          (let ([h (k:splice-list head)])
+            (transformer-global (k:car h) (k:datum->syntax stx (k:cons 'lambda (k:cons (k:cons (k:cadr h) '()) (k:cddr parts))) stx))))))
+
+  ;; name bound to the value of phase-1 expression e, a transformer if it
+  ;; is a procedure: the value is made in a global at phase 1, a module
+  ;; body where e's lambdas can be lifted, which a define-syntax's own
+  ;; expression is not.
+  (func (transformer-global [name i32] [e i32]) -> i32
+    (let ([v (hidden-name name '".transformer")])
+      #`(begin
+          (begin-for-syntax (global #,v (mut i32) (as-transformer #,e)))
+          (define-syntax #,name #,v))))
+
   ;; (struct name (field ...) option ...): a field is an id or
   ;; [id #:mutable], and the option #:mutable makes every field mutable.
   ;; It defines the constructor, which takes the fields in order, the
@@ -597,6 +640,7 @@
 (define-syntax substrate-let* substrate-let*)
 (define-syntax letrec letrec)
 (define-syntax substrate-struct substrate-struct)
+(define-syntax substrate-define-syntax substrate-define-syntax)
 (define-syntax substrate-body substrate-body)
 (define-syntax substrate-expr substrate-expr)
 
@@ -1057,6 +1101,57 @@
 (substrate-define (dynamic-wind pre thunk post) (rt:dynamic-wind pre thunk post))
 (substrate-define (exn? v) (bool (rt:exn? v)))
 (substrate-define (exn-message v) (rt:exn-message v))
+(substrate-define (syntax-error? v) (bool (rt:syntax-error? v)))
+(substrate-define (syntax-error-message v) (rt:exn-message v))
+(substrate-define (syntax-error-syntax v) (rt:syntax-error-syntax v))
+
+;; ---- syntax ----
+;;
+;; The kernel module's functions (spec 2.3) as Substrate functions, for
+;; macros written in Substrate: predicates give #t or #f.
+
+(func (not-syntax [x i32] [who i32]) -> i32 (rt:wrong-type who '"a syntax object" x))
+(func (syntax-arg [x i32] [who i32]) #:inline -> i32 (if (kd:syntax? x) x (not-syntax x who)))
+
+(substrate-define (syntax? x) (bool (kd:syntax? x)))
+(substrate-define (identifier? x) (bool (kd:identifier? x)))
+(substrate-define (syntax-e x) (kd:syntax-e (syntax-arg x '"syntax-e")))
+(substrate-define (syntax->list x) (kd:syntax->list x))
+(substrate-define (syntax->datum x) (kd:syntax->datum x))
+(substrate-define datum->syntax
+  (substrate-case-lambda
+    [(ctx d) (kd:datum->syntax ctx d 0)]
+    [(ctx d loc) (kd:datum->syntax ctx d loc)]))
+(substrate-define (syntax-rewrap x e) (kd:syntax-rewrap (syntax-arg x '"syntax-rewrap") e))
+;; (syntax-property x key) reads a property, and
+;; (syntax-property x key value) returns a copy of x with it set.
+(substrate-define syntax-property
+  (substrate-case-lambda
+    [(x key) (kd:syntax-property (syntax-arg x '"syntax-property") key)]
+    [(x key value) (kd:syntax-property-set (syntax-arg x '"syntax-property") key value)]))
+(substrate-define (free-identifier=? a b) (bool (kd:free-identifier=? a b)))
+(substrate-define (syntax-local-value id) (kd:syntax-local-value id))
+(substrate-define (identifier-binding-kind id) (kd:identifier-binding-kind id))
+(substrate-define (identifier-function-signature id) (kd:identifier-function-signature id))
+(substrate-define (local-expand x) (kd:local-expand x))
+(substrate-define (transformer? x) (bool (kd:transformer? x)))
+(substrate-define (transformer-env t)
+  (if (i32.eqz (kd:transformer? t)) (return (rt:wrong-type '"transformer-env" '"a transformer" t)))
+  (kd:transformer-env t))
+(substrate-define (syntax-local-lift-definition form) (kd:syntax-local-lift-definition form))
+(substrate-define (syntax-local-introduce x) (kd:syntax-local-introduce x))
+(substrate-define (syntax-local-facts id) (kd:syntax-local-facts id))
+(substrate-define (identifier-name id) (kd:identifier-name id))
+(substrate-define (name-identifier n) (kd:name-identifier n))
+(substrate-define (local-binding id) (kd:local-binding id))
+(substrate-define (splice-list x) (kd:splice-list x))
+(substrate-define (syntax-source x) (kd:syntax-source (syntax-arg x '"syntax-source")))
+(substrate-define (syntax-line x) (kd:syntax-line (syntax-arg x '"syntax-line")))
+(substrate-define (syntax-column x) (kd:syntax-column (syntax-arg x '"syntax-column")))
+(substrate-define raise-syntax-error
+  (substrate-case-lambda
+    [(name message) (kd:raise-syntax-error name message 0) '#f]
+    [(name message x) (kd:raise-syntax-error name message x) '#f]))
 
 ;; ---- output and errors ----
 ;;

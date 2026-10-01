@@ -1,10 +1,10 @@
-;; Lifecycle: experimental. Substrate on cells (next/cells): next/substrate/substrate.sub
-;; on core.sub here, whose values are the kernel module's cells. Its macros are written in
-;; the C-like Lisp, on the kernel module's data, and a module written in
-;; Substrate defines its macros with patterns, not Substrate code (below).
-;; Values are the kernel module's cells (runtime.sub), plus closures,
-;; vectors, byte strings, structs, hash tables and boxes. A module written
-;; in Substrate takes its forms with require-unqualified:
+;; Lifecycle: experimental. Substrate on cells (next/cells): lib/substrate.sub
+;; on core.sub here, whose values are the kernel module's cells. Its macros
+;; are written in Substrate, at phase 1, on the core's forms, as
+;; lib/substrate.sub's are: Substrate's data is the kernel module's, syntax
+;; objects included, so a macro takes syntax apart with the same car and
+;; cdr it takes lists apart with. A module written in Substrate takes its
+;; forms with require-unqualified:
 ;;
 ;;   define, lambda, case-lambda, set!, calls, let, let*, letrec, struct:
 ;;                                  core.sub's, as lib/substrate.sub's
@@ -15,134 +15,172 @@
 ;;                                  that a pred is true of, the value of
 ;;                                  the first such pred's handler, called
 ;;                                  with it once body has been left
+;;   (syntax-match subject [pattern body ...] ...)
 ;;   (match subject [pattern body ...] ...)
 ;;                                  the body of the first clause whose
-;;                                  pattern subject matches (below)
+;;                                  pattern subject matches, with the
+;;                                  pattern's variables bound: syntax-match
+;;                                  takes syntax apart, and match any
+;;                                  value, structs included (patterns,
+;;                                  below)
+;;   (define-syntax (name stx) body ...), (define-syntax name expr)
+;;                                  a macro, if the value is a procedure,
+;;                                  which becomes its transformer; the
+;;                                  module must also take Substrate at
+;;                                  phase 1
 ;;   (define-syntax name (syntax-rules (literal ...) [pattern template] ...))
-;;                                  a macro, by patterns (below)
+;;                                  a macro by patterns (rules.sub), which
+;;                                  needs no Substrate at phase 1
 ;;
 ;; and the functions core.sub provides and those below, as
 ;; lib/substrate.sub has them.
 
 (require-unqualified core "core.sub")
+(require rules "rules.sub" syntax-rules define-rules)
 (require pt "../c/patterns.sub" _ ... ?)
-(begin-for-syntax
-  (require-unqualified c "../c/c.sub")
-  (require-unqualified kd "../compiler/kernel.sub")
-  (require sm "../c/c-syntax-match.sub" syntax-match _ ... ?))
+(begin-for-syntax (require-unqualified core "core.sub"))
 
-(provide (except-out (all-from-out core) call-with-handlers) else when unless and or cond case do with-handlers
-         match _ ... ? [define-syntax substrate-define-syntax] syntax-rules
+(provide (except-out (all-from-out core) call-with-handlers define-syntax) else when unless and or cond case do with-handlers
+         syntax-match match _ ... ? [define-syntax substrate-define-syntax] syntax-rules
          list-tail list-ref last-pair take [drop list-drop] last findf range sort
          memq memv member assq assv assoc map for-each andmap ormap filter foldl foldr)
 
 ;; ---- forms -----------------------------------------------------------------------------
-;;
-;; Their transformers are C, at phase 1, and take syntax apart with
-;; syntax-match (next/c/c-syntax-match.sub).
 
+;; else is a keyword of clauses, such as cond's and case's last, which the
+;; forms compare by binding; as an expression it is an error.
+(define-syntax (else stx) (raise-syntax-error #f "not allowed as an expression" stx))
+
+;; Helpers of the macros below, at phase 1.
 (begin-for-syntax
-  ;; else is a keyword of clauses, such as cond's and case's last, which
-  ;; the forms compare by binding; as an expression it is an error.
-  (define (else-form [s datum]) -> datum (raise-syntax-error 0 '"not allowed as an expression" s))
-
-  (define (else? [x datum]) -> i32 (and (identifier? x) (free-identifier=? x #'else)))
-
-  (define (when-form [s datum]) -> datum
-    (syntax-match s [(_ test body ...) #`(if #,test (begin #,@body))]))
-
-  (define (unless-form [s datum]) -> datum
-    (syntax-match s [(_ test body ...) #`(if #,test '#f (begin #,@body))]))
-
-  (define (and-form [s datum]) -> datum
-    (syntax-match s
-      [(_) #''#t]
-      [(_ e) e]
-      [(_ e more ...) #`(if #,e (and #,@more) '#f)]))
-
-  (define (or-form [s datum]) -> datum
-    (syntax-match s
-      [(_) #''#f]
-      [(_ e) e]
-      [(_ e more ...) #`(let ([t #,e]) (if t t (or #,@more)))]))
-
-  ;; (cond [test body ...] ... [else body ...])
-  (define (cond-form [s datum]) -> datum
-    (syntax-match s
-      [(_) #''#f]
-      [(_ ((? else? _) body ...) . _) #`(begin #,@body)]
-      [(_ (test body ...) clause ...) #`(if #,test (begin #,@body) (cond #,@clause))]))
-
-  ;; (case key [(datum ...) body ...] ... [else body ...]): the first clause
-  ;; with a datum equal? to key. A clause whose datums equal? compares as
-  ;; references is tested with eq?, which is inline, one datum at a time.
-  (define (case-form [s datum]) -> datum
-    (syntax-match s [(_ key clause ...) #`(let ([k #,key]) (cond #,@(case-clauses clause)))]))
+  (define (else? x) (if (identifier? x) (free-identifier=? x #'else) #f))
 
   ;; The cond clauses of case's clauses cs, testing k: case binds it.
-  (define (case-clauses [cs datum]) -> datum
+  (define (case-clauses cs)
     (if (null? cs)
-        nil
-        (cons (syntax-match (car cs)
-                [((? else? e) body ...) #`[#,e #,@body]]
-                [((ds ...) body ...) #`[#,(datum-test ds) #,@body]]
-                [c (raise-syntax-error 'case '"expected a clause: [(datum ...) body ...]" c)])
-              (case-clauses (cdr cs)))))
+        '()
+        (let ([c (syntax->list (car cs))])
+          (if (not c) (raise-syntax-error 'case "expected a clause: [(datum ...) body ...]" (car cs)))
+          (cons (if (else? (car c))
+                    #`[else #,@(cdr c)]
+                    #`[#,(datum-test (car c)) #,@(cdr c)])
+                (case-clauses (cdr cs))))))
 
-  ;; The test that k is one of the datums ds. If equal? compares them as
-  ;; references, an eq? test per datum, each inline:
+  ;; The test that k is one of the datums ds, a syntax list. If equal?
+  ;; compares them as references, an eq? test per datum, each inline:
   ;; (if (eq? k 'd1) '#t (if (eq? k 'd2) '#t ... '#f)). Otherwise member.
-  (define (datum-test [ds datum]) -> datum
-    (if (eq-datums? ds) (eq-tests ds) #`(member k '#,ds)))
+  (define (datum-test ds)
+    (if (eq-datums? (syntax->datum ds))
+        (eq-tests (syntax->list ds))
+        #`(member k '#,ds)))
 
-  (define (eq-tests [ds datum]) -> datum
+  (define (eq-tests ds)
     (if (null? ds) #''#f #`(if (eq? k '#,(car ds)) '#t #,(eq-tests (cdr ds)))))
 
-  ;; Whether ds are datums that equal? compares as references: symbols
-  ;; and keywords, which are interned, fixnums, booleans and ().
-  (define (eq-datums? [ds datum]) -> i32
-    (while (pair? ds)
-      (let ([d (syntax->datum (car ds))])
-        (if (not (or (symbol? d) (keyword? d) (boolean? d) (null? d)
-                     (and (integer? d) (== (integer-negative? d) (< (integer-value d) 0))
-                          (>= (integer-value d) -1073741824) (<= (integer-value d) 1073741823))))
-            (return 0)))
-      (set! ds (cdr ds)))
-    1)
+  ;; Whether ds is a list of datums that equal? compares as references:
+  ;; symbols and keywords, which are interned, fixnums, booleans and ().
+  (define (eq-datums? ds)
+    (if (null? ds)
+        #t
+        (if (pair? ds)
+            (let ([d (car ds)])
+              (if (if (symbol? d) #t (if (keyword? d) #t (if (fixnum? d) #t (if (boolean? d) #t (null? d)))))
+                  (eq-datums? (cdr ds))
+                  #f))
+            #f)))
 
-  ;; (do ([x init step] ...) (test result ...) body ...): a loop. A variable
-  ;; without a step keeps its value.
-  (define (do-form [s datum]) -> datum
-    (syntax-match s
-      [(_ ([x init step ...] ...) (test result ...) body ...)
-       #`(let loop (#,@(do-inits x init))
-           (if #,test
-               (begin '#f #,@result)
-               (begin #,@body (loop #,@(do-steps x step)))))]))
+  ;; Part i of each of with-handlers' clauses cs, [pred handler].
+  (define (clause-parts cs i)
+    (if (null? cs)
+        '()
+        (let ([c (syntax->list (car cs))])
+          (if (if c (= (length c) 2) #f)
+              (cons (if (= i 0) (car c) (car (cdr c))) (clause-parts (cdr cs) i))
+              (raise-syntax-error 'with-handlers "expected a clause: [pred handler]" (car cs))))))
 
-  (define (do-inits [xs datum] [inits datum]) -> datum
-    (if (null? xs) nil (cons #`[#,(car xs) #,(car inits)] (do-inits (cdr xs) (cdr inits)))))
+  (define (do-inits specs)
+    (if (null? specs)
+        '()
+        (let ([spec (syntax->list (car specs))])
+          (cons #`[#,(car spec) #,(car (cdr spec))] (do-inits (cdr specs))))))
 
-  (define (do-steps [xs datum] [steps datum]) -> datum
-    (if (null? xs)
-        nil
-        (cons (if (null? (car steps)) (car xs) (car (car steps))) (do-steps (cdr xs) (cdr steps)))))
+  (define (do-steps specs)
+    (if (null? specs)
+        '()
+        (let ([spec (syntax->list (car specs))])
+          (cons (if (null? (cdr (cdr spec))) (car spec) (car (cdr (cdr spec)))) (do-steps (cdr specs)))))))
 
-  ;; (with-handlers ([pred handler] ...) body ...)
-  (define (with-handlers-form [s datum]) -> datum
-    (syntax-match s
-      [(_ ([pred handler] ...) body ...)
-       #`(call-with-handlers (list #,@pred) (list #,@handler) (lambda () #,@body))])))
+(define-syntax (when stx)
+  (let ([parts (syntax->list stx)])
+    #`(if #,(car (cdr parts)) (begin #,@(cdr (cdr parts))))))
 
-(define-syntax else else-form)
-(define-syntax when when-form)
-(define-syntax unless unless-form)
-(define-syntax and and-form)
-(define-syntax or or-form)
-(define-syntax cond cond-form)
-(define-syntax case case-form)
-(define-syntax do do-form)
-(define-syntax with-handlers with-handlers-form)
+(define-syntax (unless stx)
+  (let ([parts (syntax->list stx)])
+    #`(if #,(car (cdr parts)) '#f (begin #,@(cdr (cdr parts))))))
+
+(define-syntax (and stx)
+  (let ([args (cdr (syntax->list stx))])
+    (if (null? args)
+        #''#t
+        (if (null? (cdr args))
+            (car args)
+            #`(if #,(car args) (and #,@(cdr args)) '#f)))))
+
+(define-syntax (or stx)
+  (let ([args (cdr (syntax->list stx))])
+    (if (null? args)
+        #''#f
+        (if (null? (cdr args))
+            (car args)
+            #`(let ([t #,(car args)]) (if t t (or #,@(cdr args))))))))
+
+;; (cond [test body ...] ... [else body ...])
+(define-syntax (cond stx)
+  (let ([clauses (cdr (syntax->list stx))])
+    (if (null? clauses)
+        #''#f
+        (let ([c (syntax->list (car clauses))])
+          (if (else? (car c))
+              #`(begin #,@(cdr c))
+              #`(if #,(car c) (begin #,@(cdr c)) (cond #,@(cdr clauses))))))))
+
+;; (case key [(datum ...) body ...] ... [else body ...]): the first clause
+;; with a datum equal? to key. A clause whose datums equal? compares as
+;; references is tested with eq?, which is inline, one datum at a time.
+(define-syntax (case stx)
+  (let ([parts (syntax->list stx)])
+    #`(let ([k #,(car (cdr parts))]) (cond #,@(case-clauses (cdr (cdr parts)))))))
+
+;; (do ([x init step] ...) (test result ...) body ...): a loop. A variable
+;; without a step keeps its value.
+(define-syntax (do stx)
+  (let* ([parts (syntax->list stx)]
+         [specs (syntax->list (car (cdr parts)))]
+         [end (syntax->list (car (cdr (cdr parts))))])
+    #`(let loop (#,@(do-inits specs))
+        (if #,(car end)
+            (begin '#f #,@(cdr end))
+            (begin #,@(cdr (cdr (cdr parts))) (loop #,@(do-steps specs)))))))
+
+;; (with-handlers ([pred handler] ...) body ...)
+(define-syntax (with-handlers stx)
+  (let* ([parts (syntax->list stx)] [clauses (syntax->list (car (cdr parts)))])
+    #`(call-with-handlers (list #,@(clause-parts clauses 0)) (list #,@(clause-parts clauses 1))
+                          (lambda () #,@(cdr (cdr parts))))))
+
+;; (define-syntax name (syntax-rules (literal ...) clause ...)): a macro
+;; by patterns, compiled into C (rules.sub); any other define-syntax is
+;; the core's, whose transformer is Substrate code.
+(begin-for-syntax
+  (define (rules? x)
+    (let ([l (syntax->list x)])
+      (if (if l (pair? l) #f) (if (identifier? (car l)) (free-identifier=? (car l) #'syntax-rules) #f) #f))))
+
+(define-syntax (substrate-define-syntax stx)
+  (let ([parts (syntax->list stx)])
+    (if (if (= (length parts) 3) (if (identifier? (car (cdr parts))) (rules? (car (cdr (cdr parts)))) #f) #f)
+        #`(define-rules #,(car (cdr parts)) #,@(cdr (syntax->list (car (cdr (cdr parts))))))
+        #`(define-syntax #,@(cdr parts)))))
 
 ;; ---- lists -----------------------------------------------------------------------------
 ;;
@@ -319,242 +357,374 @@
 (define (foldl-n f acc ls ls0)
   (if (andmap pair? ls) (foldl-n f (apply f (append (cars ls) (list acc))) (cdrs ls) ls0) (ended-n 'foldl ls0 ls acc)))
 
-
-;; ---- match -----------------------------------------------------------------------------
+;; ---- patterns ----------------------------------------------------------------------
 ;;
-;; (match subject [pattern body ...] ...) takes any value apart: the
-;; clauses are tried in order, and the first whose pattern the subject
-;; matches binds the pattern's variables, and its body gives the value;
-;; if none does, it raises an error that shows the subject. A pattern is
-;; syntax-match's (next/c/patterns.sub), on values, not syntax:
+;; (syntax-match subject [pattern body ...] ...) takes syntax apart, as
+;; quasisyntax builds it, and (match subject [pattern body ...] ...) takes
+;; any value apart. The clauses are tried in order: the first whose
+;; pattern the subject matches binds the pattern's variables, and its body
+;; gives the value. A pattern is:
 ;;
-;;   x                  anything, bound to x
+;;   x                  an identifier: anything, bound to x
 ;;   _                  anything
-;;   #:kw "s" 5 #\c #t  a value equal? to it
-;;   'd                 a value equal? to d
+;;   #:kw "s" 5 #\c #t  a value equal? to it; syntax whose datum is
+;;   'd                 a value equal? to d; syntax whose datum is: for a
+;;                      symbol, an identifier of that name
+;;   #'id               an identifier free-identifier=? to id, which asks
+;;                      the expander, so only a macro can use it
 ;;   (p ...), (p ... . tail)
-;;                      a list, element by element
+;;                      a list, or a syntax list, element by element
 ;;   p ...              in a list, as many elements that match p as there
 ;;                      can be while the rest of the list matches
 ;;   (? pred p ...)     x, if (pred x) is true and every p matches x
-;;   (name p ...)       when name is a struct's: one of it, whose fields
-;;                      match p ...
+;;   (name p ...)       in match, when name is a struct's: one of it, whose
+;;                      fields match p ...
 ;;
 ;; A variable is bound to what it matched, or under an ellipsis to the
-;; list of what each element bound. _, ... and ? are compared by binding.
+;; list of what each element bound, which #,@ splices. _, ... and ? are
+;; patterns.sub's, compared by binding. If no clause matches, syntax-match
+;; raises a syntax error blamed on the subject: "expected" and the
+;; patterns, each written as it is, but for a check (? pred p ...),
+;; written as its last p, and a _ at a pattern's head, written as the
+;; subject's head. match raises an error that shows the subject.
 ;;
-;; A clause's pattern is compiled, at compile time, in C, into a test of
-;; the subject: Substrate code true if the subject matches, which sets a
-;; local for each of the pattern's variables to what it matched on the
-;; way. The clause is (if test body next), next the following clauses',
-;; so each is written once. A value the patterns use that is an
-;; identifier, such as a struct's predicate or accessor, is called by
-;; name, and any other is evaluated once, first. p ... ending a list is a
-;; loop; a list in which p ... is followed by more of it backtracks, and
-;; is left to matches?, which walks its description at run time.
+;; A clause's pattern is compiled, at phase 1, in Substrate, into a test
+;; of the subject: code true if the subject matches, which sets a local
+;; for each of the pattern's variables to what it matched on the way. The
+;; clause is (if test body next), next the following clauses', so each is
+;; written once. A value the patterns use that is an identifier, such as
+;; a struct's predicate or accessor, is called by name, and any other is
+;; evaluated once, first. p ... ending a list is a loop; a list in which
+;; p ... is followed by more of it backtracks, and is left to matches?,
+;; which walks its description at run time.
 
 (begin-for-syntax
-  (require pt "../c/patterns.sub")
+  ;; A pattern is parsed into a description, a datum that the pattern's
+  ;; code is compiled from (below), and matches? walks if it backtracks:
+  ;; (var i name), the pattern's variable i; (any); (datum d); (bound i
+  ;; name), an identifier free-identifier=? to value i; (check i p ...),
+  ;; value i being the predicate; (struct i name (p ...)), value i being
+  ;; the struct's predicate and the values after it its accessors; or
+  ;; (list (element ...) tail), where an element is a description or
+  ;; (repeat p (i ...)), p repeated, binding variables i ..., and tail is
+  ;; a description or (null). The values are the form's predicates, #'id
+  ;; identifiers and struct functions, which it evaluates first. A name
+  ;; is as written, for errors.
 
-  (define temps i32 0)
+  (define (pattern-keyword? x k) (if (identifier? x) (free-identifier=? x k) #f))
+
+  ;; Is l a list of two elements?
+  (define (two? l) (if (pair? l) (if (pair? (cdr l)) (null? (cdr (cdr l))) #f) #f))
+
+  ;; The numbers from i below n.
+  (define (numbers-from i n) (if (< i n) (cons i (numbers-from (+ i 1) n)) '()))
+
+  (define (nth l i) (if (= i 0) (car l) (nth (cdr l) (- i 1))))
+
+  ;; Is an identifier in ids named as id is?
+  (define (named-in? id ids)
+    (if (null? ids) #f (if (eq? (syntax-e (car ids)) (syntax-e id)) #t (named-in? id (cdr ids)))))
+
+  ;; The information of the struct id names, if id is bound to a struct's
+  ;; transformer (core.sub): the syntax (struct-info name constructor
+  ;; predicate (accessor ...) (field ...)); else #f.
+  (define (struct-info-of id)
+    (let ([v (if (identifier? id) (syntax-local-value id) #f)])
+      (if (if v (transformer? v) #f)
+          (let ([l (syntax->list (transformer-env v))])
+            (if (if l (pair? l) #f)
+                (if (if (identifier? (car l)) (eq? (syntax-e (car l)) 'struct-info) #f) l #f)
+                #f))
+          #f)))
+
+  ;; Patterns ps of a who form, match or syntax-match, parsed, as
+  ;; (descriptions variables values): for each pattern its description
+  ;; and its variables, in order, and the values the descriptions refer
+  ;; to, in order.
+  (define (parse-patterns ps who)
+    (let ([values '()] [vars '()])
+      (letrec
+          ([value! (lambda (e) (set! values (cons e values)) (- (length values) 1))]
+           [values! (lambda (es) (if (null? es) #f (begin (value! (car es)) (values! (cdr es)))))]
+           [var! (lambda (id)
+                   (if (named-in? id vars)
+                       (raise-syntax-error who "this pattern variable appears twice in its pattern" id)
+                       (begin (set! vars (cons id vars)) (- (length vars) 1))))]
+           [parse (lambda (p)
+                    (let ([e (syntax-e p)])
+                      (if (symbol? e)
+                          (if (pattern-keyword? p #'_)
+                              '(any)
+                              (if (if (pattern-keyword? p #'...) #t (pattern-keyword? p #'?))
+                                  (raise-syntax-error who "not allowed here in a pattern" p)
+                                  (list 'var (var! p) e)))
+                          (if (pair? e) (parse-form p e) (if (null? e) '(list () (null)) (list 'datum e))))))]
+           [parse-form (lambda (p e)
+                         (if (if (two? e) (pattern-keyword? (car e) #'quote) #f)
+                             (list 'datum (syntax->datum (cadr e)))
+                             (if (if (two? e) (pattern-keyword? (car e) #'quote-syntax) #f)
+                                 (if (identifier? (cadr e))
+                                     (list 'bound (value! p) (syntax-e (cadr e)))
+                                     (raise-syntax-error who "expected #'identifier" p))
+                                 (if (pattern-keyword? (car e) #'?)
+                                     (if (if (pair? (cdr e)) (list? (cdr e)) #f)
+                                         (cons 'check (cons (value! (cadr e)) (parse-all (cddr e))))
+                                         (raise-syntax-error who "expected (? predicate pattern ...)" p))
+                                     (let ([info (if (eq? who 'match) (struct-info-of (car e)) #f)])
+                                       (if info
+                                           (parse-struct p e info)
+                                           (let ([r (elements e)]) (list 'list (car r) (cdr r)))))))))]
+           ;; (name p ...) for a struct: its predicate, then its accessors,
+           ;; are values.
+           [parse-struct (lambda (p e info)
+                           (let ([fields (syntax->list (nth info 5))])
+                             (if (= (length (cdr e)) (length fields))
+                                 (let ([i (value! (nth info 3))])
+                                   (values! (syntax->list (nth info 4)))
+                                   (list 'struct i (syntax-e (cadr info)) (parse-all (cdr e))))
+                                 (raise-syntax-error who
+                                                     (format "~a has ~a field~a, not ~a" (syntax-e (cadr info))
+                                                             (length fields) (if (= (length fields) 1) "" "s")
+                                                             (length (cdr e)))
+                                                     p))))]
+           [parse-all (lambda (ps) (if (null? ps) '() (let ([d (parse (car ps))]) (cons d (parse-all (cdr ps))))))]
+           ;; The elements and the tail of pair chain l, as (elements . tail).
+           [elements (lambda (l)
+                       (if (pair? l)
+                           (if (pattern-keyword? (car l) #'...)
+                               (raise-syntax-error who "... follows the pattern it repeats" (car l))
+                               (if (if (pair? (cdr l)) (pattern-keyword? (cadr l) #'...) #f)
+                                   (let* ([before (length vars)]
+                                          [d (parse (car l))]
+                                          [repeat (list 'repeat d (numbers-from before (length vars)))]
+                                          [r (elements (cddr l))])
+                                     (cons (cons repeat (car r)) (cdr r)))
+                                   (let* ([d (parse (car l))] [r (elements (cdr l))])
+                                     (cons (cons d (car r)) (cdr r)))))
+                           (cons '() (if (null? l) '(null) (parse l)))))])
+        (let loop ([ps ps] [descs '()] [varss '()])
+          (if (null? ps)
+              (list (reverse descs) (reverse varss) (reverse values))
+              (begin
+                (set! vars '())
+                (let ([d (parse (car ps))])
+                  (loop (cdr ps) (cons d descs) (cons (reverse vars) varss)))))))))
+
+  ;; A who form's clauses, each [pattern body ...], as lists.
+  (define (match-clauses cs who)
+    (if (null? cs)
+        '()
+        (let ([c (syntax->list (car cs))])
+          (if (if c (>= (length c) 2) #f)
+              (cons c (match-clauses (cdr cs) who))
+              (raise-syntax-error who "expected a clause [pattern body ...]" (car cs))))))
+
+  (define (clause-patterns cs) (if (null? cs) '() (cons (car (car cs)) (clause-patterns (cdr cs)))))
+
+  (define (literal d) (datum->syntax #'here d))
+
+  ;; ---- compiling patterns ----
+  ;;
+  ;; A clause's pattern is compiled into a test of the subject: an
+  ;; expression true if the subject matches, which sets a local for each
+  ;; of the pattern's variables to what it matched on the way. The clause
+  ;; is (if test body next), next the following clauses', so each is
+  ;; written once. A value the patterns use that is an identifier, such as
+  ;; a struct's predicate or accessor, is called by name, and any other is
+  ;; evaluated once, first. p ... ending a list is a loop; a list in which
+  ;; p ... is followed by more of it backtracks, and is left to matches?.
+
+  (define temps 0)
 
   ;; A temporary: an identifier no other of this expansion is.
-  (define (temp [base datum]) -> datum
-    (+= temps 1)
-    (datum->syntax #'here (string->symbol (format '"~a~a" `(,base ,(make-integer temps)))) 0))
+  (define (temp base)
+    (set! temps (+ temps 1))
+    (datum->syntax #'here (string->symbol (string-append base (number->string temps)))))
 
-  (define (temps-for [l datum] [base datum]) -> datum
-    (if (null? l) nil (cons (temp base) (temps-for (cdr l) base))))
-
-  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
-
-  ;; Element i of l, i a fixnum of a description.
-  (define (nth [l datum] [i datum]) -> datum (list-ref l (cast u32 (integer-value i))))
+  (define (temps-for l base) (if (null? l) '() (cons (temp base) (temps-for (cdr l) base))))
 
   ;; The form's values vs, each (expression . identifier): itself if it is
   ;; an identifier, or else a temporary bound to it.
-  (define (value-slots [vs datum]) -> datum
-    (if (null? vs)
-        nil
-        (cons (cons (car vs) (if (identifier? (car vs)) (car vs) (temp '"v"))) (value-slots (cdr vs)))))
+  (define (value-slots vs)
+    (if (null? vs) '() (cons (cons (car vs) (if (identifier? (car vs)) (car vs) (temp "v"))) (value-slots (cdr vs)))))
 
-  (define (value-bindings [slots datum]) -> datum
-    (cond [(null? slots) nil]
-          [(== (car (car slots)) (cdr (car slots))) (value-bindings (cdr slots))]
-          [else (cons #`[#,(cdr (car slots)) #,(car (car slots))] (value-bindings (cdr slots)))]))
+  (define (value-bindings slots)
+    (if (null? slots)
+        '()
+        (if (eq? (car (car slots)) (cdr (car slots)))
+            (value-bindings (cdr slots))
+            (cons #`[#,(cdr (car slots)) #,(car (car slots))] (value-bindings (cdr slots))))))
 
-  (define (value-ref [slots datum] [i u32]) -> datum (cdr (list-ref slots i)))
+  (define (value-ref slots i) (cdr (nth slots i)))
 
-  (define (value-refs [slots datum]) -> datum
-    (if (null? slots) nil (cons (cdr (car slots)) (value-refs (cdr slots)))))
+  (define (value-refs slots) (if (null? slots) '() (cons (cdr (car slots)) (value-refs (cdr slots)))))
 
-  ;; [x '#f] for each x of xs, and [name v] for each of names and vs.
-  (define (false-bindings [xs datum]) -> datum
-    (if (null? xs) nil (cons #`[#,(car xs) '#f] (false-bindings (cdr xs)))))
-
-  (define (name-bindings [names datum] [vs datum]) -> datum
-    (if (null? names) nil (cons #`[#,(car names) #,(car vs)] (name-bindings (cdr names) (cdr vs)))))
+  (define (pairs-of xs f) (if (null? xs) '() (cons #`[#,(car xs) #,(f (car xs))] (pairs-of (cdr xs) f))))
+  (define (zip-with xs ys f) (if (null? xs) '() (cons (f (car xs) (car ys)) (zip-with (cdr xs) (cdr ys) f))))
 
   ;; A test is code true if it matched, or (always statement ...), which
   ;; matched and sets variables: a test that only binds a variable is
   ;; nothing more.
-  (define (always? [t datum]) -> i32 (and (pair? t) (== (car t) 'always)))
+  (define (always? t) (if (pair? t) (eq? (car t) 'always) #f))
 
-  (define (test-code [t datum]) -> datum (if (always? t) #`(begin #,@(cdr t) #t) t))
+  (define (test-code t) (if (always? t) #`(begin #,@(cdr t) #t) t))
 
   ;; a, then b.
-  (define (both [a datum] [b datum]) -> datum
-    (cond [(and (always? a) (always? b)) (cons 'always (append (cdr a) (cdr b)))]
-          [(always? a) #`(begin #,@(cdr a) #,(test-code b))]
-          [else #`(if #,a #,(test-code b) #f)]))
+  (define (both a b)
+    (if (always? a)
+        (if (always? b) (cons 'always (append (cdr a) (cdr b))) #`(begin #,@(cdr a) #,(test-code b)))
+        #`(if #,a #,(test-code b) #f)))
 
   ;; The test of x, an identifier, against description d, setting vars,
   ;; the pattern's variables' locals by index. slots: the form's values.
-  (define (compile-test [d datum] [x datum] [vars datum] [slots datum]) -> datum
+  (define (compile-test d x vars slots)
     (let ([kind (car d)])
-      (cond [(== kind 'var) `(always ,#`(set! #,(nth vars (cadr d)) #,x))]
-            [(== kind 'any) '(always)]
-            [(== kind 'datum) #`(equal? #,x '#,(literal (cadr d)))]
-            [(== kind 'bound)
-             (raise-syntax-error 'match '"#'identifier matches syntax, and a value is not syntax"
-                                 (car (nth slots (cadr d))))]
-            [(== kind 'check)
-             (both #`(#,(value-ref slots (cast u32 (integer-value (cadr d)))) #,x) (compile-tests (cddr d) x vars slots))]
-            [(== kind 'struct)
-             (let ([i (cast u32 (integer-value (cadr d)))])
-               (both #`(#,(value-ref slots i) #,x) (compile-fields (cadddr d) (+ i 1) x vars slots)))]
-            [else (compile-elements (cadr d) (caddr d) x vars slots)])))
+      (if (eq? kind 'var)
+          (list 'always #`(set! #,(nth vars (cadr d)) #,x))
+          (if (eq? kind 'any)
+              (list 'always)
+              (if (eq? kind 'datum)
+                  #`(datum-matches? #,x '#,(literal (cadr d)))
+                  (if (eq? kind 'bound)
+                      #`(bound-matches? #,x #,(value-ref slots (cadr d)))
+                      (if (eq? kind 'check)
+                          (both #`(#,(value-ref slots (cadr d)) #,x) (compile-tests (cddr d) x vars slots))
+                          (if (eq? kind 'struct)
+                              (both #`(#,(value-ref slots (cadr d)) #,x) (compile-fields (cadddr d) (+ (cadr d) 1) x vars slots))
+                              (compile-elements (cadr d) (caddr d) x vars slots)))))))))
 
-  (define (compile-tests [ds datum] [x datum] [vars datum] [slots datum]) -> datum
-    (cond [(null? ds) '(always)]
-          [(null? (cdr ds)) (compile-test (car ds) x vars slots)]
-          [else (both (compile-test (car ds) x vars slots) (compile-tests (cdr ds) x vars slots))]))
+  (define (compile-tests ds x vars slots)
+    (if (null? ds)
+        (list 'always)
+        (if (null? (cdr ds))
+            (compile-test (car ds) x vars slots)
+            (both (compile-test (car ds) x vars slots) (compile-tests (cdr ds) x vars slots)))))
 
   ;; A struct's fields ps, read from x by the accessors, values j ....
-  (define (compile-fields [ps datum] [j u32] [x datum] [vars datum] [slots datum]) -> datum
-    (cond [(null? ps) '(always)]
-          [(== (car (car ps)) 'any) (compile-fields (cdr ps) (+ j 1) x vars slots)]
-          [else
-           (let ([y (temp '"f")])
-             #`(let ([#,y (#,(value-ref slots j) #,x)])
-                 #,(test-code (both (compile-test (car ps) y vars slots) (compile-fields (cdr ps) (+ j 1) x vars slots)))))]))
+  (define (compile-fields ps j x vars slots)
+    (if (null? ps)
+        (list 'always)
+        (if (eq? (car (car ps)) 'any)
+            (compile-fields (cdr ps) (+ j 1) x vars slots)
+            (let ([y (temp "f")])
+              #`(let ([#,y (#,(value-ref slots j) #,x)])
+                  #,(test-code (both (compile-test (car ps) y vars slots) (compile-fields (cdr ps) (+ j 1) x vars slots))))))))
 
-  ;; The elements es, then the tail, of list r.
-  (define (compile-elements [es datum] [tail datum] [r datum] [vars datum] [slots datum]) -> datum
-    (cond [(null? es) (if (== (car tail) 'null) #`(null? #,r) (compile-test tail r vars slots))]
-          [(== (car (car es)) 'repeat)
-           (if (and (null? (cdr es)) (== (car tail) 'null))
-               (compile-repeat (car es) r vars slots)
-               (compile-interpreted `(list ,es ,tail) r vars slots))]
-          [else
-           (let ([a (temp '"a")] [rest (temp '"d")])
-             #`(if (pair? #,r)
-                   #,(if (== (car (car es)) 'any)
-                         #`(let ([#,rest (unsafe-cdr #,r)]) #,(test-code (compile-elements (cdr es) tail rest vars slots)))
-                         #`(let ([#,a (unsafe-car #,r)] [#,rest (unsafe-cdr #,r)])
-                             #,(test-code (both (compile-test (car es) a vars slots)
-                                                (compile-elements (cdr es) tail rest vars slots)))))
-                   #f))]))
+  ;; The elements es, then the tail, of r, a list or syntax list.
+  (define (compile-elements es tail r vars slots)
+    (if (null? es)
+        (if (eq? (car tail) 'null)
+            #`(null? (list-part #,r))
+            (compile-test tail r vars slots))
+        (if (eq? (car (car es)) 'repeat)
+            (if (if (null? (cdr es)) (eq? (car tail) 'null) #f)
+                (compile-repeat (car es) r vars slots)
+                (compile-interpreted (list 'list es tail) r vars slots))
+            (let ([m (temp "m")] [a (temp "a")] [d (temp "d")])
+              #`(let ([#,m (list-pair #,r)])
+                  (if #,m
+                      #,(if (eq? (car (car es)) 'any)
+                            #`(let ([#,d (unsafe-cdr #,m)]) #,(test-code (compile-elements (cdr es) tail d vars slots)))
+                            #`(let ([#,a (unsafe-car #,m)] [#,d (unsafe-cdr #,m)])
+                                #,(test-code (both (compile-test (car es) a vars slots) (compile-elements (cdr es) tail d vars slots)))))
+                      #f))))))
 
   ;; e, (repeat p (i ...)), matching every element of r to its end: its
   ;; variables i ... set to the lists of what p matched.
-  (define (compile-repeat [e datum] [r datum] [vars datum] [slots datum]) -> datum
+  (define (compile-repeat e r vars slots)
     (let ([p (cadr e)] [is (caddr e)])
-      (cond [(== (car p) 'var) #`(if (list? #,r) (begin (set! #,(nth vars (cadr p)) #,r) #t) #f)]
-            [(== (car p) 'any) #`(list? #,r)]
-            [else
-             (let ([loop (temp '"loop")] [rest (temp '"r")] [a (temp '"a")] [accs (temps-for is '"acc")])
-               #`(let #,loop ([#,rest #,r] #,@(nil-bindings accs))
-                   (if (null? #,rest)
-                       (begin #,@(acc-results is accs vars) #t)
-                       (if (pair? #,rest)
-                           (let ([#,a (unsafe-car #,rest)])
-                             (if #,(test-code (compile-test p a vars slots))
-                                 (#,loop (unsafe-cdr #,rest) #,@(acc-conses is accs vars))
-                                 #f))
-                           #f))))])))
+      (if (eq? (car p) 'var)
+          (let ([xs (temp "xs")])
+            #`(let ([#,xs (elements-of #,r)]) (if #,xs (begin (set! #,(nth vars (cadr p)) #,xs) #t) #f)))
+          (if (eq? (car p) 'any)
+              #`(if (elements-of #,r) #t #f)
+              (let* ([loop (temp "loop")] [rest (temp "r")] [m (temp "m")] [a (temp "a")] [accs (temps-for is "acc")])
+                #`(let #,loop ([#,rest #,r] #,@(pairs-of accs (lambda (acc) #''())))
+                    (let ([#,m (list-part #,rest)])
+                      (if (null? #,m)
+                          (begin #,@(zip-with is accs (lambda (i acc) #`(set! #,(nth vars i) (reverse #,acc)))) #t)
+                          (if (pair? #,m)
+                              (let ([#,a (car #,m)])
+                                (if #,(test-code (compile-test p a vars slots))
+                                    (#,loop (cdr #,m) #,@(zip-with is accs (lambda (i acc) #`(cons #,(nth vars i) #,acc))))
+                                    #f))
+                              #f)))))))))
 
-  (define (nil-bindings [accs datum]) -> datum
-    (if (null? accs) nil (cons #`[#,(car accs) '()] (nil-bindings (cdr accs)))))
-
-  (define (acc-results [is datum] [accs datum] [vars datum]) -> datum
-    (if (null? is)
-        nil
-        (cons #`(set! #,(nth vars (car is)) (reverse #,(car accs))) (acc-results (cdr is) (cdr accs) vars))))
-
-  (define (acc-conses [is datum] [accs datum] [vars datum]) -> datum
-    (if (null? is) nil (cons #`(cons #,(nth vars (car is)) #,(car accs)) (acc-conses (cdr is) (cdr accs) vars))))
-
-  ;; Description d, a list that backtracks, matched by matches?.
-  (define (compile-interpreted [d datum] [r datum] [vars datum] [slots datum]) -> datum
-    (let ([vs (temp '"vs")])
-      #`(let ([#,vs (make-vector #,(literal (make-integer (length vars))) #f)])
+  ;; Description d, a list that backtracks, matched by matches?, as match
+  ;; did before patterns were compiled.
+  (define (compile-interpreted d r vars slots)
+    (let ([vs (temp "vs")])
+      #`(let ([#,vs (make-vector #,(literal (length vars)) #f)])
           (if (matches? '#,(literal d) #,r (vector #,@(value-refs slots)) #,vs)
               (begin #,@(vector-sets (description-vars d) vars vs) #t)
               #f))))
 
-  (define (vector-sets [is datum] [vars datum] [vs datum]) -> datum
+  (define (vector-sets is vars vs)
     (if (null? is)
-        nil
+        '()
         (cons #`(set! #,(nth vars (car is)) (vector-ref #,vs #,(literal (car is)))) (vector-sets (cdr is) vars vs))))
 
   ;; The variables description d binds.
-  (define (description-vars [d datum]) -> datum
-    (let ([kind (car d)])
-      (cond [(== kind 'var) `(,(cadr d))]
-            [(== kind 'list) (append (elements-vars (cadr d)) (description-vars (caddr d)))]
-            [(== kind 'repeat) (description-vars (cadr d))]
-            [(== kind 'check) (elements-vars (cddr d))]
-            [(== kind 'struct) (elements-vars (cadddr d))]
-            [else nil])))
+  (define (description-vars d)
+    (if (eq? (car d) 'var)
+        (list (cadr d))
+        (if (eq? (car d) 'list)
+            (append (elements-vars (cadr d)) (description-vars (caddr d)))
+            (if (eq? (car d) 'repeat)
+                (description-vars (cadr d))
+                (if (eq? (car d) 'check)
+                    (elements-vars (cddr d))
+                    (if (eq? (car d) 'struct) (elements-vars (cadddr d)) '()))))))
 
-  (define (elements-vars [ds datum]) -> datum
-    (if (null? ds) nil (append (description-vars (car ds)) (elements-vars (cdr ds)))))
+  (define (elements-vars ds) (if (null? ds) '() (append (description-vars (car ds)) (elements-vars (cdr ds)))))
 
   ;; Code that tries clauses cs, whose patterns have descriptions ds and
   ;; variables varss, against x, in turn, and runs last if none matches.
-  (define (compile-clauses [cs datum] [ds datum] [varss datum] [x datum] [last datum] [slots datum]) -> datum
+  (define (compile-clauses cs ds varss x last slots)
     (if (null? cs)
         last
-        (let ([vars (temps-for (car varss) '"v")])
-          (let ([test (compile-test (car ds) x vars slots)]
-                [body #`(let (#,@(name-bindings (car varss) vars)) #,@(cdr (car cs)))])
-            ;; A pattern that always matches leaves the clauses after it
-            ;; unreachable.
-            (if (always? test)
-                #`(let (#,@(false-bindings vars)) #,@(cdr test) #,body)
-                #`(let (#,@(false-bindings vars))
-                    (if #,test #,body #,(compile-clauses (cdr cs) (cdr ds) (cdr varss) x last slots))))))))
+        (let* ([vars (temps-for (car varss) "v")]
+               [test (compile-test (car ds) x vars slots)]
+               [body #`(let (#,@(zip-with (car varss) vars (lambda (name v) #`[#,name #,v]))) #,@(cdr (car cs)))])
+          ;; A pattern that always matches leaves the clauses after it
+          ;; unreachable.
+          (if (always? test)
+              #`(let (#,@(pairs-of vars (lambda (v) #''#f))) #,@(cdr test) #,body)
+              #`(let (#,@(pairs-of vars (lambda (v) #''#f)))
+                  (if #,test #,body #,(compile-clauses (cdr cs) (cdr ds) (cdr varss) x last slots)))))))
 
-  (define (clause-patterns [cs datum]) -> datum
-    (if (null? cs) nil (cons (car (car cs)) (clause-patterns (cdr cs)))))
-
-  ;; (match subject [pattern body ...] ...) expanded: the subject and the
+  ;; (who subject [pattern body ...] ...) expanded: the subject and the
   ;; values bound, then the clauses tried in turn, and if none matches
-  ;; the error.
-  (define (match-form [s datum]) -> datum
-    (let ([parts (syntax->list s)])
-      (if (not (and parts (>= (length parts) 3)))
-          (raise-syntax-error 'match '"expected (match subject [pattern body ...] ...)" s))
-      (let ([clauses (cast datum (pt:match-clauses (cast i32 (cddr parts)) (cast i32 'match)))])
-        (let ([parsed (cast datum (pt:parse-match-patterns (cast i32 (clause-patterns clauses)) (cast i32 'match)
-                                                           (cast i32 `(,#'_ ,#'... ,#'? ,#'quote ,#'quote-syntax))))]
-              [x (temp '"s")])
-          (let ([slots (value-slots (caddr parsed))])
-            #`(let ([#,x #,(cadr parts)] #,@(value-bindings slots))
-                #,(compile-clauses clauses (car parsed) (cadr parsed) x #`(no-value-match #,x) slots))))))))
+  ;; the code fail gives for every description and the subject.
+  (define (match-form stx who fail)
+    (let* ([parts (syntax->list stx)]
+           [clauses (if (if parts (>= (length parts) 3) #f)
+                        (match-clauses (cddr parts) who)
+                        (raise-syntax-error who (format "expected (~a subject [pattern body ...] ...)" who) stx))]
+           [parsed (parse-patterns (clause-patterns clauses) who)]
+           [slots (value-slots (caddr parsed))]
+           [x (temp "s")])
+      #`(let ([#,x #,(cadr parts)] #,@(value-bindings slots))
+          #,(compile-clauses clauses (car parsed) (cadr parsed) x (fail (car parsed) x) slots)))))
 
-(define-syntax match match-form)
+;; (syntax-match subject [pattern body ...] ...)
+(define-syntax (syntax-match stx)
+  (match-form stx 'syntax-match (lambda (all x) #`(no-match '#,(literal all) #,x))))
+
+;; (match subject [pattern body ...] ...)
+(define-syntax (match stx)
+  (match-form stx 'match (lambda (all x) #`(no-value-match #,x))))
 
 ;; Does x match description d? The variables d binds are written in vs.
 (define (matches? d x values vs)
   (let ([kind (car d)])
     (cond [(eq? kind 'list) (elements-match? (cadr d) (caddr d) x values vs)]
           [(eq? kind 'var) (vector-set! vs (cadr d) x) #t]
-          [(eq? kind 'datum) (equal? x (cadr d))]
+          [(eq? kind 'datum) (let ([v (cadr d)]) (equal? (if (pair? v) (syntax->datum x) (list-part x)) v))]
           [(eq? kind 'check) (and ((vector-ref values (cadr d)) x) (all-match? (cddr d) x values vs))]
           [(eq? kind 'any) #t]
-          [else (struct-matches? d x values vs)])))
+          [(eq? kind 'struct) (struct-matches? d x values vs)]
+          [else (and (identifier? x) (free-identifier=? x (vector-ref values (cadr d))))])))
 
 (define (all-match? ds x values vs)
   (or (null? ds) (and (matches? (car ds) x values vs) (all-match? (cdr ds) x values vs))))
@@ -568,27 +738,41 @@
              (and (matches? (car ps) ((vector-ref values j) x) values vs)
                   (loop (cdr ps) (+ j 1)))))))
 
+;; x's elements if it is a syntax list; otherwise x.
+(define (list-part x) #:inline (if (syntax? x) (syntax-e x) x))
+
+;; x's elements, if they are a pair: that pair; otherwise #f.
+(define (list-pair x) (let ([m (list-part x)]) (if (pair? m) m #f)))
+
+;; Does x match (datum v): is it v, or syntax whose datum is?
+(define (datum-matches? x v) (equal? (if (pair? v) (syntax->datum x) (list-part x)) v))
+
+;; Does x match #'id: is it an identifier free-identifier=? to id?
+(define (bound-matches? x id) (and (identifier? x) (free-identifier=? x id)))
+
 ;; Do the elements of list l match descriptions es, and what follows them
 ;; tail?
 (define (elements-match? es tail l values vs)
-  (cond [(null? es) (if (eq? (car tail) 'null) (null? l) (matches? tail l values vs))]
-        [(eq? (car (car es)) 'repeat)
-         (if (and (null? (cdr es)) (eq? (car tail) 'null))
-             (repeat-ends? (car es) l values vs)
-             (repeat-matches? (car es) (cdr es) tail l values vs))]
-        [else (and (pair? l) (matches? (car es) (car l) values vs)
-                   (elements-match? (cdr es) tail (cdr l) values vs))]))
+  (let ([m (list-part l)])
+    (cond [(null? es) (if (eq? (car tail) 'null) (null? m) (matches? tail l values vs))]
+          [(eq? (car (car es)) 'repeat)
+           (if (and (null? (cdr es)) (eq? (car tail) 'null))
+               (repeat-ends? (car es) m values vs)
+               (repeat-matches? (car es) (cdr es) tail m values vs))]
+          [else (and (pair? m) (matches? (car es) (car m) values vs)
+                     (elements-match? (cdr es) tail (cdr m) values vs))])))
 
 ;; e is (repeat p (i ...)), the last element of its list: does every element
 ;; of l, to its end, match p? Variables i ... are bound to lists.
 (define (repeat-ends? e l values vs)
   (let ([p (cadr e)] [vars (caddr e)])
     (if (eq? (car p) 'var)
-        (and (list? l) (begin (vector-set! vs (cadr p) l) #t))
+        (let ([xs (elements-of l)]) (and xs (begin (vector-set! vs (cadr p) xs) #t)))
         (let collect ([l l] [rows '()])
-          (cond [(null? l) (set-repeated! vars (reverse rows) vs) #t]
-                [(and (pair? l) (matches? p (car l) values vs)) (collect (cdr l) (cons (row vars vs) rows))]
-                [else #f])))))
+          (let ([m (list-part l)])
+            (cond [(null? m) (set-repeated! vars (reverse rows) vs) #t]
+                  [(and (pair? m) (matches? p (car m) values vs)) (collect (cdr m) (cons (row vars vs) rows))]
+                  [else #f]))))))
 
 ;; e is (repeat p (i ...)): do elements from the start of l match p, as
 ;; many as can while es and tail match the rest? Variables i ... are bound
@@ -598,12 +782,22 @@
     ;; rows: for each element that matches p, the latest first, the values
     ;; of vars then and the rest of l after it.
     (let collect ([rest l] [rows '()])
-      (if (and (pair? rest) (matches? p (car rest) values vs))
-          (collect (cdr rest) (cons (cons (row vars vs) (cdr rest)) rows))
-          (let try ([rows rows])
-            (set-repeated! vars (reverse (map car rows)) vs)
-            (or (elements-match? es tail (if (null? rows) l (cdr (car rows))) values vs)
-                (and (pair? rows) (try (cdr rows)))))))))
+      (let ([m (list-part rest)])
+        (if (and (pair? m) (matches? p (car m) values vs))
+            (collect (cdr m) (cons (cons (row vars vs) (cdr m)) rows))
+            (let try ([rows rows])
+              (set-repeated! vars (reverse (map car rows)) vs)
+              (or (elements-match? es tail (if (null? rows) l (cdr (car rows))) values vs)
+                  (and (pair? rows) (try (cdr rows))))))))))
+
+;; The elements of list l, whose tails may be syntax lists, as a list; #f
+;; if it is not a proper list.
+(define (elements-of l)
+  (let ([m (list-part l)])
+    (cond [(null? m) '()]
+          [(list? m) m]
+          [(pair? m) (let ([r (elements-of (cdr m))]) (and r (cons (car m) r)))]
+          [else #f])))
 
 ;; The values of vars in vs, in order.
 (define (row vars vs) (if (null? vars) '() (cons (vector-ref vs (car vars)) (row (cdr vars) vs))))
@@ -615,193 +809,39 @@
     (vector-set! vs (car vars) (map car rows))
     (set-repeated! (cdr vars) (map cdr rows) vs)))
 
+;; No clause of a syntax-match matched x, and ds are the descriptions of
+;; the clauses' patterns: the error.
+(define (no-match ds x)
+  (raise-syntax-error #f (string-append "expected " (alternatives (map (lambda (d) (pattern-text d x)) ds))) x))
+
 ;; No clause of a match matched x.
 (define (no-value-match x) (error 'match "no clause matches ~s" x))
 
-;; ---- pattern macros ----------------------------------------------------------------------
-;;
-;; A module written in Substrate defines a macro with patterns:
-;;
-;;   (define-syntax name
-;;     (syntax-rules (literal ...)
-;;       [pattern template] ...))
-;;
-;; A use of name is taken apart by the first pattern it matches, and
-;; replaced with that clause's template, the pattern's variables in it
-;; filled in. A pattern is syntax-match's (next/c/patterns.sub), but for
-;; checks (? pred p ...), its head standing for name; a literal in it is
-;; an identifier that matches one bound as it is, #'literal. A template
-;; is syntax, in which a pattern variable is what it matched, and t ...
-;; is t for each element its variables matched under an ellipsis. A use
-;; that no pattern matches is a syntax error that lists the patterns.
-;;
-;; The macro is compiled into C, at phase 1 of the module that defines it:
-;; a transformer, syntax-match on the patterns, whose clauses build the
-;; templates. So the macro runs as C, and needs no Substrate at compile
-;; time. (define-syntax name e) is the kernel's: e is code at phase 1.
+;; "a", "a or b", "a, b or c".
+(define (alternatives ts)
+  (cond [(null? (cdr ts)) (car ts)]
+        [(null? (cddr ts)) (string-append (car ts) " or " (cadr ts))]
+        [else (string-append (car ts) ", " (alternatives (cdr ts)))]))
 
-(begin-for-syntax
-  (define (rules-only [s datum]) -> datum (raise-syntax-error 0 '"allowed only in define-syntax" s))
+;; Description d written as its pattern is, in an error about x: a _ at its
+;; head as x's head.
+(define (pattern-text d x)
+  (let ([l (list-part x)])
+    (if (and (eq? (car d) 'list) (pair? (cadr d)) (equal? (car (cadr d)) '(any)) (pair? l) (identifier? (car l)))
+        (description-text (list 'list (cons (list 'datum (syntax-e (car l))) (cdr (cadr d))) (caddr d)))
+        (description-text d))))
 
-  (define (ellipsis? [x datum]) -> i32 (and (identifier? x) (free-identifier=? x #'...)))
-  (define (wildcard? [x datum]) -> i32 (and (identifier? x) (free-identifier=? x #'_)))
+(define (description-text d)
+  (case (car d)
+    [(var bound) (symbol->string (caddr d))]
+    [(datum) (format "~s" (cadr d))]
+    [(any) "_"]
+    [(check) (if (null? (cddr d)) "_" (description-text (last (cddr d))))]
+    [(repeat) (string-append (description-text (cadr d)) " ...")]
+    [(struct) (string-append "(" (spaced (cons (symbol->string (caddr d)) (map description-text (cadddr d)))) ")")]
+    [(list) (string-append "(" (spaced (map description-text (cadr d)))
+                           (if (eq? (car (caddr d)) 'null) "" (string-append " . " (description-text (caddr d))))
+                           ")")]))
 
-  ;; Is x one of the literals, compared by binding?
-  (define (literal? [x datum] [literals datum]) -> i32
-    (while (pair? literals)
-      (if (free-identifier=? x (car literals)) (return 1))
-      (set! literals (cdr literals)))
-    0)
-
-  (define (quoted? [x datum]) -> i32
-    (let ([l (syntax->list x)])
-      (and l (== (length l) 2) (identifier? (car l)) (free-identifier=? (car l) #'quote))))
-
-  ;; Pattern p as syntax-match at phase 1 takes it: its _ and ... this
-  ;; module's, which name the pattern words there, its literals #'literal,
-  ;; and its quote this module's.
-  (define (rule-pattern [p datum] [literals datum]) -> datum
-    (cond [(identifier? p)
-           (cond [(wildcard? p) #'_]
-                 [(ellipsis? p) #'...]
-                 [(free-identifier=? p #'?)
-                  (raise-syntax-error 'syntax-rules '"a pattern of syntax-rules has no checks" p)]
-                 [(literal? p literals) #`(quote-syntax #,p)]
-                 [else p])]
-          [(quoted? p) #`(quote #,(cadr (syntax->list p)))]
-          [(pair? (syntax-e p)) (syntax-rewrap p (rule-chain (syntax-e p) literals))]
-          [else p]))
-
-  (define (rule-chain [l datum] [literals datum]) -> datum
-    (cond [(syntax? l) (rule-pattern l literals)]
-          [(pair? l) (cons (rule-pattern (car l) literals) (rule-chain (cdr l) literals))]
-          [else l]))
-
-  ;; The variables of pattern p, at depth, as (identifier . depth), a
-  ;; depth being how many ellipses follow it.
-  (define (pattern-variables [p datum] [literals datum] [depth i32]) -> datum
-    (cond [(identifier? p)
-           (if (or (wildcard? p) (ellipsis? p) (literal? p literals)) nil `((,p . ,(make-integer depth))))]
-          [(quoted? p) nil]
-          [(pair? (syntax-e p)) (chain-variables (syntax-e p) literals depth)]
-          [else nil]))
-
-  (define (chain-variables [l datum] [literals datum] [depth i32]) -> datum
-    (cond [(syntax? l) (pattern-variables l literals depth)]
-          [(not (pair? l)) nil]
-          [(and (pair? (cdr l)) (ellipsis? (car (cdr l))))
-           (append (pattern-variables (car l) literals (+ depth 1)) (chain-variables (cdr (cdr l)) literals depth))]
-          [else (append (pattern-variables (car l) literals depth) (chain-variables (cdr l) literals depth))]))
-
-  ;; The variable of vars that identifier x names, (identifier . depth);
-  ;; #f if none.
-  (define (variable-of [x datum] [vars datum]) -> datum
-    (while (pair? vars)
-      (if (== (syntax-e (car (car vars))) (syntax-e x)) (return (car vars)))
-      (set! vars (cdr vars)))
-    0)
-
-  (define (depth-of [v datum]) -> i64 (integer-value (cdr v)))
-
-  ;; vars, if no two have one name.
-  (define (distinct [vars datum]) -> datum
-    (let ([l vars])
-      (while (pair? l)
-        (let ([v (variable-of (car (car l)) (cdr l))])
-          (if v (raise-syntax-error 'syntax-rules '"this pattern variable appears twice in its pattern" (car v))))
-        (set! l (cdr l))))
-    vars)
-
-  ;; The variables of vars in template t, each once, those repeated only
-  ;; if repeated.
-  (define (template-variables [t datum] [vars datum] [repeated i32] [acc datum]) -> datum
-    (cond [(identifier? t)
-           (let ([v (variable-of t vars)])
-             (if (and v (or (not repeated) (> (depth-of v) 0)) (not (memq v acc))) (cons v acc) acc))]
-          [(syntax? t) (template-variables (syntax-e t) vars repeated acc)]
-          [(pair? t) (template-variables (cdr t) vars repeated (template-variables (car t) vars repeated acc))]
-          [else acc]))
-
-
-  ;; C code that builds template t, whose pattern variables are vars.
-  (define (template-code [t datum] [vars datum]) -> datum
-    (cond [(identifier? t)
-           (let ([v (variable-of t vars)])
-             (cond [(not v) #`(quote-syntax #,t)]
-                   [(> (depth-of v) 0)
-                    (raise-syntax-error 'syntax-rules '"this pattern variable matched under ..., so ... must follow it" t)]
-                   [else (car v)]))]
-          [(null? (template-variables t vars 0 nil)) #`(quote-syntax #,t)]
-          [else #`(syntax-rewrap (quote-syntax #,t) #,(chain-code (syntax-e t) vars))]))
-
-  (define (chain-code [l datum] [vars datum]) -> datum
-    (cond [(syntax? l) (template-code l vars)]
-          [(null? l) #'nil]
-          [(and (pair? (cdr l)) (ellipsis? (car (cdr l))))
-           #`(append #,(repeat-code (car l) vars) #,(chain-code (cdr (cdr l)) vars))]
-          [else #`(cons #,(template-code (car l) vars) #,(chain-code (cdr l) vars))]))
-
-  ;; C code that builds the list of template t for each element its
-  ;; repeated variables matched, each of those one less deep in it.
-  (define (repeat-code [t datum] [vars datum]) -> datum
-    (let ([rs (template-variables t vars 1 nil)])
-      (if (null? rs) (raise-syntax-error 'syntax-rules '"no pattern variable before this ... matched under one" t))
-      (let ([acc (temp '"acc")] [ls (temps-for rs '"l")])
-        #`(let ([#,acc datum nil] #,@(list-bindings ls rs))
-            (while (pair? #,(car ls))
-              (let (#,@(element-bindings rs ls))
-                (set! #,acc (cons #,(template-code t (shallower vars rs)) #,acc)))
-              #,@(list-steps ls))
-            (reverse #,acc)))))
-
-  (define (list-bindings [ls datum] [rs datum]) -> datum
-    (if (null? ls) nil (cons #`[#,(car ls) datum #,(car (car rs))] (list-bindings (cdr ls) (cdr rs)))))
-
-  (define (element-bindings [rs datum] [ls datum]) -> datum
-    (if (null? rs) nil (cons #`[#,(car (car rs)) datum (car #,(car ls))] (element-bindings (cdr rs) (cdr ls)))))
-
-  (define (list-steps [ls datum]) -> datum
-    (if (null? ls) nil (cons #`(set! #,(car ls) (cdr #,(car ls))) (list-steps (cdr ls)))))
-
-  ;; vars, with those of rs one less deep.
-  (define (shallower [vars datum] [rs datum]) -> datum
-    (cond [(null? vars) nil]
-          [(memq (car vars) rs)
-           (cons (cons (car (car vars)) (make-integer (- (depth-of (car vars)) 1))) (shallower (cdr vars) rs))]
-          [else (cons (car vars) (shallower (cdr vars) rs))]))
-
-  ;; The syntax-match clauses of syntax-rules' clauses cs.
-  (define (rule-clauses [cs datum] [literals datum]) -> datum
-    (if (null? cs)
-        nil
-        (cons (syntax-match (car cs)
-                [(pattern template)
-                 (syntax-match pattern
-                   [(_ . rest)
-                    #`[#,(syntax-rewrap pattern (cons #'_ (rule-chain rest literals)))
-                       #,(template-code template (distinct (chain-variables rest literals 0)))]]
-                   [_ (raise-syntax-error 'syntax-rules '"expected a pattern (name pattern ...)" pattern)])]
-                [c (raise-syntax-error 'syntax-rules '"expected a clause: [pattern template]" c)])
-              (rule-clauses (cdr cs) literals))))
-
-  ;; (define-syntax name (syntax-rules (literal ...) clause ...)): the
-  ;; transformer, a C function at phase 1, and name bound to it; any other
-  ;; define-syntax, the kernel's.
-  (define (substrate-define-syntax-form [s datum]) -> datum
-    (syntax-match s
-      [(_ name (#'syntax-rules ((? identifier? literal) ...)))
-       (let ([t (temp '"rules")])
-         #`(begin
-             (begin-for-syntax
-               (define (#,t [s datum]) -> datum (raise-syntax-error 0 '"bad syntax: this macro has no patterns" s)))
-             (define-syntax #,name #,t)))]
-      [(_ name (#'syntax-rules ((? identifier? literal) ...) clause ...))
-       (let ([t (temp '"rules")])
-         #`(begin
-             (begin-for-syntax
-               (define (#,t [s datum]) -> datum (syntax-match s #,@(rule-clauses clause literal))))
-             (define-syntax #,name #,t)))]
-      [(_ name e) #`(define-syntax #,name #,e)])))
-
-(define-syntax syntax-rules rules-only)
-(define-syntax substrate-define-syntax substrate-define-syntax-form)
+;; Strings ts, with a space between each two.
+(define (spaced ts) (if (null? ts) "" (foldl (lambda (t acc) (string-append acc " " t)) (car ts) (cdr ts))))
