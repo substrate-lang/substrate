@@ -93,7 +93,8 @@ on them there.
     number and fields, passed and given as several values, and boxed into
     its node only where one term is held, as a node's field or a
     closure's argument. A match of many ways, or on Nat numbers, is a
-    switch, one jump, or, if each way gives a number, a table's. A term
+    switch, one jump, or, if each way gives a number, a table's; a call
+    of a small definition, not recursive, is its code, inlined. A term
     is made a function's code, then kernel code that owns each value
     once, as Bend's quantities allow: a value used again is shared, one
     not used is dropped, and a match frees the node it takes, or reuses

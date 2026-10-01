@@ -80,6 +80,7 @@
   (set! layouts (make-table))
   (set! shapes (make-table))
   (set! signatures (make-table))
+  (set! inlines (make-table))
   (set! in-progress nil)
   (set! uniform-lay (new-lay uniform-kind 1 0 0))
   (set! word-lay (new-lay word-kind 1 0 0))
@@ -865,7 +866,9 @@
                     (+= pi 1))
                   (if (>= op 0)
                       (mkval (new-ir (Prim (cast u32 op) n xs)) word-lay)
-                      (mkval (new-ir (Call (code-of (ref-k head)) n xs (-> (-> s result) words))) (-> s result))))]
+                      (let ([inl (inline-ir f (ref-k head) def s xs n)])
+                        (mkval (if (!= inl 0) inl (new-ir (Call (code-of (ref-k head)) n xs (-> (-> s result) words))))
+                               (-> s result)))))]
                [(> n need) (apply-last f live)]
                [else
                 (let ([xs (term-array napps)] [a apps])
@@ -1011,6 +1014,146 @@
         (set! l (cdr l))))
     (set! (-> b then) (body-ir f h 0 (append (reverse bound) rest) want))
     b))
+
+;; ---- inlining ----
+;;
+;; A call of a definition whose code is small is that code, made here, of
+;; its value checked again (core.sub's checked-value), its parameters
+;; bound to the arguments: if the code made is of size inline-limit or
+;; less (ir-size), and the definition does not call itself. Code inlined
+;; inlines too, max-inline deep. Whether a definition's code is small is
+;; kept for the module; its checked value, in the arena of the piece of
+;; code being made, for that piece.
+
+(define inline-limit u32 40)
+(define max-inline u32 2)
+;; A value of more nodes than raw-limit, unchecked, is not small.
+(define raw-limit u32 200)
+(define inline-depth u32 0)
+;; Each definition's name -> 1 if it is inlined, 2 if not; and -> its
+;; checked value.
+(define inlines (ptr arena-table) 0)
+(define bodies (ptr arena-table) 0)
+
+(define (inline-ir [f (ptr lfn)] [k datum] [d (ptr tld)] [s (ptr sig)] [xs (ptr (ptr ir))] [n u32]) -> (ptr ir)
+  (when (or (>= inline-depth max-inline) (== (table-ref inlines (cast u64 k)) 2)) (return 0))
+  (let ([v (cast (ptr term) (table-ref bodies (cast u64 k)))])
+    (when (== v 0)
+      ;; First, what its value says as it is, unchecked.
+      (when (or (refers? (defd-v d) k) (> (term-size (defd-v d) raw-limit) raw-limit))
+        (table-set! inlines (cast u64 k) 2)
+        (return 0))
+      (set! v (checked-value k))
+      (when (or (== v 0) (refers? v k))
+        (table-set! inlines (cast u64 k) 2)
+        (return 0))
+      (table-set! bodies (cast u64 k) (cast u32 v)))
+    (let ([params nil] [ds (domains (defd-T d))] [j u32 0] [body (ptr ir) 0])
+      (for ([i u32 0]) (< i (defd-n d)) (+= i 1)
+        (when (or (null? ds) (!= (dom-q (car ds)) 0))
+          (set! params (cons (new-binding (@ (-> s params) j) (if (pair? ds) (dom-k (car ds)) (sym x))) params))
+          (+= j 1))
+        (when (pair? ds) (set! ds (cdr ds))))
+      (set! params (reverse params))
+      (+= inline-depth 1)
+      (set! body (body-ir f (higher v) (defd-T d) params (-> s result)))
+      (-= inline-depth 1)
+      (when (> (ir-size body) inline-limit)
+        (table-set! inlines (cast u64 k) 2)
+        (return 0))
+      (table-set! inlines (cast u64 k) 1)
+      ;; The arguments bound, in order.
+      (let ([l (reverse params)])
+        (for ([i u32 n]) (> i 0) (-= i 1)
+          (set! body (new-ir (Bind (b-syms (car l)) (@ xs (- i 1)) body)))
+          (set! l (cdr l))))
+      body)))
+
+;; How big c's code is, about: a variable's and a number's nothing, a
+;; node's 4, a match's branch that takes a node 8, a closure's more than
+;; any limit, anything else 1, with its parts.
+(define (ir-size [c (ptr ir)]) -> u32
+  (match c
+    [(Use _) 0]
+    [(Lit _) 0]
+    [(Values n xs) (irs-size xs n)]
+    [(Call _ n xs _) (+ 1 (irs-size xs n))]
+    [(Prim _ n xs) (+ 1 (irs-size xs n))]
+    [(Apply g x) (+ 1 (+ (ir-size g) (ir-size x)))]
+    [(Succ x) (+ 1 (ir-size x))]
+    [(Make _ n xs) (+ 4 (irs-size xs n))]
+    [(Pack _ x) (+ 1 (ir-size x))]
+    [(Close _ _ _) 1000000]
+    [(Box _ x) (+ 4 (ir-size x))]
+    [(Unbox _ x) (+ 4 (ir-size x))]
+    [(Bind _ x r) (+ (ir-size x) (ir-size r))]
+    [(Case _ kind n bs o)
+     (let ([t u32 (if (!= o 0) (+ 1 (ir-size o)) 1)])
+       (for ([j u32 0]) (< j n) (+= j 1)
+         (let ([b (@ bs j)])
+           (when (and (== kind 0) (> (-> b n) 0) (not (-> b word))) (+= t 8))
+           (+= t (ir-size (-> b then)))))
+       t)]
+    [_ 1]))
+
+(define (irs-size [xs (ptr (ptr ir))] [n u32]) -> u32
+  (let ([t u32 0])
+    (for ([j u32 0]) (< j n) (+= j 1) (+= t (ir-size (@ xs j))))
+    t))
+
+;; A piece of code started, a definition's or a print's: its checked
+;; values in its arena.
+(define (start-piece!)
+  (set! bodies (make-table))
+  (set! inline-depth 0))
+
+;; Does t, a checked term, refer to definition k?
+(define (refers? [t (ptr term)] [k datum]) -> i32
+  (when (== t 0) (return 0))
+  (match t
+    [(Var _ i v _) (and (< i 0) (refers? v k))]
+    [(Ref r _) (== r k)]
+    [(Sub _ v _ b _) (or (refers? v k) (refers? b k))]
+    [(Let n _ _ _ vs b _ _)
+     (for ([j u32 0]) (< j n) (+= j 1) (when (refers? (@ vs j) k) (return 1)))
+     (refers? b k)]
+    [(Lam _ _ b _ _) (refers? b k)]
+    [(App g x _) (or (refers? g k) (refers? x k))]
+    [(Ctr _ n xs _)
+     (for ([j u32 0]) (< j n) (+= j 1) (when (refers? (@ xs j) k) (return 1)))
+     0]
+    [(Mat _ h m _) (or (refers? h k) (refers? m k))]
+    [(Rwt _ _ b _) (refers? b k)]
+    [(Ann x _ _) (refers? x k)]
+    [_ 0]))
+
+;; How many nodes t has, a term, checked or not, a U32 number one, up to
+;; past limit.
+(define (term-size [t (ptr term)] [limit u32]) -> u32
+  (when (== t 0) (return 0))
+  (match t
+    [(Var _ i v _) (if (and (< i 0) (!= v 0)) (term-size v limit) 1)]
+    [(Sub _ v _ b _) (+ (term-size v limit) (term-size b limit))]
+    [(Let n _ _ _ vs b _ _)
+     (let ([s u32 1])
+       (for ([j u32 0]) (< j n) (+= j 1)
+         (+= s (term-size (@ vs j) limit))
+         (when (> s limit) (return s)))
+       (+ s (term-size b limit)))]
+    [(Lam _ _ b _ _) (+ 1 (term-size b limit))]
+    [(App g x _) (let ([s (+ 1 (term-size g limit))]) (if (> s limit) s (+ s (term-size x limit))))]
+    [(Ctr k n xs _)
+     (if (== k u32-name)
+         1
+         (let ([s u32 1])
+           (for ([j u32 0]) (< j n) (+= j 1)
+             (+= s (term-size (@ xs j) limit))
+             (when (> s limit) (return s)))
+           s))]
+    [(Mat _ h m _) (let ([s (+ 1 (term-size h limit))]) (if (> s limit) s (+ s (term-size m limit))))]
+    [(Rwt _ _ b _) (term-size b limit)]
+    [(Ann x _ _) (term-size x limit)]
+    [_ 1]))
 
 ;; ---- owning ----
 ;;
@@ -1176,7 +1319,8 @@
                                 (call-indirect (i64 i64 -> i64) ,(index-code cv) ,cv ,av))))
                  sp tail)))]
     [(Succ x) (finish `(i64.add ,(emit x gamma sp 0) (i64.const 1)) sp tail)]
-    [(Pack bits x) (finish `(i64.or ,(i64-const bits) ,(emit x gamma sp 0)) sp tail)]
+    [(Pack bits x)
+     (let ([e (emit x gamma sp 0)]) (finish (if (== bits 0) e `(i64.or ,(i64-const bits) ,e)) sp tail))]
     [(Box l x)
      (let* ([xs (ir-array 1)] [pc datum 0] [pa datum 0])
        (set! (@ xs 0) x)
@@ -1215,26 +1359,29 @@
        (sequence (reverse shares)
                  `(let ([,(if (null? (cdr vs)) (car vs) vs) ,(emit x (used-by gamma x) sp 0)])
                     ,(emit r (append vs (used-by gamma r)) sp tail))))]
-    [(Case s kind n bs o) (emit-case s kind n bs o gamma sp)]))
+    [(Case s kind n bs o) (emit-case s kind n bs o gamma sp tail)]))
 
 ;; A match on s, which owns gamma, s among them: each branch's way its
-;; own, its spares those not yet used and, for a node it takes, that
-;; node. A flat value's match, kind 3, is on its variables s, the first
-;; its constructor's number if its family has more than one. A match of
-;; switch-ways ways or more is a switch on its constructor's number, and
-;; a chain of a Nat's, one on its count (nat-chain); a smaller one tests
-;; each branch in turn.
+;; own, and, for a node it takes, that node a spare of it. At the end of
+;; its function's way, tail 1, a branch has the spares not yet used too,
+;; and returns; else its value flows on from the match, and it frees the
+;; spares it does not use before it does. A flat value's match, kind 3,
+;; is on its variables s, the first its constructor's number if its
+;; family has more than one. A match of switch-ways ways or more is a
+;; switch on its constructor's number, and a chain of a Nat's, one on its
+;; count (nat-chain); a smaller one tests each branch in turn.
 (define switch-ways u32 4)
 
-(define (emit-case [s datum] [kind i32] [n u32] [bs (ptr (ptr branch))] [o (ptr ir)] [gamma datum] [sp (ptr spare)]) -> datum
-  (let ([rest nil] [tg (local! (sym tag))] [codes nil] [tests nil] [numbers nil] [tagged i32 0] [nat (== kind 1)])
+(define (emit-case [s datum] [kind i32] [n u32] [bs (ptr (ptr branch))] [o (ptr ir)] [gamma datum] [sp (ptr spare)] [tail i32]) -> datum
+  (let ([rest nil] [tg (local! (sym tag))] [codes nil] [tests nil] [numbers nil] [tagged i32 0] [nat (== kind 1)]
+        [mode i32 (if (== tail 1) 1 2)] [bsp (if (== tail 1) sp (cast (ptr spare) 0))])
     (let ([g gamma])
       (while (pair? g)
         (unless (or (== (car g) s) (and (pair? s) (!= (memq (car g) s) 0))) (set! rest (cons (car g) rest)))
         (set! g (cdr g))))
     (set! rest (reverse rest))
     (when nat
-      (let ([c (nat-chain s n bs o rest sp)]) (when (!= c 0) (return c))))
+      (let ([c (nat-chain s n bs o rest bsp mode)]) (when (!= c 0) (return c))))
     (for ([j u32 0]) (< j n) (+= j 1)
       (let ([b (@ bs j)])
         ;; The last branch, with no other code, is not tested; a test of
@@ -1247,14 +1394,14 @@
                                  `(i32.eq ,tg ,(i32-const (-> b number)))])
                           tests))
         (set! numbers (cons (int (-> b number)) numbers))
-        (set! codes (cons (branch-code s kind b rest (pending sp)) codes))))
-    (let ([chain (if (!= o 0) (emit o gamma (pending sp) 1) 0)])
+        (set! codes (cons (branch-code s kind b rest (pending bsp) mode) codes))))
+    (let ([chain (if (!= o 0) (emit o gamma (pending bsp) mode) 0)])
       (set! codes (reverse codes))
       (set! tests (reverse tests))
       (if (and (or (== kind 0) (== kind 3)) (>= (+ n (if (!= o 0) 1 0)) switch-ways))
           (if (== kind 3)
-              (switch-code `(i32.wrap_i64 ,(car s)) (reverse numbers) codes chain 0)
-              `(let ([,tg ,(variant-code s)]) ,(switch-code tg (reverse numbers) codes chain 0)))
+              (switch-code `(i32.wrap_i64 ,(car s)) (reverse numbers) codes chain 0 mode)
+              `(let ([,tg ,(variant-code s)]) ,(switch-code tg (reverse numbers) codes chain 0 mode)))
           (let ([dispatch (if-chain tests codes chain)])
             (if tagged `(let ([,tg ,(variant-code s)]) ,dispatch) dispatch))))))
 
@@ -1264,14 +1411,14 @@
   (cond [(null? codes) (if (!= other 0) other `(unreachable))]
         [(and (null? (cdr codes)) (== other 0)) (car codes)]
         [else `(if ,(car tests) ,(car codes) ,(if-chain (cdr tests) (cdr codes) other))]))
-
 ;; A switch on index, an i32: each of codes runs for its number, in
 ;; numbers, and other for any other number, or, if there is no other
 ;; code, the last code does. Each case is its block's, after the block,
-;; and returns, as a match ends its function's way; the other code is
-;; past them all. If each code is a number, it is a table's (const-table).
+;; and returns, if the switch ends its function's way, mode 1, or gives
+;; its value from a block around them all, mode 2; the other code is past
+;; them all. If each code is a number, it is a table's (const-table).
 ;; bounded says index is at most past the numbers by one.
-(define (switch-code [index datum] [numbers datum] [codes datum] [other datum] [bounded i32]) -> datum
+(define (switch-code [index datum] [numbers datum] [codes datum] [other datum] [bounded i32] [mode i32]) -> datum
   (when (== other 0)
     (set! other (car (reverse codes)))
     (set! codes (reverse (cdr (reverse codes))))
@@ -1294,12 +1441,12 @@
           (set! ns (cdr ns))
           (set! ls (cdr ls)))
         (set! entries (cons e entries))))
-    (let ([b `(block ,(car labels) (br-table ,(reverse entries) ,lf ,index))] [ls labels] [cs codes])
+    (let ([b `(block ,(car labels) (br-table ,(reverse entries) ,lf ,index))] [ls labels] [cs codes] [done (local! (sym done))])
       (while (pair? cs)
-        (set! b `(block ,(if (pair? (cdr ls)) (cadr ls) lf) ,b (return ,(car cs))))
+        (set! b `(block ,(if (pair? (cdr ls)) (cadr ls) lf) ,b ,(if (== mode 1) `(return ,(car cs)) `(br ,done ,(car cs)))))
         (set! ls (cdr ls))
         (set! cs (cdr cs)))
-      `(begin ,b ,other))))
+      (if (== mode 1) `(begin ,b ,other) `(block ,done ,b ,other)))))
 
 ;; Is code a number, (i64.const n)? Is each of codes?
 (define (const-code? [code datum]) -> i32 (and (pair? code) (== (car code) (sym i64.const))))
@@ -1340,7 +1487,7 @@
 ;; match is not one, 0.
 (define nat-levels u32 3)
 
-(define (nat-chain [s datum] [n u32] [bs (ptr (ptr branch))] [o (ptr ir)] [rest datum] [sp (ptr spare)]) -> datum
+(define (nat-chain [s datum] [n u32] [bs (ptr (ptr branch))] [o (ptr ir)] [rest datum] [sp (ptr spare)] [mode i32]) -> datum
   (let ([zeros nil] [k i64 0] [succ (ptr branch) 0] [go i32 (nat-level? n bs o)])
     (unless go (return 0))
     (while go
@@ -1360,15 +1507,15 @@
     (when (< k nat-levels) (return 0))
     (let ([p (@ (-> succ vs) 0)] [codes nil] [numbers nil] [z (reverse zeros)] [j i64 0])
       (while (pair? z)
-        (set! codes (cons (emit (cast (ptr ir) (car z)) rest (pending sp) 1) codes))
+        (set! codes (cons (emit (cast (ptr ir) (car z)) rest (pending sp) mode) codes))
         (set! numbers (cons (int j) numbers))
         (+= j 1)
         (set! z (cdr z)))
       (switch-code `(if (i64.lt_u ,s ,(i64-const (+ nat-zero k))) (i32.wrap_i64 ,s) ,(i32-const k))
                    (reverse numbers) (reverse codes)
-                   (let ([d (emit (-> succ then) (cons p rest) (pending sp) 1)])
+                   (let ([d (emit (-> succ then) (cons p rest) (pending sp) mode)])
                      (if (uses? (-> succ then) p) `(let ([,p (i64.sub ,s ,(i64-const k))]) ,d) d))
-                   1))))
+                   1 mode))))
 
 ;; Does a Nat's match of branches bs, n of them, and other code o, have
 ;; a Zero and a Succ branch and no other code?
@@ -1386,27 +1533,27 @@
   0)
 
 ;; Branch b of a match on s: its fields bound, and its way.
-(define (branch-code [s datum] [kind i32] [b (ptr branch)] [rest datum] [sp (ptr spare)]) -> datum
+(define (branch-code [s datum] [kind i32] [b (ptr branch)] [rest datum] [sp (ptr spare)] [mode i32]) -> datum
   (let ([n (-> b n)] [vs (-> b vs)] [fvs nil])
     (for ([j u32 n]) (> j 0) (-= j 1) (set! fvs (cons (@ vs (- j 1)) fvs)))
     (cond
-      [(== n 0) (emit (-> b then) rest sp 1)]
+      [(== n 0) (emit (-> b then) rest sp mode)]
       [(== kind 1)
        `(let ([,(@ vs 0) (i64.sub ,s (i64.const 1))])
-          ,(emit (-> b then) (cons (@ vs 0) rest) sp 1))]
+          ,(emit (-> b then) (cons (@ vs 0) rest) sp mode))]
       [(== kind 2)
        `(let ([,(@ vs 0) (#%app %bend-rt:u32-word ,s)])
-          ,(emit (-> b then) (cons (@ vs 0) rest) sp 1))]
+          ,(emit (-> b then) (cons (@ vs 0) rest) sp mode))]
       [(-> b word)
        `(let ([,(@ vs 0) (i64.and ,s (i64.const 4294967295))])
-          ,(emit (-> b then) (cons (@ vs 0) rest) sp 1))]
+          ,(emit (-> b then) (cons (@ vs 0) rest) sp mode))]
       [else
        (let ([a (local! (sym node))] [loads nil])
          (for ([j u32 0]) (< j n) (+= j 1)
            (set! loads (cons `[,(@ vs j) ,(load-code a j)] loads)))
          `(let ([,a (if (i64.lt_s ,s (i64.const 0)) (#%app %bend-rt:take ,s ,(i32-const n)) (i32.wrap_i64 ,s))])
             (let ,(reverse loads)
-              ,(emit (-> b then) (append fvs rest) (new-spare a n sp) 1))))])))
+              ,(emit (-> b then) (append fvs rest) (new-spare a n sp) mode))))])))
 
 ;; A closure's function: its captured values read, its node freed, then
 ;; its body, which owns them and its argument.
@@ -1498,6 +1645,7 @@
 ;; results as its result's layout has; a U32 operation's, its
 ;; instructions.
 (define (def-function [k datum] [fsym datum] [n u32] [T (ptr term)] [e (ptr term)]) -> datum
+  (start-piece!)
   (let* ([s (signature k T n)] [ds (domains T)] [ps (-> s params)] [pi u32 0] [params nil] [syms nil] [op (prim-of k)])
     (for ([j u32 0]) (< j n) (+= j 1)
       (when (or (null? ds) (!= (dom-q (car ds)) 0))
@@ -1528,6 +1676,7 @@
 
 ;; The code of a print of checked term e, of type T.
 (define (print-code [e (ptr term)] [T (ptr term)]) -> datum
+  (start-piece!)
   (set! printed (term-show-string (term-lower (term-wnf T) 0)))
   (let ([v (local! (sym v))])
     `(let ([,v ,(emit (to (expr-ir (new-lfn 0) (higher e) T) uniform-lay) nil 0 0)])
