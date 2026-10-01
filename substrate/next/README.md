@@ -179,7 +179,10 @@ that wants GC data, as Substrate will, defines its own.
 The new compiler adds to the kernel language, for code it compiles
 better: `(values e ...)`, several values, and a `let` binding of them,
 `[(x ...) init]` or `[(x ...) (type ...) init]`, so that a function of
-several results can be called for them (`tests/let-values.sub`).
+several results can be called for them (`tests/let-values.sub`); and
+`(br-table (label ...) default index)`, a branch to the label a number
+says, as wasm's `br_table` is, so that a switch is one jump
+(`tests/br-table.sub`).
 
 Code written for the old compiler's kernel module, its GC data and
 syntax objects, `lib/` among it, does not run on the new compiler:
