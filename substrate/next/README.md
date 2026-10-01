@@ -98,7 +98,8 @@ on them there.
     is made a function's code, then kernel code that owns each value
     once, as Bend's quantities allow: a value used again is shared, one
     not used is dropped, and a match frees the node it takes, or reuses
-    it for a constructor it builds.
+    it for a constructor it builds; a + parameter the code only reads is
+    borrowed: read in place, and lent by its caller.
   - `runtime.sub`: what that code runs with: nodes, from lists of the
     freed ones of each size; sharing, a count of owners off the node,
     made the first time a value is shared; dropping; and writing a Nat.

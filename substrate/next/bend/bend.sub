@@ -728,7 +728,7 @@
              [T (resolved (canonical T0))]
              [b (make-buffer)]
              [Th (higher T)]
-             [code (function! name n Th (validate-def! name n Th (higher v)))])
+             [code (function! name n Th (validate-def! name n Th (higher v)) 1)])
         (end-check!)
         (enc-start!)
         (buffer-add-byte! (& b) 3)
@@ -736,7 +736,7 @@
         (enc-term (& b) T)
         (buffer-add-byte! (& b) 1)
         (enc-term (& b) v)
-        (enc-code (& b) code)
+        (enc-code (& b) name code)
         (fact f (& b)))))
 
   ;; (law (f [q x : A] ...) R): f bound, then its type read and checked.
@@ -780,12 +780,12 @@
       (reset-fresh! 0)
       (set! template-read 0)
       (let* ([name (-> info name)] [v (resolved (read-value xs body))] [b (make-buffer)] [law (book-tld name)]
-             [code (function! name (defd-n law) (defd-T law) (validate-fill! name (higher v)))])
+             [code (function! name (defd-n law) (defd-T law) (validate-fill! name (higher v)) 0)])
         (end-check!)
         (enc-start!)
         (buffer-add-byte! (& b) 4)
         (enc-term (& b) v)
-        (enc-code (& b) code)
+        (enc-code (& b) name code)
         (fact f (& b)))))
 
   ;; ---- code ----
@@ -832,26 +832,31 @@
 
   ;; The function of definition name, of n parameters, of type T, whose
   ;; checked value is e: lowered, copied, lifted; the name of the function,
-  ;; which the definition's fact holds.
-  (define (function! [name datum] [n u32] [T (ptr term)] [e (ptr term)]) -> datum
+  ;; which the definition's fact holds. It borrows the parameters it only
+  ;; reads if borrow: not a law's, which callers made before its fill own.
+  (define (function! [name datum] [n u32] [T (ptr term)] [e (ptr term)] [borrow i32]) -> datum
     (if (erased-type? T)
         0
         (let ([fsym (fresh-global (string->symbol (short name)))])
           (table-set! codes (cast u64 name) (cast u32 fsym))
-          (let* ([code (def-function name fsym n T e)] [helpers (lowered-forms!)])
+          (let* ([code (def-function name fsym n T e borrow)] [helpers (lowered-forms!)])
             (in-module-arena!)
             (lift-code! (copy-code `(begin ,@helpers ,code)))
             (identifier-name (datum->syntax gen fsym 0))))))
 
-  ;; The name of a definition's function, as its fact holds it: 0, for
-  ;; none, as an erased definition has, or 1 and the name.
-  (define (enc-code [b (ptr buffer)] [code datum])
-    (if (== code 0)
-        (buffer-add-byte! b 0)
-        (begin (buffer-add-byte! b 1) (enc-sym b code))))
+  ;; The name of definition name's function, as its fact holds it: 0, for
+  ;; none, as an erased definition has; 1 and the name; or 2, the name and
+  ;; the mask of the parameters it borrows (lower.sub), if it borrows one.
+  (define (enc-code [b (ptr buffer)] [name datum] [code datum])
+    (cond [(== code 0) (buffer-add-byte! b 0)]
+          [(== (borrow-mask name) 0) (buffer-add-byte! b 1) (enc-sym b code)]
+          [else (buffer-add-byte! b 2) (enc-sym b code) (enc-u b (borrow-mask name))]))
 
   (define (dec-code! [name datum] [c (ptr cursor)])
-    (when (dec-byte c) (code! name (dec-sym c))))
+    (let ([kind (dec-byte c)])
+      (unless (== kind 0)
+        (code! name (dec-sym c))
+        (set-borrow-mask! name (if (== kind 2) (dec-u c) 0)))))
 
   ;; The function of definition name, for the code: a symbol of this
   ;; module's, or another module's, as an identifier, which lookup records
@@ -1182,7 +1187,7 @@
           (begin-check!)
           (when (!= (-> tp where) 0) (where! (-> tp where)))
           (reset-fresh! 0)
-          (let* ([Th (higher T)] [code (function! name n Th (validate-def! name n Th (higher v)))] [b (make-buffer)])
+          (let* ([Th (higher T)] [code (function! name n Th (validate-def! name n Th (higher v)) 1)] [b (make-buffer)])
             (end-check!)
             (enc-start!)
             (buffer-add-byte! (& b) 3)
@@ -1190,7 +1195,7 @@
             (enc-term (& b) T)
             (buffer-add-byte! (& b) 1)
             (enc-term (& b) v)
-            (enc-code (& b) code)
+            (enc-code (& b) name code)
             (syntax-local-lift-definition (fact (generated sym) (& b)))
             (enc-start!)
             (set! b (make-buffer))
@@ -1257,8 +1262,8 @@
 
   ;; The transformer every name a module defines is bound to: a name is
   ;; read as a term, not expanded; in kernel code, a definition applied,
-  ;; (f a ...), is a call of its function, which takes its live arguments,
-  ;; or, if f is erased (lower.sub), 0, once they are.
+  ;; (f a ...), is a call of its function, which takes its live arguments
+  ;; (kernel-call), or, if f is erased (lower.sub), 0, once they are.
   (define (bend-name [s datum]) -> datum
     (start!)
     (let* ([l (syntax->list s)] [applied (and (!= l 0) (pair? l))] [info (classify (if applied (car l) s))])
@@ -1269,7 +1274,26 @@
                    (list1 (short (-> info name)))))
       (generated (if (erased-def? (-> info name))
                      `(begin ,@(map (lambda ([a datum]) -> datum `(#%app %bend-rt:drop ,a)) (cdr l)) (i64.const 0))
-                     `(#%app ,(code-of (-> info name)) ,@(cdr l))))))
+                     (kernel-call (code-of (-> info name)) (borrow-mask (-> info name)) (cdr l))))))
+
+  ;; A call of function f, of arguments args, kernel code, which the
+  ;; caller owns: those f borrows, by mask, held, and dropped after.
+  (define (kernel-call [f datum] [mask u32] [args datum]) -> datum
+    (if (== mask 0)
+        `(#%app ,f ,@args)
+        (let ([binds nil] [ts nil] [drops nil] [j u32 0])
+          (while (pair? args)
+            (let ([t (string->symbol (format-message "bend-arg.~a" (list1 (make-integer j))))])
+              (set! binds (cons `[,t ,(car args)] binds))
+              (set! ts (cons t ts))
+              (when (and (< j 32) (!= (bit-and mask (<< (cast u32 1) j)) 0))
+                (set! drops (cons `(#%app %bend-rt:drop ,t) drops))))
+            (+= j 1)
+            (set! args (cdr args)))
+          `(let* ,(reverse binds)
+             (let ([bend-result (#%app ,f ,@(reverse ts))])
+               ,@(reverse drops)
+               bend-result)))))
 
   (define (keyword-alone [s datum]) -> datum
     (bend-fail s "expected this form of Bend's only in a Bend term" nil)

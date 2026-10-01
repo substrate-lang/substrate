@@ -41,7 +41,8 @@
 (memory from c)
 (table from c)
 
-(provide lower-start! def-function kernel-callable? print-code lowered-forms! fresh-global erased-type? erased-def?)
+(provide lower-start! def-function kernel-callable? borrow-mask set-borrow-mask! print-code lowered-forms! fresh-global
+         erased-type? erased-def?)
 
 ;; ---- the module ----
 ;;
@@ -81,6 +82,7 @@
   (set! shapes (make-table))
   (set! signatures (make-table))
   (set! inlines (make-table))
+  (set! borrows (make-table))
   (set! in-progress nil)
   (set! uniform-lay (new-lay uniform-kind 1 0 0))
   (set! word-lay (new-lay word-kind 1 0 0))
@@ -559,9 +561,9 @@
 ;; What a term's code does, its variables a function's locals, each a
 ;; symbol holding a word or a term, before what owns what is said, each
 ;; giving as many values as its layout has words: a variable; a term word;
-;; values, of parts; a call of a definition's function; a U32 operation
-;; (above); an application of a closure; a Nat's successor; a
-;; constructor's node, of its term's high bits, or its packed term; a
+;; values, of parts; a call of a definition's function, by its name; a
+;; U32 operation (above); an application of a closure; a Nat's successor;
+;; a constructor's node, of its term's high bits, or its packed term; a
 ;; closure of a lifted function, of the variables it captures; a flat
 ;; value boxed, or unboxed; values bound; a match on a variable, or a flat
 ;; value's variables, by constructor, of a kind, a node's (0), a Nat's
@@ -572,7 +574,7 @@
   [Use [v datum]]
   [Lit [x i64]]
   [Values [n u32] [xs (ptr (ptr ir))]]
-  [Call [f datum] [n u32] [xs (ptr (ptr ir))] [k u32]]
+  [Call [f datum] [n u32] [xs (ptr (ptr ir))] [k u32] [key datum]]
   [Prim [op u32] [n u32] [xs (ptr (ptr ir))]]
   [Apply [g (ptr ir)] [x (ptr ir)]]
   [Succ [x (ptr ir)]]
@@ -602,7 +604,7 @@
      (let ([w u32 0])
        (for ([j u32 0]) (< j n) (+= j 1) (+= w (ir-words (@ xs j))))
        w)]
-    [(Call _ _ _ k) k]
+    [(Call _ _ _ k _) k]
     [(Unbox l _) (-> l words)]
     [(Bind _ _ r) (ir-words r)]
     [(Case _ _ n bs o)
@@ -867,7 +869,9 @@
                   (if (>= op 0)
                       (mkval (new-ir (Prim (cast u32 op) n xs)) word-lay)
                       (let ([inl (inline-ir f (ref-k head) def s xs n)])
-                        (mkval (if (!= inl 0) inl (new-ir (Call (code-of (ref-k head)) n xs (-> (-> s result) words))))
+                        (mkval (if (!= inl 0)
+                                   inl
+                                   (new-ir (Call (code-of (ref-k head)) n xs (-> (-> s result) words) (ref-k head))))
                                (-> s result)))))]
                [(> n need) (apply-last f live)]
                [else
@@ -1077,7 +1081,7 @@
     [(Use _) 0]
     [(Lit _) 0]
     [(Values n xs) (irs-size xs n)]
-    [(Call _ n xs _) (+ 1 (irs-size xs n))]
+    [(Call _ n xs _ _) (+ 1 (irs-size xs n))]
     [(Prim _ n xs) (+ 1 (irs-size xs n))]
     [(Apply g x) (+ 1 (+ (ir-size g) (ir-size x)))]
     [(Succ x) (+ 1 (ir-size x))]
@@ -1105,6 +1109,7 @@
 ;; values in its arena.
 (define (start-piece!)
   (set! bodies (make-table))
+  (set! borrowed (make-table))
   (set! inline-depth 0))
 
 ;; Does t, a checked term, refer to definition k?
@@ -1155,6 +1160,151 @@
     [(Ann x _ _) (term-size x limit)]
     [_ 1]))
 
+;; ---- borrowing ----
+;;
+;; A + parameter of a definition, a term, that its code only reads is
+;; borrowed, as Bend2's borrow inference finds: its caller keeps it, and
+;; lends it for the call. The code matches it in place, neither taking
+;; its node nor freeing it, and reads its fields borrowed too; it never
+;; shares one, which would leave its owner's term out of date, nor drops
+;; one. Each + parameter of a term starts borrowed; one whose value, or a
+;; value read from it, reaches a place that owns it, as a constructor's
+;; field, a result, a closure or a parameter not borrowed, is owned, and
+;; again, until none does (infer-borrows!). A parameter of one use is
+;; owned: its caller, done with it, gives it, and its code frees it as it
+;; reads it, or reuses its nodes. A call lends a value it owns by holding
+;; it, and drops it after, so it is not a tail call: a call of the
+;; definition itself at the end of its way, then, owns what it would
+;; lend; and a definition that calls one not made yet, a law to fill
+;; later, which owns all its parameters, owns all its own, so that no
+;; loop of calls grows the stack.
+
+;; Each definition's name -> its mask, plus 1: bit j its j-th live
+;; parameter's, if it is borrowed. A definition made has one.
+(define borrows (ptr arena-table) 0)
+
+(define (borrow-mask [k datum]) -> u32
+  (let ([m (table-ref borrows (cast u64 k))]) (if (== m 0) 0 (- m 1))))
+
+(define (set-borrow-mask! [k datum] [m u32]) (table-set! borrows (cast u64 k) (+ m 1)))
+
+(define (lent? [k datum] [j u32]) -> i32 (and (< j 32) (!= (bit-and (borrow-mask k) (<< (cast u32 1) j)) 0)))
+
+;; The variable c is, or 0.
+(define (use-of [c (ptr ir)]) -> datum (match c [(Use v) v] [_ 0]))
+
+;; For a pass: each variable read from a borrowed parameter -> its place
+;; plus 1; the places of those that reach an owner; and the definition.
+(define roots (ptr arena-table) 0)
+(define escaped u32 0)
+(define current-def datum 0)
+
+(define (root-of [v datum]) -> u32 (if (plain? v) 0 (table-ref roots (cast u64 v))))
+
+(define (escape-place! [r u32]) (unless (== r 0) (set! escaped (bit-or escaped (<< (cast u32 1) (- r 1))))))
+
+;; What of c reaches an owner: c's value does, at the end of the
+;; function's way if tail.
+(define (scan! [c (ptr ir)] [tail i32])
+  (match c
+    [(Use v) (escape-place! (root-of v))]
+    [(Values n xs) (scan-all! xs n)]
+    [(Call _ n xs _ key)
+     (for ([j u32 0]) (< j n) (+= j 1)
+       (let* ([x (@ xs j)] [v (use-of x)])
+         (cond [(not (lent? key j)) (scan! x 0)]
+               [(== v 0)
+                (scan! x 0)
+                (when (and tail (== key current-def)) (escape-place! (+ j 1)))]
+               ;; A value of its own lent to itself at the end of its way.
+               [(and tail (== key current-def) (== (root-of v) 0) (not (plain? v))) (escape-place! (+ j 1))])))]
+    [(Prim _ n xs) (scan-all! xs n)]
+    [(Apply g x) (scan! g 0) (scan! x 0)]
+    [(Succ x) (scan! x 0)]
+    [(Make _ n xs) (scan-all! xs n)]
+    [(Pack _ x) (scan! x 0)]
+    [(Close _ n vs) (for ([j u32 0]) (< j n) (+= j 1) (escape-place! (root-of (@ vs j))))]
+    [(Box _ x) (scan! x 0)]
+    [(Unbox _ x) (scan! x 0)]
+    [(Bind vs x r)
+     (let ([v (use-of x)])
+       (if (and (!= v 0) (null? (cdr vs)))
+           (let ([rt (root-of v)]) (unless (== rt 0) (table-set! roots (cast u64 (car vs)) rt)))
+           (scan! x 0)))
+     (scan! r tail)]
+    [(Case s kind n bs o)
+     (let ([rt (if (or (pair? s) (!= kind 0)) 0 (root-of s))])
+       (for ([j u32 0]) (< j n) (+= j 1)
+         (let ([b (@ bs j)])
+           (unless (== rt 0)
+             (for ([i u32 0]) (< i (-> b n)) (+= i 1)
+               (table-set! roots (cast u64 (@ (-> b vs) i)) rt)))
+           (scan! (-> b then) tail)))
+       (unless (== o 0) (scan! o tail)))]
+    [_ 0]))
+
+(define (scan-all! [xs (ptr (ptr ir))] [n u32])
+  (for ([j u32 0]) (< j n) (+= j 1) (scan! (@ xs j) 0)))
+
+;; Does c call a definition not made yet?
+(define (calls-unmade? [c (ptr ir)]) -> i32
+  (match c
+    [(Call _ n xs _ key) (or (== (table-ref borrows (cast u64 key)) 0) (calls-unmade-any? xs n))]
+    [(Values n xs) (calls-unmade-any? xs n)]
+    [(Prim _ n xs) (calls-unmade-any? xs n)]
+    [(Make _ n xs) (calls-unmade-any? xs n)]
+    [(Apply g x) (or (calls-unmade? g) (calls-unmade? x))]
+    [(Succ x) (calls-unmade? x)]
+    [(Pack _ x) (calls-unmade? x)]
+    [(Box _ x) (calls-unmade? x)]
+    [(Unbox _ x) (calls-unmade? x)]
+    [(Bind _ x r) (or (calls-unmade? x) (calls-unmade? r))]
+    [(Case _ _ n bs o)
+     (for ([j u32 0]) (< j n) (+= j 1) (when (calls-unmade? (-> (@ bs j) then)) (return 1)))
+     (and (!= o 0) (calls-unmade? o))]
+    [_ 0]))
+
+(define (calls-unmade-any? [xs (ptr (ptr ir))] [n u32]) -> i32
+  (for ([j u32 0]) (< j n) (+= j 1) (when (calls-unmade? (@ xs j)) (return 1)))
+  0)
+
+;; Which of definition k's parameters, params, bindings, its code body
+;; borrows: each of a term of many uses, by many, a mask, starts borrowed,
+;; and those that reach an owner are owned, again, until none does. Kept
+;; as k's mask, which it gives.
+(define (infer-borrows! [k datum] [params datum] [many u32] [body (ptr ir)]) -> u32
+  (let ([mask u32 0] [j u32 0] [l params] [go i32 1])
+    (while (pair? l)
+      (let ([b (car l)])
+        (when (and (< j 32) (== (b-lay b) uniform-lay) (not (plain? (car (b-syms b)))) (!= (bit-and many (<< (cast u32 1) j)) 0))
+          (set! mask (bit-or mask (<< (cast u32 1) j)))))
+      (+= j 1)
+      (set! l (cdr l)))
+    (set-borrow-mask! k mask)
+    (when (calls-unmade? body) (set! mask 0))
+    (set! current-def k)
+    (while (and go (!= mask 0))
+      (set-borrow-mask! k mask)
+      (set! roots (make-table))
+      (set! escaped 0)
+      (set! j 0)
+      (set! l params)
+      (while (pair? l)
+        (when (lent? k j) (table-set! roots (cast u64 (car (b-syms (car l)))) (+ j 1)))
+        (+= j 1)
+        (set! l (cdr l)))
+      (scan! body 1)
+      (set! go (!= escaped 0))
+      (set! mask (bit-and mask (bit-xor escaped 4294967295))))
+    (set-borrow-mask! k mask)
+    mask))
+
+;; The variables borrowed in the piece of code being made, each -> 1.
+(define borrowed (ptr arena-table) 0)
+
+(define (borrow! [v datum]) (table-set! borrowed (cast u64 v) 1))
+(define (borrowed? [v datum]) -> i32 (!= (table-ref borrowed (cast u64 v)) 0))
+
 ;; ---- owning ----
 ;;
 ;; A function's code made kernel code, gamma the variables it owns, each
@@ -1188,7 +1338,7 @@
   (match c
     [(Use x) (== x v)]
     [(Values n xs) (uses-any? xs n v)]
-    [(Call _ n xs _) (uses-any? xs n v)]
+    [(Call _ n xs _ _) (uses-any? xs n v)]
     [(Prim _ n xs) (uses-any? xs n v)]
     [(Apply g x) (or (uses? g v) (uses? x v))]
     [(Succ x) (uses? x v)]
@@ -1245,16 +1395,21 @@
     (cons (reverse shares) (reverse codes))))
 
 ;; The arguments of parts xs, whose codes are codes, each part as many as
-;; it gives values: (bindings . arguments). A part of one value is its
-;; code; one of values, their codes, which run in order as arguments do;
-;; another is bound to locals first, so that each argument is one value,
-;; and so is each part before it, so that the parts run in order.
-(define (part-args [xs (ptr (ptr ir))] [n u32] [codes datum]) -> datum
-  (let ([binds nil] [args nil] [cs codes] [last i32 -1])
+;; it gives values: (bindings arguments temporaries). A part of one value
+;; is its code; one of values, their codes, which run in order as
+;; arguments do; another is bound to locals first, so that each argument
+;; is one value, and so is a part that force says, a list of 1 and 0 or
+;; nil, whose local is a temporary; and so is each part before them, so
+;; that the parts run in order.
+(define (part-args [xs (ptr (ptr ir))] [n u32] [codes datum] [force datum]) -> datum
+  (let ([binds nil] [args nil] [temps nil] [cs codes] [fs force] [last i32 -1])
     (for ([j u32 0]) (< j n) (+= j 1)
-      (unless (or (== (ir-words (@ xs j)) 1) (values-code? (car cs))) (set! last (cast i32 j)))
-      (set! cs (cdr cs)))
+      (when (or (and (!= (ir-words (@ xs j)) 1) (not (values-code? (car cs)))) (and (pair? fs) (!= (car fs) 0)))
+        (set! last (cast i32 j)))
+      (set! cs (cdr cs))
+      (when (pair? fs) (set! fs (cdr fs))))
     (set! cs codes)
+    (set! fs force)
     (for ([j u32 0]) (< j n) (+= j 1)
       (let ([w (ir-words (@ xs j))] [code (car cs)])
         (cond [(> (cast i32 j) last)
@@ -1264,14 +1419,27 @@
                  (for ([i u32 0]) (< i w) (+= i 1) (set! syms (cons (local! (sym v)) syms)))
                  (set! syms (reverse syms))
                  (set! binds (cons (if (== w 1) `[,(car syms) ,code] `[,syms ,code]) binds))
-                 (set! args (append (reverse syms) args)))]))
-      (set! cs (cdr cs)))
-    (cons (reverse binds) (reverse args))))
+                 (set! args (append (reverse syms) args))
+                 (when (and (pair? fs) (!= (car fs) 0)) (set! temps (cons (car syms) temps))))]))
+      (set! cs (cdr cs))
+      (when (pair? fs) (set! fs (cdr fs))))
+    `(,(reverse binds) ,(reverse args) ,(reverse temps))))
 
 (define (values-code? [code datum]) -> i32 (and (pair? code) (== (car code) (sym values))))
 
 ;; e in the let* of binds, if any.
 (define (bound-code [binds datum] [e datum]) -> datum (if (null? binds) e `(let* ,binds ,e)))
+
+;; Call code, of k results, then temps dropped, then its results.
+(define (after-call [call datum] [k u32] [temps datum]) -> datum
+  (let ([rs nil] [drops nil])
+    (for ([i u32 0]) (< i k) (+= i 1) (set! rs (cons (local! (sym r)) rs)))
+    (while (pair? temps)
+      (set! drops (cons-code (drop-code (car temps)) drops))
+      (set! temps (cdr temps)))
+    `(let ([,(if (== k 1) (car rs) rs) ,call])
+       ,@(reverse drops)
+       ,(if (== k 1) (car rs) `(values ,@rs)))))
 
 ;; Where the way ends, the spares no constructor on it reused freed
 ;; first.
@@ -1299,12 +1467,19 @@
     [(Lit x) (finish (i64-const x) sp tail)]
     [(Fail) `(unreachable)]
     [(Values n xs)
-     (let* ([pc (emit-parts xs n gamma sp)] [pa (part-args xs n (cdr pc))])
-       (finish (sequence (car pc) (bound-code (car pa) (if (and (== n 1) (null? (car pa))) (car (cdr pa)) `(values ,@(cdr pa)))))
+     (let* ([pc (emit-parts xs n gamma sp)] [pa (part-args xs n (cdr pc) nil)])
+       (finish (sequence (car pc) (bound-code (car pa) (if (and (== n 1) (null? (car pa))) (car (cadr pa)) `(values ,@(cadr pa)))))
                sp tail))]
-    [(Call fn n xs _)
-     (let* ([pc (emit-parts xs n gamma sp)] [pa (part-args xs n (cdr pc))])
-       (finish (sequence (car pc) (bound-code (car pa) `(#%app ,fn ,@(cdr pa)))) sp tail))]
+    ;; A part lent, a value of the caller's own or made for the call, held
+    ;; in a temporary, which is dropped after.
+    [(Call fn n xs k key)
+     (let* ([pc (emit-parts xs n gamma sp)] [force nil] [pa datum 0])
+       (for ([j u32 0]) (< j n) (+= j 1)
+         (let ([v (use-of (@ xs j))])
+           (set! force (cons (if (and (lent? key j) (not (and (!= v 0) (or (borrowed? v) (plain? v))))) (cast datum 1) 0) force))))
+       (set! pa (part-args xs n (cdr pc) (reverse force)))
+       (let ([call `(#%app ,fn ,@(cadr pa))])
+         (finish (sequence (car pc) (bound-code (car pa) (if (null? (caddr pa)) call (after-call call k (caddr pa))))) sp tail)))]
     [(Prim op n xs)
      (let ([pc (emit-parts xs n gamma sp)])
        (finish (sequence (car pc) (prim-code op (cdr pc))) sp tail))]
@@ -1325,8 +1500,8 @@
      (let* ([xs (ir-array 1)] [pc datum 0] [pa datum 0])
        (set! (@ xs 0) x)
        (set! pc (emit-parts xs 1 gamma sp))
-       (set! pa (part-args xs 1 (cdr pc)))
-       (finish (sequence (car pc) (bound-code (car pa) `(#%app ,(box-name l) ,@(cdr pa)))) sp tail))]
+       (set! pa (part-args xs 1 (cdr pc) nil))
+       (finish (sequence (car pc) (bound-code (car pa) `(#%app ,(box-name l) ,@(cadr pa)))) sp tail))]
     [(Unbox l x) (finish `(#%app ,(unbox-name l) ,(emit x gamma sp 0)) sp tail)]
     [(Make bits n xs)
      (let* ([nd (local! (sym nd))] [at (alloc-code n sp)] [pc (emit-parts xs n gamma sp)] [stores nil] [es (cdr pc)])
@@ -1350,15 +1525,21 @@
                         ,@(reverse stores)
                         (i64.or ,word (i64.extend_i32_u ,nd)))
                      sp tail))))]
+    ;; A variable borrowed, bound again: borrowed.
     [(Bind vs x r)
-     (let ([shares nil] [g gamma])
-       (while (pair? g)
-         (when (and (uses? x (car g)) (uses? r (car g)))
-           (set! shares (cons-code (share-code (car g) 1) shares)))
-         (set! g (cdr g)))
-       (sequence (reverse shares)
-                 `(let ([,(if (null? (cdr vs)) (car vs) vs) ,(emit x (used-by gamma x) sp 0)])
-                    ,(emit r (append vs (used-by gamma r)) sp tail))))]
+     (let ([v (use-of x)])
+       (if (and (!= v 0) (null? (cdr vs)) (borrowed? v))
+           (begin
+             (borrow! (car vs))
+             `(let ([,(car vs) ,v]) ,(emit r gamma sp tail)))
+           (let ([shares nil] [g gamma])
+             (while (pair? g)
+               (when (and (uses? x (car g)) (uses? r (car g)))
+                 (set! shares (cons-code (share-code (car g) 1) shares)))
+               (set! g (cdr g)))
+             (sequence (reverse shares)
+                       `(let ([,(if (null? (cdr vs)) (car vs) vs) ,(emit x (used-by gamma x) sp 0)])
+                          ,(emit r (append vs (used-by gamma r)) sp tail))))))]
     [(Case s kind n bs o) (emit-case s kind n bs o gamma sp tail)]))
 
 ;; A match on s, which owns gamma, s among them: each branch's way its
@@ -1532,7 +1713,9 @@
   (for ([j u32 0]) (< j n) (+= j 1) (when (uses? (-> (@ bs j) then) v) (return 1)))
   0)
 
-;; Branch b of a match on s: its fields bound, and its way.
+;; Branch b of a match on s: its fields bound, and its way. A node
+;; borrowed is read where it is, through its redirect if it is shared,
+;; neither taken nor freed, and its fields are borrowed.
 (define (branch-code [s datum] [kind i32] [b (ptr branch)] [rest datum] [sp (ptr spare)] [mode i32]) -> datum
   (let ([n (-> b n)] [vs (-> b vs)] [fvs nil])
     (for ([j u32 n]) (> j 0) (-= j 1) (set! fvs (cons (@ vs (- j 1)) fvs)))
@@ -1547,6 +1730,16 @@
       [(-> b word)
        `(let ([,(@ vs 0) (i64.and ,s (i64.const 4294967295))])
           ,(emit (-> b then) (cons (@ vs 0) rest) sp mode))]
+      [(borrowed? s)
+       (let ([a (local! (sym node))] [loads nil])
+         (for ([j u32 0]) (< j n) (+= j 1)
+           (borrow! (@ vs j))
+           (set! loads (cons `[,(@ vs j) ,(load-code a j)] loads)))
+         `(let ([,a (if (i64.lt_s ,s (i64.const 0))
+                        (i32.wrap_i64 (i64.shr_u (i64.load (i32.wrap_i64 ,s)) (i64.const 32)))
+                        (i32.wrap_i64 ,s))])
+            (let ,(reverse loads)
+              ,(emit (-> b then) rest sp mode))))]
       [else
        (let ([a (local! (sym node))] [loads nil])
          (for ([j u32 0]) (< j n) (+= j 1)
@@ -1641,10 +1834,10 @@
 
 ;; Definition k's function, named fsym, of type T, its first n binders its
 ;; parameters, of checked value e: a function of its live parameters, each
-;; as many locals as its layout has words, which it owns, of as many
-;; results as its result's layout has; a U32 operation's, its
-;; instructions.
-(define (def-function [k datum] [fsym datum] [n u32] [T (ptr term)] [e (ptr term)]) -> datum
+;; as many locals as its layout has words, which it owns, or, if borrow
+;; and it only reads one, borrows (infer-borrows!), of as many results as
+;; its result's layout has; a U32 operation's, its instructions.
+(define (def-function [k datum] [fsym datum] [n u32] [T (ptr term)] [e (ptr term)] [borrow i32]) -> datum
   (start-piece!)
   (let* ([s (signature k T n)] [ds (domains T)] [ps (-> s params)] [pi u32 0] [params nil] [syms nil] [op (prim-of k)])
     (for ([j u32 0]) (< j n) (+= j 1)
@@ -1658,8 +1851,29 @@
     (set! syms (reverse syms))
     `(func (,fsym ,@(map (lambda ([x datum]) -> datum `[,x i64]) syms)) -> ,(result-types (-> s result))
        ,(if (>= op 0)
-            (prim-code (cast u32 op) syms)
-            (emit (body-ir (new-lfn 0) (higher e) T params (-> s result)) syms 0 1)))))
+            (begin (set-borrow-mask! k 0) (prim-code (cast u32 op) syms))
+            (let ([body (body-ir (new-lfn 0) (higher e) T params (-> s result))] [owned nil] [j u32 0] [l datum 0])
+              (if borrow (infer-borrows! k params (many-mask T n) body) (set-borrow-mask! k 0))
+              (set! l params)
+              (while (pair? l)
+                (if (lent? k j)
+                    (borrow! (car (b-syms (car l))))
+                    (set! owned (append (reverse (b-syms (car l))) owned)))
+                (+= j 1)
+                (set! l (cdr l)))
+              (emit body (reverse owned) 0 1))))))
+
+;; The mask of the live parameters, of type T's first n domains, of many
+;; uses, +.
+(define (many-mask [T (ptr term)] [n u32]) -> u32
+  (let ([ds (domains T)] [m u32 0] [j u32 0])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (cond [(null? ds) (+= j 1)]
+            [(!= (dom-q (car ds)) 0)
+             (when (and (== (dom-q (car ds)) 2) (< j 32)) (set! m (bit-or m (<< (cast u32 1) j))))
+             (+= j 1)])
+      (when (pair? ds) (set! ds (cdr ds))))
+    m))
 
 ;; ---- print ----
 ;;
