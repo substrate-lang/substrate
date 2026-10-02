@@ -59,9 +59,9 @@ on them there.
     Substrate its forms.
   - `forms.sub`: the same for code written in the C-like Lisp, macros
     above all: `for/each` and `for/list` over lists, `fmt`, a message
-    formatted from its arguments, and `define-syntax` defining a macro
-    with its transformer, `(define-syntax (name stx) body ...)`; `bend/`
-    writes its loops and messages with them.
+    formatted from its arguments, and `define-macro`, a macro defined
+    with its transformer, `(define-macro (name stx) body ...)`; `bend/`
+    writes its macros, loops and messages with them.
 - `substrate/`: Substrate as the new compiler builds it, on the C-like
   Lisp (plan, 5):
   - `data.sub`: its data, `compiler/kernel.sub`'s but for its syntax
