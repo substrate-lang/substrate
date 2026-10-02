@@ -1,0 +1,716 @@
+;; Lifecycle: experimental. A language for a page's views, on the C-like
+;; Lisp (next/c): a view is a template of elements, compiled where it is
+;; written into the code that makes its nodes and the code that brings
+;; them up to date, so that what a template says once is done once, and an
+;; update looks only at the parts that can change.
+;;
+;;   (messages M)                           the type, a variant's, of the
+;;                                          messages this module's views
+;;                                          send
+;;   (view (v [x T] ...) child ...)         a view, v, of x ...
+;;
+;; A child is one of:
+;;
+;;   "text"                                 text
+;;   (tag ([attr value] ...) child ...)     an element, <tag>; the attributes
+;;   (tag child ...)                        may be left out
+;;   (text e)                               text that changes: e, a (ptr u8)
+;;   (int e)                                an integer that changes, e, in
+;;                                          decimal
+;;   (if c child [child])                   the first child if c is true, or
+;;                                          the second, if there is one
+;;   (when c child ...)                     the children if c is true
+;;   (each [x items n] #:key k child ...)   the children for each x, a
+;;                                          pointer to each of the n items
+;;                                          at items; k, an integer, tells
+;;                                          an item from the others, so
+;;                                          that when the items change, an
+;;                                          item that stays keeps its nodes.
+;;                                          An each among the children is
+;;                                          in a view of its own, (v e ...)
+;;   (v e ...)                              the view v, of e ...
+;;
+;; and an attribute is one of:
+;;
+;;   [name "text"]                          the attribute, as it stays
+;;   [name e]                               one that changes: e, a (ptr u8),
+;;                                          or 0 for an element without it
+;;   [on event m]                           a listener: when the event,
+;;                                          such as click, reaches the
+;;                                          element, the page's update is
+;;                                          given the message m
+;;   [focus e], [scroll-end e]              the element is given the focus,
+;;                                          or scrolled to its end, each
+;;                                          time e, an integer, changes
+;;
+;; The words of a template, tags among them, are compared by name, and e,
+;; c, k and m are C code, which sees the view's x ... and, in an each, its
+;; x. So what a view shows is all in its template: no code makes a node.
+;; That is what lets the template be compiled. Its text and its elements
+;; that never change are one piece of HTML, a template of the page's, made
+;; once and copied for each of the view's instances; a part that can change
+;; is a slot of the instance, a struct, holding what the page shows; and
+;; an update works each slot's value out again and changes the page where
+;; it differs. An update allocates nothing, and costs as the view's slots
+;; number, not its nodes.
+;;
+;; A view v is a struct, v.state, an instance, and three functions:
+;;
+;;   (v.mount st parent before x ...)       the instance st made, its nodes
+;;                                          put in node parent, before node
+;;                                          before, or last if that is 0
+;;   (v.update st x ...)                    brought up to date
+;;   (v.unmount st detach)                  ended; its nodes are taken out
+;;                                          if detach is 1, and if it is 0
+;;                                          go with those that hold them
+;;
+;; They change no page: they write patches, to a buffer (ui-patches), for
+;; the page's host to apply as one batch (web.sub, flush!). A patch is
+;; 32-bit words, its number then its operands; a node or a copy is a
+;; number the program gives it, 0 the page's root, and text is where it is
+;; in memory, its address and its length, read when the batch is applied.
+;; What an if shows, an each's rows and a view in another are copies of
+;; their own, put before an anchor, a comment, of the copy they are in. So
+;; a copy's nodes are those from its first to its last, the copies in it
+;; among them, and moving it or taking it out moves or takes them all.
+;;
+;;   1 template t html len        t is the HTML at html. In it, <!--t-->
+;;                                is an empty text node, <!--a--> stays, a
+;;                                comment, and an element with the
+;;                                attribute data-n loses it: the marked
+;;                                nodes, which a copy numbers.
+;;   2 clone t first n parent before
+;;                                a copy of template t: first is the copy,
+;;                                and first+1 ... first+n its marked nodes,
+;;                                in the HTML's order. before is a node, or
+;;                                a copy, for its first node.
+;;   3 remove first n             copy first, taken out of the page, and
+;;                                its numbers free
+;;   4 free first n               its numbers free: its nodes went with a
+;;                                copy they were in
+;;   5 move first parent before   copy first, moved
+;;   6 text node s len            a text node's text
+;;   7 attr node name len s len   an element's attribute
+;;   8 unattr node name len       an element without the attribute
+;;   9 listen node event len m    a listener, which gives m, a number, to
+;;                                the program's on-event
+;;   10 focus node, 11 scroll-end node
+(require-unqualified c "../c/c.sub")
+
+(provide view messages
+         ui-patches ui-patches-done! ui-frame-alloc
+         ui-template ui-clone ui-remove ui-move ui-text ui-attr ui-listen
+         ui-text-slot! ui-attr-slot! ui-int-set! ui-int-slot! ui-effect-slot!
+         ui-row ui-rows ui-each! ui-each-clear!)
+
+(memory from c)
+(table from c)
+
+;; ---- patches ----
+
+;; The batch being written; what its text is kept in, when no slot holds
+;; it, until the batch is applied; and the numbers given out so far.
+(define patches buffer)
+(define frame arena)
+(define next-id u32 1)
+(define next-template u32 1)
+
+(define (ui-patches) -> (ptr buffer) (& patches))
+
+;; The batch has been applied: it is empty again.
+(define (ui-patches-done!)
+  (set! (-> patches length) 0)
+  (arena-free (& frame)))
+
+;; n bytes that last until the batch is applied.
+(define (ui-frame-alloc [n u32]) -> (ptr void) (arena-alloc (& frame) n))
+
+(define (words! [w (ptr u32)] [n u32]) (buffer-add! (& patches) (cast (ptr u8) w) (* 4 n)))
+
+;; A new template, of the HTML at html, which stays: its number.
+(define (ui-template [html (ptr u8)]) -> u32
+  (let ([t next-template])
+    (+= next-template 1)
+    (words! (array-of u32 1 t (cast u32 html) (strlen html)) 4)
+    t))
+
+;; A copy of template t, with n marked nodes, in parent before before: its
+;; number, the n after which are its nodes'.
+(define (ui-clone [t u32] [n u32] [parent u32] [before u32]) -> u32
+  (let ([first next-id])
+    (+= next-id (+ n 1))
+    (words! (array-of u32 2 t first n parent before) 6)
+    first))
+
+(define (ui-remove [first u32] [n u32] [detach i32]) (words! (array-of u32 (if detach 3 4) first n) 3))
+(define (ui-move [first u32] [parent u32] [before u32]) (words! (array-of u32 5 first parent before) 4))
+(define (ui-text [node u32] [s (ptr u8)]) (words! (array-of u32 6 node (cast u32 s) (strlen s)) 4))
+
+;; node's attribute name: value, or none if value is 0.
+(define (ui-attr [node u32] [name (ptr u8)] [value (ptr u8)])
+  (if (== value 0)
+      (words! (array-of u32 8 node (cast u32 name) (strlen name)) 4)
+      (words! (array-of u32 7 node (cast u32 name) (strlen name) (cast u32 value) (strlen value)) 6)))
+
+(define (ui-listen [node u32] [event (ptr u8)] [message (ptr void)])
+  (words! (array-of u32 9 node (cast u32 event) (strlen event) (cast u32 message)) 5))
+
+;; ---- slots ----
+;;
+;; A slot holds what the page shows of a part that can change: a text
+;; slot a copy of the text, so that the text it is given may be anywhere,
+;; and change there.
+
+(define (same-text? [a (ptr u8)] [b (ptr u8)]) -> i32
+  (if (or (== a 0) (== b 0))
+      (== a b)
+      (let ([i u32 0])
+        (while (and (== (@ a i) (@ b i)) (!= (@ a i) 0)) (+= i 1))
+        (== (@ a i) (@ b i)))))
+
+;; s kept in the slot at cache, if it is not the text there: 1 if so.
+(define (keep-text! [cache (ptr (ptr u8))] [s (ptr u8)]) -> i32
+  (if (same-text? (@ cache) s)
+      0
+      (begin
+        (free (@ cache))
+        (set! (@ cache) (if (== s 0)
+                            0
+                            (let* ([n (+ (strlen s) 1)] [p (cast (ptr u8) (malloc n))])
+                              (memcpy p s n)
+                              p)))
+        1)))
+
+(define (ui-text-slot! [cache (ptr (ptr u8))] [node u32] [s (ptr u8)])
+  (when (keep-text! cache s) (ui-text node (if (== (@ cache) 0) "" (@ cache)))))
+
+(define (ui-attr-slot! [cache (ptr (ptr u8))] [node u32] [name (ptr u8)] [s (ptr u8)])
+  (when (keep-text! cache s) (ui-attr node name (@ cache))))
+
+;; n in decimal, until the batch is applied.
+(define (int-text [n i64]) -> (ptr u8)
+  (let* ([p (cast (ptr u8) (ui-frame-alloc 24))] [i u32 23] [u u64 (if (< n 0) (- 0 n) n)])
+    (set! (@ p 23) 0)
+    (while 1
+      (-= i 1)
+      (set! (@ p i) (+ 48 (cast i32 (% u 10))))
+      (set! u (/ u 10))
+      (when (== u 0) (break)))
+    (when (< n 0)
+      (-= i 1)
+      (set! (@ p i) 45))
+    (+ p i)))
+
+(define (ui-int-set! [cache (ptr i64)] [node u32] [n i64])
+  (set! (@ cache) n)
+  (ui-text node (int-text n)))
+
+(define (ui-int-slot! [cache (ptr i64)] [node u32] [n i64])
+  (when (!= (@ cache) n) (ui-int-set! cache node n)))
+
+;; Patch op of node, each time n is not what the slot holds.
+(define (ui-effect-slot! [cache (ptr i64)] [node u32] [n i64] [op u32])
+  (when (!= (@ cache) n)
+    (set! (@ cache) n)
+    (words! (array-of u32 op node) 2)))
+
+;; ---- each ----
+;;
+;; The rows of an each: each item's key, and its instance, of the each's
+;; children, whose first field is its number.
+
+(struct ui-row [key u64] [state (ptr void)])
+(struct ui-rows [items (ptr ui-row)] [count u32])
+
+(define (first-of [state (ptr void)]) -> u32 (@ (cast (ptr u32) state)))
+
+;; A key of a table of them, which has none that is 0.
+(define (table-key [key u64]) -> u64 (bit-or (<< key 1) 1))
+
+;; The rows of b brought up to date with n items, before node anchor: the
+;; item at i has the key (key-of i); (mount i state parent before) makes
+;; its instance, of size bytes, and (update i state) brings one up to date;
+;; (unmount state detach) ends one. The rows that start both the old and
+;; the new, and those that end both, stay where they are. Of those
+;; between, an item whose key a row has keeps the row, and the other rows
+;; go; the kept rows that are in the order they were, the most of them
+;; that are, stay where they are, and the others are moved.
+(define (ui-each! [b (ptr ui-rows)] [parent u32] [anchor u32] [n u32] [size u32]
+                  [key-of (closure (u32) -> u64)]
+                  [mount (closure (u32 (ptr void) u32 u32))]
+                  [update (closure (u32 (ptr void)))]
+                  [unmount (closure ((ptr void) i32))])
+  (let ([old (-> b items)] [m (-> b count)] [p u32 0] [s u32 0])
+    (while (and (< p m) (< p n) (== (-> (+ old p) key) (key-of p)))
+      (update p (-> (+ old p) state))
+      (+= p 1))
+    (when (and (== p m) (== p n)) (return))
+    (while (and (< s (- m p)) (< s (- n p)) (== (-> (+ old (- m 1 s)) key) (key-of (- n 1 s)))) (+= s 1))
+    (let* ([rows (cast (ptr ui-row) (malloc (* (+ n 1) (sizeof ui-row))))]
+           [middle (- m p s)] [between (- n p s)]
+           [used (cast (ptr u8) (calloc (+ middle 1) 1))]
+           ;; For each item between: the row it keeps, by its place among
+           ;; the old ones between, or -1; and whether that row stays.
+           [from (cast (ptr i32) (malloc (* 4 (+ between 1))))]
+           [stays (cast (ptr u8) (calloc (+ between 1) 1))]
+           [index hash-table])
+      (memset (& index) 0 (sizeof hash-table))
+      (memcpy rows old (* p (sizeof ui-row)))
+      (for ([i u32 0]) (< i middle) (+= i 1)
+        (hash-set! (& index) (table-key (-> (+ old (+ p i)) key)) (+ i 1)))
+      (for ([j u32 0]) (< j between) (+= j 1)
+        (let* ([k (key-of (+ p j))] [i (hash-ref (& index) (table-key k))] [r (+ rows (+ p j))])
+          (set! (-> r key) k)
+          (if (and (!= i 0) (== (-> (+ old (+ p (- i 1))) key) k) (not (@ used (- i 1))))
+              (begin
+                (set! (@ used (- i 1)) 1)
+                (set! (@ from j) (cast i32 (- i 1)))
+                (set! (-> r state) (-> (+ old (+ p (- i 1))) state)))
+              (begin
+                (set! (@ from j) -1)
+                (set! (-> r state) 0)))))
+      (for ([i u32 0]) (< i middle) (+= i 1)
+        (unless (@ used i)
+          (let ([state (-> (+ old (+ p i)) state)])
+            (unmount state 1)
+            (free state))))
+      (for ([i u32 0]) (< i s) (+= i 1)
+        (set! (@ rows (+ (- n s) i)) (@ old (+ (- m s) i)))
+        (update (+ (- n s) i) (-> (+ rows (+ (- n s) i)) state)))
+      (longest-rising from between stays)
+      ;; Those between take their places, the last first, each before the
+      ;; row after it.
+      (let ([j between])
+        (while (> j 0)
+          (-= j 1)
+          (let* ([at (+ p j)] [r (+ rows at)]
+                 [before (if (< (+ at 1) n) (first-of (-> (+ rows (+ at 1)) state)) anchor)])
+            (cond [(== (-> r state) 0)
+                   (set! (-> r state) (malloc size))
+                   (mount at (-> r state) parent before)]
+                  [else
+                   (update at (-> r state))
+                   (unless (@ stays j) (ui-move (first-of (-> r state)) parent before))]))))
+      (hash-free! (& index))
+      (free used)
+      (free from)
+      (free stays)
+      (free old)
+      (set! (-> b items) rows)
+      (set! (-> b count) n))))
+
+;; Of the n numbers at xs, those that are not -1: the most of them that
+;; rise, each greater than the one before it; stays is 1 at each of those.
+;; Each number is put at the end of the shortest rising run it can end,
+;; found by halving, so the runs' ends rise too.
+(define (longest-rising [xs (ptr i32)] [n u32] [stays (ptr u8)])
+  (let* ([ends (cast (ptr u32) (malloc (* 4 (+ n 1))))] [before (cast (ptr i32) (malloc (* 4 (+ n 1))))] [length u32 0])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (>= (@ xs i) 0)
+        (let ([lo u32 0] [hi length])
+          (while (< lo hi)
+            (let ([mid (/ (+ lo hi) 2)])
+              (if (< (@ xs (@ ends mid)) (@ xs i)) (set! lo (+ mid 1)) (set! hi mid))))
+          (set! (@ before i) (if (> lo 0) (cast i32 (@ ends (- lo 1))) -1))
+          (set! (@ ends lo) i)
+          (when (== lo length) (+= length 1)))))
+    (let ([i i32 (if (> length 0) (cast i32 (@ ends (- length 1))) -1)])
+      (while (>= i 0)
+        (set! (@ stays i) 1)
+        (set! i (@ before i))))
+    (free ends)
+    (free before)))
+
+;; Every row of b ended.
+(define (ui-each-clear! [b (ptr ui-rows)] [detach i32] [unmount (closure ((ptr void) i32))])
+  (for ([i u32 0]) (< i (-> b count)) (+= i 1)
+    (let ([state (-> (+ (-> b items) i) state)])
+      (unmount state detach)
+      (free state)))
+  (free (-> b items))
+  (set! (-> b items) 0)
+  (set! (-> b count) 0))
+
+;; ---- views ----
+;;
+;; view compiles a template into blocks. A block is what one copy makes:
+;; a view's children, an if's or when's, or an each's for one item. Its
+;; children are walked once, in order: what never changes is written to
+;; the block's HTML, and each part that can change adds a marked node to
+;; it, a field to the block's struct, and code to the block's mount,
+;; update and unmount. That code is in terms of bs, the block's instance,
+;; and for the mount parent and before, where its copy goes; an if's and
+;; an each's code holds that of the blocks inside it, where bs is theirs.
+
+(begin-for-syntax
+  (require-unqualified c "../c/c.sub")
+  (require-unqualified kd "../compiler/kernel.sub")
+  (require sm "../c/c-syntax-match.sub" syntax-match _ ... ?)
+
+  ;; A block: its HTML so far; its marked nodes so far; its fields, each
+  ;; [f T], and its code, statements, the latest first; and the names of
+  ;; its struct, of the global that holds its template's number, and of
+  ;; its unmount function.
+  (struct block [html buffer] [nodes u32] [fields datum] [mount datum] [update datum] [unmount datum]
+          [state datum] [template datum] [unmounter datum])
+
+  ;; The view being compiled: its name; the type of its messages, or #f;
+  ;; how many blocks and fields it has so far; its blocks' definitions,
+  ;; the latest first; and whether an each's rows are being compiled.
+  (define view-name datum 0)
+  (define message-type datum 0)
+  (define blocks u32 0)
+  (define fields u32 0)
+  (define definitions datum 0)
+  (define in-rows i32 0)
+
+  (define (fail [where datum] [message datum]) -> datum (raise-syntax-error 'view message where))
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+  (define (number [n u32]) -> datum (literal (make-integer n)))
+
+  ;; The identifier of one of the view's definitions: its name, a dot, and
+  ;; what, where the view's name is written.
+  (define (named [what datum]) -> datum
+    (datum->syntax view-name (string->symbol (format '"~a.~a" `(,(syntax-e view-name) ,what))) view-name))
+
+  (define (new-block [top i32]) -> (ptr block)
+    (let ([b (cast (ptr block) (alloc-in (current-arena) (sizeof block)))] [n blocks])
+      (+= blocks 1)
+      (set! (-> b html) (make-buffer))
+      (set! (-> b nodes) 0)
+      (set! (-> b fields) nil)
+      (set! (-> b mount) nil)
+      (set! (-> b update) nil)
+      (set! (-> b unmount) nil)
+      (set! (-> b state) (named (if top '"state" (format '"block~a" `(,(make-integer n))))))
+      (set! (-> b template) (named (format '"template~a" `(,(make-integer n)))))
+      (set! (-> b unmounter) (named (if top '"unmount" (format '"unmount~a" `(,(make-integer n))))))
+      b))
+
+  ;; ---- a block's parts ----
+
+  (define (html! [b (ptr block)] [s (ptr u8)]) (buffer-add-string! (& (-> b html)) s))
+
+  ;; The n bytes at p, as HTML's text, or as an attribute's value: its &,
+  ;; < and >, and in a value its ", written as HTML writes them.
+  (define (html-escaped! [b (ptr block)] [p (ptr u8)] [n u32] [value i32])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let ([c (@ p i)])
+        (cond [(== c #\&) (html! b "&amp;")]
+              [(== c #\<) (html! b "&lt;")]
+              [(== c #\>) (html! b "&gt;")]
+              [(and value (== c 34)) (html! b "&quot;")]
+              [else (buffer-add-byte! (& (-> b html)) c)]))))
+
+  ;; A new marked node of b: its number in a copy, after the copy's own.
+  (define (node! [b (ptr block)]) -> datum
+    (+= (-> b nodes) 1)
+    #`(+ (-> bs first) #,(number (-> b nodes))))
+
+  ;; A new field of b, of type: its name.
+  (define (field! [b (ptr block)] [type datum]) -> datum
+    (let ([f (literal (string->symbol (format '"f~a" `(,(make-integer fields)))))])
+      (+= fields 1)
+      (set! (-> b fields) (cons #`[#,f #,type] (-> b fields)))
+      f))
+
+  (define (mount! [b (ptr block)] [code datum]) (set! (-> b mount) (cons code (-> b mount))))
+  (define (update! [b (ptr block)] [code datum]) (set! (-> b update) (cons code (-> b update))))
+  (define (unmount! [b (ptr block)] [code datum]) (set! (-> b unmount) (cons code (-> b unmount))))
+  (define (both! [b (ptr block)] [code datum]) (mount! b code) (update! b code))
+
+  ;; Code, the latest first, as a body's statements: in order, and one
+  ;; that does nothing if there are none.
+  (define (statements [code datum]) -> datum (if (null? code) `(,#'(begin)) (reverse code)))
+
+  ;; b's mount: its template made, the first time, its copy, and its
+  ;; parts' code.
+  (define (mount-code [b (ptr block)]) -> datum
+    (let ([html (literal (bytes->string (-> b html bytes) (-> b html length)))])
+      `(,#`(when (== #,(-> b template) 0) (set! #,(-> b template) (ui-template #,html)))
+        ,#`(set! (-> bs first) (ui-clone #,(-> b template) #,(number (-> b nodes)) parent before))
+        ,@(reverse (-> b mount)))))
+
+  ;; b is done: its struct, its template's global and its unmount function
+  ;; are defined.
+  (define (finish! [b (ptr block)])
+    (set! definitions
+          (append `(,#`(define (#,(-> b unmounter) [bs (ptr #,(-> b state))] [detach i32])
+                         #,@(reverse (-> b unmount))
+                         (ui-remove (-> bs first) #,(number (-> b nodes)) detach))
+                    ,#`(define #,(-> b template) u32 0)
+                    ,#`(struct #,(-> b state) [first u32] #,@(reverse (-> b fields))))
+                  definitions)))
+
+  ;; ---- children ----
+
+  ;; The view head names, if it names one: (ui-view (state mount update
+  ;; unmount)), their names syntax; or #f.
+  (define (view-of [head datum]) -> datum
+    (if (== (identifier-binding-kind head) 'compile-time-value)
+        (let ([v (syntax-local-value head)])
+          (if (and (pair? v) (== (car v) 'ui-view)) (syntax->list (cadr v)) 0))
+        0))
+
+  ;; Is x a list of attributes, ([name value] ...), rather than a child?
+  ;; A child that is a list starts with a word.
+  (define (attributes? [x datum]) -> i32
+    (let ([l (syntax->list x)])
+      (and (!= l 0) (or (null? l) (not (identifier? (car l)))))))
+
+  (define (compile-children! [b (ptr block)] [children datum])
+    (while (pair? children)
+      (compile-child! b (car children))
+      (set! children (cdr children))))
+
+  ;; Child f of b.
+  (define (compile-child! [b (ptr block)] [f datum])
+    (let ([e (syntax-e f)] [l (syntax->list f)])
+      (cond [(string? e) (html-escaped! b (string-bytes e) (string-length e) 0)]
+            [(or (== l 0) (null? l) (not (identifier? (car l))))
+             (fail f '"expected an element, text, or (text e), (int e), (if c child child), (when c child ...), (each [x items n] #:key k child ...) or a view")]
+            [else
+             (let ([word (syntax-e (car l))])
+               (cond [(== word 'text) (text! b f l)]
+                     [(== word 'int) (int! b f l)]
+                     [(== word 'if) (if! b f l)]
+                     [(== word 'when) (when! b f l)]
+                     [(== word 'each) (each! b f l)]
+                     [(!= (view-of (car l)) 0) (call! b f l (view-of (car l)))]
+                     [else (element! b f l)]))])))
+
+  ;; (text e)
+  (define (text! [b (ptr block)] [f datum] [l datum])
+    (unless (== (length l) 2) (fail f '"expected (text e)"))
+    (html! b "<!--t-->")
+    (let ([node (node! b)] [slot (field! b #'(ptr u8))])
+      (mount! b #`(set! (-> bs #,slot) 0))
+      (both! b #`(ui-text-slot! (& (-> bs #,slot)) #,node #,(cadr l)))
+      (unmount! b #`(free (-> bs #,slot)))))
+
+  ;; (int e)
+  (define (int! [b (ptr block)] [f datum] [l datum])
+    (unless (== (length l) 2) (fail f '"expected (int e)"))
+    (html! b "<!--t-->")
+    (let ([node (node! b)] [slot (field! b #'i64)])
+      (mount! b #`(ui-int-set! (& (-> bs #,slot)) #,node #,(cadr l)))
+      (update! b #`(ui-int-slot! (& (-> bs #,slot)) #,node #,(cadr l)))))
+
+  ;; An element, (tag ([attr value] ...) child ...).
+  (define (element! [b (ptr block)] [f datum] [l datum])
+    (let* ([tag (symbol->string (syntax-e (car l)))]
+           [given (and (pair? (cdr l)) (attributes? (cadr l)))]
+           [attributes (if given (syntax->list (cadr l)) nil)]
+           [children (if given (cddr l) (cdr l))]
+           [node datum 0])
+      (html! b "<")
+      (buffer-add! (& (-> b html)) (string-bytes tag) (string-length tag))
+      ;; The attributes that stay are the HTML's; one that does not makes
+      ;; the element a marked node, numbered before what is in it.
+      (while (pair? attributes)
+        (let* ([a (car attributes)] [al (syntax->list a)])
+          (unless (and (!= al 0) (>= (length al) 2) (identifier? (car al)))
+            (fail a '"expected [name value], [on event message], [focus e] or [scroll-end e]"))
+          (let ([name (syntax-e (car al))])
+            (if (and (== (length al) 2) (string? (syntax-e (cadr al))) (!= name 'on) (!= name 'focus) (!= name 'scroll-end))
+                (let ([value (syntax-e (cadr al))])
+                  (html! b " ")
+                  (buffer-add! (& (-> b html)) (symbol-bytes name) (symbol-length name))
+                  (html! b "=\"")
+                  (html-escaped! b (string-bytes value) (string-length value) 1)
+                  (html! b "\""))
+                (begin
+                  (when (== node 0)
+                    (set! node (node! b))
+                    (html! b " data-n"))
+                  (attribute! b a al name node)))))
+        (set! attributes (cdr attributes)))
+      (html! b ">")
+      (if (void-element? tag)
+          (unless (null? children) (fail f '"this element has no children"))
+          (begin
+            (compile-children! b children)
+            (html! b "</")
+            (buffer-add! (& (-> b html)) (string-bytes tag) (string-length tag))
+            (html! b ">")))))
+
+  ;; The elements HTML gives no end tag.
+  (define (void-element? [tag datum]) -> i32
+    (!= (member tag '("area" "base" "br" "col" "embed" "hr" "img" "input" "link" "meta" "source" "track" "wbr")) 0))
+
+  ;; Attribute a, whose parts are al, of the element numbered node, which
+  ;; is not one that stays.
+  (define (attribute! [b (ptr block)] [a datum] [al datum] [name datum] [node datum])
+    (cond [(== name 'on)
+           (unless (and (== (length al) 3) (identifier? (cadr al))) (fail a '"expected [on event message]"))
+           (when (== message-type 0) (fail a '"a listener's message is of the module's message type: declare it, (messages type)"))
+           (let ([slot (field! b message-type)])
+             (both! b #`(set! (-> bs #,slot) #,(caddr al)))
+             (mount! b #`(ui-listen #,node #,(literal (symbol->string (syntax-e (cadr al)))) (& (-> bs #,slot)))))]
+          [(or (== name 'focus) (== name 'scroll-end))
+           (unless (== (length al) 2) (fail a '"expected [focus e] or [scroll-end e]"))
+           (let ([slot (field! b #'i64)])
+             (mount! b #`(set! (-> bs #,slot) #,(cadr al)))
+             (update! b #`(ui-effect-slot! (& (-> bs #,slot)) #,node #,(cadr al) #,(number (if (== name 'focus) 10 11)))))]
+          [else
+           (unless (== (length al) 2) (fail a '"expected [name value]"))
+           (let ([slot (field! b #'(ptr u8))])
+             (mount! b #`(set! (-> bs #,slot) 0))
+             (both! b #`(ui-attr-slot! (& (-> bs #,slot)) #,node #,(literal (symbol->string name)) #,(cadr al)))
+             (unmount! b #`(free (-> bs #,slot))))]))
+
+  ;; A block inside b's is unmounted with a detach of 0 when b is: its
+  ;; nodes are among b's, before an anchor of b's, and go with them.
+
+  ;; (if c child [child]): an anchor, which of the children is shown, 1 or
+  ;; 2, or 0 for none, and its instance.
+  (define (if! [b (ptr block)] [f datum] [l datum])
+    (unless (or (== (length l) 3) (== (length l) 4)) (fail f '"expected (if c child) or (if c child child)"))
+    (branches! b (cadr l) (cons (caddr l) nil) (if (== (length l) 4) (cons (cadddr l) nil) 0)))
+
+  ;; (when c child ...)
+  (define (when! [b (ptr block)] [f datum] [l datum])
+    (unless (>= (length l) 3) (fail f '"expected (when c child ...)"))
+    (branches! b (cadr l) (cddr l) 0))
+
+  ;; The children then if c is true, or the children other otherwise,
+  ;; which may be #f.
+  (define (branches! [b (ptr block)] [c datum] [then datum] [other datum])
+    (html! b "<!--a-->")
+    (let* ([anchor (node! b)] [which (field! b #'i32)] [state (field! b #'(ptr void))]
+           [one (new-block 0)] [two (ptr block) (if (== other 0) 0 (new-block 0))])
+      (compile-children! one then)
+      (finish! one)
+      (when (!= two 0)
+        (compile-children! two other)
+        (finish! two))
+      (mount! b #`(set! (-> bs #,which) 0))
+      (mount! b #`(set! (-> bs #,state) 0))
+      (both! b #`(let ([now (if #,c 1 #,(number (if (== two 0) 0 2)))])
+                   (if (== now (-> bs #,which))
+                       (case now
+                         [(1) (let ([bs (cast (ptr #,(-> one state)) (-> bs #,state))]) #,@(statements (-> one update)))]
+                         #,@(if (== two 0)
+                                nil
+                                `(,#`[(2) (let ([bs (cast (ptr #,(-> two state)) (-> bs #,state))]) #,@(statements (-> two update)))])))
+                       (begin
+                         #,(branches-unmount one two which state #'1)
+                         (set! (-> bs #,which) now)
+                         (case now
+                           [(1)
+                            (set! (-> bs #,state) (malloc (sizeof #,(-> one state))))
+                            (let ([bs (cast (ptr #,(-> one state)) (-> bs #,state))] [parent 0] [before #,anchor])
+                              #,@(mount-code one))]
+                           #,@(if (== two 0)
+                                  nil
+                                  `(,#`[(2)
+                                        (set! (-> bs #,state) (malloc (sizeof #,(-> two state))))
+                                        (let ([bs (cast (ptr #,(-> two state)) (-> bs #,state))] [parent 0] [before #,anchor])
+                                          #,@(mount-code two))]))
+                           [else (set! (-> bs #,state) 0)])))))
+      (unmount! b (branches-unmount one two which state #'0))))
+
+  ;; The child shown, if one is, ended, with detach.
+  (define (branches-unmount [one (ptr block)] [two (ptr block)] [which datum] [state datum] [detach datum]) -> datum
+    #`(begin
+        (case (-> bs #,which)
+          [(1) (#,(-> one unmounter) (cast (ptr #,(-> one state)) (-> bs #,state)) #,detach)]
+          #,@(if (== two 0) nil `(,#`[(2) (#,(-> two unmounter) (cast (ptr #,(-> two state)) (-> bs #,state)) #,detach)])))
+        (free (-> bs #,state))))
+
+  ;; (each [x items n] #:key k child ...): an anchor and the rows. A row
+  ;; is an instance of a block of the children; or, if they are one view,
+  ;; (v e ...), an instance of that view, with no block around it.
+  (define (each! [b (ptr block)] [f datum] [l datum])
+    (let ([binding (if (>= (length l) 5) (syntax->list (cadr l)) 0)])
+      (unless (and (!= binding 0) (== (length binding) 3) (identifier? (car binding)) (== (syntax-e (caddr l)) '#:key))
+        (fail f '"expected (each [x items n] #:key k child ...)"))
+      ;; A row's code is a closure's, which sees the variables of the
+      ;; function it is in and not those of a closure around it (lang.sub).
+      (when in-rows
+        (fail f '"an each in an each's rows: make the rows a view of their own, whose template this each is in"))
+      (html! b "<!--a-->")
+      (let* ([anchor (node! b)] [rows (field! b #'ui-rows)] [x (car binding)] [key (cadddr l)]
+             [children (cddddr l)] [only (if (null? (cdr children)) (syntax->list (car children)) 0)]
+             [names (if (and (!= only 0) (pair? only) (identifier? (car only))) (view-of (car only)) 0)]
+             [state datum 0] [mount datum 0] [update datum 0] [unmount datum 0])
+        (if (!= names 0)
+            (begin
+              (set! state (car names))
+              (set! mount #`(#,(cadr names) bs parent before #,@(cdr only)))
+              (set! update #`(#,(caddr names) bs #,@(cdr only)))
+              (set! unmount (cadddr names)))
+            (let ([row (new-block 0)])
+              (set! in-rows 1)
+              (compile-children! row children)
+              (set! in-rows 0)
+              (finish! row)
+              (set! state (-> row state))
+              (set! mount #`(begin #,@(mount-code row)))
+              (set! update #`(begin #,@(statements (-> row update))))
+              (set! unmount (-> row unmounter))))
+        (mount! b #`(set! (-> bs #,rows items) 0))
+        (mount! b #`(set! (-> bs #,rows count) 0))
+        (both! b #`(let ([items #,(cadr binding)] [anchor #,anchor] [rows (& (-> bs #,rows))])
+                     (ui-each! rows 0 anchor #,(caddr binding) (sizeof #,state)
+                               (lambda ([i u32]) -> u64 (let ([#,x (+ items i)]) #,key))
+                               (lambda ([i u32] [row (ptr void)] [parent u32] [before u32])
+                                 (let ([#,x (+ items i)] [bs (cast (ptr #,state) row)]) #,mount))
+                               (lambda ([i u32] [row (ptr void)])
+                                 (let ([#,x (+ items i)] [bs (cast (ptr #,state) row)]) #,update))
+                               (lambda ([row (ptr void)] [detach i32]) (#,unmount (cast (ptr #,state) row) detach)))))
+        (unmount! b #`(ui-each-clear! (& (-> bs #,rows)) 0
+                                      (lambda ([row (ptr void)] [detach i32]) (#,unmount (cast (ptr #,state) row) detach)))))))
+
+  ;; (v e ...), v the view whose definitions are names: an anchor, and
+  ;; its instance, a field.
+  (define (call! [b (ptr block)] [f datum] [l datum] [names datum])
+    (html! b "<!--a-->")
+    (let ([anchor (node! b)] [state (field! b (car names))])
+      (mount! b #`(#,(cadr names) (& (-> bs #,state)) 0 #,anchor #,@(cdr l)))
+      (update! b #`(#,(caddr names) (& (-> bs #,state)) #,@(cdr l)))
+      (unmount! b #`(#,(cadddr names) (& (-> bs #,state)) 0))))
+
+  (define (cddddr [l datum]) -> datum (cdr (cdddr l)))
+
+  ;; ---- the forms ----
+
+  ;; The name messages binds to the module's message type: one the module
+  ;; could write, where s is.
+  (define (message-type-name [s datum]) -> datum (datum->syntax s 'ui-message-type s))
+
+  ;; (messages M)
+  (define (messages-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? identifier? m)) #`(define-syntax #,(message-type-name s) (quote-syntax #,m))]))
+
+  ;; (view (v [x T] ...) child ...)
+  (define (view-form [s datum]) -> datum
+    (syntax-match s
+      [(_ ((? identifier? v) parameter ...) child ...)
+       (let ([declared (message-type-name s)])
+         (set! view-name v)
+         (set! message-type (if (== (identifier-binding-kind declared) 'compile-time-value) (syntax-local-value declared) 0))
+         (set! blocks 0)
+         (set! fields 0)
+         (set! definitions nil)
+         (set! in-rows 0)
+         (let ([b (new-block 1)])
+           (compile-children! b child)
+           (finish! b)
+           #`(begin
+               #,@(reverse definitions)
+               (define (#,(named '"mount") [bs (ptr #,(-> b state))] [parent u32] [before u32] #,@parameter)
+                 #,@(mount-code b))
+               (define (#,(named '"update") [bs (ptr #,(-> b state))] #,@parameter)
+                 #,@(statements (-> b update)))
+               (define-syntax #,v
+                 (view-value (quote-syntax (#,(-> b state) #,(named '"mount") #,(named '"update") #,(-> b unmounter))))))))]))
+
+  ;; What a view's name is bound to: (ui-view names), names the syntax of
+  ;; its definitions' names, (state mount update unmount).
+  (define (view-value [names datum]) -> datum `(ui-view ,names)))
+
+(define-syntax messages messages-form)
+(define-syntax view view-form)
