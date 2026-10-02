@@ -297,24 +297,34 @@ Substrate is built again in `substrate/` (plan, 5).
    in use than before it. Then its speed, against `substrate/` with its
    GC on both hosts. Every primitive was a call into C; now an inline
    function may use memory where the calling module shares it, which
-   every module here does (`kernel.sub`, spec 5.2), so `car`, `cdr`,
-   `cons`, dup and drop are inline, as are fixnum arithmetic and
+   every module here does (`kernel.sub`, spec 5.2; the kernel module's
+   own are found through its group's linklets), so `car`, `cdr`,
+   `cons`, dup, drop, a struct's accessors and a closure's captures are
+   inline in the program itself, as are fixnum arithmetic and
    comparison; the heap's cells and records' blocks come from a free
-   list per size, filled from chunks, so a `cons` is a few stores; and
-   a closure's code borrows the closure, which its caller keeps through
-   the call. Over 30 M iterations, on wasmtime, fixnum arithmetic takes
-   0.30 s on cells against 1.1 s with GC, walking a list 0.53 s against
-   1.1 s, making and freeing pairs 0.64 s against 4.8 s, and 10 M
-   closure calls 0.20 s against 0.74 s; a list benchmark 0.63 s against
-   2.1 s, one of closures, structs and a hash table 0.23 s against 0.63
-   s. V8's optimizing compiler runs the GC version of those in 0.49,
-   0.21, 0.28, 0.15, 0.19 and 0.11 s, and the cells version at
-   wasmtime's speed: ahead on arithmetic, 2 to 3 times behind on
-   walking and making lists, which is the dup and drop per element.
-   Next: a parameter the pass can tell is only read is borrowed, and a
-   pair dropped at its last owner is reused by the next `cons`, as
-   Perceus does, so that `map` and `filter` over a list that dies make
-   no cells; the pass's time at compile time (the typed example builds
-   in 1.0 s, 0.7 s before it); and what still leaks: a value a raise
-   unwinds past, and a closure that refers to itself through a box, as
-   a letrec's that escapes does.
+   list per size, filled from chunks, so a `cons` is a few stores; a
+   closure's code borrows the closure, which its caller keeps through
+   the call; the cells in use are counted when asked, not at each
+   `cons`. The pass borrows a parameter of a local function it can tell
+   is only read, keeps a variable alive through a call that reads it,
+   reads `car` and `cdr` without the check where a `pair?` test guards
+   them, and takes a pair apart where its owner's last use projects it,
+   as Perceus does: the cell is freed, and the next `cons` takes it
+   back, so `map`, `filter`, `reverse` and `sort` over a list that
+   dies, which `substrate.sub` tells by `unshared-pair?`, make no
+   cells; a predicate's or count's result needs no counting
+   (`#:free`). Over 30 M iterations, on wasmtime, fixnum arithmetic
+   takes 0.24 s on cells against 1.1 s with GC, walking a list 0.14 s
+   against 1.1 s, making and freeing pairs 0.29 s against 4.8 s, and 10
+   M closure calls 0.14 s against 0.74 s; a list benchmark 0.23 s
+   against 2.1 s, one of closures, structs and a hash table 0.17 s
+   against 0.63 s. V8's optimizing compiler runs the GC version of
+   those in 0.34, 0.20, 0.27, 0.14, 0.19 and 0.11 s, and the cells
+   version in 0.39, 0.15, 0.29, 0.15, 0.21 and 0.19 s: even on all but
+   closures, structs and a hash table, where a record is still made and
+   freed through the runtime. Next: records made and freed by the
+   kernel module from their layout, with no call into the runtime; the
+   pass's time at compile time (the typed example builds in 1.0 s, 0.7
+   s before it); and what still leaks: a value a raise unwinds past,
+   and a closure that refers to itself through a box, as a letrec's
+   that escapes does.
