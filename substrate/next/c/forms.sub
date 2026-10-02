@@ -1,0 +1,120 @@
+;; Lifecycle: experimental. Forms for code written in the C-like Lisp on
+;; the kernel module's data, macros above all: loops over lists without a
+;; closure, Racket's for forms as kernel-forms.sub gives them to kernel
+;; code, (for/each (clause ...) body ...) running body for the elements of
+;; the lists in step, a clause [x l] and the last maybe #:when test, and
+;; (for/list (clause ...) body ...), the list of body's values; a message
+;; formatted from its arguments, (fmt template arg ...); and a macro
+;; defined with its transformer, (define-syntax (name stx) body ...), a
+;; function of phase 1 running body, which the kernel's define-syntax
+;; binds name to, so that (define-syntax name e) stays the kernel's. Each
+;; such definition is a begin-for-syntax of its own, so a compile-time
+;; linklet of its own, which costs a module of many macros a little at
+;; every use (bend/ keeps its in one block for that). A module takes the
+;; loops and fmt where it takes the C-like Lisp, at phase 1 for macros,
+;; and define-syntax at the phase it defines macros at:
+;;
+;;   (require-unqualified forms ".../forms.sub")
+;;   (begin-for-syntax (require-unqualified forms ".../forms.sub"))
+(require-unqualified c "c.sub")
+(require-unqualified kd "../compiler/kernel.sub")
+(provide for/each for/list fmt [define-syntax c-define-syntax])
+
+(begin-for-syntax
+  (require-unqualified c "c.sub")
+  (require-unqualified kd "../compiler/kernel.sub")
+
+;; The clauses of for form stx, cs: (xs ls guard), guard 0 if there is
+  ;; none, each clause [x l], x an identifier, and the last maybe #:when
+  ;; test.
+  (define (for-clauses [stx datum] [cs datum]) -> datum
+    (let ([xs nil] [ls nil] [guard datum 0])
+      (while (pair? cs)
+        (let ([c (car cs)])
+          (cond [(and (syntax? c) (== (syntax-e c) '#:when) (pair? (cdr cs)) (null? (cddr cs)))
+                 (set! guard (cadr cs))
+                 (set! cs nil)]
+                [else
+                 (let ([b (syntax->list c)])
+                   (unless (and (!= b 0) (pair? b) (pair? (cdr b)) (null? (cddr b)) (identifier? (car b)))
+                     (raise-syntax-error 0 '"expected ([x list] ... [#:when test])" stx))
+                   (set! xs (cons (car b) xs))
+                   (set! ls (cons (cadr b) ls))
+                   (set! cs (cdr cs)))])))
+      (when (null? xs) (raise-syntax-error 0 '"expected ([x list] ... [#:when test])" stx))
+      `(,(reverse xs) ,(reverse ls) ,guard)))
+
+  ;; A temporary: an identifier no other of this expansion is.
+  (define temps i32 0)
+  (define (temp) -> datum
+    (set! temps (+ temps 1))
+    (datum->syntax #'here (string->symbol (format-message "l~a" (cons (fixnum temps) nil))) 0))
+
+  (define (temps-for [l datum]) -> datum (if (null? l) nil (cons (temp) (temps-for (cdr l)))))
+  (define (pairs [xs datum] [es datum]) -> datum
+    (if (null? xs) nil (cons #`[#,(car xs) #,(car es)] (pairs (cdr xs) (cdr es)))))
+  (define (element-bindings [xs datum] [ts datum]) -> datum
+    (if (null? xs) nil (cons #`[#,(car xs) (car #,(car ts))] (element-bindings (cdr xs) (cdr ts)))))
+  (define (steps [ts datum]) -> datum
+    (if (null? ts) nil (cons #`(set! #,(car ts) (cdr #,(car ts))) (steps (cdr ts)))))
+  (define (all-pairs [ts datum]) -> datum
+    (if (null? (cdr ts)) #`(pair? #,(car ts)) #`(and (pair? #,(car ts)) #,(all-pairs (cdr ts)))))
+
+  ;; The loop of for form stx over clauses cs, which does each for the
+  ;; elements, bound to the clauses' variables: a while over temporaries
+  ;; holding the lists, which step before the body, so that continue in
+  ;; the body takes the next elements and break leaves the loop.
+  (define (for-loop [stx datum] [cs datum] [each datum]) -> datum
+    (let* ([c (for-clauses stx cs)] [ts (temps-for (car c))] [guard (caddr c)])
+      #`(let (#,@(pairs ts (cadr c)))
+          (while #,(all-pairs ts)
+            (let (#,@(element-bindings (car c) ts))
+              #,@(steps ts)
+              #,(if (!= guard 0) #`(when #,guard #,each) each))))))
+
+  ;; (for/each (clause ...) body ...): body for each of the elements.
+  (define (for/each-form [stx datum]) -> datum
+    (let ([parts (syntax->list stx)])
+      (unless (and (!= parts 0) (>= (length parts) 3) (!= (syntax->list (cadr parts)) 0))
+        (raise-syntax-error 0 '"expected (for/each (clause ...) body ...)" stx))
+      (for-loop stx (syntax->list (cadr parts)) #`(begin #,@(cddr parts)))))
+
+  ;; (for/list (clause ...) body ...): the list of body's values, in order.
+  (define (for/list-form [stx datum]) -> datum
+    (let ([parts (syntax->list stx)])
+      (unless (and (!= parts 0) (>= (length parts) 3) (!= (syntax->list (cadr parts)) 0))
+        (raise-syntax-error 0 '"expected (for/list (clause ...) body ...)" stx))
+      #`(let ([acc nil])
+          #,(for-loop stx (syntax->list (cadr parts)) #`(set! acc (cons (begin #,@(cddr parts)) acc)))
+          (reverse acc))))
+
+  ;; (fmt template arg ...): the template, a C string, formatted with the
+  ;; arguments, data, as format-message formats it with a list of them.
+  (define (fmt-form [stx datum]) -> datum
+    (let ([parts (syntax->list stx)])
+      (unless (and (!= parts 0) (pair? (cdr parts))) (raise-syntax-error 0 '"expected (fmt template arg ...)" stx))
+      #`(format-message #,(cadr parts) #,(list-of (cddr parts)))))
+
+  (define (list-of [args datum]) -> datum
+    (if (pair? args) #`(cons #,(car args) #,(list-of (cdr args))) #'nil))
+
+  ;; (define-syntax (name stx) body ...): name bound to the transformer
+  ;; (name stx), a function of phase 1 running body, defined first;
+  ;; (define-syntax name e) is the kernel's.
+  (define (c-define-syntax-form [stx datum]) -> datum
+    (let* ([parts (syntax->list stx)]
+           [head (if (and (!= parts 0) (pair? (cdr parts))) (cadr parts) 0)]
+           [h (if (or (== head 0) (identifier? head)) 0 (syntax->list head))])
+      (if (and (!= h 0) (pair? h) (pair? (cdr h)) (null? (cddr h)))
+          (let ([name (car h)] [s (cadr h)])
+            (unless (and (identifier? name) (identifier? s))
+              (raise-syntax-error 0 '"expected (define-syntax (name stx) body ...)" stx))
+            #`(begin
+                (begin-for-syntax (define (#,name [#,s datum]) -> datum #,@(cddr parts)))
+                (define-syntax #,name #,name)))
+          #`(define-syntax #,@(cdr parts))))))
+
+(define-syntax for/each for/each-form)
+(define-syntax for/list for/list-form)
+(define-syntax fmt fmt-form)
+(define-syntax c-define-syntax c-define-syntax-form)
