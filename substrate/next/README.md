@@ -628,3 +628,11 @@ browser has laid the page out again.
       example takes 12.7 s.
    5. Numeric instructions and reference types in C code; then the typed
       example.
+6. Still to do in the C-like Lisp: the exact line of a trap inside an
+   instance of another module's generic function. The instance is now
+   located at the generic's definition, but the lines within it are not
+   reported, because the compiler replaces a location from another file
+   by the nearest enclosing one (spec 3.6). An instance's own file
+   should count as its file. That is a change to the compiler's back
+   end and to the spec, held back while `compare.sh` still requires
+   the two compilers' output to match byte for byte.
