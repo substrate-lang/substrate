@@ -15,8 +15,9 @@
 ;; fact says (foreign borrowed); it reads its arguments, which their
 ;; owner keeps, unless its fact names the positions it takes ownership
 ;; of; and a function that never returns says (foreign diverges). A
-;; function that calls a closure gives it references of its own to the
-;; closure and the arguments, and owns the result. At compile time, which
+;; function that calls a closure keeps the closure through the call,
+;; gives it references of its own to the arguments, and owns the result.
+;; At compile time, which
 ;; frees nothing, cells and blocks are made in the module's arena.
 ;;
 ;; Procedures. A closure is a record whose block holds the table index of
@@ -98,8 +99,39 @@
 (define kind-exn u32 1008)
 
 ;; n bytes for a record's block: from the heap when the program frees,
-;; freed by the record's dropper; else from the current arena.
-(define (alloc [n u32]) -> (ptr void) (if (freeing?) (malloc (if (== n 0) 1 n)) (alloc-in (current-arena) n)))
+;; freed by the record's dropper (free-block); else from the current
+;; arena. A block of up to 64 bytes is of a class, a multiple of 4
+;; bytes, whose freed blocks are a list, through their first word, that
+;; the next block of the class comes from, filled from a chunk of the
+;; heap when empty, as the kernel module keeps its cells.
+(define block-free (ptr u32) 0)
+(define block-chunk u32 4096)
+
+(define (alloc [n u32]) -> (ptr void)
+  (cond [(not (freeing?)) (alloc-in (current-arena) n)]
+        [(> n 64) (malloc n)]
+        [else
+         (let ([k (>> (+ (if (== n 0) 4 n) 3) 2)])
+           (when (== block-free 0) (set! block-free (cast (ptr u32) (calloc 17 4))))
+           (when (== (@ block-free k) 0) (refill-blocks! k))
+           (let ([p (cast (ptr u32) (@ block-free k))])
+             (set! (@ block-free k) (@ p 0))
+             (cast (ptr void) p)))]))
+
+(define (refill-blocks! [k u32])
+  (let* ([size (<< k 2)] [count (/ block-chunk size)] [chunk (cast (ptr u8) (malloc block-chunk))])
+    (for ([i u32 0]) (< i count) (+= i 1)
+      (set! (@ (cast (ptr u32) (+ chunk (* i size))) 0)
+            (if (== (+ i 1) count) 0 (cast u32 (+ chunk (* (+ i 1) size))))))
+    (set! (@ block-free k) (cast u32 chunk))))
+
+;; Block p of n bytes, from alloc, freed.
+(define (free-block [p (ptr void)] [n u32])
+  (if (> n 64)
+      (free p)
+      (let ([k (>> (+ (if (== n 0) 4 n) 3) 2)])
+        (set! (@ (cast (ptr u32) p) 0) (@ block-free k))
+        (set! (@ block-free k) (cast u32 p)))))
 
 ;; A record of kind with a block of n bytes, zero.
 (define (new-record [kind u32] [n u32]) -> datum
@@ -120,30 +152,31 @@
 (define (drop-closure-block [p (ptr void)])
   (let ([b (cast (ptr closure-block) p)])
     (for ([i u32 0]) (< i (-> b n)) (+= i 1) (drop (@ (-> b caps) i)))
-    (free p)))
+    (free-block p (+ (sizeof closure-block) (* (-> b n) 4)))))
 
 (define (drop-box-block [p (ptr void)])
   (drop (-> (cast (ptr box-block) p) value))
-  (free p))
+  (free-block p (sizeof box-block)))
 
 (define (drop-vector-block [p (ptr void)])
   (let ([b (cast (ptr vector-block) p)])
     (for ([i u32 0]) (< i (-> b n)) (+= i 1) (drop (@ (-> b items) i)))
-    (free p)))
+    (free-block p (+ (sizeof vector-block) (* (-> b n) 4)))))
 
-(define (drop-plain-block [p (ptr void)]) (free p))
+(define (drop-bytes-block [p (ptr void)])
+  (free-block p (+ (sizeof bytes-block) (-> (cast (ptr bytes-block) p) n))))
 
 (define (drop-type-block [p (ptr void)])
   (let ([b (cast (ptr type-block) p)])
     (drop (-> b name))
     (drop (-> b fields))
-    (free p)))
+    (free-block p (sizeof type-block))))
 
 (define (drop-struct-block [p (ptr void)])
   (let ([b (cast (ptr struct-block) p)])
     (drop (-> b type))
     (for ([i u32 0]) (< i (-> b n)) (+= i 1) (drop (@ (-> b fields) i)))
-    (free p)))
+    (free-block p (+ (sizeof struct-block) (* (-> b n) 4)))))
 
 (define (drop-table-block [p (ptr void)])
   (let ([b (cast (ptr table-block) p)])
@@ -153,20 +186,20 @@
           (let ([next (-> e next)])
             (drop (-> e key))
             (drop (-> e value))
-            (free e)
+            (free-block e (sizeof entry))
             (set! e next)))))
-    (free (-> b buckets))
-    (free p)))
+    (free-block (-> b buckets) (* (-> b nbuckets) 4))
+    (free-block p (sizeof table-block))))
 
 (define (drop-port-block [p (ptr void)])
   (buffer-free! (& (-> (cast (ptr port-block) p) buf)))
-  (free p))
+  (free-block p (sizeof port-block)))
 
 (define (drop-exn-block [p (ptr void)])
   (let ([b (cast (ptr exn-block) p)])
     (drop (-> b message))
     (drop (-> b stx))
-    (free p)))
+    (free-block p (sizeof exn-block))))
 
 ;; In a function, since an expression at module level is kernel code,
 ;; which reads a C global's address, not its value.
@@ -174,7 +207,7 @@
   (set-record-dropper! kind-closure drop-closure-block)
   (set-record-dropper! kind-box drop-box-block)
   (set-record-dropper! kind-vector drop-vector-block)
-  (set-record-dropper! kind-bytes drop-plain-block)
+  (set-record-dropper! kind-bytes drop-bytes-block)
   (set-record-dropper! kind-struct-type drop-type-block)
   (set-record-dropper! kind-struct drop-struct-block)
   (set-record-dropper! kind-table drop-table-block)
@@ -217,8 +250,9 @@
 (typedef code (fn (datum i32 datum datum datum datum) -> datum))
 
 ;; f called with nargs arguments, the first four given: a call from C.
-;; The code owns f and the arguments, so a caller that keeps them gives
-;; it references of its own (dup), and owns the result.
+;; The code borrows f, which the caller keeps through the call, and owns
+;; the arguments, so a caller that keeps one gives it a reference of its
+;; own (dup); the caller owns the result.
 (define (call-closure [f datum] [nargs i32] [a0 datum] [a1 datum] [a2 datum] [a3 datum]) -> datum
   (let ([k (cast code (closure-code f))])
     (k f nargs a0 a1 a2 a3)))
@@ -232,7 +266,7 @@
 ;; A transformer (spec 2.1) whose code applies closure c to the syntax:
 ;; how a Substrate function from syntax to syntax becomes a macro. The
 ;; transformer owns c.
-(define (apply-transformer [env datum] [s datum]) -> datum (call-closure (dup env) 1 (dup s) 0 0 0))
+(define (apply-transformer [env datum] [s datum]) -> datum (call-closure env 1 (dup s) 0 0 0))
 (define (transformer-of [c datum]) -> datum (make-transformer (cast u32 apply-transformer) c))
 (#%fact transformer-of '(foreign owned 0))
 
@@ -278,7 +312,7 @@
               [else (set-extra-arg! (- n 4) v)]))
       (+= n 1)
       (set! rest (cdr rest)))
-    (call-closure (dup f) n a0 a1 a2 a3)))
+    (call-closure f n a0 a1 a2 a3)))
 
 ;; (a ... l): the list of the a ... followed by the elements of l, a new
 ;; list up to l, which it shares.
@@ -332,7 +366,7 @@
     (while (pair? hs)
       (let ([ps (car hs)])
         (while (pair? ps)
-          (when (truth (call-closure (dup (car ps)) 1 (dup v) 0 0 0)) (return 1))
+          (when (truth (call-closure (car ps) 1 (dup v) 0 0 0)) (return 1))
           (set! ps (cdr ps))))
       (set! hs (cdr hs)))
     0))
@@ -426,7 +460,7 @@
 (define (call-with-handlers [preds datum] [procs datum] [thunk datum]) -> datum
   (let* ([outer handlers] [frame (cons (dup preds) (dup outer))])
     (set! handlers frame)
-    (try (let ([r (call-closure (dup thunk) 0 0 0 0 0)])
+    (try (let ([r (call-closure thunk 0 0 0 0 0)])
            (set! handlers outer)
            (drop frame)
            r)
@@ -443,12 +477,12 @@
 ;; procs, or v raised again, to the handlers further out.
 (define (handle [v datum] [preds datum] [procs datum]) -> datum
   (let ([h (handler-for v preds procs)])
-    (if (== h 0) (raise-value v) (call-closure (dup h) 1 v 0 0 0))))
+    (if (== h 0) (raise-value v) (call-closure h 1 v 0 0 0))))
 
 ;; The handler among preds and procs for v, or 0.
 (define (handler-for [v datum] [preds datum] [procs datum]) -> datum
   (while (pair? preds)
-    (when (truth (call-closure (dup (car preds)) 1 (dup v) 0 0 0)) (return (car procs)))
+    (when (truth (call-closure (car preds) 1 (dup v) 0 0 0)) (return (car procs)))
     (set! preds (cdr preds))
     (set! procs (cdr procs)))
   0)
@@ -457,16 +491,16 @@
 ;; the value of its handler, or thrown again as it was.
 (define (handle-syntax-error [m datum] [s datum] [l (ptr srcloc)] [preds datum] [procs datum]) -> datum
   (let* ([v (make-syntax-exn m s l)] [h (handler-for v preds procs)])
-    (if (== h 0) (begin (drop v) (throw compile-error m s l)) (call-closure (dup h) 1 v 0 0 0))))
+    (if (== h 0) (begin (drop v) (throw compile-error m s l)) (call-closure h 1 v 0 0 0))))
 
 ;; thunk's value, with pre called before it and post after it, also when
 ;; an exception leaves it.
 (define (dynamic-wind [pre datum] [thunk datum] [post datum]) -> datum
-  (drop (call-closure (dup pre) 0 0 0 0 0))
-  (let ([r (try (call-closure (dup thunk) 0 0 0 0 0)
-                [catch exn (v) (drop (call-closure (dup post) 0 0 0 0 0)) (throw exn v)]
-                [catch compile-error (m s l) (drop (call-closure (dup post) 0 0 0 0 0)) (throw compile-error m s l)])])
-    (drop (call-closure (dup post) 0 0 0 0 0))
+  (drop (call-closure pre 0 0 0 0 0))
+  (let ([r (try (call-closure thunk 0 0 0 0 0)
+                [catch exn (v) (drop (call-closure post 0 0 0 0 0)) (throw exn v)]
+                [catch compile-error (m s l) (drop (call-closure post 0 0 0 0 0)) (throw compile-error m s l)])])
+    (drop (call-closure post 0 0 0 0 0))
     r))
 
 ;; ---- equivalence ----
@@ -1150,6 +1184,7 @@
             (set! (-> e next) (@ new j))
             (set! (@ new j) e)
             (set! e next)))))
+    (free-block old (* m 4))
     (set! (-> b buckets) new)
     (set! (-> b nbuckets) n)))
 
@@ -1173,7 +1208,7 @@
   (let* ([b (table-arg t who)] [e (find-entry b k (key-hash k (-> b kind) who))])
     (cond [(!= e 0) (dup (-> e value))]
           [(not has-failure) (fail-format who '"no value found for key ~s" (cons k nil))]
-          [(procedure? failure) (call-closure (dup failure) 0 0 0 0 0)]
+          [(procedure? failure) (call-closure failure 0 0 0 0 0)]
           [else (dup failure)])))
 
 (define (hash-has-key? [t datum] [k datum] [who datum]) -> i32
@@ -1192,7 +1227,7 @@
 (define (free-entry [e (ptr entry)])
   (drop (-> e key))
   (drop (-> e value))
-  (free e))
+  (free-block e (sizeof entry)))
 
 (define (hash-remove! [t datum] [k datum] [who datum])
   (let* ([b (table-arg t who)] [h (key-hash k (-> b kind) who)] [i (bit-and h (- (-> b nbuckets) 1))]
@@ -1216,7 +1251,7 @@
           (let ([next (-> e next)])
             (free-entry e)
             (set! e next)))))
-    (free (-> b buckets))
+    (free-block (-> b buckets) (* (-> b nbuckets) 4))
     (set! (-> b buckets) (new-buckets 16))
     (set! (-> b nbuckets) 16)
     (set! (-> b count) 0)))

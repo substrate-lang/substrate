@@ -8,8 +8,9 @@
 ;; data functions (kd:).
 ;;
 ;; Procedures. Every function is a closure of one signature: its code
-;; takes the closure, the number of arguments and the first four, 0
-;; where there are fewer, as runtime.sub says. A lambda or case-lambda
+;; takes the closure, which the caller keeps through the call, the
+;; number of arguments and the first four, which it owns, 0 where there
+;; are fewer, as runtime.sub says. A lambda or case-lambda
 ;; expands to the kernel's lambda form, which lower.sub lifts to a
 ;; function of its own and replaces by the closure, once the body it is
 ;; in is expanded (substrate-body); a lambda in kernel code is converted
@@ -358,8 +359,9 @@
   ;; which parameters it borrows (lower.sub), whose value (spec 5.2,
   ;; #:value) is a closure made once, in a global: of the kernel lambda if
   ;; given, else of code that checks the number of arguments and calls the
-  ;; function, dropping the closure, which it owns, and after the call the
-  ;; borrowed arguments.
+  ;; function, and after the call drops the borrowed arguments; the
+  ;; closure is its caller's.
+  ;;
   (func (known-function [name i32] [params i32] [body i32] [closure i32] [inline i32] [borrowed i32]) -> i32
     (let ([n (k:length params)] [value (hidden-name name '".value")] [code (hidden-name name '".code")]
           [bs (if borrowed (k:syntax->list borrowed) '())])
@@ -370,7 +372,6 @@
           (#%fact #,name '(substrate-function #,@(borrow-flags params bs)))
           #,@(if (i32.eqz closure)
                  (k:cons #`(func (#,code [self i32] [nargs i32] [a0 i32] [a1 i32] [a2 i32] [a3 i32]) -> i32
-                             (drop-value self)
                              (if (i32.eq nargs #,(number n))
                                  #,(wrapper-call name n params bs)
                                  (rt:arity-error '#,name #,(number n) 0 nargs)))
@@ -485,11 +486,11 @@
   (func (call-value [head i32] [args i32]) -> i32
     (let ([n (k:length args)])
       (if (i32.le_u n 4)
-          (return #`(call-indirect (i32 i32 i32 i32 i32 i32 -> i32) (rt:closure-code #,head) #,head #,(number n) #,@(first-four args))))
+          (return #`(call-indirect (i32 i32 i32 i32 i32 i32 -> i32) (closure-code* #,head) #,head #,(number n) #,@(first-four args))))
       (let ([ts (temporaries n)])
         #`(let (#,@(temporary-bindings ts args))
             #,@(extra-stores (drop-n ts 4) 0)
-            (call-indirect (i32 i32 i32 i32 i32 i32 -> i32) (rt:closure-code #,head) #,head #,(number n) #,@(take ts 4))))))
+            (call-indirect (i32 i32 i32 i32 i32 i32 -> i32) (closure-code* #,head) #,head #,(number n) #,@(take ts 4))))))
 
   (func (function-name? [f i32]) -> i32
     (if (k:identifier? f) (i32.eq (k:identifier-binding-kind f) 'function) 0))
@@ -756,13 +757,98 @@
 ;; it is, so a body uses one as a check, in statement position.
 
 ;; A reference of the program's own to d, and one given up: nothing for
-;; a fixnum, nil or #t, or a permanent cell (kernel.sub).
-(func (dup-value [d i32]) #:inline -> i32 (if (i32.and d 1) d (kd:dup d)))
+;; a fixnum, nil or #t, or a permanent cell; a count moved in place, and
+;; the last dropped by the kernel module (kernel.sub, dup-inline).
+(func (dup-value [d i32]) #:inline -> i32 (kd:dup-inline d))
 (#%fact dup-value '(foreign owned))
-(func (drop-value [d i32]) #:inline (if (i32.eqz (i32.and d 1)) (kd:drop d)))
+(func (drop-value [d i32]) #:inline (kd:drop-inline d))
+
+;; ---- fixnums inline ----
+;;
+;; Arithmetic and comparison on two fixnums, tagged 2n + 1 in the datum,
+;; inline, as the GC core's are on i31s; anything else, overflow included,
+;; is the runtime's. A tagged sum is a + b - 1, which overflows i32 just
+;; when the sum leaves the fixnum range; tags keep order, so comparisons
+;; are of the words.
+
+(func (both-fixnums? [a i32] [b i32]) #:inline -> i32 (i32.and (i32.and a b) 1))
+
+;; A word that is a fixnum already, for the pass, which owns a value it
+;; does not know as one.
+(func (fixnum-word [w i32]) #:inline -> i32 w)
+(#%fact fixnum-word '(foreign owned))
+
+(func (add-values [a i32] [b i32]) #:inline -> i32
+  (if (both-fixnums? a b)
+      (let ([r (i32.add a (i32.sub b 1))])
+        (if (i32.lt_s (i32.and (i32.xor a r) (i32.xor (i32.sub b 1) r)) 0) (rt:add a b) r))
+      (rt:add a b)))
+(#%fact add-values '(foreign owned))
+
+(func (sub-values [a i32] [b i32]) #:inline -> i32
+  (if (both-fixnums? a b)
+      (let ([d (i32.sub a b)])
+        (if (i32.lt_s (i32.and (i32.xor a b) (i32.xor a d)) 0) (rt:sub a b) (i32.add d 1)))
+      (rt:sub a b)))
+(#%fact sub-values '(foreign owned))
+
+;; The product in i64, kept if it fits a fixnum.
+(func (mul-values [a i32] [b i32]) #:inline -> i32
+  (if (both-fixnums? a b)
+      (let ([m (i64.mul (i64.extend_i32_s (i32.shr_s a 1)) (i64.extend_i32_s (i32.sub b 1)))])
+        (if (i64.eq (i64.extend_i32_s (i32.wrap_i64 m)) m) (i32.add (i32.wrap_i64 m) 1) (rt:mul a b)))
+      (rt:mul a b)))
+(#%fact mul-values '(foreign owned))
+
+;; Division by zero, and the quotient of the least fixnum by -1, which
+;; is not one, are the runtime's.
+(func (quo-values [a i32] [b i32]) #:inline -> i32
+  (if (i32.and (both-fixnums? a b) (i32.ne b 1))
+      (let ([q (i32.div_s (i32.shr_s a 1) (i32.shr_s b 1))])
+        (if (i32.eq q 1073741824) (rt:quo a b) (i32.or (i32.shl q 1) 1)))
+      (rt:quo a b)))
+(#%fact quo-values '(foreign owned))
+
+(func (rem-values [a i32] [b i32]) #:inline -> i32
+  (if (i32.and (both-fixnums? a b) (i32.ne b 1))
+      (i32.or (i32.shl (i32.rem_s (i32.shr_s a 1) (i32.shr_s b 1)) 1) 1)
+      (rt:rem a b)))
+(#%fact rem-values '(foreign owned))
+
+(func (mod-values [a i32] [b i32]) #:inline -> i32
+  (if (i32.and (both-fixnums? a b) (i32.ne b 1))
+      (let ([r (i32.rem_s (i32.shr_s a 1) (i32.shr_s b 1))])
+        (i32.or (i32.shl (if (i32.and (i32.ne r 0) (i32.lt_s (i32.xor r b) 0)) (i32.add r (i32.shr_s b 1)) r) 1) 1))
+      (rt:floor-remainder a b)))
+(#%fact mod-values '(foreign owned))
+
+(func (lt-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.lt_s a b) (rt:compare 0 a b))))
+(#%fact lt-values '(foreign owned))
+(func (gt-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.gt_s a b) (rt:compare 1 a b))))
+(#%fact gt-values '(foreign owned))
+(func (le-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.le_s a b) (rt:compare 2 a b))))
+(#%fact le-values '(foreign owned))
+(func (ge-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.ge_s a b) (rt:compare 3 a b))))
+(#%fact ge-values '(foreign owned))
+(func (eq-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.eq a b) (rt:compare 4 a b))))
+(#%fact eq-values '(foreign owned))
 
 (func (bool [x i32]) #:inline -> i32 (if x '#t 0))
 (#%fact bool '(foreign owned))
+
+;; A closure's code, the table index its call goes through, and its
+;; captured values, inline: a record of kind 1000 (runtime.sub,
+;; kind-closure) whose block is the code, a count and the values.
+(func (closure-code* [c i32]) #:inline -> i32
+  (if (kd:record-cell? c 1000) (i32.load (kd:record-block c)) (rt:closure-code c)))
+(#%fact closure-code* '(foreign raw))
+(func (closure-cap [c i32] [i i32]) #:inline -> i32 (i32.load (i32.add (kd:record-block c) (i32.shl i 2)) 8))
+(#%fact closure-cap '(foreign borrowed))
 (func (fix [n i32]) #:inline -> i32 (kd:make-integer (i64.extend_i32_s n)))
 (#%fact fix '(foreign owned))
 
@@ -830,13 +916,13 @@
     b))
 (#%fact append-2 '(foreign owned 1))
 
-(substrate-define (cons a d) #:inline (kd:cons a d))
-(substrate-define (car p) #:inline #:borrow (p) (if (kd:pair? p) (kd:unsafe-car p) (rt:wrong-type 'car '"a pair" p)))
-(substrate-define (cdr p) #:inline #:borrow (p) (if (kd:pair? p) (kd:unsafe-cdr p) (rt:wrong-type 'cdr '"a pair" p)))
+(substrate-define (cons a d) #:inline (kd:cons-inline a d))
+(substrate-define (car p) #:inline #:borrow (p) (if (kd:pair-cell? p) (kd:pair-car p) (rt:wrong-type 'car '"a pair" p)))
+(substrate-define (cdr p) #:inline #:borrow (p) (if (kd:pair-cell? p) (kd:pair-cdr p) (rt:wrong-type 'cdr '"a pair" p)))
 ;; The car and cdr of p, read where they are, for function who.
-(func (car-of [p i32] [who i32]) #:inline -> i32 (if (kd:pair? p) (kd:unsafe-car p) (rt:wrong-type who '"a pair" p)))
+(func (car-of [p i32] [who i32]) #:inline -> i32 (if (kd:pair-cell? p) (kd:pair-car p) (rt:wrong-type who '"a pair" p)))
 (#%fact car-of '(foreign borrowed))
-(func (cdr-of [p i32] [who i32]) #:inline -> i32 (if (kd:pair? p) (kd:unsafe-cdr p) (rt:wrong-type who '"a pair" p)))
+(func (cdr-of [p i32] [who i32]) #:inline -> i32 (if (kd:pair-cell? p) (kd:pair-cdr p) (rt:wrong-type who '"a pair" p)))
 (#%fact cdr-of '(foreign borrowed))
 (substrate-define (caar p) #:borrow (p) (car-of (car-of p 'caar) 'caar))
 (substrate-define (cadr p) #:borrow (p) (car-of (cdr-of p 'cadr) 'cadr))
@@ -845,15 +931,15 @@
 (substrate-define (caddr p) #:borrow (p) (car-of (cdr-of (cdr-of p 'caddr) 'caddr) 'caddr))
 (substrate-define (cdddr p) #:borrow (p) (cdr-of (cdr-of (cdr-of p 'cdddr) 'cdddr) 'cdddr))
 (substrate-define (cadddr p) #:borrow (p) (car-of (cdr-of (cdr-of (cdr-of p 'cadddr) 'cadddr) 'cadddr) 'cadddr))
-(substrate-define (pair? x) #:inline #:borrow (x) (bool (kd:pair? x)))
-(substrate-define (null? x) #:inline #:borrow (x) (bool (kd:null? x)))
+(substrate-define (pair? x) #:inline #:borrow (x) (bool (kd:pair-cell? x)))
+(substrate-define (null? x) #:inline #:borrow (x) (bool (kd:null-cell? x)))
 (substrate-define (list? x) #:borrow (x) (bool (kd:list? x)))
 (substrate-define (list-function . xs) xs)
 (substrate-define (length l) #:borrow (l) (fix (list-length l '"length")))
 (substrate-define (reverse l) #:borrow (l) (reverse-list l '"reverse"))
-(func (unsafe-car [p i32]) #:inline -> i32 (kd:unsafe-car p))
+(func (unsafe-car [p i32]) #:inline -> i32 (kd:pair-car p))
 (#%fact unsafe-car '(foreign borrowed))
-(func (unsafe-cdr [p i32]) #:inline -> i32 (kd:unsafe-cdr p))
+(func (unsafe-cdr [p i32]) #:inline -> i32 (kd:pair-cdr p))
 (#%fact unsafe-cdr '(foreign borrowed))
 
 ;; The lists of ls appended: each but the last copied, sharing its
@@ -928,54 +1014,59 @@
 
 (substrate-define + #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (rt:add a b)]
+    [(a b) (add-values a b)]
     [() '0]
     [(a) (rt:add a '0)]
-    [(a b . more) (fold-op 0 (rt:add a b) more)]))
+    [(a b . more) (fold-op 0 (add-values a b) more)]))
 
 (substrate-define - #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (rt:sub a b)]
-    [(a) (rt:sub '0 a)]
-    [(a b . more) (fold-op 1 (rt:sub a b) more)]))
+    [(a b) (sub-values a b)]
+    [(a) (sub-values '0 a)]
+    [(a b . more) (fold-op 1 (sub-values a b) more)]))
 
 (substrate-define * #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (rt:mul a b)]
+    [(a b) (mul-values a b)]
     [() '1]
     [(a) (rt:mul a '1)]
-    [(a b . more) (fold-op 2 (rt:mul a b) more)]))
+    [(a b . more) (fold-op 2 (mul-values a b) more)]))
 
-(substrate-define (quotient a b) #:borrow (a b) (rt:quo a b))
-(substrate-define (remainder a b) #:borrow (a b) (rt:rem a b))
-(substrate-define (modulo a b) #:borrow (a b) (rt:floor-remainder a b))
+(substrate-define (quotient a b) #:inline #:borrow (a b) (quo-values a b))
+(substrate-define (remainder a b) #:inline #:borrow (a b) (rem-values a b))
+(substrate-define (modulo a b) #:inline #:borrow (a b) (mod-values a b))
 
 (substrate-define < #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (bool (rt:compare 0 a b))]
+    [(a b) (lt-values a b)]
     [(a . more) (chain 0 0 a more)]))
 (substrate-define > #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (bool (rt:compare 1 a b))]
+    [(a b) (gt-values a b)]
     [(a . more) (chain 0 1 a more)]))
 (substrate-define <= #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (bool (rt:compare 2 a b))]
+    [(a b) (le-values a b)]
     [(a . more) (chain 0 2 a more)]))
 (substrate-define >= #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (bool (rt:compare 3 a b))]
+    [(a b) (ge-values a b)]
     [(a . more) (chain 0 3 a more)]))
 (substrate-define = #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (bool (rt:compare 4 a b))]
+    [(a b) (eq-values a b)]
     [(a . more) (chain 0 4 a more)]))
 
-(substrate-define (zero? a) #:borrow (a) (bool (i64.eqz (rt:int-value a 'zero?))))
-(substrate-define (positive? a) #:borrow (a) (bool (i64.gt_s (rt:int-value a 'positive?) (i64.const 0))))
-(substrate-define (negative? a) #:borrow (a) (bool (i64.lt_s (rt:int-value a 'negative?) (i64.const 0))))
-(substrate-define (even? a) #:borrow (a) (bool (i64.eqz (i64.and (rt:int-value a 'even?) (i64.const 1)))))
-(substrate-define (odd? a) #:borrow (a) (bool (i64.ne (i64.and (rt:int-value a 'odd?) (i64.const 1)) (i64.const 0))))
+(substrate-define (zero? a) #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.eq a 1) (i64.eqz (rt:int-value a 'zero?)))))
+(substrate-define (positive? a) #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.gt_s a 1) (i64.gt_s (rt:int-value a 'positive?) (i64.const 0)))))
+(substrate-define (negative? a) #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.lt_s a 0) (i64.lt_s (rt:int-value a 'negative?) (i64.const 0)))))
+(substrate-define (even? a) #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.eqz (i32.and a 2)) (i64.eqz (i64.and (rt:int-value a 'even?) (i64.const 1))))))
+(substrate-define (odd? a) #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.and a 2) (i64.ne (i64.and (rt:int-value a 'odd?) (i64.const 1)) (i64.const 0)))))
 (substrate-define (abs a) #:borrow (a) (if (i64.lt_s (rt:int-value a '"abs") (i64.const 0)) (rt:sub '0 a) a))
 
 ;; The least (op 0) or greatest (op 1) of a and the elements of l, read
@@ -994,19 +1085,19 @@
 (substrate-define (min a . more) (extreme a more 0))
 (substrate-define (max a . more) (extreme a more 1))
 
-(substrate-define bitwise-and #:borrow (a b)
+(substrate-define bitwise-and #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (rt:bitwise 3 a b)]
+    [(a b) (if (both-fixnums? a b) (fixnum-word (i32.and a b)) (rt:bitwise 3 a b))]
     [() '-1]
     [(a . more) (fold-op 3 (rt:bitwise 3 a '-1) more)]))
-(substrate-define bitwise-ior #:borrow (a b)
+(substrate-define bitwise-ior #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (rt:bitwise 4 a b)]
+    [(a b) (if (both-fixnums? a b) (fixnum-word (i32.or a b)) (rt:bitwise 4 a b))]
     [() '0]
     [(a . more) (fold-op 4 (rt:bitwise 4 a '0) more)]))
-(substrate-define bitwise-xor #:borrow (a b)
+(substrate-define bitwise-xor #:inline #:borrow (a b)
   (substrate-case-lambda
-    [(a b) (rt:bitwise 5 a b)]
+    [(a b) (if (both-fixnums? a b) (fixnum-word (i32.or (i32.xor a b) 1)) (rt:bitwise 5 a b))]
     [() '0]
     [(a . more) (fold-op 5 (rt:bitwise 5 a '0) more)]))
 (substrate-define (bitwise-not a) #:borrow (a) (kd:make-integer (i64.xor (rt:int-value a '"bitwise-not") (i64.const -1))))
@@ -1212,7 +1303,7 @@
 ;; none, failure's result, as for hash-ref, reading t, k, updater and
 ;; failure. updater may change the table.
 (func (hash-update* [t i32] [k i32] [updater i32] [failure i32] [has-failure i32]) -> i32
-  (let ([v (rt:call-closure (dup-value updater) 1 (rt:hash-ref-value t k failure has-failure '"hash-update!") 0 0 0)])
+  (let ([v (rt:call-closure updater 1 (rt:hash-ref-value t k failure has-failure '"hash-update!") 0 0 0)])
     (rt:hash-set-value! t (dup-value k) v '"hash-update!")
     '#f))
 (#%fact hash-update* '(foreign owned))
@@ -1235,7 +1326,7 @@
     (block done
       (loop next
         (br-if done (i32.eqz (kd:pair? p)))
-        (drop-value (rt:call-closure (dup-value f) 2 (dup-value (kd:car (kd:car p))) (dup-value (kd:cdr (kd:car p))) 0 0))
+        (drop-value (rt:call-closure f 2 (dup-value (kd:car (kd:car p))) (dup-value (kd:cdr (kd:car p))) 0 0))
         (set! p (kd:cdr p))
         (br next)))
     (drop-value l)
@@ -1357,7 +1448,7 @@
 ;; there, as bytes.
 (func (call-with-output-bytes* [proc i32]) -> i32
   (let ([p (rt:new-port -1)])
-    (drop-value (rt:call-closure (dup-value proc) 1 (dup-value p) 0 0 0))
+    (drop-value (rt:call-closure proc 1 (dup-value p) 0 0 0))
     (let ([r (rt:port-bytes p)])
       (drop-value p)
       r)))
