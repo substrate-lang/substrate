@@ -1,0 +1,249 @@
+;; Lifecycle: experimental. A page that is a session of the compiler
+;; (next/compiler/expander.sub, sessions): what is typed is evaluated, an
+;; input at a time, in the page, by the compiler, which is this program's
+;; library, as it is next/sub's (next/compiler/main.sub). The page is a
+;; program of ui.sub's views (../web.sub); its host is a page's
+;; (host/web), which gives it the compiler's files, the sources its inputs
+;; require, in memory, and what the inputs' code writes (the host module
+;; out, page.html's). site.sh makes its site.
+;;
+;; The session is in no language of its own: a session's is what its
+;; inputs require, as a file's is. The page starts one whose first input
+;; requires Substrate, and each of its languages' buttons starts another,
+;; whose first input requires that language; kernel's, one with no input,
+;; which is in kernel code.
+(require-unqualified c "../../c/c.sub")
+(require-unqualified kd "../../compiler/kernel.sub")
+(require-unqualified ex "../../compiler/expander.sub")
+(require-unqualified ui "../ui.sub")
+(require-unqualified web "../web.sub")
+
+(memory from c)
+(table from c)
+
+;; What the session's code has written to the standard output and error
+;; since it was last taken: at most cap bytes of it copied to buf, and
+;; forgotten, if cap is its length; its length.
+(import out-take "out" "take" (i32 i32 -> i32))
+
+;; ---- the model ----
+
+;; An input and what evaluating it wrote, its error among it if it failed.
+(struct entry [id u32] [input (ptr u8)] [output (ptr u8)] [failed i32])
+
+;; The entries, count of them in room for room; the text being typed; how
+;; many inputs there have been; a number that changes when the text field
+;; is to take the focus; and the entry last recalled into the field, by
+;; its index, or count for none.
+(struct model [entries (ptr entry)] [count u32] [room u32] [draft (ptr u8)] [inputs u32] [focus u32] [recalled u32])
+
+(variant message [draft-changed] [key-pressed] [run] [clear] [use [language u32]])
+(messages message)
+
+(define (copy-text [s (ptr u8)]) -> (ptr u8)
+  (let* ([n (+ (strlen s) 1)] [p (cast (ptr u8) (malloc n))])
+    (memcpy p s n)
+    p))
+
+(define (same? [a (ptr u8)] [b (ptr u8)]) -> i32
+  (let ([i u32 0])
+    (while (and (== (@ a i) (@ b i)) (!= (@ a i) 0)) (+= i 1))
+    (== (@ a i) (@ b i))))
+
+(define (set-draft! [m (ptr model)] [s (ptr u8)])
+  (let ([new (copy-text s)])
+    (free (-> m draft))
+    (set! (-> m draft) new)))
+
+;; A new entry for input: its index.
+(define (add-entry! [m (ptr model)] [input (ptr u8)]) -> u32
+  (when (== (-> m count) (-> m room))
+    (set! (-> m room) (if (== (-> m room) 0) 16 (* 2 (-> m room))))
+    (set! (-> m entries) (cast (ptr entry) (realloc (-> m entries) (* (-> m room) (sizeof entry))))))
+  (let ([e (+ (-> m entries) (-> m count))])
+    (+= (-> m inputs) 1)
+    (set! (-> e id) (-> m inputs))
+    (set! (-> e input) (copy-text input))
+    (set! (-> e output) (copy-text ""))
+    (set! (-> e failed) 0)
+    (+= (-> m count) 1)
+    (- (-> m count) 1)))
+
+;; ---- evaluating ----
+
+;; The entry being evaluated, by its index, or -1: a trap leaves it so.
+(define pending i32 -1)
+
+;; What the session's code wrote, added to b.
+(define (take-output! [b (ptr buffer)])
+  (let ([n (out-take 0 0)])
+    (when (> n 0)
+      (let ([p (cast (ptr u8) (malloc n))])
+        (out-take (cast i32 p) n)
+        (buffer-add! b p n)
+        (free p)))))
+
+;; Entry i is evaluated: its output is what its code wrote, then error, a
+;; string, if it failed, or #f.
+(define (finish-entry! [m (ptr model)] [i u32] [error datum])
+  (let ([e (+ (-> m entries) i)] [b (make-buffer)])
+    (take-output! (& b))
+    (when (!= error 0)
+      (buffer-add! (& b) (string-bytes error) (string-length error))
+      (set! (-> e failed) 1))
+    (when (and (> (-> b length) 0) (== (@ (-> b bytes) (- (-> b length) 1)) 10)) (-= (-> b length) 1))
+    (buffer-add-byte! (& b) 0)
+    (free (-> e output))
+    (set! (-> e output) (-> b bytes))))
+
+;; input evaluated as the session's next, and shown: its source locations
+;; name it input-N, N its entry's number.
+(define (evaluate! [m (ptr model)] [input (ptr u8)])
+  (let* ([i (add-entry! m input)]
+         [source (format-message "input-~a" (cons (make-integer (-> (+ (-> m entries) i) id)) nil))])
+    (set! pending (cast i32 i))
+    (finish-entry! m i (if (session-eval-text! (bytes->string input (strlen input)) source) 0 (session-error)))
+    (set! pending -1)))
+
+;; After a trap that unwound the compiler, as one in a macro does: the
+;; entry that was being evaluated shows it, and the session goes on. The
+;; trap left what follows an input's evaluation undone.
+(define (trapped [m (ptr model)])
+  (when (>= pending 0)
+    (finish-entry! m (cast u32 pending) (trap-report))
+    (set! pending -1))
+  (session-recover!)
+  (set-draft! m "")
+  (set! (-> m recalled) (-> m count))
+  (+= (-> m focus) 1))
+
+;; ---- the messages ----
+
+;; Is s whole: has it text, and is every list in it closed? A list's
+;; brackets in a string, a character or a comment are not its own.
+(define (complete? [s (ptr u8)]) -> i32
+  (let ([depth 0] [i u32 0] [some 0])
+    (while (!= (@ s i) 0)
+      (let ([c (@ s i)])
+        (cond [(== c #\;) (while (and (!= (@ s i) 0) (!= (@ s i) 10)) (+= i 1)) (continue)]
+              [(== c 34)
+               (+= i 1)
+               (while (and (!= (@ s i) 0) (!= (@ s i) 34))
+                 (when (and (== (@ s i) 92) (!= (@ s (+ i 1)) 0)) (+= i 1))
+                 (+= i 1))
+               (when (== (@ s i) 0) (return 0))
+               (set! some 1)]
+              [(and (== c #\#) (== (@ s (+ i 1)) 92) (!= (@ s (+ i 2)) 0)) (+= i 2) (set! some 1)]
+              [(or (== c #\() (== c #\[)) (+= depth 1) (set! some 1)]
+              [(or (== c #\)) (== c #\])) (-= depth 1)]
+              [(> c 32) (set! some 1)]))
+      (+= i 1))
+    (and some (<= depth 0))))
+
+(define (one-line? [s (ptr u8)]) -> i32
+  (let ([i u32 0])
+    (while (!= (@ s i) 0)
+      (when (== (@ s i) 10) (return 0))
+      (+= i 1))
+    1))
+
+(define (submit! [m (ptr model)])
+  (when (complete? (-> m draft))
+    (evaluate! m (-> m draft))
+    (set-draft! m ""))
+  (set! (-> m recalled) (-> m count))
+  (+= (-> m focus) 1))
+
+;; The input before the one in the field, if by is -1, or after it, if 1.
+(define (recall! [m (ptr model)] [by i32])
+  (let ([i (+ (cast i32 (-> m recalled)) by)])
+    (when (and (>= i 0) (<= i (cast i32 (-> m count))))
+      (set! (-> m recalled) (cast u32 i))
+      (set-draft! m (if (== (cast u32 i) (-> m count)) "" (-> (+ (-> m entries) i) input))))))
+
+;; Enter evaluates what is typed, once it is whole: until then, and with
+;; shift, it is a new line. The arrows recall the inputs.
+(define (key! [m (ptr model)])
+  (let ([key (event-key)])
+    (cond [(and (same? key "Enter") (not (event-shift?)) (complete? (-> m draft)))
+           (prevent-default!)
+           (submit! m)]
+          [(and (same? key "ArrowUp") (one-line? (-> m draft)))
+           (prevent-default!)
+           (recall! m -1)]
+          [(and (same? key "ArrowDown") (one-line? (-> m draft)))
+           (prevent-default!)
+           (recall! m 1)])))
+
+(define (clear! [m (ptr model)])
+  (for ([i u32 0]) (< i (-> m count)) (+= i 1)
+    (free (-> (+ (-> m entries) i) input))
+    (free (-> (+ (-> m entries) i) output)))
+  (set! (-> m count) 0)
+  (set! (-> m recalled) 0)
+  (+= (-> m focus) 1))
+
+;; The input that makes a session one in a language, or 0 for kernel code,
+;; which needs none.
+(define (language-input [language u32]) -> (ptr u8)
+  (case language
+    [(0) "(require-unqualified substrate \"next/substrate/substrate.sub\")"]
+    [(1) "(require-unqualified c \"next/c/c.sub\")"]
+    [(2) "(begin (require-unqualified bend \"next/bend/bend.sub\") (require-unqualified base \"next/bend/base.sub\"))"]
+    [else 0]))
+
+;; A new session, in a language: the one before is left as it is, and its
+;; entries go. A session cannot be made one in another language by an
+;; input that requires it: the names the first bound that the second
+;; leaves the kernel's, such as if, would stay the first's.
+(define (start! [m (ptr model)] [language u32])
+  (clear! m)
+  (session-open! `"repl")
+  (let ([input (language-input language)])
+    (when (!= input 0) (evaluate! m input)))
+  (set! (-> m recalled) (-> m count)))
+
+(define (update [m (ptr model)] [e (ptr message)])
+  (match e
+    [draft-changed (set-draft! m (event-value))]
+    [key-pressed (key! m)]
+    [run (submit! m)]
+    [clear (clear! m)]
+    [(use language) (start! m language)]))
+
+;; The compiler's files are the page's: the sources at /src, which is the
+;; package's root, and this program, whose kernel module the session's
+;; compile-time code shares, at /program (expander.sub, the kernel module).
+(define (init [m (ptr model)])
+  (set! (-> m draft) (copy-text ""))
+  (set-repository-root! `"/src")
+  (set-package-root! `"/src")
+  (set-running-directory! `"/program")
+  (start! m 0))
+
+;; ---- the view ----
+
+(view (entry-view [e (ptr entry)])
+  (section ([class (if (-> e failed) "entry failed" "entry")])
+    (pre ([class "input"]) (text (-> e input)))
+    (when (!= (@ (-> e output)) 0) (pre ([class "output"]) (text (-> e output))))))
+
+(view (repl [m (ptr model)])
+  (header
+    (h1 "substrate")
+    (p "A session: a module typed one input at a time, compiled and run in this page. Its language is what its inputs require: each button starts a new session whose first input requires one.")
+    (nav
+      (button ([on click (use 0)]) "Substrate")
+      (button ([on click (use 1)]) "C-like Lisp")
+      (button ([on click (use 2)]) "Bend")
+      (button ([on click (use 3)]) "kernel")
+      (button ([class "quiet"] [on click clear]) "clear")))
+  (main ([scroll-end (-> m inputs)])
+    (each [e (-> m entries) (-> m count)] #:key (-> e id) (entry-view e)))
+  (footer
+    (textarea ([value (-> m draft)] [rows "3"] [spellcheck "false"] [autocapitalize "off"]
+               [placeholder "(define (sq x) (* x x))    Enter evaluates, Shift+Enter is a new line"]
+               [on input draft-changed] [on keydown key-pressed] [focus (-> m focus)]))
+    (button ([on click run]) "run")))
+
+(app model message init update repl trapped)
