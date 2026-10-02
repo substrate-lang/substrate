@@ -161,8 +161,8 @@ the kernel, syntax objects among them, and the functions of the macro
 contract (spec 2). The old compiler's, `compiler/kernel.sub`, has them as
 GC objects; the new compiler's is `kernel.sub`, with the data in memory,
 with the run-time modules it rests on, which give it its memory and
-allocator: `lib/print.sub`'s memory, and `c/`'s `sbrk`, stack and
-allocator. The GC kernel module is not part of the new compiler: the
+allocator: `lib/memory.sub`'s memory, which every module of a program
+shares, and `c/`'s `sbrk`, stack and allocator. The GC kernel module is not part of the new compiler: the
 kernel language keeps wasm's GC types and instructions, and a language
 that wants GC data, as Substrate will, defines its own.
 
