@@ -35,6 +35,11 @@
 //       Yes/no facts about the event being handled, as bits: 1 = Shift
 //       was held, 2 = Control, 4 = Alt, 8 = Meta, 16 = the element the
 //       event came from is a ticked checkbox.
+//   event_number (which) -> f64
+//       A number about the event being handled. which = 0: when the
+//       event happened, in milliseconds. which = 1 and 2: the x and y
+//       position of the mouse, in pixels from the top left corner of
+//       the element the event came from.
 //   prevent_default ()
 //       Cancels the browser's default action for the event being handled.
 //
@@ -43,6 +48,16 @@
 // fires, this module calls the program's exported function `on-event`
 // with that number. The call happens inside the browser's event dispatch,
 // so the program can still call prevent_default.
+//
+// A "listen-window" patch (number 12) is the same, except that the
+// listener is attached to the browser window. It is used for events that
+// do not belong to one element, such as a key pressed anywhere on the
+// page. Its event name "frame" is special: it is not a DOM event, and
+// asks for a call on every animation frame (requestAnimationFrame).
+//
+// A "draw" patch (number 13) draws on a canvas element. It carries a
+// list of drawing commands, which next/web/canvas.sub documents, and
+// which `draw` below carries out on the canvas's 2D context.
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
 
@@ -65,7 +80,8 @@ export function dom(root) {
   // event that fires during that time must not be passed to the program
   // straight away: the program would answer by writing new patches into
   // the buffer that is being read. Such events are queued in `waiting`,
-  // each with the node it fired on, and delivered when the batch is done.
+  // as functions that deliver them, and are delivered when the batch is
+  // done.
   let applying = false;
   const waiting = [];
 
@@ -91,8 +107,11 @@ export function dom(root) {
   // prevent it, `unlisten` clears a node's listener table when its number
   // is freed, and `heard` looks in the table when it delivers an event.
   const listener = (e) => {
-    if (applying) waiting.push([e, e.currentTarget]);
-    else heard(e, e.currentTarget);
+    // currentTarget is only set while the event is being dispatched, so
+    // it is read now.
+    const node = e.currentTarget;
+    if (applying) waiting.push(() => heard(e, node));
+    else heard(e, node);
   };
 
   // Delivers the event e, which fired on `node`, if the node still has a
@@ -102,11 +121,60 @@ export function dom(root) {
     if (messages && e.type in messages) give(e, messages[e.type]);
   };
 
-  // Forgets the listeners of the node numbered `id`. Called when the
-  // number is freed.
+  // The listeners that "listen-window" patches attached to the window.
+  // A window listener belongs to a node number: it is removed when that
+  // number is freed. `windowListeners` maps a node number to a list of
+  // { type, handler }.
+  const windowListeners = new Map();
+
+  // The listeners for the pseudo-event "frame": a Map from a node number
+  // to the listener's number. While it is not empty, `frame` runs on
+  // every animation frame and calls the program once per listener.
+  // `frameRequest` is the pending requestAnimationFrame, or 0.
+  const frames = new Map();
+  let frameRequest = 0;
+
+  function frame(time) {
+    frameRequest = 0;
+    // A listener can be removed while the frame is being handled (the
+    // program may unmount its element), so check before each call.
+    for (const [id, message] of [...frames]) {
+      if (frames.get(id) === message) give({ type: 'frame', timeStamp: time }, message);
+    }
+    if (frames.size > 0 && !frameRequest) frameRequest = requestAnimationFrame(frame);
+  }
+
+  // Attaches a window listener that belongs to the node numbered `id`.
+  function listenWindow(id, type, message) {
+    if (type === 'frame') {
+      frames.set(id, message);
+      if (!frameRequest) frameRequest = requestAnimationFrame(frame);
+      return;
+    }
+    const entry = { type, handler: null };
+    // The listener may be removed before a held-back event is delivered,
+    // so the delivery checks that it is still there.
+    const deliver = (e) => {
+      const list = windowListeners.get(id);
+      if (list && list.includes(entry)) give(e, message);
+    };
+    entry.handler = (e) => {
+      if (applying) waiting.push(() => deliver(e));
+      else deliver(e);
+    };
+    window.addEventListener(type, entry.handler);
+    if (!windowListeners.has(id)) windowListeners.set(id, []);
+    windowListeners.get(id).push(entry);
+  }
+
+  // Forgets the listeners of the node numbered `id`, including its window
+  // and frame listeners. Called when the number is freed.
   const unlisten = (id) => {
     const n = nodes.get(id);
     if (n instanceof Node && n.subListeners) n.subListeners = null;
+    for (const { type, handler } of windowListeners.get(id) || []) window.removeEventListener(type, handler);
+    windowListeners.delete(id);
+    frames.delete(id);
   };
 
   // Parses a template's HTML and finds its marked nodes (ui.sub explains
@@ -201,6 +269,43 @@ export function dom(root) {
     }
   }
 
+  // Carries out the drawing commands of a "draw" patch on a canvas's 2D
+  // context. The commands are the words w[i] up to w[end]. `f` views the
+  // same words as 32-bit floats, which is how numbers are stored, and
+  // `string(at)` reads a text operand (an address and a length, two
+  // words). next/web/canvas.sub lists the commands and their numbers.
+  function draw(ctx, w, f, i, end, string) {
+    while (i < end) {
+      switch (w[i]) {
+        case 1: ctx.clearRect(f[i + 1], f[i + 2], f[i + 3], f[i + 4]); i += 5; break;
+        case 2: ctx.fillStyle = string(i + 1); i += 3; break;
+        case 3: ctx.strokeStyle = string(i + 1); i += 3; break;
+        case 4: ctx.lineWidth = f[i + 1]; i += 2; break;
+        case 5: ctx.fillRect(f[i + 1], f[i + 2], f[i + 3], f[i + 4]); i += 5; break;
+        case 6: ctx.strokeRect(f[i + 1], f[i + 2], f[i + 3], f[i + 4]); i += 5; break;
+        case 7: ctx.beginPath(); i += 1; break;
+        case 8: ctx.moveTo(f[i + 1], f[i + 2]); i += 3; break;
+        case 9: ctx.lineTo(f[i + 1], f[i + 2]); i += 3; break;
+        case 10: ctx.arc(f[i + 1], f[i + 2], f[i + 3], f[i + 4], f[i + 5]); i += 6; break;
+        case 11: ctx.closePath(); i += 1; break;
+        case 12: ctx.fill(); i += 1; break;
+        case 13: ctx.stroke(); i += 1; break;
+        case 14: ctx.font = string(i + 1); i += 3; break;
+        case 15: ctx.fillText(string(i + 1), f[i + 3], f[i + 4]); i += 5; break;
+        case 16: ctx.textAlign = string(i + 1); i += 3; break;
+        case 17: ctx.textBaseline = string(i + 1); i += 3; break;
+        case 18: ctx.save(); i += 1; break;
+        case 19: ctx.restore(); i += 1; break;
+        case 20: ctx.translate(f[i + 1], f[i + 2]); i += 3; break;
+        case 21: ctx.rotate(f[i + 1]); i += 2; break;
+        case 22: ctx.scale(f[i + 1], f[i + 2]); i += 3; break;
+        case 23: ctx.globalAlpha = f[i + 1]; i += 2; break;
+        default:
+          throw new Error(`dom.apply: no drawing command ${w[i]}`);
+      }
+    }
+  }
+
   // Applies the patches of one batch: `length` bytes at `ptr` in the
   // program's memory. ui.sub lists the patches.
   //
@@ -283,6 +388,20 @@ export function dom(root) {
           i += 2;
           break;
         }
+        case 12:
+          listenWindow(w[i + 1], string(i + 2), w[i + 4]);
+          i += 5;
+          break;
+        case 13: {
+          const canvas = nodes.get(w[i + 1]);
+          const count = w[i + 2];
+          // Numbers in drawing commands are 32-bit floats, in the same
+          // words.
+          const f = new Float32Array(w.buffer, w.byteOffset, w.length);
+          draw(canvas.getContext('2d'), w, f, i + 3, i + 3 + count, string);
+          i += 3 + count;
+          break;
+        }
         default:
           throw new Error(`dom.apply: no patch ${w[i]}`);
       }
@@ -306,7 +425,7 @@ export function dom(root) {
       applying = false;
     }
     for (const f of after) f();
-    while (waiting.length > 0) heard(...waiting.shift());
+    while (waiting.length > 0) waiting.shift()();
   }
 
   // The functions the program imports. `caller` gives access to the
@@ -337,8 +456,13 @@ export function dom(root) {
         return (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0) |
           (event.target && event.target.checked === true ? 16 : 0);
       },
+      event_number(which) {
+        if (!event) return 0;
+        if (which === 0) return event.timeStamp || 0;
+        return (which === 1 ? event.offsetX : event.offsetY) || 0;
+      },
       prevent_default() {
-        if (event) event.preventDefault();
+        if (event && event.preventDefault) event.preventDefault();
       },
     };
   };

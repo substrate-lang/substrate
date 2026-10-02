@@ -116,12 +116,16 @@ on them there.
     C-like Lisp.
   - `web.sub`: the structure of a page's program (model, messages,
     update, view) and its connection to the browser.
+  - `canvas.sub`: drawing on a `<canvas>` element: rectangles, paths,
+    circles and text.
   - `trace.sub`: a test helper that prints what a view would change on
     a page, so that views can be tested without a browser.
   - `site.sh`: builds a program and its page into a static web site.
-  - `examples/`: `counter.sub`, a minimal example, and `rows.sub`, a
-    table with many rows, used to measure performance
-    (`tests/web/rows.mjs`).
+  - `examples/`: `counter.sub`, a minimal example; `rows.sub`, a table
+    with many rows, used to measure performance
+    (`tests/web/rows.mjs`); and `snake/`, a small game: `rules.sub` is
+    the game itself (rules, timing, random food), `snake.sub` the page
+    around it, and `page.html` its HTML.
   - `repl/`: the REPL page. `repl.sub` is the page's program (the user
     interface); `session.sub` is the compiler, which the page runs in a
     sandbox; `page.html` and `site.sh` make the site.
@@ -147,7 +151,8 @@ on them there.
   kernel's tests, which is what the compiler gives. `tests/ui` tests
   the page views (`web/ui.sub`): the tests print the page changes that
   a view produces, and check the error messages for templates that are
-  wrong. `tests/session` tests sessions: `next/sub eval` runs each
+  wrong, and they play the snake example's game without its page.
+  `tests/session` tests sessions: `next/sub eval` runs each
   file, one form at a time. `tests/web/run.sh` is separate, and runs
   the tests that need a browser: the session tests again, with the
   compiler running in a page, and the pages of `web/`.
@@ -333,6 +338,23 @@ A site is made of static files only, so any web server can serve it.
   as a reply from a guest, are turned into messages with `send!`.
   `web/examples/counter.sub` is a minimal example; its compiled program
   is 20 KB.
+- **Canvas** (`web/canvas.sub`): drawing with code instead of with
+  elements. A `<canvas>` is an ordinary element in a view, with one
+  extra attribute: `[draw key code]` runs `code` when the canvas is
+  created and again whenever `key` changes. `code` calls drawing
+  functions such as `fill-rect`, `fill-circle` and `fill-text`. Drawing
+  uses the same mechanism as the rest of a view: each function writes
+  a small command into the patch buffer, and the host carries them all
+  out in one call. So a canvas needs no engine of its own, and a whole
+  frame of drawing is still one call from wasm to JavaScript.
+- **Window events and animation frames.** `[on-window event message]`
+  listens on the browser window instead of on one element, for things
+  like a key pressed anywhere on the page. The event name `frame`
+  sends a message for every frame the browser draws, which is what an
+  animation or a game runs on. These are listeners like any other:
+  they produce messages, they can carry event data (`(event time)`,
+  `(event key)`, and `(event x)` and `(event y)` for the mouse), and
+  they are removed when the element they are written on is removed.
 - **Guests** (`host/web/guest.mjs`, `c/guest.sub`): running code that is
   not trusted. A program can start another program as a "guest": a
   separate sandbox with its own memory. The two share nothing, and they
@@ -366,6 +388,26 @@ Because the user's code runs in the guest, it cannot harm the page:
   had succeeded, so the new session has the same definitions as the old
   one.
 
+### The snake example
+
+`web/examples/snake` is a small complete game, and shows how the
+pieces fit together. The game itself (`rules.sub`) knows nothing about
+pages. It is a struct and a few functions: start a game, turn, and
+advance to a given time. It has its own timing, which turns the
+browser's uneven frames into steps of a fixed length, so the snake
+moves at the same speed on every screen. Because it needs no browser,
+it is tested by a scripted game with made-up times, which prints the
+board as text (`tests/ui/snake.sub`). The page (`snake.sub`) is the
+usual model, messages, update and view. Its canvas has a frame
+listener and a key listener; `update` passes frames and keys on to
+the game; and the board is drawn again whenever a counter in the
+model changes. The compiled program is 33 KB.
+
+```sh
+next/web/site.sh next/web/examples/snake/snake.sub build/next/web/snake next/web/examples/snake/page.html
+host/web/serve.mjs build/next/web/snake
+```
+
 ### Measurements
 
 In headless Chromium, on the development machine:
@@ -385,6 +427,11 @@ In headless Chromium, on the development machine:
 | Select one row of 10,000 (every row is checked for changes) | 0.5 ms |
 | Swap two rows of 1,000 | 1 ms |
 | Remove one row of 1,000 | 0.9 ms |
+
+| Canvas | |
+|---|---|
+| Draw 10,000 rectangles in one frame | 2 ms |
+| One frame of snake, including drawing the board | under 0.1 ms |
 
 The rows are timed by `tests/web/rows.mjs`, from the click until the
 browser has laid the page out again.

@@ -1,0 +1,195 @@
+;; Lifecycle: experimental.
+;;
+;; Drawing on a <canvas> element: rectangles, paths, circles and text.
+;;
+;; A canvas is an element in a view (ui.sub) whose content is drawn by
+;; code instead of being described by a template:
+;;
+;;   (view (page [m (ptr model)])
+;;     (canvas ([width 320] [height 240] [draw (-> m frame) (paint m)])))
+;;
+;;   (define (paint [m (ptr model)])
+;;     (fill-style "black")
+;;     (fill-rect 0 0 320 240)
+;;     (fill-style "#4caf50")
+;;     (fill-circle (-> m x) (-> m y) 10))
+;;
+;; [draw key code] runs `code` when the canvas is created, and again each
+;; time the integer `key` changes. A canvas keeps what was drawn on it,
+;; so `code` usually starts by painting over everything.
+;;
+;; The functions here are the browser's 2D canvas API under almost the
+;; same names. Positions and sizes are in pixels, measured from the
+;; canvas's top left corner; x grows to the right and y grows downwards.
+;; Angles are in radians. Colours, fonts and so on are strings in CSS
+;; syntax, such as "red", "#4caf50" or "bold 16px sans-serif". Numbers can
+;; be integers or decimals.
+;;
+;;   Colours and line style, which apply to what is drawn afterwards:
+;;     (fill-style color)        the colour for filling shapes and text
+;;     (stroke-style color)      the colour for outlines and lines
+;;     (line-width w)            the thickness of outlines and lines
+;;     (global-alpha a)          opacity, from 0 (invisible) to 1 (solid)
+;;
+;;   Rectangles:
+;;     (fill-rect x y w h)       a filled rectangle
+;;     (stroke-rect x y w h)     the outline of a rectangle
+;;     (clear-rect x y w h)      makes a rectangle transparent again
+;;
+;;   Paths. A path is a shape built from lines and arcs, then filled or
+;;   outlined:
+;;     (begin-path)              starts a new path
+;;     (move-to x y)             moves the pen without drawing
+;;     (line-to x y)             a straight line from the pen to (x, y)
+;;     (arc x y radius start end)
+;;                               part of a circle around (x, y), between
+;;                               the angles `start` and `end`
+;;     (close-path)              a line back to where the path started
+;;     (fill-path)               fills the path
+;;     (stroke-path)             outlines the path
+;;
+;;   Shortcuts built from the above:
+;;     (fill-circle x y radius)  a filled circle
+;;     (draw-line x1 y1 x2 y2)   a single line
+;;
+;;   Text:
+;;     (set-font font)           for example "16px sans-serif"
+;;     (text-align align)        "left", "center" or "right": which part
+;;                               of the text is placed at x
+;;     (text-baseline baseline)  "top", "middle", "alphabetic" or "bottom":
+;;                               which part of the text is placed at y
+;;     (fill-text text x y)      draws text
+;;
+;;   Moving the coordinate system. These change where and how everything
+;;   after them is drawn:
+;;     (translate x y)           moves the origin to (x, y)
+;;     (rotate angle)            turns around the origin
+;;     (scale x y)               stretches
+;;     (save-state)              remembers the current colours, line
+;;                               style, font and coordinate system
+;;     (restore-state)           goes back to what the matching save-state
+;;                               remembered
+;;
+;; These functions only have an effect inside the `code` of a [draw ...]
+;; attribute. Called anywhere else, they do nothing.
+;;
+;; A limitation: the canvas has as many pixels as its width and height
+;; attributes say. On a high-resolution ("retina") screen the browser
+;; scales that up, which looks slightly soft.
+;;
+;; ---- How it works ----
+;;
+;; Like the rest of a view, drawing does not call the browser directly.
+;; Each function appends a small command to ui.sub's patch buffer, inside
+;; a "draw" patch for the canvas (ui.sub explains patches). The host
+;; carries the commands out when the buffer is applied (`draw` in
+;; host/web/dom.mjs). A whole frame of drawing therefore costs one call
+;; from wasm to JavaScript, not one per shape.
+;;
+;; A command is 32-bit words: its number, then its operands. A number
+;; operand is one word, a 32-bit float. A text operand is two words, the
+;; address and the length of the text.
+;;
+;;    1 clear-rect x y w h        13 stroke-path
+;;    2 fill-style color          14 set-font font
+;;    3 stroke-style color        15 fill-text text x y
+;;    4 line-width w              16 text-align align
+;;    5 fill-rect x y w h         17 text-baseline baseline
+;;    6 stroke-rect x y w h       18 save-state
+;;    7 begin-path                19 restore-state
+;;    8 move-to x y               20 translate x y
+;;    9 line-to x y               21 rotate angle
+;;   10 arc x y radius start end  22 scale x y
+;;   11 close-path                23 global-alpha a
+;;   12 fill-path
+(require-unqualified c "../c/c.sub")
+(require-unqualified ui "ui.sub")
+
+(provide fill-style stroke-style line-width global-alpha
+         fill-rect stroke-rect clear-rect
+         begin-path move-to line-to arc close-path fill-path stroke-path
+         fill-circle draw-line
+         set-font text-align text-baseline fill-text
+         translate rotate scale save-state restore-state)
+
+(memory from c)
+(table from c)
+
+;; ---- Writing commands ----
+
+;; Starts a command: appends its number to the patch buffer. Returns 1 if
+;; it did. Returns 0, and writes nothing, if no draw patch is open; the
+;; caller then skips the operands too.
+(define (command! [op u32]) -> i32
+  (if (ui-canvas-drawing?)
+      (begin
+        (buffer-add! (ui-patches) (cast (ptr u8) (array-of u32 op)) 4)
+        1)
+      0))
+
+;; Appends n number operands.
+(define (numbers! [v (ptr f32)] [n u32]) (buffer-add! (ui-patches) (cast (ptr u8) v) (* 4 n)))
+
+;; Appends a text operand. The command is carried out later, when the
+;; patch buffer is applied, and the caller's string may have changed by
+;; then. So the text is copied into memory that lasts exactly until the
+;; buffer has been applied (ui-frame-alloc).
+(define (text! [s (ptr u8)])
+  (let* ([n (strlen s)] [copy (cast (ptr u8) (ui-frame-alloc (+ n 1)))])
+    (memcpy copy s (+ n 1))
+    (buffer-add! (ui-patches) (cast (ptr u8) (array-of u32 (cast u32 copy) n)) 8)))
+
+;; The shapes of the commands: no operands, some numbers, or one text.
+(define (plain! [op u32]) (command! op))
+(define (one! [op u32] [a f64]) (when (command! op) (numbers! (array-of f32 (cast f32 a)) 1)))
+(define (two! [op u32] [a f64] [b f64]) (when (command! op) (numbers! (array-of f32 (cast f32 a) (cast f32 b)) 2)))
+(define (four! [op u32] [a f64] [b f64] [c f64] [d f64])
+  (when (command! op) (numbers! (array-of f32 (cast f32 a) (cast f32 b) (cast f32 c) (cast f32 d)) 4)))
+(define (named! [op u32] [s (ptr u8)]) (when (command! op) (text! s)))
+
+;; ---- The drawing functions ----
+
+(define (fill-style [color (ptr u8)]) (named! 2 color))
+(define (stroke-style [color (ptr u8)]) (named! 3 color))
+(define (line-width [w f64]) (one! 4 w))
+(define (global-alpha [a f64]) (one! 23 a))
+
+(define (fill-rect [x f64] [y f64] [w f64] [h f64]) (four! 5 x y w h))
+(define (stroke-rect [x f64] [y f64] [w f64] [h f64]) (four! 6 x y w h))
+(define (clear-rect [x f64] [y f64] [w f64] [h f64]) (four! 1 x y w h))
+
+(define (begin-path) (plain! 7))
+(define (move-to [x f64] [y f64]) (two! 8 x y))
+(define (line-to [x f64] [y f64]) (two! 9 x y))
+(define (arc [x f64] [y f64] [radius f64] [start f64] [end f64])
+  (when (command! 10)
+    (numbers! (array-of f32 (cast f32 x) (cast f32 y) (cast f32 radius) (cast f32 start) (cast f32 end)) 5)))
+(define (close-path) (plain! 11))
+(define (fill-path) (plain! 12))
+(define (stroke-path) (plain! 13))
+
+;; A full circle is an arc from angle 0 to 2 pi.
+(define (fill-circle [x f64] [y f64] [radius f64])
+  (begin-path)
+  (arc x y radius 0.0 6.283185307179586)
+  (fill-path))
+
+(define (draw-line [x1 f64] [y1 f64] [x2 f64] [y2 f64])
+  (begin-path)
+  (move-to x1 y1)
+  (line-to x2 y2)
+  (stroke-path))
+
+(define (set-font [font (ptr u8)]) (named! 14 font))
+(define (text-align [align (ptr u8)]) (named! 16 align))
+(define (text-baseline [baseline (ptr u8)]) (named! 17 baseline))
+(define (fill-text [text (ptr u8)] [x f64] [y f64])
+  (when (command! 15)
+    (text! text)
+    (numbers! (array-of f32 (cast f32 x) (cast f32 y)) 2)))
+
+(define (translate [x f64] [y f64]) (two! 20 x y))
+(define (rotate [angle f64]) (one! 21 angle))
+(define (scale [x f64] [y f64]) (two! 22 x y))
+(define (save-state) (plain! 18))
+(define (restore-state) (plain! 19))

@@ -20,9 +20,12 @@
 # 2. Pages written with next/web/ui.sub. pages.mjs opens each one, clicks
 #    and types, and checks what the page shows:
 #      counter, rows   the examples in next/web/examples
+#      snake           the snake game (next/web/examples/snake)
 #      focus           an event that fires while the page is being updated
 #                      (focus.sub)
 #      fields          typed attributes and event data (fields.sub)
+#      canvas          canvas drawing, window listeners and animation
+#                      frames (canvas.sub)
 #      guests          sandboxed programs (guests.sub; its guests run
 #                      a-guest.sub, which is put in the site as a file
 #                      pack)
@@ -60,9 +63,11 @@ next/web/site.sh next/web/examples/rows.sub "$sites/rows"
 next/web/repl/site.sh "$sites/repl"
 next/web/site.sh next/tests/web/focus.sub "$sites/focus"
 next/web/site.sh next/tests/web/fields.sub "$sites/fields"
+next/web/site.sh next/tests/web/canvas.sub "$sites/canvas"
+next/web/site.sh next/web/examples/snake/snake.sub "$sites/snake" next/web/examples/snake/page.html
 next/web/site.sh next/tests/web/guests.sub "$sites/guests" next/tests/web/guests.html
 next/sub build next/tests/web/a-guest.sub -o "$sites/guests/guest"
 host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
 rm -r "${sites:?}/guests/guest"
-node next/tests/web/pages.mjs "$sites" counter rows focus fields guests repl || status=1
+node next/tests/web/pages.mjs "$sites" counter rows focus fields canvas snake guests repl || status=1
 exit $status

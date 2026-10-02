@@ -20,9 +20,10 @@
 # tests of Bend as the new compiler builds it (next/bend),
 # next/tests/substrate has the
 # tests of Substrate as the new compiler builds it (next/substrate),
-# next/tests/ui has the tests of web-page views (next/web/ui.sub): they
-# print the page changes a view produces, and check the error messages for
-# templates that are wrong. next/tests/session has the session tests, which
+# next/tests/ui has the tests of the web libraries that need no browser
+# (next/web): they print the page changes a view produces, check the error
+# messages for templates that are wrong, and play the snake example's game
+# without its page. next/tests/session has the session tests, which
 # next/sub eval runs. Then,
 # as tests/run.sh does, the cache (spec 3.7): each program built again
 # from it is the same, and a stale entry is not used. OUT is where builds

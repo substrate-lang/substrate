@@ -382,6 +382,109 @@ const checks = {
       await page.evaluate('window.app.files.has("/out/made.txt")'), false);
   },
 
+  // next/tests/web/canvas.sub: canvas drawing, window listeners and
+  // animation frames. canvas.sub explains the page. `pixel(x, y)` reads
+  // one pixel of the canvas, as "red,green,blue,alpha".
+  async canvas(page) {
+    const shown = () => page.evaluate('document.getElementById("shown").textContent');
+    const pixel = (x, y) => page.evaluate(
+      `[...document.getElementById("board").getContext("2d").getImageData(${x}, ${y}, 1, 1).data].join(",")`);
+    const frames = async () => Number((await shown()).match(/frames (\d+)/)[1]);
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    check('canvas: initial page', await shown(), '0,0 clicks 0 frames 0 keys 0');
+    check('canvas: the canvas is painted white when it is created', await pixel(100, 50), '255,255,255,255');
+
+    // page.click clicks the middle of the element: (100, 50) on a canvas
+    // of 200 by 100.
+    await page.click('#board');
+    check('canvas: a click reports the mouse position', await shown(), '100,50 clicks 1 frames 0 keys 0');
+    check('canvas: the square is drawn where the click was', await pixel(100, 50), '255,0,0,255');
+    check('canvas: the rest of the canvas is still white', await pixel(20, 20), '255,255,255,255');
+
+    // No window listener exists yet: keys and frames are not counted.
+    await page.press('a');
+    await sleep(100);
+    check('canvas: nothing listens before the label is shown', await shown(), '100,50 clicks 1 frames 0 keys 0');
+
+    // Showing the label adds a frame listener and a key listener.
+    await page.click('#toggle');
+    await page.waitFor('Number(document.getElementById("shown").textContent.match(/frames (\\d+)/)[1]) >= 3');
+    await page.press('a');
+    await page.press('ArrowUp');
+    check('canvas: a window listener hears keys without any element having the focus',
+      (await shown()).match(/keys (\d+)/)[1], '2');
+    check('canvas: frames do not redraw the canvas, whose draw key did not change', await pixel(100, 50), '255,0,0,255');
+
+    // Hiding the label removes both listeners.
+    await page.click('#toggle');
+    const before = await frames();
+    await sleep(150);
+    await page.press('a');
+    check('canvas: frames stop when the element is removed', await frames(), before);
+    check('canvas: keys stop when the element is removed', (await shown()).match(/keys (\d+)/)[1], '2');
+
+    // Showing it again starts them again.
+    await page.click('#toggle');
+    await page.waitFor(`Number(document.getElementById("shown").textContent.match(/frames (\\d+)/)[1]) > ${before}`);
+    await page.press('a');
+    check('canvas: the listeners work again when the element comes back', (await shown()).match(/keys (\d+)/)[1], '3');
+  },
+
+  // next/web/examples/snake: the snake game. The rules are tested without
+  // a browser (next/tests/ui/snake.sub). This checks the page around
+  // them: the board is drawn, keys reach the game although nothing has
+  // the focus, the snake moves at the clock's pace, and the game ends at
+  // the wall.
+  //
+  // The board is 20 by 20 cells of 20 pixels. `cell(x, y)` reads the pixel
+  // in the middle of a cell. A new snake's head is at cell (10, 10), with
+  // its body to the left.
+  async snake(page) {
+    const text = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    const cell = (x, y) => page.evaluate(
+      `[...document.getElementById("board").getContext("2d").getImageData(${x * 20 + 10}, ${y * 20 + 10}, 1, 1).data].join(",")`);
+    const head = '180,241,167,255';
+    const body = '87,171,90,255';
+    const empty = '16,20,26,255';
+    // The first frame restarts the game with a seed taken from the time.
+    // Wait for a frame before looking.
+    await page.evaluate('new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))');
+    check('snake: a new game waits for a key', await text('status'), 'Press an arrow key to start.');
+    check('snake: the head is drawn', await cell(10, 10), head);
+    check('snake: the body is drawn', await cell(9, 10), body);
+    check('snake: the score starts at 0', await text('score'), '0');
+
+    // Nothing on the page has the keyboard focus: the key is heard by the
+    // window listener.
+    await page.press('ArrowRight');
+    check('snake: an arrow key starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
+    await page.waitFor(`(() => {
+      const d = document.getElementById("board").getContext("2d").getImageData(13 * 20 + 10, 10 * 20 + 10, 1, 1).data;
+      return d[0] === 180 && d[1] === 241;
+    })()`, 5000);
+    check('snake: the snake has moved, and left its old cells', await cell(10, 10), empty);
+
+    await page.press(' ');
+    check('snake: Space pauses', await text('status'), 'Paused. Press Space to continue.');
+    await page.press(' ');
+    check('snake: Space continues', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
+
+    // Going right from column 10, the snake reaches the wall after ten
+    // steps, a little over a second.
+    await page.waitFor('document.getElementById("status").textContent.startsWith("Game over")', 10000);
+    check('snake: the game ends at the wall', await text('status'), 'Game over. Press Enter to play again.');
+    await page.press('ArrowLeft');
+    check('snake: arrow keys do not restart a finished game', await text('status'), 'Game over. Press Enter to play again.');
+
+    await page.press('Enter');
+    check('snake: Enter starts a new game', await text('status'), 'Press an arrow key to start.');
+    check('snake: the new snake is back in the middle', await cell(10, 10), head);
+    await page.click('#new-game');
+    check('snake: the button starts a new game too', await text('status'), 'Press an arrow key to start.');
+    await page.press('a');
+    check('snake: the A key turns left and starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
+  },
+
   // next/tests/web/focus.sub: a regression test for events that fire
   // while the page is being updated.
   //
