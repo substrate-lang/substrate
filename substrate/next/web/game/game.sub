@@ -6,8 +6,10 @@
 ;; functions:
 ;;
 ;;   (define (init [w (ptr world)]) ...)
-;;       Sets the world up. Called once, when the page loads. This is the
-;;       place to load images (load-image in ../canvas.sub).
+;;       Sets the world up. Called once, before the first step. The world
+;;       starts out as all zero bytes. This is the place to load images
+;;       (load-image in ../canvas.sub) and sounds (load-sound in
+;;       sound.sub).
 ;;
 ;;   (define (step [w (ptr world)] [in (ptr input)]) ...)
 ;;       Advances the world by one step: move things, check collisions,
@@ -37,14 +39,22 @@
 ;;     was in the background) it does not try to catch up;
 ;;   - keeping the input up to date from the browser's key events, and
 ;;     stopping the arrow keys and Space from scrolling the page;
-;;   - waiting until the images have loaded before the first step;
-;;   - playing the sounds that the game asked for with play-tone
+;;   - waiting until the images and sounds have loaded before the first
+;;     step;
+;;   - playing the sounds and the music that the game asked for
 ;;     (sound.sub);
-;;   - redrawing on every frame.
+;;   - redrawing on every frame;
+;;   - stopping the game if it traps. A trap is what happens when the
+;;     program cannot go on: it found a mistake in itself, such as an
+;;     index that is out of range (trap.sub), or it did something
+;;     impossible, such as dividing by zero. The loop then takes no more
+;;     steps, and shows the message, with the list of functions that were
+;;     running, on top of the screen. (Without this the game would simply
+;;     freeze, and the message would only be in the browser's console.)
 ;;
-;; `step` and `draw` only use input.sub, sound.sub, tiles.sub and
-;; ../canvas.sub, none of which needs a browser. So a game's world can be
-;; put in a file of its own and played by a test, with made-up key
+;; `step` and `draw` only use input.sub, sound.sub, timers.sub, tiles.sub
+;; and ../canvas.sub, none of which needs a browser. So a game's world
+;; can be put in a file of its own and played by a test, with made-up key
 ;; presses (see next/tests/ui/platformer.sub).
 ;;
 ;; A game's page must give the program two host modules, "dom" and
@@ -66,10 +76,16 @@
 (memory from c)
 (table from c)
 
-;; From the browser: play a tone (host/web/audio.mjs), and how many images
-;; are still loading (host/web/dom.mjs).
+;; From the browser: sound (host/web/audio.mjs documents each function),
+;; and how many images are still loading (host/web/dom.mjs).
 (import audio-tone "audio" "tone" (i32 f64 f64 f64 f64 ->))
+(import audio-load "audio" "load" (i32 i32 i32 ->))
+(import audio-loading "audio" "loading" (-> i32))
+(import audio-play "audio" "play" (i32 f64 f64 i32 -> i32))
+(import audio-stop "audio" "stop" (i32 ->))
 (import dom-images-loading "dom" "images_loading" (-> i32))
+;; From every host: the report of the last trap (spec 4).
+(import host-error-message "host" "error_message" (i32 i32 -> i32))
 
 ;; ---- The loop's own state ----
 
@@ -85,7 +101,15 @@
   [pending f64]
   ;; A counter of frames. The canvas is redrawn whenever it changes, which
   ;; is on every frame.
-  [frame u32])
+  [frame u32]
+  ;; 1 once the game's init function has been called.
+  [started i32]
+  ;; The number the browser gave the music that is playing, or 0.
+  [music i32]
+  ;; 1 once the game has stopped because of a trap, and the report of the
+  ;; trap: its message, then the functions that were running.
+  [stopped i32]
+  [problem (array u8 2048)])
 
 ;; The most steps taken on one frame. If more time than that has built up,
 ;; the rest is dropped: the game falls behind real time instead of rushing
@@ -101,9 +125,9 @@
 ;; how many steps of the game to run now.
 (define (game-loop-steps! [l (ptr game-loop)] [now f64]) -> u32
   (cond
-    ;; Nothing happens until the images have arrived. The clock starts
-    ;; afterwards.
-    [(> (dom-images-loading) 0)
+    ;; Nothing happens until the images and sounds have arrived. The
+    ;; clock starts afterwards.
+    [(> (+ (dom-images-loading) (audio-loading)) 0)
      (set! (-> l timed) 0)
      0]
     ;; The first frame only records the time.
@@ -122,17 +146,63 @@
        (when (>= (-> l pending) (-> l step-ms)) (set! (-> l pending) 0.0))
        steps)]))
 
+;; Returns 1 the first time it is called and 0 afterwards. The game's
+;; init function runs when it returns 1: on the first frame, not when the
+;; page loads, so that a trap in it is shown like any other. `started` is
+;; set before init runs, so that an init that traps is not run again.
+(define (game-loop-first-frame? [l (ptr game-loop)]) -> i32
+  (if (-> l started)
+      0
+      (begin
+        (set! (-> l started) 1)
+        1)))
+
+;; Returns 1 while the game is running: it has been set up and has not
+;; stopped. Only then is the world drawn.
+(define (game-loop-running? [l (ptr game-loop)]) -> i32 (and (-> l started) (not (-> l stopped))))
+
+(define (game-loop-stopped? [l (ptr game-loop)]) -> i32 (-> l stopped))
+
+;; Called after a trap: stops the game and its music, and keeps the
+;; host's report of the trap, to be shown on the page.
+(define (game-loop-trapped! [l (ptr game-loop)])
+  (let ([n (host-error-message (cast i32 (-> l problem)) 2047)])
+    (set! (@ (-> l problem) (if (< n 2047) n 2047)) 0))
+  (when (!= (-> l music) 0)
+    (audio-stop (-> l music))
+    (set! (-> l music) 0))
+  (set! (-> l stopped) 1))
+
+(define (game-loop-problem [l (ptr game-loop)]) -> (ptr u8) (-> l problem))
+
 ;; Called after each step: presses and releases are reported for one step
 ;; only.
 (define (game-loop-step-done! [l (ptr game-loop)]) (input-end-step! (& (-> l input))))
 
-;; Called at the end of every frame: plays the tones the game asked for,
-;; and makes the canvas redraw.
+;; Called at the end of every frame: hands the browser what the game
+;; asked for during the frame (sound files to load, tones and sounds to
+;; play, a change of music), and makes the canvas redraw.
 (define (game-loop-frame-done! [l (ptr game-loop)])
+  (for ([i u32 0]) (< i (sound-files-waiting)) (+= i 1)
+    (let ([f (sound-file-at i)])
+      (audio-load (cast i32 (-> f id)) (cast i32 (-> f path)) (cast i32 (strlen (-> f path))))))
+  (sound-files-clear!)
   (for ([i u32 0]) (< i (tones-waiting)) (+= i 1)
     (let ([t (tone-at i)])
       (audio-tone (cast i32 (-> t wave)) (-> t from) (-> t to) (-> t ms) (-> t volume))))
   (tones-clear!)
+  (for ([i u32 0]) (< i (sounds-waiting)) (+= i 1)
+    (let ([s (sound-at i)])
+      (audio-play (cast i32 (-> s sound)) (-> s volume) 1.0 0)))
+  (sounds-clear!)
+  ;; Music: a sound that loops. Starting a piece stops the one before.
+  (when (!= (music-change) music-same)
+    (when (!= (-> l music) 0)
+      (audio-stop (-> l music))
+      (set! (-> l music) 0))
+    (when (== (music-change) music-start)
+      (set! (-> l music) (audio-play (cast i32 (music-sound)) (music-volume) 1.0 1)))
+    (music-change-clear!))
   (+= (-> l frame) 1))
 
 ;; A key went down (down = 1) or came up (down = 0). `name` is the key's
@@ -162,13 +232,16 @@
   ;;   game-state     the model: the world, and the loop's state
   ;;   game-message   one message for a frame, two for keys, one for the
   ;;                  window losing the focus
-  ;;   game-update    runs the steps that are due on a frame; passes key
+  ;;   game-update    on the first frame, calls the game's init function;
+  ;;                  runs the steps that are due on a frame; passes key
   ;;                  events to the loop
+  ;;   game-trapped   called after a trap: stops the game
   ;;   game-screen    the view: one canvas. Its listeners are on the
   ;;                  window, so keys work without anything being clicked
   ;;                  first. Its style makes the browser stretch it to fill
   ;;                  the window, keeping its shape and its hard pixel
-  ;;                  edges.
+  ;;                  edges. When the game has stopped, a panel with the
+  ;;                  report of the trap is shown on top of it.
   (define (game-form [s datum]) -> datum
     (syntax-match s
       [(_ world ((? identifier? word) width height) init step draw)
@@ -183,27 +256,33 @@
              (variant game-message
                [game-frame [time f64]] [game-key-down [key (ptr u8)]] [game-key-up [key (ptr u8)]] [game-blurred])
              (messages game-message)
-             (define (game-init [g (ptr game-state)])
-               (game-loop-start! (& (-> g loop)) 60.0)
-               (#,init (& (-> g world))))
+             (define (game-init [g (ptr game-state)]) (game-loop-start! (& (-> g loop)) 60.0))
              (define (game-update [g (ptr game-state)] [e (ptr game-message)])
                (match e
                  [(game-frame time)
-                  (let ([steps (game-loop-steps! (& (-> g loop)) time)])
-                    (for ([i u32 0]) (< i steps) (+= i 1)
-                      (#,step (& (-> g world)) (& (-> g loop input)))
-                      (game-loop-step-done! (& (-> g loop))))
+                  (unless (game-loop-stopped? (& (-> g loop)))
+                    (when (game-loop-first-frame? (& (-> g loop))) (#,init (& (-> g world))))
+                    (let ([steps (game-loop-steps! (& (-> g loop)) time)])
+                      (for ([i u32 0]) (< i steps) (+= i 1)
+                        (#,step (& (-> g world)) (& (-> g loop input)))
+                        (game-loop-step-done! (& (-> g loop)))))
                     (game-loop-frame-done! (& (-> g loop))))]
                  [(game-key-down key) (when (game-loop-key! (& (-> g loop)) key 1) (prevent-default!))]
                  [(game-key-up key) (game-loop-key! (& (-> g loop)) key 0)]
                  [game-blurred (game-loop-blur! (& (-> g loop)))]))
+             (define (game-trapped [g (ptr game-state)]) (game-loop-trapped! (& (-> g loop))))
              (view (game-screen [g (ptr game-state)])
                (canvas ([width #,width] [height #,height] [style #,style]
                         [on-window frame (game-frame (event time))]
                         [on-window keydown (game-key-down (event key))]
                         [on-window keyup (game-key-up (event key))]
                         [on-window blur game-blurred]
-                        [draw (-> g loop frame) (#,draw (& (-> g world)))])))
-             (app game-state game-message game-init game-update game-screen)))])))
+                        [draw (-> g loop frame) (when (game-loop-running? (& (-> g loop))) (#,draw (& (-> g world))))]))
+               (when (game-loop-stopped? (& (-> g loop)))
+                 (div ([class "game-stopped"]
+                       [style "position: fixed; left: 0; top: 0; right: 0; max-height: 100vh; overflow: auto; box-sizing: border-box; padding: 12px 16px; background: #5c1a1a; color: #ffffff; font: 13px/1.5 monospace;"])
+                   (p ([style "margin: 0 0 8px 0; font-weight: bold;"]) "The game has stopped.")
+                   (pre ([style "margin: 0; white-space: pre-wrap;"]) (text (game-loop-problem (& (-> g loop))))))))
+             (app game-state game-message game-init game-update game-screen game-trapped)))])))
 
 (define-syntax game game-form)

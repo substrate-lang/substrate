@@ -23,8 +23,9 @@
 # tests of Substrate as the new compiler builds it (next/substrate),
 # next/tests/ui has the tests of the web libraries that need no browser
 # (next/web): they print the page changes a view produces, check the error
-# messages for templates that are wrong, test the game library's collision
-# and keyboard code, and play the two example games without their pages.
+# messages for templates that are wrong, test the game library (collision,
+# keys, timers, sound, its containers and its formatting), and play the two
+# example games without their pages.
 # next/tests/session has the session tests, which
 # next/sub eval runs. Then,
 # as tests/run.sh does, the cache (spec 3.7): each program built again

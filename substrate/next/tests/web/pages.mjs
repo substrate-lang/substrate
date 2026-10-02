@@ -537,6 +537,81 @@ const checks = {
     check('platformer: a jump plays a sound', (await page.evaluate('window.audio.played()')) > before, true);
   },
 
+  // next/tests/web/sounds.sub: a game that loads a sound file and asks
+  // for it as music (repeating) as soon as it starts. S stops the music,
+  // M starts it again, and Space plays the sound once. The page keeps its
+  // audio module in window.audio, which counts what happens.
+  async sounds(page) {
+    const count = (what) => page.evaluate(`window.audio.${what}()`);
+    // The screen turns green when the game takes its first step, which
+    // is after its sound file has been decoded. The other file it asks
+    // for does not exist, and must not hold the game up.
+    await page.waitFor(`(() => {
+      const d = document.querySelector("canvas").getContext("2d").getImageData(10, 10, 1, 1).data;
+      return d[0] === 46 && d[1] === 125;
+    })()`, 10000);
+    check('sounds: one sound file was loaded and decoded', await count('loaded'), 1);
+    check('sounds: the file that is missing is reported',
+      page.log.some((line) => line.includes('audio: cannot load the sound assets/nothing.wav')), true);
+    // A browser allows sound only after a key press or a click, so the
+    // music that the game asked for at the start is not playing yet.
+    check('sounds: nothing plays before a key is pressed', await count('started'), 0);
+    // Any key will do; this one means nothing to the game. The music
+    // then starts by itself.
+    await page.press('x');
+    await page.waitFor('window.audio.running()', 5000);
+    await page.waitFor('window.audio.started() === 1', 5000);
+    // Music repeats: it is still playing after several times its length.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    check('sounds: the music started with the first key press, and keeps playing', await count('playing'), 1);
+    await page.press('s');
+    await page.waitFor('window.audio.playing() === 0', 5000);
+    check('sounds: S stopped the music', await count('started'), 1);
+
+    await page.press(' ');
+    await page.waitFor('window.audio.started() === 2', 5000);
+    // The sound is a tenth of a second long, and then it is over.
+    await page.waitFor('window.audio.playing() === 0', 5000);
+    check('sounds: Space played the sound once', await count('started'), 2);
+
+    await page.press('m');
+    await page.waitFor('window.audio.started() === 3 && window.audio.playing() === 1', 5000);
+    await page.press('s');
+    await page.waitFor('window.audio.playing() === 0', 5000);
+    check('sounds: M started the music again and S stopped it', await count('started'), 3);
+  },
+
+  // next/tests/web/stopped.sub: a game that traps on its twentieth step,
+  // by asking a vector for an item it does not have. The game loop must
+  // stop the game and show the report of the trap on the page.
+  async stopped(page) {
+    await page.waitFor('document.querySelector(".game-stopped pre") !== null', 10000);
+    const report = await page.evaluate('document.querySelector(".game-stopped pre").textContent');
+    check('stopped: the report starts with the message of the trap',
+      report.split('\n')[0], 'trap: vector-at: there is no item 5: the vector holds 1');
+    check('stopped: the report lists the game function that was running, and where it is',
+      /step! .*next\/tests\/web\/stopped\.sub:22:/.test(report), true);
+    check('stopped: the screen keeps what was drawn before the trap', await page.evaluate(
+      '[...document.querySelector("canvas").getContext("2d").getImageData(10, 10, 1, 1).data].join(",")'), '46,125,50,255');
+    // The game takes no more steps, so it does not trap again: there is
+    // still one report, and nothing was written to the console.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    check('stopped: there is one report', await page.evaluate('document.querySelectorAll(".game-stopped").length'), 1);
+    check('stopped: nothing is written to the console', page.log.join('\n'), '');
+  },
+
+  // next/tests/web/stopped-at-start.sub: a game whose init function
+  // traps. The report must be shown, and the game's step and draw
+  // functions must not run.
+  async 'stopped-at-start'(page) {
+    await page.waitFor('document.querySelector(".game-stopped pre") !== null', 10000);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const report = await page.evaluate('document.querySelector(".game-stopped pre").textContent');
+    check('stopped-at-start: the report has the message of the trap in init',
+      report.split('\n')[0], 'trap: the level file assets/levels/1.txt is missing');
+    check('stopped-at-start: nothing is written to the console', page.log.join('\n'), '');
+  },
+
   // next/tests/web/assets.sub: a program's assets, the files in the
   // directory `assets` next to its source, which next/web/site.sh copies
   // into the site. The page reads one as a text file. Another is a 4 by 4

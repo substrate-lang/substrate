@@ -2,69 +2,81 @@
 ;;
 ;; A small platformer: the game itself, without its page.
 ;;
-;; The player runs and jumps through a level of tiles, collects coins,
+;; The player runs and jumps through levels of tiles, collects coins,
 ;; jumps on enemies (or avoids them), stays away from spikes and pits, and
-;; reaches the flag. Touching an enemy from the side, a spike, or the
-;; bottom of the screen starts the level again.
+;; reaches the flag, which leads to the next level. Touching an enemy from
+;; the side, a spike, or the bottom of the level starts the level again.
 ;;
-;; This file is the whole game: the level, the rules and the drawing. It
-;; uses the game library (next/web/game) for the parts every such game
-;; needs: tiles and collision (tiles.sub), keys (input.sub) and sounds
-;; (sound.sub). platformer.sub is three lines that put it in a page.
+;; This file is the whole game: the rules and the drawing. The levels are
+;; text files among the game's assets (assets/levels/1.txt, 2.txt, ...),
+;; so a level can be changed, or a new one added, without compiling
+;; anything. The game uses the game library (next/web/game) for the parts
+;; every such game needs:
 ;;
-;; Nothing here needs a browser, so a test plays the game with a simple
-;; "bot" that presses the keys (next/tests/ui/platformer.sub).
+;;   tiles and collision     ../../game/tiles.sub
+;;   keys                    ../../game/input.sub
+;;   sounds                  ../../game/sound.sub
+;;   things that happen      ../../game/timers.sub
+;;   later
+;;   the coins and enemies   ../../game/store.sub: objects that come and
+;;                           go, remembered by handles
+;;   the text on the screen  ../../game/format.sub
 ;;
-;;   (world-init! w)       sets the game up; called once
-;;   (world-step! w in)    one step of the game, 60 times a second; `in`
-;;                         says which keys are down (input.sub)
-;;   (world-draw w)        draws the current frame (next/web/canvas.sub)
+;; and reads the level files with ../../../c/files.sub.
+;;
+;; platformer.sub is one line that puts the game in a page. Nothing here
+;; needs a browser, so a test plays the game with a simple "bot" that
+;; presses the keys (next/tests/ui/platformer.sub).
+;;
+;;   (world-init! w)             sets the game up, with the levels in
+;;                               "assets/levels/"; called once
+;;   (world-start! w directory)  the same, with the levels in another
+;;                               directory (the test's is elsewhere)
+;;   (world-step! w in)          one step of the game, 60 times a second;
+;;                               `in` says which keys are down
+;;                               (input.sub)
+;;   (world-draw w)              draws the current frame
+;;                               (next/web/canvas.sub)
 ;;
 ;; Keys: left and right arrows (or A and D) to run; Space, the up arrow or
-;; W to jump (hold it to jump higher); Enter to play again after winning.
+;; W to jump (hold it to jump higher); Enter to play again after the last
+;; level.
 (require-unqualified c "../../../c/c.sub")
+(require-unqualified files "../../../c/files.sub")
+(require-unqualified format "../../game/format.sub")
+(require-unqualified trap "../../game/trap.sub")
+(require-unqualified store "../../game/store.sub")
 (require-unqualified canvas "../../canvas.sub")
 (require-unqualified tiles "../../game/tiles.sub")
 (require-unqualified input "../../game/input.sub")
 (require-unqualified sound "../../game/sound.sub")
+(require-unqualified timers "../../game/timers.sub")
 
-(provide world coin enemy world-init! world-step! world-draw
-         world-playing world-won screen-width screen-height tile-spikes)
+(provide world coin enemy world-init! world-start! world-step! world-draw
+         world-playing world-dying world-cleared world-won screen-width screen-height tile-spikes)
 
 (memory from c)
 (table from c)
 
 ;; ---- Sizes ----
 
-;; The screen is 320 by 180 pixels, and a tile is 16 by 16. The level is
-;; 80 tiles wide and 12 high, so the screen shows a quarter of its width.
+;; The screen is 320 by 180 pixels, and a tile is 16 by 16: the screen
+;; shows 20 tiles across. A level can be any size.
 (define (screen-width) -> f64 320.0)
 (define (screen-height) -> f64 180.0)
 
-;; ---- The level ----
+;; ---- The levels ----
 ;;
-;; The level is drawn with characters, one per tile:
+;; A level is a text file, with one character for each tile:
 ;;
 ;;   .  nothing            #  ground             =  a floating block
 ;;   ^  spikes             o  a coin
 ;;   P  where the player starts
 ;;   E  an enemy           F  the flag
 ;;
-;; To change the level, change these rows. Rows may be of different
-;; lengths; a row that is shorter than the level is empty at its end.
-(define (level-row [row u32]) -> (ptr u8)
-  (case row
-    [(5)  "...................ooo..............................oooo........................"]
-    [(6)  "............ooo...=====............................======......ooo.............."]
-    [(7)  "...............................oo..............................................."]
-    [(8)  "......ooo.....................####.............................................."]
-    [(9)  "..P......................E..######......^^.................E..........E.....F..."]
-    [(10) "############...################################...#############...##############"]
-    [(11) "############...################################...#############...##############"]
-    [else ""]))
-
-(define level-columns i32 80)
-(define level-rows i32 12)
+;; The number of lines is the level's height in tiles, and the longest
+;; line is its width. A line that is shorter is empty at its end. Any
+;; other character counts as nothing.
 
 ;; Tile numbers. Tile n is drawn as cell n - 1 of the sprite sheet.
 (define tile-grass u32 1)
@@ -99,20 +111,31 @@
 
 ;; ---- The world ----
 
-;; A coin: its top left corner, and whether it has been collected.
-(struct coin [x f64] [y f64] [taken i32])
+;; A coin: its top left corner. A coin that is collected is removed.
+(struct coin [x f64] [y f64])
 
 ;; An enemy walks back and forth around the place it started.
 ;;   body        where it is (tiles.sub)
 ;;   home        the x position it started at
 ;;   direction   1 while walking right, -1 while walking left
-;;   alive       0 once it has been jumped on
-;;   flat        after that, how many more steps its flattened picture
-;;               is shown
-(struct enemy [body body] [home f64] [direction f64] [alive i32] [flat u32])
+;;   flat        1 once it has been jumped on. It then lies still, and is
+;;               removed half a second later.
+(struct enemy [body body] [home f64] [direction f64] [flat i32])
 
+;; The things that happen later, each set with a timer (timers.sub).
+(variant event
+  ;; A flattened enemy disappears.
+  [enemy-gone [who (handle enemy)]]
+  ;; The level starts again, a moment after the player died.
+  [restart]
+  ;; The next level starts, a moment after the flag was reached.
+  [next-level])
+
+;; What the game is doing.
 (define world-playing u32 0)
-(define world-won u32 1)
+(define world-dying u32 1)       ; the player was hit; the level will start again
+(define world-cleared u32 2)     ; the flag was reached; the next level will start
+(define world-won u32 3)         ; the last level is finished
 
 (struct world
   [map tilemap]
@@ -122,23 +145,21 @@
   [state u32]
   ;; Steps played in this attempt, and how often the player has died.
   [steps u32] [deaths u32]
+  ;; The directory of the level files; the number of the level being
+  ;; played; and its text, as it was read from its file.
+  [levels (ptr u8)] [level u32] [level-text (ptr u8)] [grid text-grid]
   ;; The player: its body; 1 if it faces right and -1 if left; and two
   ;; small counters that make jumping forgiving (see step-player!).
   [player body] [facing i32] [coyote u32] [jump-wanted u32]
-  [coins (array coin 64)] [coin-count u32] [collected u32]
-  [enemies (array enemy 16)] [enemy-count u32]
+  ;; The coins that are left, how many the level started with, and how
+  ;; many have been collected.
+  [coins (store coin)] [coin-count u32] [collected u32]
+  [enemies (store enemy)]
+  [timers (timers event)]
   ;; The flag's top left corner.
   [flag-x f64] [flag-y f64])
 
-;; ---- Loading the level ----
-
-;; Returns the character of the level at a column and row, or "." outside
-;; the text.
-(define (level-char [column i32] [row i32]) -> u32
-  (if (or (< column 0) (< row 0))
-      #\.
-      (let ([text (level-row (cast u32 row))])
-        (if (< (cast u32 column) (strlen text)) (cast u32 (@ text column)) #\.))))
+;; ---- Loading a level ----
 
 ;; Points the camera at the player: the middle of the player in the middle
 ;; of the screen, as far as the edges of the level allow.
@@ -147,86 +168,108 @@
                   (+ (-> w player x) 5.0) (+ (-> w player y) 7.0)
                   (screen-width) (screen-height) (& (-> w map))))
 
-;; Reads the level text into the map, the player, the coins, the enemies
-;; and the flag. Called at the start, and again each time the player dies.
+;; Reads the file of level n. Returns 1, or 0 if there is no such file,
+;; in which case the current level is kept.
+(define (read-level! [w (ptr world)] [n u32]) -> i32
+  (let ([path (array u8 256)])
+    (format-into path 256 "~s~d.txt" (-> w levels) n)
+    (let ([text (read-text-file path)])
+      (when (== text 0) (return 0))
+      (free (-> w level-text))
+      (set! (-> w level-text) text)
+      (set! (-> w level) n)
+      (text-grid-read! (& (-> w grid)) text)
+      1)))
+
+;; Builds the level from its text: the map, the player, the coins, the
+;; enemies and the flag. Called when a level starts, and again each time
+;; the player dies.
 (define (load-level! [w (ptr world)])
-  (set! (-> w coin-count) 0)
-  (set! (-> w collected) 0)
-  (set! (-> w enemy-count) 0)
-  (set! (-> w steps) 0)
-  (set! (-> w state) world-playing)
-  (for ([row i32 0]) (< row level-rows) (+= row 1)
-    (for ([column i32 0]) (< column level-columns) (+= column 1)
-      (let ([c (level-char column row)] [x (cast f64 (* column 16))] [y (cast f64 (* row 16))])
-        (tile-set! (& (-> w map)) column row 0)
-        (cond
-          ;; Ground has grass on it where nothing is above it.
-          [(== c #\#)
-           (tile-set! (& (-> w map)) column row (if (== (level-char column (- row 1)) #\#) tile-dirt tile-grass))]
-          [(== c #\=) (tile-set! (& (-> w map)) column row tile-brick)]
-          [(== c #\^) (tile-set! (& (-> w map)) column row tile-spikes)]
-          [(== c #\o)
-           (when (< (-> w coin-count) 64)
-             (let ([k (+ (-> w coins) (-> w coin-count))])
+  (let ([map (& (-> w map))] [grid (& (-> w grid))] [players u32 0])
+    (tilemap-free! map)
+    (tilemap-init! map (-> grid columns) (-> grid rows) 16)
+    (tile-solid! map tile-grass)
+    (tile-solid! map tile-dirt)
+    (tile-solid! map tile-brick)
+    (store-clear! (& (-> w coins)))
+    (store-clear! (& (-> w enemies)))
+    (timers-clear! (& (-> w timers)))
+    (set! (-> w collected) 0)
+    (set! (-> w steps) 0)
+    (set! (-> w state) world-playing)
+    (for ([row i32 0]) (< row (-> grid rows)) (+= row 1)
+      (for ([column i32 0]) (< column (-> grid columns)) (+= column 1)
+        (let ([c (grid-char grid column row)] [x (cast f64 (* column 16))] [y (cast f64 (* row 16))])
+          (cond
+            ;; Ground has grass on it where nothing is above it.
+            [(== c #\#)
+             (tile-set! map column row (if (== (grid-char grid column (- row 1)) #\#) tile-dirt tile-grass))]
+            [(== c #\=) (tile-set! map column row tile-brick)]
+            [(== c #\^) (tile-set! map column row tile-spikes)]
+            [(== c #\o)
+             (let ([k (store-add! (& (-> w coins)))])
                (set! (-> k x) x)
-               (set! (-> k y) y)
-               (set! (-> k taken) 0))
-             (+= (-> w coin-count) 1))]
-          ;; The player is 10 pixels wide and 14 high, and stands in the
-          ;; middle of the tile, on its bottom edge.
-          [(== c #\P)
-           (let ([p (& (-> w player))])
-             (set! (-> p width) 10.0)
-             (set! (-> p height) 14.0)
-             (set! (-> p x) (+ x 3.0))
-             (set! (-> p y) (+ y 2.0))
-             (set! (-> p vx) 0.0)
-             (set! (-> p vy) 0.0)
-             (set! (-> p on-ground) 0))
-           (set! (-> w facing) 1)
-           (set! (-> w coyote) 0)
-           (set! (-> w jump-wanted) 0)]
-          ;; An enemy is 12 wide and 10 high.
-          [(== c #\E)
-           (when (< (-> w enemy-count) 16)
-             (let ([e (+ (-> w enemies) (-> w enemy-count))])
+               (set! (-> k y) y))]
+            ;; The player is 10 pixels wide and 14 high, and stands in the
+            ;; middle of the tile, on its bottom edge.
+            [(== c #\P)
+             (let ([p (& (-> w player))])
+               (set! (-> p width) 10.0)
+               (set! (-> p height) 14.0)
+               (set! (-> p x) (+ x 3.0))
+               (set! (-> p y) (+ y 2.0))
+               (set! (-> p vx) 0.0)
+               (set! (-> p vy) 0.0)
+               (set! (-> p on-ground) 0))
+             (set! (-> w facing) 1)
+             (set! (-> w coyote) 0)
+             (set! (-> w jump-wanted) 0)
+             (+= players 1)]
+            ;; An enemy is 12 wide and 10 high.
+            [(== c #\E)
+             (let ([e (store-add! (& (-> w enemies)))])
                (set! (-> e body width) 12.0)
                (set! (-> e body height) 10.0)
                (set! (-> e body x) (+ x 2.0))
                (set! (-> e body y) (+ y 6.0))
-               (set! (-> e body vx) 0.0)
-               (set! (-> e body vy) 0.0)
                (set! (-> e home) (+ x 2.0))
-               (set! (-> e direction) -1.0)
-               (set! (-> e alive) 1)
-               (set! (-> e flat) 0))
-             (+= (-> w enemy-count) 1))]
-          [(== c #\F)
-           (set! (-> w flag-x) x)
-           (set! (-> w flag-y) y)]))))
+               (set! (-> e direction) -1.0))]
+            [(== c #\F)
+             (set! (-> w flag-x) x)
+             (set! (-> w flag-y) y)]))))
+    (set! (-> w coin-count) (store-count (& (-> w coins))))
+    ;; A level with no player, or with several, cannot be played. Saying
+    ;; so is better than starting it with the player in some odd place.
+    (when (!= players 1)
+      (trap-format "level ~d must have exactly one P, where the player starts: it has ~d" (-> w level) players)))
   ;; The camera is set here too, so that the very first picture is
   ;; already in the right place.
   (follow-player! w))
 
-(define (world-init! [w (ptr world)])
+(define (world-start! [w (ptr world)] [directory (ptr u8)])
+  (set! (-> w levels) directory)
   (set! (-> w sheet) (load-image "assets/sprites.png"))
-  (tilemap-init! (& (-> w map)) level-columns level-rows 16)
-  (tile-solid! (& (-> w map)) tile-grass)
-  (tile-solid! (& (-> w map)) tile-dirt)
-  (tile-solid! (& (-> w map)) tile-brick)
   (set! (-> w deaths) 0)
+  (unless (read-level! w 1)
+    (let ([why (file-error)])
+      (trap-format "the first level cannot be read (~s1.txt): ~s" directory why)))
   (load-level! w))
+
+(define (world-init! [w (ptr world)]) (world-start! w "assets/levels/"))
 
 ;; ---- One step ----
 
 (define (smaller [a f64] [b f64]) -> f64 (if (< a b) a b))
 (define (larger [a f64] [b f64]) -> f64 (if (> a b) a b))
 
-;; The player died: a sad sound, and the level starts again.
+;; The player died: a sad sound, a small jump, and a fall off the screen.
+;; The level starts again three quarters of a second later.
 (define (die! [w (ptr world)])
   (play-tone sawtooth-wave 320.0 70.0 350.0 0.25)
   (+= (-> w deaths) 1)
-  (load-level! w))
+  (set! (-> w state) world-dying)
+  (set! (-> w player vy) (- 0.0 (bounce-speed)))
+  (after! (& (-> w timers)) 45 restart))
 
 (define (step-player! [w (ptr world)] [in (ptr input)])
   (let* ([p (& (-> w player))]
@@ -270,23 +313,23 @@
 
 ;; An enemy walks at a steady speed and turns around at a wall, at an
 ;; edge it would fall off, and when it is 24 pixels from where it started.
+;; A flattened enemy lies still.
 (define (step-enemy! [w (ptr world)] [e (ptr enemy)])
-  (if (not (-> e alive))
-      (when (> (-> e flat) 0) (-= (-> e flat) 1))
-      (let* ([b (& (-> e body))]
-             ;; The pixel just beyond the enemy's front foot, one below it.
-             [front (if (> (-> e direction) 0.0) (+ (-> b x) (-> b width) 1.0) (- (-> b x) 1.0))]
-             [column (cast i32 (floor (/ front 16.0)))]
-             [below (cast i32 (floor (/ (+ (-> b y) (-> b height) 1.0) 16.0)))])
-        ;; "Too far" only counts while walking away from home, so that an
-        ;; enemy on its way back is not turned around again.
-        (when (or (-> b hit-wall)
-                  (not (solid-at? (& (-> w map)) column below))
-                  (> (* (- (-> b x) (-> e home)) (-> e direction)) 24.0))
-          (set! (-> e direction) (- 0.0 (-> e direction))))
-        (set! (-> b vx) (* (-> e direction) (enemy-speed)))
-        (set! (-> b vy) (smaller (+ (-> b vy) (gravity)) (fall-speed)))
-        (move-body! b (& (-> w map))))))
+  (unless (-> e flat)
+    (let* ([b (& (-> e body))]
+           ;; The pixel just beyond the enemy's front foot, one below it.
+           [front (if (> (-> e direction) 0.0) (+ (-> b x) (-> b width) 1.0) (- (-> b x) 1.0))]
+           [column (cast i32 (floor (/ front 16.0)))]
+           [below (cast i32 (floor (/ (+ (-> b y) (-> b height) 1.0) 16.0)))])
+      ;; "Too far" only counts while walking away from home, so that an
+      ;; enemy on its way back is not turned around again.
+      (when (or (-> b hit-wall)
+                (not (solid-at? (& (-> w map)) column below))
+                (> (* (- (-> b x) (-> e home)) (-> e direction)) 24.0))
+        (set! (-> e direction) (- 0.0 (-> e direction))))
+      (set! (-> b vx) (* (-> e direction) (enemy-speed)))
+      (set! (-> b vy) (smaller (+ (-> b vy) (gravity)) (fall-speed)))
+      (move-body! b (& (-> w map))))))
 
 ;; What the player touches after moving: coins, enemies, spikes, the flag,
 ;; and the bottom of the level.
@@ -295,31 +338,30 @@
     ;; A coin's box is the 8 by 8 pixels in the middle of its tile.
     (set! (-> box width) 8.0)
     (set! (-> box height) 8.0)
-    (for ([i u32 0]) (< i (-> w coin-count)) (+= i 1)
-      (let ([k (+ (-> w coins) i)])
-        (unless (-> k taken)
-          (set! (-> box x) (+ (-> k x) 4.0))
-          (set! (-> box y) (+ (-> k y) 4.0))
-          (when (bodies-overlap? p (& box))
-            (set! (-> k taken) 1)
-            (+= (-> w collected) 1)
-            (play-tone square-wave 990.0 1480.0 90.0 0.15)))))
+    (store-each ([k h (& (-> w coins))])
+      (set! (-> box x) (+ (-> k x) 4.0))
+      (set! (-> box y) (+ (-> k y) 4.0))
+      (when (bodies-overlap? p (& box))
+        (store-remove! (& (-> w coins)) h)
+        (+= (-> w collected) 1)
+        (play-tone square-wave 990.0 1480.0 90.0 0.15)))
 
     ;; Landing on an enemy from above flattens it and bounces the player.
     ;; "From above" means the player is falling and its feet are in the
-    ;; top half of the enemy. Any other touch kills the player.
-    (for ([i u32 0]) (< i (-> w enemy-count)) (+= i 1)
-      (let ([e (+ (-> w enemies) i)])
-        (when (and (-> e alive) (bodies-overlap? p (& (-> e body))))
-          (if (and (> (-> p vy) 0.0) (< (+ (-> p y) (-> p height)) (+ (-> e body y) 6.0)))
-              (begin
-                (set! (-> e alive) 0)
-                (set! (-> e flat) 30)
-                (set! (-> p vy) (- 0.0 (bounce-speed)))
-                (play-tone square-wave 200.0 90.0 120.0 0.2))
-              (begin
-                (die! w)
-                (return))))))
+    ;; top half of the enemy. Any other touch kills the player. The
+    ;; flattened enemy is removed half a second later, by a message that
+    ;; carries its handle.
+    (store-each ([e h (& (-> w enemies))])
+      (when (and (not (-> e flat)) (bodies-overlap? p (& (-> e body))))
+        (if (and (> (-> p vy) 0.0) (< (+ (-> p y) (-> p height)) (+ (-> e body y) 6.0)))
+            (begin
+              (set! (-> e flat) 1)
+              (after! (& (-> w timers)) 30 (enemy-gone h))
+              (set! (-> p vy) (- 0.0 (bounce-speed)))
+              (play-tone square-wave 200.0 90.0 120.0 0.2))
+            (begin
+              (die! w)
+              (return)))))
 
     ;; Spikes fill the lower half of their tile. The player dies if its
     ;; feet reach into that half of a spike tile.
@@ -333,48 +375,57 @@
           (return))))
 
     ;; Falling out of the bottom of the level.
-    (when (> (-> p y) (cast f64 (* level-rows 16)))
+    (when (> (-> p y) (cast f64 (* (-> w map rows) 16)))
       (die! w)
       (return))
 
-    ;; The flag.
+    ;; The flag: a fanfare, and the next level one second later.
     (set! (-> box x) (-> w flag-x))
     (set! (-> box y) (-> w flag-y))
     (set! (-> box width) 16.0)
     (set! (-> box height) 16.0)
     (when (bodies-overlap? p (& box))
-      (set! (-> w state) world-won)
-      (play-tone square-wave 660.0 1320.0 400.0 0.2))))
+      (set! (-> w state) world-cleared)
+      (play-tone square-wave 660.0 1320.0 400.0 0.2)
+      (after! (& (-> w timers)) 60 next-level))))
+
+;; Deals with a message whose time has come.
+(define (happen! [w (ptr world)] [e (ptr event)])
+  (match e
+    ;; The enemy may be gone already, if the level started again in the
+    ;; meantime. store-remove! then does nothing.
+    [(enemy-gone who) (store-remove! (& (-> w enemies)) who)]
+    [restart (load-level! w)]
+    ;; When there is no next level, the game is won.
+    [next-level
+     (if (read-level! w (+ (-> w level) 1))
+         (load-level! w)
+         (set! (-> w state) world-won))]))
 
 (define (world-step! [w (ptr world)] [in (ptr input)])
-  (if (== (-> w state) world-won)
-      ;; After winning, the world stands still until Enter starts again.
-      (when (pressed? in key-enter)
-        (set! (-> w deaths) 0)
-        (load-level! w))
-      (begin
-        (+= (-> w steps) 1)
-        (step-player! w in)
-        (for ([i u32 0]) (< i (-> w enemy-count)) (+= i 1)
-          (step-enemy! w (+ (-> w enemies) i)))
-        (touch! w)))
-  (follow-player! w))
+  (timers-step! (& (-> w timers)))
+  (let ([e event])
+    (while (timer-due! (& (-> w timers)) (& e)) (happen! w (& e))))
+  (cond
+    [(== (-> w state) world-playing)
+     (+= (-> w steps) 1)
+     (step-player! w in)
+     (store-each ([e (& (-> w enemies))]) (step-enemy! w e))
+     (touch! w)]
+    ;; A player that has died falls off the screen, through everything.
+    [(== (-> w state) world-dying)
+     (let ([p (& (-> w player))])
+       (set! (-> p vy) (smaller (+ (-> p vy) (gravity)) (fall-speed)))
+       (+= (-> p y) (-> p vy)))]
+    ;; After the last level, the world stands still until Enter starts
+    ;; the first level again.
+    [(== (-> w state) world-won)
+     (when (pressed? in key-enter)
+       (set! (-> w deaths) 0)
+       (when (read-level! w 1) (load-level! w)))])
+  (when (== (-> w state) world-playing) (follow-player! w)))
 
 ;; ---- Drawing ----
-
-;; Writes n in decimal at the end of the text in `out`, and returns the
-;; new end. `out` must have room.
-(define (write-number [out (ptr u8)] [n u32]) -> (ptr u8)
-  (when (>= n 10) (set! out (write-number out (/ n 10))))
-  (set! (@ out 0) (cast u8 (+ #\0 (% n 10))))
-  (set! (@ out 1) 0)
-  (+ out 1))
-
-;; Copies the text s to `out`, and returns the new end.
-(define (write-text [out (ptr u8)] [s (ptr u8)]) -> (ptr u8)
-  (let ([n (strlen s)])
-    (memcpy out s (+ n 1))
-    (+ out n)))
 
 ;; Draws cell `frame` of the sprite sheet at a position in the level. The
 ;; camera is subtracted, and the result is rounded down to whole pixels so
@@ -397,47 +448,42 @@
     (draw-tilemap (& (-> w map)) (-> w sheet) (& (-> w camera)) (screen-width) (screen-height))
     (sprite w sprite-flag (-> w flag-x) (-> w flag-y) 0)
 
-    ;; Coins turn: the three pictures are shown as 1, 2, 3, 2, and each
-    ;; coin starts at a different point so that they do not turn in step.
-    (for ([i u32 0]) (< i (-> w coin-count)) (+= i 1)
-      (let ([k (+ (-> w coins) i)] [turn (% (+ (/ (-> w steps) 8) i) 4)])
-        (unless (-> k taken)
-          (sprite w (+ sprite-coin (if (== turn 3) 1 turn)) (-> k x) (-> k y) 0))))
+    ;; Coins turn: the three pictures are shown as 1, 2, 3, 2. Each coin
+    ;; starts at a different point, which depends on where it is, so that
+    ;; they do not all turn in step.
+    (store-each ([k (& (-> w coins))])
+      (let ([turn (% (+ (/ (-> w steps) 8) (cast u32 (/ (-> k x) 16.0))) 4)])
+        (sprite w (+ sprite-coin (if (== turn 3) 1 turn)) (-> k x) (-> k y) 0)))
 
     ;; Enemies. The picture is 16 by 16 and the body 12 by 10, so the
     ;; picture is drawn 2 to the left of the body and 6 above it.
-    (for ([i u32 0]) (< i (-> w enemy-count)) (+= i 1)
-      (let ([e (+ (-> w enemies) i)])
-        (cond [(-> e alive)
-               (sprite w (+ sprite-enemy (% (/ (-> w steps) 10) 2))
-                       (- (-> e body x) 2.0) (- (-> e body y) 6.0) (> (-> e direction) 0.0))]
-              [(> (-> e flat) 0)
-               (sprite w sprite-enemy-flat (- (-> e body x) 2.0) (- (-> e body y) 6.0) 0)])))
+    (store-each ([e (& (-> w enemies))])
+      (if (-> e flat)
+          (sprite w sprite-enemy-flat (- (-> e body x) 2.0) (- (-> e body y) 6.0) 0)
+          (sprite w (+ sprite-enemy (% (/ (-> w steps) 10) 2))
+                  (- (-> e body x) 2.0) (- (-> e body y) 6.0) (> (-> e direction) 0.0))))
 
     ;; The player: in the air, running (two pictures in turn) or standing.
     ;; The pictures face right, and are mirrored when the player faces
     ;; left.
     (sprite w
-            (cond [(not (-> p on-ground)) sprite-jump]
+            (cond [(or (not (-> p on-ground)) (== (-> w state) world-dying)) sprite-jump]
                   [(> (fabs (-> p vx)) 0.3) (+ sprite-run (% (/ (-> w steps) 6) 2))]
                   [else sprite-stand])
             (- (-> p x) 3.0) (- (-> p y) 2.0) (< (-> w facing) 0))
 
-    ;; The coins collected, at the top left.
+    ;; The level and the coins collected, at the top left.
     (set-font "8px monospace")
     (text-baseline "top")
     (fill-style "#1b1f2a")
-    (let ([end (write-text line "coins ")])
-      (set! end (write-number end (-> w collected)))
-      (set! end (write-text end "/"))
-      (write-number end (-> w coin-count)))
+    (format-into line 64 "level ~d   coins ~d/~d" (-> w level) (-> w collected) (-> w coin-count))
     (fill-text line 6 5)
 
-    (cond [(== (-> w state) world-won)
-           (text-align "center")
-           (fill-text "You made it! Press Enter to play again." 160 60)
-           (text-align "left")]
-          [(and (< (-> w steps) 240) (== (-> w deaths) 0))
-           (text-align "center")
-           (fill-text "Arrows to run, Space to jump" 160 60)
-           (text-align "left")])))
+    (text-align "center")
+    (cond [(== (-> w state) world-won) (fill-text "You made it! Press Enter to play again." 160 60)]
+          [(== (-> w state) world-cleared)
+           (format-into line 64 "Level ~d done!" (-> w level))
+           (fill-text line 160 60)]
+          [(and (== (-> w level) 1) (< (-> w steps) 240) (== (-> w deaths) 0))
+           (fill-text "Arrows to run, Space to jump" 160 60)])
+    (text-align "left")))

@@ -123,9 +123,20 @@ on them there.
     - `game.sub`: the game loop. `(game World [size 320 180] init step
       draw)` turns three functions into a game in a page.
     - `input.sub`: which keys are held, and which were just pressed.
-    - `sound.sub`: short synthesized sound effects.
+    - `sound.sub`: sound files, music, and short synthesized tones.
+    - `timers.sub`: things that happen later: a message that the game
+      is handed after a number of steps.
     - `tiles.sub`: levels made of tiles, moving things that are stopped
-      by walls and floors, and a camera.
+      by walls and floors, a camera, and levels written as text.
+    - `vector.sub` and `store.sub`: containers that check how they are
+      used. A vector is a row of items that grows. A store holds
+      objects that come and go, and gives out handles that can tell
+      when their object has been removed.
+    - `format.sub`: text made from a pattern and arguments, such as
+      `(format-into line 64 "coins ~d/~d" a b)`. The pattern is read
+      at compile time.
+    - `trap.sub`: stopping the program, with a message, when it cannot
+      go on.
   - `trace.sub`: a test helper that prints what a view would change on
     a page, so that views can be tested without a browser.
   - `site.sh`: builds a program, its page and its assets into a static
@@ -136,8 +147,8 @@ on them there.
     the game itself (rules, timing, random food), `snake.sub` the page
     around it, and `page.html` its HTML; and `platformer/`, a platform
     game built on `game/`: `world.sub` is the game, `platformer.sub`
-    puts it in a page, and `assets/` holds its one image, a sheet of
-    sprites.
+    puts it in a page, and `assets/` holds its levels, which are text
+    files, and its sheet of sprites.
   - `repl/`: the REPL page. `repl.sub` is the page's program (the user
     interface); `session.sub` is the compiler, which the page runs in a
     sandbox; `page.html` and `site.sh` make the site.
@@ -164,8 +175,9 @@ on them there.
   kernel's tests, which is what the compiler gives. `tests/ui` tests
   the page views (`web/ui.sub`): the tests print the page changes that
   a view produces, and check the error messages for templates that are
-  wrong. They also test the game library's collision and keyboard
-  code, and play the two example games without their pages: the
+  wrong. They also test the game library (collision, keys, timers,
+  sound, its containers and its formatting), and play the two example
+  games without their pages: the
   platformer is played by a bot that presses the keys.
   `tests/session` tests sessions: `next/sub eval` runs each
   file, one form at a time. `tests/web/run.sh` is separate, and runs
@@ -324,7 +336,7 @@ A site is made of static files only, so any web server can serve it.
   a program extra modules of host functions, each under a name. A
   program can only use the modules it is given, so they also work as
   permissions. There are three: `dom` (`host/web/dom.mjs`), for drawing
-  on the page; `audio` (`host/web/audio.mjs`), for sound effects; and
+  on the page; `audio` (`host/web/audio.mjs`), for sound; and
   `guest` (`host/web/guest.mjs`), for running other programs in a
   sandbox. The compiler is run with no extra modules, so
   code that runs at compile time cannot use them, and builds stay
@@ -390,10 +402,12 @@ A site is made of static files only, so any web server can serve it.
 - **Images and sound.** `load-image` loads an image, usually one of the
   program's assets, and `draw-sprite` draws one cell of it, optionally
   mirrored: an image can be a "sprite sheet", a grid of small pictures
-  such as the frames of an animation. Sound is synthesized: `play-tone`
-  plays a short tone whose pitch slides from one frequency to another,
-  which is enough for the jumps, coins and bumps of a retro game, and
-  needs no sound files.
+  such as the frames of an animation. Sound comes from files, which
+  are assets too: `load-sound` loads one, `play-sound` plays it once,
+  and `play-music` plays it again and again. Sound can also be
+  synthesized: `play-tone` plays a short tone whose pitch slides from
+  one frequency to another, which is enough for the jumps, coins and
+  bumps of a retro game, and needs no files.
 - **The game library** (`web/game/`). A page program is driven by
   messages, which suits a user interface. A game is easier to write as
   a loop: sixty times a second, look at the keys and move everything;
@@ -407,9 +421,41 @@ A site is made of static files only, so any web server can serve it.
   `tiles.sub` adds what a platformer or a top-down game needs: a level
   as a grid of tiles, bodies that move through it and are stopped by
   walls, floors and ceilings, and a camera that follows the player.
+  `timers.sub` is for things that happen later. A timer carries a
+  message, a value of a variant type that the game defines, and the
+  game's step function is handed the message when its time has come.
+  (It is a message and not a function to call, because a closure in
+  this language lasts only as long as the call that made it.)
   Only the loop itself needs a browser. A game's own code uses the
-  keyboard state, the sound list and the drawing commands, none of
+  keyboard state, the sound lists and the drawing commands, none of
   which does, so a game can be played by a test.
+- **Guarding against mistakes in a game** (`game/vector.sub`,
+  `game/store.sub`, `game/format.sub`, `game/trap.sub`). The C-like
+  Lisp, like C, does not check what a program does with memory: an
+  index that is out of range reads or writes some other part of the
+  program's data. These files check where it matters most in a game.
+  They are part of the game library, written for its needs. They are
+  not standard libraries of the language, which is unchanged.
+  - A vector is a row of items that grows. Asking for an item that is
+    not there stops the program with a message. Code that already
+    knows its index is good can ask without the check. A vector's
+    items never move, so a pointer to one stays good while the vector
+    grows.
+  - A store holds objects that come and go, such as a game's enemies.
+    To remember an object for later, a program keeps a handle. A
+    handle can tell that its object has been removed, which a pointer
+    cannot, and the compiler rejects a handle that is used with a
+    store of another type.
+  - A formatting pattern, such as `"coins ~d/~d"`, is read at compile
+    time. A pattern that does not match its arguments is a compile
+    error.
+  - `trap` stops the program with a message. On the command line the
+    program ends. In a page, a game stops and shows the message, with
+    the functions that were running and their places in the source,
+    on top of its screen.
+
+  What they do not do: plain arrays and pointers are still unchecked,
+  so code that uses those directly is as unsafe as before.
 - **Guests** (`host/web/guest.mjs`, `c/guest.sub`): running code that is
   not trusted. A program can start another program as a "guest": a
   separate sandbox with its own memory. The two share nothing, and they
@@ -467,24 +513,34 @@ host/web/serve.mjs build/next/web/snake
 
 `web/examples/platformer` is a small platform game built on the game
 library: run, jump, collect coins, jump on enemies, avoid spikes and
-pits, reach the flag. The level is drawn with characters in the source
-(`#` for ground, `o` for a coin, and so on), so it is easy to change.
-The whole game is one file, `world.sub`: the level, the rules and the
-drawing. `platformer.sub` is one line that hands its three functions
-to the game loop.
+pits, reach the flag, which leads to the next level. The game is one
+file, `world.sub`: the rules and the drawing. `platformer.sub` is one
+line that hands its three functions to the game loop.
 
-The game has one asset, `assets/sprites.png`: a sheet of sprites of 16
-by 16 pixels. It is shipped like the assets of any program, by
-`site.sh`. The directory `art/` is not part of the game. It records
+The levels are text files among the game's assets
+(`assets/levels/1.txt`, `2.txt`, and so on), drawn with characters:
+`#` for ground, `o` for a coin, `E` for an enemy. After each flag the
+game loads the level with the next number, and it is won when there
+is no such file. So a level is changed, or one is added, by editing a
+text file; nothing is compiled.
+
+The coins and the enemies are kept in stores (`game/store.sub`). What
+happens later is done with timers that carry messages
+(`game/timers.sub`): a flattened enemy disappears after half a second,
+the level starts again a moment after the player died, and the next
+level starts a second after the flag.
+
+The other asset is `assets/sprites.png`: a sheet of sprites of 16 by
+16 pixels. The directory `art/` is not part of the game. It records
 how this image was drawn: as text, in `art.txt`, with one character
 per pixel, which `make-sprites.mjs` turns into the PNG. An image
 editor would do as well.
 
 The game is tested without a browser (`tests/ui/platformer.sub`): a
 bot holds the right arrow and jumps when a wall, a hole, spikes or an
-enemy is ahead, and must reach the flag. Since the game has no
+enemy is ahead, and must finish both levels. Since the game has no
 randomness and takes fixed steps, the run is the same every time. The
-compiled program is 48 KB, and its sprite sheet under 1 KB.
+compiled program is 74 KB, and its assets under 3 KB.
 
 ```sh
 next/web/site.sh next/web/examples/platformer/platformer.sub build/next/web/platformer next/web/examples/platformer/page.html
@@ -517,7 +573,7 @@ In headless Chromium, on the development machine:
 |---|---|
 | Draw 10,000 rectangles in one frame | 2 ms |
 | One frame of snake, including drawing the board | under 0.1 ms |
-| One frame of the platformer: a step, and about 70 sprites drawn | 0.1 ms |
+| One frame of the platformer: a step, and about 70 sprites drawn | under 0.1 ms |
 
 The rows are timed by `tests/web/rows.mjs`, from the click until the
 browser has laid the page out again.
