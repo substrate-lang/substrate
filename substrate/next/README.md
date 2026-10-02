@@ -282,118 +282,83 @@ Substrate is built again in `substrate/` (plan, 5).
       example takes 12.7 s.
    5. Numeric instructions and reference types in C code; then the typed
       example.
-6. Substrate on cells, `cells/`: Substrate's values the kernel module's
-   cells, in memory, so that a program needs no GC, and Substrate's data
-   at compile time is the kernel module's, syntax objects included, so
-   that its macros are written in Substrate, as `lib/substrate.sub`'s
-   were, and a macro written in Substrate calls a function written in C
-   on its syntax (`tests/cells/c-interop.sub`). Done, without
-   reclamation: the Substrate tests, those of Substrate at compile time
-   among them, and the typed example (`tests/cells/typed.sub`, a type
-   checker written in Substrate as a macro) give their outputs and errors
-   on it, with the kernel module as it was. Then the kernel module: a
-   word before each cell with a permanent bit and a count of owners,
-   cells sized by their case, cells and records on the heap, owned,
-   `dup` and `drop`, a dropper per record kind, and fixnums in the datum
-   itself; the compiler builds itself in the same time. Then the lowering owning each value
-   (`lower.sub`): a function owns its parameters, unless `core.sub`
-   marks them `#:borrow`, as the primitives that only read theirs are,
-   or the pass finds it only reads them (below), and what it returns;
-   the last use of a variable moves its value, an
-   earlier use dups it, a variable never used is dropped where it is
-   bound, a branch drops what only the other branch uses, and `set!`
-   drops what it replaces; what a function of the runtime's or the
-   kernel module's gives and takes, the pass reads from facts. A local
-   function that is only called is a kernel function of the variables
-   it captures, called directly, so a loop makes no closure and no box.
-   After each check of `tests/cells/live-cells.sub` no more cells are
-   in use than before it. Then its speed, against `substrate/` with its
-   GC on both hosts. Every primitive was a call into C; now an inline
-   function may use memory where the calling module shares it, which
-   every module here does (`kernel.sub`, spec 5.2; the kernel module's
-   own are found through its group's linklets), so `car`, `cdr`,
-   `cons`, dup, drop, a struct's accessors and a closure's captures are
-   inline in the program itself, as are fixnum arithmetic and
-   comparison; the heap's cells and records' blocks come from a free
-   list per size, filled from chunks, so a `cons` is a few stores; a
-   closure's code borrows the closure, which its caller keeps through
-   the call; the cells in use are counted when asked, not at each
-   `cons`. The pass borrows a parameter of a local function it can tell
-   is only read, keeps a variable alive through a call that reads it,
-   reads `car` and `cdr` without the check where a `pair?` test guards
-   them, and takes a pair apart where its owner's last use projects it,
-   as Perceus does: the cell is freed, and the next `cons` takes it
-   back, so `map`, `filter`, `reverse` and `sort` over a list that
-   dies, which `substrate.sub` tells by `unshared-pair?`, make no
-   cells; a predicate's or count's result needs no counting
-   (`#:free`). A closure or a struct is made inline from the heap's
-   lists, and the kernel module frees a record of a kind whose layout
-   the runtime registered (`set-record-layout!`) with no call into the
-   runtime; a hash table's update hashes its key once. Over 30 M
-   iterations, on wasmtime, fixnum arithmetic takes 0.20 s on cells
-   against 1.1 s with GC, walking a list 0.14 s against 1.1 s, making
-   and freeing pairs 0.29 s against 4.8 s, and 10 M closure calls 0.14
-   s against 0.74 s; a list benchmark 0.22 s against 2.1 s, one of
-   closures, structs and a hash table 0.13 s against 0.63 s. V8 runs
-   the GC version of those in 0.27, 0.18, 0.22, 0.11, 0.17 and 0.07 s,
-   and the cells version in 0.21, 0.12, 0.25, 0.12, 0.19 and 0.13 s
-   (each with 0.08 s of starting): ahead on arithmetic and walking,
-   even on calls and lists, behind by a tenth on making pairs and by
-   half on closures, structs and a hash table, where each record freed
-   costs what V8's nursery never pays for garbage. The pass costs
-   little at compile time: the typed example builds in 0.34 s from a
-   warm cache, of which the compiler runs 20 ms, the rest the host
-   compiling the compiler. Then memory at compile time, made of one
-   piece with memory at run time. There are two lifetimes: a
-   compilation, whose data the compiler makes in arenas and frees
-   wholesale, a module's with the module, and a program run, whose
-   values are owned and freed one by one. The kernel module serves both
-   with one kind of cell, permanent in an arena, counted in the heap,
-   and the heap is a place chosen as an arena is (`use-heap!`), not a
-   mode: Substrate's runtime switches to it as a program starts, as a
-   Substrate module's code starts at compile time, and as a Substrate
-   macro is called (`apply-transformer`), the way Bend's checker
-   switches to an arena of its own per definition. The expander knows
-   no language: it makes the arena that was current again after a
-   transformer or an instantiation, runs a query from a macro in the
-   heap in its own arena, and holds a cell of the heap's a macro gives
-   it, a result, or lends a query, a form to lift or expand, as long as
-   the module's arena, whose cells refer into it, dropping it with the
-   arena (`hold!`); a compile-time value it keeps. On
-   Substrate's side a syntax cell, a pair of `reverse` or `append`,
-   takes a reference of its own to what it holds while in the heap
-   (`dup-held`), the pass treats the kernel's syntax constructors'
-   results as owned, a module-level expression of Substrate's is
-   converted as a body is, and a function named in `define-syntax` runs
-   as its value does (`transformer-value`), in the heap. A macro that
-   makes and drops lists, strings, closures and a table leaves no cell
-   in use (`tests/cells/live-cells.sub`). The Bend example's checker,
-   running as macros, checks the 3200-definition proofs module in 10.8
-   s and 3.6 GB on V8 and 13.1 s and 3.7 GB on wasmtime, where before,
-   nothing freed until the module was done, it ran out of the 4 GB a
-   wasm32 memory has; the GC Substrate's checker takes 12.4 s and 3.1
-   GB on V8, the C-like Bend 2.8 s and 1.6 GB. The owners cost time:
-   800 definitions take 3.2 s where the arena took 2.8, most of the
-   difference dropping cells, among them the results of macro uses the
-   expander holds for the module, 9 million cells after 800
-   definitions, dropped at its end. Then the type predicates inline, as
-   tests of a cell's tag, and a parameter of a module's function
-   borrowed where its body only reads it, as a local function's was: as
-   a module's second pass begins, before any body is converted, every
-   body is expanded in a `let` binding its parameters, and the flags
-   are found together, a parameter owned where any body owns a value
-   given to it, where owning it would let the body take its pair apart
-   and reuse the cell, or where a call in tail position that can come
-   back to its function gives it a value that is not read where it is,
-   so that the call stays a tail call; each function's fact is written
-   from them, so callers in other modules know. Walking a list in
-   recursion then counts nothing: the N-queens program runs in 0.29 s
-   on wasmtime and V8, from 0.35 and 0.32, against 0.21 with V8's GC;
-   the list and interpreter programs are as they were, a fifth and six
-   tenths behind on V8, their cost in the pairs, closures and
-   environments each call makes and frees, which the GC's nursery
-   never pays for. Next: a closure given to a call that does not keep
-   it, which the facts could tell, made on the stack rather than freed;
-   and what still leaks: a value a raise unwinds past, and a closure
-   that refers to itself through a box, as a letrec's that escapes
-   does.
+6. Substrate on its own values, `owned/`: Substrate's values nodes in
+   the program's memory, owned and freed by the program, so that a
+   program needs no GC, with the kernel module as it is and Substrate
+   not running at compile time: its macros are written in the C-like
+   Lisp, as `substrate/`'s are, or with `syntax-rules`. The way there
+   was an experiment, Substrate on cells, which made Substrate's values
+   the kernel module's cells so that its data at compile time was the
+   kernel module's, syntax objects included, and its macros could be
+   written in Substrate again: it worked, the Substrate tests and a
+   type checker written in Substrate as a macro passed on it, but it
+   put a facility of owners, a heap beside the arenas, and a hold on
+   what a macro gives the expander into the kernel module, two worlds
+   in one kind of cell, for the sake of a macro language the C-like
+   Lisp already serves (`c/forms.sub`); so the kernel module was made
+   an arena's again, and Substrate given values of its own. What the
+   experiment found stays: the lowering that owns each value
+   (`lower.sub`), from it.
+
+   `values.sub` is the data, in the C-like Lisp: a datum is an i32, a
+   fixnum odd, a character its code shifted with 10 below, #f 0, and
+   anything else the address of a node, a multiple of 4, whose first
+   word holds its tag in the low byte and its count of owners above,
+   the count 2^24 - 1 marking it permanent: nil, #t, every symbol and
+   keyword, which are interned, and a module's quoted data. A pair is
+   three words; a string, integer, flonum, symbol or keyword a node of
+   its own; a closure, box, vector, byte string, struct type, struct,
+   hash table, port or exception a node of the runtime's kind
+   (`runtime.sub`), whose layout the runtime registers so that the drop
+   loop frees it, or whose dropper it does. Nodes come from a free list
+   per size up to 64 bytes, filled from chunks past the C heap, and go
+   back to it; `dup` adds an owner, `drop` takes one away and at the
+   last frees the node and what it holds, a list cdr by cdr and anything
+   else through an explicit stack, a pair whose fields need nothing
+   freed inline where it is dropped. `quote` makes a module's quoted
+   data once, as the module starts, in a C global marked permanent and a
+   kernel global holding the same value, so a literal in compiled code
+   is a global.get that the lowering knows needs no counting; `lit` is
+   the same for C code. The lowering (`lower.sub`) is the experiment's,
+   naming `values.sub`'s inline functions: a function owns its
+   parameters, unless `core.sub` marks them `#:borrow` or the pass finds
+   it only reads them, and what it returns; the last use of a variable
+   moves its value, an earlier use dups it, a variable never used is
+   dropped where it is bound, a branch drops what only the other branch
+   uses, `set!` drops what it replaces; a local function that is only
+   called is a kernel function of the variables it captures, called
+   directly; a pair whose owner's last use projects it is taken apart
+   and its node reused, as Perceus does; `car` and `cdr` of a variable
+   that holds its value, borrowed or owned, given to a function that
+   only reads them are read where they are, the variable kept through
+   the call; and what a function of the runtime's or `values.sub`'s
+   gives and takes, the pass reads from facts. After each check of
+   `tests/owned/live-nodes.sub` no more nodes are in use than before
+   it; the tests of Substrate at compile time, and the typed example,
+   are gone with it.
+
+   Its speed, against the cells experiment and `substrate/` with its GC
+   on V8, each program run twice and the second taken, on this machine
+   (the GC versions take 0.08 s to start): over 30 M iterations, on
+   wasmtime, fixnum arithmetic takes 0.20 s on owned values against
+   0.21 on cells and 0.33 with GC on V8, walking a list 0.16 against
+   0.15 and 0.20, making and freeing pairs 0.26 against 0.31 and 0.28,
+   and 10 M closure calls 0.14 against 0.15 and 0.14; the list
+   benchmark 0.21 against 0.23 and 0.19, the one of closures, structs
+   and a hash table 0.13 against 0.14 and 0.11; on V8 the owned
+   versions take 0.19, 0.17, 0.26, 0.15, 0.21 and 0.15 s. The untuned
+   programs: the interpreter 0.51 s on wasmtime and 0.39 on V8, against
+   0.57 and 0.45 on cells and 0.29 with GC; N-queens 0.27 and 0.26
+   against 0.29 and 0.29, and 0.21; the string program 0.14 and 0.18
+   against 0.18 and 0.21, and 0.17. So owned values are at or ahead of
+   cells everywhere, ahead of V8's GC on arithmetic, walking, pairs and
+   calls, and behind it where a program makes and frees many short-lived
+   pairs, closures and environments: freeing them one by one, through
+   `free-node!`, is a tenth of the interpreter's time, which the GC's
+   nursery never pays for garbage. The Bend checker written in Substrate
+   ran as macros, Substrate at compile time, which this design does not
+   run: Bend on the new compiler is `bend/`, in the C-like Lisp. Next: a
+   closure given to a call that does not keep it, which the facts could
+   tell, made on the stack rather than freed; and what still leaks: a
+   value a raise unwinds past, and a closure that refers to itself
+   through a box, as a letrec's that escapes does.

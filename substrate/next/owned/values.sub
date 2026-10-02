@@ -50,7 +50,7 @@
          nil true-node %nil %true permanent! dup drop live-nodes node-tag node? tagged?
          alloc-node alloc-bytes free-bytes free-node! set-layout! set-dropper! node-size
          ;; inline, for code the lowering makes
-         pair-cell? null-cell? true-value pair-car pair-cdr cons-inline dup-inline drop-inline
+         pair-cell? null-cell? true-value null-value literal-value pair-car pair-cdr cons-inline dup-inline drop-inline
          unique-cell? free-pair-shell! node-tagged? node-datum? alloc-inline
          boolean-datum? integer-datum? fixnum-datum? char-datum?
          ;; pairs and lists
@@ -105,10 +105,11 @@
   (if (i32.and d 3) 0 (if d (i32.eq (i32.and (i32.load d) 255) tag) 0)))
 (#%fact node-tagged? #'(foreign raw))
 
-;; The same, for C code.
-(define (node? [d datum]) -> i32 (and (== (bit-and (cast u32 d) 3) 0) (!= d 0)))
+;; For C code, the same as forms (below): (node? d), (tagged? d tag),
+;; (pair? d), (null? d), (symbol? d), (keyword? d), (string? d),
+;; (integer? d), (fixnum? d), (flonum? d), (char? d) and (boolean? d),
+;; each the test on the datum's i32, inline.
 (define (node-tag [d datum]) -> u32 (bit-and (-> d w) 255))
-(define (tagged? [d datum] [tag u32]) -> i32 (and (node? d) (== (bit-and (-> d w) 255) tag)))
 
 ;; ---- the free lists ----
 
@@ -276,7 +277,9 @@
       (if d
           (let ([w (i32.load d)])
             (if (i32.lt_u w 4294967040)
-                (if (i32.lt_u w 512) (free-node! d) (i32.store d (i32.sub w 256))))))))
+                (if (i32.lt_u w 512)
+                    (if (i32.and w 255) (free-node! d) (free-pair! d))
+                    (i32.store d (i32.sub w 256))))))))
 (#%fact drop-inline #'(foreign void 0))
 (define (drop [d datum])
   (when (node? d)
@@ -316,27 +319,54 @@
 
 ;; Node d, whose last owner is gone, freed, and what it holds dropped:
 ;; the chain of a list cdr by cdr, each other node through the stack.
-;; Not re-entered: a dropper that drops, as a table's does, pushes.
+;; Not re-entered: a dropper that drops, as a table's does, pushes. The
+;; pair, the common case, is freed here without a call: its car pushed
+;; if it is a counted node, its words to the pairs' list, its cdr next.
 (define (free-node! [d datum])
   (if dropping
       (push-drop! d)
-      (let ([u d] [more 1])
+      (let ([u d] [more 1] [heads (cast (ptr u32) (& node-free))])
         (set! dropping 1)
         (while more
           (while (!= u 0)
-            (let ([p (cast (ptr u32) u)] [w (-> u w)])
+            (let ([p (cast (ptr u32) u)] [w (@ (cast (ptr u32) u) 0)])
               (cond [(>= w 512) (set! (@ p 0) (- w 256)) (set! u 0)]
-                    [(== (bit-and w 255) tag-pair)
-                     (let ([a (cast datum (@ p 1))] [b (cast datum (@ p 2))])
-                       (push-held! a)
-                       (free-bytes p 12)
-                       (set! u (if (and (node? b) (< (-> b w) permanent-base)) b 0)))]
+                    [(== (bit-and w 255) 0)
+                     (let ([a (@ p 1)] [b (@ p 2)])
+                       (when (and (== (bit-and a 3) 0) (!= a 0) (< (@ (cast (ptr u32) a) 0) permanent-base))
+                         (push-drop! (cast datum a)))
+                       (set! (@ p 1) (@ heads 3))
+                       (set! (@ heads 3) (cast u32 p))
+                       (set! u (if (and (== (bit-and b 3) 0) (!= b 0) (< (@ (cast (ptr u32) b) 0) permanent-base)) (cast datum b) 0)))]
                     [else (free-other! u w) (set! u 0)])))
           (if (> drop-top 0)
               (begin (-= drop-top 1) (set! u (@ drop-stack drop-top)))
               (set! more 0)))
         (set! dropping 0))))
 (#%fact free-node! #'(foreign void 0))
+
+;; Pair d, whose last owner is gone, freed, and the chain of pairs with
+;; one owner after it: the common case of free-node!, without its stack.
+;; The car, and a cdr that is not such a pair, are dropped: a node with
+;; one owner by free-node!, which goes through its own stack.
+(define (free-pair! [d datum])
+  (let ([u (cast (ptr u32) d)] [heads (cast (ptr u32) (& node-free))])
+    (while (!= u 0)
+      (let ([a (@ u 1)] [b (@ u 2)])
+        (set! (@ u 1) (@ heads 3))
+        (set! (@ heads 3) (cast u32 u))
+        (set! u 0)
+        (when (and (== (bit-and a 3) 0) (!= a 0))
+          (let ([wa (@ (cast (ptr u32) a) 0)])
+            (when (< wa permanent-base)
+              (if (< wa 512) (free-node! (cast datum a)) (set! (@ (cast (ptr u32) a) 0) (- wa 256))))))
+        (when (and (== (bit-and b 3) 0) (!= b 0))
+          (let ([wb (@ (cast (ptr u32) b) 0)])
+            (when (< wb permanent-base)
+              (cond [(>= wb 512) (set! (@ (cast (ptr u32) b) 0) (- wb 256))]
+                    [(== (bit-and wb 255) 0) (set! u (cast (ptr u32) b))]
+                    [else (free-node! (cast datum b))]))))))))
+(#%fact free-pair! #'(foreign void 0))
 
 ;; Node u, no pair, with header w, freed: a string, integer or flonum at
 ;; once, one of the runtime's by its layout or its dropper.
@@ -381,7 +411,13 @@
 (func (null-cell? [d i32]) #:inline -> i32 (i32.eq d %nil))
 (#%fact null-cell? #'(foreign raw))
 (func (true-value) #:inline -> i32 %true)
-(#%fact true-value #'(foreign borrowed))
+(#%fact true-value #'(foreign free))
+(func (null-value) #:inline -> i32 %nil)
+(#%fact null-value #'(foreign free))
+;; The value of a quoted datum's global g, permanent: a value that needs
+;; no counting (lower.sub).
+(func (literal-value [g i32]) #:inline -> i32 g)
+(#%fact literal-value #'(foreign free))
 (func (pair-car [d i32]) #:inline -> i32 (i32.load d 4))
 (#%fact pair-car #'(foreign borrowed))
 (func (pair-cdr [d i32]) #:inline -> i32 (i32.load d 8))
@@ -408,8 +444,6 @@
     p))
 (#%fact cons #'(foreign owned 0 1))
 
-(define (pair? [d datum]) -> i32 (tagged? d tag-pair))
-(define (null? [d datum]) -> i32 (== d nil))
 (define (car [p datum]) -> datum (if (pair? p) (cast datum (@ (cast (ptr u32) p) 1)) (fail "expected a pair")))
 (#%fact car #'(foreign borrowed))
 (define (cdr [p datum]) -> datum (if (pair? p) (cast datum (@ (cast (ptr u32) p) 2)) (fail "expected a pair")))
@@ -473,7 +507,6 @@
 
 (define (boolean [b i32]) -> datum (if b true-node (cast datum 0)))
 (#%fact boolean #'(foreign borrowed))
-(define (boolean? [d datum]) -> i32 (or (== d 0) (== d true-node)))
 (func (boolean-datum? [d i32]) #:inline -> i32 (i32.or (i32.eqz d) (i32.eq d %true)))
 (#%fact boolean-datum? #'(foreign raw))
 (func (integer-datum? [d i32]) #:inline -> i32 (i32.or (i32.and d 1) (node-tagged? d 6)))
@@ -530,8 +563,6 @@
     (set! (-> t entries) entries)
     (set! (-> t capacity) capacity)))
 
-(define (symbol? [d datum]) -> i32 (tagged? d tag-symbol))
-(define (keyword? [d datum]) -> i32 (tagged? d tag-keyword))
 (define (symbol-hash [s datum]) -> u32 (@ (cast (ptr u32) s) 1))
 (define (symbol-length [s datum]) -> u32 (@ (cast (ptr u32) s) 2))
 (define (symbol-bytes [s datum]) -> (ptr u8) (+ (cast (ptr u8) s) 12))
@@ -562,7 +593,6 @@
 (#%fact symbol-append #'(foreign borrowed))
 
 ;; A string: its length, then its bytes, which it owns, in its node.
-(define (string? [d datum]) -> i32 (tagged? d tag-string))
 (define (string-length [s datum]) -> u32 (@ (cast (ptr u32) s) 1))
 (define (string-bytes [s datum]) -> (ptr u8) (+ (cast (ptr u8) s) 8))
 (define (string-byte [s datum] [i u32]) -> u32 (@ (string-bytes s) i))
@@ -589,12 +619,10 @@
 
 ;; ---- numbers and characters ----
 
-(define (fixnum? [d datum]) -> i32 (bit-and (cast u32 d) 1))
 (define (fixnum [n i32]) -> datum (cast datum (bit-or (<< n 1) 1)))
 (#%fact fixnum #'(foreign owned))
 (define (fixnum-value [d datum]) -> i32 (>> (cast i32 d) 1))
 
-(define (integer? [d datum]) -> i32 (or (fixnum? d) (tagged? d tag-integer)))
 ;; The integer n: a fixnum if it fits, else a node of its two's
 ;; complement, negative if it is.
 (define (make-integer [n i64]) -> datum
@@ -622,7 +650,6 @@
 (define (integer-negative? [d datum]) -> i32
   (if (fixnum? d) (< (fixnum-value d) 0) (cast i32 (@ (cast (ptr u32) d) 3))))
 
-(define (flonum? [d datum]) -> i32 (tagged? d tag-flonum))
 (define (make-flonum [x f64]) -> datum
   (let ([d (alloc-node 12 tag-flonum)] [bits (f64-bits x)])
     (set! (@ (cast (ptr u32) d) 1) (cast u32 bits))
@@ -633,7 +660,6 @@
   (bits-f64 (bit-or (cast i64 (@ (cast (ptr u32) d) 1)) (<< (cast i64 (@ (cast (ptr u32) d) 2)) 32))))
 
 ;; A character is its code, shifted, with 10 in the lowest bits.
-(define (char? [d datum]) -> i32 (== (bit-and (cast u32 d) 3) 2))
 (define (integer->char [c u32]) -> datum (cast datum (bit-or (<< c 2) 2)))
 (#%fact integer->char #'(foreign owned))
 (define (char->integer [d datum]) -> u32 (>> (cast u32 d) 2))
@@ -871,14 +897,15 @@
           [(pair? d) #`(cons #,(construction (car d)) #,(construction (cdr d)))]
           [else (raise-syntax-error 'quote '"this datum is not one of Substrate's" (syn d))]))
 
-  ;; Kernel code that gives datum d as Substrate's value, where it is.
+  ;; Kernel code that gives datum d as Substrate's value, where it is: a
+  ;; value that needs no counting, which the forms around it say.
   (define (literal [d datum]) -> datum
     (cond [(== d 0) #'0]
-          [(null? d) #'%nil]
-          [(boolean? d) #'%true]
+          [(null? d) #'(null-value)]
+          [(boolean? d) #'(true-value)]
           [(fixnum-range? d) (syn (fixnum-word d))]
           [(char? d) (syn (char-word d))]
-          [else (cdr (literal-globals d))]))
+          [else #`(literal-value #,(cdr (literal-globals d)))]))
 
   ;; C code that gives datum d, where it is.
   (define (c-literal [d datum]) -> datum
@@ -956,3 +983,46 @@
 (define-syntax quote quote-form)
 (define-syntax quasiquote quasiquote-form)
 (define-syntax lit lit-form)
+
+;; ---- the predicates, for C code ----
+;;
+;; Each a form whose expansion is the inline test on the datum's i32, so
+;; that C code pays no call for one.
+
+(begin-for-syntax
+  (define (test-form [s datum] [test datum]) -> datum
+    (syntax-match s
+      [(_ d) (datum->syntax #'here `(,test (cast i32 ,d)) s)]
+      [_ (raise-syntax-error (syntax-e (car (syntax->list s))) '"expected one argument, a datum" s)]))
+  (define (tag-form [s datum] [tag i32]) -> datum
+    (syntax-match s
+      [(_ d) (datum->syntax #'here `(node-tagged? (cast i32 ,d) ,(fixnum tag)) s)]
+      [_ (raise-syntax-error (syntax-e (car (syntax->list s))) '"expected one argument, a datum" s)]))
+  (define (node?-form [s datum]) -> datum (test-form s 'node-datum?))
+  (define (tagged?-form [s datum]) -> datum
+    (syntax-match s
+      [(_ d tag) (datum->syntax #'here `(node-tagged? (cast i32 ,d) (cast i32 ,tag)) s)]
+      [_ (raise-syntax-error 'tagged? '"expected (tagged? datum tag)" s)]))
+  (define (pair?-form [s datum]) -> datum (test-form s 'pair-cell?))
+  (define (null?-form [s datum]) -> datum (test-form s 'null-cell?))
+  (define (symbol?-form [s datum]) -> datum (tag-form s 3))
+  (define (keyword?-form [s datum]) -> datum (tag-form s 4))
+  (define (string?-form [s datum]) -> datum (tag-form s 5))
+  (define (flonum?-form [s datum]) -> datum (tag-form s 7))
+  (define (integer?-form [s datum]) -> datum (test-form s 'integer-datum?))
+  (define (fixnum?-form [s datum]) -> datum (test-form s 'fixnum-datum?))
+  (define (char?-form [s datum]) -> datum (test-form s 'char-datum?))
+  (define (boolean?-form [s datum]) -> datum (test-form s 'boolean-datum?)))
+
+(define-syntax node? node?-form)
+(define-syntax tagged? tagged?-form)
+(define-syntax pair? pair?-form)
+(define-syntax null? null?-form)
+(define-syntax symbol? symbol?-form)
+(define-syntax keyword? keyword?-form)
+(define-syntax string? string?-form)
+(define-syntax flonum? flonum?-form)
+(define-syntax integer? integer?-form)
+(define-syntax fixnum? fixnum?-form)
+(define-syntax char? char?-form)
+(define-syntax boolean? boolean?-form)
