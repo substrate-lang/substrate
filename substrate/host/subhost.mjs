@@ -1,13 +1,21 @@
 #!/usr/bin/env -S node --stack-size=4000
-// Lifecycle: permanent. The host of spec section 4 over Node's V8; bin/sub
-// runs the compiler on it. The stack limit, in KiB, is build/subhost's: 4 MiB
-// (V8's default is under 1 MiB). The store, the host imports and the
-// instantiate hook are host/subhost-core.mjs's, which a browser's host
-// shares (host/web); here is what Node gives them: the arguments, files,
-// the standard output and error, and the process's end.
+// Lifecycle: permanent.
 //
-// host/subhost.mjs DIR [arg ...]: run the program sub build wrote to DIR,
-// as build/subhost does.
+// The host for Node: runs a compiled Substrate program from the command
+// line (spec section 4). bin/sub runs the compiler with it.
+//
+//   host/subhost.mjs DIR [arg ...]
+//
+// DIR is the program directory that `sub build` wrote. This behaves like
+// build/subhost, the C host: same output, same exit statuses.
+//
+// Loading and linking modules, and the host functions, are in
+// host/subhost-core.mjs, which the browser host shares (host/web). This
+// file adds what is specific to Node: command-line arguments, real files,
+// standard output and error, and exiting the process.
+//
+// The first line raises V8's stack limit to 4000 KiB (the default is
+// under 1 MiB), which matches build/subhost's 4 MiB stack.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import util from 'node:util';
@@ -19,8 +27,9 @@ if (!dir) {
   process.exit(64);
 }
 
-// A failed file operation's error, its message the system's, worded as
-// C's strerror words it, as build/subhost reports it.
+// Converts the error of a failed file operation into an Error whose
+// message is the operating system's, worded as C's strerror words it
+// ("No such file or directory"), so that messages match build/subhost's.
 function systemError(e) {
   if (typeof e.errno !== 'number') return e;
   const m = util.getSystemErrorMessage(e.errno);
@@ -71,10 +80,11 @@ if (!entry) {
   process.stderr.write(`error: ${host.lastError}\n`);
   process.exit(2);
 }
-// A program without a main function has nothing to run. A trap in main,
-// or an exception that escapes it, is reported as build/subhost reports
-// it: what happened, then, for a trap, where; the program's on-trap, if
-// it has one, reports it instead (spec 4).
+// Run the program's main function, if it has one. A trap in main, or a
+// wasm exception that escapes it, is reported as build/subhost reports
+// it: the message, then a backtrace for a trap. If the program exports
+// on-trap, the program reports the problem itself instead (spec 4). The
+// exit status is 2 either way.
 if (typeof entry.main === 'function' &&
     !host.call(entry, entry.main, [], (message) => process.stderr.write(`error: ${message}\n`))) {
   process.exit(2);

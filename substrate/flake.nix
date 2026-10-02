@@ -21,7 +21,7 @@
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.gcc       # on macOS, the shell's clang is the C compiler
             pkgs.perf      # profile compiled wasm (SUBHOST_PERFMAP)
-            pkgs.chromium  # a browser, run headless, to check pages in (host/web/browser.mjs)
+            pkgs.chromium  # the headless browser used by the web tests (host/web/browser.mjs)
           ];
           WASMTIME_INCLUDE = "${pkgs.wasmtime.dev}/include";
           WASMTIME_LIB = "${pkgs.wasmtime.lib}/lib";

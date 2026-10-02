@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
-# Lifecycle: experimental. A page's site: the program of FILE, a module
-# whose views are ui.sub's, built by the new compiler (next/sub), with the
-# host that runs it in a page (host/web) and the page, PAGE, or
-# host/web/page.html, as OUT/index.html. The site is files: any server of
-# them serves it, as host/web/serve.mjs does on this machine. In the dev
-# shell:
+# Lifecycle: experimental.
+#
+# Builds a web site for one program into the directory OUT. Run it in the
+# dev shell:
 #
 #   next/web/site.sh FILE OUT [PAGE]
+#
+# FILE is the program's main source file; its user interface is written
+# with next/web/ui.sub and next/web/web.sub. PAGE is the HTML page to
+# use; the default is host/web/page.html.
+#
+# The site is only static files, so any web server can serve it;
+# host/web/serve.mjs is one for this machine.
+#
+#   OUT/index.html   the page
+#   OUT/program/     the compiled program (built with next/sub)
+#   OUT/host/        the JavaScript that runs the program in a browser
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [ $# -lt 2 ]; then
@@ -20,5 +29,6 @@ rm -rf "${out:?}"
 mkdir -p "$out/host/web"
 "$root/next/sub" build "$file" -o "$out/program"
 cp "$root/host/subhost-core.mjs" "$out/host/"
-cp "$root/host/web/subhost-web.mjs" "$root/host/web/dom.mjs" "$out/host/web/"
+cp "$root/host/web/subhost-web.mjs" "$root/host/web/dom.mjs" "$root/host/web/guest.mjs" "$root/host/web/guest-worker.mjs" \
+  "$out/host/web/"
 cp "$page" "$out/index.html"

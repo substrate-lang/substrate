@@ -1,53 +1,76 @@
-// Lifecycle: experimental. The host module dom: a page's document, for a
-// program whose views write patches (next/web/ui.sub, which says what
-// each patch is; next/web/web.sub is what imports this). A program does
-// not reach the document itself: it gives the host a batch of patches to
-// apply, and the host gives it the events its listeners are for.
+// Lifecycle: experimental.
 //
-//   boot({ ..., modules: { dom: dom(root) } })
+// The host module "dom": the connection between a program and a web page.
 //
-// root is the element the program's nodes go in, its node 0. The module's
-// imports, as the others' (spec 4), take pointers into the caller's memory:
+// A program does not manipulate the page itself. Its views
+// (next/web/ui.sub) produce "patches": small binary instructions such as
+// "make a copy of template 3" or "set the text of node 17". The program
+// hands a batch of patches to this module, which applies them to the real
+// DOM. In the other direction, when a DOM event fires that the program
+// asked to hear about, this module calls the program.
 //
-//   apply (ptr len)               apply the batch: len bytes of patches,
-//                                 32-bit words
-//   event_value (buf cap) -> len  while a listener's event is handled, the
-//                                 value of the element it came from, such
-//                                 as a text field's text: at most cap
-//                                 bytes of it copied to buf; its length
-//   event_key (buf cap) -> len    the key of a keyboard event, as its name,
-//                                 such as "Enter" or "a"
-//   event_flags () -> i32         what is so of it, as bits: the keys held
-//                                 with it, 1 shift, 2 control, 4 alt, 8
-//                                 meta; and 16, the element it came from
-//                                 is checked, as a checkbox is
-//   prevent_default ()            the event does not do what it would
+// ui.sub documents the patch format and how nodes are numbered.
+// next/web/web.sub is the program-side code that imports this module.
 //
-// A listener gives its event to the program by calling the entry's
-// on-event with the number the listener was made with (patch 9), while
-// the event is being dispatched: so the program handles it, and may stop
-// what it would do, before anything else happens in the page.
+// Usage, in the page:
+//
+//   import { dom } from './dom.mjs';
+//   boot({ ..., modules: { dom: dom(rootElement) } })
+//
+// `rootElement` is the element that the program draws into. The program
+// knows it as node 0.
+//
+// What a program can call (pointers are addresses in its memory):
+//
+//   apply (ptr, len)
+//       Applies a batch of patches: `len` bytes of 32-bit words.
+//   event_value (buf, cap) -> len
+//   event_key (buf, cap) -> len
+//       Only meaningful while the program is handling an event.
+//       event_value gives the value of the element the event came from,
+//       for example the text in a text field. event_key gives the name of
+//       the key of a keyboard event, such as "Enter" or "a". Each copies
+//       at most `cap` bytes to `buf` and returns the full length.
+//   event_flags () -> i32
+//       Yes/no facts about the event being handled, as bits: 1 = Shift
+//       was held, 2 = Control, 4 = Alt, 8 = Meta, 16 = the element the
+//       event came from is a ticked checkbox.
+//   prevent_default ()
+//       Cancels the browser's default action for the event being handled.
+//
+// How events reach the program: a "listen" patch (number 9) attaches a
+// listener to a node, with a number chosen by the program. When the event
+// fires, this module calls the program's exported function `on-event`
+// with that number. The call happens inside the browser's event dispatch,
+// so the program can still call prevent_default.
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
 
 export function dom(root) {
-  // Each template, by number: its content, and the path to each of its
-  // marked nodes, the indexes of the children that lead to it.
+  // The templates defined so far, by number. Each is { content, paths }:
+  // the parsed HTML (a DocumentFragment), and, for each marked node, the
+  // path to it from the top of the fragment, as a list of child indexes.
+  // The paths let the marked nodes of a fresh clone be found quickly.
   const templates = new Map();
-  // Each node, by number; a copy is { start, end }, its first and last
-  // nodes, between which are the rest and those of the copies in it.
+  // What each node number refers to. The number of a marked node maps to
+  // the DOM node. The number of a copy maps to { start, end }: the first
+  // and last of the copy's top-level nodes. A copy's nodes are consecutive
+  // siblings, so `start` and `end` identify all of them, including the
+  // nodes of any copies nested inside it.
   const nodes = new Map([[0, root]]);
-  // The event being handled.
+  // The DOM event that the program is handling right now, or null.
   let event = null;
   let app = null;
-  // Whether a batch's patches are being applied, and the events that came
-  // meanwhile, each with the node it reached: the program is given those
-  // once the batch is applied, since it handles an event by writing
-  // another batch.
+  // `applying` is true while a batch of patches is being applied. A DOM
+  // event that fires during that time must not be passed to the program
+  // straight away: the program would answer by writing new patches into
+  // the buffer that is being read. Such events are queued in `waiting`,
+  // each with the node it fired on, and delivered when the batch is done.
   let applying = false;
   const waiting = [];
 
-  // The program is given event e, for the listener numbered message.
+  // Calls the program's on-event for the DOM event e. `message` is the
+  // number that the listen patch gave the listener.
   const give = (e, message) => {
     const outer = event;
     event = e;
@@ -58,29 +81,38 @@ export function dom(root) {
     }
   };
 
-  // A listener's number is the address of its message in the program's
-  // memory, which lasts as long as its node's number does: a node whose
-  // number is free has no listeners (unlisten), so an event that reaches
-  // a node the program has let go of, as one can a node that is out of
-  // the page, is not given to the program.
+  // The one DOM event handler that every listener uses.
+  //
+  // The number that the program gives a listener is really an address in
+  // the program's memory, and that memory is freed when the node's number
+  // is freed. So an event must never be delivered for a node whose number
+  // has been freed. This can otherwise happen: a script can fire an event
+  // on a node that was removed from the page but is still referenced. To
+  // prevent it, `unlisten` clears a node's listener table when its number
+  // is freed, and `heard` looks in the table when it delivers an event.
   const listener = (e) => {
     if (applying) waiting.push([e, e.currentTarget]);
     else heard(e, e.currentTarget);
   };
 
-  // Event e reached node: the program is given it, if node has a listener
-  // for it still.
+  // Delivers the event e, which fired on `node`, if the node still has a
+  // listener for that type of event.
   const heard = (e, node) => {
     const messages = node.subListeners;
     if (messages && e.type in messages) give(e, messages[e.type]);
   };
 
+  // Forgets the listeners of the node numbered `id`. Called when the
+  // number is freed.
   const unlisten = (id) => {
     const n = nodes.get(id);
     if (n instanceof Node && n.subListeners) n.subListeners = null;
   };
 
-  // The template of html: its marked nodes are found once, here.
+  // Parses a template's HTML and finds its marked nodes (ui.sub explains
+  // the marks): <!--t--> comments, each replaced by an empty text node;
+  // <!--a--> comments, which stay, as anchors; and elements with the
+  // attribute data-n, which is removed.
   function template(html) {
     const t = document.createElement('template');
     t.innerHTML = html;
@@ -99,8 +131,11 @@ export function dom(root) {
         n.replaceWith(marked[i]);
       }
     }
-    // A copy's first node is its own, and stays its first: what goes
-    // before an anchor that starts it goes after this.
+    // A copy is known by its first and last nodes, so its first node must
+    // stay first. If the template began with an anchor, the nodes that are
+    // later inserted before that anchor would land in front of the copy's
+    // first node. An empty text node placed in front prevents this. An
+    // empty template gets one too, so that every copy has a node.
     const first = content.firstChild;
     if (!first || (first.nodeType === Node.COMMENT_NODE && first.data === 'a')) {
       content.insertBefore(document.createTextNode(''), first);
@@ -113,13 +148,15 @@ export function dom(root) {
     return { content, paths };
   }
 
-  // The node a number names, a copy's being its first.
+  // Returns the DOM node for a number. For a copy, that is its first node.
   const nodeOf = (id) => {
     const n = nodes.get(id);
     return n instanceof Node ? n : n.start;
   };
 
-  // nodes put in parent before before, or last if that is 0.
+  // Inserts `what` (a node or a fragment) before the node numbered
+  // `before`; or, if `before` is 0, at the end of the node numbered
+  // `parent`.
   function place(what, parent, before) {
     if (before) {
       const next = nodeOf(before);
@@ -129,8 +166,8 @@ export function dom(root) {
     }
   }
 
-  // A copy's nodes, from its first to its last, taken out of the page, as
-  // a fragment.
+  // Detaches all of a copy's nodes, from its first to its last, from the
+  // page, and returns them in a DocumentFragment.
   function taken(copy) {
     const fragment = document.createDocumentFragment();
     for (let n = copy.start; ; ) {
@@ -142,8 +179,11 @@ export function dom(root) {
     return fragment;
   }
 
+  // Sets an attribute. `value` and `checked` are special. For a form
+  // control, the attribute only gives the initial state; what the control
+  // shows is a property. So `value` sets the value property instead of
+  // the attribute, and `checked` sets the checked property as well.
   function setAttribute(node, name, value) {
-    // What a field shows is its value, which its attribute only starts.
     if (name === 'value') {
       if (node.value !== value) node.value = value;
     } else {
@@ -152,6 +192,7 @@ export function dom(root) {
     }
   }
 
+  // Removes an attribute, with the same two special cases.
   function removeAttribute(node, name) {
     if (name === 'value') node.value = '';
     else {
@@ -160,9 +201,17 @@ export function dom(root) {
     }
   }
 
-  // The patches of a batch, len bytes at ptr, applied in order; what is to
-  // be done once they all are is added to after.
+  // Applies the patches of one batch: `length` bytes at `ptr` in the
+  // program's memory. ui.sub lists the patches.
+  //
+  // Patches 10 (focus) and 11 (scroll to the end) are not carried out
+  // here. They are added to the list `after`, which `apply` runs when the
+  // whole batch has been applied. Focusing an element fires events, which
+  // the program should only receive once the batch is done; and scrolling
+  // to the end needs the element's final content.
   function patches(memory, ptr, length, after) {
+    // View the batch as 32-bit words. A Uint32Array must start at a
+    // multiple of 4, so a batch at any other address is copied first.
     const w = ptr % 4 === 0
       ? new Uint32Array(memory.buffer, memory.byteOffset + ptr, length >>> 2)
       : new Uint32Array(memory.slice(ptr, ptr + length).buffer);
@@ -189,7 +238,8 @@ export function dom(root) {
         }
         case 3:
           taken(nodes.get(w[i + 1]));
-          // falls through: its numbers are free
+          // No break here: removing a copy also frees its numbers, which is
+          // what patch 4 does.
         case 4:
           for (let id = w[i + 1]; id <= w[i + 1] + w[i + 2]; id++) {
             unlisten(id);
@@ -239,11 +289,14 @@ export function dom(root) {
     }
   }
 
-  // A batch applied. An event that comes while its patches are waits
-  // until they all are, since the program would handle it by writing
-  // patches where this batch's are. What the batch's effects cause, as
-  // giving an element the focus does, comes after, and is handled at
-  // once: the program has let the batch go by then (web.sub, flush!).
+  // Applies a batch, then delivers the events that were held back.
+  //   1. Apply every patch. Events that fire meanwhile are queued (see
+  //      `applying`).
+  //   2. Run the deferred effects (focus, scroll). Events that these fire
+  //      are delivered at once. That is safe: the program emptied its
+  //      patch buffer before calling apply (flush! in web.sub), so it can
+  //      write and apply a new batch from inside the event.
+  //   3. Deliver the queued events.
   function apply(memory, ptr, length) {
     const after = [];
     applying = true;
@@ -256,9 +309,13 @@ export function dom(root) {
     while (waiting.length > 0) heard(...waiting.shift());
   }
 
+  // The functions the program imports. `caller` gives access to the
+  // memory of the instance that calls them; `theApp` is the running
+  // program.
   return (caller, theApp) => {
     app = theApp;
-    // s, as much of it as cap bytes hold, copied to buf: its length.
+    // Copies the string s, as UTF-8, into the program's memory at `buf`,
+    // at most `cap` bytes. Returns the full length in bytes.
     const copied = (s, buf, cap) => {
       const bytes = utf8.encode(s);
       caller.memory().set(bytes.subarray(0, cap), buf);

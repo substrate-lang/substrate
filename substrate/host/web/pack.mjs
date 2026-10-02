@@ -1,14 +1,24 @@
 #!/usr/bin/env node
-// Lifecycle: experimental. A file pack: files as one, for a page to fetch
-// and give a program as its files (host/web/subhost-web.mjs, unpack).
+// Lifecycle: experimental.
+//
+// Makes a "file pack": one file that contains many files. A web page can
+// then download a whole set of files (for example, library sources) with
+// one request, and give them to a program as its files
+// (host/web/subhost-web.mjs, `packs` and `unpack`).
 //
 //   host/web/pack.mjs -o OUT [-C DIR] PATH ...
 //
-// Each PATH, a file or a directory with every file in it, is put in OUT
-// under its own name, which is relative to DIR, or the working directory:
-// its name's length, the name, its length and its bytes, the lengths 32
-// bits, little-endian. The files are in the order of their names, so a
-// pack's bytes do not depend on a directory's order.
+// Each PATH is a file, or a directory, in which case every file inside it
+// is included. Paths are relative to DIR if -C is given, otherwise to the
+// current directory, and the files are stored under those relative paths.
+//
+// The format is a sequence of records, one per file:
+//   the path's length      32 bits, little-endian
+//   the path               UTF-8
+//   the content's length   32 bits, little-endian
+//   the content
+// Files are stored in sorted order of their paths, so the same input
+// always produces the same pack.
 import fs from 'node:fs';
 import path from 'node:path';
 

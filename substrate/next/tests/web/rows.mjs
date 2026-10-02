@@ -1,11 +1,15 @@
-// Lifecycle: experimental. What the views of next/web/examples/rows.sub
-// cost in a browser: its site, which next/web/site.sh made, in Chromium,
-// each of its operations timed in the page, from the click to the page
-// laid out again, the fastest of a few runs. It checks nothing but that
-// the rows are there: it is a measure, not a test.
+// Lifecycle: experimental.
+//
+// Measures how fast the rows example (next/web/examples/rows.sub) is in a
+// browser. This is a benchmark, not a test: it checks only that the rows
+// exist. To run it, in the dev shell:
 //
 //   next/web/site.sh next/web/examples/rows.sub build/next/web/rows
 //   node next/tests/web/rows.mjs build/next/web
+//
+// Each operation (create 1,000 rows, swap two rows, ...) is timed inside
+// the page, from the click until the browser has laid the page out
+// again. The time printed is the fastest of a few runs.
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +24,10 @@ try {
   await withBrowser(async (open) => {
     const page = await open(`${url}rows/index.html`);
     await page.waitFor('window.ready', 60000);
-    // A click on the element, timed in the page until its layout is done.
+    // Clicks the element and returns how long the click took, in
+    // milliseconds, measured inside the page. Reading offsetHeight forces
+    // the browser to finish laying out the page, so the layout is part of
+    // the time.
     const click = (selector) => page.evaluate(`(() => {
       const e = document.querySelector(${JSON.stringify(selector)});
       const t = performance.now();
@@ -29,7 +36,8 @@ try {
       return performance.now() - t;
     })()`);
     const count = () => page.evaluate('document.querySelectorAll("tbody tr").length');
-    // The fastest of n runs of an operation, each after setup.
+    // Runs an operation n times and prints the fastest time. Before each
+    // run, the buttons listed in `setup` are clicked to prepare the table.
     const measure = async (what, setup, selector, n = 5) => {
       let best = Infinity;
       for (let i = 0; i < n; i++) {

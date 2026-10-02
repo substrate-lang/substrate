@@ -20,9 +20,10 @@
 # tests of Bend as the new compiler builds it (next/bend),
 # next/tests/substrate has the
 # tests of Substrate as the new compiler builds it (next/substrate),
-# next/tests/ui those of a page's views (next/web/ui.sub), by the patches
-# they write and the errors of templates that are wrong, and
-# next/tests/session those of sessions, which next/sub eval runs. Then,
+# next/tests/ui has the tests of web-page views (next/web/ui.sub): they
+# print the page changes a view produces, and check the error messages for
+# templates that are wrong. next/tests/session has the session tests, which
+# next/sub eval runs. Then,
 # as tests/run.sh does, the cache (spec 3.7): each program built again
 # from it is the same, and a stale entry is not used. OUT is where builds
 # go (default build). In the dev shell:
@@ -90,10 +91,12 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
-# Sessions (next/tests/session): each file's forms evaluated one at a
-# time, an input each, by next/sub eval (next/compiler/expander.sub,
-# sessions). NAME.out is what that writes, the errors of the inputs that
-# fail among it, but for a backtrace's frames, which are a host's own.
+# The session tests (next/tests/session). `next/sub eval NAME.sub`
+# evaluates the file's forms one at a time, each as one input of a
+# session (see "sessions" in next/compiler/expander.sub). Its output,
+# including the error messages of inputs that fail, must equal NAME.out.
+# Backtrace lines (which start with four spaces) are removed first,
+# because their content depends on the host.
 for t in next/tests/session/*.sub; do
   name="$(basename "$t" .sub)"
   actual="$(cd next/tests/session && "$root/next/sub" eval "$name.sub" -c "$cache" 2>&1 | grep -v '^    ')"

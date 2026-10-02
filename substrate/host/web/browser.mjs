@@ -1,6 +1,10 @@
-// Lifecycle: experimental. A browser to check pages in: Chromium, headless,
-// driven over its DevTools protocol, which is all this needs of it, so
-// there is nothing to install but the browser (the flake's chromium).
+// Lifecycle: experimental.
+//
+// Drives a headless Chromium, for the browser tests (next/tests/web).
+//
+// It talks to Chromium directly over the DevTools protocol (a WebSocket),
+// so no test framework has to be installed: only the browser itself,
+// which the Nix flake provides.
 //
 //   import { withBrowser } from './browser.mjs';
 //   await withBrowser(async (open) => {
@@ -10,26 +14,33 @@
 //     console.log(await page.evaluate('document.title'));
 //   });
 //
-// A page has:
+// `open(url)` opens a page and returns an object with:
 //
-//   evaluate(js)        the value of the expression js in the page, which
-//                       is awaited if it is a promise; an exception it
-//                       throws is thrown here
-//   waitFor(js, ms)     wait until js is true, for at most ms (10000)
-//   click(selector)     a mouse click at the middle of the element
-//   type(text)          text typed into the focused element, as input
-//   press(key, mods)    a key pressed and released, such as "Enter" or
-//                       "ArrowUp"; mods is DevTools' modifiers, 8 Shift
+//   evaluate(js)       Evaluates the JavaScript expression `js` in the
+//                      page and returns its value. If the value is a
+//                      promise, waits for it. If the expression throws,
+//                      evaluate throws.
+//   waitFor(js, ms)    Waits until `js` evaluates to a true value. Throws
+//                      after `ms` milliseconds (default 10000).
+//   click(selector)    Clicks the mouse in the middle of the first
+//                      element that matches the CSS selector.
+//   type(text)         Types `text` into the element that has the focus.
+//   press(key, mods)   Presses and releases a key, such as "Enter" or
+//                      "ArrowUp". `mods` are the modifier keys held, as
+//                      DevTools numbers them: 1 Alt, 2 Control, 4 Meta,
+//                      8 Shift.
 //   screenshot(file, width, height)
-//                       the page as it looks, at that size, a PNG
-//   log                 what the page wrote to its console, and its
-//                       uncaught exceptions, as lines
+//                      Saves a PNG of the page at the given size.
+//   log                An array of lines: what the page wrote to its
+//                      console, and its uncaught exceptions.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-// The keys press knows: DevTools wants a key's code and number with its name.
+// The named keys that `press` supports. DevTools needs each key's code
+// and Windows virtual key number as well as its name. Any other key is
+// treated as a letter key.
 const keys = {
   Enter: { code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
   Tab: { code: 'Tab', windowsVirtualKeyCode: 9 },
@@ -41,12 +52,17 @@ const keys = {
   ArrowRight: { code: 'ArrowRight', windowsVirtualKeyCode: 39 },
 };
 
-// The browser is started for use, a function of open, which opens a page,
-// and closed after it. Its profile is a directory of its own, in
-// options.dir or the system's, removed after; it runs without Chromium's
-// sandbox, which needs what a build's machine may not allow, and which
-// the pages it is given, this repository's, served from this machine, do
-// not need.
+// Starts Chromium, calls `use(open)`, and closes Chromium when `use` has
+// finished (or failed).
+//
+// Chromium gets a fresh, temporary profile directory, created under
+// options.dir (or the system's temporary directory) and deleted
+// afterwards.
+//
+// Chromium runs with --no-sandbox. Its sandbox needs kernel features
+// that build machines and containers often do not allow. That is
+// acceptable here because the only pages opened are this repository's
+// own, served from this machine.
 export async function withBrowser(use, options = {}) {
   const profile = fs.mkdtempSync(path.join(options.dir || os.tmpdir(), 'chromium-'));
   const browser = spawn(options.chromium || process.env.CHROMIUM || 'chromium', [
@@ -55,7 +71,8 @@ export async function withBrowser(use, options = {}) {
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let socket;
   try {
-    // Chromium says where its DevTools listen on its standard error.
+    // Chromium prints the address of its DevTools WebSocket on standard
+    // error when it starts.
     const endpoint = await new Promise((resolve, reject) => {
       let said = '';
       browser.stderr.on('data', (d) => {
@@ -72,7 +89,9 @@ export async function withBrowser(use, options = {}) {
       socket.onerror = () => reject(new Error('cannot connect to chromium'));
     });
 
-    // Commands are numbered, and each one's answer has its number.
+    // Each command sent to DevTools carries a number, and the reply to it
+    // carries the same number. `waiting` maps a number to the promise
+    // callbacks that are waiting for that reply.
     let next = 0;
     const waiting = new Map();
     const listeners = new Map();

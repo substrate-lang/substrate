@@ -1,31 +1,44 @@
 #!/usr/bin/env bash
-# Lifecycle: experimental. The new compiler's tests in a browser, Chromium,
-# headless (host/web/browser.mjs), apart from next/tests/run.sh, which
-# needs none. The sites are made in build/next/web, or OUT/next/web.
+# Lifecycle: experimental.
 #
-# First the compiler itself, in a page (host/web): the site session is the
-# compiler's build as its program, the sources that sessions require as a
-# file pack, and session.html, which evaluates a session test
-# (next/tests/session) as next/sub eval does; what the page writes must
-# be the test's .out (session.mjs).
-#
-# Then the pages whose programs' views are ui.sub's (next/web), each a
-# site next/web/site.sh made: a counter and a table of rows
-# (next/web/examples), and the page that is a session (next/web/repl);
-# what each shows, after it loads and after the events it is given, is
-# checked in pages.mjs, with pages of their own for an event that a patch
-# causes (focus.sub) and for attributes' kinds and events' data
-# (fields.sub). rows.mjs, apart, times the table's operations. In
-# the dev shell:
+# The browser tests for the new compiler. They run in headless Chromium
+# (host/web/browser.mjs). They are separate from next/tests/run.sh, which
+# needs no browser. Run them in the dev shell:
 #
 #   next/tests/web/run.sh
+#
+# Each test page is built as a small static web site under build/next/web
+# (or OUT/next/web if OUT is set). There are two groups of tests.
+#
+# 1. The compiler running in a page. The site "session" contains the
+#    compiler's own build as the page's program, and a file pack with the
+#    library sources and the session tests (next/tests/session). The page
+#    session.html evaluates one session test, exactly as `next/sub eval`
+#    does on the command line, and session.mjs checks that the output
+#    equals the test's .out file.
+#
+# 2. Pages written with next/web/ui.sub. pages.mjs opens each one, clicks
+#    and types, and checks what the page shows:
+#      counter, rows   the examples in next/web/examples
+#      focus           an event that fires while the page is being updated
+#                      (focus.sub)
+#      fields          typed attributes and event data (fields.sub)
+#      guests          sandboxed programs (guests.sub; its guests run
+#                      a-guest.sub, which is put in the site as a file
+#                      pack)
+#      repl            the REPL page (next/web/repl)
+#
+# rows.mjs is not part of the tests. It measures how long the operations
+# of the rows example take.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$root"
 sites="${OUT:-build}/next/web"
 
-# next/sub builds build/next/sub if its sources changed; expanding an
-# empty module needs no more.
+# Make sure the compiler's build (build/next/sub) is up to date before it
+# is copied into a site. next/sub rebuilds it when the compiler's sources
+# have changed, and expanding an empty file is the cheapest command that
+# triggers this.
 mkdir -p build/next
 : > build/next/empty.sub
 next/sub expand build/next/empty.sub > /dev/null
@@ -47,5 +60,9 @@ next/web/site.sh next/web/examples/rows.sub "$sites/rows"
 next/web/repl/site.sh "$sites/repl"
 next/web/site.sh next/tests/web/focus.sub "$sites/focus"
 next/web/site.sh next/tests/web/fields.sub "$sites/fields"
-node next/tests/web/pages.mjs "$sites" counter rows focus fields repl || status=1
+next/web/site.sh next/tests/web/guests.sub "$sites/guests" next/tests/web/guests.html
+next/sub build next/tests/web/a-guest.sub -o "$sites/guests/guest"
+host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
+rm -r "${sites:?}/guests/guest"
+node next/tests/web/pages.mjs "$sites" counter rows focus fields guests repl || status=1
 exit $status

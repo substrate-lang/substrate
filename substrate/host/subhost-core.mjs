@@ -1,32 +1,58 @@
-// Lifecycle: permanent. The host of spec section 4 over a JavaScript engine's
-// WebAssembly, V8's: what host/subhost.mjs, over Node, and
-// host/web/subhost-web.mjs, in a browser, share. A platform gives it what
-// differs between them: the program's arguments, its files, where its
-// output goes and how it ends.
+// Lifecycle: permanent.
 //
-// createHost(platform) is one store: instances by name, the host imports,
-// and the instantiate hook. platform has:
+// The JavaScript host: the part that Node and the browser share.
 //
-//   args                    the program's command-line arguments, strings
-//   write(fd, bytes)        write bytes, a Uint8Array, to fd 1 or 2
-//   readFile(path)          the file's bytes, a Uint8Array; or throws an
-//                           Error whose message says why not
-//   writeFile(path, bytes)  make or replace the file; or throws likewise
-//   exit(code)              end the program with status code; does not
-//                           return
-//   modules                 a Map, name -> (caller) => imports: the host
-//                           modules besides "host" that a linklet can
-//                           import from, each given the calling instance,
-//                           caller.memory() its memory's bytes and
-//                           caller.exports its exports once it has them
-//   keyOf(bytes)            optional: a hash of bytes that tells any two
-//                           modules apart, a string
+// A "host" is what loads and runs a compiled Substrate program (spec
+// section 4). It instantiates the program's wasm modules, links them to
+// each other, and provides the "host" imports: writing output, reading
+// files, instantiating more modules at run time, and so on.
 //
-// A host module is how an embedder gives programs more than spec 4's
-// imports, such as a page's document: a linklet reaches it by importing
-// from its name, so a program's imports say what it can touch. The
-// compiler's builds are given none, so that compile-time code stays
-// reproducible (spec 4).
+// This file is everything that does not depend on where the host runs.
+// Two small adapters supply the rest:
+//
+//   host/subhost.mjs           for Node: real files, the process's output
+//   host/web/subhost-web.mjs   for a browser: files kept in memory
+//
+// createHost(platform) creates one "store": a set of instances that can
+// link to each other. `platform` supplies what differs between Node and
+// the browser:
+//
+//   args                    the program's command-line arguments (strings)
+//   write(fd, bytes)        writes bytes (a Uint8Array) to standard output
+//                           (fd 1) or standard error (fd 2)
+//   readFile(path)          returns the file's bytes as a Uint8Array, or
+//                           throws an Error whose message says what went
+//                           wrong
+//   writeFile(path, bytes)  creates or replaces the file, or throws in the
+//                           same way
+//   exit(code)              ends the program with the given status. It
+//                           must not return.
+//   modules                 optional: extra host modules (see below), as a
+//                           Map from a module's name to a function
+//                           (caller) => imports
+//   keyOf(bytes)            optional: a hash of a module's bytes, as a
+//                           string, strong enough that two different
+//                           modules never get the same one (see compile)
+//   memoryPages             optional: a limit, in 64 KiB pages, on the size
+//                           of each wasm memory of the program (see
+//                           limitMemory)
+//
+// Host modules. Besides "host", a platform can offer programs more
+// modules of host functions, each under its own name. An example is
+// "dom", which lets a program draw on a web page. A program uses one
+// simply by importing from that name. The module's functions are created
+// separately for each instance that imports them, by calling the module's
+// function with a `caller` object (see callerOf) through which they can
+// reach that instance's memory.
+//
+// A program can only use the host modules it is given, so they also work
+// as permissions. The compiler itself is run with none. Code that runs at
+// compile time (macros) can therefore only use the standard host
+// functions, which keeps builds reproducible (spec 4).
+//
+// createHost returns { registry, instantiate, load, call, lastError }.
+// `registry` is the Map of instances by name; the others are documented
+// where they are defined, below.
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
@@ -74,7 +100,7 @@ function u32(n) {
   return out;
 }
 
-// The byte arrays parts, as one.
+// Joins the byte arrays in `parts` into one Uint8Array.
 function concat(parts) {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
   let at = 0;
@@ -115,10 +141,49 @@ function deferStart(bytes) {
   return concat(parts);
 }
 
-// A key for bytes, to find a module compiled from the same ones: two
-// 32-bit FNV-1a hashes, from either end, and the length. The bytes are
-// compared too (compile), so a key that two modules share costs only the
-// comparison.
+// Returns a wasm module's bytes, changed so that every linear memory the
+// module defines can grow to at most `pages` pages (64 KiB each).
+//
+// It rewrites the module's memory section so that each memory declares
+// that maximum size. The engine then enforces it: memory.grow fails
+// (returns -1) at the limit, just as it does when the machine is out of
+// memory. Throws an Error if a memory's initial size is already above the
+// limit. Guests with a memory limit use this (host/web/guest.mjs).
+function limitMemory(bytes, pages) {
+  let section = null;
+  for (let pos = 8; pos < bytes.length; ) {
+    const [size, body] = readU32(bytes, pos + 1);
+    if (bytes[pos] === 5) section = { start: pos, body, end: body + size };
+    pos = body + size;
+  }
+  if (!section) return bytes;
+  let [count, pos] = readU32(bytes, section.body);
+  const body = [...u32(count)];
+  for (; count > 0; count--) {
+    const flags = bytes[pos++];
+    // Bit 2 of the flags marks a memory with 64-bit addresses, whose
+    // limits are encoded differently. This function does not support it.
+    if (flags & 4) throw new Error('a memory of 64-bit addresses, which a limited store has none of');
+    let min;
+    let max = pages;
+    [min, pos] = readU32(bytes, pos);
+    if (flags & 1) {
+      let declared;
+      [declared, pos] = readU32(bytes, pos);
+      max = Math.min(declared, pages);
+    }
+    if (min > pages) throw new Error(`a memory of ${min} pages, where the most is ${pages}`);
+    body.push(flags | 1, ...u32(min), ...u32(max));
+  }
+  return concat([bytes.subarray(0, section.start), Uint8Array.from([5, ...u32(body.length), ...body]),
+    bytes.subarray(section.end)]);
+}
+
+// Returns a key for a module's bytes, used to look up a module that was
+// already compiled from the same bytes. The key is two 32-bit FNV-1a
+// hashes (one over the bytes forwards, one backwards) plus the length.
+// Different modules could in theory get the same key, so `compile` also
+// compares the bytes themselves; a clash only costs that comparison.
 function keyOf(bytes) {
   let a = 0x811c9dc5;
   let b = 0x811c9dc5;
@@ -177,12 +242,13 @@ function importMap(bytes) {
 }
 
 export function createHost(platform) {
-  // Every instance so far, by name: its exports.
+  // Every instance created so far: a Map from its name to its exports.
   const registry = new Map();
-  // Every module compiled so far, by the key of its bytes: each with the
-  // bytes it was compiled from.
+  // Every module compiled so far: a Map from the key of its bytes to a
+  // list of { bytes, module }.
   const modules = new Map();
-  // The message of the last failure, for host.error_message.
+  // The message of the most recent failure. A program reads it with
+  // host.error_message.
   let lastError = '';
 
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
@@ -193,39 +259,51 @@ export function createHost(platform) {
     trapper.trap();
   }
 
-  // A trap's message: the host's, if it made the trap, or the engine's.
+  // Returns the message for a trap: the host's own message if the host
+  // caused the trap (hostTrap), otherwise the engine's.
   function trapMessageOf(e) {
     const m = trapMessage === null ? e.message : trapMessage;
     trapMessage = null;
     return m;
   }
 
-  // The module of bytes, compiled once. A platform with a hash that tells
-  // any two modules apart gives it as keyOf; without one, a module is
-  // kept with its bytes, which those of the same key are compared with.
+  // Compiles a module, or returns the module already compiled from the
+  // same bytes.
+  //
+  // If the platform provides keyOf, its key alone identifies a module.
+  // Otherwise the weaker built-in keyOf is used, and the bytes are kept
+  // and compared as well.
   function compile(bytes) {
     const key = platform.keyOf ? platform.keyOf(bytes) : keyOf(bytes);
     const known = modules.get(key);
     if (known) for (const k of known) if (platform.keyOf || sameBytes(k.bytes, bytes)) return k.module;
-    const deferred = deferStart(bytes);
+    let deferred = deferStart(bytes);
+    if (platform.memoryPages) deferred = limitMemory(deferred, platform.memoryPages);
     const module = new WebAssembly.Module(deferred);
     const kept = { bytes: platform.keyOf ? null : bytes, module };
     if (known) known.push(kept);
     else modules.set(key, [kept]);
-    // Moving the start function moves the code after it.
+    // The source-location table refers to code by its offset in the
+    // module. deferStart and limitMemory change the size of sections that
+    // come before the code, so the code has moved by the difference in
+    // length.
     noteLocations(module, deferred.length - bytes.length);
     return module;
   }
 
-  // ---- source locations ----
+  // ---- Source locations for backtraces ----
   //
-  // A module's source-locations section maps code offsets to where the code
-  // comes from (spec 3.6). A backtrace names each frame's module, by the
-  // module name its name section gives, and the frame's offset in it.
+  // A module compiled by `sub` can contain a custom section named
+  // "source-locations". It maps offsets in the module's code to the
+  // source file, line and column that the code came from (spec 3.6).
+  // When a trap happens, the engine's stack trace gives each frame's
+  // module name and code offset, and this table turns those into a source
+  // location.
   const locations = new Map();
 
-  // The locations in module, whose code is shift bytes after where the
-  // compiler put it.
+  // Reads a module's source-locations section and stores it under the
+  // module's name. `shift` is how far the module's code has moved from
+  // where the compiler put it (see compile).
   function noteLocations(module, shift) {
     const [section] = WebAssembly.Module.customSections(module, 'source-locations');
     const [names] = WebAssembly.Module.customSections(module, 'name');
@@ -254,17 +332,19 @@ export function createHost(platform) {
     locations.set(moduleName, entries);
   }
 
-  // A trap's backtrace (spec 4): the wasm frames of error e, each with its
-  // source location, in main or in a start function while the program
-  // loads; the host's own frames are not the program's.
+  // Returns a trap's backtrace as text: one line per wasm frame, with its
+  // source location where that is known (spec 4). The host's own
+  // JavaScript frames are left out.
   function backtrace(e) {
     return (e.stack || '').split('\n').filter((l) => l.includes('wasm://') && !l.includes('subhost-trap'))
       .map(located).join('\n');
   }
 
-  // A backtrace line of V8's, "at MODULE.f (wasm://wasm/MODULE-HASH:wasm-function[i]:0xOFFSET)",
-  // as the frame's function and its source location, "at f FILE:LINE:COL",
-  // if the frame has one; or as it is.
+  // Rewrites one line of a V8 stack trace. V8 prints a wasm frame as
+  //   at MODULE.f (wasm://wasm/MODULE-HASH:wasm-function[i]:0xOFFSET)
+  // If the frame's source location is known, the line becomes
+  //   at f FILE:LINE:COL
+  // Otherwise the line is returned unchanged.
   function located(line) {
     const m = /wasm:\/\/wasm\/(.*)-[0-9a-f]+:wasm-function\[\d+\]:0x([0-9a-f]+)/.exec(line);
     const entries = m && locations.get(m[1]);
@@ -287,8 +367,14 @@ export function createHost(platform) {
     return `${named[1]}${f} ${found.where}`;
   }
 
-  // What a host function is given of the instance that calls it, self:
-  // its memory's bytes, text in them, and its exports.
+  // Builds the `caller` object through which host functions reach the
+  // instance that called them. `self.exports` is that instance's exports,
+  // and `who` names the host module, for error messages.
+  //   memory()          the instance's memory, as a Uint8Array
+  //   string(ptr, len)  the text at that address in its memory
+  //   exports           its exports
+  //   trap(message)     traps, with a message
+  //   error(message)    sets the message that host.error_message returns
   function callerOf(self, who) {
     const memory = () => {
       const m = self.exports && self.exports.memory;
@@ -302,11 +388,15 @@ export function createHost(platform) {
         return self.exports;
       },
       trap: hostTrap,
+      error(message) {
+        lastError = message;
+      },
     };
   }
 
-  // The host imports for one instance, self.exports once it exists. Every
-  // pointer is into that instance's memory.
+  // Returns the functions of the "host" module (spec 4) for one instance.
+  // Every pointer argument is an address in that instance's memory.
+  // `self.exports` is filled in once the instance exists.
   function hostImports(self) {
     const { memory, string } = callerOf(self, 'host');
     return {
@@ -372,10 +462,17 @@ export function createHost(platform) {
     };
   }
 
-  // Compile and instantiate bytes as instance name, linking each import to
-  // the instance map names for its module, or to the instance of that name;
-  // one from "host", or from a host module of the platform's, is that
-  // module's for this instance. False, with lastError set, on failure.
+  // Compiles `bytes` and instantiates the module under the name `name`.
+  // Each import is resolved as follows:
+  //   - from "host": the standard host functions (hostImports);
+  //   - from a host module that the platform provides: that module's
+  //     functions;
+  //   - otherwise: an export of an existing instance. `map` can redirect
+  //     the lookup: an import from module M is taken from the instance
+  //     named map.get(M), or from the instance named M if the map has no
+  //     entry for it.
+  // Returns true on success. On failure, returns false and sets
+  // lastError.
   function instantiate(name, bytes, map) {
     let module;
     try {
@@ -411,7 +508,9 @@ export function createHost(platform) {
       const start = self.exports[START_EXPORT];
       if (start) start();
     } catch (e) {
-      // An exception out of the start function goes on to the caller (spec 4).
+      // Traps and link errors are reported as a failed instantiation. A
+      // wasm exception thrown by the start function is passed on to the
+      // caller instead (spec 4).
       if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError ||
             e instanceof WebAssembly.LinkError)) throw e;
       const where = backtrace(e);
@@ -422,9 +521,10 @@ export function createHost(platform) {
     return true;
   }
 
-  // Instantiate the program whose linklets are names, in order, each of
-  // bytes bytesOf(name) (spec 4): its entry's exports, the last's; or
-  // null, with lastError set, if one cannot be loaded.
+  // Loads a program: instantiates the modules listed in `names`, in
+  // order. `bytesOf(name)` returns a module's bytes. Returns the exports
+  // of the last module, which is the program's entry; or null, with
+  // lastError set, if a module cannot be loaded.
   function load(names, bytesOf) {
     for (const name of names) {
       let loaded;
@@ -436,16 +536,21 @@ export function createHost(platform) {
       }
       if (!loaded) return null;
     }
-    // A program without linklets has nothing to run.
+    // A program with no modules has no entry: return an empty object.
     return names.length > 0 ? registry.get(names[names.length - 1]) : {};
   }
 
-  // Call f, a function of the program's, the entry's exports being
-  // entry, with args: true if it returned; false after a trap in it, or
-  // an exception that escaped it, which the entry's on-trap, if it has
-  // one, has reported (spec 4), reading the message with
-  // host.error_message; else report is given the message. The store
-  // stays usable after either.
+  // Calls `f`, one of the program's functions, with `args`. `entry` is
+  // the program's entry exports.
+  //
+  // Returns true if f returned normally. If f trapped, or threw a wasm
+  // exception that nothing caught, returns false, after:
+  //   - setting lastError to the message and backtrace; and
+  //   - calling the program's exported on-trap function, if it has one,
+  //     so that the program can report the problem itself (it reads the
+  //     message with host.error_message) and recover (spec 4); or
+  //   - calling `report(message)`, if the program has no on-trap.
+  // The store stays usable in either case: later calls still work.
   function call(entry, f, args, report) {
     try {
       f(...args);
@@ -464,8 +569,9 @@ export function createHost(platform) {
           onTrap();
           return false;
         } catch (e2) {
-          // It trapped too: report the first trap. One that ends the
-          // program, as a platform's exit may, does.
+          // on-trap trapped as well. Fall through and report the original
+          // trap. Anything else that was thrown is passed on; that includes
+          // what a platform throws to end the program from host.exit.
           if (!(e2 instanceof WebAssembly.RuntimeError || e2 instanceof RangeError ||
                 e2 instanceof WebAssembly.Exception)) throw e2;
         }

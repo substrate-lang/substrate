@@ -18,7 +18,7 @@ line says the same.
 | Directory | What it holds | Lifecycle |
 |---|---|---|
 | `docs/` | the kernel specification | permanent |
-| `host/` | the hosts, in C over wasmtime (`subhost.c`) and in JavaScript over Node's V8 (`subhost.mjs`): stores, linking, the `host` imports and the instantiate hook. The JavaScript host's store and imports are `subhost-core.mjs`, which a browser's page shares (`host/web`, experimental: `next/README.md`, pages) | permanent: they run programs, the compiler among them |
+| `host/` | the hosts, in C over wasmtime (`subhost.c`) and in JavaScript over Node's V8 (`subhost.mjs`): stores, linking, the `host` imports and the instantiate hook. The code that the JavaScript host shares with the browser is in `subhost-core.mjs`. `host/web` (experimental) runs programs in a web page, where a program can also run another program in a sandbox (`host/web/guest.mjs`); see "Web pages" in `next/README.md` | permanent: they run programs, the compiler among them |
 | `compiler/` | the compiler, written in Substrate: reader, expander, kernel compiler, wasm encoder. It compiles itself (spec 1.4). And the kernel module (`kernel.sub`, in kernel code): the data of every language and the functions macros use on it, which the compiler carries into the programs that use them | permanent, grows |
 | `lib/` | libraries, which programs use, the compiler among them: Substrate (`substrate.sub`, written in Substrate on its core in kernel code, `substrate-core.sub`), the language built on the kernel; and printing for programs without GC (`print.sub`) | permanent, grows |
 | `examples/` | demos meant to be read, each a program `NAME.sub` (with `.out` and `.imports`) and any modules it requires in `NAME/`; checked by `make check` | grows |

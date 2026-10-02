@@ -5,8 +5,9 @@ An experiment: the compiler written in a C-like Lisp, the C example's
 expanding and compiling need no GC. It is ported from `compiler/` file by
 file. It builds itself, from a seed, as the compiler does; the compiler
 built its first stage, and nothing in `compiler/` or `lib/` changes for
-it. In `host/`, the host over V8 is in two parts, so that a browser's
-page can be a host too (below, pages).
+it. The JavaScript host in `host/` is split into a shared core and a
+part for Node, so that a web page can run programs too (see "Web
+pages" below).
 
 The stack it aims at is the wasm kernel, then a C-like Lisp, then
 Substrate as a library on it, able to drop into it, then Bend. Syntax
@@ -41,8 +42,8 @@ on them there.
     `compile.sub`: the compiler's, into buffers and arenas.
   - `main.sub`: `compiler/main.sub`, with its `build` (`-m` included),
     `compile` and `expand` commands, and its cache, `-c DIR`; and `eval`,
-    which evaluates a file's forms one at a time, as a session's inputs
-    (below).
+    which runs a file as a session: its top-level forms are compiled and
+    run one at a time (see "Sessions" below).
 - `c/`: the C-like Lisp, `examples/c` as the new compiler builds it,
   which the compiler's sources are written in:
   - `lang.sub`: `examples/c/lang.sub`, its transformers in kernel code,
@@ -51,6 +52,8 @@ on them there.
     or global that quotes it names it, with `kernel.sub`'s templates
     `` `t `` and `` #`t ``.
   - `runtime.sub`, `math.sub` and `c.sub`: `examples/c`'s.
+  - `guest.sub`: functions for running another program in a sandbox (a
+    "guest"), on hosts that support it (see "Web pages" below).
   - `syntax-match.sub`: `lib/substrate.sub`'s patterns for syntax, in
     kernel code, on the kernel module's syntax objects, its code kernel
     code; `c-syntax-match.sub`, the same, its code C, for macros written
@@ -107,17 +110,21 @@ on them there.
     freed ones of each size; sharing, a count of owners off the node,
     made the first time a value is shared; dropping; and writing a Nat.
   - `base.sub`: `examples/bend/base.sub`.
-- `web/`: a page's programs (below, pages):
-  - `ui.sub`: a language for views, on the C-like Lisp: templates,
-    compiled to the patches that make and change a page's nodes.
-  - `web.sub`: a page's program, a model, its messages and a view, on the
-    host module `dom`.
-  - `trace.sub`: a batch of patches as text, for tests of views.
-  - `site.sh`: a program's site, with the host and its page.
-  - `examples/`: a counter (`counter.sub`), and a table of rows
-    (`rows.sub`), whose operations `tests/web/rows.mjs` times.
-  - `repl/`: the page that is a session of the compiler: `repl.sub`, its
-    page and its site.
+- `web/`: libraries and examples for programs that run in a web page
+  (see "Web pages" below):
+  - `ui.sub`: a template language for pages ("views"), built on the
+    C-like Lisp.
+  - `web.sub`: the structure of a page's program (model, messages,
+    update, view) and its connection to the browser.
+  - `trace.sub`: a test helper that prints what a view would change on
+    a page, so that views can be tested without a browser.
+  - `site.sh`: builds a program and its page into a static web site.
+  - `examples/`: `counter.sub`, a minimal example, and `rows.sub`, a
+    table with many rows, used to measure performance
+    (`tests/web/rows.mjs`).
+  - `repl/`: the REPL page. `repl.sub` is the page's program (the user
+    interface); `session.sub` is the compiler, which the page runs in a
+    sandbox; `page.html` and `site.sh` make the site.
 - `seed/`: a build of the new compiler by itself, checked in, as `seed/`
   is the compiler's.
 - `sub`: runs the new compiler as `bin/sub` runs the compiler, keeping
@@ -137,12 +144,13 @@ on them there.
   at compile time; the Bend tests of `tests/` and `examples/bend.sub`
   (`tests/bend`), on `bend/`; and the tests of its parts: its syntax
   objects, its reader, and what its expander and back end give for the
-  kernel's tests, which is what the compiler gives; those of views
-  (`tests/ui`), by the patches they write and the errors of templates
-  that are wrong; and those of sessions
-  (`tests/session`), each a file whose forms `next/sub eval` evaluates.
-  `tests/web/run.sh`, apart, runs those that need a browser: the sessions
-  again, by the compiler in a page, and the pages of `web/`.
+  kernel's tests, which is what the compiler gives. `tests/ui` tests
+  the page views (`web/ui.sub`): the tests print the page changes that
+  a view produces, and check the error messages for templates that are
+  wrong. `tests/session` tests sessions: `next/sub eval` runs each
+  file, one form at a time. `tests/web/run.sh` is separate, and runs
+  the tests that need a browser: the session tests again, with the
+  compiler running in a page, and the pages of `web/`.
   Then, as `tests/run.sh` checks the
   compiler's, the cache: every program built again from it is byte for
   byte the same, and a stale entry is not used; and `compiled-import.sub`
@@ -214,107 +222,172 @@ Substrate is built again in `substrate/` (plan, 5).
 
 ## Sessions
 
-A session is a module that is not finished: its text comes an input at a
-time, and each input's code is compiled into a linklet of its own and
-run at once, as a module's `begin-for-syntax` is, its phase 0 too
-(`expander.sub`, sessions). `next/sub eval FILE` runs one, each form of
-`FILE` an input, and reports the inputs that fail (`tests/session`).
-
-- **A session has no language of its own.** It is written in what its
-  inputs require, as a file is: `(require-unqualified c ".../c.sub")`
-  makes it one in the C-like Lisp, and one that requires nothing is in
-  kernel code; kernel code, the C-like Lisp, Substrate and Bend each have
-  a test (`tests/session`). A later `require-unqualified` shadows what an
-  earlier one bound, but that does not make the session one in the later
-  language: the names the earlier bound that the later leaves the
-  kernel's, such as `if` and `#%app`, stay the earlier's. A session in
-  another language is another session.
-- **A definition is there for the inputs after it.** An input is a body
-  of its own, so its forms may refer to each other. A definition of a
-  name that an earlier input defined shadows it for the inputs after,
-  and code compiled before keeps the definition it referred to: a call
-  is to a function, not to a name.
-- **An expression's value is the language's to show.** An expression
-  among an input's forms, `e`, is `(#%top-interaction e)` if that name is
-  bound to a macro where `e` is written, as an application is `(#%app f
-  arg ...)` (spec 5.3). Substrate's writes the value; the C-like Lisp's
-  checks `e` as it does a function's body, and writes its value by its
-  type. In kernel code an expression runs, and its value is dropped.
-- **An input that fails leaves the session as it was**, but for what its
-  code did before it failed: its definitions are taken out. A trap in an
-  input's code is the host's failure of `instantiate`, an error like
-  another, reported with its backtrace.
-- **A session's code is compile-time code.** It runs in the compiler's
-  store, and links to the running compiler's instances of the kernel
-  module's group: C code in a session has the compiler's memory,
-  allocator and stack, as a macro's has, and can write over them. A
-  session's linklets are not a program's: there is nothing to build.
-- **What an input makes lasts the session**: its syntax and its code are
-  in the session's arena, 10 to 30 KB an input.
-
-## Pages
-
-A program can be a page's (`web/`, `host/web`): its views are written as
-templates, and its host is a browser's page. `web/repl` is one that is a
-session of the compiler, which is its library: what is typed in the page
-is compiled and run in the page.
+A session compiles and runs code one piece at a time, as a REPL does. It
+is part of the compiler (`compiler/expander.sub`, the "sessions"
+section).
 
 ```sh
-next/web/repl/site.sh build/next/web/repl    # the site: the program, the host, the page, the sources
-host/web/serve.mjs build/next/web/repl       # serve it on this machine; any server of files does
-next/web/site.sh FILE OUT                    # the site of another program, FILE's
-next/tests/web/run.sh                        # the tests in a browser (Chromium, headless)
+next/sub eval FILE    # run FILE's top-level forms one at a time, as a session
 ```
 
-- **The host** (`host/web/subhost-web.mjs`) is the host of spec 4, on what
-  `host/subhost.mjs` and it share (`host/subhost-core.mjs`): a program is
-  the directory `sub build` wrote, fetched; its files are a map in memory,
-  filled from file packs (`host/web/pack.mjs`); and its instances stay
-  when `main` returns, since a page goes on. `instantiate` works as it
-  does anywhere, so the compiler runs in a page as it is: its build is
-  460 KB, and a session's first input, which compiles Substrate from its
-  source, takes a quarter of a second.
-- **Host modules.** A linklet can import from a module the page's host
-  was given by name, besides `host`: `dom` (`host/web/dom.mjs`) is the
-  page's document, and a page can give its own, as `web/repl/page.html`
-  gives `out`, what the session's code wrote. What a program imports says
-  what it can touch; the compiler's builds are given none, so compile-time
-  code in them stays reproducible (spec 4).
-- **Events.** The page calls the entry's `on-event` for each event a
-  listener is for, as a host calls `main` and `on-trap`; the program asks
-  the host for what the event carries, as it asks for an argument, which
-  a view's listener does for its message. After a trap the host calls
-  `on-trap` and the program goes on (spec 4).
-- **Views** (`web/ui.sub`) are a language on the C-like Lisp: a template
-  of elements, compiled where it is written. What never changes in it is
-  one piece of HTML, made once and copied for each instance; each part
-  that can change is a slot of the instance, holding what the page
-  shows; and an update works out each slot's value and changes the page
-  where it differs. So an update allocates nothing, and costs as the
-  view's slots number, not its nodes. A view's structure is all in its
-  template (`if`, `each`, a view in another): no code makes a node, which
-  is what lets a template be compiled. And its words are HTML's, checked
-  where they are written: an element, an attribute of it or an event
-  that HTML does not have is an error at the word, as is code of another
-  type than its place takes, an attribute that is there or not, as
-  `disabled` is, taking a truth, and one that is a number an integer.
-- **Patches.** A view changes no page. It writes patches to a buffer, and
-  the host applies them as one batch (`dom`'s `apply`): one call out of
-  wasm for an update. A program does not hold the page's nodes, only
-  numbers for them, so its views can be tested with no page, by the
-  patches they write (`tests/ui`, `web/trace.sub`).
-- **A page's program** (`web/web.sub`) is a model, the messages that
-  change it, and a view of it: a listener holds a message, a value, not
-  code, since the C-like Lisp's closures do not outlast their functions;
-  what a message takes of its event, as `(event value)`, a field's text,
-  is put in it when the event comes, as its field's type; `update`
-  changes the model for a message; and the view is brought up to date.
-  `web/examples/counter.sub` is one, 19 KB as a program.
-- **What it costs** (`web/examples/rows.sub`, timed by
-  `tests/web/rows.mjs` in Chromium, from a click to the page laid out
-  again): 1,000 rows made in 20 ms and 10,000 in 210 ms; a row of 10,000
-  selected, which brings every row up to date, in 0.5 ms; two rows of
-  1,000 swapped in 1 ms, and one removed in 0.8 ms.
+`eval` reports each form that fails and carries on with the next.
+`tests/session` has session tests in kernel code, the C-like Lisp,
+Substrate and Bend.
+
+How it works: each piece of code typed into a session (an "input") is
+compiled into a small wasm module of its own, which is instantiated at
+once, inside the running compiler. This is the mechanism that already
+runs macros at compile time. A session uses it for ordinary run-time
+code too.
+
+- **A session has no fixed language.** As in a file, the language is
+  whatever the inputs `require`. `(require-unqualified c ".../c.sub")`
+  makes a session in the C-like Lisp, and a session that requires
+  nothing is in kernel code. Requiring a second language later does not
+  switch the session cleanly: the second language's names replace the
+  first's, but basic forms that only the first language defines, such as
+  `if` and `#%app`, keep the first language's meaning. To change
+  language, start a new session.
+- **Definitions last.** A definition made by one input can be used by
+  every later input. Defining a name again replaces it for later inputs.
+  Code that was compiled earlier keeps using the old definition, because
+  a compiled call refers to a function, not to a name.
+- **The language decides how values are shown.** When an input contains
+  an expression `e`, the compiler rewrites it to `(#%top-interaction e)`
+  if the session's language binds that name to a macro. (A function call
+  becomes `(#%app f arg ...)` by the same convention, spec 5.3.)
+  Substrate's macro prints the value. The C-like Lisp's macro
+  type-checks `e` as it would a function body, and prints the value
+  according to its type. Kernel code has no such macro: an expression is
+  run and its value is dropped.
+- **A failed input changes nothing**, apart from whatever its code had
+  already done when it failed: its definitions are removed. A trap in an
+  input's code is reported like any other error, with a backtrace.
+- **Inputs are trusted.** An input's code runs inside the compiler. It
+  links to the modules the compiler itself is running, and C-like Lisp
+  code in a session shares the compiler's memory, allocator and stack,
+  and can overwrite them. A program that evaluates code it does not
+  trust should run the whole session in a sandbox, as the REPL page does
+  (see "Guests" below).
+- **Memory grows.** What an input creates, its syntax and its code, is
+  kept for as long as the session lasts: 10 to 30 KB per input.
+
+## Web pages
+
+A program can run in a browser and draw a web page. `web/` has the
+libraries for this, and `host/web` has the JavaScript that runs a
+compiled program in a page. The demonstration is `web/repl`, a REPL in
+which everything that is typed is compiled and run in the browser.
+
+```sh
+next/web/repl/site.sh build/next/web/repl    # build the REPL's web site
+host/web/serve.mjs build/next/web/repl       # serve it, and open the address it prints
+next/web/site.sh FILE OUT                    # build the site of another program
+next/tests/web/run.sh                        # run the browser tests (headless Chromium)
+```
+
+A site is made of static files only, so any web server can serve it.
+
+### The pieces
+
+- **The browser host** (`host/web/subhost-web.mjs`). A "host" loads a
+  compiled program and provides its imports (spec 4). Most of that code
+  is shared between Node and the browser (`host/subhost-core.mjs`). The
+  browser's part fetches the program's modules over HTTP, and keeps the
+  program's "files" in memory; they can be downloaded in bulk as file
+  packs (`host/web/pack.mjs`). It also keeps the program alive after
+  `main` returns, so that the program can respond to events. The
+  compiler itself runs in a browser unchanged; its build is 460 KB.
+- **Host modules.** Besides the standard `host` imports, a page can give
+  a program extra modules of host functions, each under a name. A
+  program can only use the modules it is given, so they also work as
+  permissions. There are two: `dom` (`host/web/dom.mjs`), for drawing on
+  the page, and `guest` (`host/web/guest.mjs`), for running other
+  programs in a sandbox. The compiler is run with no extra modules, so
+  code that runs at compile time cannot use them, and builds stay
+  reproducible (spec 4).
+- **Views** (`web/ui.sub`): a template language for pages, built on the
+  C-like Lisp. A view looks like the HTML it produces, with holes for
+  the parts that depend on the program's data. Views are compiled. The
+  constant parts of a view become one HTML string, which the browser
+  parses once and clones for each instance. Each hole remembers its last
+  value; an update recomputes the holes and changes the page only where
+  a value differs. So an update allocates nothing, and its cost depends
+  on the number of holes, not on the size of the page. The names of HTML
+  elements, attributes and events are checked at compile time, and so
+  are the types of expressions: a boolean attribute such as `disabled`
+  takes a condition, and a numeric one takes an integer. Errors point at
+  the word or the expression in the template.
+- **Patches.** A view never touches the page itself. It writes "patches",
+  small binary instructions, into a buffer, and the host applies the
+  whole buffer in one call. This keeps the number of calls between wasm
+  and JavaScript low. It also means that views can be tested without a
+  browser, by printing the patches (`tests/ui`, `web/trace.sub`).
+- **Program structure** (`web/web.sub`): a model (all of the program's
+  state), a message type (everything that can happen), an `update`
+  function, and a view. The design is Elm's. An event listener in a
+  template names the message to send, and the message can carry data
+  from the event, such as `(event value)` for the text of a field.
+  Messages are data rather than callbacks, because the C-like Lisp's
+  closures cannot be stored. Things that happen outside the page, such
+  as a reply from a guest, are turned into messages with `send!`.
+  `web/examples/counter.sub` is a minimal example; its compiled program
+  is 20 KB.
+- **Guests** (`host/web/guest.mjs`, `c/guest.sub`): running code that is
+  not trusted. A program can start another program as a "guest": a
+  separate sandbox with its own memory. The two share nothing, and they
+  communicate only by messages, which are bytes that the host copies.
+  The first program decides what the guest gets: its program, its
+  arguments, the directories it may read and write, a time limit for
+  each message, and a memory limit. It can stop the guest at any time,
+  even in the middle of an infinite loop, and it is told when the guest
+  prints, sends a message, finishes handling a message, crashes or
+  exits. In a browser a guest is a Web Worker, so it also runs in
+  parallel with the page. The interface itself does not depend on
+  workers: a host with a single thread could run a guest between the
+  main program's events, and stop it with an instruction budget. Only
+  the browser host implements guests so far.
+
+### The REPL page
+
+`web/repl` is two programs. `repl.sub` is the page: the user interface,
+39 KB when compiled. `session.sub` is the compiler with a session
+(460 KB), which the page runs as a guest. Each input is sent to the
+guest, which compiles and runs it and sends back the result.
+
+Because the user's code runs in the guest, it cannot harm the page:
+
+- An input that loops forever leaves the page responsive, and a Stop
+  button kills the guest.
+- An input that corrupts memory, which is possible in the C-like Lisp,
+  breaks only the guest. The page notices that the guest has stopped
+  answering, and replaces it.
+- When a guest is replaced, the page sends the new one every input that
+  had succeeded, so the new session has the same definitions as the old
+  one.
+
+### Measurements
+
+In headless Chromium, on the development machine:
+
+| The REPL | |
+|---|---|
+| The page is ready | 80 ms |
+| Starting a guest that contains the compiler | 20 ms |
+| The first input of a session, which compiles Substrate from source | 210 ms |
+| A later input, from sending it to receiving the reply | 0.4 ms |
+| Stopping a looping guest and restoring a session of 23 inputs | 100 ms |
+
+| The rows example (`web/examples/rows.sub`) | |
+|---|---|
+| Create 1,000 rows | 20 ms |
+| Create 10,000 rows | 210 ms |
+| Select one row of 10,000 (every row is checked for changes) | 0.5 ms |
+| Swap two rows of 1,000 | 1 ms |
+| Remove one row of 1,000 | 0.9 ms |
+
+The rows are timed by `tests/web/rows.mjs`, from the click until the
+browser has laid the page out again.
 
 ## Plan
 

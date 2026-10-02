@@ -1,0 +1,102 @@
+;; Lifecycle: experimental.
+;;
+;; The REPL web page: the compiler half.
+;;
+;; The page (repl.sub) starts this program as a "guest": a separate
+;; program in its own sandbox (in a browser, a Web Worker), with its own
+;; memory. See next/c/guest.sub for the guest functions.
+;;
+;; This program is the compiler, linked in as a library, plus a small
+;; loop: receive an input from the page, compile and run it, send back
+;; the result. The inputs are evaluated in one compiler "session" (see
+;; the "sessions" section of next/compiler/expander.sub), so a definition
+;; made by one input can be used by later inputs.
+;;
+;; The user's code runs inside this program. It can read and overwrite
+;; this program's memory, including the compiler's own data. It cannot
+;; reach the page's memory, and it can only read the files the page
+;; granted (repl.sub, session-spec).
+;;
+;; Messages:
+;;   page -> guest   bytes 0-3: the input's number (u32, little-endian)
+;;                   the rest:  the input text
+;;   guest -> page   byte 0:    0 if the input succeeded, 1 if it failed
+;;                   the rest:  the error message, if any
+;; Whatever the input prints goes to this program's standard output and
+;; standard error. The host forwards both to the page as the input runs.
+(require-unqualified c "../../c/c.sub")
+(require-unqualified kd "../../compiler/kernel.sub")
+(require-unqualified ex "../../compiler/expander.sub")
+(require-unqualified guest "../../c/guest.sub")
+
+(memory from c)
+(table from c)
+
+;; The message being handled. One buffer is reused for every message.
+(define input buffer)
+
+;; 1 while an input is being evaluated. If the program traps (crashes)
+;; during evaluation, this is still 1 when on-trap runs, which is how
+;; on-trap knows that a reply is owed.
+(define evaluating i32 0)
+
+;; Called once, when the guest starts. Tells the compiler where its files
+;; are, then opens the session.
+;;   /src       the library sources, which inputs can `require`
+;;   /session   this program's own compiled files. The compiler reads
+;;              them so that the code it compiles at run time (macros,
+;;              and the user's inputs) links to the modules this
+;;              program is already running, instead of loading second
+;;              copies of them.
+(define (main)
+  (set! input (make-buffer))
+  (set-repository-root! `"/src")
+  (set-package-root! `"/src")
+  (set-running-directory! `"/session")
+  (session-open! `"repl"))
+
+;; Sends the reply for the current input: a status byte (0 = succeeded,
+;; 1 = failed), then the error message. `error` is a compiler string, or
+;; 0 for none.
+(define (reply! [failed i32] [error datum])
+  (let ([b (make-buffer)])
+    (buffer-add-byte! (& b) failed)
+    (when (!= error 0) (buffer-add! (& b) (string-bytes error) (string-length error)))
+    (guest-send 0 (-> b bytes) (-> b length))
+    (buffer-free! (& b))))
+
+;; The host calls this function, by name, for each message from the page.
+;; It evaluates the input and replies. The input's source name is
+;; "input-N", where N is its number, so errors point at, for example,
+;; "input-3:1:2".
+(define (on-message)
+  (set! (-> input length) 0)
+  (when (>= (guest-take! (& input)) 4)
+    (let* ([id (@ (cast (ptr u32) (-> input bytes)))]
+           [source (format-message "input-~a" (cons (make-integer id) nil))]
+           [text (bytes->string (+ (-> input bytes) 4) (- (-> input length) 4))])
+      (set! evaluating 1)
+      (let ([succeeded (session-eval-text! text source)])
+        (set! evaluating 0)
+        (reply! (not succeeded) (if succeeded 0 (session-error)))))))
+
+;; The host calls on-trap, by name, after a trap (a crash such as
+;; `unreachable` or an out-of-bounds memory access) in this program.
+;;
+;; Most errors in an input do not get here: the compiler catches them and
+;; session-eval-text! returns 0. A trap in a macro, though, unwinds the
+;; compiler itself. When that happens:
+;;   1. reset-stack! puts the C stack pointer back to the top of the
+;;      stack. The trap skipped the code that would have done so.
+;;   2. The page is sent a "failed" reply with the trap's message.
+;;   3. session-recover! returns the compiler to the state it was in
+;;      before the input.
+;; on-trap must be a kernel-level function (`func`), because C code
+;; cannot run until the stack pointer is valid again.
+(func (on-trap) (reset-stack!) (after-trap))
+
+(define (after-trap)
+  (when evaluating
+    (set! evaluating 0)
+    (reply! 1 (trap-report))
+    (session-recover!)))
