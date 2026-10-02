@@ -19,7 +19,8 @@
 # Lisp as the new compiler builds it (next/c); next/tests/bend has the
 # tests of Bend as the new compiler builds it (next/bend), and
 # next/tests/substrate has the
-# tests of Substrate as the new compiler builds it (next/substrate). Then,
+# tests of Substrate as the new compiler builds it (next/substrate), and
+# next/tests/session those of sessions, which next/sub eval runs. Then,
 # as tests/run.sh does, the cache (spec 3.7): each program built again
 # from it is the same, and a stale entry is not used. OUT is where builds
 # go (default build). In the dev shell:
@@ -85,6 +86,21 @@ for t in "${tests[@]}"; do
     fail=$((fail + 1))
     echo "FAIL $base: $problem"
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
+  fi
+done
+# Sessions (next/tests/session): each file's forms evaluated one at a
+# time, an input each, by next/sub eval (next/compiler/expander.sub,
+# sessions). NAME.out is what that writes, the errors of the inputs that
+# fail among it, but for a backtrace's frames, which are a host's own.
+for t in next/tests/session/*.sub; do
+  name="$(basename "$t" .sub)"
+  actual="$(cd next/tests/session && "$root/next/sub" eval "$name.sub" -c "$cache" 2>&1 | grep -v '^    ')"
+  if [ -f "next/tests/session/$name.out" ] && [ "$actual" = "$(cat "next/tests/session/$name.out")" ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL next/tests/session/$name: output differs"
+    diff <(echo "$actual") "next/tests/session/$name.out" | head -20
   fi
 done
 # A module compiles to the same bytes whatever the run compiled before it
