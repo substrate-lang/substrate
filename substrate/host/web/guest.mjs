@@ -28,7 +28,7 @@
 //   import { guests } from './guest.mjs';
 //   boot({ ..., modules: { guest: guests() } })
 //
-// next/c/guest.sub wraps the module for programs written in the C-like
+// next/web/guest.sub wraps the module for programs written in the C-like
 // Lisp.
 //
 // ---- What a program can call ----

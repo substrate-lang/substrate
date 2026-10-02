@@ -21,7 +21,7 @@
 #   - By the program, as files. The page downloads the files listed in
 #     assets.list before it starts the program (host/web/subhost-web.mjs,
 #     the `lists` option), so the program can read "assets/NAME" with the
-#     ordinary file functions (next/c/files.sub).
+#     ordinary file functions (next/web/files.sub).
 #
 # The site is only static files, so any web server can serve it;
 # host/web/serve.mjs is one for this machine.

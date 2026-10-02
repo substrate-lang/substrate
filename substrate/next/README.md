@@ -52,9 +52,6 @@ on them there.
     or global that quotes it names it, with `kernel.sub`'s templates
     `` `t `` and `` #`t ``.
   - `runtime.sub`, `math.sub` and `c.sub`: `examples/c`'s.
-  - `files.sub`: reading and writing files, which works on every host.
-  - `guest.sub`: functions for running another program in a sandbox (a
-    "guest"), on hosts that support it (see "Web pages" below).
   - `syntax-match.sub`: `lib/substrate.sub`'s patterns for syntax, in
     kernel code, on the kernel module's syntax objects, its code kernel
     code; `c-syntax-match.sub`, the same, its code C, for macros written
@@ -119,6 +116,9 @@ on them there.
     update, view) and its connection to the browser.
   - `canvas.sub`: drawing on a `<canvas>` element: rectangles, paths,
     circles, text, and sprites from image files.
+  - `files.sub`: reading and writing files, which works on every host.
+  - `guest.sub`: functions for running another program in a sandbox (a
+    "guest"), on hosts that support it.
   - `game/`: a small library for 2D games:
     - `game.sub`: the game loop. `(game World [size 320 180] init step
       draw)` turns three functions into a game in a page.
@@ -165,8 +165,8 @@ on them there.
   for byte, but where the new compiler differs by design.
 - `tests/`: the new compiler's own tests, which it builds (`run.sh`): the
   kernel's tests of compile-time code and of `syntax-match`, on the new
-  kernel module; the C example's tests (`tests/c`), on `c/`, with a
-  test of `c/files.sub`; the Substrate tests of `tests/`
+  kernel module; the C example's tests (`tests/c`), on `c/`; the
+  Substrate tests of `tests/`
   (`tests/substrate`), on `substrate/`, with
   their outputs, but for those of Substrate's syntax objects and its code
   at compile time; the Bend tests of `tests/` and `examples/bend.sub`
@@ -175,9 +175,9 @@ on them there.
   kernel's tests, which is what the compiler gives. `tests/ui` tests
   the page views (`web/ui.sub`): the tests print the page changes that
   a view produces, and check the error messages for templates that are
-  wrong. They also test the game library (collision, keys, timers,
-  sound, its containers and its formatting), and play the two example
-  games without their pages: the
+  wrong. They also test reading files (`web/files.sub`) and the game
+  library (collision, keys, timers, sound, its containers and its
+  formatting), and play the two example games without their pages: the
   platformer is played by a bot that presses the keys.
   `tests/session` tests sessions: `next/sub eval` runs each
   file, one form at a time. `tests/web/run.sh` is separate, and runs
@@ -391,7 +391,7 @@ A site is made of static files only, so any web server can serve it.
   files. So the page can use one by its URL, `assets/NAME`, wherever
   the browser takes a URL: the `src` of an `<img>` in a view, a style
   sheet, `load-image`. The program can also read them as files
-  (`c/files.sub`): `site.sh` writes their names in `assets.list`, and
+  (`web/files.sub`): `site.sh` writes their names in `assets.list`, and
   the page downloads the files in that list before it starts the
   program. Nothing in the program is specific to the browser. The
   same program, run on the command line in its own directory, reads
@@ -456,7 +456,7 @@ A site is made of static files only, so any web server can serve it.
 
   What they do not do: plain arrays and pointers are still unchecked,
   so code that uses those directly is as unsafe as before.
-- **Guests** (`host/web/guest.mjs`, `c/guest.sub`): running code that is
+- **Guests** (`host/web/guest.mjs`, `web/guest.sub`): running code that is
   not trusted. A program can start another program as a "guest": a
   separate sandbox with its own memory. The two share nothing, and they
   communicate only by messages, which are bytes that the host copies.
