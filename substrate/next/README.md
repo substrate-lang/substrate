@@ -75,19 +75,23 @@ on them there.
     `syntax-rules`, which compile into C at its phase 1, not with
     Substrate code: Substrate does not run at compile time, and has no
     syntax objects among its values.
-- `cells/`: an experiment on `substrate/`: Substrate with its values the
-  kernel module's cells (plan, 6), so that a program needs no GC and
-  Substrate's data at compile time is the kernel module's, syntax
-  objects included, and its macros are written in Substrate again:
+- `owned/`: Substrate on its own values (plan, 6): `substrate/` but
+  that its values are nodes in the program's memory, owned and freed by
+  the program, so that a program needs no GC; its macros are written in
+  the C-like Lisp, as `substrate/`'s are, and Substrate does not run at
+  compile time:
+  - `values.sub`: Substrate's data in the C-like Lisp: pairs, symbols
+    and keywords (interned), strings, integers, flonums and characters,
+    with fixnums and characters in the datum itself, #f 0; a header word
+    per node with its tag and its count of owners, `dup` and `drop`, a
+    free list per size filled from chunks, the drop loop, which frees a
+    list cdr by cdr, and the layouts and droppers of the runtime's
+    kinds; `quote` and `quasiquote`, whose data a module makes once as
+    it starts, permanent, in kernel code, and `lit`, the same in C code.
   - `runtime.sub`: what Substrate's code runs with, in the C-like Lisp:
     closures, boxes, vectors, byte strings, structs, hash tables, ports
-    and exceptions as records of the kernel module's, their blocks in
-    memory; calls, errors, handlers, writing and the host. Substrate's
-    code runs in the heap (`use-heap!`): a program's from its start, and
-    at compile time a module's as it starts and a macro's as it is
-    called, so that its cells and blocks are owned and freed by their
-    last owner; what the compiler makes around it is its module arena's,
-    freed with the module.
+    and exceptions as nodes of `values.sub`'s; calls, errors, handlers,
+    writing and the host.
   - `lower.sub`: closures without the kernel's, and ownership, in the
     C-like Lisp at compile time. A function's body, once expanded, has
     each variable some lambda captures and some code assigns boxed; a
@@ -96,16 +100,15 @@ on them there.
     other lambda lifted to a function of the closure and its parameters.
     Its values are owned: the last use of a variable moves its value, an
     earlier use dups it, a variable never used again is dropped, and so
-    a program frees what it is done with (`tests/cells/live-cells.sub`).
+    a program frees what it is done with (`tests/owned/live-nodes.sub`).
     A parameter a function only reads is borrowed, its caller keeping
     the value through the call: the module's functions' bodies are
     expanded as its second pass begins, and their flags inferred
-    together and written as their facts (`tests/cells/borrowed.sub`).
-  - `core.sub`: `substrate/core.sub` on i32 values and the runtime, and
-    `define-syntax` whose transformer is Substrate code.
-  - `substrate.sub`: `lib/substrate.sub`'s forms, `syntax-match` and
-    `match`, written in Substrate at phase 1, as they were; `rules.sub`:
-    `syntax-rules`, in C, which `define-syntax` sends it to.
+    together and written as their facts (`tests/owned/borrowed.sub`).
+  - `core.sub`: `substrate/core.sub` on i32 values and the runtime.
+  - `substrate.sub`: `substrate/substrate.sub`'s forms and `match`, in
+    C, on the owned core; `rules.sub`: `syntax-rules`, in C, which
+    `define-syntax` sends it to.
 - `bend/`: Bend as the new compiler builds it, `examples/bend` ported to
   the C-like Lisp (plan, 5):
   - `core.sub`: `examples/bend/core.sub`, the checker, function for
@@ -156,8 +159,8 @@ on them there.
   kernel module; the C example's tests (`tests/c`), on `c/`; the
   Substrate tests of `tests/` (`tests/substrate`), on `substrate/`, with
   their outputs, but for those of Substrate's syntax objects and its code
-  at compile time, and those and the typed example on `cells/`
-  (`tests/cells`); the Bend tests of `tests/` and `examples/bend.sub`
+  at compile time, and the same on `owned/` (`tests/owned`), with the
+  tests of what it frees; the Bend tests of `tests/` and `examples/bend.sub`
   (`tests/bend`), on `bend/`; and the tests of its parts: its syntax
   objects, its reader, and what its expander and back end give for the
   kernel's tests, which is what the compiler gives. Then, as `tests/run.sh` checks the
