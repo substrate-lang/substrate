@@ -169,6 +169,46 @@ const checks = {
       '(() => { window.given = 0; document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a").click(); return window.given; })()'), 1);
   },
 
+  // next/tests/web/fields.sub: attributes that are there or not and that
+  // are numbers, in the page, and messages with their events' data.
+  async fields(page) {
+    const shown = () => page.evaluate('document.getElementById("shown").textContent');
+    const attribute = (id, name) => page.evaluate(`document.getElementById("${id}").getAttribute("${name}")`);
+    check('loaded', await shown(), '||0|0');
+    check('what stays is the template\'s', await page.evaluate('document.getElementById("field").outerHTML'),
+      '<input id="field" type="text" maxlength="12" autofocus="">');
+    check('the button is disabled', await attribute('send', 'disabled'), '');
+    check('the cell spans one column', await attribute('cell', 'colspan'), '1');
+    check('a textarea\'s value, which its HTML has no attribute for, is given it',
+      await page.evaluate('document.getElementById("area").value'), 'kept');
+    await page.click('#send');
+    check('and a click on it is not heard', await shown(), '||0|0');
+
+    await page.click('#field');
+    await page.type('abc');
+    check('what is typed is the message\'s text', await shown(), 'abc||0|0');
+    check('the cell spans as the text is long', await attribute('cell', 'colspan'), '4');
+    await page.press('Enter', 8);
+    check('a key, with shift', await shown(), 'abc|Enter+shift|0|0');
+    await page.press('ArrowUp', 2);
+    check('another, with control', await shown(), 'abc|ArrowUp+control|0|0');
+    await page.press('ArrowDown');
+    check('and one with neither', await shown(), 'abc|ArrowDown|0|0');
+
+    await page.click('#box');
+    check('the box, checked, is the message\'s truth: the button is not disabled',
+      await attribute('send', 'disabled'), null);
+    check('the box is checked', await page.evaluate('document.getElementById("box").checked'), true);
+    await page.click('#send');
+    check('and its click is heard', await shown(), 'abc|ArrowDown|1|0');
+    await page.click('#box');
+    check('not checked, it is disabled again', await attribute('send', 'disabled'), '');
+    check('the box is not checked', await page.evaluate('document.getElementById("box").checked'), false);
+
+    await page.evaluate('document.getElementById("part").dispatchEvent(new Event("my-event"))');
+    check('an event of the page\'s own, named by a string', await shown(), 'abc|ArrowDown|1|1');
+  },
+
   // next/tests/web/focus.sub: an event that a batch's patch causes is
   // handled while the batch is being applied, and the batch is applied
   // once.

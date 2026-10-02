@@ -21,7 +21,7 @@
 # next/tests/substrate has the
 # tests of Substrate as the new compiler builds it (next/substrate),
 # next/tests/ui those of a page's views (next/web/ui.sub), by the patches
-# they write, and
+# they write and the errors of templates that are wrong, and
 # next/tests/session those of sessions, which next/sub eval runs. Then,
 # as tests/run.sh does, the cache (spec 3.7): each program built again
 # from it is the same, and a stale entry is not used. OUT is where builds

@@ -17,8 +17,10 @@
 //                                 bytes of it copied to buf; its length
 //   event_key (buf cap) -> len    the key of a keyboard event, as its name,
 //                                 such as "Enter" or "a"
-//   event_flags () -> i32         the keys held with it: 1 shift, 2
-//                                 control, 4 alt, 8 meta
+//   event_flags () -> i32         what is so of it, as bits: the keys held
+//                                 with it, 1 shift, 2 control, 4 alt, 8
+//                                 meta; and 16, the element it came from
+//                                 is checked, as a checkbox is
 //   prevent_default ()            the event does not do what it would
 //
 // A listener gives its event to the program by calling the entry's
@@ -275,7 +277,8 @@ export function dom(root) {
       },
       event_flags() {
         if (!event) return 0;
-        return (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0);
+        return (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0) |
+          (event.target && event.target.checked === true ? 16 : 0);
       },
       prevent_default() {
         if (event) event.preventDefault();

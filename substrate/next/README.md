@@ -138,7 +138,8 @@ on them there.
   (`tests/bend`), on `bend/`; and the tests of its parts: its syntax
   objects, its reader, and what its expander and back end give for the
   kernel's tests, which is what the compiler gives; those of views
-  (`tests/ui`), by the patches they write; and those of sessions
+  (`tests/ui`), by the patches they write and the errors of templates
+  that are wrong; and those of sessions
   (`tests/session`), each a file whose forms `next/sub eval` evaluates.
   `tests/web/run.sh`, apart, runs those that need a browser: the sessions
   again, by the compiler in a page, and the pages of `web/`.
@@ -281,8 +282,9 @@ next/tests/web/run.sh                        # the tests in a browser (Chromium,
   code in them stays reproducible (spec 4).
 - **Events.** The page calls the entry's `on-event` for each event a
   listener is for, as a host calls `main` and `on-trap`; the program asks
-  the host for what the event carries, as it asks for an argument. After
-  a trap the host calls `on-trap` and the program goes on (spec 4).
+  the host for what the event carries, as it asks for an argument, which
+  a view's listener does for its message. After a trap the host calls
+  `on-trap` and the program goes on (spec 4).
 - **Views** (`web/ui.sub`) are a language on the C-like Lisp: a template
   of elements, compiled where it is written. What never changes in it is
   one piece of HTML, made once and copied for each instance; each part
@@ -291,7 +293,11 @@ next/tests/web/run.sh                        # the tests in a browser (Chromium,
   where it differs. So an update allocates nothing, and costs as the
   view's slots number, not its nodes. A view's structure is all in its
   template (`if`, `each`, a view in another): no code makes a node, which
-  is what lets a template be compiled.
+  is what lets a template be compiled. And its words are HTML's, checked
+  where they are written: an element, an attribute of it or an event
+  that HTML does not have is an error at the word, as is code of another
+  type than its place takes, an attribute that is there or not, as
+  `disabled` is, taking a truth, and one that is a number an integer.
 - **Patches.** A view changes no page. It writes patches to a buffer, and
   the host applies them as one batch (`dom`'s `apply`): one call out of
   wasm for an update. A program does not hold the page's nodes, only
@@ -300,8 +306,10 @@ next/tests/web/run.sh                        # the tests in a browser (Chromium,
 - **A page's program** (`web/web.sub`) is a model, the messages that
   change it, and a view of it: a listener holds a message, a value, not
   code, since the C-like Lisp's closures do not outlast their functions;
-  `update` changes the model for a message; and the view is brought up
-  to date. `web/examples/counter.sub` is one, 17 KB as a program.
+  what a message takes of its event, as `(event value)`, a field's text,
+  is put in it when the event comes, as its field's type; `update`
+  changes the model for a message; and the view is brought up to date.
+  `web/examples/counter.sub` is one, 19 KB as a program.
 - **What it costs** (`web/examples/rows.sub`, timed by
   `tests/web/rows.mjs` in Chromium, from a click to the page laid out
   again): 1,000 rows made in 20 ms and 10,000 in 210 ms; a row of 10,000
