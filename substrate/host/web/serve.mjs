@@ -28,7 +28,17 @@ const types = {
   '.css': 'text/css; charset=utf-8',
   '.wasm': 'application/wasm',
   '.json': 'application/json',
+  '.txt': 'text/plain; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.woff2': 'font/woff2',
 };
 
 const server = http.createServer((request, response) => {

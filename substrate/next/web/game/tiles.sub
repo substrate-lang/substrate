@@ -1,0 +1,236 @@
+;; Lifecycle: experimental.
+;;
+;; Tile maps for 2D games: a level built from square tiles, things that
+;; move through it without passing through walls, and a camera.
+;;
+;; A tile map is a grid. Each cell holds a tile number: 0 for empty, and
+;; 1 to 255 for the kinds of tile a game has (grass, brick, spikes, ...).
+;; The game says which kinds are solid.
+;;
+;;   (tilemap-init! m columns rows size)   an empty map; `size` is the
+;;                                         width and height of one tile,
+;;                                         in pixels
+;;   (tile-set! m column row tile)         puts a tile in a cell
+;;   (tile-at m column row)                the tile in a cell; 0 outside
+;;                                         the map
+;;   (tile-solid! m tile)                  declares a kind of tile solid
+;;   (solid-at? m column row)              1 if the cell holds a solid
+;;                                         tile. Beyond the left and right
+;;                                         edges of the map everything is
+;;                                         solid, so nothing can walk out
+;;                                         of the level. Above and below
+;;                                         it nothing is, so things can
+;;                                         jump above the top and fall out
+;;                                         of the bottom.
+;;
+;; A body is a rectangle that moves: a player, an enemy. Its position
+;; (x, y) is its top left corner, in pixels, and (vx, vy) is how far it
+;; moves in one step of the game.
+;;
+;;   (move-body! b m)        moves the body by its velocity, stopping it
+;;                           at solid tiles. Afterwards these fields say
+;;                           what it ran into:
+;;                             on-ground    1 if it is standing on a tile
+;;                             hit-wall     1 if a wall stopped it
+;;                             hit-ceiling  1 if it bumped its head
+;;                           The velocity along a blocked direction is
+;;                           set to 0.
+;;   (bodies-overlap? a b)   1 if two bodies' rectangles overlap
+;;
+;; The usual way to use move-body! each step: change the velocity (add
+;; gravity to vy, set vx from the keys), then call move-body!. A body that
+;; stands still is pulled down by gravity and stopped by the floor every
+;; step, which is what keeps on-ground at 1.
+;;
+;; A camera is the top left corner of the part of the level that is on
+;; the screen.
+;;
+;;   (camera-follow! c x y screen-width screen-height m)
+;;                           centres the camera on the point (x, y), but
+;;                           never shows anything outside the map
+;;   (draw-tilemap m image c screen-width screen-height)
+;;                           draws the tiles that are on the screen. Tile
+;;                           number n is drawn as cell n - 1 of the sprite
+;;                           sheet `image` (next/web/canvas.sub), whose
+;;                           cells are the size of a tile.
+;;
+;; To draw anything else at its place in the level, subtract the camera:
+;; a body at (x, y) is drawn at (x - camera x, y - camera y).
+;;
+;; This file uses nothing from the browser, so a game built on it can be
+;; tested without one.
+(require-unqualified c "../../c/c.sub")
+(require-unqualified canvas "../canvas.sub")
+
+(provide tilemap tilemap-init! tile-set! tile-at tile-solid! solid-at?
+         body move-body! bodies-overlap?
+         camera camera-follow! draw-tilemap)
+
+(memory from c)
+(table from c)
+
+;; ---- The map ----
+
+(struct tilemap
+  [columns i32] [rows i32]
+  ;; The width and height of one tile, in pixels.
+  [size i32]
+  ;; The tile numbers, one byte per cell, row after row.
+  [tiles (ptr u8)]
+  ;; solid[n] is 1 if tiles numbered n are solid.
+  [solid (array u8 256)])
+
+(define (tilemap-init! [m (ptr tilemap)] [columns i32] [rows i32] [size i32])
+  (set! (-> m columns) columns)
+  (set! (-> m rows) rows)
+  (set! (-> m size) size)
+  (set! (-> m tiles) (cast (ptr u8) (calloc (cast u32 (* columns rows)) 1)))
+  (memset (-> m solid) 0 256))
+
+(define (inside? [m (ptr tilemap)] [column i32] [row i32]) -> i32
+  (and (>= column 0) (< column (-> m columns)) (>= row 0) (< row (-> m rows))))
+
+(define (tile-set! [m (ptr tilemap)] [column i32] [row i32] [tile u32])
+  (when (inside? m column row)
+    (set! (@ (-> m tiles) (+ (* row (-> m columns)) column)) (cast u8 tile))))
+
+(define (tile-at [m (ptr tilemap)] [column i32] [row i32]) -> u32
+  (if (inside? m column row)
+      (cast u32 (@ (-> m tiles) (+ (* row (-> m columns)) column)))
+      0))
+
+(define (tile-solid! [m (ptr tilemap)] [tile u32])
+  (when (< tile 256) (set! (@ (-> m solid) tile) 1)))
+
+(define (solid-at? [m (ptr tilemap)] [column i32] [row i32]) -> i32
+  (cond [(or (< column 0) (>= column (-> m columns))) 1]
+        [(or (< row 0) (>= row (-> m rows))) 0]
+        [else (!= (@ (-> m solid) (tile-at m column row)) 0)]))
+
+;; ---- Bodies ----
+
+(struct body
+  [x f64] [y f64] [width f64] [height f64]
+  [vx f64] [vy f64]
+  [on-ground i32] [hit-wall i32] [hit-ceiling i32])
+
+;; Returns the column (or row) of the tile that contains the pixel
+;; position p.
+(define (cell-of [m (ptr tilemap)] [p f64]) -> i32 (cast i32 (floor (/ p (cast f64 (-> m size))))))
+
+;; A body whose right edge is exactly on a tile's left edge touches that
+;; tile but is not inside it. Edges are moved in by this much before
+;; asking which tiles they are in, so that touching does not count.
+(define (edge) -> f64 0.001)
+
+;; Returns 1 if the vertical strip of the body at pixel column x overlaps
+;; a solid tile: it checks every row that the body covers.
+(define (solid-column? [m (ptr tilemap)] [b (ptr body)] [x f64]) -> i32
+  (let ([column (cell-of m x)] [last (cell-of m (- (+ (-> b y) (-> b height)) (edge)))])
+    (for ([row i32 (cell-of m (-> b y))]) (<= row last) (+= row 1)
+      (when (solid-at? m column row) (return 1)))
+    0))
+
+;; The same for the horizontal strip of the body at pixel row y.
+(define (solid-row? [m (ptr tilemap)] [b (ptr body)] [y f64]) -> i32
+  (let ([row (cell-of m y)] [last (cell-of m (- (+ (-> b x) (-> b width)) (edge)))])
+    (for ([column i32 (cell-of m (-> b x))]) (<= column last) (+= column 1)
+      (when (solid-at? m column row) (return 1)))
+    0))
+
+;; Moves the body horizontally by `distance` pixels. If its leading edge
+;; ends up inside a solid tile, the body is put back so that it touches
+;; the tile, and its horizontal velocity is set to 0.
+;;
+;; The move is made in pieces shorter than a tile. Only the tiles at the
+;; leading edge are checked, so a single move longer than a tile could
+;; jump straight over a wall.
+(define (move-x! [b (ptr body)] [m (ptr tilemap)] [distance f64])
+  (let ([size (cast f64 (-> m size))] [left distance])
+    (while (!= left 0.0)
+      (let* ([most (- size 1.0)]
+             [piece (if (> left most) most (if (< left (- 0.0 most)) (- 0.0 most) left))])
+        (-= left piece)
+        (+= (-> b x) piece)
+        (if (> piece 0.0)
+            ;; Moving right: the leading edge is the right one.
+            (let ([right (- (+ (-> b x) (-> b width)) (edge))])
+              (when (solid-column? m b right)
+                (set! (-> b x) (- (* (cast f64 (cell-of m right)) size) (-> b width)))
+                (set! (-> b vx) 0.0)
+                (set! (-> b hit-wall) 1)
+                (return)))
+            ;; Moving left.
+            (when (solid-column? m b (-> b x))
+              (set! (-> b x) (* (cast f64 (+ (cell-of m (-> b x)) 1)) size))
+              (set! (-> b vx) 0.0)
+              (set! (-> b hit-wall) 1)
+              (return)))))))
+
+;; The same, vertically. Landing on a tile sets on-ground; bumping into
+;; one from below sets hit-ceiling.
+(define (move-y! [b (ptr body)] [m (ptr tilemap)] [distance f64])
+  (let ([size (cast f64 (-> m size))] [left distance])
+    (while (!= left 0.0)
+      (let* ([most (- size 1.0)]
+             [piece (if (> left most) most (if (< left (- 0.0 most)) (- 0.0 most) left))])
+        (-= left piece)
+        (+= (-> b y) piece)
+        (if (> piece 0.0)
+            ;; Moving down: the leading edge is the bottom one.
+            (let ([bottom (- (+ (-> b y) (-> b height)) (edge))])
+              (when (solid-row? m b bottom)
+                (set! (-> b y) (- (* (cast f64 (cell-of m bottom)) size) (-> b height)))
+                (set! (-> b vy) 0.0)
+                (set! (-> b on-ground) 1)
+                (return)))
+            ;; Moving up.
+            (when (solid-row? m b (-> b y))
+              (set! (-> b y) (* (cast f64 (+ (cell-of m (-> b y)) 1)) size))
+              (set! (-> b vy) 0.0)
+              (set! (-> b hit-ceiling) 1)
+              (return)))))))
+
+;; Moving along one axis at a time is what lets a body slide: a player
+;; who runs into a wall while falling is stopped sideways and keeps
+;; falling, instead of sticking to the wall.
+(define (move-body! [b (ptr body)] [m (ptr tilemap)])
+  (set! (-> b on-ground) 0)
+  (set! (-> b hit-wall) 0)
+  (set! (-> b hit-ceiling) 0)
+  (move-x! b m (-> b vx))
+  (move-y! b m (-> b vy)))
+
+(define (bodies-overlap? [a (ptr body)] [b (ptr body)]) -> i32
+  (and (< (-> a x) (+ (-> b x) (-> b width)))
+       (< (-> b x) (+ (-> a x) (-> a width)))
+       (< (-> a y) (+ (-> b y) (-> b height)))
+       (< (-> b y) (+ (-> a y) (-> a height)))))
+
+;; ---- The camera ----
+
+(struct camera [x f64] [y f64])
+
+;; Returns v, kept between low and high. If high is below low (the level
+;; is smaller than the screen), returns low.
+(define (clamp [v f64] [low f64] [high f64]) -> f64
+  (if (or (< v low) (< high low)) low (if (> v high) high v)))
+
+(define (camera-follow! [c (ptr camera)] [x f64] [y f64] [screen-width f64] [screen-height f64] [m (ptr tilemap)])
+  (let ([size (cast f64 (-> m size))])
+    (set! (-> c x) (clamp (- x (/ screen-width 2.0)) 0.0 (- (* (cast f64 (-> m columns)) size) screen-width)))
+    (set! (-> c y) (clamp (- y (/ screen-height 2.0)) 0.0 (- (* (cast f64 (-> m rows)) size) screen-height)))))
+
+;; Only the tiles that are on the screen are drawn, however large the
+;; level is. Positions are rounded down to whole pixels: a sprite drawn
+;; between two pixels would be blurred.
+(define (draw-tilemap [m (ptr tilemap)] [image u32] [c (ptr camera)] [screen-width f64] [screen-height f64])
+  (let* ([size (cast f64 (-> m size))]
+         [cx (floor (-> c x))] [cy (floor (-> c y))]
+         [last-column (cell-of m (+ cx screen-width))] [last-row (cell-of m (+ cy screen-height))])
+    (for ([row i32 (cell-of m cy)]) (<= row last-row) (+= row 1)
+      (for ([column i32 (cell-of m cx)]) (<= column last-column) (+= column 1)
+        (let ([tile (tile-at m column row)])
+          (when (!= tile 0)
+            (draw-sprite image size size (- tile 1)
+                         (- (* (cast f64 column) size) cx) (- (* (cast f64 row) size) cy) 0)))))))

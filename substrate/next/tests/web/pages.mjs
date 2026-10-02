@@ -485,6 +485,82 @@ const checks = {
     check('snake: the A key turns left and starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
   },
 
+  // next/web/examples/platformer: the platformer, built on the game
+  // library (next/web/game). The game's rules are tested without a browser
+  // by a bot that plays the level (next/tests/ui/platformer.sub). This
+  // checks what only a browser can show: the sprite sheet loads and is
+  // drawn, a held key moves the player, a jump plays a sound, and the
+  // small screen is stretched to fill the window.
+  //
+  // The screen is 320 by 180 pixels. `pixel(x, y)` reads one of them, as
+  // "red,green,blue,alpha". The level is 12 pixels taller than the
+  // screen, and the camera sits at the bottom, so the player, who starts
+  // at (35, 146) in the level, is drawn with its top at y = 134.
+  async platformer(page) {
+    const pixel = (x, y) => page.evaluate(
+      `[...document.querySelector("canvas").getContext("2d").getImageData(${x}, ${y}, 1, 1).data].join(",")`);
+    const sky = '143,211,255,255';
+    const dirt = '160,103,63,255';
+    const shirt = '83,155,245,255';
+    // The sprite sheet takes a moment to load. Until then no tile is drawn.
+    await page.waitFor(`(() => {
+      const d = document.querySelector("canvas").getContext("2d").getImageData(8, 170, 1, 1).data;
+      return d[0] === 160 && d[1] === 103;
+    })()`, 10000);
+    check('platformer: the ground is drawn from the sprite sheet', await pixel(8, 170), dirt);
+    check('platformer: the sky is drawn', await pixel(100, 100), sky);
+    check('platformer: the player is drawn where the level puts it', await pixel(40, 140), shirt);
+    // The page downloaded the sprite sheet with the program's other
+    // assets, before the program started. The image is made from that
+    // file, so the browser must not have requested it a second time.
+    check('platformer: the sprite sheet is downloaded only once', await page.evaluate(
+      'performance.getEntriesByType("resource").filter((e) => e.name.endsWith("/assets/sprites.png")).length'), 1);
+    check('platformer: the screen has 320 by 180 pixels',
+      await page.evaluate('(() => { const c = document.querySelector("canvas"); return c.width + "x" + c.height; })()'), '320x180');
+    check('platformer: the screen is stretched to the window, keeping its shape', await page.evaluate(`(() => {
+      const c = document.querySelector("canvas");
+      return c.clientWidth > 320 && Math.abs(c.clientWidth / c.clientHeight - 320 / 180) < 0.01;
+    })()`), true);
+
+    // A held key keeps the player running: its starting place empties.
+    await page.keyDown('ArrowRight');
+    await page.waitFor(`(() => {
+      const d = document.querySelector("canvas").getContext("2d").getImageData(40, 140, 1, 1).data;
+      return d[0] === 143 && d[1] === 211;
+    })()`, 5000);
+    check('platformer: holding the right arrow moves the player away', await pixel(40, 140), sky);
+    await page.keyUp('ArrowRight');
+
+    const before = await page.evaluate('window.audio.played()');
+    await page.press(' ');
+    await page.waitFor(`window.audio.played() > ${before}`, 5000);
+    check('platformer: a jump plays a sound', (await page.evaluate('window.audio.played()')) > before, true);
+  },
+
+  // next/tests/web/assets.sub: a program's assets, the files in the
+  // directory `assets` next to its source, which next/web/site.sh copies
+  // into the site. The page reads one as a text file. Another is a 4 by 4
+  // red square, which it draws in the middle of a white canvas of 16 by
+  // 16, and also shows in an <img> element, by its URL.
+  async assets(page) {
+    const text = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    const pixel = (x, y) => page.evaluate(
+      `[...document.getElementById("board").getContext("2d").getImageData(${x}, ${y}, 1, 1).data].join(",")`);
+    check('assets: a text asset is read as a file', await text('note'), 'An asset, read as a file.');
+    check('assets: and so is one in a folder, with "#" and a space in its name', await text('nested'), 'An asset in a folder.');
+    check('assets: a file that is not among the assets cannot be read', await text('missing'), 'no such file');
+    check('assets: a file the program wrote is read back', await text('written'), 'written and read back');
+    // An image takes a moment to decode, and to load from its URL.
+    await page.waitFor(`(() => {
+      const d = document.getElementById("board").getContext("2d").getImageData(8, 8, 1, 1).data;
+      return d[0] === 255 && d[1] === 0;
+    })()`, 10000);
+    check('assets: an image asset is drawn', await pixel(8, 8), '255,0,0,255');
+    check('assets: and only where it was drawn', await pixel(2, 2), '255,255,255,255');
+    await page.waitFor('document.getElementById("picture").complete', 10000);
+    check('assets: an image asset is shown by its URL', await page.evaluate('document.getElementById("picture").naturalWidth'), 4);
+  },
+
   // next/tests/web/focus.sub: a regression test for events that fire
   // while the page is being updated.
   //

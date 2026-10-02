@@ -16,14 +16,16 @@
 # on data in memory, i32s, where they worked on GC objects, and their
 # outputs are those tests' own. next/tests/fixtures holds the modules they
 # require. next/tests/c has the C example's tests (tests/c), on the C-like
-# Lisp as the new compiler builds it (next/c); next/tests/bend has the
+# Lisp as the new compiler builds it (next/c), and a test of its file
+# functions (next/c/files.sub); next/tests/bend has the
 # tests of Bend as the new compiler builds it (next/bend),
 # next/tests/substrate has the
 # tests of Substrate as the new compiler builds it (next/substrate),
 # next/tests/ui has the tests of the web libraries that need no browser
 # (next/web): they print the page changes a view produces, check the error
-# messages for templates that are wrong, and play the snake example's game
-# without its page. next/tests/session has the session tests, which
+# messages for templates that are wrong, test the game library's collision
+# and keyboard code, and play the two example games without their pages.
+# next/tests/session has the session tests, which
 # next/sub eval runs. Then,
 # as tests/run.sh does, the cache (spec 3.7): each program built again
 # from it is the same, and a stale entry is not used. OUT is where builds

@@ -40,6 +40,8 @@
 //       event happened, in milliseconds. which = 1 and 2: the x and y
 //       position of the mouse, in pixels from the top left corner of
 //       the element the event came from.
+//   images_loading () -> i32
+//       How many images are still being loaded (see patch 14, below).
 //   prevent_default ()
 //       Cancels the browser's default action for the event being handled.
 //
@@ -58,8 +60,28 @@
 // A "draw" patch (number 13) draws on a canvas element. It carries a
 // list of drawing commands, which next/web/canvas.sub documents, and
 // which `draw` below carries out on the canvas's 2D context.
+//
+// An "image" patch (number 14) starts loading an image file and gives it
+// a number. The patch names the image by a path, such as
+// "assets/sprites.png". If that is one of the program's files (the page
+// usually downloads a program's assets for it before it starts: see
+// next/web/site.sh), the image is made from the file's bytes, so it is
+// not downloaded a second time. Otherwise the path is taken as a URL and
+// fetched. A drawing command can then draw the image, or one cell of it
+// if the image is a sheet of sprites. Loading takes time: until an image
+// is ready, drawing it does nothing, and images_loading says how many
+// are still on their way.
+import { resolvePath } from './subhost-web.mjs';
+
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
+
+// The media type of an image file, from the end of its name. The browser
+// needs it to decode an image that is given to it as bytes.
+const imageTypes = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
+  avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml',
+};
 
 export function dom(root) {
   // The templates defined so far, by number. Each is { content, paths }:
@@ -73,6 +95,10 @@ export function dom(root) {
   // siblings, so `start` and `end` identify all of them, including the
   // nodes of any copies nested inside it.
   const nodes = new Map([[0, root]]);
+  // The images that "image" patches have asked for, by number, and how
+  // many of them are still loading.
+  const images = new Map();
+  let loading = 0;
   // The DOM event that the program is handling right now, or null.
   let event = null;
   let app = null;
@@ -300,6 +326,31 @@ export function dom(root) {
         case 21: ctx.rotate(f[i + 1]); i += 2; break;
         case 22: ctx.scale(f[i + 1], f[i + 2]); i += 3; break;
         case 23: ctx.globalAlpha = f[i + 1]; i += 2; break;
+        case 24: {
+          // draw-sprite: image, frame, flags, cell width, cell height, x, y.
+          // The image is a grid of equal cells, numbered from 0, left to
+          // right and then top to bottom. Flag 1 mirrors the cell.
+          const image = images.get(w[i + 1]);
+          if (image && image.complete && image.naturalWidth > 0) {
+            const cw = f[i + 4];
+            const ch = f[i + 5];
+            const columns = Math.max(1, Math.floor(image.naturalWidth / cw));
+            const sx = (w[i + 2] % columns) * cw;
+            const sy = Math.floor(w[i + 2] / columns) * ch;
+            if (w[i + 3] & 1) {
+              // Mirror by flipping the x axis around the cell's right edge.
+              ctx.save();
+              ctx.translate(f[i + 6] + cw, f[i + 7]);
+              ctx.scale(-1, 1);
+              ctx.drawImage(image, sx, sy, cw, ch, 0, 0, cw, ch);
+              ctx.restore();
+            } else {
+              ctx.drawImage(image, sx, sy, cw, ch, f[i + 6], f[i + 7], cw, ch);
+            }
+          }
+          i += 8;
+          break;
+        }
         default:
           throw new Error(`dom.apply: no drawing command ${w[i]}`);
       }
@@ -392,6 +443,30 @@ export function dom(root) {
           listenWindow(w[i + 1], string(i + 2), w[i + 4]);
           i += 5;
           break;
+        case 14: {
+          const name = string(i + 2);
+          const image = new Image();
+          // A file the program already has is loaded from its bytes,
+          // through a temporary "blob" URL that stands for them. Anything
+          // else is fetched as a URL.
+          const bytes = app.files.get(resolvePath(app.cwd, name));
+          const type = imageTypes[name.slice(name.lastIndexOf('.') + 1).toLowerCase()] || '';
+          const url = bytes ? URL.createObjectURL(new Blob([bytes], { type })) : name;
+          const finished = () => {
+            loading--;
+            if (bytes) URL.revokeObjectURL(url);
+          };
+          loading++;
+          image.onload = finished;
+          image.onerror = () => {
+            finished();
+            console.error(`dom: cannot load the image ${name}`);
+          };
+          image.src = url;
+          images.set(w[i + 1], image);
+          i += 4;
+          break;
+        }
         case 13: {
           const canvas = nodes.get(w[i + 1]);
           const count = w[i + 2];
@@ -460,6 +535,9 @@ export function dom(root) {
         if (!event) return 0;
         if (which === 0) return event.timeStamp || 0;
         return (which === 1 ? event.offsetX : event.offsetY) || 0;
+      },
+      images_loading() {
+        return loading;
       },
       prevent_default() {
         if (event && event.preventDefault) event.preventDefault();

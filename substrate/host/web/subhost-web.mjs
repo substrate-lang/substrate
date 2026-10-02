@@ -8,7 +8,8 @@
 // is specific to a browser:
 //   - the program's modules are fetched over HTTP;
 //   - the program's "files" are a Map kept in memory, which can be filled
-//     from file packs (host/web/pack.mjs);
+//     with files downloaded from the site, one by one (`lists`) or many
+//     in one file (`packs`);
 //   - the program keeps running after its main function returns. On the
 //     command line a program is over when main returns. A page stays
 //     open, so the program's instances are kept, and the page calls the
@@ -27,9 +28,15 @@
 //   files      a Map from path to bytes (Uint8Array): the files that the
 //              program can read and write with host.read_file and
 //              host.write_file. Nothing is written to disk.
-//   packs      file packs to download and add to `files` first: a list of
-//              [url, directory] pairs. Each pack's files are placed under
-//              its directory.
+//   lists      file lists to download and add to `files` first: a list of
+//              [url, directory] pairs. A file list is a text file with
+//              one path per line. Each file it names is downloaded from
+//              that path, relative to the list, and placed at the same
+//              path under the directory. next/web/site.sh writes such a
+//              list for a program's assets.
+//   packs      file packs (host/web/pack.mjs) to download and add to
+//              `files` first: a list of [url, directory] pairs. Each
+//              pack's files are placed under its directory.
 //   cwd        the directory that relative paths start from (default "/")
 //   programAt  if given, the program's own files are also added to
 //              `files`, under this directory. The compiler needs this: it
@@ -71,7 +78,8 @@
 // run(options, names, linklets) is the same as boot for a program whose
 // modules are already in memory. `names` lists the modules in load order
 // and `linklets` is a Map from name to bytes. It does not fetch anything
-// (so `program` and `packs` are not used) and returns `app` immediately.
+// (so `program`, `lists` and `packs` are not used) and returns `app`
+// immediately.
 // A guest's worker uses it (guest-worker.mjs).
 import { createHost } from '../subhost-core.mjs';
 
@@ -122,6 +130,24 @@ async function fetchBytes(url) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+// Downloads every file that the file list at `url` names, and adds each
+// to the Map `files`, under the directory `dir`. A path in the list is
+// relative to the list itself: "assets/a.png" in the list
+// "https://example.org/game/assets.list" is downloaded from
+// "https://example.org/game/assets/a.png", and with `dir` "/" it becomes
+// the file "/assets/a.png". All the files are requested at once.
+async function fetchListed(url, dir, files) {
+  // A relative URL is resolved as `fetch` resolves it.
+  const list = new URL(url, globalThis.document ? document.baseURI : globalThis.location.href);
+  const paths = text.decode(await fetchBytes(list)).split('\n').filter((p) => p !== '');
+  await Promise.all(paths.map(async (path) => {
+    // Each part of the path is escaped, so that a name may contain
+    // characters that mean something else in a URL, such as "#" or "?".
+    const from = new URL(path.split('/').map(encodeURIComponent).join('/'), list);
+    files.set(resolvePath(dir, path), await fetchBytes(from));
+  }));
+}
+
 // Returns a function that accepts text in arbitrary pieces and calls
 // `line` once for each complete line. Used to send a program's output to
 // the console, which prints a line at a time.
@@ -139,6 +165,7 @@ function lines(line) {
 export async function boot(options) {
   const base = options.program.endsWith('/') ? options.program : `${options.program}/`;
   const files = options.files || new Map();
+  for (const [url, dir] of options.lists || []) await fetchListed(url, dir, files);
   for (const [url, dir] of options.packs || []) unpack(await fetchBytes(url), dir, files);
 
   const names = text.decode(await fetchBytes(`${base}program`)).split('\n').filter((n) => n !== '');

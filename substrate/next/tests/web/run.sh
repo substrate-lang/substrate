@@ -21,9 +21,14 @@
 #    and types, and checks what the page shows:
 #      counter, rows   the examples in next/web/examples
 #      snake           the snake game (next/web/examples/snake)
+#      platformer      the platformer (next/web/examples/platformer),
+#                      built on the game library (next/web/game)
 #      focus           an event that fires while the page is being updated
 #                      (focus.sub)
 #      fields          typed attributes and event data (fields.sub)
+#      assets          a program's assets: one read as a file, one drawn
+#                      on a canvas and shown by an <img> (assets.sub, and
+#                      the directory assets)
 #      canvas          canvas drawing, window listeners and animation
 #                      frames (canvas.sub)
 #      guests          sandboxed programs (guests.sub; its guests run
@@ -63,11 +68,13 @@ next/web/site.sh next/web/examples/rows.sub "$sites/rows"
 next/web/repl/site.sh "$sites/repl"
 next/web/site.sh next/tests/web/focus.sub "$sites/focus"
 next/web/site.sh next/tests/web/fields.sub "$sites/fields"
+next/web/site.sh next/tests/web/assets.sub "$sites/assets"
 next/web/site.sh next/tests/web/canvas.sub "$sites/canvas"
 next/web/site.sh next/web/examples/snake/snake.sub "$sites/snake" next/web/examples/snake/page.html
+next/web/site.sh next/web/examples/platformer/platformer.sub "$sites/platformer" next/web/examples/platformer/page.html
 next/web/site.sh next/tests/web/guests.sub "$sites/guests" next/tests/web/guests.html
 next/sub build next/tests/web/a-guest.sub -o "$sites/guests/guest"
 host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
 rm -r "${sites:?}/guests/guest"
-node next/tests/web/pages.mjs "$sites" counter rows focus fields canvas snake guests repl || status=1
+node next/tests/web/pages.mjs "$sites" counter rows focus fields assets canvas snake platformer guests repl || status=1
 exit $status

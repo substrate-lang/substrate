@@ -52,6 +52,7 @@ on them there.
     or global that quotes it names it, with `kernel.sub`'s templates
     `` `t `` and `` #`t ``.
   - `runtime.sub`, `math.sub` and `c.sub`: `examples/c`'s.
+  - `files.sub`: reading and writing files, which works on every host.
   - `guest.sub`: functions for running another program in a sandbox (a
     "guest"), on hosts that support it (see "Web pages" below).
   - `syntax-match.sub`: `lib/substrate.sub`'s patterns for syntax, in
@@ -117,15 +118,26 @@ on them there.
   - `web.sub`: the structure of a page's program (model, messages,
     update, view) and its connection to the browser.
   - `canvas.sub`: drawing on a `<canvas>` element: rectangles, paths,
-    circles and text.
+    circles, text, and sprites from image files.
+  - `game/`: a small library for 2D games:
+    - `game.sub`: the game loop. `(game World [size 320 180] init step
+      draw)` turns three functions into a game in a page.
+    - `input.sub`: which keys are held, and which were just pressed.
+    - `sound.sub`: short synthesized sound effects.
+    - `tiles.sub`: levels made of tiles, moving things that are stopped
+      by walls and floors, and a camera.
   - `trace.sub`: a test helper that prints what a view would change on
     a page, so that views can be tested without a browser.
-  - `site.sh`: builds a program and its page into a static web site.
+  - `site.sh`: builds a program, its page and its assets into a static
+    web site.
   - `examples/`: `counter.sub`, a minimal example; `rows.sub`, a table
     with many rows, used to measure performance
     (`tests/web/rows.mjs`); and `snake/`, a small game: `rules.sub` is
     the game itself (rules, timing, random food), `snake.sub` the page
-    around it, and `page.html` its HTML.
+    around it, and `page.html` its HTML; and `platformer/`, a platform
+    game built on `game/`: `world.sub` is the game, `platformer.sub`
+    puts it in a page, and `assets/` holds its one image, a sheet of
+    sprites.
   - `repl/`: the REPL page. `repl.sub` is the page's program (the user
     interface); `session.sub` is the compiler, which the page runs in a
     sandbox; `page.html` and `site.sh` make the site.
@@ -142,8 +154,9 @@ on them there.
   for byte, but where the new compiler differs by design.
 - `tests/`: the new compiler's own tests, which it builds (`run.sh`): the
   kernel's tests of compile-time code and of `syntax-match`, on the new
-  kernel module; the C example's tests (`tests/c`), on `c/`; the
-  Substrate tests of `tests/` (`tests/substrate`), on `substrate/`, with
+  kernel module; the C example's tests (`tests/c`), on `c/`, with a
+  test of `c/files.sub`; the Substrate tests of `tests/`
+  (`tests/substrate`), on `substrate/`, with
   their outputs, but for those of Substrate's syntax objects and its code
   at compile time; the Bend tests of `tests/` and `examples/bend.sub`
   (`tests/bend`), on `bend/`; and the tests of its parts: its syntax
@@ -151,7 +164,9 @@ on them there.
   kernel's tests, which is what the compiler gives. `tests/ui` tests
   the page views (`web/ui.sub`): the tests print the page changes that
   a view produces, and check the error messages for templates that are
-  wrong, and they play the snake example's game without its page.
+  wrong. They also test the game library's collision and keyboard
+  code, and play the two example games without their pages: the
+  platformer is played by a bot that presses the keys.
   `tests/session` tests sessions: `next/sub eval` runs each
   file, one form at a time. `tests/web/run.sh` is separate, and runs
   the tests that need a browser: the session tests again, with the
@@ -299,16 +314,19 @@ A site is made of static files only, so any web server can serve it.
   compiled program and provides its imports (spec 4). Most of that code
   is shared between Node and the browser (`host/subhost-core.mjs`). The
   browser's part fetches the program's modules over HTTP, and keeps the
-  program's "files" in memory; they can be downloaded in bulk as file
-  packs (`host/web/pack.mjs`). It also keeps the program alive after
-  `main` returns, so that the program can respond to events. The
-  compiler itself runs in a browser unchanged; its build is 460 KB.
+  program's "files" in memory. A page says which files to download for
+  the program before it starts: the files named in a list, or many
+  files stored in one, a "file pack" (`host/web/pack.mjs`). It also
+  keeps the program alive after `main` returns, so that the program can
+  respond to events. The compiler itself runs in a browser unchanged;
+  its build is 460 KB.
 - **Host modules.** Besides the standard `host` imports, a page can give
   a program extra modules of host functions, each under a name. A
   program can only use the modules it is given, so they also work as
-  permissions. There are two: `dom` (`host/web/dom.mjs`), for drawing on
-  the page, and `guest` (`host/web/guest.mjs`), for running other
-  programs in a sandbox. The compiler is run with no extra modules, so
+  permissions. There are three: `dom` (`host/web/dom.mjs`), for drawing
+  on the page; `audio` (`host/web/audio.mjs`), for sound effects; and
+  `guest` (`host/web/guest.mjs`), for running other programs in a
+  sandbox. The compiler is run with no extra modules, so
   code that runs at compile time cannot use them, and builds stay
   reproducible (spec 4).
 - **Views** (`web/ui.sub`): a template language for pages, built on the
@@ -355,6 +373,43 @@ A site is made of static files only, so any web server can serve it.
   they produce messages, they can carry event data (`(event time)`,
   `(event key)`, and `(event x)` and `(event y)` for the mouse), and
   they are removed when the element they are written on is removed.
+- **Assets.** A program's assets are the files in a directory called
+  `assets` next to its source: images, text, level data, anything.
+  `site.sh` copies them into the site, where they are ordinary static
+  files. So the page can use one by its URL, `assets/NAME`, wherever
+  the browser takes a URL: the `src` of an `<img>` in a view, a style
+  sheet, `load-image`. The program can also read them as files
+  (`c/files.sub`): `site.sh` writes their names in `assets.list`, and
+  the page downloads the files in that list before it starts the
+  program. Nothing in the program is specific to the browser. The
+  same program, run on the command line in its own directory, reads
+  the same paths from disk. The default page downloads every asset
+  before the program starts, which suits a small program or a game.
+  A site with many or large assets should use a page of its own that
+  lists only the files its program reads.
+- **Images and sound.** `load-image` loads an image, usually one of the
+  program's assets, and `draw-sprite` draws one cell of it, optionally
+  mirrored: an image can be a "sprite sheet", a grid of small pictures
+  such as the frames of an animation. Sound is synthesized: `play-tone`
+  plays a short tone whose pitch slides from one frequency to another,
+  which is enough for the jumps, coins and bumps of a retro game, and
+  needs no sound files.
+- **The game library** (`web/game/`). A page program is driven by
+  messages, which suits a user interface. A game is easier to write as
+  a loop: sixty times a second, look at the keys and move everything;
+  then draw. `(game World [size 320 180] init step draw)` provides that
+  loop. It calls `step` at a steady rate whatever the screen's refresh
+  rate, hands it the state of the keyboard (which keys are held, and
+  which were pressed since the last step), plays the sounds the game
+  asked for, and draws every frame on a canvas of exactly the size
+  given, which the browser stretches to the window without blurring.
+  It is a macro that expands into an ordinary page program.
+  `tiles.sub` adds what a platformer or a top-down game needs: a level
+  as a grid of tiles, bodies that move through it and are stopped by
+  walls, floors and ceilings, and a camera that follows the player.
+  Only the loop itself needs a browser. A game's own code uses the
+  keyboard state, the sound list and the drawing commands, none of
+  which does, so a game can be played by a test.
 - **Guests** (`host/web/guest.mjs`, `c/guest.sub`): running code that is
   not trusted. A program can start another program as a "guest": a
   separate sandbox with its own memory. The two share nothing, and they
@@ -408,6 +463,36 @@ next/web/site.sh next/web/examples/snake/snake.sub build/next/web/snake next/web
 host/web/serve.mjs build/next/web/snake
 ```
 
+### The platformer example
+
+`web/examples/platformer` is a small platform game built on the game
+library: run, jump, collect coins, jump on enemies, avoid spikes and
+pits, reach the flag. The level is drawn with characters in the source
+(`#` for ground, `o` for a coin, and so on), so it is easy to change.
+The whole game is one file, `world.sub`: the level, the rules and the
+drawing. `platformer.sub` is one line that hands its three functions
+to the game loop.
+
+The game has one asset, `assets/sprites.png`: a sheet of sprites of 16
+by 16 pixels. It is shipped like the assets of any program, by
+`site.sh`. The directory `art/` is not part of the game. It records
+how this image was drawn: as text, in `art.txt`, with one character
+per pixel, which `make-sprites.mjs` turns into the PNG. An image
+editor would do as well.
+
+The game is tested without a browser (`tests/ui/platformer.sub`): a
+bot holds the right arrow and jumps when a wall, a hole, spikes or an
+enemy is ahead, and must reach the flag. Since the game has no
+randomness and takes fixed steps, the run is the same every time. The
+compiled program is 48 KB, and its sprite sheet under 1 KB.
+
+```sh
+next/web/site.sh next/web/examples/platformer/platformer.sub build/next/web/platformer next/web/examples/platformer/page.html
+host/web/serve.mjs build/next/web/platformer
+```
+
+Arrows (or A and D) run, Space (or the up arrow, or W) jumps.
+
 ### Measurements
 
 In headless Chromium, on the development machine:
@@ -432,6 +517,7 @@ In headless Chromium, on the development machine:
 |---|---|
 | Draw 10,000 rectangles in one frame | 2 ms |
 | One frame of snake, including drawing the board | under 0.1 ms |
+| One frame of the platformer: a step, and about 70 sprites drawn | 0.1 ms |
 
 The rows are timed by `tests/web/rows.mjs`, from the click until the
 browser has laid the page out again.

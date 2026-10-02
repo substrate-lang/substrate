@@ -1,0 +1,209 @@
+;; Lifecycle: experimental.
+;;
+;; The game loop: what turns three functions into a game in a web page.
+;;
+;; A game is a "world" (a struct with everything in it) and three
+;; functions:
+;;
+;;   (define (init [w (ptr world)]) ...)
+;;       Sets the world up. Called once, when the page loads. This is the
+;;       place to load images (load-image in ../canvas.sub).
+;;
+;;   (define (step [w (ptr world)] [in (ptr input)]) ...)
+;;       Advances the world by one step: move things, check collisions,
+;;       react to keys. Called 60 times a second, however fast or slow the
+;;       screen is. `in` says which keys are held and which were just
+;;       pressed (input.sub).
+;;
+;;   (define (draw [w (ptr world)]) ...)
+;;       Draws the world, with the functions of ../canvas.sub. Called once
+;;       for every frame the browser displays.
+;;
+;; and one line that ties them together:
+;;
+;;   (game world [size 320 180] init step draw)
+;;
+;; `size` is the width and height of the game's screen in pixels. The
+;; screen is a canvas with exactly that many pixels, which the browser
+;; stretches to fill the window, keeping its shape and without blurring.
+;; A small size such as 320 by 180 gives the blocky look of an old video
+;; game, and means a sprite drawn at (10, 20) is always at (10, 20),
+;; whatever the size of the window.
+;;
+;; What the loop takes care of:
+;;   - calling `step` at a steady 60 times a second. Screens refresh at
+;;     different rates, so on each frame it works out how many steps are
+;;     due: often one, sometimes none or two. After a long pause (the tab
+;;     was in the background) it does not try to catch up;
+;;   - keeping the input up to date from the browser's key events, and
+;;     stopping the arrow keys and Space from scrolling the page;
+;;   - waiting until the images have loaded before the first step;
+;;   - playing the sounds that the game asked for with play-tone
+;;     (sound.sub);
+;;   - redrawing on every frame.
+;;
+;; `step` and `draw` only use input.sub, sound.sub, tiles.sub and
+;; ../canvas.sub, none of which needs a browser. So a game's world can be
+;; put in a file of its own and played by a test, with made-up key
+;; presses (see next/tests/ui/platformer.sub).
+;;
+;; A game's page must give the program two host modules, "dom" and
+;; "audio" (see next/web/examples/platformer/page.html).
+;;
+;; How it is built: `game` is a macro. It expands into an ordinary page
+;; program (../web.sub): a model that holds the world and the loop's own
+;; state, messages for frames and keys, an update function, and a view
+;; with one canvas.
+(require-unqualified c "../../c/c.sub")
+(require-unqualified ui "../ui.sub")
+(require-unqualified web "../web.sub")
+(require-unqualified canvas "../canvas.sub")
+(require-unqualified input "input.sub")
+(require-unqualified sound "sound.sub")
+
+(provide game)
+
+(memory from c)
+(table from c)
+
+;; From the browser: play a tone (host/web/audio.mjs), and how many images
+;; are still loading (host/web/dom.mjs).
+(import audio-tone "audio" "tone" (i32 f64 f64 f64 f64 ->))
+(import dom-images-loading "dom" "images_loading" (-> i32))
+
+;; ---- The loop's own state ----
+
+(struct game-loop
+  ;; The keys, as the game's step function sees them.
+  [input input]
+  ;; The length of one step, in milliseconds.
+  [step-ms f64]
+  ;; 1 once `last-time` holds the time of the previous frame.
+  [timed i32]
+  [last-time f64]
+  ;; Time that has passed but has not been used up by a step yet.
+  [pending f64]
+  ;; A counter of frames. The canvas is redrawn whenever it changes, which
+  ;; is on every frame.
+  [frame u32])
+
+;; The most steps taken on one frame. If more time than that has built up,
+;; the rest is dropped: the game falls behind real time instead of rushing
+;; ahead to catch up.
+(define max-steps u32 5)
+
+(define (game-loop-start! [l (ptr game-loop)] [steps-per-second f64])
+  (set! (-> l step-ms) (/ 1000.0 steps-per-second))
+  (set! (-> l timed) 0)
+  (set! (-> l pending) 0.0))
+
+;; Called on every frame with the frame's time, in milliseconds. Returns
+;; how many steps of the game to run now.
+(define (game-loop-steps! [l (ptr game-loop)] [now f64]) -> u32
+  (cond
+    ;; Nothing happens until the images have arrived. The clock starts
+    ;; afterwards.
+    [(> (dom-images-loading) 0)
+     (set! (-> l timed) 0)
+     0]
+    ;; The first frame only records the time.
+    [(not (-> l timed))
+     (set! (-> l timed) 1)
+     (set! (-> l last-time) now)
+     (set! (-> l pending) 0.0)
+     0]
+    [else
+     (let ([steps u32 0])
+       (+= (-> l pending) (- now (-> l last-time)))
+       (set! (-> l last-time) now)
+       (while (and (>= (-> l pending) (-> l step-ms)) (< steps max-steps))
+         (-= (-> l pending) (-> l step-ms))
+         (+= steps 1))
+       (when (>= (-> l pending) (-> l step-ms)) (set! (-> l pending) 0.0))
+       steps)]))
+
+;; Called after each step: presses and releases are reported for one step
+;; only.
+(define (game-loop-step-done! [l (ptr game-loop)]) (input-end-step! (& (-> l input))))
+
+;; Called at the end of every frame: plays the tones the game asked for,
+;; and makes the canvas redraw.
+(define (game-loop-frame-done! [l (ptr game-loop)])
+  (for ([i u32 0]) (< i (tones-waiting)) (+= i 1)
+    (let ([t (tone-at i)])
+      (audio-tone (cast i32 (-> t wave)) (-> t from) (-> t to) (-> t ms) (-> t volume))))
+  (tones-clear!)
+  (+= (-> l frame) 1))
+
+;; A key went down (down = 1) or came up (down = 0). `name` is the key's
+;; name as the browser gives it. Returns 1 if the browser should be
+;; stopped from using the key itself: the arrow keys and Space would
+;; scroll the page.
+(define (game-loop-key! [l (ptr game-loop)] [name (ptr u8)] [down i32]) -> i32
+  (let ([code (key-code name)])
+    (if down
+        (input-key-down! (& (-> l input)) code)
+        (input-key-up! (& (-> l input)) code))
+    (or (== code key-left) (== code key-right) (== code key-up) (== code key-down) (== code key-space))))
+
+;; The window lost the keyboard focus: the key-up events of keys that are
+;; still held will never arrive, so forget them.
+(define (game-loop-blur! [l (ptr game-loop)]) (input-clear! (& (-> l input))))
+
+;; ---- The `game` form ----
+
+(begin-for-syntax
+  (require-unqualified c "../../c/c.sub")
+  (require-unqualified kd "../../compiler/kernel.sub")
+  (require sm "../../c/c-syntax-match.sub" syntax-match _ ... ?)
+
+  ;; Expands (game World [size width height] init step draw) into a page
+  ;; program:
+  ;;   game-state     the model: the world, and the loop's state
+  ;;   game-message   one message for a frame, two for keys, one for the
+  ;;                  window losing the focus
+  ;;   game-update    runs the steps that are due on a frame; passes key
+  ;;                  events to the loop
+  ;;   game-screen    the view: one canvas. Its listeners are on the
+  ;;                  window, so keys work without anything being clicked
+  ;;                  first. Its style makes the browser stretch it to fill
+  ;;                  the window, keeping its shape and its hard pixel
+  ;;                  edges.
+  (define (game-form [s datum]) -> datum
+    (syntax-match s
+      [(_ world ((? identifier? word) width height) init step draw)
+       (unless (and (== (syntax-e word) 'size) (integer? (syntax-e width)) (integer? (syntax-e height)))
+         (raise-syntax-error 'game '"expected (game World [size width height] init step draw), with the width and height written as numbers" s))
+       (let ([style (datum->syntax #'here
+                                   (format '"display: block; margin: 0 auto; width: min(100vw, calc(100vh * ~a / ~a)); image-rendering: pixelated;"
+                                           `(,(syntax-e width) ,(syntax-e height)))
+                                   0)])
+         #`(begin
+             (struct game-state [world #,world] [loop game-loop])
+             (variant game-message
+               [game-frame [time f64]] [game-key-down [key (ptr u8)]] [game-key-up [key (ptr u8)]] [game-blurred])
+             (messages game-message)
+             (define (game-init [g (ptr game-state)])
+               (game-loop-start! (& (-> g loop)) 60.0)
+               (#,init (& (-> g world))))
+             (define (game-update [g (ptr game-state)] [e (ptr game-message)])
+               (match e
+                 [(game-frame time)
+                  (let ([steps (game-loop-steps! (& (-> g loop)) time)])
+                    (for ([i u32 0]) (< i steps) (+= i 1)
+                      (#,step (& (-> g world)) (& (-> g loop input)))
+                      (game-loop-step-done! (& (-> g loop))))
+                    (game-loop-frame-done! (& (-> g loop))))]
+                 [(game-key-down key) (when (game-loop-key! (& (-> g loop)) key 1) (prevent-default!))]
+                 [(game-key-up key) (game-loop-key! (& (-> g loop)) key 0)]
+                 [game-blurred (game-loop-blur! (& (-> g loop)))]))
+             (view (game-screen [g (ptr game-state)])
+               (canvas ([width #,width] [height #,height] [style #,style]
+                        [on-window frame (game-frame (event time))]
+                        [on-window keydown (game-key-down (event key))]
+                        [on-window keyup (game-key-up (event key))]
+                        [on-window blur game-blurred]
+                        [draw (-> g loop frame) (#,draw (& (-> g world)))])))
+             (app game-state game-message game-init game-update game-screen)))])))
+
+(define-syntax game game-form)

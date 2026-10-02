@@ -29,6 +29,8 @@
 //                      "ArrowUp". `mods` are the modifier keys held, as
 //                      DevTools numbers them: 1 Alt, 2 Control, 4 Meta,
 //                      8 Shift.
+//   keyDown(key, mods) Presses a key and keeps it down, until
+//   keyUp(key, mods)   releases it. For testing keys that are held.
 //   screenshot(file, width, height)
 //                      Saves a PNG of the page at the given size.
 //   log                An array of lines: what the page wrote to its
@@ -160,6 +162,14 @@ export async function withBrowser(use, options = {}) {
         },
         async type(string) {
           await command('Input.insertText', { text: string });
+        },
+        async keyDown(key, modifiers = 0) {
+          const k = keys[key] || { code: `Key${key.toUpperCase()}`, text: key };
+          await command('Input.dispatchKeyEvent', { type: k.text ? 'keyDown' : 'rawKeyDown', key, modifiers, ...k });
+        },
+        async keyUp(key, modifiers = 0) {
+          const k = keys[key] || { code: `Key${key.toUpperCase()}`, text: key };
+          await command('Input.dispatchKeyEvent', { type: 'keyUp', key, modifiers, ...k });
         },
         async press(key, modifiers = 0) {
           const k = keys[key] || { code: `Key${key.toUpperCase()}`, text: key };
