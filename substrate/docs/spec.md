@@ -131,16 +131,6 @@ name that `define-syntax` binds to a transformer is a **macro** (6.3).
 `(define-syntax m f)`, where `f` names a phase-1 function of type
 `(eqref) -> eqref`, binds `m` to a transformer that calls `f`.
 
-A transformer may run in an arena of its own, as a language whose values
-are owned runs its code in the kernel module's heap: the expander makes
-the arena that was current again when the transformer returns, and
-after an instantiation; a query (2.3) made from a transformer running in
-the heap runs in the expander's arena, the one the transformer was
-called from; and a cell of the heap's a transformer gives the expander,
-its result, or lends a query, a form to lift or expand, the expander
-holds as long as the module's arena, whose cells refer into it, and
-drops with the arena; a compile-time value it keeps.
-
 ### 2.2 Values
 
 The kernel module represents data as **values** of wasm type `eqref`.

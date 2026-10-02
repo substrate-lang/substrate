@@ -57,7 +57,7 @@ mkdir -p "$builds/compiled"
    -m "$root/$builds/compiled/geometry.subc" -c "$cache" > /dev/null) ||
   { echo "FAIL building next/tests/fixtures/geometry.sub as a compiled file"; fail=$((fail + 1)); }
 
-tests=(next/tests/*.sub next/tests/c/*.sub next/tests/substrate/*.sub next/tests/cells/*.sub next/tests/bend/*.sub)
+tests=(next/tests/*.sub next/tests/c/*.sub next/tests/substrate/*.sub next/tests/bend/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
