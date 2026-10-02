@@ -25,6 +25,7 @@ line says the same.
 | `lib/` | the languages built on the kernel, as libraries programs require: Substrate (`substrate/`), on its own values in memory, and Bend (`bend/`), both written in the C-like Lisp on `compiler/` | permanent, grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error). `tests/*.sub` are the kernel's; `tests/base/`, `tests/substrate/` and `tests/bend/` each language's; `tests/fixtures/` holds the modules the tests require | grows |
 | `seed/` | the compiler, built by itself: what builds the compiler's source (spec 1.4) | permanent, replaced as the compiler grows |
+| `bench/` | benchmarks, each directory with its `run.sh`: `base/`, the C-like Lisp against C; `substrate/`, Substrate's programs; `bend/compile/`, checking and compiling Bend's proofs module; and `compare/`, the same programs in the three languages. `bench/README.md` has the measurements | grows |
 | `bin/sub` | runs the compiler (`build/sub`), building it from the seed when its sources changed; `bin/bootstrap` checks the fixpoint and makes the seed | permanent |
 
 A language in `lib/` is one we intend to build on, not the only way to
