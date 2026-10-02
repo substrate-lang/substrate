@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lifecycle: test harness. Each tests/*.sub, tests/c/*.sub,
+# Lifecycle: test harness. Each tests/*.sub, tests/base/*.sub,
 # tests/substrate/*.sub and tests/bend/*.sub built by the compiler
 # (bin/sub), in its own directory, and run with a host, build/subhost
 # unless HOST names another (host/subhost.mjs runs programs on Node's
@@ -11,11 +11,11 @@
 #   NAME.args  the run's command-line arguments, on one line
 #
 # tests/*.sub are the kernel's tests: of the kernel language, of
-# compile-time code and of syntax-match (compiler/c/syntax-match.sub), on
+# compile-time code and of syntax-match (compiler/syntax-match.sub), on
 # the kernel module (compiler/kernel.sub); tests/fixtures holds the
-# modules they require. tests/c has the C-like Lisp's tests
-# (compiler/c), tests/substrate Substrate's (lib/languages/substrate), and
-# tests/bend Bend's (lib/languages/bend). Then the cache (spec 3.7): each
+# modules they require. tests/base has the C-like Lisp's tests
+# (compiler/base), tests/substrate Substrate's (lib/substrate), and
+# tests/bend Bend's (lib/bend). Then the cache (spec 3.7): each
 # program built again from it is the same, and a stale entry is not
 # used. OUT is where builds go (default build). In the dev shell:
 #
@@ -52,7 +52,7 @@ mkdir -p "$builds/compiled"
    -m "$root/$builds/compiled/geometry.subc" -c "$cache" > /dev/null) ||
   { echo "FAIL building tests/fixtures/geometry.sub as a compiled file"; fail=$((fail + 1)); }
 
-tests=(tests/*.sub tests/c/*.sub tests/substrate/*.sub tests/bend/*.sub)
+tests=(tests/*.sub tests/base/*.sub tests/substrate/*.sub tests/bend/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
@@ -117,7 +117,7 @@ done
 stale="$builds/stale"
 rm -rf "${stale:?}"
 mkdir -p "$stale"
-print="(require print \"$root/lib/print.sub\" write-int newline)"
+print="(require print \"$root/compiler/print.sub\" write-int newline)"
 printf '(provide x)\n(func (x) -> i32 1)\n' > "$stale/b.sub"
 printf '%s\n(require b "b.sub" x)\n(func (main) (write-int (x)) (newline))\n' "$print" > "$stale/a.sub"
 first="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"

@@ -21,22 +21,31 @@ line says the same.
 |---|---|---|
 | `docs/` | the kernel specification | permanent |
 | `host/` | the hosts, in C over wasmtime (`subhost.c`) and in JavaScript over Node's V8 (`subhost.mjs`): stores, linking, the `host` imports and the instantiate hook | permanent: they run programs, the compiler among them |
-| `compiler/` | the compiler, written in the C-like Lisp: reader, expander, kernel compiler, wasm encoder. It compiles itself (spec 1.4). With it, the kernel module (`kernel.sub`, in kernel code): the data of every language, in memory, and the functions macros use on it, which the compiler carries into the programs that use them; the program's memory (`memory.sub`); and the C-like Lisp itself (`c/`), whose macros are kernel code on the kernel module's data | permanent, grows |
-| `lib/` | libraries, which programs use: printing for programs (`print.sub`), and the languages (`languages/`): Substrate (`substrate/`), on its own values in memory, and Bend (`bend/`), both written in the C-like Lisp | permanent, grows |
-| `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error). `tests/*.sub` are the kernel's; `tests/c/`, `tests/substrate/` and `tests/bend/` each language's; `tests/fixtures/` holds the modules the tests require | grows |
+| `compiler/` | the compiler, written in the C-like Lisp: reader, expander, kernel compiler, wasm encoder. It compiles itself (spec 1.4). With it, everything it rests on and carries into programs: the kernel module (`kernel.sub`, in kernel code), the data of every language, in memory, and the functions macros use on it; the forms kernel code is written with (`kernel-forms.sub`, `syntax-match.sub`, `patterns.sub`); the program's memory (`memory.sub`) and printing from it (`print.sub`); and the C-like Lisp itself (`base/`), whose macros are kernel code on the kernel module's data. Nothing here requires anything outside it | permanent, grows |
+| `lib/` | the languages built on the kernel, as libraries programs require: Substrate (`substrate/`), on its own values in memory, and Bend (`bend/`), both written in the C-like Lisp on `compiler/` | permanent, grows |
+| `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error). `tests/*.sub` are the kernel's; `tests/base/`, `tests/substrate/` and `tests/bend/` each language's; `tests/fixtures/` holds the modules the tests require | grows |
 | `seed/` | the compiler, built by itself: what builds the compiler's source (spec 1.4) | permanent, replaced as the compiler grows |
 | `bin/sub` | runs the compiler (`build/sub`), building it from the seed when its sources changed; `bin/bootstrap` checks the fixpoint and makes the seed | permanent |
 
-A library in `lib/` is one we intend to build on, not the only way to do
-what it does: languages on the kernel can bring their own.
+A language in `lib/` is one we intend to build on, not the only way to
+do what it does: another language on the kernel can bring its own.
 
-- `compiler/`, the compiler, its files after `compiler/`'s:
+- `compiler/`: the compiler, written in the C-like Lisp (`compiler/base/`):
   - `kernel.sub`: the kernel module (below), with its data, syntax
     objects among them, in memory; and the scope sets and syntax
     objects of the expander.
   - `memory.sub`: the program's memory, which every module shares, and
-    its layout: the bytes below its `heap-start` are `lib/print.sub`'s,
-    and the C language's heap and stack lie above.
+    its layout: the bytes below its `heap-start` are `print.sub`'s, and
+    the C language's heap and stack lie above.
+  - `print.sub`: output for tests and programs, bytes and integers,
+    written with the host's `write` from the program's memory.
+  - `kernel-forms.sub`: forms that kernel code is written with, `cond`,
+    `and`, `or`, `when`, `unless` and `case`, and Racket's `for` forms on
+    lists, its `for` named `for/each`.
+  - `syntax-match.sub`: Substrate's patterns for syntax, in kernel code,
+    on the kernel module's syntax objects, its code kernel code;
+    `patterns.sub`, what it shares with the C-like Lisp's `syntax-match`:
+    the pattern words, the parser and the error when no clause matches.
   - `numbers.sub`: the reading and writing of numbers, decimals among
     them.
   - `host.sub`: the host's imports, reading and writing files among them.
@@ -59,7 +68,7 @@ what it does: languages on the kernel can bring their own.
     and arenas.
   - `main.sub`: the command, `build` (`-m` included), `compile` and
     `expand`, and its cache, `-c DIR`.
-- `compiler/c/`: the C-like Lisp, which the compiler's sources are
+- `compiler/base/`: the C-like Lisp, which the compiler's sources are
   written in:
   - `lang.sub`: the language, its transformers in kernel code. C code quotes data and syntax (`'d`, `#'x`),
     typed as the kernel module's `datum`, as the module of the function
@@ -67,22 +76,15 @@ what it does: languages on the kernel can bring their own.
     `` `t `` and `` #`t ``.
   - `runtime.sub`: the allocator, arenas, buffers and hash tables;
     `math.sub`: C's math functions that wasm has instructions for; and
-    `c.sub`, which bundles the three.
-  - `syntax-match.sub`: `lib/substrate.sub`'s patterns for syntax, in
-    kernel code, on the kernel module's syntax objects, its code kernel
-    code; `c-syntax-match.sub`, the same, its code C, for macros written
-    in C; `patterns.sub`, what the two share: the pattern words, the
-    parser and the error when no clause matches.
-  - `kernel-forms.sub`: forms that kernel code is written with, `cond`,
-    `and`, `or`, `when`, `unless` and `case`, and Racket's `for` forms on
-    lists, its `for` named `for/each`, as `lib/substrate-core.sub` gives
-    Substrate its forms.
-  - `forms.sub`: the same for code written in the C-like Lisp, macros
+    `base.sub`, which bundles the three.
+  - `syntax-match.sub`: the patterns of `compiler/syntax-match.sub`
+    compiled to C, for macros written in C.
+  - `forms.sub`: forms for code written in the C-like Lisp, macros
     above all: `for/each` and `for/list` over lists, `fmt`, a message
     formatted from its arguments, and `define-macro`, a macro defined
-    with its transformer, `(define-macro (name stx) body ...)`; `lib/languages/bend/`
+    with its transformer, `(define-macro (name stx) body ...)`; `lib/bend/`
     writes its macros, loops and messages with them.
-- `lib/languages/substrate/`: Substrate as the compiler builds it, on the C-like
+- `lib/substrate/`: Substrate as the compiler builds it, on the C-like
   Lisp (plan, 5 and 6): its values nodes in the program's memory, owned
   and freed by the program, so that a program needs no GC; its macros
   written in the C-like Lisp, and Substrate not running at compile time:
@@ -119,7 +121,7 @@ what it does: languages on the kernel can bring their own.
     `syntax-rules` (`rules.sub`, in C), which compile into C at its phase
     1, not with Substrate code: Substrate does not run at compile time,
     and has no syntax objects among its values.
-- `lib/languages/bend/`: Bend, a port of Bend2's kernel, a dependently
+- `lib/bend/`: Bend, a port of Bend2's kernel, a dependently
   typed language with quantities, in s-expressions, written in the C-like
   Lisp (plan, 5):
   - `core.sub`: the checker, function for
@@ -191,7 +193,7 @@ the kernel, syntax objects among them, and the functions of the macro
 contract (spec 2), with the data in memory: `compiler/kernel.sub`, with
 the run-time modules it rests on, which give it its memory and
 allocator, `compiler/memory.sub`'s memory, which every module of a program
-shares, and `compiler/c/`'s `sbrk`, stack and allocator. The kernel
+shares, and `compiler/base/`'s `sbrk`, stack and allocator. The kernel
 language keeps wasm's GC types and instructions, and a language that
 wants GC data defines its own.
 
@@ -262,16 +264,16 @@ plan, and what each step found:
    compile-time code, in the new kernel module (`tests/`), give their
    tests' output.
 3. `syntax-match`, from `lib/substrate.sub`'s patterns, on the kernel
-   module's syntax objects. Done: `compiler/c/syntax-match.sub`, in kernel code,
+   module's syntax objects. Done: `compiler/syntax-match.sub`, in kernel code,
    gives the kernel's tests of it, ported to `tests/`, their output:
    `tests/syntax-match.sub`'s, and its error tests' messages.
 4. The C-like Lisp, until then an example of a language on the kernel
-   (`examples/c/lang.sub`, now `compiler/c/`), as macros on the kernel
+   (`examples/c/lang.sub`, now `compiler/base/`), as macros on the kernel
    module, written in kernel code, as `lib/substrate-core.sub` writes
    Substrate's, with its run-time part in the kernel module; then the C
    example's tests, and the compiler compiling itself, to a fixpoint,
    the current build its first stage. Done: `c/lang.sub` has its
-   transformers in kernel code; the C example's tests, in `tests/c`,
+   transformers in kernel code; the C example's tests, in `tests/base`,
    give their outputs and errors on it; the compiler's sources are
    written in it, `kernel.sub`'s own macros in kernel code; and the
    build the compiler made of them built them into a compiler that
@@ -284,7 +286,7 @@ plan, and what each step found:
    its own. In order:
    1. C as a language for macros: quoted data and syntax in C code, and
       `syntax-match` for C. Done: `tests/c-macros.sub`,
-      `tests/c-quote.sub`, and `tests/c/syntax-match.sub`, the kernel's
+      `tests/c-quote.sub`, and `tests/base/syntax-match.sub`, the kernel's
       test of `syntax-match` in C, which gives its output.
    2. Substrate's data, the old kernel module's GC data but syntax, and
       its literals, made when a module starts. Done: `substrate/data.sub`
@@ -295,14 +297,14 @@ plan, and what each step found:
       their macros written with `syntax-rules`; both now on the values
       of 6.
    4. Bend, its checker first-order, in C, compiling to linear memory.
-      Done: `lib/languages/bend/`; the Bend tests of `tests/` (`tests/bend`) and
+      Done: `lib/bend/`; the Bend tests of `tests/` (`tests/bend`) and
       the Bend example (`tests/bend/example.sub`) give their outputs
       and errors on it. Bend2's `proofs_3200` benchmark, checked and
       compiled, builds in 2.9 s on V8 and 3.3 s natively, where the
       example takes 12.7 s.
    5. Numeric instructions and reference types in C code; then the typed
       example.
-6. Substrate on its own values, `lib/languages/substrate/` as it is now: Substrate's
+6. Substrate on its own values, `lib/substrate/` as it is now: Substrate's
    values nodes in the program's memory, owned and freed by the program,
    so that a program needs no GC, with the kernel module as it is and
    Substrate not running at compile time: its macros are written in the
@@ -315,7 +317,7 @@ plan, and what each step found:
    put a facility of owners, a heap beside the arenas, and a hold on
    what a macro gives the expander into the kernel module, two worlds
    in one kind of cell, for the sake of a macro language the C-like
-   Lisp already serves (`compiler/c/forms.sub`); so the kernel module was made
+   Lisp already serves (`compiler/base/forms.sub`); so the kernel module was made
    an arena's again, and Substrate given values of its own. What the
    experiment found stays: the lowering that owns each value
    (`lower.sub`), from it.
@@ -376,7 +378,7 @@ plan, and what each step found:
    `free-node!`, is a tenth of the interpreter's time, which the GC's
    nursery never pays for garbage. The Bend checker written in Substrate
    ran as macros, Substrate at compile time, which this design does not
-   run: Bend on the compiler is `lib/languages/bend/`, in the C-like Lisp. Next: a
+   run: Bend on the compiler is `lib/bend/`, in the C-like Lisp. Next: a
    closure given to a call that does not keep it, which the facts could
    tell, made on the stack rather than freed; and what still leaks: a
    value a raise unwinds past, and a closure that refers to itself

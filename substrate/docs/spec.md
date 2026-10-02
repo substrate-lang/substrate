@@ -6,7 +6,7 @@ ordinary kernel code, compiled to wasm and run by the same engine that runs
 programs. The aim is that different languages can be built as libraries
 over one small kernel, and that the code they produce carries no runtime
 it did not ask for. The language most code is written in, also called
-Substrate, is one such library (`lib/languages/substrate/`), as
+Substrate, is one such library (`lib/substrate/`), as
 `racket/base` is built over Racket's `#%kernel`.
 
 The kernel has three parts: its forms (section 5), which the compiler
@@ -43,10 +43,10 @@ interface (section 4). Kernel code is code written in the kernel's forms.
 | Component | What it is | Where |
 |---|---|---|
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime), `host/subhost.mjs` (JavaScript, over Node's V8) |
-| compiler | Reader, expander, kernel compiler, binary encoder. | `compiler/*.sub`, written in the C-like Lisp (`compiler/c/`) |
+| compiler | Reader, expander, kernel compiler, binary encoder. | `compiler/*.sub`, written in the C-like Lisp (`compiler/base/`) |
 | kernel module | The data of every language built on the kernel, in memory, syntax objects among them, and the functions of section 2. The compiler links to its own instance, and carries the module into the programs that use its data. | `compiler/kernel.sub` (kernel code), with the compiler, on the program's memory (`compiler/memory.sub`) and the C-like Lisp's allocator |
-| libraries | Ordinary modules, what programs in the languages built on the kernel use, such as printing. | `lib/*.sub` |
-| languages | Libraries that make a language: the C-like Lisp, which the compiler is written in, Substrate and Bend. | `compiler/c/`, `lib/languages/substrate/` and `lib/languages/bend/`, the last two written in the C-like Lisp |
+| run-time modules | What every program rests on: the program's memory, printing from it, and the C-like Lisp's allocator. | `compiler/memory.sub`, `compiler/print.sub`, `compiler/base/runtime.sub` |
+| languages | Libraries that make a language: the C-like Lisp, which the compiler is written in, Substrate and Bend. | `compiler/base/`, `lib/substrate/` and `lib/bend/`, the last two written in the C-like Lisp |
 
 ### 1.3 What runs where
 
@@ -70,7 +70,7 @@ collected only if its own code uses GC types.
 ### 1.4 Bootstrap
 
 The compiler is written in the C-like Lisp (`compiler/*.sub`,
-`compiler/c/`), and requires the kernel module (`compiler/kernel.sub`). It
+`compiler/base/`), and requires the kernel module (`compiler/kernel.sub`). It
 is built by a build of itself, the **seed**, checked in (`seed/`). The
 compiler bin/sub runs, `build/sub`, is the compiler's source built by the
 seed, then by that build: the source compiled by itself, even when the
@@ -573,7 +573,7 @@ itself, and this is how it does. The compiler runs compile-time code with
 it. An instantiated module can reach exactly what its imports name, so
 compile-time code runs sandboxed. The first five imports are tested from
 kernel code in `tests/hook.sub`, and the rest through Substrate
-(`lib/languages/substrate/`). A path is relative to the process's working
+(`lib/substrate/`). A path is relative to the process's working
 directory, which is the package root when `bin/sub` runs the compiler
 (3.6).
 
@@ -911,7 +911,7 @@ GC instructions take their type and field immediates by name:
   `x`, and a known function of that signature stays one. A language
   chooses its calling convention by the signatures it writes: Substrate's
   lambdas take the closure, a count and the first four arguments
-  (`lib/languages/substrate/runtime.sub`).
+  (`lib/substrate/runtime.sub`).
 - **Application is an implicit form**, as in Racket. A form whose head is
   not bound to a macro, a core form or a wasm operator, including one
   whose head is not an identifier, is expanded as `(#%app head arg ...)`.
