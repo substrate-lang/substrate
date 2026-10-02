@@ -55,7 +55,7 @@
          vector-arg index-of count-of bound-of
          make-bytes bytes? bytes-length bytes-ref bytes-set! bytes-arg bytes-data subbytes bytes-copy! bytes-append-list
          bytes->list list->bytes bytes-of-list byte-arg
-         make-struct-type struct-type-name make-struct struct-of? struct-arg struct-ref struct-set! struct-init! not-a-struct struct?
+         make-struct-type struct-type-name make-struct struct-of? struct-arg struct-ref struct-set! struct-init! fresh-hash not-a-struct struct?
          make-hash-table table? hash-count hash-ref-value hash-has-key? hash-set-value! hash-remove! hash-clear! table-walk
          make-table-from
          ;; numbers and characters
@@ -104,34 +104,12 @@
 ;; bytes, whose freed blocks are a list, through their first word, that
 ;; the next block of the class comes from, filled from a chunk of the
 ;; heap when empty, as the kernel module keeps its cells.
-(define block-free (ptr u32) 0)
-(define block-chunk u32 4096)
 
-(define (alloc [n u32]) -> (ptr void)
-  (cond [(not (freeing?)) (alloc-in (current-arena) n)]
-        [(> n 64) (malloc n)]
-        [else
-         (let ([k (>> (+ (if (== n 0) 4 n) 3) 2)])
-           (when (== block-free 0) (set! block-free (cast (ptr u32) (calloc 17 4))))
-           (when (== (@ block-free k) 0) (refill-blocks! k))
-           (let ([p (cast (ptr u32) (@ block-free k))])
-             (set! (@ block-free k) (@ p 0))
-             (cast (ptr void) p)))]))
+(define (alloc [n u32]) -> (ptr void) (alloc-block n))
 
-(define (refill-blocks! [k u32])
-  (let* ([size (<< k 2)] [count (/ block-chunk size)] [chunk (cast (ptr u8) (malloc block-chunk))])
-    (for ([i u32 0]) (< i count) (+= i 1)
-      (set! (@ (cast (ptr u32) (+ chunk (* i size))) 0)
-            (if (== (+ i 1) count) 0 (cast u32 (+ chunk (* (+ i 1) size))))))
-    (set! (@ block-free k) (cast u32 chunk))))
 
 ;; Block p of n bytes, from alloc, freed.
-(define (free-block [p (ptr void)] [n u32])
-  (if (> n 64)
-      (free p)
-      (let ([k (>> (+ (if (== n 0) 4 n) 3) 2)])
-        (set! (@ (cast (ptr u32) p) 0) (@ block-free k))
-        (set! (@ block-free k) (cast u32 p)))))
+(define (free-block [p (ptr void)] [n u32]) (free-block! p n))
 
 ;; A record of kind with a block of n bytes, zero.
 ;; A record of kind with a block of n bytes, which the caller fills: its
@@ -154,34 +132,6 @@
 ;; What drop calls for a record of each kind whose last owner is gone,
 ;; given its block: it drops the values the block holds and frees it.
 
-(define (drop-closure-block [p (ptr void)])
-  (let ([b (cast (ptr closure-block) p)])
-    (for ([i u32 0]) (< i (-> b n)) (+= i 1) (drop (@ (-> b caps) i)))
-    (free-block p (+ (sizeof closure-block) (* (-> b n) 4)))))
-
-(define (drop-box-block [p (ptr void)])
-  (drop (-> (cast (ptr box-block) p) value))
-  (free-block p (sizeof box-block)))
-
-(define (drop-vector-block [p (ptr void)])
-  (let ([b (cast (ptr vector-block) p)])
-    (for ([i u32 0]) (< i (-> b n)) (+= i 1) (drop (@ (-> b items) i)))
-    (free-block p (+ (sizeof vector-block) (* (-> b n) 4)))))
-
-(define (drop-bytes-block [p (ptr void)])
-  (free-block p (+ (sizeof bytes-block) (-> (cast (ptr bytes-block) p) n))))
-
-(define (drop-type-block [p (ptr void)])
-  (let ([b (cast (ptr type-block) p)])
-    (drop (-> b name))
-    (drop (-> b fields))
-    (free-block p (sizeof type-block))))
-
-(define (drop-struct-block [p (ptr void)])
-  (let ([b (cast (ptr struct-block) p)])
-    (drop (-> b type))
-    (for ([i u32 0]) (< i (-> b n)) (+= i 1) (drop (@ (-> b fields) i)))
-    (free-block p (+ (sizeof struct-block) (* (-> b n) 4)))))
 
 (define (drop-table-block [p (ptr void)])
   (let ([b (cast (ptr table-block) p)])
@@ -200,24 +150,22 @@
   (buffer-free! (& (-> (cast (ptr port-block) p) buf)))
   (free-block p (sizeof port-block)))
 
-(define (drop-exn-block [p (ptr void)])
-  (let ([b (cast (ptr exn-block) p)])
-    (drop (-> b message))
-    (drop (-> b stx))
-    (free-block p (sizeof exn-block))))
 
 ;; In a function, since an expression at module level is kernel code,
 ;; which reads a C global's address, not its value.
+;; The kernel module frees most kinds itself, by their layout (fields,
+;; datums-at, datums, extra, size-at, base, per: set-record-layout!);
+;; a table and a port, which hold more than datums, have droppers.
 (define (register-droppers!)
-  (set-record-dropper! kind-closure drop-closure-block)
-  (set-record-dropper! kind-box drop-box-block)
-  (set-record-dropper! kind-vector drop-vector-block)
-  (set-record-dropper! kind-bytes drop-bytes-block)
-  (set-record-dropper! kind-struct-type drop-type-block)
-  (set-record-dropper! kind-struct drop-struct-block)
+  (set-record-layout! kind-closure 8 4 0 -1 4 8 4)       ; code, n, caps
+  (set-record-layout! kind-box 0 -1 1 -1 -1 4 0)         ; value
+  (set-record-layout! kind-vector 4 0 0 -1 0 4 4)        ; n, items
+  (set-record-layout! kind-bytes 4 -1 0 -1 0 4 1)        ; n, data
+  (set-record-layout! kind-struct-type 0 -1 2 -1 -1 12 0) ; name, fields, n
+  (set-record-layout! kind-struct 12 8 0 0 8 12 4)       ; type, hash, n, fields
+  (set-record-layout! kind-exn 0 -1 2 -1 -1 16 0)        ; message, stx, loc, syntax
   (set-record-dropper! kind-table drop-table-block)
-  (set-record-dropper! kind-port drop-port-block)
-  (set-record-dropper! kind-exn drop-exn-block))
+  (set-record-dropper! kind-port drop-port-block))
 (register-droppers!)
 
 (define (bool [x i32]) -> datum (if x (boolean 1) 0))

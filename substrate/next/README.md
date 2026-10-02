@@ -313,17 +313,20 @@ Substrate is built again in `substrate/` (plan, 5).
    back, so `map`, `filter`, `reverse` and `sort` over a list that
    dies, which `substrate.sub` tells by `unshared-pair?`, make no
    cells; a predicate's or count's result needs no counting
-   (`#:free`). Over 30 M iterations, on wasmtime, fixnum arithmetic
-   takes 0.24 s on cells against 1.1 s with GC, walking a list 0.14 s
-   against 1.1 s, making and freeing pairs 0.29 s against 4.8 s, and 10
-   M closure calls 0.14 s against 0.74 s; a list benchmark 0.23 s
-   against 2.1 s, one of closures, structs and a hash table 0.17 s
-   against 0.63 s. V8's optimizing compiler runs the GC version of
-   those in 0.34, 0.20, 0.27, 0.14, 0.19 and 0.11 s, and the cells
-   version in 0.39, 0.15, 0.29, 0.15, 0.21 and 0.19 s: even on all but
-   closures, structs and a hash table, where a record is still made and
-   freed through the runtime. Next: records made and freed by the
-   kernel module from their layout, with no call into the runtime; the
+   (`#:free`). A closure or a struct is made inline from the heap's
+   lists, and the kernel module frees a record of a kind whose layout
+   the runtime registered (`set-record-layout!`) with no call into the
+   runtime. Over 30 M iterations, on wasmtime, fixnum arithmetic takes
+   0.22 s on cells against 1.1 s with GC, walking a list 0.14 s against
+   1.1 s, making and freeing pairs 0.30 s against 4.8 s, and 10 M
+   closure calls 0.14 s against 0.74 s; a list benchmark 0.23 s against
+   2.1 s, one of closures, structs and a hash table 0.14 s against 0.63
+   s. V8 runs the GC version of those in 0.27, 0.18, 0.22, 0.11, 0.17
+   and 0.07 s, and the cells version in 0.21, 0.12, 0.27, 0.14, 0.19
+   and 0.13 s (each with 0.08 s of starting): ahead on arithmetic and
+   walking, even on calls and lists, behind on making pairs by a fifth
+   and on closures, structs and a hash table, where a record made and
+   freed costs what V8's nursery never pays for garbage. Next: the
    pass's time at compile time (the typed example builds in 1.0 s, 0.7
    s before it); and what still leaks: a value a raise unwinds past,
    and a closure that refers to itself through a box, as a letrec's
