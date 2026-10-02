@@ -92,6 +92,10 @@ on them there.
     Its values are owned: the last use of a variable moves its value, an
     earlier use dups it, a variable never used again is dropped, and so
     a program frees what it is done with (`tests/cells/live-cells.sub`).
+    A parameter a function only reads is borrowed, its caller keeping
+    the value through the call: the module's functions' bodies are
+    expanded as its second pass begins, and their flags inferred
+    together and written as their facts (`tests/cells/borrowed.sub`).
   - `core.sub`: `substrate/core.sub` on i32 values and the runtime, and
     `define-syntax` whose transformer is Substrate code.
   - `substrate.sub`: `lib/substrate.sub`'s forms, `syntax-match` and
@@ -286,7 +290,8 @@ Substrate is built again in `substrate/` (plan, 5).
    itself; the compiler builds itself in the same time. Then the lowering owning each value
    (`lower.sub`): a function owns its parameters, unless `core.sub`
    marks them `#:borrow`, as the primitives that only read theirs are,
-   and what it returns; the last use of a variable moves its value, an
+   or the pass finds it only reads them (below), and what it returns;
+   the last use of a variable moves its value, an
    earlier use dups it, a variable never used is dropped where it is
    bound, a branch drops what only the other branch uses, and `set!`
    drops what it replaces; what a function of the runtime's or the
@@ -355,16 +360,32 @@ Substrate is built again in `substrate/` (plan, 5).
    as its value does (`transformer-value`), in the heap. A macro that
    makes and drops lists, strings, closures and a table leaves no cell
    in use (`tests/cells/live-cells.sub`). The Bend example's checker,
-   running as macros, checks the 3200-definition proofs module in 11.0
-   s and 3.8 GB on V8 and 12.8 s and 4.0 GB on wasmtime, where before,
+   running as macros, checks the 3200-definition proofs module in 10.8
+   s and 3.6 GB on V8 and 13.1 s and 3.7 GB on wasmtime, where before,
    nothing freed until the module was done, it ran out of the 4 GB a
    wasm32 memory has; the GC Substrate's checker takes 12.4 s and 3.1
    GB on V8, the C-like Bend 2.8 s and 1.6 GB. The owners cost time:
-   800 definitions take 3.4 s where the arena took 2.8, most of the
+   800 definitions take 3.2 s where the arena took 2.8, most of the
    difference dropping cells, among them the results of macro uses the
    expander holds for the module, 9 million cells after 800
-   definitions, dropped at its end. Next: a
-   closure given to a call that does not keep it, which the facts could
-   tell, made on the stack rather than freed; and what still leaks: a
-   value a raise unwinds past, and a closure that refers to itself
-   through a box, as a letrec's that escapes does.
+   definitions, dropped at its end. Then the type predicates inline, as
+   tests of a cell's tag, and a parameter of a module's function
+   borrowed where its body only reads it, as a local function's was: as
+   a module's second pass begins, before any body is converted, every
+   body is expanded in a `let` binding its parameters, and the flags
+   are found together, a parameter owned where any body owns a value
+   given to it, where owning it would let the body take its pair apart
+   and reuse the cell, or where a call in tail position that can come
+   back to its function gives it a value that is not read where it is,
+   so that the call stays a tail call; each function's fact is written
+   from them, so callers in other modules know. Walking a list in
+   recursion then counts nothing: the N-queens program runs in 0.29 s
+   on wasmtime and V8, from 0.35 and 0.32, against 0.21 with V8's GC;
+   the list and interpreter programs are as they were, a fifth and six
+   tenths behind on V8, their cost in the pairs, closures and
+   environments each call makes and frees, which the GC's nursery
+   never pays for. Next: a closure given to a call that does not keep
+   it, which the facts could tell, made on the stack rather than freed;
+   and what still leaks: a value a raise unwinds past, and a closure
+   that refers to itself through a box, as a letrec's that escapes
+   does.

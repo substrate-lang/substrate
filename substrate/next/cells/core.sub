@@ -38,7 +38,7 @@
 (provide [define substrate-define] [lambda substrate-lambda] [case-lambda substrate-case-lambda]
          [set! substrate-set!] [#%app app] [#%datum datum]
          [if substrate-if] [let substrate-let] [let* substrate-let*] letrec
-         [struct substrate-struct] [define-syntax substrate-define-syntax] transformer as-transformer substrate-body
+         [struct substrate-struct] [define-syntax substrate-define-syntax] transformer as-transformer substrate-body substrate-wrapper
          ;; equivalence and predicates
          eq? eqv? equal? not boolean? procedure?
          ;; the heap
@@ -89,7 +89,7 @@
 
 (begin-for-syntax
   (require k kernel)
-  (require lower "lower.sub" convert-body convert-lambda in-pass?)
+  (require lower "lower.sub" convert-body convert-lambda infer-module! in-pass?)
   (require rt "runtime.sub")
 
   ;; v, a define-syntax's value, as a transformer if it is a procedure: a
@@ -146,16 +146,89 @@
 
   ;; ---- bodies ----
 
-  ;; (substrate-body (x ...) (b ...) body ...): the body of a function
-  ;; whose parameters are x ..., of which b ... are borrowed, converted
-  ;; (lower.sub) once the module's second pass expands it.
+  ;; (substrate-body name (x ...) (b ...) body ...): the body of function
+  ;; name, whose parameters are x ..., of which b ... are marked
+  ;; borrowed, and the ones inferred so are too, converted (lower.sub)
+  ;; once the module's second pass expands it.
   (func (substrate-body [stx i32]) -> i32
-    (let ([parts (k:syntax->list stx)])
-      (convert-body #'here (k:syntax->list (k:cadr parts)) (k:syntax->list (k:caddr parts)) (k:cdddr parts))))
+    (let* ([parts (k:syntax->list stx)] [name (k:cadr parts)] [params (k:syntax->list (k:caddr parts))])
+      (convert-body #'here params (borrowed-of name params (k:syntax->list (k:cadddr parts))) (k:cdr (k:cdddr parts)))))
 
   ;; (substrate-expr e): expression e, a global's value say, converted.
   (func (substrate-expr [stx i32]) -> i32
+    (ensure-inferred!)
     (convert-body #'here '() '() (k:cdr (k:syntax->list stx))))
+
+  ;; ---- the module's functions ----
+  ;;
+  ;; Each known function, (name params body free marked), marked the
+  ;; parameters its define marks #:borrow, kept as it is defined
+  ;; (known-function), for lower.sub to tell which of its parameters it
+  ;; only reads, so borrows (infer-module!), as the second pass of the
+  ;; body it is in begins (ensure-inferred!): before any body or
+  ;; expression is converted, since a call takes the flags of the
+  ;; function it calls. A module has a body per phase and per
+  ;; begin-for-syntax, each with a second pass of its own, so the
+  ;; functions wait to be inferred, and are, all that wait, at the first
+  ;; conversion after they are defined. The result, (name flag ...) for
+  ;; each, gives each body its borrowed parameters (substrate-body), its
+  ;; value's code the arguments to drop (substrate-wrapper), and its
+  ;; fact, lifted then, which tells a caller in another module.
+  (global functions (mut i32) 0)       ; the functions waiting, or 0
+  (global inferred (mut i32) 0)        ; the flags of those inferred, or 0
+  (func (record-function! [name i32] [params i32] [body i32] [bs i32]) -> i32
+    (set! functions (k:cons (k:cons name (k:cons params (k:cons body (k:cons (k:fixnum defined-free) (k:cons bs '())))))
+                            (if functions functions '())))
+    0)
+
+  (func (ensure-inferred!) -> i32
+    (if (i32.eqz inferred) (set! inferred '()))
+    (if functions
+        (let ([waiting functions])
+          (set! functions 0)
+          (let ([flags (infer-module! #'here waiting)])
+            (set! inferred (k:append flags inferred))
+            (lift-facts! flags))))
+    inferred)
+
+  (func (lift-facts! [l i32]) -> i32
+    (if (k:pair? l)
+        (let ([name (k:car (k:car l))] [flags (flags-syntax (k:cdr (k:car l)))])
+          (k:syntax-local-lift-definition #`(#%fact #,name '(substrate-function #,@flags)))
+          (lift-facts! (k:cdr l)))
+        0))
+
+  (func (flags-syntax [flags i32]) -> i32
+    (if (k:pair? flags)
+        (k:cons (if (i32.eq (k:fixnum-value (k:car flags)) 1) #'1 #'0) (flags-syntax (k:cdr flags)))
+        '()))
+
+  ;; The flags of the function name, or ().
+  (func (flags-for [name i32] [l i32]) -> i32
+    (if (k:pair? l)
+        (if (i32.eq (k:syntax-e (k:car (k:car l))) (k:syntax-e name)) (k:cdr (k:car l)) (flags-for name (k:cdr l)))
+        '()))
+
+  ;; The parameters of name, params, that are borrowed: those bs names,
+  ;; and those inferred so.
+  (func (borrowed-of [name i32] [params i32] [bs i32]) -> i32
+    (add-flagged params (flags-for name (ensure-inferred!)) bs))
+
+  (func (add-flagged [params i32] [flags i32] [bs i32]) -> i32
+    (if (k:pair? params)
+        (add-flagged (k:cdr params) (if (k:pair? flags) (k:cdr flags) '())
+                     (if (if (k:pair? flags) (i32.eq (k:fixnum-value (k:car flags)) 1) 0)
+                         (if (borrowed? (k:car params) bs) bs (k:cons (k:car params) bs))
+                         bs))
+        bs))
+
+  ;; Is f one of the module's functions, recorded?
+  (func (recorded-function? [f i32]) -> i32
+    (recorded-in? f (if functions functions '())))
+  (func (recorded-in? [f i32] [l i32]) -> i32
+    (if (k:pair? l)
+        (if (k:free-identifier=? f (k:car (k:car l))) 1 (recorded-in? f (k:cdr l)))
+        0))
 
   ;; ---- define, lambda, calls, literals ----
 
@@ -360,32 +433,33 @@
       (if (i32.eqz (k:cdr p)) (k:cons (k:car p) (k:cddr parts)) '#f)))
 
   ;; Known function name, taking params, of which borrowed (a list, or #f)
-  ;; are read without being owned, and running body: a kernel function,
-  ;; inline if inline, with a fact saying it is a Substrate function and
-  ;; which parameters it borrows (lower.sub), whose value (spec 5.2,
-  ;; #:value) is a closure made once, in a global: of the kernel lambda if
-  ;; given, else of code that checks the number of arguments and calls the
-  ;; function, and after the call drops the borrowed arguments; the
-  ;; closure is its caller's.
+  ;; are read without being owned, as are the parameters inferred so once
+  ;; the second pass begins (ensure-inferred!), and running body: a kernel
+  ;; function, inline if inline, with a fact, lifted then, saying it is a
+  ;; Substrate function and which parameters it borrows (lower.sub), whose
+  ;; value (spec 5.2, #:value) is a closure made once, in a global: of the
+  ;; kernel lambda if given, else of code that checks the number of
+  ;; arguments and calls the function, and after the call drops the
+  ;; borrowed arguments (substrate-wrapper); the closure is its caller's.
   ;;
   (func (known-function [name i32] [params i32] [body i32] [closure i32] [inline i32] [borrowed i32]) -> i32
     (let ([n (k:length params)] [value (hidden-name name '".value")] [code (hidden-name name '".code")]
           [getter (hidden-name name '".getter")]
           [bs (if borrowed (k:syntax->list borrowed) '())])
       (check-borrowed bs params)
+      (record-function! name params body bs)
       ;; The getter gives the value, for a define-syntax that names the
       ;; function (transformer-value), which a fact tells it of.
       #`(begin
           (func (#,name #,@(i32-params params)) #,@(if inline (k:syntax->list #'(#:inline)) '())
-            #:value #,value -> i32 (substrate-body (#,@params) (#,@bs) #,@body))
+            #:value #,value -> i32 (substrate-body #,name (#,@params) (#,@bs) #,@body))
           (func (#,getter) -> i32 #,value)
-          (#%fact #,name '(substrate-function #,@(borrow-flags params bs)))
           (#%fact #,name (quote-syntax (substrate-value #,getter)))
           #,@(if defined-free (k:cons #`(#%fact #,name '(result free)) '()) '())
           #,@(if (i32.eqz closure)
                  (k:cons #`(func (#,code [self i32] [nargs i32] [a0 i32] [a1 i32] [a2 i32] [a3 i32]) -> i32
                              (if (i32.eq nargs #,(number n))
-                                 #,(wrapper-call name n params bs)
+                                 (substrate-wrapper #,name (#,@params) (#,@bs) #,@(arguments-from 0 n))
                                  (rt:arity-error '#,name #,(number n) 0 nargs)))
                          '())
                  '())
@@ -406,23 +480,25 @@
     (if (i32.eq (k:syntax-e x) (k:syntax-e (k:car l))) (return 1))
     (borrowed? x (k:cdr l)))
 
-  ;; 1 for each parameter in bs, 0 for the others.
-  (func (borrow-flags [params i32] [bs i32]) -> i32
-    (if (k:null? params) '() (k:cons (if (borrowed? (k:car params) bs) #'1 #'0) (borrow-flags (k:cdr params) bs))))
-
-  ;; The call of name from its value's code; with borrowed parameters, its
-  ;; result kept while the borrowed arguments are dropped.
-  (func (wrapper-call [name i32] [n i32] [params i32] [bs i32]) -> i32
-    (let ([call #`(#,name #,@(arguments-from 0 n))])
+  ;; (substrate-wrapper name (x ...) (b ...) a ...): the call of name with
+  ;; arguments a ..., from its value's code, whose parameters are x ...,
+  ;; of which b ... are marked borrowed; with borrowed parameters, marked
+  ;; or inferred, its result kept while the borrowed arguments are
+  ;; dropped. The arguments come through the use, so that they are the
+  ;; code's.
+  (func (substrate-wrapper [stx i32]) -> i32
+    (let* ([parts (k:syntax->list stx)] [name (k:cadr parts)] [params (k:syntax->list (k:caddr parts))]
+           [bs (borrowed-of name params (k:syntax->list (k:cadddr parts)))] [args (k:cdr (k:cdddr parts))]
+           [call #`(#,name #,@args)])
       (if (k:null? bs)
           call
-          #`(let ([r i32 #,call]) #,@(borrowed-drops params bs 0) r))))
+          #`(let ([r i32 #,call]) #,@(borrowed-drops params bs args) r))))
 
-  (func (borrowed-drops [params i32] [bs i32] [i i32]) -> i32
+  (func (borrowed-drops [params i32] [bs i32] [args i32]) -> i32
     (if (k:null? params) (return '()))
-    (let ([rest (borrowed-drops (k:cdr params) bs (i32.add i 1))])
+    (let ([rest (borrowed-drops (k:cdr params) bs (k:cdr args))])
       (if (borrowed? (k:car params) bs)
-          (k:cons #`(drop-value #,(k:car (arguments-from i (i32.add i 1)))) rest)
+          (k:cons #`(drop-value #,(k:car args)) rest)
           rest)))
 
   ;; The name of id with suffix, as an identifier of this macro's, so no
@@ -493,7 +569,7 @@
       ;; its value, if nothing takes it, is left. A kernel function's
       ;; application stays kernel code.
       (if (i32.eqz (in-pass?))
-          (if (if (function-name? f) (substrate-function? f) 1)
+          (if (if (function-name? f) (if (recorded-function? f) 1 (substrate-function? f)) 1)
               (return #`(substrate-expr #,stx))))
       (if (function-name? f)
           (return (if (takes? f (k:length args)) #`(#%app #,f #,@args) (call-value #`(begin #,f) args))))
@@ -515,8 +591,9 @@
   (func (function-name? [f i32]) -> i32
     (if (k:identifier? f) (i32.eq (k:identifier-binding-kind f) 'function) 0))
 
-  ;; Is function f one of Substrate's, with a substrate-function fact
-  ;; (known-function)? The kernel module's own have no facts to ask for.
+  ;; Is function f one of Substrate's, of another module, with a
+  ;; substrate-function fact (known-function)? The kernel module's own
+  ;; have no facts to ask for.
   (func (substrate-function? [f i32]) -> i32
     (let ([fs (try ([catch k:compile-error (m x l) '()]) (k:syntax-local-facts f))])
       (block done
@@ -773,18 +850,6 @@
     (require k kernel)
     (func (function-name-2? [f i32]) -> i32
       (if (k:identifier? f) (i32.eq (k:identifier-binding-kind f) 'function) 0))
-    (func (substrate-function-2? [f i32]) -> i32
-      (let ([fs (try ([catch k:compile-error (m x l) '()]) (k:syntax-local-facts f))])
-        (block done
-          (loop next
-            (br-if done (i32.eqz (k:pair? fs)))
-            (if (substrate-function-fact-2? (k:car fs)) (return 1))
-            (set! fs (k:cdr fs))
-            (br next)))
-        0))
-    (func (substrate-function-fact-2? [entry i32]) -> i32
-      (let ([v (k:syntax->datum (k:caddr entry))])
-        (if (k:pair? v) (i32.eq (k:car v) 'substrate-function) 0)))
     ;; The getter a function's substrate-value fact names, or #f.
     (func (value-getter-2 [f i32]) -> i32
       (let ([fs (try ([catch k:compile-error (m x l) '()]) (k:syntax-local-facts f))])
@@ -824,6 +889,7 @@
 (define-syntax transformer transformer)
 (define-syntax substrate-body substrate-body)
 (define-syntax substrate-expr substrate-expr)
+(define-syntax substrate-wrapper substrate-wrapper)
 
 ;; ---- functions -------------------------------------------------------------------------
 ;;
