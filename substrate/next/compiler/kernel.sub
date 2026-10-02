@@ -62,8 +62,9 @@
 (require print "../../lib/print.sub")
 
 (provide datum srcloc scope-set
-         run-arena current-arena use-arena begin-module-arena end-module-arena alloc-in keep
-         enable-freeing! freeing? dup drop live-cells set-record-dropper! pair-cell? null-cell? pair-car pair-cdr record-cell? record-block cons-inline dup-inline drop-inline
+         run-arena current-arena use-arena begin-module-arena end-module-arena alloc-in keep keep-in hold!
+         the-heap use-heap! heap-mode? heap-cell? compile-arena alloc-heap-block dup drop live-cells
+         heap-cells arena-bytes compile-arena-bytes run-arena-bytes heap-arena-bytes set-record-dropper! pair-cell? null-cell? pair-car pair-cdr record-cell? record-block cons-inline dup-inline drop-inline
          unique-cell? free-pair-shell! true-value block-inline record-inline
          alloc-block free-block! make-record-current set-record-layout!
          cell-free
@@ -158,12 +159,12 @@
 (func (record-block [d i32]) #:inline -> i32 (i32.load d 8))
 
 ;; A pair of a and d, made inline from the heap's pairs (the heap's
-;; cells, below): the first of the class-4 list, if there is one, its
-;; word 1, its tag 0, its next the list's new first; else cons, which
-;; fills the list. Where cells are permanent, as while compiling, the
-;; list stays empty, so cons makes it.
+;; cells, below), where the heap is current: the first of the class-4
+;; list, if there is one, its word 1, its tag 0, its next the list's new
+;; first; else cons, which fills the list, or makes a permanent pair in
+;; an arena, as the code running there expects.
 (func (cons-inline [a i32] [d i32]) #:inline -> i32
-  (let ([h (i32.load cell-free 16)])
+  (let ([h (if (i32.eq (i32.load current) heap) (i32.load cell-free 16) 0)])
     (if h
         (begin
           (i32.store cell-free (i32.load h 4) 16)
@@ -196,7 +197,7 @@
 ;; (the heap's blocks, below), else alloc-block; and a record cell of
 ;; kind with block p, from the class-4 list, as cons-inline makes a pair.
 (func (block-inline [n i32]) #:inline -> i32
-  (if (i32.le_u n 64)
+  (if (if (i32.le_u n 64) (i32.eq (i32.load current) heap) 0)
       (let ([k (i32.shr_u (i32.add n 3) 2)])
         (let ([h (i32.load (i32.add block-free (i32.shl k 2)))])
           (if h
@@ -204,7 +205,7 @@
               (alloc-block n))))
       (alloc-block n)))
 (func (record-inline [kind i32] [p i32]) #:inline -> i32
-  (let ([h (i32.load cell-free 16)])
+  (let ([h (if (i32.eq (i32.load current) heap) (i32.load cell-free 16) 0)])
     (if h
         (begin
           (i32.store cell-free (i32.load h 4) 16)
@@ -264,9 +265,10 @@
 
 (define run-arena arena)
 
-;; A module's arena, and the one of the module whose compilation its
-;; compilation is in.
-(struct module-arena [arena arena] [outer (ptr module-arena)])
+;; A module's arena, the one of the module whose compilation its
+;; compilation is in, and the cells of the heap its compilation holds
+;; (hold!).
+(struct module-arena [arena arena] [outer (ptr module-arena)] [held datum])
 
 (define innermost (ptr module-arena) 0)
 (define current (ptr arena) (& run-arena))
@@ -281,18 +283,35 @@
 
 (define (in-run-arena?) -> i32 (== current (& run-arena)))
 
+;; Cell d, if it is the heap's, held by the module's compilation as long
+;; as its arena, and dropped with it: a reference given to the compiler,
+;; a macro's result, which the compiler's data refers into without
+;; counting, as an arena's cells refer to each other, for as long as
+;; they live. Outside a module's compilation, held for the run.
+(define run-held datum 0)
+(define (hold! [d datum]) -> datum
+  (when (heap-cell? d)
+    (if (== innermost 0)
+        (set! run-held (make-cell-in (& run-arena) (pair d run-held)))
+        (set! (-> innermost held) (make-cell-in (& (-> innermost arena)) (pair d (-> innermost held))))))
+  d)
+
 ;; A module arena, made current, for a module's compilation.
 (define (begin-module-arena)
   (let ([m (cast (ptr module-arena) (malloc (sizeof module-arena)))])
     (set! (-> m arena) (make-arena))
     (set! (-> m outer) innermost)
+    (set! (-> m held) nil)
     (set! innermost m)
     (set! current (& (-> m arena)))))
 
-;; The innermost module arena freed, its module compiled, and the one
-;; around it current again, or the run's.
+;; The innermost module arena freed, its module compiled, with the cells
+;; of the heap it held dropped, and the one around it current again, or
+;; the run's.
 (define (end-module-arena)
-  (let ([m innermost])
+  (let ([m innermost] [h datum 0])
+    (set! h (-> m held))
+    (while (pair? h) (drop (car h)) (set! h (cdr h)))
     (arena-free (& (-> m arena)))
     (set! innermost (-> m outer))
     (set! current (if (== innermost 0) (& run-arena) (& (-> innermost arena))))
@@ -339,19 +358,28 @@
 ;; ---- owners ----
 
 (define permanent-bit u32 2147483648)
-(define freeing i32 0)
 (define deserializing i32 0)
 (define cells-total i32 0)       ; cells the heap has handed out, on the free lists or in use
 
-;; Make cells on the heap, owned, from now on: a program whose language
-;; frees its values calls it as it starts. Not while compiling.
-(define (enable-freeing!) (when (== innermost 0) (set! freeing 1)))
-(define (freeing?) -> i32 freeing)
+;; The heap: a place for cells chosen as an arena is (use-arena), whose
+;; cells are owned, counted in their word and freed by their last
+;; owner's drop (below), where an arena's are permanent, freed with it.
+;; A language that counts owners makes its cells here: Substrate's
+;; runtime switches to the heap as a program starts, and as Substrate
+;; code starts at compile time, a module's or a macro's, as Bend's
+;; checker switches to an arena of its own per definition. The heap's
+;; chunks take what alloc-in is asked for meanwhile, kept.
+(define heap arena)
+(define (the-heap) -> (ptr arena) (& heap))
+(define (use-heap!) (set! current (& heap)))
 
-;; Is a cell that would be made in the current arena made on the heap?
-;; Asked only when the program frees, which is rare: while compiling,
-;; freeing is 0, and the callers test it first.
-(define (heap-mode?) -> i32 (and freeing (== current (& run-arena)) (not deserializing)))
+;; Is a cell made now the heap's? Not while a linklet's literals are
+;; read, which are permanent.
+(define (heap-mode?) -> i32 (and (== current (& heap)) (not deserializing)))
+
+;; The arena a module's compilation makes in, the innermost module's, or
+;; the run's.
+(define (compile-arena) -> (ptr arena) (if (== innermost 0) (& run-arena) (& (-> innermost arena))))
 
 ;; The word before cell d.
 (define (cell-word [d datum]) -> (ptr u32) (- (cast (ptr u32) d) 1))
@@ -365,7 +393,7 @@
 ;; through this one call, so it bumps the arena itself, as alloc-in does,
 ;; and calls out only when the chunk is full or the program frees.
 (define (cell-bytes [n u32]) -> datum
-  (if freeing
+  (if (== current (& heap))
       (heap-cell-bytes n)
       (let* ([size (bit-and (+ n 11) -8)] [p (-> current next)])
         (if (> size (- (-> current end) p))
@@ -375,8 +403,7 @@
               (set! (@ (cast (ptr u32) p) 0) permanent-bit)
               (cast datum (+ p 4)))))))
 
-;; The same, when the program frees: from the heap, unless the current
-;; arena is not the run's, or literals are being read.
+;; The same, in the heap: from its cells, unless literals are being read.
 (define (heap-cell-bytes [n u32]) -> datum
   (if (heap-mode?)
       (let* ([k (>> (+ n 4) 2)] [heads (cast (ptr u32) (& cell-free))] [p (ptr u32) 0])
@@ -397,8 +424,10 @@
 (define cell-free free-heads)
 (define cell-chunk u32 4096)
 
+;; A chunk is never freed, so it comes from sbrk, past the C heap, not
+;; from malloc, whose list of free blocks it would be searched for.
 (define (refill-cells! [k u32])
-  (let* ([size (<< k 2)] [count (/ cell-chunk size)] [chunk (cast (ptr u8) (malloc cell-chunk))]
+  (let* ([size (<< k 2)] [count (/ cell-chunk size)] [chunk (cast (ptr u8) (sbrk cell-chunk))]
          [heads (cast (ptr u32) (& cell-free))])
     (for ([i u32 0]) (< i count) (+= i 1)
       (let ([p (cast (ptr u32) (+ chunk (* i size)))])
@@ -433,14 +462,19 @@
 ;; n bytes a cell made in the current arena holds, a string's: from the
 ;; heap when the cell is, freed with it; else from the arena.
 (define (held-bytes [n u32]) -> (ptr u8)
-  (if (and freeing (heap-mode?))
+  (if (heap-mode?)
       (cast (ptr u8) (malloc (if (== n 0) 1 n)))
       (cast (ptr u8) (alloc-in current n))))
 
 ;; d, with an owner more.
 (define (dup [d datum]) -> datum
-  (when (and freeing (heap-cell? d)) (+= (@ (cell-word d) 0) 1))
+  (when (heap-cell? d) (+= (@ (cell-word d) 0) 1))
   d)
+
+;; d, held by a cell made now: in the heap, with a reference of its own,
+;; as a cell owns what it holds; in an arena, where nothing is counted
+;; and a list may hold any word, as it is.
+(define (dup-held [d datum]) -> datum (if (== current (& heap)) (dup d) d))
 
 ;; ---- the heap's blocks ----
 ;;
@@ -454,7 +488,7 @@
 (define block-chunk u32 4096)
 
 (define (refill-blocks! [k u32])
-  (let* ([size (<< k 2)] [count (/ block-chunk size)] [chunk (cast (ptr u8) (malloc block-chunk))]
+  (let* ([size (<< k 2)] [count (/ block-chunk size)] [chunk (cast (ptr u8) (sbrk block-chunk))]
          [heads (cast (ptr u32) (& block-free))])
     (for ([i u32 0]) (< i count) (+= i 1)
       (set! (@ (cast (ptr u32) (+ chunk (* i size))) 0)
@@ -462,26 +496,29 @@
     (set! (@ heads k) (cast u32 chunk))))
 
 (define (alloc-block [n u32]) -> (ptr void)
-  (cond [(not (heap-mode?)) (alloc-in current n)]
-        [(> n 64) (malloc n)]
-        [else
-         (let* ([k (>> (+ (if (== n 0) 4 n) 3) 2)] [heads (cast (ptr u32) (& block-free))])
-           (when (== (@ heads k) 0) (refill-blocks! k))
-           (let ([p (cast (ptr u32) (@ heads k))])
-             (set! (@ heads k) (@ p 0))
-             (cast (ptr void) p)))]))
+  (if (heap-mode?) (alloc-heap-block n) (alloc-in current n)))
 
-;; A block is freed only where it came from the heap: where cells are
-;; permanent, as while compiling, it is the arena's, freed with it, and
-;; the class lists stay empty, so that block-inline, which takes from
-;; them before asking, never takes a block of an arena that is gone.
+;; A block of the heap's, wherever cells are made now: for a structure of
+;; the heap, whose owner frees what it holds.
+(define (alloc-heap-block [n u32]) -> (ptr void)
+  (if (> n 64)
+      (malloc n)
+      (let* ([k (>> (+ (if (== n 0) 4 n) 3) 2)] [heads (cast (ptr u32) (& block-free))])
+        (when (== (@ heads k) 0) (refill-blocks! k))
+        (let ([p (cast (ptr u32) (@ heads k))])
+          (set! (@ heads k) (@ p 0))
+          (cast (ptr void) p)))))
+
+;; A block of the heap's freed by its owner: a record's, with its cell,
+;; which is the heap's when the block is, or a table's. An arena's block
+;; is the arena's to free, never this one's: the class lists hold only
+;; the heap's, which block-inline takes from before asking.
 (define (free-block! [p (ptr void)] [n u32])
-  (when (heap-mode?)
-    (if (> n 64)
-        (free p)
-        (let ([k (>> (+ (if (== n 0) 4 n) 3) 2)] [heads (cast (ptr u32) (& block-free))])
-          (set! (@ (cast (ptr u32) p) 0) (@ heads k))
-          (set! (@ heads k) (cast u32 p))))))
+  (if (> n 64)
+      (free p)
+      (let ([k (>> (+ (if (== n 0) 4 n) 3) 2)] [heads (cast (ptr u32) (& block-free))])
+        (set! (@ (cast (ptr u32) p) 0) (@ heads k))
+        (set! (@ heads k) (cast u32 p)))))
 
 ;; A record of kind with block p, in the current arena: on the heap,
 ;; owned, when a program frees (record-inline's other case).
@@ -536,7 +573,7 @@
 ;; d's owner gone: if it was the last, d is freed, and what it holds
 ;; dropped.
 (define (drop [d datum])
-  (when (and freeing (heap-cell? d))
+  (when (heap-cell? d)
     (push-drop! d)
     (unless dropping
       (set! dropping 1)
@@ -577,6 +614,20 @@
                        (set! u 0))]
                     [else (free-cell! u w) (set! u 0)])))))
       (set! dropping 0))))
+
+;; How the memory is used, for a program or a language to tell: the
+;; cells the heap has handed out, in use or free; and the bytes of an
+;; arena's chunks, the module's, the run's or the heap's own.
+(define (heap-cells) -> i32 cells-total)
+(define (arena-bytes [a (ptr arena)]) -> i32
+  (let ([n 0] [c (-> a last)])
+    (while (!= c 0)
+      (+= n (cast i32 (-> c size)))
+      (set! c (-> c previous)))
+    n))
+(define (compile-arena-bytes) -> i32 (arena-bytes (compile-arena)))
+(define (run-arena-bytes) -> i32 (arena-bytes (& run-arena)))
+(define (heap-arena-bytes) -> i32 (arena-bytes (& heap)))
 
 ;; How many cells of the heap are in use: handed out and not on a free
 ;; list. Counted when asked, so that making and freeing a cell need not.
@@ -765,16 +816,22 @@
     (while (pair? l) (+= n 1) (set! l (cdr l)))
     n))
 
+;; A new list of l's elements, which it holds with references of its
+;; own (dup-held), as a pair owns what it holds.
 (define (reverse [l datum]) -> datum
   (let ([r nil])
-    (while (pair? l) (set! r (cons (car l) r)) (set! l (cdr l)))
+    (while (pair? l) (set! r (cons (dup-held (car l)) r)) (set! l (cdr l)))
     r))
 
-;; a's elements, then b, shared.
+;; a's elements, held with references of their own, then b, which the
+;; list is given.
 (define (append [a datum] [b datum]) -> datum
   (let ([r (reverse a)])
     (while (pair? r) (set! b (cons (car r) b)) (set! r (cdr r)))
     b))
+;; For a language whose lowering owns values (next/cells/lower.sub).
+(#%fact reverse '(foreign owned))
+(#%fact append '(foreign owned 1))
 
 ;; The nth element of l, from 0.
 (define (list-ref [l datum] [n u32]) -> datum (car (list-tail l n)))
@@ -1074,7 +1131,7 @@
 ;; A string of its name's bytes, which it shares; copied, where a string
 ;; of the heap owns its bytes.
 (define (symbol->string [s datum]) -> datum
-  (if (and freeing (heap-mode?))
+  (if (heap-mode?)
       (bytes->string (symbol-bytes s) (symbol-length s))
       (make-cell (string (symbol-bytes s) (symbol-length s)))))
 
@@ -1092,7 +1149,7 @@
 
 (define (keyword->string [k datum]) -> datum
   (match (cell-of k)
-    [(keyword name length next) (if (and freeing (heap-mode?)) (bytes->string name length) (make-cell (string name length)))]
+    [(keyword name length next) (if (heap-mode?) (bytes->string name length) (make-cell (string name length)))]
     [_ (fail "expected a keyword")]))
 
 (define (string? [d datum]) -> i32 (match (cell-of d) [(string a b) 1] [_ 0]))
@@ -1279,8 +1336,8 @@
   (match s
     [(syntax e scopes loc props pending)
      (if (in-run-arena?)
-         (make-cell (syntax (push (push e pending) cs) (scopes-apply scopes cs) loc props 0))
-         (make-cell (syntax e (scopes-apply scopes cs) loc props (if (or (pair? e) (syntax? e)) (changes-compose pending cs) 0))))]
+         (make-cell (syntax (push (push e pending) cs) (scopes-apply scopes cs) loc (dup-held props) 0))
+         (make-cell (syntax (dup-held e) (scopes-apply scopes cs) loc (dup-held props) (if (or (pair? e) (syntax? e)) (changes-compose pending cs) 0))))]
     [_ s]))
 
 ;; Datum d with changes cs made to the syntax objects in it outside any
@@ -1297,9 +1354,9 @@
            (set-cdr! last p)
            (set! last p))
          (set! rest (cdr rest)))
-       (set-cdr! last (if (syntax? rest) (change-all rest cs) rest))
+       (set-cdr! last (if (syntax? rest) (change-all rest cs) (dup-held rest)))
        head)]
-    [_ d]))
+    [_ (dup-held d)]))
 
 ;; Set s with only the scopes keep? is true of.
 (define (scopes-filter [s (ptr scope-set)] [keep? (fn (u32) -> i32)]) -> (ptr scope-set)
@@ -1374,7 +1431,7 @@
   (match (cell-of d)
     [(syntax e scopes loc props pending) (syntax->datum e)]
     [(pair a b) (cons (syntax->datum a) (syntax->datum b))]
-    [_ d]))
+    [_ (dup-held d)]))
 
 ;; d, each datum in it that is not syntax made a syntax object with the
 ;; scopes of ctx and the source location of loc, each a syntax object or
@@ -1382,9 +1439,12 @@
 (define (datum->syntax [ctx datum] [d datum] [loc datum]) -> datum
   (wrap d (if (syntax? ctx) (syntax-scopes ctx) no-scopes) (if (syntax? loc) (syntax-srcloc loc) 0)))
 
+;; A syntax cell owns what it holds, which its freeing drops, so a
+;; syntax object made of what another cell holds takes a reference of
+;; its own (dup), nothing on a permanent cell.
 (define (wrap [d datum] [scopes (ptr scope-set)] [loc (ptr srcloc)]) -> datum
   (match (cell-of d)
-    [(syntax e s l props pending) d]
+    [(syntax e s l props pending) (dup-held d)]
     [(pair a b)
      (let* ([head (cons (wrap a scopes loc) nil)] [last head] [rest b])
        (while (pair? rest)
@@ -1394,11 +1454,11 @@
          (set! rest (cdr rest)))
        (set-cdr! last (if (null? rest) nil (wrap rest scopes loc)))
        (make-syntax head scopes loc nil))]
-    [_ (make-syntax d scopes loc nil)]))
+    [_ (make-syntax (dup-held d) scopes loc nil)]))
 
 ;; A copy of s holding datum e, with its scopes, location and properties.
 (define (syntax-rewrap [s datum] [e datum]) -> datum
-  (match (cell-of s) [(syntax x scopes loc props pending) (make-syntax e scopes loc props)] [_ (fail "expected a syntax object")]))
+  (match (cell-of s) [(syntax x scopes loc props pending) (make-syntax (dup-held e) scopes loc (dup-held props))] [_ (fail "expected a syntax object")]))
 
 ;; ---- properties ----
 ;;
@@ -1419,13 +1479,13 @@
   (when (in-run-arena?) (syntax-e s))
   (match (cell-of s)
     [(syntax e scopes loc props pending)
-     (make-cell (syntax e scopes loc (cons (cons key value) (without key props)) pending))]
+     (make-cell (syntax (dup-held e) scopes loc (cons (cons (dup-held key) (dup-held value)) (without key props)) pending))]
     [_ (fail "expected a syntax object")]))
 
 (define (without [key datum] [ps datum]) -> datum
   (cond [(not (pair? ps)) ps]
         [(== (car (car ps)) key) (without key (cdr ps))]
-        [else (cons (car ps) (without key (cdr ps)))]))
+        [else (cons (dup-held (car ps)) (without key (cdr ps)))]))
 
 ;; ---- keeping ----
 
@@ -1433,26 +1493,31 @@
 ;; module whose arena it is in; with its syntax objects' pending changes
 ;; made first, in that arena. Symbols, keywords, scope sets, nil and #t
 ;; are in the run's arena already, as #f needs none.
-(define (keep [d datum]) -> datum
-  (match (cell-of d)
-    [(pair a b) (let ([x (keep a)] [y (keep b)]) (make-cell-in (& run-arena) (pair x y)))]
-    [(string bytes length)
-     (let ([kept (cast (ptr u8) (alloc-in (& run-arena) length))])
-       (memcpy kept bytes length)
-       (make-cell-in (& run-arena) (string kept length)))]
-    [(integer low high negative) (make-cell-in (& run-arena) (integer low high negative))]
-    [(flonum low high) (make-cell-in (& run-arena) (flonum low high))]
-    [(character c) (make-cell-in (& run-arena) (character c))]
-    [(syntax e scopes loc props pending)
-     (let ([x (keep (syntax-e d))] [l (keep-srcloc loc)] [ps (keep props)])
-       (make-cell-in (& run-arena) (syntax x scopes l ps 0)))]
-    [(transformer code env arity) (let ([e (keep env)]) (make-cell-in (& run-arena) (transformer code e arity)))]
-    [_ d]))
+(define (keep [d datum]) -> datum (keep-in (& run-arena) d))
 
-(define (keep-srcloc [l (ptr srcloc)]) -> (ptr srcloc)
+;; d copied into arena a, permanent: a symbol, keyword, () or #t is
+;; itself, and a record is itself with one more owner, this copy, which
+;; never lets go.
+(define (keep-in [a (ptr arena)] [d datum]) -> datum
+  (match (cell-of d)
+    [(pair x y) (let ([kx (keep-in a x)] [ky (keep-in a y)]) (make-cell-in a (pair kx ky)))]
+    [(string bytes length)
+     (let ([kept (cast (ptr u8) (alloc-in a length))])
+       (memcpy kept bytes length)
+       (make-cell-in a (string kept length)))]
+    [(integer low high negative) (make-cell-in a (integer low high negative))]
+    [(flonum low high) (make-cell-in a (flonum low high))]
+    [(character c) (make-cell-in a (character c))]
+    [(syntax e scopes loc props pending)
+     (let ([x (keep-in a (syntax-e d))] [l (keep-srcloc-in a loc)] [ps (keep-in a props)])
+       (make-cell-in a (syntax x scopes l ps 0)))]
+    [(transformer code env arity) (let ([e (keep-in a env)]) (make-cell-in a (transformer code e arity)))]
+    [_ (dup d)]))
+
+(define (keep-srcloc-in [a (ptr arena)] [l (ptr srcloc)]) -> (ptr srcloc)
   (if (== l 0)
       0
-      (let ([kept (cast (ptr srcloc) (alloc-in (& run-arena) (sizeof srcloc)))])
+      (let ([kept (cast (ptr srcloc) (alloc-in a (sizeof srcloc)))])
         (set! (@ kept) (@ l))
         kept)))
 

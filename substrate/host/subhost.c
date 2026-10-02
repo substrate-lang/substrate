@@ -722,6 +722,9 @@ static void define(const char *name, int np, int nr, wasmtime_func_callback_t cb
 static void start_host(void) {
   host.store = wasmtime_store_new(engine(), NULL, NULL);
   host.ctx = wasmtime_store_context(host.store);
+  /* A compile keeps every instance it makes, one per compile-time linklet;
+     a big module makes more than the store's default limit of 10000. */
+  wasmtime_store_limiter(host.store, -1, -1, 1000000, -1, -1);
   host.linker = wasmtime_linker_new(engine());
   define("write", 3, 1, host_write);
   define("trap", 2, 0, host_trap);

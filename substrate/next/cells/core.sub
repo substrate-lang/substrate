@@ -132,15 +132,16 @@
   (global runtime-required (mut i32) 0)
 
   ;; form, stx's expansion, after the require of the runtime, %rt, whose
-  ;; memory and table the module takes, if stx is its first definition;
-  ;; this module, which requires the runtime itself, needs none. The path
-  ;; is from this file, where it is written.
+  ;; memory and table the module takes, and whose run-in-heap! makes the
+  ;; module's code run in the heap, if stx is its first definition; this
+  ;; module, which requires the runtime itself, needs none. The path is
+  ;; from this file, where it is written.
   (func (with-runtime [stx i32] [form i32]) -> i32
     (if (i32.or runtime-required (i32.eq (k:syntax-source stx) (k:syntax-source #'here)))
         form
         (begin
           (set! runtime-required 1)
-          #`(begin #,(k:datum->syntax #'here '(begin (require %rt "runtime.sub") (memory from %rt) (table from %rt)) #'here)
+          #`(begin #,(k:datum->syntax #'here '(begin (require %rt "runtime.sub") (memory from %rt) (table from %rt) (%rt:run-in-heap!)) #'here)
                    #,form))))
 
   ;; ---- bodies ----
@@ -369,12 +370,17 @@
   ;;
   (func (known-function [name i32] [params i32] [body i32] [closure i32] [inline i32] [borrowed i32]) -> i32
     (let ([n (k:length params)] [value (hidden-name name '".value")] [code (hidden-name name '".code")]
+          [getter (hidden-name name '".getter")]
           [bs (if borrowed (k:syntax->list borrowed) '())])
       (check-borrowed bs params)
+      ;; The getter gives the value, for a define-syntax that names the
+      ;; function (transformer-value), which a fact tells it of.
       #`(begin
           (func (#,name #,@(i32-params params)) #,@(if inline (k:syntax->list #'(#:inline)) '())
             #:value #,value -> i32 (substrate-body (#,@params) (#,@bs) #,@body))
+          (func (#,getter) -> i32 #,value)
           (#%fact #,name '(substrate-function #,@(borrow-flags params bs)))
+          (#%fact #,name (quote-syntax (substrate-value #,getter)))
           #,@(if defined-free (k:cons #`(#%fact #,name '(result free)) '()) '())
           #,@(if (i32.eqz closure)
                  (k:cons #`(func (#,code [self i32] [nargs i32] [a0 i32] [a1 i32] [a2 i32] [a3 i32]) -> i32
@@ -481,6 +487,14 @@
     (let* ([parts (k:cdr (k:syntax->list stx))]
            [f (k:car parts)]
            [args (k:cdr parts)])
+      ;; Outside a body's pass, at a module's level say, an application
+      ;; of a function of Substrate's or of a closure is converted on its
+      ;; own (substrate-expr), so that it owns its values as a body does;
+      ;; its value, if nothing takes it, is left. A kernel function's
+      ;; application stays kernel code.
+      (if (i32.eqz (in-pass?))
+          (if (if (function-name? f) (substrate-function? f) 1)
+              (return #`(substrate-expr #,stx))))
       (if (function-name? f)
           (return (if (takes? f (k:length args)) #`(#%app #,f #,@args) (call-value #`(begin #,f) args))))
       (if (k:identifier? f) (return (call-value f args)))
@@ -500,6 +514,22 @@
 
   (func (function-name? [f i32]) -> i32
     (if (k:identifier? f) (i32.eq (k:identifier-binding-kind f) 'function) 0))
+
+  ;; Is function f one of Substrate's, with a substrate-function fact
+  ;; (known-function)? The kernel module's own have no facts to ask for.
+  (func (substrate-function? [f i32]) -> i32
+    (let ([fs (try ([catch k:compile-error (m x l) '()]) (k:syntax-local-facts f))])
+      (block done
+        (loop next
+          (br-if done (i32.eqz (k:pair? fs)))
+          (if (substrate-function-fact? (k:car fs)) (return 1))
+          (set! fs (k:cdr fs))
+          (br next)))
+      0))
+
+  (func (substrate-function-fact? [entry i32]) -> i32
+    (let ([v (k:syntax->datum (k:caddr entry))])
+      (if (k:pair? v) (i32.eq (k:car v) 'substrate-function) 0)))
 
   ;; Whether function f takes n arguments. A call that gives it another
   ;; number calls its value, whose code reports the error when it runs.
@@ -583,9 +613,13 @@
   ;; (define-syntax (name stx) body ...): name bound to a transformer that
   ;; runs body, Substrate code at phase 1, so the module must take
   ;; Substrate at phase 1 too, with (begin-for-syntax (require-unqualified
-  ;; substrate ".../substrate.sub")). (define-syntax name f), f a function,
-  ;; is the kernel's. Any other (define-syntax name e) binds name to e's
-  ;; value, made a transformer if it is a procedure (as-transformer).
+  ;; substrate ".../substrate.sub")). (define-syntax name f), f a name,
+  ;; binds name to f's value as a transformer (transformer-value): a
+  ;; function of Substrate's runs as its value does, in the heap, and a
+  ;; kernel function is called as the kernel's rule calls it; the
+  ;; expander makes either without running a linklet. Any other
+  ;; (define-syntax name e) binds name to e's value, made a transformer
+  ;; if it is a procedure (as-transformer).
   (func (substrate-define-syntax [stx i32]) -> i32
     (with-runtime stx (define-syntax-form stx)))
 
@@ -594,7 +628,7 @@
       (if (k:identifier? head)
           (let ([rhs (k:caddr parts)])
             (if (k:identifier? rhs)
-                #`(define-syntax #,head #,rhs)
+                #`(define-syntax #,head (transformer-value #,rhs))
                 (transformer-global head rhs)))
           ;; The lambda is the use's: Substrate's, if the module takes
           ;; Substrate at phase 1, where this module's lambda is not bound.
@@ -620,7 +654,7 @@
   (func (transformer-global [name i32] [e i32]) -> i32
     (let ([v (hidden-name name '".transformer")])
       #`(begin
-          (begin-for-syntax (global #,v (mut i32) (as-transformer #,e)))
+          (begin-for-syntax (global #,v (mut i32) (transformer-value #,e)))
           (define-syntax #,name #,v))))
 
   ;; (struct name (field ...) option ...): a field is an id or
@@ -728,6 +762,50 @@
                                 (begin (rt:struct-set! v #,(number i) x) '#f)
                                 (rt:not-a-struct v D '#,set)))
                         rest)))))
+
+  ;; (transformer-value e), in phase-1 code: e's value as a transformer
+  ;; (as-transformer): of a function of Substrate's, through the getter
+  ;; its substrate-value fact names, a call the expander makes itself;
+  ;; of a kernel function, a transformer calling it as the kernel's
+  ;; (define-syntax m f) does. A macro of phase 1, expanded where e is
+  ;; bound, so that it can ask e's facts; its code is at phase 2.
+  (begin-for-syntax
+    (require k kernel)
+    (func (function-name-2? [f i32]) -> i32
+      (if (k:identifier? f) (i32.eq (k:identifier-binding-kind f) 'function) 0))
+    (func (substrate-function-2? [f i32]) -> i32
+      (let ([fs (try ([catch k:compile-error (m x l) '()]) (k:syntax-local-facts f))])
+        (block done
+          (loop next
+            (br-if done (i32.eqz (k:pair? fs)))
+            (if (substrate-function-fact-2? (k:car fs)) (return 1))
+            (set! fs (k:cdr fs))
+            (br next)))
+        0))
+    (func (substrate-function-fact-2? [entry i32]) -> i32
+      (let ([v (k:syntax->datum (k:caddr entry))])
+        (if (k:pair? v) (i32.eq (k:car v) 'substrate-function) 0)))
+    ;; The getter a function's substrate-value fact names, or #f.
+    (func (value-getter-2 [f i32]) -> i32
+      (let ([fs (try ([catch k:compile-error (m x l) '()]) (k:syntax-local-facts f))])
+        (block done
+          (loop next
+            (br-if done (i32.eqz (k:pair? fs)))
+            (let ([v (k:syntax->list (k:caddr (k:car fs)))])
+              (if (if v (if (k:identifier? (k:car v)) (i32.eq (k:syntax-e (k:car v)) 'substrate-value) 0) 0)
+                  (return (k:cadr v))))
+            (set! fs (k:cdr fs))
+            (br next)))
+        '#f))
+    (func (transformer-value-form [stx i32]) -> i32
+      (let* ([e (k:cadr (k:syntax->list stx))]
+             [getter (if (k:identifier? e) (value-getter-2 e) '#f)])
+        (if getter
+            #`(as-transformer (#,getter))
+            (if (if (k:identifier? e) (function-name-2? e) 0)
+                #`(k:make-function-transformer (func-index #,e))
+                #`(as-transformer #,e))))))
+  (define-syntax transformer-value transformer-value-form)
 )
 
 (define-syntax substrate-define substrate-define)

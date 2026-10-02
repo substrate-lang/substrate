@@ -44,7 +44,7 @@
 (provide exn
          ;; closures and calls
          make-closure closure-set! closure-ref closure-code procedure? call-closure
-         set-extra-arg! extra-arg rest-arguments apply-list spread transformer-of
+         set-extra-arg! extra-arg rest-arguments apply-list spread run-in-heap! transformer-of
          ;; errors
          raise-value fail-format wrong-type index-error arity-error no-clause-error not-a-function
          overflow divide-by-zero make-exn exn? exn-message syntax-error? syntax-error-syntax call-with-handlers dynamic-wind
@@ -125,7 +125,13 @@
 (define (block-of [d datum]) -> (ptr void) (cast (ptr void) (@ (cast (ptr u32) d) 2)))
 
 ;; This program frees, if it is one: not while compiling.
-(enable-freeing!)
+;; Substrate's code runs in the heap (kernel.sub): a program from here on,
+;; and at compile time a Substrate module's code as it starts (core.sub's
+;; prologue, run-in-heap!) and a macro's as it is called
+;; (apply-transformer); the expander makes the arena that was current
+;; again after each.
+(define (run-in-heap!) (use-heap!))
+(use-heap!)
 
 ;; ---- droppers ----
 ;;
@@ -139,11 +145,9 @@
       (let ([e (@ (-> b buckets) i)])
         (while (!= e 0)
           (let ([next (-> e next)])
-            (drop (-> e key))
-            (drop (-> e value))
-            (free-block e (sizeof entry))
+            (free-entry b e)
             (set! e next)))))
-    (free-block (-> b buckets) (* (-> b nbuckets) 4))
+    (when (-> b heap) (free-block (-> b buckets) (* (-> b nbuckets) 4)))
     (free-block p (sizeof table-block))))
 
 (define (drop-port-block [p (ptr void)])
@@ -219,7 +223,12 @@
 ;; A transformer (spec 2.1) whose code applies closure c to the syntax:
 ;; how a Substrate function from syntax to syntax becomes a macro. The
 ;; transformer owns c.
-(define (apply-transformer [env datum] [s datum]) -> datum (call-closure env 1 (dup s) 0 0 0))
+(define (apply-transformer [env datum] [s datum]) -> datum
+  (let ([was (current-arena)])
+    (use-heap!)
+    (let ([r (call-closure env 1 (dup s) 0 0 0)])
+      (use-arena was)
+      r)))
 (define (transformer-of [c datum]) -> datum (make-transformer (cast u32 apply-transformer) c))
 (#%fact transformer-of '(foreign owned 0))
 
@@ -1061,7 +1070,10 @@
 ;; are deterministic.
 
 (struct entry [key datum] [hash u32] [value datum] [next (ptr entry)])
-(struct table-block [kind i32] [count u32] [nbuckets u32] [buckets (ptr (ptr entry))])
+;; heap: made in the heap, so its entries and buckets are the heap's
+;; blocks, wherever the code that adds them runs, and freed; a table of
+;; an arena frees nothing.
+(struct table-block [kind i32] [count u32] [nbuckets u32] [buckets (ptr (ptr entry))] [heap i32])
 
 (define (mix [x u32]) -> u32
   (let ([h (* (bit-xor x (>> x 16)) 2246822507)])
@@ -1108,8 +1120,10 @@
            h)]
         [else (wrong-type who '"a key with a hash or contents to hash" k) 0]))
 
-(define (new-buckets [n u32]) -> (ptr (ptr entry))
-  (let ([bs (cast (ptr (ptr entry)) (alloc (* n 4)))])
+(define (alloc-of [heap i32] [n u32]) -> (ptr void) (if heap (alloc-heap-block n) (alloc n)))
+
+(define (new-buckets [n u32] [heap i32]) -> (ptr (ptr entry))
+  (let ([bs (cast (ptr (ptr entry)) (alloc-of heap (* n 4)))])
     (memset bs 0 (* n 4))
     bs))
 
@@ -1119,7 +1133,8 @@
     (set! (-> b kind) kind)
     (set! (-> b count) 0)
     (set! (-> b nbuckets) 16)
-    (set! (-> b buckets) (new-buckets 16))
+    (set! (-> b heap) (heap-mode?))
+    (set! (-> b buckets) (new-buckets 16 (-> b heap)))
     d))
 
 (define (table? [v datum]) -> i32 (record-of? v kind-table))
@@ -1139,7 +1154,7 @@
     0))
 
 (define (rehash [b (ptr table-block)] [n u32])
-  (let ([old (-> b buckets)] [m (-> b nbuckets)] [new (new-buckets n)])
+  (let ([old (-> b buckets)] [m (-> b nbuckets)] [new (new-buckets n (-> b heap))])
     (for ([i u32 0]) (< i m) (+= i 1)
       (let ([e (@ old i)])
         (while (!= e 0)
@@ -1147,13 +1162,13 @@
             (set! (-> e next) (@ new j))
             (set! (@ new j) e)
             (set! e next)))))
-    (free-block old (* m 4))
+    (when (-> b heap) (free-block old (* m 4)))
     (set! (-> b buckets) new)
     (set! (-> b nbuckets) n)))
 
 (define (add-entry [b (ptr table-block)] [k datum] [h u32] [v datum])
   (when (>= (-> b count) (* 2 (-> b nbuckets))) (rehash b (* 2 (-> b nbuckets))))
-  (let ([e (cast (ptr entry) (alloc (sizeof entry)))] [i (bit-and h (- (-> b nbuckets) 1))])
+  (let ([e (cast (ptr entry) (alloc-of (-> b heap) (sizeof entry)))] [i (bit-and h (- (-> b nbuckets) 1))])
     (set! (-> e key) k)
     (set! (-> e hash) h)
     (set! (-> e value) v)
@@ -1204,10 +1219,10 @@
         (add-entry b k h v))))
 (#%fact hash-set-value! '(foreign void 1 2))
 
-(define (free-entry [e (ptr entry)])
+(define (free-entry [b (ptr table-block)] [e (ptr entry)])
   (drop (-> e key))
   (drop (-> e value))
-  (free-block e (sizeof entry)))
+  (when (-> b heap) (free-block e (sizeof entry))))
 
 (define (hash-remove! [t datum] [k datum] [who datum])
   (let* ([b (table-arg t who)] [h (key-hash k (-> b kind) who)] [i (bit-and h (- (-> b nbuckets) 1))]
@@ -1218,7 +1233,7 @@
             (set! (@ (-> b buckets) i) (-> e next))
             (set! (-> prev next) (-> e next)))
         (-= (-> b count) 1)
-        (free-entry e)
+        (free-entry b e)
         (return))
       (set! prev e)
       (set! e (-> e next)))))
@@ -1229,10 +1244,10 @@
       (let ([e (@ (-> b buckets) i)])
         (while (!= e 0)
           (let ([next (-> e next)])
-            (free-entry e)
+            (free-entry b e)
             (set! e next)))))
-    (free-block (-> b buckets) (* (-> b nbuckets) 4))
-    (set! (-> b buckets) (new-buckets 16))
+    (when (-> b heap) (free-block (-> b buckets) (* (-> b nbuckets) 4)))
+    (set! (-> b buckets) (new-buckets 16 (-> b heap)))
     (set! (-> b nbuckets) 16)
     (set! (-> b count) 0)))
 

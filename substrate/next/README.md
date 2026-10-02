@@ -77,10 +77,12 @@ on them there.
   - `runtime.sub`: what Substrate's code runs with, in the C-like Lisp:
     closures, boxes, vectors, byte strings, structs, hash tables, ports
     and exceptions as records of the kernel module's, their blocks in
-    memory; calls, errors, handlers, writing and the host. In a program,
-    cells and blocks are made on the heap, owned, and a record's dropper
-    frees its block with what it holds; while a module is compiled they
-    are made in its arena, and nothing is reclaimed.
+    memory; calls, errors, handlers, writing and the host. Substrate's
+    code runs in the heap (`use-heap!`): a program's from its start, and
+    at compile time a module's as it starts and a macro's as it is
+    called, so that its cells and blocks are owned and freed by their
+    last owner; what the compiler makes around it is its module arena's,
+    freed with the module.
   - `lower.sub`: closures without the kernel's, and ownership, in the
     C-like Lisp at compile time. A function's body, once expanded, has
     each variable some lambda captures and some code assigns boxed; a
@@ -279,11 +281,9 @@ Substrate is built again in `substrate/` (plan, 5).
    checker written in Substrate as a macro) give their outputs and errors
    on it, with the kernel module as it was. Then the kernel module: a
    word before each cell with a permanent bit and a count of owners,
-   cells sized by their case, cells and records on the heap, owned, in a
-   program that frees (`enable-freeing!`, which the runtime calls as a
-   program starts and the compiler never), `dup` and `drop`, a dropper
-   per record kind, and fixnums in the datum itself; the compiler
-   builds itself in the same time. Then the lowering owning each value
+   cells sized by their case, cells and records on the heap, owned,
+   `dup` and `drop`, a dropper per record kind, and fixnums in the datum
+   itself; the compiler builds itself in the same time. Then the lowering owning each value
    (`lower.sub`): a function owns its parameters, unless `core.sub`
    marks them `#:borrow`, as the primitives that only read theirs are,
    and what it returns; the last use of a variable moves its value, an
@@ -330,8 +330,41 @@ Substrate is built again in `substrate/` (plan, 5).
    costs what V8's nursery never pays for garbage. The pass costs
    little at compile time: the typed example builds in 0.34 s from a
    warm cache, of which the compiler runs 20 ms, the rest the host
-   compiling the compiler. Next: a closure given to a call that does
-   not keep it, which the facts could tell, made on the stack rather
-   than freed; and what still leaks: a value a raise unwinds past, and
-   a closure that refers to itself through a box, as a letrec's that
-   escapes does.
+   compiling the compiler. Then memory at compile time, made of one
+   piece with memory at run time. There are two lifetimes: a
+   compilation, whose data the compiler makes in arenas and frees
+   wholesale, a module's with the module, and a program run, whose
+   values are owned and freed one by one. The kernel module serves both
+   with one kind of cell, permanent in an arena, counted in the heap,
+   and the heap is a place chosen as an arena is (`use-heap!`), not a
+   mode: Substrate's runtime switches to it as a program starts, as a
+   Substrate module's code starts at compile time, and as a Substrate
+   macro is called (`apply-transformer`), the way Bend's checker
+   switches to an arena of its own per definition. The expander knows
+   no language: it makes the arena that was current again after a
+   transformer or an instantiation, runs a query from a macro in the
+   heap in its own arena, and holds a cell of the heap's a macro gives
+   it, a result, or lends a query, a form to lift or expand, as long as
+   the module's arena, whose cells refer into it, dropping it with the
+   arena (`hold!`); a compile-time value it keeps. On
+   Substrate's side a syntax cell, a pair of `reverse` or `append`,
+   takes a reference of its own to what it holds while in the heap
+   (`dup-held`), the pass treats the kernel's syntax constructors'
+   results as owned, a module-level expression of Substrate's is
+   converted as a body is, and a function named in `define-syntax` runs
+   as its value does (`transformer-value`), in the heap. A macro that
+   makes and drops lists, strings, closures and a table leaves no cell
+   in use (`tests/cells/live-cells.sub`). The Bend example's checker,
+   running as macros, checks the 3200-definition proofs module in 11.0
+   s and 3.8 GB on V8 and 12.8 s and 4.0 GB on wasmtime, where before,
+   nothing freed until the module was done, it ran out of the 4 GB a
+   wasm32 memory has; the GC Substrate's checker takes 12.4 s and 3.1
+   GB on V8, the C-like Bend 2.8 s and 1.6 GB. The owners cost time:
+   800 definitions take 3.4 s where the arena took 2.8, most of the
+   difference dropping cells, among them the results of macro uses the
+   expander holds for the module, 9 million cells after 800
+   definitions, dropped at its end. Next: a
+   closure given to a call that does not keep it, which the facts could
+   tell, made on the stack rather than freed; and what still leaks: a
+   value a raise unwinds past, and a closure that refers to itself
+   through a box, as a letrec's that escapes does.

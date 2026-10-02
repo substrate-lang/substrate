@@ -2652,8 +2652,10 @@
 ;; import-map says for phase shift t, while the kernel module maps the
 ;; linklet's scope table, scopes, to the run's scopes at t (spec 3.5). If
 ;; that fails, the compile error is at where, the code it comes from.
+;; A linklet's start may leave another arena current, as a Substrate
+;; module's leaves the heap: the arena that was is current again after.
 (define (instantiate! [name datum] [bytes datum] [imports datum] [scopes datum] [t u32] [where datum])
-  (let ([m (make-buffer)] [map (import-map imports t)] [ok i32 0])
+  (let ([m (make-buffer)] [map (import-map imports t)] [ok i32 0] [arena (current-arena)])
     (while (pair? map)
       (buffer-add! (& m) (string-bytes (car (car map))) (string-length (car (car map))))
       (buffer-add-byte! (& m) 0)
@@ -2664,9 +2666,11 @@
     (try (set! ok (instantiate-bytes (string-bytes name) (string-length name) (string-bytes bytes) (string-length bytes)
                                      (-> m bytes) (-> m length)))
          [catch compile-error (message blamed loc)
+          (use-arena arena)
           (set-scope-map! 0 0)
           (buffer-free! (& m))
           (throw compile-error message blamed loc)])
+    (use-arena arena)
     (set-scope-map! 0 0)
     (buffer-free! (& m))
     (unless ok (fail-at where "compile-time code failed: ~a" (list1 (host-error))))))
@@ -2751,7 +2755,9 @@
     (if (!= cached 0)
         (car cached)
         (let ([f (cast (fn () -> datum) (function-index getter))])
-          (set! v (f))
+          ;; Kept for the module: a cell of the heap's gets an owner that
+          ;; never lets go.
+          (set! v (dup (f)))
           (table-set! (-> current values) (cast u64 getter) (cast u32 (cons v nil)))
           v))))
 
@@ -2989,6 +2995,7 @@
 (define api-phase i32 0)
 (define api-where datum 0)
 (define api-intro u32 0)
+(define api-arena (ptr arena) 0)                ; the arena the running macro was called from
 
 ;; Hygiene (spec 6.2): a fresh introduction scope is flipped on the input
 ;; and on the output, so only what the transformer introduced carries it.
@@ -3023,23 +3030,41 @@
 ;; blame s, and local-expand uses intro, its introduction scope. Calls
 ;; nest: a query can expand code, which calls more macros. A compile error
 ;; from the call that has no location is located at s, the use.
+;; The transformer may run in an arena of its own, the heap for a
+;; language that counts owners (kernel.sub): the arena that was is
+;; current again after, and a result that is a cell of the heap, which
+;; the macro gave this caller, is held for the module (given).
 (define (call-syntax-function [who datum] [t datum] [s datum] [phase i32] [intro u32]) -> datum
-  (let ([saved-phase api-phase] [saved-where api-where] [saved-intro api-intro] [result datum 0])
+  (let ([saved-phase api-phase] [saved-where api-where] [saved-intro api-intro] [saved-arena api-arena]
+        [arena (current-arena)] [result datum 0])
     (set! api-phase phase)
     (set! api-where s)
     (set! api-intro intro)
+    (set! api-arena arena)
     (try (set! result (call-transformer t s))
          [catch compile-error (message blamed loc)
+          (use-arena arena)
           (set! api-phase saved-phase)
           (set! api-where saved-where)
           (set! api-intro saved-intro)
+          (set! api-arena saved-arena)
           (throw compile-error message blamed
                  (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0)))) (syntax-srcloc s) loc))])
+    (use-arena arena)
     (set! api-phase saved-phase)
     (set! api-where saved-where)
     (set! api-intro saved-intro)
+    (set! api-arena saved-arena)
     (unless (syntax? result) (fail-at s "~a returned a non-syntax value: ~s" `(,who ,(syntax->datum result))))
-    result))
+    (given result)))
+
+;; A cell of the heap a macro gives the expander, its result (given), or
+;; lends a query, which takes a reference of its own (lent), is held for
+;; the module's compilation (hold!, kernel.sub): the expander's data
+;; refers into it without counting, as into its arena's cells, which
+;; live as long.
+(define (given [d datum]) -> datum (hold! d))
+(define (lent [d datum]) -> datum (hold! (dup d)))
 
 ;; A macro use relied on id's binding: if require-unqualified made it, no
 ;; definition may shadow it now.
@@ -3051,15 +3076,49 @@
 ;; ---- the queries ----
 ;;
 ;; The kernel module's expander queries (spec 2.3), answered for the
-;; running macro.
+;; running macro. A query runs in the macro's arena, as the macro's own
+;; code does, unless the macro runs in the heap, where nothing the
+;; expander keeps may be: then it runs in the expander's arena, the one
+;; the macro was called from, or the module's, and holds what the macro
+;; lends it (lent).
 
-(define (query-local-value [id datum]) -> datum
+(define (query-arena) -> (ptr arena)
+  (cond [(!= (current-arena) (the-heap)) (current-arena)]
+        [(!= api-arena 0) api-arena]
+        [else (compile-arena)]))
+
+(define (in-query [f (fn (datum) -> datum)] [x datum]) -> datum
+  (let ([saved (use-arena (query-arena))] [r datum 0])
+    (try (set! r (f x))
+         [catch compile-error (message blamed loc) (use-arena saved) (throw compile-error message blamed loc)])
+    (use-arena saved)
+    r))
+
+(define (in-query-2 [f (fn (datum datum) -> datum)] [x datum] [y datum]) -> datum
+  (let ([saved (use-arena (query-arena))] [r datum 0])
+    (try (set! r (f x y))
+         [catch compile-error (message blamed loc) (use-arena saved) (throw compile-error message blamed loc)])
+    (use-arena saved)
+    r))
+
+(define (query-local-value [id datum]) -> datum (in-query query-local-value* id))
+(define (query-free-identifier=? [x datum] [y datum]) -> datum (in-query-2 query-free-identifier=?* x y))
+(define (query-binding-kind [id datum]) -> datum (in-query query-binding-kind* id))
+(define (query-function-signature [id datum]) -> datum (in-query query-function-signature* id))
+(define (query-local-expand [s datum]) -> datum (in-query query-local-expand* s))
+(define (query-lift [form datum]) -> datum (in-query query-lift* form))
+(define (query-introduce [s datum]) -> datum (in-query query-introduce* s))
+(define (query-local-facts [id datum]) -> datum (in-query query-local-facts* id))
+(define (query-identifier-name [id datum]) -> datum (in-query query-identifier-name* id))
+(define (query-name-identifier [name datum]) -> datum (in-query query-name-identifier* name))
+
+(define (query-local-value* [id datum]) -> datum
   (let ([m (if (identifier? id) (meaning-of id api-phase) 0)])
     (if (and (!= m 0) (== (car m) (sym compile-time-value))) (compile-time-value (cadr m)) 0)))
 
 ;; The same meanings, as a value and as a type, so an import and what it
 ;; imports are equal.
-(define (query-free-identifier=? [x datum] [y datum]) -> datum
+(define (query-free-identifier=?* [x datum] [y datum]) -> datum
   (unless (and (identifier? x) (identifier? y)) (fail-at api-where "free-identifier=?: expected identifiers" nil))
   (let ([vx (meaning-of x api-phase)] [vy (meaning-of y api-phase)]
         [tx (type-meaning-of x api-phase)] [ty (type-meaning-of y api-phase)])
@@ -3067,7 +3126,7 @@
                  (and (equal? vx vy) (equal? tx ty))
                  (== (syntax-e x) (syntax-e y))))))
 
-(define (query-binding-kind [id datum]) -> datum
+(define (query-binding-kind* [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "identifier-binding-kind: expected an identifier" nil))
   (let ([m (meaning-of id api-phase)])
     (case (if (== m 0) 0 (car m))
@@ -3083,7 +3142,7 @@
 ;; The signature of the function id is bound to, (t ... -> r ...), each
 ;; type written as in the kernel: a numeric type's name, (ref T) or (ref
 ;; null T) with T a heap type's name; #f if id is not a function.
-(define (query-function-signature [id datum]) -> datum
+(define (query-function-signature* [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "identifier-function-signature: expected an identifier" nil))
   (let ([m (meaning-of id api-phase)])
     (if (and (!= m 0) (== (car m) (sym func)))
@@ -3103,9 +3162,9 @@
 ;; macro's input expands as it would at the use site. If a compile error
 ;; leaves the expansion, the expander is as it was, since the macro may
 ;; handle it and go on.
-(define (query-local-expand [s datum]) -> datum
-  (unless (syntax? s) (fail-at api-where "local-expand: expected syntax" nil))
-  (let ([saved current-function] [saved-output to-syntax] [out datum 0])
+(define (query-local-expand* [s0 datum]) -> datum
+  (unless (syntax? s0) (fail-at api-where "local-expand: expected syntax" nil))
+  (let ([s (lent s0)] [saved current-function] [saved-output to-syntax] [out datum 0])
     (set! to-syntax 1)
     (try (set! out (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro))
          [catch compile-error (message blamed loc)
@@ -3118,14 +3177,14 @@
 
 ;; The form gets the macro's introduction scope, as its output does. The
 ;; macro gets back the form it gave, which its output can hold.
-(define (query-lift [form datum]) -> datum
+(define (query-lift* [form datum]) -> datum
   (unless (syntax? form) (fail-at api-where "syntax-local-lift-definition: expected syntax" nil))
-  (lift! (flip-scope form api-intro) api-where api-phase)
+  (lift! (flip-scope (lent form) api-intro) api-where api-phase)
   form)
 
-(define (query-introduce [s datum]) -> datum
+(define (query-introduce* [s datum]) -> datum
   (unless (syntax? s) (fail-at api-where "syntax-local-introduce: expected syntax" nil))
-  (flip-scope s api-intro))
+  (flip-scope (lent s) api-intro))
 
 ;; The module being expanded and each module it requires, directly or
 ;; not, as (module . shift): dependencies first, in the order of their
@@ -3147,7 +3206,7 @@
 ;; and of each module it requires (dependencies). Each is (module phase
 ;; value): the file of the module that recorded it, the phase that module
 ;; recorded it at, and its datum or syntax.
-(define (query-local-facts [id datum]) -> datum
+(define (query-local-facts* [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "syntax-local-facts: expected an identifier" nil))
   (let* ([facts (reverse (cast datum (hash-ref (& facts-by-key) (cast u64 (fact-key id api-phase)))))]
          [deps (if (null? facts) nil (dependencies))] [out nil])
@@ -3244,7 +3303,7 @@
 
 ;; The name of the definition id refers to at the running macro's phase,
 ;; or #f (spec 6.6).
-(define (query-identifier-name [id datum]) -> datum
+(define (query-identifier-name* [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "identifier-name: expected an identifier" nil))
   (let ([base (definition-of (meaning-of id api-phase))])
     (if (== base 0)
@@ -3255,7 +3314,7 @@
 ;; macro's phase, if the module being expanded made it or requires,
 ;; directly or not, the module that did: its symbol, with its scopes at
 ;; the phase shift that module is required at (spec 6.6).
-(define (query-name-identifier [name datum]) -> datum
+(define (query-name-identifier* [name datum]) -> datum
   (unless (symbol? name) (fail-at api-where "name-identifier: expected a name, a symbol" nil))
   (let ([deps (dependencies)])
     (while (pair? deps)
