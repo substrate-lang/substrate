@@ -1,0 +1,215 @@
+;; Lifecycle: permanent. Part of the compiler, written in
+;; the C-like Lisp (compiler/c), with no counterpart in compiler/: the running
+;; compiler's build, as the compiler reads it (expander.sub, the kernel
+;; module).
+;;
+;; Compile-time code links to the running compiler's instances of the
+;; kernel module, as the compiler's does to its running kernel's (spec 1.1,
+;; 1.4). The host registers the running compiler's linklets under the
+;; names its program lists, so an import of one of those names links to
+;; the compiler's instance. What a linklet provides is read from its bytes,
+;; its exports and their types, and what it needs, its imports.
+(require-unqualified c "c/c.sub")
+(require-unqualified k "kernel.sub")
+(require-unqualified host "host.sub")
+
+(provide file-string program-names linklet-exports linklet-imports linklet-memory-import)
+
+(memory from c)
+(table from c)
+
+;; The bytes of the file at path, a string, as a string; or #f.
+(define (file-string [path datum]) -> datum
+  (let ([name (make-buffer)] [n u32 0] [p (ptr u8) 0] [s datum 0])
+    (buffer-add! (& name) (string-bytes path) (string-length path))
+    (buffer-add-byte! (& name) 0)
+    (set! p (read-file-bytes (-> name bytes) (& n)))
+    (buffer-free! (& name))
+    (unless (== p 0)
+      (set! s (bytes->string p n))
+      (free p))
+    s))
+
+;; The instance names a program's file lists, one per line, in order.
+(define (program-names [text datum]) -> datum
+  (let ([names nil] [bytes (string-bytes text)] [start u32 0])
+    (for ([i u32 0]) (< i (string-length text)) (+= i 1)
+      (when (== (@ bytes i) 10)
+        (set! names (cons (bytes->string (+ bytes start) (- i start)) names))
+        (set! start (+ i 1))))
+    (reverse names)))
+
+;; ---- reading a linklet's exports ----
+
+;; The bytes being read, where, and where they end.
+(define in (ptr u8) 0)
+(define at u32 0)
+(define end u32 0)
+
+(define (byte) -> u32
+  (when (>= at end) (raise-compile-error 0 `"internal: a running linklet ends too soon"))
+  (let ([b (@ in at)]) (+= at 1) b))
+
+(define (uleb) -> u32
+  (let ([n u32 0] [shift u32 0] [b u32 128])
+    (while (!= (bit-and b 128) 0)
+      (set! b (byte))
+      (set! n (bit-or n (<< (bit-and b 127) shift)))
+      (+= shift 7))
+    n))
+
+(define (skip [n u32]) (+= at n))
+
+;; A name: a string.
+(define (name) -> datum
+  (let* ([n (uleb)] [s (bytes->string (+ in at) n)])
+    (skip n)
+    s))
+
+;; A value type: i32, i64, f32 or f64; or #f for a reference type, whose
+;; heap type is skipped.
+(define (valtype) -> datum
+  (let ([b (byte)])
+    (cond [(== b #x7F) (sym i32)]
+          [(== b #x7E) (sym i64)]
+          [(== b #x7D) (sym f32)]
+          [(== b #x7C) (sym f64)]
+          [(or (== b #x63) (== b #x64)) (heaptype) 0]
+          [else 0])))
+
+;; A heap type: a signed LEB128, whose value does not matter here.
+(define (heaptype)
+  (let ([b u32 128])
+    (while (!= (bit-and b 128) 0) (set! b (byte)))))
+
+(define (valtypes) -> datum
+  (let ([n (uleb)] [out nil])
+    (for ([i u32 0]) (< i n) (+= i 1) (set! out (cons (valtype) out)))
+    (reverse out)))
+
+(define (limits)
+  (let ([flag (byte)])
+    (uleb)
+    (when (== (bit-and flag 1) 1) (uleb))))
+
+;; A type's entry, pushed onto types: (params results) for a function
+;; type, or #f.
+(define (comptype [types datum]) -> datum
+  (let ([b (byte)])
+    (cond [(== b #x60) (let* ([ps (valtypes)] [rs (valtypes)]) (cons `(,ps ,rs) types))]
+          [(== b #x5F)
+           (let ([n (uleb)]) (for ([i u32 0]) (< i n) (+= i 1) (valtype) (byte)))
+           (cons 0 types)]
+          [(== b #x5E) (valtype) (byte) (cons 0 types)]
+          [(or (== b #x50) (== b #x4F))
+           (let ([n (uleb)]) (for ([i u32 0]) (< i n) (+= i 1) (uleb)))
+           (comptype types)]
+          [else (raise-compile-error 0 `"internal: a running linklet has a type this compiler does not read") types])))
+
+;; The functions and tags that the n bytes of the linklet at p export,
+;; each (func name params results) or (tag name params), its types i32,
+;; i64, f32 or f64; those of other types are left out.
+(define (linklet-exports [p (ptr u8)] [n u32]) -> datum
+  (let ([types nil] [imported-funcs nil] [funcs nil] [tags nil] [imported-tags nil] [out nil] [id u32 0] [size u32 0] [next u32 0])
+    (set! in p)
+    (set! at 8)
+    (set! end n)
+    (while (< at end)
+      (set! id (byte))
+      (set! size (uleb))
+      (set! next (+ at size))
+      (cond
+        [(== id 1)
+         (let ([count (uleb)])
+           (for ([i u32 0]) (< i count) (+= i 1)
+             (if (== (@ in at) #x4E)
+                 (let ([m (begin (skip 1) (uleb))])
+                   (for ([j u32 0]) (< j m) (+= j 1) (set! types (comptype types))))
+                 (set! types (comptype types)))))
+         (set! types (reverse types))]
+        [(== id 2)
+         (let ([count (uleb)])
+           (for ([i u32 0]) (< i count) (+= i 1)
+             (name)
+             (name)
+             (let ([kind (byte)])
+               (cond [(== kind 0) (set! imported-funcs (cons (make-integer (uleb)) imported-funcs))]
+                     [(== kind 1) (valtype) (limits)]
+                     [(== kind 2) (limits)]
+                     [(== kind 3) (valtype) (byte)]
+                     [else (byte) (set! imported-tags (cons (make-integer (uleb)) imported-tags))]))))]
+        [(== id 3)
+         (let ([count (uleb)])
+           (for ([i u32 0]) (< i count) (+= i 1) (set! funcs (cons (make-integer (uleb)) funcs))))]
+        [(== id 13)
+         (let ([count (uleb)])
+           (for ([i u32 0]) (< i count) (+= i 1) (byte) (set! tags (cons (make-integer (uleb)) tags))))]
+        [(== id 7)
+         (let ([count (uleb)] [all-funcs (append (reverse imported-funcs) (reverse funcs))]
+               [all-tags (append (reverse imported-tags) (reverse tags))])
+           (for ([i u32 0]) (< i count) (+= i 1)
+             (let* ([export (name)] [kind (byte)] [index (uleb)])
+               (when (or (== kind 0) (== kind 4))
+                 (let ([t (list-ref types (cast u32 (integer-value (list-ref (if (== kind 0) all-funcs all-tags) index))))])
+                   (when (and (!= t 0) (numeric? (car t)) (numeric? (cadr t)))
+                     (set! out (cons (if (== kind 0) `(func ,export ,(car t) ,(cadr t)) `(tag ,export ,(car t))) out))))))))])
+      (set! at next))
+    (reverse out)))
+
+;; Are types all numeric: none #f?
+(define (numeric? [types datum]) -> i32
+  (while (pair? types)
+    (when (== (car types) 0) (return 0))
+    (set! types (cdr types)))
+  1)
+
+;; The instance names the n bytes of the linklet at p import from, each
+;; once, in order.
+;; The module the n bytes of the linklet at p import their memory from,
+;; or #f if the linklet declares its own.
+(define (linklet-memory-import [p (ptr u8)] [n u32]) -> datum
+  (let ([id u32 0] [size u32 0] [next u32 0] [module datum 0] [found datum 0])
+    (set! in p)
+    (set! at 8)
+    (set! end n)
+    (while (< at end)
+      (set! id (byte))
+      (set! size (uleb))
+      (set! next (+ at size))
+      (when (== id 2)
+        (let ([count (uleb)])
+          (for ([i u32 0]) (< i count) (+= i 1)
+            (set! module (name))
+            (name)
+            (let ([kind (byte)])
+              (cond [(== kind 0) (uleb)]
+                    [(== kind 1) (valtype) (limits)]
+                    [(== kind 2) (limits) (set! found module)]
+                    [(== kind 3) (valtype) (byte)]
+                    [else (byte) (uleb)])))))
+      (set! at next))
+    found))
+
+(define (linklet-imports [p (ptr u8)] [n u32]) -> datum
+  (let ([out nil] [id u32 0] [size u32 0] [next u32 0] [module datum 0])
+    (set! in p)
+    (set! at 8)
+    (set! end n)
+    (while (< at end)
+      (set! id (byte))
+      (set! size (uleb))
+      (set! next (+ at size))
+      (when (== id 2)
+        (let ([count (uleb)])
+          (for ([i u32 0]) (< i count) (+= i 1)
+            (set! module (name))
+            (name)
+            (let ([kind (byte)])
+              (cond [(== kind 0) (uleb)]
+                    [(== kind 1) (valtype) (limits)]
+                    [(== kind 2) (limits)]
+                    [(== kind 3) (valtype) (byte)]
+                    [else (byte) (uleb)]))
+            (when (== (member module out) 0) (set! out (cons module out))))))
+      (set! at next))
+    (reverse out)))

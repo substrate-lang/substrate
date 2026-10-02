@@ -1,312 +1,349 @@
-;; Lifecycle: permanent. Part of the compiler.
+;; Lifecycle: permanent. Part of the compiler, written in
+;; the C-like Lisp (compiler/c): the compiler's reader.sub.
 ;;
 ;; Reader: text -> syntax objects with source locations and empty scopes.
 ;; It scans bytes: strings are UTF-8, and every character that shapes the
-;; syntax is ASCII, so the code compares bytes with (ascii #\c), c's.
-;; Positions, spans and columns count characters, not bytes.
-(require-unqualified substrate "../lib/substrate.sub")
-(require stx "stx.sub" make-stx make-srcloc raise-compile-error)
-(require num "numbers.sub" digits->integer)
+;; syntax is ASCII. Positions, spans and columns count characters, not
+;; bytes.
+(require-unqualified c "c/c.sub")
+(require-unqualified k "kernel.sub")
+(require-unqualified numbers "numbers.sub")
+(require-unqualified host "host.sub")
 
-;; (ascii #\c): the byte of character c, which must be ASCII, as a number
-;; written in its place.
-(begin-for-syntax
-  (require k kernel)
-  (func (ascii [stx eqref]) -> eqref
-    (let ([n (k:char->integer (k:syntax-e (k:cadr (k:syntax->list stx))))])
-      (if (i32.ge_u n 128) (k:raise-syntax-error '#f '"expected an ASCII character" stx))
-      (k:datum->syntax stx (k:fixnum n) stx))))
-(define-syntax ascii ascii)
+(provide read-file read-all)
 
-(provide read-file read-string-all)
+(memory from c)
+(table from c)
 
-(define (read-file path) (read-string-all (file->string path) (string->symbol path)))
+;; The text being read, its length in bytes, the byte index of its next
+;; character, that character's index, and its line and column; and the
+;; file it is from, a symbol.
+(define text (ptr u8) 0)
+(define text-bytes u32 0)
+(define bpos u32 0)
+(define pos u32 0)
+(define line u32 1)
+(define col u32 0)
+(define source datum 0)
 
-;; The text being read, the byte index of its next character, that
-;; character's index, and its line and column.
-(define text "")
-(define text-bytes 0)
-(define bpos 0)
-(define pos 0)
-(define line 1)
-(define col 0)
-(define source #f)
+;; Where a datum starts.
+(struct place [pos u32] [line u32] [col u32])
 
-;; The first byte of the next character, or #f at the end; and of the one
+;; The first byte of the next character, or -1 at the end; and of the one
 ;; after it.
-(define (peek) (if (< bpos text-bytes) (string-utf-8-byte text bpos) #f))
-(define (peek2)
+(define (peek) -> i32 (if (< bpos text-bytes) (@ text bpos) -1))
+
+(define (peek2) -> i32
   (let ([b (peek)])
-    (and b (let ([i (+ bpos (char-bytes b))]) (and (< i text-bytes) (string-utf-8-byte text i))))))
+    (if (< b 0)
+        -1
+        (let ([i (+ bpos (char-bytes b))]) (if (< i text-bytes) (@ text i) -1)))))
 
 ;; The length of the UTF-8 sequence whose first byte is b.
-(define (char-bytes b) (cond [(< b 128) 1] [(< b 224) 2] [(< b 240) 3] [else 4]))
+(define (char-bytes [b i32]) -> u32
+  (cond [(< b 128) 1] [(< b 224) 2] [(< b 240) 3] [else 4]))
 
 ;; Advance past the next character; returns its first byte.
-(define (next!)
-  (let ([b (string-utf-8-byte text bpos)])
-    (set! bpos (+ bpos (char-bytes b)))
-    (set! pos (+ pos 1))
-    (if (= b (ascii #\newline))
-        (begin (set! line (+ line 1)) (set! col 0))
-        (set! col (+ col 1)))
+(define (next!) -> i32
+  (let ([b (@ text bpos)])
+    (+= bpos (char-bytes b))
+    (+= pos 1)
+    (if (== b 10)
+        (begin (+= line 1) (set! col 0))
+        (+= col 1))
     b))
 
-(define (here) (list pos line col))
-(define (loc-from start)
-  (make-srcloc source (cadr start) (caddr start) (car start) (- pos (car start))))
-(define (fail start form . args)
-  (apply raise-compile-error (make-srcloc source (cadr start) (caddr start) (car start) 1)
-         (string-append "read: " form) args))
+(define (here) -> place
+  (let ([p place])
+    (set! (-> p pos) pos)
+    (set! (-> p line) line)
+    (set! (-> p col) col)
+    p))
+
+(define (loc-from [start (ptr place)]) -> (ptr srcloc)
+  (make-srcloc source (-> start line) (-> start col) (-> start pos) (- pos (-> start pos))))
+
+;; A compile error at start: template, with args (format-message).
+(define (fail [start (ptr place)] [template (ptr u8)] [args datum]) -> datum
+  (raise-compile-error (make-srcloc source (-> start line) (-> start col) (-> start pos) 1) (format-message template args))
+  0)
+
+(define (list1 [x datum]) -> datum (cons x nil))
+
+;; The bytes of the text from byte index from to the next character's, as
+;; a string.
+(define (text-from [from u32]) -> datum (bytes->string (+ text from) (- bpos from)))
+
+;; Whether the text from byte index from to the next character's is C
+;; string s.
+(define (token=? [from u32] [s (ptr u8)]) -> i32
+  (let ([n (strlen s)])
+    (and (== (- bpos from) n) (== (memcmp (+ text from) s n) 0))))
 
 ;; Space and the control characters tab to return are whitespace; ( ) [ ]
 ;; " ; and the end delimit.
-(define (whitespace? b) (or (= b (ascii #\space)) (and (>= b (ascii #\tab)) (<= b (ascii #\return)))))
-(define (delimiter? b)
-  (or (not b) (whitespace? b) (= b (ascii #\()) (= b (ascii #\))) (= b (ascii #\[)) (= b (ascii #\]))
-      (= b (ascii #\")) (= b (ascii #\;))))
+(define (whitespace? [b i32]) -> i32 (or (== b 32) (and (>= b 9) (<= b 13))))
 
-;; Skip whitespace and comments. Returns when the next char starts a datum.
+(define (delimiter? [b i32]) -> i32
+  (or (< b 0) (whitespace? b) (== b #\() (== b #\)) (== b #\[) (== b #\]) (== b #\") (== b #\;)))
+
+;; Skip whitespace and comments, up to what starts the next datum.
 (define (skip-atmosphere!)
-  (let ([b (peek)])
-    (cond [(not b) #f]
-          [(whitespace? b) (next!) (skip-atmosphere!)]
-          [(= b (ascii #\;))                                   ; to the end of the line
-           (let loop () (let ([b (peek)]) (when (and b (not (= b (ascii #\newline)))) (next!) (loop))))
-           (skip-atmosphere!)]
-          [(and (= b (ascii #\#)) (eqv? (peek2) (ascii #\|)))  ; #| ... |#, nesting
-           (let ([start (here)])
-             (next!) (next!)
-             (let loop ([depth 1])
-               (cond [(= depth 0) #f]
-                     [(not (peek)) (fail start "unterminated block comment")]
-                     [(and (= (peek) (ascii #\|)) (eqv? (peek2) (ascii #\#))) (next!) (next!) (loop (- depth 1))]
-                     [(and (= (peek) (ascii #\#)) (eqv? (peek2) (ascii #\|))) (next!) (next!) (loop (+ depth 1))]
-                     [else (next!) (loop depth)])))
-           (skip-atmosphere!)]
-          [(and (= b (ascii #\#)) (eqv? (peek2) (ascii #\;)))  ; #; datum
-           (next!) (next!)
-           (read-datum)
-           (skip-atmosphere!)]
-          [else #f])))
-
-;; The characters up to the next delimiter, as a string.
-(define (read-token)
-  (let ([start bpos])
-    (let loop () (unless (delimiter? (peek)) (next!) (loop)))
-    (substring/utf-8 text start bpos)))
-
-(define (wrap start e) (make-stx e '() (loc-from start) '()))
-
-;; (prefix-form start 'quote) reads the next datum and wraps it.
-(define (prefix-form start sym)
-  (let* ([head-loc (loc-from start)]
-         [d (read-datum)])
-    (unless d (fail start "expected a datum after ~a" sym))
-    (wrap start (list (make-stx sym '() head-loc '()) d))))
-
-(define (read-list start close)
-  (let loop ([acc '()])
-    (skip-atmosphere!)
+  (while 1
     (let ([b (peek)])
-      (cond [(not b) (fail start "unterminated list")]
-            [(or (= b (ascii #\))) (= b (ascii #\])))
-             (unless (= b close) (fail (here) "mismatched ~a" (integer->char b)))
-             (next!)
-             (wrap start (reverse acc))]
-            [(and (= b (ascii #\.)) (delimiter? (peek2)) (pair? acc))  ; . tail
-             (next!)
-             (let ([tail (read-datum)])
-               (skip-atmosphere!)
-               (unless (eqv? (peek) close) (fail start "expected ~a after dotted tail" (integer->char close)))
+      (cond [(< b 0) (return)]
+            [(whitespace? b) (next!)]
+            ;; To the end of the line.
+            [(== b #\;) (while (and (>= (peek) 0) (!= (peek) 10)) (next!))]
+            [(and (== b #\#) (== (peek2) #\|)) (skip-block-comment!)]
+            ;; #; and the datum after it.
+            [(and (== b #\#) (== (peek2) #\;)) (next!) (next!) (read-datum)]
+            [else (return)]))))
+
+;; #| ... |#, which nest.
+(define (skip-block-comment!)
+  (let ([start (here)] [depth 1])
+    (next!)
+    (next!)
+    (while (> depth 0)
+      (let ([b (peek)])
+        (cond [(< b 0) (fail (& start) "read: unterminated block comment" nil)]
+              [(and (== b #\|) (== (peek2) #\#)) (next!) (next!) (-= depth 1)]
+              [(and (== b #\#) (== (peek2) #\|)) (next!) (next!) (+= depth 1)]
+              [else (next!)])))))
+
+;; The characters up to the next delimiter: the byte index where they
+;; start, the next character's being where they end.
+(define (read-token) -> u32
+  (let ([start bpos])
+    (while (not (delimiter? (peek))) (next!))
+    start))
+
+(define (wrap [start (ptr place)] [e datum]) -> datum (make-syntax e no-scopes (loc-from start) nil))
+
+;; The datum after a prefix, from start, wrapped with symbol name, such as
+;; quote.
+(define (prefix-form [start (ptr place)] [name datum]) -> datum
+  (let* ([head-loc (loc-from start)] [d (read-datum)])
+    (when (== d 0) (fail start "read: expected a datum after ~a" (list1 name)))
+    (wrap start (cons (make-syntax name no-scopes head-loc nil) (list1 d)))))
+
+;; A list from start, up to close: its elements' syntax, and a tail after
+;; a dot.
+(define (read-list [start (ptr place)] [close i32]) -> datum
+  (let ([head nil] [last datum 0])
+    (while 1
+      (skip-atmosphere!)
+      (let ([b (peek)])
+        (cond [(< b 0) (fail start "read: unterminated list" nil)]
+              [(or (== b #\)) (== b #\]))
+               (unless (== b close)
+                 (let ([at (here)]) (fail (& at) "read: mismatched ~a" (list1 (integer->char b)))))
                (next!)
-               (wrap start (append (reverse acc) tail)))]
-            [else (loop (cons (read-datum) acc))]))))
+               (return (wrap start head))]
+              [(and (== b #\.) (delimiter? (peek2)) (!= last 0))
+               (next!)
+               (set-cdr! last (read-datum))
+               (skip-atmosphere!)
+               (unless (== (peek) close) (fail start "read: expected ~a after dotted tail" (list1 (integer->char close))))
+               (next!)
+               (return (wrap start head))]
+              [else
+               (let ([p (list1 (read-datum))])
+                 (if (== last 0) (set! head p) (set-cdr! last p))
+                 (set! last p))])))))
 
 ;; A string literal: its bytes, with the escapes \n \t \r \0 \\ \" and
 ;; \xH...; replaced, as a new string.
-(define (read-string-lit start)
-  (next!)
-  (let ([p (open-output-bytes)])
-    (let loop ()
-      (let ([b (peek)])
-        (cond [(not b) (fail start "unterminated string")]
-              [(= b (ascii #\")) (next!) (wrap start (bytes->string/utf-8 (get-output-bytes p)))]
-              [(= b (ascii #\\))
+(define (read-string-lit [start (ptr place)]) -> datum
+  (let ([b (make-buffer)] [s datum 0])
+    (next!)
+    (while 1
+      (let ([c (peek)] [from bpos])
+        (cond [(< c 0) (fail start "read: unterminated string" nil)]
+              [(== c #\")
+               (next!)
+               (set! s (wrap start (bytes->string (-> b bytes) (-> b length))))
+               (buffer-free! (& b))
+               (return s)]
+              [(== c #\\)
                (next!)
                (let ([e (peek)])
-                 (unless e (fail start "unterminated string"))
+                 (when (< e 0) (fail start "read: unterminated string" nil))
                  (next!)
-                 (cond [(= e (ascii #\n)) (write-byte (ascii #\newline) p)]
-                       [(= e (ascii #\t)) (write-byte (ascii #\tab) p)]
-                       [(= e (ascii #\r)) (write-byte (ascii #\return) p)]
-                       [(= e (ascii #\0)) (write-byte (ascii #\nul) p)]
-                       [(or (= e (ascii #\\)) (= e (ascii #\"))) (write-byte e p)]
-                       [(= e (ascii #\x)) (write-bytes (string->bytes/utf-8 (string (integer->char (hex-escape start)))) p)]
-                       [else (fail start "unknown string escape \\~a" (integer->char e))]))
-               (loop)]
-              [else (copy-char! p) (loop)])))))
+                 (case e
+                   [(#\n) (buffer-add-byte! (& b) 10)]
+                   [(#\t) (buffer-add-byte! (& b) 9)]
+                   [(#\r) (buffer-add-byte! (& b) 13)]
+                   [(#\0) (buffer-add-byte! (& b) 0)]
+                   [(#\\ #\") (buffer-add-byte! (& b) e)]
+                   [(#\x) (buffer-add-utf-8! (& b) (hex-escape start))]
+                   [else (fail start "read: unknown string escape \\~a" (list1 (integer->char e)))]))]
+              [else
+               ;; The next character's bytes.
+               (next!)
+               (buffer-add! (& b) (+ text from) (- bpos from))])))))
 
-;; The next character's bytes, copied to p.
-(define (copy-char! p)
-  (let ([start bpos])
-    (next!)
-    (let loop ([i start]) (when (< i bpos) (write-byte (string-utf-8-byte text i) p) (loop (+ i 1))))))
+;; The hex digits of a \x escape, up to the ; that ends it, as a code
+;; point.
+(define (hex-escape [start (ptr place)]) -> u32
+  (let ([n u32 0] [any 0])
+    (while 1
+      (let ([h (peek)])
+        (cond [(< h 0) (fail start "read: unterminated \\x escape" nil)]
+              [(== h #\;)
+               (next!)
+               (unless (and any (<= n 1114111)) (fail start "read: bad \\x escape" nil))
+               (return n)]
+              [(< (digit-value h 16) 0) (fail start "read: bad \\x escape" nil)]
+              [else
+               (next!)
+               (unless (> n 1114111) (set! n (+ (* n 16) (digit-value h 16))))
+               (set! any 1)])))))
 
-;; The hex digits of a \x escape, up to the ; that ends it, as a code point.
-(define (hex-escape start)
-  (let loop ([n 0] [any? #f])
-    (let ([h (peek)])
-      (cond [(not h) (fail start "unterminated \\x escape")]
-            [(= h (ascii #\;)) (next!) (if (and any? (<= n 1114111)) n (fail start "bad \\x escape"))]
-            [else (let ([d (digit-value h 16)])
-                    (unless d (fail start "bad \\x escape"))
-                    (next!)
-                    (loop (if (> n 1114111) n (+ (* n 16) d)) #t))]))))
+;; The code point of the UTF-8 sequence at p.
+(define (code-point [p (ptr u8)]) -> u32
+  (let ([b (@ p 0)])
+    (cond [(< b 128) b]
+          [(< b 224) (bit-or (<< (bit-and b 31) 6) (bit-and (@ p 1) 63))]
+          [(< b 240) (bit-or (<< (bit-and b 15) 12) (<< (bit-and (@ p 1) 63) 6) (bit-and (@ p 2) 63))]
+          [else (bit-or (<< (bit-and b 7) 18) (<< (bit-and (@ p 1) 63) 12) (<< (bit-and (@ p 2) 63) 6) (bit-and (@ p 3) 63))])))
 
-(define char-names
-  (list (cons "space" #\space) (cons "newline" #\newline) (cons "tab" #\tab)
-        (cons "nul" (integer->char 0)) (cons "return" (integer->char 13))
-        (cons "linefeed" #\newline) (cons "delete" (integer->char 127))
-        (cons "alarm" (integer->char 7)) (cons "backspace" (integer->char 8))
-        (cons "escape" (integer->char 27))))
+;; The characters #\name names.
+(define char-names (array (ptr u8) 10)
+  (array-of (ptr u8) "space" "newline" "tab" "nul" "return" "linefeed" "delete" "alarm" "backspace" "escape"))
+(define char-codes (array u32 10) (array-of u32 32 10 9 0 13 10 127 7 8 27))
 
-(define (read-char-lit start)
-  ;; after #\ : one character, then any following non-delimiters
-  (let* ([first (string-ref/utf-8 text bpos)]
-         [rest (begin (next!) (read-token))]
-         [tok (string-append (string first) rest)]
-         [named (assoc tok char-names)]
-         [n (and (char=? first #\x) (digits-value rest 0 (string-utf-8-length rest) 16))])
-    (cond [(= (string-utf-8-length rest) 0) (wrap start first)]
-          [named (wrap start (cdr named))]
-          [n (wrap start (integer->char n))]
-          [else (fail start "unknown character #\\~a" tok)])))
+;; A character after #\ : one character, then any that follow up to a
+;; delimiter, which make its name, or #\xH... its code point. The end of
+;; the text right after #\ is an error of its own.
+(define (read-char-lit [start (ptr place)]) -> datum
+  (when (< (peek) 0) (fail start "read: unexpected end after #\\" nil))
+  (let* ([from bpos] [first (code-point (+ text bpos))] [rest (begin (next!) (read-token))] [n u64 0])
+    (when (== rest bpos) (return (wrap start (integer->char first))))
+    (for ([i 0]) (< i 10) (+= i 1)
+      (when (token=? from (@ char-names i)) (return (wrap start (integer->char (@ char-codes i))))))
+    (if (and (== first #\x) (digits? text rest bpos 16) (digits-integer text rest bpos 16 0 (& n)))
+        (wrap start (integer->char (cast u32 n)))
+        (fail start "read: unknown character #\\~a" (list1 (text-from from))))))
 
-(define (read-hash start)
+(define (read-hash [start (ptr place)]) -> datum
   (next!)
   (let ([b (peek)])
-    (cond [(not b) (fail start "unexpected end after #")]
-          [(= b (ascii #\()) (fail start "vector syntax #( is not part of the kernel")]
-          [(= b (ascii #\')) (next!) (prefix-form start 'quote-syntax)]
-          [(= b (ascii #\`)) (next!) (prefix-form start 'quasisyntax)]
-          [(= b (ascii #\,))
-           (next!)
-           (if (eqv? (peek) (ascii #\@))
-               (begin (next!) (prefix-form start 'unsyntax-splicing))
-               (prefix-form start 'unsyntax))]
-          [(= b (ascii #\\)) (next!) (read-char-lit start)]
+    (cond [(< b 0) (fail start "read: unexpected end after #" nil)]
+          [(== b #\() (fail start "read: vector syntax #( is not part of the kernel" nil)]
+          [(== b #\') (next!) (prefix-form start (sym quote-syntax))]
+          [(== b #\`) (next!) (prefix-form start (sym quasisyntax))]
+          [(and (== b #\,) (== (peek2) #\@)) (next!) (next!) (prefix-form start (sym unsyntax-splicing))]
+          [(== b #\,) (next!) (prefix-form start (sym unsyntax))]
+          [(== b #\\) (next!) (read-char-lit start)]
           ;; #:name is a keyword.
-          [(= b (ascii #\:)) (next!) (wrap start (string->keyword (read-token)))]
+          [(== b #\:) (next!) (let ([t (read-token)]) (wrap start (bytes->keyword (+ text t) (- bpos t))))]
           ;; #%name is a symbol, used for implicit forms like #%app.
-          [(= b (ascii #\%)) (wrap start (string->symbol (string-append "#" (read-token))))]
+          [(== b #\%) (let ([t (- (read-token) 1)]) (wrap start (bytes->symbol (+ text t) (- bpos t))))]
           [else
-           (let* ([tok (read-token)]
-                  [n (radix-number start tok)])
-             (cond [(member tok '("t" "true")) (wrap start #t)]
-                   [(member tok '("f" "false")) (wrap start #f)]
-                   [n (wrap start n)]
-                   [else (fail start "unknown syntax #~a" tok)]))])))
+           (let* ([t (read-token)] [n (radix-number start t)])
+             (cond [(or (token=? t "t") (token=? t "true")) (wrap start (boolean 1))]
+                   [(or (token=? t "f") (token=? t "false")) (wrap start 0)]
+                   [(!= n 0) (wrap start n)]
+                   [else (fail start "read: unknown syntax #~a" (list1 (text-from t)))]))])))
 
-(define (read-datum)
+(define (read-datum) -> datum
   (skip-atmosphere!)
   (let ([start (here)] [b (peek)])
-    (cond [(not b) #f]
-          [(or (= b (ascii #\()) (= b (ascii #\[))) (next!) (read-list start (if (= b (ascii #\()) (ascii #\)) (ascii #\])))]
-          [(or (= b (ascii #\))) (= b (ascii #\]))) (fail start "unexpected ~a" (integer->char b))]
-          [(= b (ascii #\')) (next!) (prefix-form start 'quote)]
-          [(= b (ascii #\`)) (next!) (prefix-form start 'quasiquote)]
-          [(= b (ascii #\,))
-           (next!)
-           (if (eqv? (peek) (ascii #\@))
-               (begin (next!) (prefix-form start 'unquote-splicing))
-               (prefix-form start 'unquote))]
-          [(= b (ascii #\")) (read-string-lit start)]
-          [(= b (ascii #\#)) (read-hash start)]
+    (cond [(< b 0) 0]
+          [(== b #\() (next!) (read-list (& start) #\))]
+          [(== b #\[) (next!) (read-list (& start) #\])]
+          [(or (== b #\)) (== b #\])) (fail (& start) "read: unexpected ~a" (list1 (integer->char b)))]
+          [(== b #\') (next!) (prefix-form (& start) (sym quote))]
+          [(== b #\`) (next!) (prefix-form (& start) (sym quasiquote))]
+          [(and (== b #\,) (== (peek2) #\@)) (next!) (next!) (prefix-form (& start) (sym unquote-splicing))]
+          [(== b #\,) (next!) (prefix-form (& start) (sym unquote))]
+          [(== b #\") (read-string-lit (& start))]
+          [(== b #\#) (read-hash (& start))]
           [else
-           (let* ([tok (read-token)]
-                  [n (and (not (string=? tok ".")) (token-number start tok))])
-             (wrap start (if n n (string->symbol tok))))])))
+           (let* ([t (read-token)] [n (if (token=? t ".") 0 (token-number (& start) t))])
+             (wrap (& start) (if (!= n 0) n (bytes->symbol (+ text t) (- bpos t)))))])))
 
 ;; ---- numbers ----
 ;;
 ;; The kernel's number literals are integers of up to 64 bits, from -2^63
 ;; to 2^64 - 1 as in wasm, and decimals (spec 5.4): an optional sign and
-;; digits, or #x, #b, #o or #d and an integer in that radix; or a decimal,
-;; as Substrate's string->number reads it. A fraction, such as 1/2, is an
-;; error; any other token is a symbol.
+;; digits, or #x, #b, #o or #d and an integer in that radix; or a decimal
+;; (read-decimal). A fraction, such as 1/2, is an error; any other token
+;; is a symbol.
 
-;; The value of byte b as a digit in radix, or #f.
-(define (digit-value b radix)
-  (let ([d (cond [(and (>= b (ascii #\0)) (<= b (ascii #\9))) (- b (ascii #\0))]
-                 [(and (>= b (ascii #\a)) (<= b (ascii #\z))) (+ (- b (ascii #\a)) 10)]
-                 [(and (>= b (ascii #\A)) (<= b (ascii #\Z))) (+ (- b (ascii #\A)) 10)]
-                 [else 99])])
-    (and (< d radix) d)))
+;; 1 if the text has a sign at byte index i, before end, else 0.
+(define (sign-length [i u32] [end u32]) -> u32
+  (if (and (< i end) (or (== (@ text i) #\+) (== (@ text i) #\-))) 1 0))
 
-;; The digits of s from byte index from to end, in radix, as a list of
-;; their values; #f if they are not all digits, or there are none.
-(define (digits s from end radix)
-  (let loop ([i (- end 1)] [acc '()])
-    (if (< i from)
-        (and (pair? acc) acc)
-        (let ([d (digit-value (string-utf-8-byte s i) radix)])
-          (and d (loop (- i 1) (cons d acc)))))))
+;; The integer of the digits from byte index from to end in radix, negated
+;; if negative is not 0; the text from shown to end names it in the error
+;; if it does not fit in 64 bits.
+(define (integer-at [start (ptr place)] [from u32] [end u32] [radix i32] [negative i32] [shown u32]) -> datum
+  (let ([bits u64 0])
+    (cond [(not (digits-integer text from end radix negative (& bits)))
+           (fail start "read: the integer ~a does not fit in 64 bits" (list1 (bytes->string (+ text shown) (- end shown))))]
+          [negative (make-integer (cast i64 bits))]
+          [else (make-unsigned-integer bits)])))
 
-;; The value of those digits, or #f: also if it is 2^64 or more.
-(define (digits-value s from end radix)
-  (let ([ds (digits s from end radix)]) (and ds (digits->integer ds radix #f))))
+;; The number #tok reads as, tok the token from byte index t, for #x, #b,
+;; #o and #d; #f otherwise.
+(define (radix-number [start (ptr place)] [t u32]) -> datum
+  (let* ([radix (case (if (< t bpos) (@ text t) 0)
+                  [(#\x #\X) 16] [(#\b #\B) 2] [(#\o #\O) 8] [(#\d #\D) 10] [else 0])]
+         [from (+ t 1 (sign-length (+ t 1) bpos))])
+    (if (and (!= radix 0) (digits? text from bpos radix))
+        (integer-at start from bpos radix (and (> from (+ t 1)) (== (@ text (+ t 1)) #\-)) (- t 1))
+        0)))
 
-;; The integer with digits ds and sign (1 or -1), in radix, which must fit
-;; in 64 bits; shown names it in the error.
-(define (integer start ds sign radix shown)
-  (or (digits->integer ds radix (= sign -1))
-      (fail start "the integer ~a does not fit in 64 bits" shown)))
-
-;; (sign . index): the sign at byte index i of tok, 1 or -1, and where
-;; what follows it starts.
-(define (sign-at tok i)
-  (cond [(>= i (string-utf-8-length tok)) (cons 1 i)]
-        [(= (string-utf-8-byte tok i) (ascii #\+)) (cons 1 (+ i 1))]
-        [(= (string-utf-8-byte tok i) (ascii #\-)) (cons -1 (+ i 1))]
-        [else (cons 1 i)]))
-
-;; The number #tok reads as, for #x, #b, #o and #d; #f otherwise.
-(define (radix-number start tok)
-  (let ([radix (and (> (string-utf-8-length tok) 0)
-                    (case (integer->char (string-utf-8-byte tok 0)) [(#\x #\X) 16] [(#\b #\B) 2] [(#\o #\O) 8] [(#\d #\D) 10] [else #f]))])
-    (and radix
-         (let* ([s (sign-at tok 1)] [ds (digits tok (cdr s) (string-utf-8-length tok) radix)])
-           (and ds (integer start ds (car s) radix (string-append "#" tok)))))))
-
-;; The number tok reads as, or #f if it is a symbol.
-(define (token-number start tok)
-  (let* ([s (sign-at tok 0)] [end (string-utf-8-length tok)] [ds (digits tok (cdr s) end 10)])
-    (cond [ds (integer start ds (car s) 10 tok)]
-          [(fraction? tok (cdr s) end) (fail start "~a is not a number literal: use integers and decimals" tok)]
+;; The number the token from byte index t reads as, or #f if it is a
+;; symbol.
+(define (token-number [start (ptr place)] [t u32]) -> datum
+  (let* ([end bpos] [from (+ t (sign-length t end))] [negative (and (> from t) (== (@ text t) #\-))] [x f64 0])
+    (cond [(digits? text from end 10) (integer-at start from end 10 negative t)]
+          [(fraction? from end) (fail start "read: ~a is not a number literal: use integers and decimals" (list1 (text-from t)))]
           ;; A decimal, or +inf.0, -inf.0, +nan.0 or -nan.0.
-          [else (string->number tok)])))
+          [(read-decimal (+ text t) (- end t) (& x)) (make-flonum x)]
+          [else 0])))
 
 ;; Digits, a slash and digits, from byte index from to end: only a token
 ;; that starts with a digit is looked through for the slash.
-(define (fraction? tok from end)
-  (and (< from end) (digit-value (string-utf-8-byte tok from) 10)
-       (let loop ([i (+ from 1)])
-         (cond [(>= i end) #f]
-               [(= (string-utf-8-byte tok i) (ascii #\/)) (and (digits tok from i 10) (digits tok (+ i 1) end 10) #t)]
-               [else (loop (+ i 1))]))))
+(define (fraction? [from u32] [end u32]) -> i32
+  (when (or (>= from end) (< (digit-value (@ text from) 10) 0)) (return 0))
+  (for ([i (+ from 1)]) (< i end) (+= i 1)
+    (when (== (@ text i) #\/) (return (and (digits? text from i 10) (digits? text (+ i 1) end 10)))))
+  0)
 
 ;; ---- entry ----
 
-;; Read every datum in text; source names the file in srclocs.
-(define (read-string-all s src)
-  (set! text s)
-  (set! text-bytes (string-utf-8-length s))
+;; Every datum in the n bytes at p, as a list; src, a symbol, names the file
+;; in their source locations.
+(define (read-all [p (ptr u8)] [n u32] [src datum]) -> datum
+  (set! text p)
+  (set! text-bytes n)
   (set! bpos 0)
   (set! pos 0)
   (set! line 1)
   (set! col 0)
   (set! source src)
-  (let loop ([acc '()])
-    (let ([d (read-datum)])
-      (if d (loop (cons d acc)) (reverse acc)))))
+  (let ([head nil] [last datum 0] [d (read-datum)])
+    (while (!= d 0)
+      (let ([q (list1 d)])
+        (if (== last 0) (set! head q) (set-cdr! last q))
+        (set! last q))
+      (set! d (read-datum)))
+    head))
+
+;; Every datum in the file named by string path, which names it in their
+;; source locations.
+(define (read-file [path datum]) -> datum
+  (let* ([name (make-buffer)] [n u32 0] [p (ptr u8) 0] [forms datum 0])
+    (buffer-add! (& name) (string-bytes path) (string-length path))
+    (buffer-add-byte! (& name) 0)
+    (set! p (read-file-bytes (-> name bytes) (& n)))
+    (buffer-free! (& name))
+    (when (== p 0) (raise-compile-error 0 (format-message "cannot read ~a" (list1 path))))
+    (set! forms (read-all p n (string->symbol path)))
+    (free p)
+    forms))

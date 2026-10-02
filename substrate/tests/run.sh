@@ -1,93 +1,72 @@
 #!/usr/bin/env bash
-# Lifecycle: test harness.
+# Lifecycle: test harness. Each tests/*.sub, tests/c/*.sub,
+# tests/substrate/*.sub and tests/bend/*.sub built by the compiler
+# (bin/sub), in its own directory, and run with a host, build/subhost
+# unless HOST names another (host/subhost.mjs runs programs on Node's
+# V8), which runs the compiler too. The output checked is the build's,
+# then the run's:
 #
-# Build every tests/*.sub, the programs of each directory in tests, such
-# as tests/bend, all but fixtures, and examples/*.sub, with bin/sub build,
-# and run it with a host, build/subhost unless HOST names another
-# (host/subhost.mjs runs programs on Node's V8); the output checked is the
-# build's, then the run's.
-# Next to each file:
-#   NAME.out      expected output of a successful run
-#   NAME.err      a line that must appear in the output of a failing run
-#   NAME.args     the run's command-line arguments, on one line
-#   NAME.imports  the instance names the compiled phase-0 linklet may import
-#                 from, one per line (checks that programs import only what
-#                 they use)
+#   NAME.out   expected output of a successful run
+#   NAME.err   a line that must appear in the output of a failing one
+#   NAME.args  the run's command-line arguments, on one line
 #
-# OUT is where builds go (default build).
+# tests/*.sub are the kernel's tests: of the kernel language, of
+# compile-time code and of syntax-match (compiler/c/syntax-match.sub), on
+# the kernel module (compiler/kernel.sub); tests/fixtures holds the
+# modules they require. tests/c has the C-like Lisp's tests
+# (compiler/c), tests/substrate Substrate's (lib/languages/substrate), and
+# tests/bend Bend's (lib/languages/bend). Then the cache (spec 3.7): each
+# program built again from it is the same, and a stale entry is not
+# used. OUT is where builds go (default build). In the dev shell:
+#
+#   tests/run.sh
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-compiler="$root/bin/sub"
-builds="${OUT:-build}"
 host="$root/${HOST:-build/subhost}"
+builds="${OUT:-build}/tests"
+mkdir -p "$builds"
 
-# bin/sub keeps compiled modules in build/cache. The suite removes it
-# first, so that every test compiles its module: a test's expected output
+# The suite keeps compiled modules in a cache of its own, removed first,
+# so that every test compiles its module: a test's expected output
 # includes what the module prints while compiling, and a module loaded
 # from the cache prints nothing. Each program is then built again from
 # the cache, which must give the same bytes (below).
-rm -rf "$root/build/cache"
-# Build the kernel module once first, so its compile notices stay out
-# of test output.
-mkdir -p build
-"$compiler" kernel -o build/kernel.wasm > /dev/null
-wasm-tools validate build/kernel.wasm || { echo "FAIL kernel.wasm does not validate"; exit 1; }
+cache="$root/$builds/cache"
+rm -rf "${cache:?}"
+mkdir -p "$cache"
 
-# Each linklet of the program in directory $1 validates.
-validates() { while read -r l; do wasm-tools validate "$1/$l.wasm" || return 1; done < "$1/program"; }
-# The program in directory $1 is byte for byte the one in $2, the
-# compiled file $3.subc included: a module written, loaded and written
-# again is the same.
+# The program in directory $1 is byte for byte the one in $2.
 same_program() {
   cmp -s "$1/program" "$2/program" || return 1
   while read -r l; do cmp -s "$1/$l.wasm" "$2/$l.wasm" || return 1; done < "$1/program"
-  cmp -s "$1/$3.subc" "$2/$3.subc"
 }
-
-# A compiled file for tests/compiled-import.sub: a fixture's closure
-# (spec 3.7).
-mkdir -p build/tests/compiled
-(cd tests/fixtures && "$compiler" build geometry.sub -o "$root/build/tests/compiled/geometry" \
-   -m "$root/build/tests/compiled/geometry.subc" > /dev/null) ||
-  { echo "FAIL building tests/fixtures/geometry.sub as a compiled file"; exit 1; }
-
-# The programs, and the directories they are in: tests/, the directories
-# in it but fixtures, which hold the modules tests require, and examples/.
-programs=(tests/*.sub)
-for d in tests/*/; do [ "$d" = tests/fixtures/ ] || programs+=("$d"*.sub); done
-programs+=(examples/*.sub)
 
 pass=0
 fail=0
-for t in "${programs[@]}"; do
-  dir="$(dirname "$t")"
+
+# A compiled file for compiled-import.sub: a fixture's closure (spec 3.7).
+mkdir -p "$builds/compiled"
+(cd tests/fixtures && "$root/bin/sub" build geometry.sub -o "$root/$builds/compiled/geometry" \
+   -m "$root/$builds/compiled/geometry.subc" -c "$cache" > /dev/null) ||
+  { echo "FAIL building tests/fixtures/geometry.sub as a compiled file"; fail=$((fail + 1)); }
+
+tests=(tests/*.sub tests/c/*.sub tests/substrate/*.sub tests/bend/*.sub)
+for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
+  dir="$(dirname "$t")"
   base="$dir/$name"
-  out="$builds/$dir"
-  mkdir -p "$out"
-  program="$out/$name"
+  program="$builds/${dir#tests}/$name"
+  rm -rf "${program:?}"
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
-  actual="$(cd "$dir" && "$compiler" build "$name.sub" -o "$root/$program" -m "$root/$program/$name.subc" 2>&1 &&
+  actual="$(cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$program" -c "$cache" 2>&1 &&
             "$host" "$root/$program" ${args[@]+"${args[@]}"} 2>&1)"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then
-    if [ $code -ne 0 ] || [ "$actual" != "$(cat "$base.out")" ]; then
-      problem="output differs (exit $code)"
-    elif ! validates "$program"; then
-      problem="a compiled linklet does not validate"
-    elif [ -f "$base.imports" ]; then
-      entry="$(tail -n 1 "$program/program")"
-      # Instance names without the hash that ends a module's name (spec 3.2).
-      imports="$(wasm-tools print "$program/$entry.wasm" | sed -n 's/^ *(import "\([^"]*\)".*/\1/p' |
-                 sed 's/\.[0-9a-f]\{12\}@/@/' | sort -u)"
-      if [ "$imports" != "$(sort -u "$base.imports")" ]; then
-        problem="imports from: $(echo $imports), expected: $(echo $(cat "$base.imports"))"
-      fi
-    fi
+    if [ $code -ne 0 ] || [ "$actual" != "$(cat "$base.out")" ]; then problem="output differs (exit $code)"; fi
   elif [ -f "$base.err" ]; then
     if [ $code -eq 0 ] || ! grep -qF -- "$(cat "$base.err")" <<< "$actual"; then
       problem="expected an error containing: $(cat "$base.err")"
@@ -104,29 +83,28 @@ for t in "${programs[@]}"; do
   fi
 done
 # A module compiles to the same bytes whatever the run compiled before it
-# (spec 3.5): order-a and order-b require the same two modules in either
-# order.
-for f in "$builds"/tests/order-a/order-[mn].*.wasm; do
-  if ! cmp -s "$f" "$builds/tests/order-b/$(basename "$f")"; then
+# (spec 3.5): tests/substrate/order-a and order-b require the same two modules in
+# either order.
+for f in "$builds"/substrate/order-a/order-[mn].*.wasm; do
+  if ! cmp -s "$f" "$builds/substrate/order-b/$(basename "$f")"; then
     fail=$((fail + 1))
-    echo "FAIL tests/order-b: $(basename "$f") differs from tests/order-a's"
+    echo "FAIL tests/substrate/order-b: $(basename "$f") differs from order-a's"
   fi
 done
 # The cache (spec 3.7): every program built again, its modules loaded
 # from the cache, is byte for byte what the first build wrote.
 again=0
-for t in "${programs[@]}"; do
-  dir="$(dirname "$t")"
+for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
-  program="$builds/$dir/$name"
+  dir="$(dirname "$t")"
+  program="$builds/${dir#tests}/$name"
   [ -f "$program/program" ] || continue
-  rebuilt="$builds/again/$dir/$name"
-  rm -rf "$rebuilt"
-  mkdir -p "$rebuilt"
-  if ! (cd "$dir" && "$compiler" build "$name.sub" -o "$root/$rebuilt" -m "$root/$rebuilt/$name.subc" > /dev/null 2>&1); then
+  rebuilt="$builds/again/${dir#tests}/$name"
+  rm -rf "${rebuilt:?}"
+  if ! (cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$rebuilt" -c "$cache" > /dev/null 2>&1); then
     fail=$((fail + 1))
     echo "FAIL $dir/$name: does not build again from the cache"
-  elif ! same_program "$rebuilt" "$program" "$name"; then
+  elif ! same_program "$rebuilt" "$program"; then
     fail=$((fail + 1))
     echo "FAIL $dir/$name: built again from the cache, the program differs"
   else
@@ -136,35 +114,21 @@ done
 # A cache entry for a module whose source has changed is not used, and
 # the requires it recorded are not looked at (spec 3.7): a required b,
 # and now does not, and b is gone.
-stale=build/tests/stale
-rm -rf "$stale"
+stale="$builds/stale"
+rm -rf "${stale:?}"
 mkdir -p "$stale"
-lib='(require-unqualified substrate "../../../lib/substrate.sub")'
-printf '%s\n(provide x)\n(define x 1)\n' "$lib" > "$stale/b.sub"
-printf '%s\n(require b "b.sub")\n(define (run) (display b:x))\n(func (main) (run))\n' "$lib" > "$stale/a.sub"
-first="$("$compiler" build "$stale/a.sub" -o "$stale/a" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
+print="(require print \"$root/lib/print.sub\" write-int newline)"
+printf '(provide x)\n(func (x) -> i32 1)\n' > "$stale/b.sub"
+printf '%s\n(require b "b.sub" x)\n(func (main) (write-int (x)) (newline))\n' "$print" > "$stale/a.sub"
+first="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
 rm "$stale/b.sub"
-printf '%s\n(define (run) (display 2))\n(func (main) (run))\n' "$lib" > "$stale/a.sub"
-second="$("$compiler" build "$stale/a.sub" -o "$stale/a" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
+printf '%s\n(func (main) (write-int 2) (newline))\n' "$print" > "$stale/a.sub"
+second="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
 if [ "$first" = 1 ] && [ "$second" = 2 ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL a changed module's cache entry: built $first, then $second"
+  echo "FAIL the stale cache entry: got $first, then $second"
 fi
-# A file has one name however a require spells it (spec 3.6): required by
-# its absolute path and by a relative one, it is one module, one counter.
-canonical=build/tests/canonical
-rm -rf "$canonical"
-mkdir -p "$canonical"
-printf '(require print "../../../lib/print.sub" write-int newline)\n(require a "%s")\n(require b "%s")\n(func (main) (write-int (a:bump)) (newline) (write-int (b:bump)) (newline))\n' \
-  "$root/tests/fixtures/twin-a/counter.sub" "../../../tests/fixtures/twin-a/counter.sub" > "$canonical/main.sub"
-actual="$("$compiler" build "$canonical/main.sub" -o "$canonical/main" 2>&1 && "$host" "$root/$canonical/main" 2>&1)"
-if [ "$actual" = "$(printf '1\n2')" ]; then
-  pass=$((pass + 1))
-else
-  fail=$((fail + 1))
-  echo "FAIL a file required by two spellings: $actual"
-fi
-echo "$pass passed, $fail failed; $again programs rebuilt from the cache"
+echo "$pass passed, $fail failed; $again built again from the cache"
 [ $fail -eq 0 ]

@@ -1,125 +1,212 @@
-;; Lifecycle: permanent. Part of the compiler.
+;; Lifecycle: permanent. Part of the compiler, written in
+;; the C-like Lisp (compiler/c): the compiler's serialize.sub.
 ;;
 ;; The byte format of kernel data (compiler/kernel.sub, "quoted
 ;; data"). The compiler writes a linklet's quoted data in it (spec 3.5).
-(require-unqualified substrate "../lib/substrate.sub")
-(require stx "stx.sub" stx? stx-e stx-scopes stx-srcloc stx-props
-         srcloc? srcloc-source srcloc-line srcloc-col srcloc-pos srcloc-span)
-(require leb "leb128.sub" write-uleb write-sleb)
-(require num "numbers.sub" flonum-bits integer-negative integer-magnitude-byte)
+(require-unqualified c "c/c.sub")
+(require-unqualified k "kernel.sub")
+(require-unqualified leb "leb128.sub")
+(require-unqualified numbers "numbers.sub")
 
-(provide make-serializer serialize! serializer-bytes serializer-scope-table)
+(provide serializer make-serializer serialize! serializer-bytes serializer-scope-table)
+
+(memory from c)
+(table from c)
 
 ;; Objects are written as they are met, each after the objects it is made
 ;; of. Equal objects, all immutable, are written once and shared, as Scheme
 ;; allows of literals: a fixnum, symbol or keyword is its own key, a pair
-;; is keyed by its parts' indexes, in a table per car, and the rest by
-;; their parts in a list. A syntax object's scopes are written as indexes into
-;; the scope table, the scopes met so far in order (spec 3.5), so the
-;; bytes do not depend on the run that assigned the scopes.
-(struct serializer (out [count #:mutable] shared fixnums atoms pairs scopes [table #:mutable]))
+;; is keyed by its parts' indexes, and the rest by their parts in a list.
+;; A syntax object's scopes are written as indexes into the scope table,
+;; the scopes met so far in order (spec 3.5), so the bytes do not depend
+;; on the run that assigned the scopes. The tables are in the current
+;; arena, a module's, and hold each object's index plus 1.
+(struct serializer [out buffer] [count u32] [shared (ptr arena-table)] [fixnums (ptr arena-table)]
+        [atoms (ptr arena-table)] [pairs (ptr arena-table)] [scopes (ptr arena-table)] [table datum])
 
-(define (make-serializer)
-  (serializer (open-output-bytes) 0 (make-hash) (make-hasheqv) (make-hasheq) (make-hasheqv) (make-hasheqv) '()))
+(define (make-serializer) -> (ptr serializer)
+  (let ([s (cast (ptr serializer) (alloc-in (current-arena) (sizeof serializer)))])
+    (set! (-> s out) (make-buffer))
+    (set! (-> s count) 0)
+    (set! (-> s shared) (make-table))
+    (set! (-> s fixnums) (make-table))
+    (set! (-> s atoms) (make-table))
+    (set! (-> s pairs) (make-table))
+    (set! (-> s scopes) (make-table))
+    (set! (-> s table) nil)
+    s))
 
 ;; The index of scope sc in the table, added if it is new.
-(define (scope-index! s sc)
-  (or (hash-ref (serializer-scopes s) sc #f)
-      (let ([i (hash-count (serializer-scopes s))])
-        (hash-set! (serializer-scopes s) sc i)
-        (set-serializer-table! s (cons sc (serializer-table s)))
-        i)))
+(define (scope-index! [s (ptr serializer)] [sc u32]) -> u32
+  (let ([known (table-ref (-> s scopes) (+ (cast u64 sc) 1))])
+    (if (!= known 0)
+        (- known 1)
+        (let ([i (table-count (-> s scopes))])
+          (table-set! (-> s scopes) (+ (cast u64 sc) 1) (+ i 1))
+          (set! (-> s table) (cons (make-integer sc) (-> s table)))
+          i))))
 
 ;; The scope table: the run's scope for each index.
-(define (serializer-scope-table s) (reverse (serializer-table s)))
+(define (serializer-scope-table [s (ptr serializer)]) -> datum (reverse (-> s table)))
 
-;; The object just written, whose key in table is key, added: its index.
-(define (added! s table key)
-  (let ([i (serializer-count s)])
-    (set-serializer-count! s (+ i 1))
-    (hash-set! table key i)
+;; The object just written, whose key in table t is key, added: its index.
+(define (added! [s (ptr serializer)] [t (ptr arena-table)] [key u64]) -> u32
+  (let ([i (-> s count)])
+    (+= (-> s count) 1)
+    (table-set! t key (+ i 1))
     i))
 
-;; Write an object with write!, unless one with the same key in table was.
-;; Returns its index.
-(define (object! s table key write!)
-  (or (hash-ref table key #f)
-      (begin (write!) (added! s table key))))
+;; The index of the object shared under key, a list, or 0 if none is:
+;; then (index + 1) is the next object's.
+(define (shared-index [s (ptr serializer)] [key datum]) -> u32
+  (let ([i (datum-get (-> s shared) key)]) (if (== i 0) 0 (+ (cast u32 (integer-value i)) 1))))
 
-(define (shared! s key write!) (object! s (serializer-shared s) key write!))
+(define (shared-added! [s (ptr serializer)] [key datum]) -> u32
+  (let ([i (-> s count)])
+    (+= (-> s count) 1)
+    (datum-put! (-> s shared) key (make-integer i))
+    i))
 
-(define (bytes! p bs)
-  (write-uleb (bytes-length bs) p)
-  (write-bytes bs p))
+(define (bytes! [p (ptr buffer)] [bytes (ptr u8)] [n u32])
+  (write-uleb p n)
+  (buffer-add! p bytes n))
 
-;; String str's bytes, with their count.
-(define (utf8! p str)
-  (write-uleb (string-utf-8-length str) p)
-  (display str p))
+(define (small [n i64]) -> datum (make-integer n))
 
 ;; The index of datum d, writing it if need be.
-(define (serialize! s d)
-  (let ([p (serializer-out s)])
-    (let loop ([d d])
-      (cond
-        [(eq? d #f) (shared! s '(0) (lambda () (write-byte 0 p)))]
-        [(fixnum? d)
-         (or (hash-ref (serializer-fixnums s) d #f)
-             (begin (write-byte 1 p) (write-sleb d p) (added! s (serializer-fixnums s) d)))]
-        [(integer? d)
-         ;; Beyond the fixnum range: a sign and a 64-bit magnitude.
-         (let ([sign (if (integer-negative d) 1 0)]
-               [magnitude (map (lambda (i) (integer-magnitude-byte d i)) (range 8))])
-           (shared! s (cons 10 (cons sign magnitude))
-                    (lambda ()
-                      (write-byte 10 p)
-                      (write-byte sign p)
-                      (for-each (lambda (b) (write-byte b p)) magnitude))))]
-        [(eq? d #t) (shared! s '(2) (lambda () (write-byte 2 p)))]
-        [(null? d) (shared! s '(3) (lambda () (write-byte 3 p)))]
-        [(char? d) (shared! s (list 4 d) (lambda () (write-byte 4 p) (write-uleb (char->integer d) p)))]
-        ;; A list: its elements, its tail, then its pairs from the last,
-        ;; the order recursion on car then cdr writes them in, without
-        ;; that recursion's depth.
-        [(pair? d)
-         (let spine ([l d] [cars '()])
-           (if (pair? l)
-               (spine (cdr l) (cons (loop (car l)) cars))
-               (foldl (lambda (a b)
-                        (let ([t (or (hash-ref (serializer-pairs s) a #f)
-                                     (let ([t (make-hasheqv)]) (hash-set! (serializer-pairs s) a t) t))])
-                          (or (hash-ref t b #f)
-                              (begin (write-byte 5 p) (write-uleb a p) (write-uleb b p) (added! s t b)))))
-                      (loop l) cars)))]
-        [(symbol? d)
-         (or (hash-ref (serializer-atoms s) d #f)
-             (begin (write-byte 6 p) (utf8! p (symbol->string d)) (added! s (serializer-atoms s) d)))]
-        [(string? d) (shared! s (list 7 d) (lambda () (write-byte 7 p) (utf8! p d)))]
-        [(bytes? d) (shared! s (list 14 d) (lambda () (write-byte 14 p) (bytes! p d)))]
-        [(keyword? d) (object! s (serializer-atoms s) d (lambda () (write-byte 13 p) (utf8! p (keyword->string d))))]
-        [(stx? d)
-         (let* ([e (loop (stx-e d))] [sc (loop (map (lambda (x) (scope-index! s x)) (stx-scopes d)))]
-                [l (loop (stx-srcloc d))] [r (loop (stx-props d))] [key (list 8 e sc l r)])
-           (or (hash-ref (serializer-shared s) key #f)
-               (begin (write-byte 8 p) (write-uleb e p) (write-uleb sc p) (write-uleb l p) (write-uleb r p)
-                      (added! s (serializer-shared s) key))))]
-        [(srcloc? d)
-         (let ([src (loop (srcloc-source d))]
-               [fields (list (srcloc-line d) (srcloc-col d) (srcloc-pos d) (srcloc-span d))])
-           (shared! s (cons 9 (cons src fields))
-                    (lambda () (write-byte 9 p) (write-uleb src p) (for-each (lambda (n) (write-sleb n p)) fields))))]
-        [(number? d)
-         (let ([bits (flonum-bits d)])
-           (shared! s (list 11 bits)
-                    (lambda ()
-                      (write-byte 11 p)
-                      (for-each (lambda (i) (write-byte (bitwise-and (arithmetic-shift bits (* -8 i)) 255) p))
-                                (range 8)))))]
-        [else (error 'serialize "cannot quote ~s" d)]))))
+(define (serialize! [s (ptr serializer)] [d datum]) -> u32
+  (let ([p (& (-> s out))] [i u32 0])
+    (cond
+      [(== d 0)
+       (set! i (shared-index s `(0)))
+       (if (!= i 0) (- i 1) (begin (buffer-add-byte! p 0) (shared-added! s `(0))))]
+      [(fixnum? d)
+       (let ([key (+ (cast u64 (integer-value d)) 1099511627776)])
+         (set! i (table-ref (-> s fixnums) key))
+         (if (!= i 0)
+             (- i 1)
+             (begin (buffer-add-byte! p 1) (write-sleb p (integer-value d)) (added! s (-> s fixnums) key))))]
+      [(integer? d)
+       ;; Beyond the fixnum range: a sign and a 64-bit magnitude.
+       (let* ([negative (integer-negative? d)] [v (integer-value d)]
+              [magnitude (if negative (- 0 v) v)]
+              [key `(10 ,(small negative) ,(make-unsigned-integer (cast u64 magnitude)))])
+         (set! i (shared-index s key))
+         (if (!= i 0)
+             (- i 1)
+             (begin (buffer-add-byte! p 10)
+                    (buffer-add-byte! p negative)
+                    (for ([k u32 0]) (< k 8) (+= k 1)
+                      (buffer-add-byte! p (cast i32 (bit-and (>> (cast u64 magnitude) (* 8 k)) 255))))
+                    (shared-added! s key))))]
+      [(== d (boolean 1))
+       (set! i (shared-index s `(2)))
+       (if (!= i 0) (- i 1) (begin (buffer-add-byte! p 2) (shared-added! s `(2))))]
+      [(null? d)
+       (set! i (shared-index s `(3)))
+       (if (!= i 0) (- i 1) (begin (buffer-add-byte! p 3) (shared-added! s `(3))))]
+      [(char? d)
+       (let ([key `(4 ,d)])
+         (set! i (shared-index s key))
+         (if (!= i 0)
+             (- i 1)
+             (begin (buffer-add-byte! p 4) (write-uleb p (char->integer d)) (shared-added! s key))))]
+      [(pair? d) (serialize-list! s d)]
+      [(symbol? d)
+       (set! i (table-ref (-> s atoms) (cast u64 d)))
+       (if (!= i 0)
+           (- i 1)
+           (begin (buffer-add-byte! p 6) (bytes! p (symbol-bytes d) (symbol-length d)) (added! s (-> s atoms) (cast u64 d))))]
+      [(string? d)
+       (let ([key `(7 ,d)])
+         (set! i (shared-index s key))
+         (if (!= i 0)
+             (- i 1)
+             (begin (buffer-add-byte! p 7) (bytes! p (string-bytes d) (string-length d)) (shared-added! s key))))]
+      [(keyword? d)
+       (set! i (table-ref (-> s atoms) (cast u64 d)))
+       (if (!= i 0)
+           (- i 1)
+           (let ([name (keyword->string d)])
+             (buffer-add-byte! p 13)
+             (bytes! p (string-bytes name) (string-length name))
+             (added! s (-> s atoms) (cast u64 d))))]
+      [(syntax? d) (serialize-syntax! s d)]
+      [(flonum? d)
+       (let* ([bits (f64-bits (flonum-value d))] [key `(11 ,(make-integer bits))])
+         (set! i (shared-index s key))
+         (if (!= i 0)
+             (- i 1)
+             (begin (buffer-add-byte! p 11)
+                    (for ([k u32 0]) (< k 8) (+= k 1)
+                      (buffer-add-byte! p (cast i32 (bit-and (>> (cast u64 bits) (* 8 k)) 255))))
+                    (shared-added! s key))))]
+      [else (raise-compile-error 0 (format-message "internal: serialize: cannot quote ~s" (cons d nil))) 0])))
 
-;; The bytes: the number of objects, then the objects.
-(define (serializer-bytes s)
-  (call-with-output-bytes
-   (lambda (p)
-     (write-uleb (serializer-count s) p)
-     (write-bytes (get-output-bytes (serializer-out s)) p))))
+;; A list: its elements, its tail, then its pairs from the last, the order
+;; recursion on car then cdr writes them in, without that recursion's
+;; depth.
+(define (serialize-list! [s (ptr serializer)] [d datum]) -> u32
+  (let ([cars nil] [l d] [b u32 0] [key u64 0] [i u32 0] [p (& (-> s out))])
+    (while (pair? l)
+      (set! cars (cons (make-integer (serialize! s (car l))) cars))
+      (set! l (cdr l)))
+    (set! b (serialize! s l))
+    (while (pair? cars)
+      (let ([a (cast u32 (integer-value (car cars)))])
+        (set! key (bit-or (<< (+ (cast u64 a) 1) 32) b))
+        (set! i (table-ref (-> s pairs) key))
+        (set! b (if (!= i 0)
+                    (- i 1)
+                    (begin (buffer-add-byte! p 5) (write-uleb p a) (write-uleb p b) (added! s (-> s pairs) key)))))
+      (set! cars (cdr cars)))
+    b))
+
+;; A syntax object: its datum, its scopes as indexes, its source location
+;; and its properties.
+(define (serialize-syntax! [s (ptr serializer)] [d datum]) -> u32
+  (let* ([e (serialize! s (syntax-e d))]
+         [sc (serialize! s (scope-indexes s (syntax-scopes d)))]
+         [l (serialize-srcloc! s (syntax-srcloc d))]
+         [r (serialize! s (syntax-props d))]
+         [key `(8 ,(small e) ,(small sc) ,(small l) ,(small r))]
+         [i (shared-index s key)]
+         [p (& (-> s out))])
+    (if (!= i 0)
+        (- i 1)
+        (begin (buffer-add-byte! p 8) (write-uleb p e) (write-uleb p sc) (write-uleb p l) (write-uleb p r)
+               (shared-added! s key)))))
+
+(define (scope-indexes [s (ptr serializer)] [set (ptr scope-set)]) -> datum
+  (let ([out nil])
+    (for ([k u32 0]) (< k (-> set count)) (+= k 1)
+      (set! out (cons (make-integer (scope-index! s (@ (-> set ids) k))) out)))
+    (reverse out)))
+
+(define (serialize-srcloc! [s (ptr serializer)] [l (ptr srcloc)]) -> u32
+  (if (== l 0)
+      (serialize! s 0)
+      (let* ([src (serialize! s (-> l source))]
+             [key `(9 ,(small src) ,(small (-> l line)) ,(small (-> l col)) ,(small (-> l pos)) ,(small (-> l span)))]
+             [i (shared-index s key)]
+             [p (& (-> s out))])
+        (if (!= i 0)
+            (- i 1)
+            (begin (buffer-add-byte! p 9)
+                   (write-uleb p src)
+                   (write-sleb p (-> l line))
+                   (write-sleb p (-> l col))
+                   (write-sleb p (-> l pos))
+                   (write-sleb p (-> l span))
+                   (shared-added! s key))))))
+
+;; The bytes, a string in the current arena: the number of objects, then
+;; the objects. The serializer's buffer is freed.
+(define (serializer-bytes [s (ptr serializer)]) -> datum
+  (let ([q (make-buffer)] [out datum 0])
+    (write-uleb (& q) (-> s count))
+    (buffer-add! (& q) (-> s out bytes) (-> s out length))
+    (set! out (bytes->string (-> q bytes) (-> q length)))
+    (buffer-free! (& q))
+    (buffer-free! (& (-> s out)))
+    out))

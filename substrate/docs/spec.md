@@ -6,8 +6,8 @@ ordinary kernel code, compiled to wasm and run by the same engine that runs
 programs. The aim is that different languages can be built as libraries
 over one small kernel, and that the code they produce carries no runtime
 it did not ask for. The language most code is written in, also called
-Substrate, is one such library (`lib/substrate.sub`), as `racket/base` is
-built over Racket's `#%kernel`.
+Substrate, is one such library (`lib/languages/substrate/`), as
+`racket/base` is built over Racket's `#%kernel`.
 
 The kernel has three parts: its forms (section 5), which the compiler
 implements; the **kernel module** (section 2), the data every language
@@ -43,17 +43,17 @@ interface (section 4). Kernel code is code written in the kernel's forms.
 | Component | What it is | Where |
 |---|---|---|
 | host | Creates stores, links instances by name, provides the instantiate hook and I/O (section 4). Owns no memory. Permanent: after bootstrap it runs the self-hosted compiler. | `host/subhost.c` (C, over wasmtime), `host/subhost.mjs` (JavaScript, over Node's V8) |
-| compiler | Reader, expander, kernel compiler, binary encoder. | `compiler/*.sub` (Substrate) |
-| kernel module | The data of every language built on the kernel, as wasm GC objects, syntax objects among them, and the functions of section 2. The compiler links to its own instance, and carries the module into the programs that use its data. | `compiler/kernel.sub` (kernel code), with the compiler |
-| libraries | Ordinary modules, what programs in the languages built on the kernel use, such as printing for programs without GC. | `lib/*.sub` |
-| languages | Libraries that make a language, such as Substrate. | `lib/substrate.sub`, written in Substrate on its core in kernel code, `lib/substrate-core.sub` |
+| compiler | Reader, expander, kernel compiler, binary encoder. | `compiler/*.sub`, written in the C-like Lisp (`compiler/c/`) |
+| kernel module | The data of every language built on the kernel, in memory, syntax objects among them, and the functions of section 2. The compiler links to its own instance, and carries the module into the programs that use its data. | `compiler/kernel.sub` (kernel code), with the compiler, on the program's memory (`compiler/memory.sub`) and the C-like Lisp's allocator |
+| libraries | Ordinary modules, what programs in the languages built on the kernel use, such as printing. | `lib/*.sub` |
+| languages | Libraries that make a language: the C-like Lisp, which the compiler is written in, Substrate and Bend. | `compiler/c/`, `lib/languages/substrate/` and `lib/languages/bend/`, the last two written in the C-like Lisp |
 
 ### 1.3 What runs where
 
 | | While compiling | While a program runs |
 |---|---|---|
 | the kernel module | always instantiated in each compile-time store; macros link to it | instantiated only if the program's linklets import it |
-| GC | syntax data lives in the engine's GC heap | only if the program's code uses GC types or the kernel module |
+| GC | none: syntax data lives in the kernel module's memory | only if the program's code uses GC types |
 | each module's memory and table | its own, if it defines them | its own, if it defines them |
 | the host | no memory of its own; reads and writes the caller's | same |
 
@@ -62,14 +62,15 @@ with its own **compile-time store**, which holds the kernel module, the
 linklets the module's compile-time code runs in, and the linklets of what it
 requires (3.2). A **run-time store** holds the linklets a program loads.
 
-The compile-time environment is garbage collected: syntax objects are GC
-objects. A compiled program is garbage collected only if its own code uses
-GC types or requires the kernel module.
+The compile-time environment is not garbage collected: syntax objects
+are the kernel module's data, in its memory, made in arenas that are
+freed wholesale, a module's with the module. A compiled program is garbage
+collected only if its own code uses GC types.
 
 ### 1.4 Bootstrap
 
-The compiler is written in Substrate (`compiler/*.sub`), and requires the
-kernel module (`compiler/kernel.sub`) and Substrate (`lib/substrate.sub`). It
+The compiler is written in the C-like Lisp (`compiler/*.sub`,
+`compiler/c/`), and requires the kernel module (`compiler/kernel.sub`). It
 is built by a build of itself, the **seed**, checked in (`seed/`). The
 compiler bin/sub runs, `build/sub`, is the compiler's source built by the
 seed, then by that build: the source compiled by itself, even when the
@@ -109,12 +110,15 @@ every module that declares it, so it may not differ between the two
 kernels of a build; the compiler stops if one does, and such a change is
 made in a build of its own.
 
-The first compiler was built by **stage0**, a compiler of the same
+The first compiler, written in Substrate over a kernel module whose data
+were wasm GC objects, was built by **stage0**, a compiler of the same
 language written apart in Chez Scheme. Its build of the compiler built
 itself, and that build built itself again, and all three were the same
 bytes: two compilers written apart, in different languages, wrote the
 same compiler. Stage0 was retired after commit 3e74bce, where this still
-held; it can be run from there.
+held; it can be run from there. The compiler in the C-like Lisp was built
+first by that compiler, and then by itself; the compiler written in
+Substrate stays in the history.
 
 ## 2. The macro contract
 
@@ -342,7 +346,7 @@ they trap.
   source, and the hashes of the modules it requires, at the phase shifts
   it requires them (64-bit FNV-1a over those strings, each followed by a
   zero byte, its top 48 bits in hexadecimal), and `<module>` is its
-  file's stem and that hash, such as `substrate-core.7bb8be1396e6`. The
+  file's stem and that hash, such as `print.9f1cfd92b643`. The
   hash covers what its bytes depend on, since its source locations name
   its path: two modules with one hash are the same bytes. So the hash
   does not depend on the order modules are compiled in, or on where the
@@ -569,7 +573,7 @@ itself, and this is how it does. The compiler runs compile-time code with
 it. An instantiated module can reach exactly what its imports name, so
 compile-time code runs sandboxed. The first five imports are tested from
 kernel code in `tests/hook.sub`, and the rest through Substrate
-(`lib/substrate.sub`). A path is relative to the process's working
+(`lib/languages/substrate/`). A path is relative to the process's working
 directory, which is the package root when `bin/sub` runs the compiler
 (3.6).
 
@@ -648,8 +652,7 @@ quotation and compile-time forms.
   types, such as a type function, should declare each strongly connected
   set of them as one group, in a canonical order. Code that must tell
   values of the same structure apart stores the difference in the value,
-  as `examples/shapes/struct.sub` does with a brand per variant and
-  Substrate's records with a descriptor.
+  as Substrate's structs do with their struct type.
 - **Type functions.** In a type position, a form whose head is a macro is
   expanded until it is not, so a compile-time function can compute a
   type: `(ref (tuple i32 3))`, as in Zig. Such a macro usually declares the
@@ -907,8 +910,8 @@ GC instructions take their type and field immediates by name:
   C) x) (ref.cast (ref C) x) e)` with `e` not using `x`: each is a call of
   `x`, and a known function of that signature stays one. A language
   chooses its calling convention by the signatures it writes: Substrate's
-  lambdas take a count and the first four arguments
-  (`lib/substrate-core.sub`).
+  lambdas take the closure, a count and the first four arguments
+  (`lib/languages/substrate/runtime.sub`).
 - **Application is an implicit form**, as in Racket. A form whose head is
   not bound to a macro, a core form or a wasm operator, including one
   whose head is not an identifier, is expanded as `(#%app head arg ...)`.
@@ -1247,18 +1250,16 @@ example's projections, types, name their trait so.
 - **Kernel types that fully expanded code leaves out**: fully expanded
   code carries only the kernel types the source wrote (6.4), and the
   kernel infers the others when it compiles. A language with types of its
-  own does not need them: `examples/typed/typed.sub` gives every variable
-  its own type and derives the kernel types it writes from those.
-  Substrate has no types of its own, so its `let` writes `eqref` for each
-  variable, since a variable's inferred type, that of its first value,
-  may be narrower than what it is assigned later.
+  own does not need them: a typed language gives every variable its own
+  type and derives the kernel types it writes from those, as the typed
+  example did (in the history). Substrate has no types of its own, so its
+  `let` writes `i32`, its one type of value, for each variable.
 - **Structs after the typed layer**: declared types are identified by
-  structure (5.1), so the accessors of `examples/shapes/struct.sub` check
-  brands at run time: passing a `fahrenheit` to `celsius-t` is a run-time
-  error, where under nominal types it was a compile-time one. With the typed layer, a
-  rung after bootstrap, revisit `examples/shapes/` (`struct`, `enum` and
-  `match`) so that it is a compile-time error again, as a library of the
-  typed language.
+  structure (5.1), so a struct's accessors check its type at run time:
+  passing a `fahrenheit` to `celsius-t` is a run-time error, where under
+  nominal types it was a compile-time one. With a typed layer, a rung
+  after bootstrap, it can be a compile-time error again, as a library of
+  the typed language.
 
 ## Appendix A: the kernel module's representation (not part of the contract)
 

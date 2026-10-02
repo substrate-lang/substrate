@@ -1,0 +1,1028 @@
+;; Lifecycle: experimental. Substrate's values, as the new compiler
+;; builds Substrate (lib/languages/substrate): written in the C-like Lisp, in the
+;; memory the program shares, owned and freed by the program, whose code
+;; (lower.sub) drops the last owner's reference. The kernel module (compiler/kernel.sub) keeps the
+;; compiler's data, which these never are: Substrate does not run at
+;; compile time, and its macros are written in the C-like Lisp on the
+;; kernel module's data.
+;;
+;; A value is a datum, an i32. A fixnum, an integer from -2^30 to 2^30
+;; - 1, is odd, its value in the bits above the lowest; a character is
+;; its code shifted up two, with 10 below; #f is 0; anything else is the
+;; address of a node, a multiple of 4. A node's first word is its
+;; header: its tag in the low byte, its count of owners above. The count
+;; 2^24 - 1 marks a node permanent, never counted or freed: nil, #t,
+;; every symbol and keyword, and a module's quoted data. The tags, and
+;; the words after the header:
+;;
+;;   0 pair         car, cdr
+;;   1 ()           nothing: the one node nil
+;;   2 #t           nothing: the one node true-node
+;;   3 symbol       hash, length, then the name's bytes, interned
+;;   4 keyword      the same, interned apart
+;;   5 string       length, then its bytes, UTF-8
+;;   6 integer      low, high, negative: a 64-bit magnitude and its sign,
+;;                  for an integer the fixnum cannot hold
+;;   7 flonum       low, high: an f64's bits
+;;   9 and up       the runtime's (runtime.sub): a closure, box, vector,
+;;                  byte string, struct type, struct, hash table, port
+;;                  or exception, whose layouts it registers (set-layout!)
+;;                  so that the drop loop here frees them, or whose
+;;                  droppers it does (set-dropper!)
+;;
+;; Nodes come from a list of free ones per size up to 64 bytes, in
+;; words, filled from chunks of memory past the C heap (sbrk), and go
+;; back to the lists; larger ones from malloc. A node's owner, done with
+;; it, drops it: the count down by one, or at one the node freed, with
+;; its own references dropped in turn, a list's cdr by cdr without
+;; growing the stack.
+;;
+;; Quoted data: (quote d), in kernel code, Substrate's compiled code, is
+;; datum d, made once as the module starts, permanent; (lit d), in C
+;; code, is the same, read as a C variable. A fixnum, a character, #f,
+;; () or #t is in place.
+(require-unqualified c "../../../compiler/c/c.sub")
+(require numbers "../../../compiler/numbers.sub" f64-bits bits-f64 flonum-digits)
+(require print "../../print.sub")
+
+(provide datum node
+         ;; nodes and owners
+         nil true-node %nil %true permanent! dup drop live-nodes node-tag node? tagged?
+         alloc-node alloc-bytes free-bytes free-node! set-layout! set-dropper! node-size
+         ;; inline, for code the lowering makes
+         pair-cell? null-cell? true-value null-value literal-value pair-car pair-cdr cons-inline dup-inline drop-inline
+         unique-cell? free-pair-shell! node-tagged? node-datum? alloc-inline
+         boolean-datum? integer-datum? fixnum-datum? char-datum?
+         ;; pairs and lists
+         pair? cons car cdr cadr cddr caddr cdddr cadddr set-car! set-cdr! null? list? length reverse append last list-ref
+         ;; booleans
+         boolean boolean?
+         ;; symbols, keywords and strings
+         symbol? symbol-bytes symbol-length symbol-hash symbol->string string->symbol bytes->symbol symbol-append symbol-named
+         keyword? keyword->string string->keyword bytes->keyword
+         string? string-bytes string-length bytes->string string-append string=? string-byte str
+         ;; numbers and characters
+         fixnum? fixnum fixnum-value integer? make-integer make-unsigned-integer integer-value integer-negative?
+         flonum? make-flonum flonum-value char? integer->char char->integer
+         ;; equality and hashing
+         equal? datum-hash hash-bytes
+         ;; writing
+         write-to write-datum buffer-add-utf-8!
+         ;; quoted data
+         quote quasiquote lit)
+(memory from c)
+(table from c)
+
+(import host-trap "host" "trap" (i32 i32 ->))
+
+;; A node, by its header word; a datum is one's address, or immediate.
+(struct node [w u32])
+(typedef datum (ptr node))
+
+;; ---- the header ----
+
+;; permanent-count << 8, with tag 0: the header of a permanent node.
+(define permanent-base u32 4294967040)
+
+(define tag-pair u32 0)
+(define tag-nil u32 1)
+(define tag-true u32 2)
+(define tag-symbol u32 3)
+(define tag-keyword u32 4)
+(define tag-string u32 5)
+(define tag-integer u32 6)
+(define tag-flonum u32 7)
+
+;; Is d a node: neither #f, a fixnum nor a character? Inline, on the i32.
+(func (node-datum? [d i32]) #:inline -> i32 (if (i32.and d 3) 0 (i32.ne d 0)))
+(#%fact node-datum? #'(foreign raw))
+(func (fixnum-datum? [d i32]) #:inline -> i32 (i32.and d 1))
+(#%fact fixnum-datum? #'(foreign raw))
+(func (char-datum? [d i32]) #:inline -> i32 (i32.eq (i32.and d 3) 2))
+(#%fact char-datum? #'(foreign raw))
+;; Is d a node of this tag?
+(func (node-tagged? [d i32] [tag i32]) #:inline -> i32
+  (if (i32.and d 3) 0 (if d (i32.eq (i32.and (i32.load d) 255) tag) 0)))
+(#%fact node-tagged? #'(foreign raw))
+
+;; For C code, the same as forms (below): (node? d), (tagged? d tag),
+;; (pair? d), (null? d), (symbol? d), (keyword? d), (string? d),
+;; (integer? d), (fixnum? d), (flonum? d), (char? d) and (boolean? d),
+;; each the test on the datum's i32, inline.
+(define (node-tag [d datum]) -> u32 (bit-and (-> d w) 255))
+
+;; ---- the free lists ----
+
+;; The free nodes of each size, 1 to 16 words, linked through their
+;; second word; the first, the header, is left as it was. A node is at
+;; least two words, so that it has the link.
+(struct free-heads [c (array u32 17)])
+(define node-free free-heads)
+(define chunk-size u32 8192)
+(define nodes-total u32 0)       ; the nodes handed out from chunks, in use or free
+(define permanent-total u32 0)   ; the nodes made permanent, which stay in use
+
+;; The class of n bytes: its size in words, at least 2.
+(define (class-of [n u32]) -> u32
+  (let ([k (>> (+ n 3) 2)]) (if (< k 2) 2 k)))
+
+;; The list of class k filled from a chunk.
+(define (refill! [k u32])
+  (let* ([size (<< k 2)] [count (/ chunk-size size)] [chunk (cast (ptr u8) (sbrk chunk-size))]
+         [heads (cast (ptr u32) (& node-free))])
+    (for ([i u32 0]) (< i count) (+= i 1)
+      (let ([p (cast (ptr u32) (+ chunk (* i size)))])
+        (set! (@ p 1) (if (< (+ i 1) count) (cast u32 (+ chunk (* (+ i 1) size))) (@ heads k)))))
+    (set! (@ heads k) (cast u32 chunk))
+    (+= nodes-total count)))
+
+;; n bytes for a node, from its class's list, or from malloc past the
+;; classes.
+(define (alloc-bytes [n u32]) -> (ptr void)
+  (let ([k (class-of n)])
+    (if (> k 16)
+        (malloc (<< k 2))
+        (let ([heads (cast (ptr u32) (& node-free))])
+          (when (== (@ heads k) 0) (refill! k))
+          (let ([p (cast (ptr u32) (@ heads k))])
+            (set! (@ heads k) (@ p 1))
+            (cast (ptr void) p))))))
+
+;; The n bytes at p, from alloc-bytes, given back.
+(define (free-bytes [p (ptr void)] [n u32])
+  (let ([k (class-of n)])
+    (if (> k 16)
+        (free p)
+        (let ([heads (cast (ptr u32) (& node-free))] [q (cast (ptr u32) p)])
+          (set! (@ q 1) (@ heads k))
+          (set! (@ heads k) (cast u32 q))))))
+
+;; A node of n bytes, its header set to tag with one owner, its other
+;; words as they were.
+(define (alloc-node [n u32] [tag u32]) -> datum
+  (let ([d (cast datum (alloc-bytes n))])
+    (set! (-> d w) (bit-or 256 tag))
+    d))
+(#%fact alloc-node #'(foreign owned))
+
+;; The same, inline, for code the lowering makes: the class's list read
+;; where it is, alloc-node when it is empty.
+(func (alloc-inline [n i32] [tag i32]) #:inline -> i32
+  (let ([k (i32.shr_u (i32.add n 3) 2)])
+    (if (i32.le_u k 16)
+        (let ([slot (i32.add node-free (i32.shl k 2))])
+          (let ([h (i32.load slot)])
+            (if h
+                (begin (i32.store slot (i32.load h 4)) (i32.store h (i32.or 256 tag)) h)
+                (alloc-node n tag))))
+        (alloc-node n tag))))
+(#%fact alloc-inline #'(foreign owned))
+
+;; How many counted nodes of the classes are in use: handed out and
+;; neither free nor permanent. What a program can leak.
+(define (live-nodes) -> i32
+  (let ([n (- nodes-total permanent-total)] [heads (cast (ptr u32) (& node-free))])
+    (for ([k u32 1]) (<= k 16) (+= k 1)
+      (let ([p (@ heads k)])
+        (while (!= p 0)
+          (-= n 1)
+          (set! p (@ (cast (ptr u32) p) 1)))))
+    (cast i32 n)))
+(#%fact live-nodes #'(foreign raw))
+
+;; ---- layouts and droppers ----
+;;
+;; How a node of a tag of the runtime's is freed: the words that hold
+;; values start at byte offset fields and are datums many, or as many as
+;; the word at datums-at says if that is not -1, plus the word at extra
+;; if that is not -1; the node is base + per * m bytes, m the word at
+;; size-at or 1 if that is -1. A tag with no layout has a dropper, a
+;; function given the node, which drops what it holds and frees it.
+(struct layout [set i32] [fields u32] [datums-at i32] [datums u32] [extra i32] [size-at i32] [base u32] [per u32]
+               [dropper (fn (datum))])
+(struct layout-table [l (array layout 32)])
+(define layouts layout-table)
+
+(define (layout-of [tag u32]) -> (ptr layout) (& (@ (-> (& layouts) l) tag)))
+
+(define (set-layout! [tag u32] [fields u32] [datums-at i32] [datums u32] [extra i32] [size-at i32] [base u32] [per u32])
+  (let ([l (layout-of tag)])
+    (set! (-> l set) 1)
+    (set! (-> l fields) fields)
+    (set! (-> l datums-at) datums-at)
+    (set! (-> l datums) datums)
+    (set! (-> l extra) extra)
+    (set! (-> l size-at) size-at)
+    (set! (-> l base) base)
+    (set! (-> l per) per)))
+
+(define (set-dropper! [tag u32] [f (fn (datum))])
+  (let ([l (layout-of tag)])
+    (set! (-> l set) 2)
+    (set! (-> l dropper) f)))
+
+(define (word-at [d datum] [offset u32]) -> u32 (@ (cast (ptr u32) (+ (cast (ptr u8) d) offset)) 0))
+
+;; The bytes of a node of tag with layout l.
+(define (layout-size [l (ptr layout)] [d datum]) -> u32
+  (+ (-> l base) (* (-> l per) (if (< (-> l size-at) 0) 1 (word-at d (-> l size-at))))))
+
+;; The bytes of node d, by its tag.
+(define (node-size [d datum]) -> u32
+  (let ([p (cast (ptr u32) d)] [tag (node-tag d)])
+    (cond [(== tag tag-pair) 12]
+          [(== tag tag-string) (+ 8 (@ p 1))]
+          [(or (== tag tag-symbol) (== tag tag-keyword)) (+ 12 (@ p 2))]
+          [(== tag tag-integer) 16]
+          [(== tag tag-flonum) 12]
+          [(or (== tag tag-nil) (== tag tag-true)) 4]
+          [else (let ([l (layout-of tag)]) (if (== (-> l set) 1) (layout-size l d) 0))])))
+
+;; ---- owners ----
+
+(define (make-permanent [tag u32]) -> datum
+  (let ([d (alloc-node 8 tag)])
+    (set! (-> d w) (bit-or permanent-base tag))
+    (+= permanent-total 1)
+    d))
+
+;; The one () and the one #t, permanent: for C code, and for kernel code
+;; as the globals %nil and %true, their values.
+(define nil datum (make-permanent tag-nil))
+(define true-node datum (make-permanent tag-true))
+(global %nil (mut i32) (i32.load nil))
+(global %true (mut i32) (i32.load true-node))
+
+;; d, with an owner more: a node that is counted.
+(func (dup-inline [d i32]) #:inline -> i32
+  (if (i32.and d 3)
+      d
+      (if (i32.eqz d)
+          d
+          (let ([w (i32.load d)])
+            (if (i32.lt_u w 4294967040) (begin (i32.store d (i32.add w 256)) d) d)))))
+(#%fact dup-inline #'(foreign owned))
+(define (dup [d datum]) -> datum
+  (when (node? d)
+    (let ([w (-> d w)])
+      (when (< w permanent-base) (set! (-> d w) (+ w 256)))))
+  d)
+(#%fact dup #'(foreign owned))
+
+;; d's owner gone: counted down, or at the last owner freed, with what
+;; it holds dropped (free-node!).
+(func (drop-inline [d i32])
+  #:inline
+  (if (i32.eqz (i32.and d 3))
+      (if d
+          (let ([w (i32.load d)])
+            (if (i32.lt_u w 4294967040)
+                (if (i32.lt_u w 512)
+                    (if (i32.and w 255) (free-node! d) (free-pair! d))
+                    (i32.store d (i32.sub w 256))))))))
+(#%fact drop-inline #'(foreign void 0))
+(define (drop [d datum])
+  (when (node? d)
+    (let ([w (-> d w)])
+      (when (< w permanent-base)
+        (if (< w 512) (free-node! d) (set! (-> d w) (- w 256)))))))
+(#%fact drop #'(foreign void 0))
+
+;; Is node d owned once, so that its owner may reuse or free it?
+(func (unique-cell? [d i32]) #:inline -> i32 (i32.lt_u (i32.load d) 512))
+(#%fact unique-cell? #'(foreign raw))
+
+;; d a pair owned once, its node to the pairs' list without its fields
+;; dropped, which its owner has taken.
+(func (free-pair-shell! [d i32]) #:inline
+  (i32.store d (i32.load node-free 12) 4)
+  (i32.store node-free d 12))
+(#%fact free-pair-shell! #'(foreign void))
+
+;; The nodes to drop, those a freed node held: a stack, since a node may
+;; hold many.
+(define drop-stack (ptr datum) 0)
+(define drop-room u32 0)
+(define drop-top u32 0)
+(define dropping i32 0)
+
+(define (push-drop! [d datum])
+  (when (>= drop-top drop-room)
+    (set! drop-room (if (== drop-room 0) 64 (* drop-room 2)))
+    (set! drop-stack (cast (ptr datum) (realloc drop-stack (* drop-room 4)))))
+  (set! (@ drop-stack drop-top) d)
+  (+= drop-top 1))
+
+;; d, if it is a counted node, to drop.
+(define (push-held! [d datum])
+  (when (and (node? d) (< (-> d w) permanent-base)) (push-drop! d)))
+
+;; Node d, whose last owner is gone, freed, and what it holds dropped:
+;; the chain of a list cdr by cdr, each other node through the stack.
+;; Not re-entered: a dropper that drops, as a table's does, pushes. The
+;; pair, the common case, is freed here without a call: its car pushed
+;; if it is a counted node, its words to the pairs' list, its cdr next.
+(define (free-node! [d datum])
+  (if dropping
+      (push-drop! d)
+      (let ([u d] [more 1] [heads (cast (ptr u32) (& node-free))])
+        (set! dropping 1)
+        (while more
+          (while (!= u 0)
+            (let ([p (cast (ptr u32) u)] [w (@ (cast (ptr u32) u) 0)])
+              (cond [(>= w 512) (set! (@ p 0) (- w 256)) (set! u 0)]
+                    [(== (bit-and w 255) 0)
+                     (let ([a (@ p 1)] [b (@ p 2)])
+                       (when (and (== (bit-and a 3) 0) (!= a 0) (< (@ (cast (ptr u32) a) 0) permanent-base))
+                         (push-drop! (cast datum a)))
+                       (set! (@ p 1) (@ heads 3))
+                       (set! (@ heads 3) (cast u32 p))
+                       (set! u (if (and (== (bit-and b 3) 0) (!= b 0) (< (@ (cast (ptr u32) b) 0) permanent-base)) (cast datum b) 0)))]
+                    [else (free-other! u w) (set! u 0)])))
+          (if (> drop-top 0)
+              (begin (-= drop-top 1) (set! u (@ drop-stack drop-top)))
+              (set! more 0)))
+        (set! dropping 0))))
+(#%fact free-node! #'(foreign void 0))
+
+;; Pair d, whose last owner is gone, freed, and the chain of pairs with
+;; one owner after it: the common case of free-node!, without its stack.
+;; The car, and a cdr that is not such a pair, are dropped: a node with
+;; one owner by free-node!, which goes through its own stack.
+(define (free-pair! [d datum])
+  (let ([u (cast (ptr u32) d)] [heads (cast (ptr u32) (& node-free))])
+    (while (!= u 0)
+      (let ([a (@ u 1)] [b (@ u 2)])
+        (set! (@ u 1) (@ heads 3))
+        (set! (@ heads 3) (cast u32 u))
+        (set! u 0)
+        (when (and (== (bit-and a 3) 0) (!= a 0))
+          (let ([wa (@ (cast (ptr u32) a) 0)])
+            (when (< wa permanent-base)
+              (if (< wa 512) (free-node! (cast datum a)) (set! (@ (cast (ptr u32) a) 0) (- wa 256))))))
+        (when (and (== (bit-and b 3) 0) (!= b 0))
+          (let ([wb (@ (cast (ptr u32) b) 0)])
+            (when (< wb permanent-base)
+              (cond [(>= wb 512) (set! (@ (cast (ptr u32) b) 0) (- wb 256))]
+                    [(== (bit-and wb 255) 0) (set! u (cast (ptr u32) b))]
+                    [else (free-node! (cast datum b))]))))))))
+(#%fact free-pair! #'(foreign void 0))
+
+;; Node u, no pair, with header w, freed: a string, integer or flonum at
+;; once, one of the runtime's by its layout or its dropper.
+(define (free-other! [u datum] [w u32])
+  (let ([tag (bit-and w 255)] [p (cast (ptr u32) u)])
+    (cond [(== tag tag-string) (free-bytes p (+ 8 (@ p 1)))]
+          [(== tag tag-integer) (free-bytes p 16)]
+          [(== tag tag-flonum) (free-bytes p 12)]
+          [else
+           (let ([l (layout-of tag)])
+             (cond [(== (-> l set) 1)
+                    (let* ([n (if (< (-> l datums-at) 0) (-> l datums) (word-at u (-> l datums-at)))]
+                           [f (cast (ptr u32) (+ (cast (ptr u8) u) (-> l fields)))]
+                           [size (layout-size l u)])
+                      (for ([i u32 0]) (< i n) (+= i 1) (push-held! (cast datum (@ f i))))
+                      (when (>= (-> l extra) 0) (push-held! (cast datum (word-at u (-> l extra)))))
+                      (free-bytes p size))]
+                   [(== (-> l set) 2) ((-> l dropper) u)]
+                   [else (drop (fail "freeing a node of an unknown kind"))]))])))
+
+;; d, and all it holds, permanent from now on: a module's quoted datum.
+(define (permanent! [d datum]) -> datum
+  (when (and (node? d) (< (-> d w) permanent-base))
+    (let ([p (cast (ptr u32) d)] [tag (node-tag d)])
+      (set! (@ p 0) (bit-or permanent-base tag))
+      (when (<= (node-size d) 64) (+= permanent-total 1))
+      (when (== tag tag-pair)
+        (drop (permanent! (cast datum (@ p 1))))
+        (drop (permanent! (cast datum (@ p 2)))))))
+  d)
+(#%fact permanent! #'(foreign borrowed))
+
+(define (fail [message (ptr u8)]) -> datum
+  (host-trap (cast i32 message) (strlen message))
+  0)
+
+;; ---- pairs and lists ----
+
+(func (pair-cell? [d i32]) #:inline -> i32
+  (if (i32.and d 3) 0 (if d (i32.eqz (i32.and (i32.load d) 255)) 0)))
+(#%fact pair-cell? #'(foreign raw))
+(func (null-cell? [d i32]) #:inline -> i32 (i32.eq d %nil))
+(#%fact null-cell? #'(foreign raw))
+(func (true-value) #:inline -> i32 %true)
+(#%fact true-value #'(foreign free))
+(func (null-value) #:inline -> i32 %nil)
+(#%fact null-value #'(foreign free))
+;; The value of a quoted datum's global g, permanent: a value that needs
+;; no counting (lower.sub).
+(func (literal-value [g i32]) #:inline -> i32 g)
+(#%fact literal-value #'(foreign free))
+(func (pair-car [d i32]) #:inline -> i32 (i32.load d 4))
+(#%fact pair-car #'(foreign borrowed))
+(func (pair-cdr [d i32]) #:inline -> i32 (i32.load d 8))
+(#%fact pair-cdr #'(foreign borrowed))
+
+;; A pair of a and d, which it now owns: inline from the pairs' list,
+;; class 3, else cons, which fills the list.
+(func (cons-inline [a i32] [d i32]) #:inline -> i32
+  (let ([h (i32.load node-free 12)])
+    (if h
+        (begin
+          (i32.store node-free (i32.load h 4) 12)
+          (i32.store h 256)
+          (i32.store h a 4)
+          (i32.store h d 8)
+          h)
+        (cons a d))))
+(#%fact cons-inline #'(foreign owned 0 1))
+
+(define (cons [a datum] [d datum]) -> datum
+  (let ([p (alloc-node 12 tag-pair)])
+    (set! (@ (cast (ptr u32) p) 1) (cast u32 a))
+    (set! (@ (cast (ptr u32) p) 2) (cast u32 d))
+    p))
+(#%fact cons #'(foreign owned 0 1))
+
+(define (car [p datum]) -> datum (if (pair? p) (cast datum (@ (cast (ptr u32) p) 1)) (fail "expected a pair")))
+(#%fact car #'(foreign borrowed))
+(define (cdr [p datum]) -> datum (if (pair? p) (cast datum (@ (cast (ptr u32) p) 2)) (fail "expected a pair")))
+(#%fact cdr #'(foreign borrowed))
+(define (cadr [p datum]) -> datum (car (cdr p)))
+(#%fact cadr #'(foreign borrowed))
+(define (cddr [p datum]) -> datum (cdr (cdr p)))
+(#%fact cddr #'(foreign borrowed))
+(define (caddr [p datum]) -> datum (car (cddr p)))
+(#%fact caddr #'(foreign borrowed))
+(define (cdddr [p datum]) -> datum (cdr (cddr p)))
+(#%fact cdddr #'(foreign borrowed))
+(define (cadddr [p datum]) -> datum (car (cdddr p)))
+(#%fact cadddr #'(foreign borrowed))
+;; The pair's field replaced by d, which it now owns; the one it held is
+;; the caller's to drop first.
+(define (set-car! [p datum] [d datum]) (if (pair? p) (set! (@ (cast (ptr u32) p) 1) (cast u32 d)) (drop (fail "expected a pair"))))
+(#%fact set-car! #'(foreign void 1))
+(define (set-cdr! [p datum] [d datum]) (if (pair? p) (set! (@ (cast (ptr u32) p) 2) (cast u32 d)) (drop (fail "expected a pair"))))
+(#%fact set-cdr! #'(foreign void 1))
+
+(define (list? [d datum]) -> i32
+  (while (pair? d) (set! d (cdr d)))
+  (null? d))
+
+(define (length [l datum]) -> u32
+  (let ([n u32 0])
+    (while (pair? l) (+= n 1) (set! l (cdr l)))
+    n))
+
+;; A new list of l's elements, each with a reference of the list's own.
+(define (reverse [l datum]) -> datum
+  (let ([r nil])
+    (while (pair? l) (set! r (cons (dup (car l)) r)) (set! l (cdr l)))
+    r))
+(#%fact reverse #'(foreign owned))
+
+;; a's elements, with references of the list's own, then b, which the
+;; list is given.
+(define (append [a datum] [b datum]) -> datum
+  (let ([r (reverse a)])
+    (while (pair? r)
+      (let ([next (cdr r)])
+        (set-cdr! r b)
+        (set! b r)
+        (set! r next)))
+    b))
+(#%fact append #'(foreign owned 1))
+
+(define (last [l datum]) -> datum
+  (while (pair? (cdr l)) (set! l (cdr l)))
+  (car l))
+(#%fact last #'(foreign borrowed))
+
+(define (list-ref [l datum] [n u32]) -> datum
+  (while (> n 0) (set! l (cdr l)) (-= n 1))
+  (car l))
+(#%fact list-ref #'(foreign borrowed))
+
+;; ---- booleans ----
+
+(define (boolean [b i32]) -> datum (if b true-node (cast datum 0)))
+(#%fact boolean #'(foreign borrowed))
+(func (boolean-datum? [d i32]) #:inline -> i32 (i32.or (i32.eqz d) (i32.eq d %true)))
+(#%fact boolean-datum? #'(foreign raw))
+(func (integer-datum? [d i32]) #:inline -> i32 (i32.or (i32.and d 1) (node-tagged? d 6)))
+(#%fact integer-datum? #'(foreign raw))
+
+;; ---- symbols, keywords and strings ----
+;;
+;; A symbol is interned: the one node of its name, found by the name's
+;; hash in a table that grows. Keywords likewise, in a table of their own.
+
+(struct intern-table [entries (ptr u32)] [capacity u32] [count u32])
+(define symbols intern-table)
+(define keywords intern-table)
+
+(define (hash-bytes [p (ptr u8)] [n u32]) -> u64
+  (let ([h u64 14695981039346656037])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! h (* (bit-xor h (@ p i)) 1099511628211)))
+    (bit-or h 1)))
+
+;; The node of tag with the n bytes at p in table t, interned: found, or
+;; made permanent and entered.
+(define (intern! [t (ptr intern-table)] [tag u32] [p (ptr u8)] [n u32]) -> datum
+  (when (== (-> t capacity) 0)
+    (set! (-> t capacity) 256)
+    (set! (-> t entries) (cast (ptr u32) (calloc 256 4))))
+  (when (> (* (-> t count) 2) (-> t capacity)) (grow-intern! t))
+  (let* ([h (cast u32 (hash-bytes p n))] [mask (- (-> t capacity) 1)] [i (bit-and h mask)])
+    (while (!= (@ (-> t entries) i) 0)
+      (let ([s (cast (ptr u32) (@ (-> t entries) i))])
+        (when (and (== (@ s 1) h) (== (@ s 2) n) (== (memcmp (cast (ptr u8) (+ (cast (ptr u8) s) 12)) p n) 0))
+          (return (cast datum s))))
+      (set! i (bit-and (+ i 1) mask)))
+    (let ([s (alloc-node (+ 12 n) tag)])
+      (set! (-> s w) (bit-or permanent-base tag))
+      (when (<= (+ 12 n) 64) (+= permanent-total 1))
+      (set! (@ (cast (ptr u32) s) 1) h)
+      (set! (@ (cast (ptr u32) s) 2) n)
+      (memcpy (+ (cast (ptr u8) s) 12) p n)
+      (set! (@ (-> t entries) i) (cast u32 s))
+      (+= (-> t count) 1)
+      s)))
+
+(define (grow-intern! [t (ptr intern-table)])
+  (let* ([old (-> t entries)] [old-capacity (-> t capacity)] [capacity (* old-capacity 2)]
+         [entries (cast (ptr u32) (calloc capacity 4))] [mask (- capacity 1)])
+    (for ([j u32 0]) (< j old-capacity) (+= j 1)
+      (let ([s (@ old j)])
+        (when (!= s 0)
+          (let ([i (bit-and (@ (cast (ptr u32) s) 1) mask)])
+            (while (!= (@ entries i) 0) (set! i (bit-and (+ i 1) mask)))
+            (set! (@ entries i) s)))))
+    (free old)
+    (set! (-> t entries) entries)
+    (set! (-> t capacity) capacity)))
+
+(define (symbol-hash [s datum]) -> u32 (@ (cast (ptr u32) s) 1))
+(define (symbol-length [s datum]) -> u32 (@ (cast (ptr u32) s) 2))
+(define (symbol-bytes [s datum]) -> (ptr u8) (+ (cast (ptr u8) s) 12))
+(define (bytes->symbol [p (ptr u8)] [n u32]) -> datum (intern! (& symbols) tag-symbol p n))
+(#%fact bytes->symbol #'(foreign borrowed))
+(define (bytes->keyword [p (ptr u8)] [n u32]) -> datum (intern! (& keywords) tag-keyword p n))
+(#%fact bytes->keyword #'(foreign borrowed))
+(define (string->symbol [s datum]) -> datum (bytes->symbol (string-bytes s) (string-length s)))
+(#%fact string->symbol #'(foreign borrowed))
+(define (string->keyword [s datum]) -> datum (bytes->keyword (string-bytes s) (string-length s)))
+(#%fact string->keyword #'(foreign borrowed))
+;; A new string of the name, the caller's.
+(define (symbol->string [s datum]) -> datum (bytes->string (symbol-bytes s) (symbol-length s)))
+(#%fact symbol->string #'(foreign owned))
+(define (keyword->string [k datum]) -> datum (bytes->string (symbol-bytes k) (symbol-length k)))
+(#%fact keyword->string #'(foreign owned))
+;; The symbol named by the C string.
+(define (symbol-named [name (ptr u8)]) -> datum (bytes->symbol name (strlen name)))
+(#%fact symbol-named #'(foreign borrowed))
+;; The symbol of a's name then b's.
+(define (symbol-append [a datum] [b datum]) -> datum
+  (let* ([n (+ (symbol-length a) (symbol-length b))] [p (cast (ptr u8) (malloc n))] [s datum 0])
+    (memcpy p (symbol-bytes a) (symbol-length a))
+    (memcpy (+ p (symbol-length a)) (symbol-bytes b) (symbol-length b))
+    (set! s (bytes->symbol p n))
+    (free p)
+    s))
+(#%fact symbol-append #'(foreign borrowed))
+
+;; A string: its length, then its bytes, which it owns, in its node.
+(define (string-length [s datum]) -> u32 (@ (cast (ptr u32) s) 1))
+(define (string-bytes [s datum]) -> (ptr u8) (+ (cast (ptr u8) s) 8))
+(define (string-byte [s datum] [i u32]) -> u32 (@ (string-bytes s) i))
+;; A new string of the n bytes at p, copied.
+(define (bytes->string [p (ptr u8)] [n u32]) -> datum
+  (let ([s (alloc-node (+ 8 n) tag-string)])
+    (set! (@ (cast (ptr u32) s) 1) n)
+    (memcpy (+ (cast (ptr u8) s) 8) p n)
+    s))
+(#%fact bytes->string #'(foreign owned))
+;; A new string of the C string: for a message.
+(define (str [s (ptr u8)]) -> datum (bytes->string s (strlen s)))
+(#%fact str #'(foreign owned))
+(define (string-append [a datum] [b datum]) -> datum
+  (let* ([n (+ (string-length a) (string-length b))] [s (alloc-node (+ 8 n) tag-string)])
+    (set! (@ (cast (ptr u32) s) 1) n)
+    (memcpy (+ (cast (ptr u8) s) 8) (string-bytes a) (string-length a))
+    (memcpy (+ (cast (ptr u8) s) (+ 8 (string-length a))) (string-bytes b) (string-length b))
+    s))
+(#%fact string-append #'(foreign owned))
+(define (string=? [a datum] [b datum]) -> i32
+  (and (== (string-length a) (string-length b))
+       (== (memcmp (string-bytes a) (string-bytes b) (string-length a)) 0)))
+
+;; ---- numbers and characters ----
+
+(define (fixnum [n i32]) -> datum (cast datum (bit-or (<< n 1) 1)))
+(#%fact fixnum #'(foreign owned))
+(define (fixnum-value [d datum]) -> i32 (>> (cast i32 d) 1))
+
+;; The integer n: a fixnum if it fits, else a node of its two's
+;; complement, negative if it is.
+(define (make-integer [n i64]) -> datum
+  (if (and (>= n -1073741824) (<= n 1073741823))
+      (fixnum (cast i32 n))
+      (integer-node (cast u32 n) (cast u32 (>> n 32)) (< n 0))))
+(#%fact make-integer #'(foreign owned))
+(define (make-unsigned-integer [n u64]) -> datum
+  (if (<= n 1073741823)
+      (fixnum (cast i32 n))
+      (integer-node (cast u32 n) (cast u32 (>> n 32)) 0)))
+(#%fact make-unsigned-integer #'(foreign owned))
+(define (integer-node [low u32] [high u32] [negative i32]) -> datum
+  (let ([d (alloc-node 16 tag-integer)])
+    (set! (@ (cast (ptr u32) d) 1) low)
+    (set! (@ (cast (ptr u32) d) 2) high)
+    (set! (@ (cast (ptr u32) d) 3) (cast u32 negative))
+    d))
+;; The value's 64 bits: the two's complement of a negative one, else its
+;; value, below 2^64, as a u64.
+(define (integer-value [d datum]) -> i64
+  (if (fixnum? d)
+      (cast i64 (fixnum-value d))
+      (bit-or (cast i64 (@ (cast (ptr u32) d) 1)) (<< (cast i64 (@ (cast (ptr u32) d) 2)) 32))))
+(define (integer-negative? [d datum]) -> i32
+  (if (fixnum? d) (< (fixnum-value d) 0) (cast i32 (@ (cast (ptr u32) d) 3))))
+
+(define (make-flonum [x f64]) -> datum
+  (let ([d (alloc-node 12 tag-flonum)] [bits (f64-bits x)])
+    (set! (@ (cast (ptr u32) d) 1) (cast u32 bits))
+    (set! (@ (cast (ptr u32) d) 2) (cast u32 (>> bits 32)))
+    d))
+(#%fact make-flonum #'(foreign owned))
+(define (flonum-value [d datum]) -> f64
+  (bits-f64 (bit-or (cast i64 (@ (cast (ptr u32) d) 1)) (<< (cast i64 (@ (cast (ptr u32) d) 2)) 32))))
+
+;; A character is its code, shifted, with 10 in the lowest bits.
+(define (integer->char [c u32]) -> datum (cast datum (bit-or (<< c 2) 2)))
+(#%fact integer->char #'(foreign owned))
+(define (char->integer [d datum]) -> u32 (>> (cast u32 d) 2))
+
+;; ---- equality and hashing ----
+
+(define (equal? [a datum] [b datum]) -> i32
+  (when (== a b) (return 1))
+  (if (not (node? a))
+      0
+      (let ([tag (node-tag a)])
+        (cond [(== tag tag-pair) (and (pair? b) (equal? (car a) (car b)) (equal? (cdr a) (cdr b)))]
+              [(== tag tag-string) (and (string? b) (string=? a b))]
+              [(== tag tag-integer) (and (tagged? b tag-integer) (== (integer-value a) (integer-value b))
+                                         (== (integer-negative? a) (integer-negative? b)))]
+              [(== tag tag-flonum) (and (flonum? b) (== (f64-bits (flonum-value a)) (f64-bits (flonum-value b))))]
+              [else 0]))))
+
+(define (mix [h u64] [x u64]) -> u64 (* (bit-xor h x) 1099511628211))
+
+;; A hash that equal values share, never 0: a hash table's key.
+(define (datum-hash [d datum]) -> u64 (bit-or (hash-into 14695981039346656037 d) 1))
+
+(define (hash-into [h u64] [d datum]) -> u64
+  (if (not (node? d))
+      (mix h (cast u64 (cast u32 d)))
+      (let ([tag (node-tag d)])
+        (cond [(== tag tag-pair) (hash-into (hash-into (mix h 2) (car d)) (cdr d))]
+              [(== tag tag-string) (mix h (hash-bytes (string-bytes d) (string-length d)))]
+              [(== tag tag-integer) (mix h (cast u64 (integer-value d)))]
+              [(== tag tag-flonum) (mix h (cast u64 (f64-bits (flonum-value d))))]
+              [else (mix h (cast u64 (cast u32 d)))]))))
+
+;; ---- writing ----
+;;
+;; A datum written into a buffer (c/runtime.sub) as write (how 0) or
+;; display (how 1) writes it: a list in parentheses, a string in quotes
+;; with ", \ and control characters escaped, or as it is for display, a
+;; symbol's name, a keyword with #: before it, an integer in decimal, a
+;; flonum as write-flonum writes it, a character as #\c or its name, or
+;; itself for display, #f, #t, and a node of the runtime's as #<node n>:
+;; the runtime writes its own (write-value).
+
+(define (write-datum [d datum])
+  (let ([b (make-buffer)])
+    (write-to (& b) d 0)
+    (print:write-bytes (cast i32 (-> b bytes)) (-> b length))
+    (buffer-free! (& b))))
+
+(define (write-to [b (ptr buffer)] [d datum] [how i32])
+  (cond [(== d 0) (buffer-add-string! b "#f")]
+        [(fixnum? d)
+         (let ([n (fixnum-value d)])
+           (when (< n 0) (buffer-add-byte! b 45))
+           (write-u64 b (cast u64 (if (< n 0) (- 0 n) n))))]
+        [(char? d) (if (== how 1) (buffer-add-utf-8! b (char->integer d)) (write-char b (char->integer d)))]
+        [(== d nil) (buffer-add-string! b "()")]
+        [(== d true-node) (buffer-add-string! b "#t")]
+        [else
+         (let ([tag (node-tag d)])
+           (cond [(== tag tag-pair) (write-pair b d how)]
+                 [(== tag tag-symbol) (buffer-add! b (symbol-bytes d) (symbol-length d))]
+                 [(== tag tag-keyword) (buffer-add-string! b "#:") (buffer-add! b (symbol-bytes d) (symbol-length d))]
+                 [(== tag tag-string)
+                  (if (== how 1) (buffer-add! b (string-bytes d) (string-length d)) (write-string b (string-bytes d) (string-length d)))]
+                 [(== tag tag-integer)
+                  (when (integer-negative? d) (buffer-add-byte! b 45))
+                  (write-u64 b (cast u64 (if (integer-negative? d) (- 0 (integer-value d)) (integer-value d))))]
+                 [(== tag tag-flonum) (write-flonum b (flonum-value d))]
+                 [else (buffer-add-string! b "#<node ") (write-u64 b tag) (buffer-add-byte! b 62)]))]))
+
+(define (write-pair [b (ptr buffer)] [d datum] [how i32])
+  (buffer-add-byte! b 40)
+  (write-to b (car d) how)
+  (set! d (cdr d))
+  (while (pair? d)
+    (buffer-add-byte! b 32)
+    (write-to b (car d) how)
+    (set! d (cdr d)))
+  (unless (null? d)
+    (buffer-add-string! b " . ")
+    (write-to b d how))
+  (buffer-add-byte! b 41))
+
+(define (write-u64 [b (ptr buffer)] [n u64])
+  (when (>= n 10) (write-u64 b (/ n 10)))
+  (buffer-add-byte! b (+ 48 (cast i32 (% n 10)))))
+
+;; A string in double quotes, with ", \ and control characters escaped.
+(define (write-string [b (ptr buffer)] [p (ptr u8)] [n u32])
+  (buffer-add-byte! b 34)
+  (for ([i u32 0]) (< i n) (+= i 1)
+    (let ([c (@ p i)])
+      (case c
+        [(34 92) (buffer-add-byte! b 92) (buffer-add-byte! b c)]
+        [(10) (buffer-add-string! b "\\n")]
+        [(9) (buffer-add-string! b "\\t")]
+        [(13) (buffer-add-string! b "\\r")]
+        [else (if (or (< c 32) (== c 127))
+                  (begin (buffer-add-string! b "\\x") (write-hex b c) (buffer-add-byte! b 59))
+                  (buffer-add-byte! b c))])))
+  (buffer-add-byte! b 34))
+
+(define (write-hex [b (ptr buffer)] [n u32])
+  (when (>= n 16) (write-hex b (>> n 4)))
+  (let ([d (bit-and n 15)])
+    (buffer-add-byte! b (if (< d 10) (+ 48 d) (+ 87 d)))))
+
+;; A character as #\c, or its name.
+(define (write-char [b (ptr buffer)] [c u32])
+  (let ([name (char-name c)])
+    (buffer-add-string! b "#\\")
+    (cond [(!= name 0) (buffer-add-string! b name)]
+          [(< c 32) (buffer-add-byte! b 120) (write-hex b c)]
+          [else (buffer-add-utf-8! b c)])))
+
+(define (char-name [c u32]) -> (ptr u8)
+  (case c
+    [(32) "space"] [(10) "newline"] [(9) "tab"] [(13) "return"] [(0) "nul"]
+    [(7) "alarm"] [(8) "backspace"] [(27) "escape"] [(127) "delete"]
+    [else 0]))
+
+;; A code point as UTF-8.
+(define (buffer-add-utf-8! [b (ptr buffer)] [c u32])
+  (cond [(< c 128) (buffer-add-byte! b c)]
+        [(< c 2048)
+         (buffer-add-byte! b (bit-or 192 (>> c 6)))
+         (buffer-add-byte! b (bit-or 128 (bit-and c 63)))]
+        [(< c 65536)
+         (buffer-add-byte! b (bit-or 224 (>> c 12)))
+         (buffer-add-byte! b (bit-or 128 (bit-and (>> c 6) 63)))
+         (buffer-add-byte! b (bit-or 128 (bit-and c 63)))]
+        [else
+         (buffer-add-byte! b (bit-or 240 (>> c 18)))
+         (buffer-add-byte! b (bit-or 128 (bit-and (>> c 12) 63)))
+         (buffer-add-byte! b (bit-or 128 (bit-and (>> c 6) 63)))
+         (buffer-add-byte! b (bit-or 128 (bit-and c 63)))]))
+
+;; x as write writes it: +inf.0, -inf.0 or +nan.0; otherwise its shortest
+;; digits (flonum-digits), in fixed-point notation from 10^-3 up to 10^10,
+;; else in scientific notation, 1.5e10.
+(define (write-flonum [b (ptr buffer)] [x f64])
+  (cond [(!= x x) (return (buffer-add-string! b "+nan.0"))]
+        [(== x (/ 1.0 0.0)) (return (buffer-add-string! b "+inf.0"))]
+        [(== x (/ -1.0 0.0)) (return (buffer-add-string! b "-inf.0"))])
+  (when (< (f64-bits x) 0) (buffer-add-byte! b 45))
+  (when (== x 0) (return (buffer-add-string! b "0.0")))
+  (let ([ds (array u8 24)] [n 0] [k 0])
+    (memset ds 0 24)
+    ;; x is 0.d1...dn times 10^k.
+    (set! k (flonum-digits (fabs x) ds))
+    (while (and (< n 24) (!= (@ ds n) 0)) (+= n 1))
+    (cond [(or (< k -2) (> k 10))
+           (buffer-add! b ds 1)
+           (when (> n 1)
+             (buffer-add-byte! b 46)
+             (buffer-add! b (+ ds 1) (- n 1)))
+           (buffer-add-byte! b 101)
+           (when (< k 1) (buffer-add-byte! b 45))
+           (write-u64 b (if (>= k 1) (- k 1) (- 1 k)))]
+          [(<= k 0)
+           (buffer-add-string! b "0.")
+           (for ([i 0]) (< i (- k)) (+= i 1) (buffer-add-byte! b 48))
+           (buffer-add! b ds n)]
+          [(< k n)
+           (buffer-add! b ds k)
+           (buffer-add-byte! b 46)
+           (buffer-add! b (+ ds k) (- n k))]
+          [else
+           (buffer-add! b ds n)
+           (for ([i n]) (< i k) (+= i 1) (buffer-add-byte! b 48))
+           (buffer-add-string! b ".0")])))
+
+;; ---- quoted data ----
+;;
+;; (quote d), in kernel code: datum d, the kernel module's at compile
+;; time, as Substrate's value. A fixnum, a character, #f, () or #t is in
+;; place; anything else is made once, as the module that quotes it
+;; starts, in a C global of that module's (lit, which C code reads) and
+;; a kernel global that holds the same value, made permanent. The
+;; transformers are C, at compile time, on the kernel module's data.
+
+(begin-for-syntax
+  (require-unqualified c "../../../compiler/c/c.sub")
+  (require-unqualified kd "../../../compiler/kernel.sub")
+  (require sm "../../../compiler/c/c-syntax-match.sub" syntax-match _ ... ?)
+
+  ;; The globals of the literals of the module being compiled, by datum:
+  ;; (c-global . kernel-global), as this macro sees their names.
+  (define literal-table (ptr arena-table) 0)
+  (define literal-count i32 0)
+
+  (define (syn [d datum]) -> datum (datum->syntax #'here d 0))
+
+  ;; Is d an integer in a fixnum's 31 bits? Its 64 bits are its two's
+  ;; complement, so its sign is its own: 2^64 - 1 is not -1.
+  (define (fixnum-range? [d datum]) -> i32
+    (and (integer? d) (== (integer-negative? d) (< (integer-value d) 0))
+         (>= (integer-value d) -1073741824) (<= (integer-value d) 1073741823)))
+
+  ;; The word of fixnum d, or of character d.
+  (define (fixnum-word [d datum]) -> datum (make-integer (bit-or (<< (integer-value d) 1) 1)))
+  (define (char-word [d datum]) -> datum (make-integer (bit-or (<< (cast i64 (char->integer d)) 2) 2)))
+
+  ;; The globals of datum d, lifted the first time the module quotes d.
+  (define (literal-globals [d datum]) -> datum
+    (when (== literal-table 0) (set! literal-table (make-table)))
+    (let ([known (datum-get literal-table d)])
+      (if known
+          (cons (syntax-local-introduce (car known)) (syntax-local-introduce (cdr known)))
+          (let* ([n (begin (+= literal-count 1) (make-integer literal-count))]
+                 [g (syn (string->symbol (format '"literal~a" `(,n))))]
+                 [k (syn (string->symbol (format '"literal~a.k" `(,n))))])
+            (syntax-local-lift-definition #`(define #,g datum (permanent! #,(construction d))))
+            (syntax-local-lift-definition #`(global #,k (mut i32) (i32.load #,g)))
+            (datum-put! literal-table d (cons (syntax-local-introduce g) (syntax-local-introduce k)))
+            (cons g k)))))
+
+  ;; C code that makes datum d, its symbols and keywords interned. A
+  ;; string literal in C code is its bytes.
+  (define (construction [d datum]) -> datum
+    (cond [(== d 0) #'(cast datum 0)]
+          [(null? d) #'nil]
+          [(boolean? d) #'true-node]
+          [(symbol? d) #`(bytes->symbol #,(syn (symbol->string d)) #,(syn (make-integer (symbol-length d))))]
+          [(keyword? d) (let ([s (keyword->string d)]) #`(bytes->keyword #,(syn s) #,(syn (make-integer (string-length s)))))]
+          [(string? d) #`(bytes->string #,(syn d) #,(syn (make-integer (string-length d))))]
+          [(fixnum-range? d) #`(cast datum #,(syn (fixnum-word d)))]
+          ;; An integer up to 2^63 is its i64; one above, its magnitude.
+          [(integer? d) (if (or (integer-negative? d) (>= (integer-value d) 0))
+                            #`(make-integer (cast i64 #,(syn d)))
+                            #`(make-unsigned-integer (cast u64 #,(syn d))))]
+          [(flonum? d) #`(make-flonum #,(syn d))]
+          [(char? d) #`(cast datum #,(syn (char-word d)))]
+          [(pair? d) #`(cons #,(construction (car d)) #,(construction (cdr d)))]
+          [else (raise-syntax-error 'quote '"this datum is not one of Substrate's" (syn d))]))
+
+  ;; Kernel code that gives datum d as Substrate's value, where it is: a
+  ;; value that needs no counting, which the forms around it say.
+  (define (literal [d datum]) -> datum
+    (cond [(== d 0) #'0]
+          [(null? d) #'(null-value)]
+          [(boolean? d) #'(true-value)]
+          [(fixnum-range? d) (syn (fixnum-word d))]
+          [(char? d) (syn (char-word d))]
+          [else #`(literal-value #,(cdr (literal-globals d)))]))
+
+  ;; C code that gives datum d, where it is.
+  (define (c-literal [d datum]) -> datum
+    (cond [(== d 0) #'(cast datum 0)]
+          [(null? d) #'nil]
+          [(boolean? d) #'true-node]
+          [(fixnum-range? d) #`(cast datum #,(syn (fixnum-word d)))]
+          [(char? d) #`(cast datum #,(syn (char-word d)))]
+          [else (car (literal-globals d))]))
+
+  (define (quote-form [s datum]) -> datum
+    (syntax-match s
+      [(_ d) (literal (syntax->datum d))]
+      [_ (raise-syntax-error 'quote '"expected (quote datum)" s)]))
+
+  (define (lit-form [s datum]) -> datum
+    (syntax-match s
+      [(_ d) (c-literal (syntax->datum d))]
+      [_ (raise-syntax-error 'lit '"expected (lit datum)" s)]))
+
+  ;; ---- quasiquote ----
+  ;;
+  ;; (quasiquote t): template t as Substrate's value, made by cons and
+  ;; append of its quoted parts and the values of its ,e and ,@e, which
+  ;; are those of its depth: a `t inside it is one deeper, and a ,e or ,@e
+  ;; one shallower. quasiquote, unquote and unquote-splicing are compared
+  ;; by name, as kernel.sub's quasiquote compares them.
+
+  (define (named? [x datum] [name datum]) -> i32 (and (identifier? x) (== (syntax-e x) name)))
+
+  ;; Is x the syntax (name e)?
+  (define (tagged? [x datum] [name datum]) -> i32
+    (let ([l (syntax->list x)]) (and l (== (length l) 2) (named? (car l) name))))
+
+  ;; Has template x, at depth, a ,e or ,@e whose value it takes?
+  (define (changes? [x datum] [depth i32]) -> i32
+    (cond [(or (tagged? x 'unquote) (tagged? x 'unquote-splicing))
+           (or (== depth 0) (changes? (cadr (syntax->list x)) (- depth 1)))]
+          [(tagged? x 'quasiquote) (changes? (cadr (syntax->list x)) (+ depth 1))]
+          [(syntax? x) (let ([e (syntax-e x)]) (and (pair? e) (chain-changes? e depth)))]
+          [else 0]))
+
+  ;; The same of pair chain l, the elements of a template and its tail.
+  (define (chain-changes? [l datum] [depth i32]) -> i32
+    (cond [(syntax? l) (changes? l depth)]
+          [(not (pair? l)) 0]
+          ;; (a . ,e) is (a unquote e).
+          [(and (== depth 0) (named? (car l) 'unquote)) 1]
+          [else (or (changes? (car l) depth) (chain-changes? (cdr l) depth))]))
+
+  ;; The code of template x at depth.
+  (define (template [x datum] [depth i32]) -> datum
+    (cond [(not (changes? x depth)) #`(quote #,x)]
+          [(and (== depth 0) (tagged? x 'unquote)) (cadr (syntax->list x))]
+          [(or (tagged? x 'unquote) (tagged? x 'unquote-splicing))
+           #`(cons (quote #,(car (syntax-e x))) #,(template-list (cdr (syntax-e x)) (- depth 1)))]
+          [(tagged? x 'quasiquote)
+           #`(cons (quote #,(car (syntax-e x))) #,(template-list (cdr (syntax-e x)) (+ depth 1)))]
+          [else (template-list (syntax-e x) depth)]))
+
+  ;; The code of pair chain l, the elements of a template and its tail.
+  (define (template-list [l datum] [depth i32]) -> datum
+    (cond [(syntax? l) (template l depth)]
+          [(null? l) #''()]
+          [(and (== depth 0) (named? (car l) 'unquote)) (cadr l)]
+          [(and (== depth 0) (tagged? (car l) 'unquote-splicing))
+           #`(append #,(cadr (syntax->list (car l))) #,(template-list (cdr l) depth))]
+          [else #`(cons #,(template (car l) depth) #,(template-list (cdr l) depth))]))
+
+  (define (quasiquote-form [s datum]) -> datum
+    (syntax-match s
+      [(_ t) (template t 0)]
+      [_ (raise-syntax-error 'quasiquote '"expected (quasiquote template)" s)])))
+
+(define-syntax quote quote-form)
+(define-syntax quasiquote quasiquote-form)
+(define-syntax lit lit-form)
+
+;; ---- the predicates, for C code ----
+;;
+;; Each a form whose expansion is the inline test on the datum's i32, so
+;; that C code pays no call for one.
+
+(begin-for-syntax
+  (define (test-form [s datum] [test datum]) -> datum
+    (syntax-match s
+      [(_ d) (datum->syntax #'here `(,test (cast i32 ,d)) s)]
+      [_ (raise-syntax-error (syntax-e (car (syntax->list s))) '"expected one argument, a datum" s)]))
+  (define (tag-form [s datum] [tag i32]) -> datum
+    (syntax-match s
+      [(_ d) (datum->syntax #'here `(node-tagged? (cast i32 ,d) ,(fixnum tag)) s)]
+      [_ (raise-syntax-error (syntax-e (car (syntax->list s))) '"expected one argument, a datum" s)]))
+  (define (node?-form [s datum]) -> datum (test-form s 'node-datum?))
+  (define (tagged?-form [s datum]) -> datum
+    (syntax-match s
+      [(_ d tag) (datum->syntax #'here `(node-tagged? (cast i32 ,d) (cast i32 ,tag)) s)]
+      [_ (raise-syntax-error 'tagged? '"expected (tagged? datum tag)" s)]))
+  (define (pair?-form [s datum]) -> datum (test-form s 'pair-cell?))
+  (define (null?-form [s datum]) -> datum (test-form s 'null-cell?))
+  (define (symbol?-form [s datum]) -> datum (tag-form s 3))
+  (define (keyword?-form [s datum]) -> datum (tag-form s 4))
+  (define (string?-form [s datum]) -> datum (tag-form s 5))
+  (define (flonum?-form [s datum]) -> datum (tag-form s 7))
+  (define (integer?-form [s datum]) -> datum (test-form s 'integer-datum?))
+  (define (fixnum?-form [s datum]) -> datum (test-form s 'fixnum-datum?))
+  (define (char?-form [s datum]) -> datum (test-form s 'char-datum?))
+  (define (boolean?-form [s datum]) -> datum (test-form s 'boolean-datum?)))
+
+(define-syntax node? node?-form)
+(define-syntax tagged? tagged?-form)
+(define-syntax pair? pair?-form)
+(define-syntax null? null?-form)
+(define-syntax symbol? symbol?-form)
+(define-syntax keyword? keyword?-form)
+(define-syntax string? string?-form)
+(define-syntax flonum? flonum?-form)
+(define-syntax integer? integer?-form)
+(define-syntax fixnum? fixnum?-form)
+(define-syntax char? char?-form)
+(define-syntax boolean? boolean?-form)
