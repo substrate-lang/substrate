@@ -316,18 +316,22 @@ Substrate is built again in `substrate/` (plan, 5).
    (`#:free`). A closure or a struct is made inline from the heap's
    lists, and the kernel module frees a record of a kind whose layout
    the runtime registered (`set-record-layout!`) with no call into the
-   runtime. Over 30 M iterations, on wasmtime, fixnum arithmetic takes
-   0.22 s on cells against 1.1 s with GC, walking a list 0.14 s against
-   1.1 s, making and freeing pairs 0.30 s against 4.8 s, and 10 M
-   closure calls 0.14 s against 0.74 s; a list benchmark 0.23 s against
-   2.1 s, one of closures, structs and a hash table 0.14 s against 0.63
-   s. V8 runs the GC version of those in 0.27, 0.18, 0.22, 0.11, 0.17
-   and 0.07 s, and the cells version in 0.21, 0.12, 0.27, 0.14, 0.19
-   and 0.13 s (each with 0.08 s of starting): ahead on arithmetic and
-   walking, even on calls and lists, behind on making pairs by a fifth
-   and on closures, structs and a hash table, where a record made and
-   freed costs what V8's nursery never pays for garbage. Next: the
-   pass's time at compile time (the typed example builds in 1.0 s, 0.7
-   s before it); and what still leaks: a value a raise unwinds past,
-   and a closure that refers to itself through a box, as a letrec's
-   that escapes does.
+   runtime; a hash table's update hashes its key once. Over 30 M
+   iterations, on wasmtime, fixnum arithmetic takes 0.20 s on cells
+   against 1.1 s with GC, walking a list 0.14 s against 1.1 s, making
+   and freeing pairs 0.29 s against 4.8 s, and 10 M closure calls 0.14
+   s against 0.74 s; a list benchmark 0.22 s against 2.1 s, one of
+   closures, structs and a hash table 0.13 s against 0.63 s. V8 runs
+   the GC version of those in 0.27, 0.18, 0.22, 0.11, 0.17 and 0.07 s,
+   and the cells version in 0.21, 0.12, 0.25, 0.12, 0.19 and 0.13 s
+   (each with 0.08 s of starting): ahead on arithmetic and walking,
+   even on calls and lists, behind by a tenth on making pairs and by
+   half on closures, structs and a hash table, where each record freed
+   costs what V8's nursery never pays for garbage. The pass costs
+   little at compile time: the typed example builds in 0.34 s from a
+   warm cache, of which the compiler runs 20 ms, the rest the host
+   compiling the compiler. Next: a closure given to a call that does
+   not keep it, which the facts could tell, made on the stack rather
+   than freed; and what still leaks: a value a raise unwinds past, and
+   a closure that refers to itself through a box, as a letrec's that
+   escapes does.
