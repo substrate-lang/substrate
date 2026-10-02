@@ -750,10 +750,14 @@ calls of itself, and calls before its definition in its own module, stay
 calls. So that an inlined call does what the call would, the body must
 not depend on which module it is compiled in:
 
-- It may not use memory or a table, or `call-indirect`, `func-index`, or
-  an instruction that names a data or element segment, since in another
+- It may not use a table, `call-indirect`, `func-index`, or an
+  instruction that names a data or element segment, since in another
   module they would be that module's. `data-address` and `data-size` are
-  constants, so a body may pass them to its own module's functions.
+  constants, so a body may pass them to its own module's functions. It
+  may use memory, but then a call is inlined only where the code being
+  compiled uses the same memory, the one of the same instance through
+  `memory from` (3.3), as the function's module; elsewhere it stays a
+  call.
 - It may quote only fixnums, booleans, `()`, symbols and keywords: quoted
   data is made by the module that holds the code, and only these are the
   same values whichever module makes them.
