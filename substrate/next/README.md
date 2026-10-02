@@ -63,23 +63,9 @@ on them there.
     with its transformer, `(define-macro (name stx) body ...)`; `bend/`
     writes its macros, loops and messages with them.
 - `substrate/`: Substrate as the new compiler builds it, on the C-like
-  Lisp (plan, 5):
-  - `data.sub`: its data, `compiler/kernel.sub`'s but for its syntax
-    objects, as wasm GC objects; its `quote`, which makes a datum as its
-    value, once, when the module that quotes it starts; and its
-    `quasiquote`.
-  - `core.sub`: `lib/substrate-core.sub`, its transformers kernel code on
-    the kernel module's data, its run-time functions on `data.sub`'s.
-  - `substrate.sub`: `lib/substrate.sub`, its forms and `match` written
-    in C. A module written in Substrate defines macros with patterns,
-    `syntax-rules`, which compile into C at its phase 1, not with
-    Substrate code: Substrate does not run at compile time, and has no
-    syntax objects among its values.
-- `owned/`: Substrate on its own values (plan, 6): `substrate/` but
-  that its values are nodes in the program's memory, owned and freed by
-  the program, so that a program needs no GC; its macros are written in
-  the C-like Lisp, as `substrate/`'s are, and Substrate does not run at
-  compile time:
+  Lisp (plan, 5 and 6): its values nodes in the program's memory, owned
+  and freed by the program, so that a program needs no GC; its macros
+  written in the C-like Lisp, and Substrate not running at compile time:
   - `values.sub`: Substrate's data in the C-like Lisp: pairs, symbols
     and keywords (interned), strings, integers, flonums and characters,
     with fixnums and characters in the datum itself, #f 0; a header word
@@ -100,15 +86,19 @@ on them there.
     other lambda lifted to a function of the closure and its parameters.
     Its values are owned: the last use of a variable moves its value, an
     earlier use dups it, a variable never used again is dropped, and so
-    a program frees what it is done with (`tests/owned/live-nodes.sub`).
+    a program frees what it is done with (`tests/substrate/live-nodes.sub`).
     A parameter a function only reads is borrowed, its caller keeping
     the value through the call: the module's functions' bodies are
     expanded as its second pass begins, and their flags inferred
-    together and written as their facts (`tests/owned/borrowed.sub`).
-  - `core.sub`: `substrate/core.sub` on i32 values and the runtime.
-  - `substrate.sub`: `substrate/substrate.sub`'s forms and `match`, in
-    C, on the owned core; `rules.sub`: `syntax-rules`, in C, which
-    `define-syntax` sends it to.
+    together and written as their facts (`tests/substrate/borrowed.sub`).
+  - `core.sub`: `lib/substrate-core.sub`, its transformers kernel code on
+    the kernel module's data, its run-time functions kernel code on
+    `values.sub`'s and `runtime.sub`'s, which the lowering owns.
+  - `substrate.sub`: `lib/substrate.sub`, its forms and `match` written
+    in C. A module written in Substrate defines macros with patterns,
+    `syntax-rules` (`rules.sub`, in C), which compile into C at its phase
+    1, not with Substrate code: Substrate does not run at compile time,
+    and has no syntax objects among its values.
 - `bend/`: Bend as the new compiler builds it, `examples/bend` ported to
   the C-like Lisp (plan, 5):
   - `core.sub`: `examples/bend/core.sub`, the checker, function for
@@ -159,8 +149,8 @@ on them there.
   kernel module; the C example's tests (`tests/c`), on `c/`; the
   Substrate tests of `tests/` (`tests/substrate`), on `substrate/`, with
   their outputs, but for those of Substrate's syntax objects and its code
-  at compile time, and the same on `owned/` (`tests/owned`), with the
-  tests of what it frees; the Bend tests of `tests/` and `examples/bend.sub`
+  at compile time, with the tests of what it frees; the Bend tests of
+  `tests/` and `examples/bend.sub`
   (`tests/bend`), on `bend/`; and the tests of its parts: its syntax
   objects, its reader, and what its expander and back end give for the
   kernel's tests, which is what the compiler gives. Then, as `tests/run.sh` checks the
@@ -261,19 +251,21 @@ Substrate is built again in `substrate/` (plan, 5).
 5. Substrate and Bend on the C-like Lisp, which is the base language:
    the kernel's specification is what code compiles to, and C is what it
    is written in, with the kernel's instructions in `func` bodies.
-   Macros are written in C, and need no GC; Substrate's values are wasm
-   GC objects, its run time in `func` bodies. In order:
+   Macros are written in C, and need no GC; Substrate's values were wasm
+   GC objects, its run time in `func` bodies, until 6 gave it values of
+   its own. In order:
    1. C as a language for macros: quoted data and syntax in C code, and
       `syntax-match` for C. Done: `tests/c-macros.sub`,
       `tests/c-quote.sub`, and `tests/c/syntax-match.sub`, the kernel's
       test of `syntax-match` in C, which gives its output.
    2. Substrate's data, the old kernel module's GC data but syntax, and
       its literals, made when a module starts. Done: `substrate/data.sub`
-      (`tests/substrate/data.sub`).
+      (`tests/substrate/data.sub`), since replaced by `values.sub` (6).
    3. Substrate's forms, and pattern macros for Substrate's users. Done:
       `substrate/core.sub` and `substrate/substrate.sub`; the Substrate
       tests of `tests/` give their outputs on them (`tests/substrate`),
-      their macros written with `syntax-rules`.
+      their macros written with `syntax-rules`; both now on the values
+      of 6.
    4. Bend, its checker first-order, in C, compiling to linear memory.
       Done: `bend/`; the Bend tests of `tests/` (`tests/bend`) and
       `examples/bend.sub` (`tests/bend/example.sub`) give their outputs
@@ -282,11 +274,11 @@ Substrate is built again in `substrate/` (plan, 5).
       example takes 12.7 s.
    5. Numeric instructions and reference types in C code; then the typed
       example.
-6. Substrate on its own values, `owned/`: Substrate's values nodes in
-   the program's memory, owned and freed by the program, so that a
-   program needs no GC, with the kernel module as it is and Substrate
-   not running at compile time: its macros are written in the C-like
-   Lisp, as `substrate/`'s are, or with `syntax-rules`. The way there
+6. Substrate on its own values, `substrate/` as it is now: Substrate's
+   values nodes in the program's memory, owned and freed by the program,
+   so that a program needs no GC, with the kernel module as it is and
+   Substrate not running at compile time: its macros are written in the
+   C-like Lisp, as they were on the GC values, or with `syntax-rules`. The way there
    was an experiment, Substrate on cells, which made Substrate's values
    the kernel module's cells so that its data at compile time was the
    kernel module's, syntax objects included, and its macros could be
@@ -333,12 +325,11 @@ Substrate is built again in `substrate/` (plan, 5).
    only reads them are read where they are, the variable kept through
    the call; and what a function of the runtime's or `values.sub`'s
    gives and takes, the pass reads from facts. After each check of
-   `tests/owned/live-nodes.sub` no more nodes are in use than before
+   `tests/substrate/live-nodes.sub` no more nodes are in use than before
    it; the tests of Substrate at compile time, and the typed example,
    are gone with it.
 
-   Its speed, against the cells experiment and `substrate/` with its GC
-   on V8, each program run twice and the second taken, on this machine
+   Its speed, against the cells experiment and the GC values on V8, each program run twice and the second taken, on this machine
    (the GC versions take 0.08 s to start): over 30 M iterations, on
    wasmtime, fixnum arithmetic takes 0.20 s on owned values against
    0.21 on cells and 0.33 with GC on V8, walking a list 0.16 against
