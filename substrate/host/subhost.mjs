@@ -177,17 +177,19 @@ function importMap(bytes) {
 }
 
 // The host imports for one instance, self.exports once it exists. Every
-// pointer is into that instance's memory.
+// pointer is into that instance's memory: an i32, which arrives signed,
+// taken unsigned (u), since a memory can be larger than 2 GB.
 function hostImports(self) {
   const memory = () => {
     const m = self.exports && self.exports.memory;
     if (!m) hostTrap('host: the caller exports no memory, or is still starting');
     return new Uint8Array(m.buffer);
   };
-  const string = (ptr, len) => text.decode(memory().slice(ptr, ptr + len));
+  const u = (ptr) => ptr >>> 0;
+  const string = (ptr, len) => text.decode(memory().slice(u(ptr), u(ptr) + len));
   return {
     write(fd, ptr, len) {
-      fs.writeSync(fd === 2 ? 2 : 1, memory().subarray(ptr, ptr + len));
+      fs.writeSync(fd === 2 ? 2 : 1, memory().subarray(u(ptr), u(ptr) + len));
       return len;
     },
     trap(ptr, len) {
@@ -195,8 +197,8 @@ function hostImports(self) {
     },
     instantiate(np, nl, bp, bl, mp, ml) {
       const name = string(np, nl);
-      const bytes = memory().slice(bp, bp + bl);
-      const map = importMap(memory().slice(mp, mp + ml));
+      const bytes = memory().slice(u(bp), u(bp) + bl);
+      const map = importMap(memory().slice(u(mp), u(mp) + ml));
       return instantiate(name, bytes, map) ? 0 : 1;
     },
     export_index(ip, il, fp, fl) {
@@ -208,7 +210,7 @@ function hostImports(self) {
     },
     error_message(bp, cap) {
       const b = utf8.encode(lastError).subarray(0, cap);
-      memory().set(b, bp);
+      memory().set(b, u(bp));
       return b.length;
     },
     arg_count() {
@@ -217,7 +219,7 @@ function hostImports(self) {
     arg(i, bp, cap) {
       if (i < 0 || i >= programArgs.length) return -1;
       const b = utf8.encode(programArgs[i]);
-      memory().set(b.subarray(0, cap), bp);
+      memory().set(b.subarray(0, cap), u(bp));
       return b.length;
     },
     read_file(pp, pl, bp, cap) {
@@ -229,13 +231,13 @@ function hostImports(self) {
         lastError = `${path}: ${systemMessage(e)}`;
         return -1;
       }
-      memory().set(b.subarray(0, cap), bp);
+      memory().set(b.subarray(0, cap), u(bp));
       return b.length;
     },
     write_file(pp, pl, bp, len) {
       const path = string(pp, pl);
       try {
-        fs.writeFileSync(path, memory().slice(bp, bp + len));
+        fs.writeFileSync(path, memory().slice(u(bp), u(bp) + len));
       } catch (e) {
         lastError = `${path}: ${systemMessage(e)}`;
         return -1;
