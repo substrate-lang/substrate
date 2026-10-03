@@ -79,7 +79,9 @@ do what it does: another language on the kernel can bring its own.
     `` `t `` and `` #`t ``.
   - `runtime.sub`: the allocator, arenas, buffers and hash tables;
     `math.sub`: C's math functions that wasm has instructions for; and
-    `base.sub`, which bundles the three.
+    `base.sub`, which bundles the three. `nodes.sub`: small blocks for
+    the nodes of languages, free lists by size with inline fast paths,
+    which Substrate and Bend share.
   - `syntax-match.sub`: the patterns of `compiler/syntax-match.sub`
     compiled to C, for macros written in C.
   - `forms.sub`: forms for code written in the C-like Lisp, macros
@@ -94,8 +96,8 @@ do what it does: another language on the kernel can bring its own.
   - `values.sub`: Substrate's data in the C-like Lisp: pairs, symbols
     and keywords (interned), strings, integers, flonums and characters,
     with fixnums and characters in the datum itself, #f 0; a header word
-    per node with its tag and its count of owners, `dup` and `drop`, a
-    free list per size filled from chunks, the drop loop, which frees a
+    per node with its tag and its count of owners, `dup` and `drop`,
+    nodes from `compiler/base/nodes.sub`, the drop loop, which frees a
     list cdr by cdr, and the layouts and droppers of the runtime's
     kinds; `quote` and `quasiquote`, whose data a module makes once as
     it starts, permanent, in kernel code, and `lit`, the same in C code.
@@ -156,8 +158,8 @@ do what it does: another language on the kernel can bring its own.
     not used is dropped, and a match frees the node it takes, or reuses
     it for a constructor it builds; a + parameter the code only reads is
     borrowed: read in place, and lent by its caller.
-  - `runtime.sub`: what that code runs with: nodes, from lists of the
-    freed ones of each size; sharing, a count of owners off the node,
+  - `runtime.sub`: what that code runs with: nodes, from
+    `compiler/base/nodes.sub`; sharing, a count of owners off the node,
     made the first time a value is shared; dropping; and writing a Nat.
   - `base.sub`: a slice of Bend's Base: its first datatypes, and
     arithmetic and equality on Nat.
