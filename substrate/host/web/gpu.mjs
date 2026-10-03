@@ -44,11 +44,11 @@
 // if it has one, when:
 //
 //   1  error     Something went wrong: a shader did not compile, a
-//                pipeline or a bind group was invalid, a draw used a
-//                buffer that was too small, or the device was lost. The
-//                data is the message. `id` is the shader's number for a
-//                compile error, the texture's for a file that could not
-//                be loaded, and 0 otherwise.
+//                pipeline, a layout or a bind group was invalid, a draw
+//                used a buffer that was too small, or the device was
+//                lost. The data is the message. `id` is the number of
+//                the shader, pipeline, layout, bind group or texture
+//                file the message is about, and 0 otherwise.
 //   2  loaded    The texture numbered `id`, loaded from a file, is ready.
 //   3  pixels    The pixels that read-texture asked for, from texture
 //                `id`: the rows from the top, tightly packed, each
@@ -448,7 +448,7 @@ export async function gpu(options = {}) {
           if (topology === 'triangle-strip' || topology === 'line-strip') description.primitive.stripIndexFormat = 'uint32';
           if (fragmentEntry.length > 0) description.fragment = { module, entryPoint: fragmentEntry, targets };
           if (depthFormat) description.depthStencil = { format: depthFormat, depthWriteEnabled: depthWrite, depthCompare };
-          pipelines.set(id, { pipeline: device.createRenderPipeline(description), compute: false });
+          pipelines.set(id, { pipeline: checked(`pipeline ${id}`, id, () => device.createRenderPipeline(description)), compute: false });
           break;
         }
         case 4: {
@@ -459,11 +459,11 @@ export async function gpu(options = {}) {
           const layoutCount = w[i++];
           const groupLayouts = [];
           for (let k = 0; k < layoutCount; k++) groupLayouts.push(get(7, w[i++]));
-          const pipeline = device.createComputePipeline({
+          const pipeline = checked(`pipeline ${id}`, id, () => device.createComputePipeline({
             label: `pipeline ${id}`,
             layout: layoutCount === 0 ? 'auto' : device.createPipelineLayout({ bindGroupLayouts: groupLayouts }),
             compute: { module, entryPoint },
-          });
+          }));
           pipelines.set(id, { pipeline, compute: true });
           break;
         }
@@ -551,7 +551,7 @@ export async function gpu(options = {}) {
             entries.push(entry);
             i += 3;
           }
-          layouts.set(id, device.createBindGroupLayout({ label: `layout ${id}`, entries }));
+          layouts.set(id, checked(`layout ${id}`, id, () => device.createBindGroupLayout({ label: `layout ${id}`, entries })));
           break;
         }
         case 10: {
@@ -756,6 +756,17 @@ export async function gpu(options = {}) {
     for (const read of reads) read();
   }
 
+  // Makes a resource with WebGPU's validation errors caught: a mistake in
+  // a pipeline, a layout or a bind group is reported as an error event
+  // naming it, as a shader's is, rather than as the "previous error"
+  // that fails the frame later.
+  function checked(what, id, make) {
+    device.pushErrorScope('validation');
+    const resource = make();
+    device.popErrorScope().then((e) => { if (e) error(id, `${what} is invalid: ${e.message}`); });
+    return resource;
+  }
+
   // readSurface's requests: each waits for the next frame drawn on its
   // surface.
   const surfaceReads = [];
@@ -835,7 +846,7 @@ export async function gpu(options = {}) {
   // Makes the GPUBindGroup of a bind group's description: its layout and
   // entries, which name resources by number.
   function makeBindGroup({ id, layout, entries }) {
-    return device.createBindGroup({
+    return checked(`bind group ${id}`, id, () => device.createBindGroup({
       label: `bind group ${id}`,
       layout,
       entries: entries.map((e) => {
@@ -850,7 +861,7 @@ export async function gpu(options = {}) {
         }
         return { binding: e.binding, resource };
       }),
-    });
+    }));
   }
 
   // Records in `encoder` the copy of part of a texture into a buffer that

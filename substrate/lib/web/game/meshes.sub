@@ -1,37 +1,61 @@
 ;; Lifecycle: experimental.
 ;;
 ;; Meshes drawn by the GPU: a renderer for a 3D scene built on ../gpu.sub,
-;; as sprites.sub is for 2D.
+;; as sprites.sub is for 2D, with a sun, shadows and a toon look.
 ;;
 ;; A mesh is a list of textured triangles that the program builds
-;; (voxels.sub builds them for a world of blocks): vertices of six
-;; floats each, position (x, y, z), texel (u, v) in an atlas, and a
-;; shade from 0 to 1; and indexes, three u32 per triangle. Every mesh
-;; shares the one atlas, and each has an origin, where its (0, 0, 0)
-;; is in the world. A frame draws all the meshes from a camera, with
-;; depth so that near things hide far ones, back faces culled, and fog
-;; towards a colour by distance.
+;; (voxels.sub builds them for a world of blocks): vertices of nine
+;; floats each, position (x, y, z), normal (x, y, z), texel (u, v) in
+;; an atlas, and a shade from 0 to 1 (how open the surface is: the
+;; ambient light is dimmed where it is closed in); and indexes, three
+;; u32 per triangle. Every mesh shares the one atlas, and each has an
+;; origin, where its (0, 0, 0) is in the world.
+;;
+;; A frame draws all the meshes from a camera, lit by a sun. A surface
+;; facing the sun is lit, one facing away is in shade, with a sharp
+;; edge between, as in a drawn picture rather than a photograph; a rim
+;; of light outlines shapes against the light; shadows fall from the
+;; sun, from a shadow map drawn each frame; near things hide far ones;
+;; back faces are culled; shapes can get a dark outline; and fog fades
+;; everything to the sky's colour by distance.
+;;
+;;   (struct camera [x] [y] [z] [yaw] [pitch] [projection])
+;;       Where the camera is and how it is turned (math.sub's mat4-view!
+;;       says how yaw and pitch count), and its projection matrix,
+;;       which camera-perspective! fills.
+;;   (camera-perspective! c fov aspect near far)
+;;   (struct light [sun-x] [sun-y] [sun-z] [sun] [ambient] [sky]
+;;                 [fog-near] [fog-far] [outline]
+;;                 [shadow-x] [shadow-y] [shadow-z] [shadow-radius])
+;;       The direction the sunlight comes from (any length), the sun's
+;;       colour and the ambient light's (#xRRGGBBAA; the alpha is not
+;;       used), the sky's colour, which clears the target and is what
+;;       fog fades to between fog-near and fog-far, the width of the
+;;       outlines in world units (0 for none), and the part of the
+;;       world that gets shadows: a box shadow-radius from its centre
+;;       each way. The map is 2048 texels across, so a radius of 48
+;;       gives it about 20 texels per unit.
+;;   (light-init! l)
+;;       Fills in an afternoon: the sun fairly high, warm white,
+;;       grey-blue ambient light, a blue sky, fog from 24 to 56,
+;;       outlines 0.03 wide, shadows within 48 of the origin.
 ;;
 ;;   (meshes-init! r atlas width height)
 ;;       Makes the GPU resources: the atlas from the image file at
-;;       `atlas` (loaded by the host), and a depth texture for a target
-;;       `width` by `height` pixels. Call it once.
+;;       `atlas` (loaded by the host), the depth texture for a target
+;;       `width` by `height` pixels, and the shadow map. Call it once.
 ;;   (meshes-add! r) -> mesh
 ;;       A new, empty mesh. Returns its number, from 0.
 ;;   (meshes-set! r mesh vertices indices x y z)
-;;       Gives the mesh its triangles and its origin. `vertices` and
-;;       `indices` are buffers (the C-like Lisp's `buffer`). Their bytes
-;;       are read when the frame is handed over (gpu.sub), so the
-;;       buffers must keep them until then.
-;;   (meshes-draw! r kind target format projection x y z yaw pitch
-;;                 sky fog-near fog-far)
-;;       Writes the commands that draw the meshes on a target (as
+;;       Gives the mesh its triangles, from two buffers (base.sub's
+;;       buffer) of vertices and indexes, and its origin. The bytes are
+;;       read when the frame is handed over (gpu.sub), so the buffers
+;;       must keep them until then.
+;;   (meshes-draw! r kind target format camera light)
+;;       Writes the commands that draw the frame on a target (as
 ;;       sprites-draw! takes it: gpu-on-surface or gpu-on-texture, its
-;;       number and its format), which is first cleared to the colour
-;;       `sky` (#xRRGGBBAA), from the camera at (x, y, z) turned by
-;;       yaw and pitch (math.sub's mat4-view!), with the given
-;;       projection matrix. Beyond fog-near things fade to the sky
-;;       colour, and at fog-far they are gone.
+;;       number and its format): first the shadow map, from the sun,
+;;       then the meshes, then their outlines.
 ;;
 ;; A game that draws sprites and text over the scene draws the scene
 ;; first: the sprite batch is drawn after the game's draw function
@@ -39,21 +63,70 @@
 ;;
 ;; ---- How it works ----
 ;;
-;; One pipeline draws every mesh. A frame is a uniform buffer with the
-;; camera's matrix, the fog colour and the fog distances; each mesh's
-;; origin is in a second uniform buffer, 256 bytes apart as WebGPU
-;; requires, and chosen per draw with a dynamic offset (gpu-offset!),
-;; so that the meshes share one bind group. Each mesh has a vertex
-;; buffer and an index buffer on the GPU, replaced by bigger ones when
-;; the mesh outgrows them.
+;; The shader is described once with ../shader.sub, which lays out its
+;; uniform struct and makes the pipelines and bind groups. Three
+;; pipelines share it: the shadow pass, which has no fragment stage and
+;; writes depth into the shadow map as seen from the sun; the lit pass;
+;; and the outline pass, which draws each mesh again pushed out along
+;; its normals with its front faces culled, so that only a rim shows
+;; around it. A frame is one uniform buffer with the camera's matrix,
+;; the sun's, the sun and the colours; each mesh's origin is in a
+;; second uniform buffer, 256 bytes apart as WebGPU requires, chosen
+;; per draw with a dynamic offset, so the meshes share one bind group.
+;; The atlas and the shadow map are a group of their own, which the
+;; shadow pass does not bind: a pass may not read the texture it draws
+;; into.
+;; Each mesh has a vertex buffer and an index buffer on the GPU,
+;; replaced by bigger ones when the mesh outgrows them.
+;;
+;; Shadows: the fragment's place in the sun's view is found in the
+;; vertex stage, with the surface pushed a little along its normal
+;; first so that a surface does not shadow itself, and compared with
+;; the map at nine texels around it (a comparison sampler does the
+;; compare and blends the four texels around a point), which softens
+;; the edge. The toon edge: the lit share of a surface is a smooth step
+;; of the angle to the sun, then pushed to a dark band and a lit band
+;; with a narrow blend between them.
 (require-unqualified base "../../../compiler/base/base.sub")
 (require-unqualified gpu "../gpu.sub")
+(require-unqualified shader "../shader.sub")
 (require-unqualified math "math.sub")
 
-(provide meshes meshes-init! meshes-add! meshes-set! meshes-draw!)
+(provide camera camera-perspective! light light-init! meshes meshes-init! meshes-add! meshes-set! meshes-draw!)
 
 (memory from base)
 (table from base)
+
+;; ---- The camera and the light ----
+
+(struct camera [x f64] [y f64] [z f64] [yaw f64] [pitch f64] [projection (array f32 16)])
+
+(define (camera-perspective! [c (ptr camera)] [fov f64] [aspect f64] [near f64] [far f64])
+  (mat4-perspective! (-> c projection) fov aspect near far))
+
+(struct light
+  [sun-x f64] [sun-y f64] [sun-z f64]
+  [sun u32] [ambient u32] [sky u32]
+  [fog-near f64] [fog-far f64]
+  [outline f64]
+  [shadow-x f64] [shadow-y f64] [shadow-z f64] [shadow-radius f64])
+
+(define (light-init! [l (ptr light)])
+  (memset l 0 (sizeof light))
+  (set! (-> l sun-x) 0.5)
+  (set! (-> l sun-y) 0.65)
+  (set! (-> l sun-z) 0.3)
+  (set! (-> l sun) #xfff4e0ff)
+  (set! (-> l ambient) #x5c6a80ff)
+  (set! (-> l sky) #x8fd3ffff)
+  (set! (-> l fog-near) 24.0)
+  (set! (-> l fog-far) 56.0)
+  (set! (-> l outline) 0.03)
+  (set! (-> l shadow-radius) 48.0))
+
+;; ---- The renderer ----
+
+(define shadow-size u32 2048)
 
 (struct mesh
   [vertices u32] [vertex-room u32]   ; the GPU buffer and its size in bytes
@@ -63,75 +136,126 @@
 
 (struct meshes
   [items (ptr mesh)] [count u32] [capacity u32]
-  [shader u32] [frame-layout u32] [mesh-layout u32] [sampler u32] [atlas u32]
-  [frame-uniforms u32] [frame-group u32]
+  [shader scene-shader]
+  [atlas-sampler u32] [atlas u32] [shadow-sampler u32] [shadow-map u32]
+  [frame-uniforms u32] [frame-group u32] [material-group u32]
   ;; The origins, one 256-byte slot per mesh.
   [origins u32] [origin-slots u32] [origin-group u32]
   [depth u32]
-  ;; The pipeline for each target format, made when first needed.
-  [pipelines (array u32 10)])
+  ;; The pipelines: the shadow pass, and for each target format the lit
+  ;; pass and the outline pass, made when first needed.
+  [shadow-pipeline u32] [lit-pipelines (array u32 10)] [outline-pipelines (array u32 10)])
 
-(define shader-code (ptr u8) "
-struct Frame { view_projection: mat4x4f, sky: vec4f, fog: vec4f }
-struct Origin { at: vec4f }
-@group(0) @binding(0) var<uniform> frame: Frame;
-@group(0) @binding(1) var atlas_sampler: sampler;
-@group(0) @binding(2) var atlas: texture_2d<f32>;
-@group(1) @binding(0) var<uniform> origin: Origin;
+;; The atlas is visible to the vertex stage too, which asks it for its
+;; size.
+(shader scene
+  [uniform frame 0 0 (vertex fragment)
+    [view-projection mat4] [sun-view-projection mat4]
+    [camera vec3] [outline f32]
+    [sun vec3] [shadow-texel f32]
+    [sun-color vec4] [ambient vec4] [sky vec4] [fog vec2]]
+  [uniform-array origin 1 0 (vertex) [at vec3]]
+  [sampler atlas-sampler 2 0 (fragment)]
+  [texture atlas 2 1 (vertex fragment)]
+  [comparison-sampler shadow-sampler 2 2 (fragment)]
+  [depth-texture shadow-map 2 3 (fragment)]
+  [vertex-input vertex per-vertex [position vec3] [normal vec3] [texel vec2] [shade f32]]
+  [varyings [world vec3] [normal vec3] [uv vec2] [shade f32] [shadow vec3]]
+  [code "
+// A vertex in the world, pushed out along its normal by `push`.
+fn place(in: Vertex, push: f32) -> vec3f { return in.position + origin.at + in.normal * push; }
 
-struct In {
-  @location(0) position: vec3f,
-  @location(1) texel: vec2f,
-  @location(2) shade: f32,
+// The fog between a point and the camera, 0 to 1.
+fn fog_at(world: vec3f) -> f32 {
+  return clamp((distance(frame.camera, world) - frame.fog.x) / (frame.fog.y - frame.fog.x), 0.0, 1.0);
 }
 
-struct Out {
-  @builtin(position) position: vec4f,
-  @location(0) uv: vec2f,
-  @location(1) shade: f32,
-  @location(2) distance: f32,
-}
-
-@vertex fn vertex(in: In) -> Out {
-  var out: Out;
-  out.position = frame.view_projection * vec4f(in.position + origin.at.xyz, 1.0);
+@vertex fn vertex(in: Vertex) -> Varyings {
+  let world = place(in, 0.0);
+  var out: Varyings;
+  out.position = frame.view_projection * vec4f(world, 1.0);
+  out.world = world;
+  out.normal = in.normal;
   out.uv = in.texel / vec2f(textureDimensions(atlas));
   out.shade = in.shade;
-  out.distance = out.position.w;
+  // The place in the shadow map: pushed along the normal first, so that
+  // a surface does not shadow itself where the map is coarse.
+  let s = frame.sun_view_projection * vec4f(place(in, 0.06), 1.0);
+  out.shadow = vec3f(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5, s.z);
   return out;
 }
 
-@fragment fn fragment(in: Out) -> @location(0) vec4f {
-  let color = textureSample(atlas, atlas_sampler, in.uv).rgb * in.shade;
-  let fog = clamp((in.distance - frame.fog.x) / (frame.fog.y - frame.fog.x), 0.0, 1.0);
-  return vec4f(mix(color, frame.sky.rgb, fog), 1.0);
+@vertex fn shadow(in: Vertex) -> Varyings {
+  var out: Varyings;
+  out.position = frame.sun_view_projection * vec4f(place(in, 0.0), 1.0);
+  return out;
 }
-")
 
-(define frame-bytes u32 96)
-(define origin-stride u32 256)
-(define vertex-bytes u32 24)
+@vertex fn outline(in: Vertex) -> Varyings {
+  var out: Varyings;
+  let world = place(in, frame.outline);
+  out.position = frame.view_projection * vec4f(world, 1.0);
+  out.world = world;
+  return out;
+}
+
+// How much of the sun reaches a point, from the shadow map: 0 to 1.
+// Outside the map everything is lit.
+fn sunlit(p: vec3f) -> f32 {
+  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) { return 1.0; }
+  var sum = 0.0;
+  for (var i = -1; i <= 1; i++) {
+    for (var j = -1; j <= 1; j++) {
+      sum += textureSampleCompareLevel(shadow_map, shadow_sampler, p.xy + vec2f(f32(i), f32(j)) * frame.shadow_texel, p.z - 0.0015);
+    }
+  }
+  return sum / 9.0;
+}
+
+@fragment fn fragment(in: Varyings) -> @location(0) vec4f {
+  let albedo = textureSample(atlas, atlas_sampler, in.uv).rgb;
+  let n = normalize(in.normal);
+  let towards_sun = normalize(frame.sun);
+  // Lit or in shade, with a narrow blend between the two bands.
+  let facing = smoothstep(-0.1, 0.15, dot(n, towards_sun)) * sunlit(in.shadow);
+  let light = 0.2 + 0.8 * smoothstep(0.4, 0.6, facing);
+  // A rim of light where a lit surface turns away from the camera.
+  let v = normalize(frame.camera - in.world);
+  let rim = pow(1.0 - max(dot(n, v), 0.0), 6.0) * facing * 0.2;
+  let ambient = frame.ambient.rgb * mix(0.5, 1.0, in.shade);
+  let color = albedo * (ambient + frame.sun_color.rgb * light * 0.9 * mix(0.7, 1.0, in.shade)) + frame.sun_color.rgb * rim;
+  return vec4f(mix(color, frame.sky.rgb, fog_at(in.world)), 1.0);
+}
+
+@fragment fn outline_fragment(in: Varyings) -> @location(0) vec4f {
+  return vec4f(mix(vec3f(0.06, 0.06, 0.09), frame.sky.rgb, fog_at(in.world)), 1.0);
+}
+"])
+
+(define vertex-bytes u32 36)
 
 (define (meshes-init! [r (ptr meshes)] [atlas (ptr u8)] [width u32] [height u32])
   (memset r 0 (sizeof meshes))
-  (set! (-> r shader) (gpu-shader! shader-code))
-  ;; The vertex shader asks the atlas for its size, so the atlas is
-  ;; visible to both stages.
-  (set! (-> r frame-layout) (gpu-layout! 3))
-  (gpu-layout-entry! 0 (+ gpu-in-vertex gpu-in-fragment) gpu-uniform-entry)
-  (gpu-layout-entry! 1 gpu-in-fragment gpu-sampler-entry)
-  (gpu-layout-entry! 2 (+ gpu-in-vertex gpu-in-fragment) gpu-texture-entry)
-  (set! (-> r mesh-layout) (gpu-layout! 1))
-  (gpu-layout-entry! 0 gpu-in-vertex gpu-dynamic-uniform-entry)
-  (set! (-> r sampler) (gpu-sampler! gpu-nearest gpu-clamp gpu-compare-none))
+  (scene-init! (& (-> r shader)))
+  (set! (-> r atlas-sampler) (gpu-sampler! gpu-nearest gpu-clamp gpu-compare-none))
   (set! (-> r atlas) (gpu-texture-file! atlas))
-  (set! (-> r frame-uniforms) (gpu-buffer! frame-bytes gpu-uniform))
-  (set! (-> r frame-group) (gpu-bind-group! (-> r frame-layout) 0 0 3))
-  (gpu-bind-buffer! 0 (-> r frame-uniforms) 0 0)
-  (gpu-bind-sampler! 1 (-> r sampler))
-  (gpu-bind-texture! 2 (-> r atlas))
+  (set! (-> r shadow-sampler) (gpu-sampler! gpu-linear gpu-clamp gpu-less))
+  (set! (-> r shadow-map) (gpu-texture! shadow-size shadow-size 1 1 gpu-depth32f (+ gpu-sampled gpu-target)))
+  (set! (-> r frame-uniforms) (gpu-buffer! (sizeof scene-frame) gpu-uniform))
+  (set! (-> r frame-group) (scene-bind-group-0! (& (-> r shader)) (-> r frame-uniforms)))
+  (set! (-> r material-group) (scene-bind-group-2! (& (-> r shader)) (-> r atlas-sampler) (-> r atlas) (-> r shadow-sampler) (-> r shadow-map)))
   (origins! r 16)
-  (set! (-> r depth) (gpu-texture! width height 1 1 gpu-depth24 gpu-target)))
+  (set! (-> r depth) (gpu-texture! width height 1 1 gpu-depth24 gpu-target))
+  ;; The shadow pipeline uses the frame and the origins only.
+  (let ([settings render-settings])
+    (render-settings-init! (& settings))
+    (set! (-> settings cull) gpu-cull-back)
+    (set! (-> settings depth-format) gpu-depth32f)
+    (set! (-> settings depth-compare) gpu-less)
+    (set! (-> settings depth-write) 1)
+    (set! (-> settings target-count) 0)
+    (set! (-> settings groups) 2)
+    (set! (-> r shadow-pipeline) (scene-render-pipeline! (& (-> r shader)) "shadow" "" (& settings)))))
 
 ;; The buffer of origins, with room for `slots` meshes, and its bind
 ;; group, which sees one slot at a time. A bigger buffer in place of a
@@ -141,16 +265,16 @@ struct Out {
     (gpu-destroy! gpu-kind-bind-group (-> r origin-group))
     (gpu-destroy! gpu-kind-buffer (-> r origins)))
   (set! (-> r origin-slots) slots)
-  (set! (-> r origins) (gpu-buffer! (* slots origin-stride) gpu-uniform))
-  (set! (-> r origin-group) (gpu-bind-group! (-> r mesh-layout) 0 0 1))
-  (gpu-bind-buffer! 0 (-> r origins) 0 16)
+  (set! (-> r origins) (gpu-buffer! (* slots scene-origin-stride) gpu-uniform))
+  (set! (-> r origin-group) (scene-bind-group-1! (& (-> r shader)) (-> r origins)))
   (for ([i u32 0]) (< i (-> r count)) (+= i 1)
     (let ([m (+ (-> r items) i)])
       (origin! r i (-> m x) (-> m y) (-> m z)))))
 
 (define (origin! [r (ptr meshes)] [mesh u32] [x f64] [y f64] [z f64])
-  (gpu-write-buffer! (-> r origins) (* mesh origin-stride)
-                     (gpu-frame-copy (array-of f32 (cast f32 x) (cast f32 y) (cast f32 z) 0.0) 16) 16))
+  (let ([o scene-origin])
+    (vec3! (-> o at) x y z)
+    (gpu-write-copy! (-> r origins) (* mesh scene-origin-stride) (& o) (sizeof scene-origin))))
 
 (define (meshes-add! [r (ptr meshes)]) -> u32
   (when (== (-> r count) (-> r capacity))
@@ -184,49 +308,76 @@ struct Out {
       (gpu-write-buffer! (-> m indices) 0 (-> indices bytes) (-> indices length)))
     (origin! r mesh x y z)))
 
-(define (pipeline! [r (ptr meshes)] [format u32]) -> u32
-  (when (== (@ (-> r pipelines) format) 0)
-    (set! (@ (-> r pipelines) format)
-          (gpu-render-pipeline! (-> r shader) "vertex" "fragment" gpu-triangles gpu-cull-back gpu-ccw gpu-blend-none
-                                gpu-depth24 gpu-less 1  2 1 1))
-    (gpu-layout-item! (-> r frame-layout))
-    (gpu-layout-item! (-> r mesh-layout))
-    (gpu-target! format)
-    (gpu-vertex-buffer-layout! vertex-bytes gpu-per-vertex 3)
-    (gpu-attribute! 0 0 gpu-f32x3)
-    (gpu-attribute! 1 12 gpu-f32x2)
-    (gpu-attribute! 2 20 gpu-f32))
-  (@ (-> r pipelines) format))
+;; The pipelines for targets of a format, made the first time they are
+;; needed.
+(define (pipelines! [r (ptr meshes)] [format u32])
+  (when (== (@ (-> r lit-pipelines) format) 0)
+    (let ([settings render-settings])
+      (render-settings-init! (& settings))
+      (set! (-> settings cull) gpu-cull-back)
+      (set! (-> settings depth-format) gpu-depth24)
+      (set! (-> settings depth-compare) gpu-less)
+      (set! (-> settings depth-write) 1)
+      (set! (@ (-> settings targets) 0) format)
+      (set! (@ (-> r lit-pipelines) format) (scene-render-pipeline! (& (-> r shader)) "vertex" "fragment" (& settings)))
+      (set! (-> settings cull) gpu-cull-front)
+      (set! (@ (-> r outline-pipelines) format) (scene-render-pipeline! (& (-> r shader)) "outline" "outline_fragment" (& settings))))))
 
 (define (part [color u32] [shift u32]) -> f64 (/ (cast f64 (bit-and (>> color shift) 255)) 255.0))
 
-(define (meshes-draw! [r (ptr meshes)] [kind u32] [target u32] [format u32] [projection (ptr f32)]
-                      [x f64] [y f64] [z f64] [yaw f64] [pitch f64] [sky u32] [fog-near f64] [fog-far f64])
-  (let ([pipeline (pipeline! r format)]
-        [frame (cast (ptr f32) (gpu-frame-alloc frame-bytes))]
-        [view (array f32 16)])
-    ;; The frame's uniforms: the matrix, then the sky colour and the fog.
-    (mat4-view! view x y z yaw pitch)
-    (mat4-multiply! frame projection view)
-    (set! (@ frame 16) (cast f32 (part sky 24)))
-    (set! (@ frame 17) (cast f32 (part sky 16)))
-    (set! (@ frame 18) (cast f32 (part sky 8)))
-    (set! (@ frame 19) 1.0)
-    (set! (@ frame 20) (cast f32 fog-near))
-    (set! (@ frame 21) (cast f32 fog-far))
-    (set! (@ frame 22) 0.0)
-    (set! (@ frame 23) 0.0)
-    (gpu-write-buffer! (-> r frame-uniforms) 0 frame frame-bytes)
-    (gpu-render-pass! 1 (-> r depth) 0 0 gpu-clear 1.0)
-    (gpu-pass-target! kind target 0 0 gpu-clear (part sky 24) (part sky 16) (part sky 8) (part sky 0))
-    (gpu-pipeline! pipeline)
+(define (color! [p (ptr f32)] [color u32]) (vec4! p (part color 24) (part color 16) (part color 8) 1.0))
+
+;; Draws every mesh with the pipeline that is set.
+(define (draw-all! [r (ptr meshes)])
+  (for ([i u32 0]) (< i (-> r count)) (+= i 1)
+    (let ([m (+ (-> r items) i)])
+      (when (> (-> m index-count) 0)
+        (gpu-bind-group-set! 1 (-> r origin-group) 1)
+        (gpu-offset! (* i scene-origin-stride))
+        (gpu-vertex-buffer! 0 (-> m vertices) 0)
+        (gpu-index-buffer! (-> m indices) gpu-u32-indexes 0)
+        (gpu-draw-indexed! (-> m index-count) 1 0 0 0)))))
+
+(define (meshes-draw! [r (ptr meshes)] [kind u32] [target u32] [format u32] [c (ptr camera)] [l (ptr light)])
+  (pipelines! r format)
+  (let ([frame scene-frame] [view (array f32 16)] [sun-view (array f32 16)] [sun-projection (array f32 16)]
+        [radius (-> l shadow-radius)]
+        [length (sqrt (+ (* (-> l sun-x) (-> l sun-x)) (* (-> l sun-y) (-> l sun-y)) (* (-> l sun-z) (-> l sun-z))))])
+    (memset (& frame) 0 (sizeof scene-frame))
+    ;; The camera's matrix.
+    (mat4-view! view (-> c x) (-> c y) (-> c z) (-> c yaw) (-> c pitch))
+    (mat4-multiply! (-> frame view-projection) (-> c projection) view)
+    ;; The sun's: looking at the shadow box's centre from the sun's side,
+    ;; with the box in view.
+    (let ([sx (/ (-> l sun-x) length)] [sy (/ (-> l sun-y) length)] [sz (/ (-> l sun-z) length)])
+      (mat4-look! sun-view
+                  (+ (-> l shadow-x) (* sx radius 2.0)) (+ (-> l shadow-y) (* sy radius 2.0)) (+ (-> l shadow-z) (* sz radius 2.0))
+                  (-> l shadow-x) (-> l shadow-y) (-> l shadow-z))
+      (mat4-orthographic! sun-projection (- 0.0 radius) radius (- 0.0 radius) radius (* radius 0.5) (* radius 3.5))
+      (mat4-multiply! (-> frame sun-view-projection) sun-projection sun-view)
+      (vec3! (-> frame sun) sx sy sz))
+    (vec3! (-> frame camera) (-> c x) (-> c y) (-> c z))
+    (set! (-> frame outline) (cast f32 (-> l outline)))
+    (set! (-> frame shadow-texel) (/ 1.0 (cast f32 shadow-size)))
+    (color! (-> frame sun-color) (-> l sun))
+    (color! (-> frame ambient) (-> l ambient))
+    (color! (-> frame sky) (-> l sky))
+    (vec2! (-> frame fog) (-> l fog-near) (-> l fog-far))
+    (gpu-write-copy! (-> r frame-uniforms) 0 (& frame) (sizeof scene-frame))
+    ;; The shadow map, from the sun.
+    (gpu-render-pass! 0 (-> r shadow-map) 0 0 gpu-clear 1.0)
+    (gpu-pipeline! (-> r shadow-pipeline))
     (gpu-bind-group-set! 0 (-> r frame-group) 0)
-    (for ([i u32 0]) (< i (-> r count)) (+= i 1)
-      (let ([m (+ (-> r items) i)])
-        (when (> (-> m index-count) 0)
-          (gpu-bind-group-set! 1 (-> r origin-group) 1)
-          (gpu-offset! (* i origin-stride))
-          (gpu-vertex-buffer! 0 (-> m vertices) 0)
-          (gpu-index-buffer! (-> m indices) gpu-u32-indexes 0)
-          (gpu-draw-indexed! (-> m index-count) 1 0 0 0))))
+    (draw-all! r)
+    (gpu-end-pass!)
+    ;; The scene, then the outlines.
+    (gpu-render-pass! 1 (-> r depth) 0 0 gpu-clear 1.0)
+    (gpu-pass-target! kind target 0 0 gpu-clear (part (-> l sky) 24) (part (-> l sky) 16) (part (-> l sky) 8) 1.0)
+    (gpu-pipeline! (@ (-> r lit-pipelines) format))
+    (gpu-bind-group-set! 0 (-> r frame-group) 0)
+    (gpu-bind-group-set! 2 (-> r material-group) 0)
+    (draw-all! r)
+    (when (> (-> l outline) 0.0)
+      (gpu-pipeline! (@ (-> r outline-pipelines) format))
+      (draw-all! r))
     (gpu-end-pass!)))
