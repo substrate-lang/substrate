@@ -567,14 +567,16 @@ kernel module's format (3.5).
 - An interface begins with what it is of: the interface format's version,
   the compiler by hash (1.4), the module's hash (3.2), and its requires by
   path, hash and phase shift, a macro-introduced `require` among them. The
-  cache's index maps a source path to the hash of the module last compiled
-  from it. To look a module up, the compiler reads the index and the
-  interface. It takes the interface if it is of this format and compiler,
-  if the module's hash, computed from its source and the recorded
-  requires' hashes, comes out as recorded, and if the recorded requires,
-  compiled or loaded in order as they would be to compile the module, each
-  have the recorded hash. So a require that the source no longer has is
-  not looked at, and neither is any after the first that changed.
+  cache holds one file per source path, named by a hash of the path, with
+  the interface of the module last compiled from that path; compiling the
+  path again replaces it, so the cache does not grow as sources change.
+  To look a module up, the compiler reads that file. It takes the
+  interface if it is of this format and compiler, if the module's hash,
+  computed from its source and the recorded requires' hashes, comes out
+  as recorded, and if the recorded requires, compiled or loaded in order
+  as they would be to compile the module, each have the recorded hash. So
+  a require that the source no longer has is not looked at, and neither
+  is any after the first that changed.
 - The cache knows what a module's expansion read only by its source and
   its requires. Compile-time code can also read other files and the
   command line through the host (section 4). A module whose expansion
@@ -601,7 +603,7 @@ kernel module's format (3.5).
   linklets inside: those a module requires come before it, and the entry
   comes last. `sub build FILE -o DIR -m OUT` writes the compiled file of
   `FILE` and every module it requires at any phase to `OUT`; the cache's
-  files hold one module each, beside its index.
+  files hold one module each.
   `(require name (compiled "file"))` loads the file's modules in order,
   except those the run has made already, and requires its entry. A module
   of another interface format, or compiled by another compiler, is an
