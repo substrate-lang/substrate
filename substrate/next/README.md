@@ -136,7 +136,8 @@ on them there.
       part of it. tiles.sub for three dimensions.
     - `math.sub`: sin and cos, which wasm does not have, and the 4 by 4
       matrices a camera needs.
-    - `input.sub`: which keys are held, and which were just pressed.
+    - `input.sub`: which keys and mouse buttons are held, and which were
+      just pressed; how far the mouse moved.
     - `sound.sub`: sound files, music, and short synthesized tones.
     - `timers.sub`: things that happen later: a message that the game
       is handed after a number of steps.
@@ -379,9 +380,15 @@ A site is made of static files only, so any web server can serve it.
   state), a message type (everything that can happen), an `update`
   function, and a view. The design is Elm's. An event listener in a
   template names the message to send, and the message can carry data
-  from the event, such as `(event value)` for the text of a field.
-  Messages are data rather than callbacks, because the C-like Lisp's
-  closures cannot be stored. Things that happen outside the page, such
+  from the event, such as `(event value)` for the text of a field, or
+  `(event movement-x)` for how far the mouse moved. Messages are data
+  rather than callbacks, because the C-like Lisp's closures cannot be
+  stored. A few things a page does are not changes to its content but
+  requests to the browser, written as attributes whose integer changes:
+  `[focus e]`, `[scroll-end e]` and `[pointer-lock e]`, which hides the
+  cursor and reports the mouse's movement without limits, as a game
+  that looks around with the mouse needs; the browser grants it only in
+  response to a click. Things that happen outside the page, such
   as a reply from a guest, are turned into messages with `send!`.
   `web/examples/counter.sub` is a minimal example; its compiled program
   is 20 KB.
@@ -437,7 +444,11 @@ A site is made of static files only, so any web server can serve it.
   It is a macro that expands into an ordinary page program. A game
   draws with `draw.sub`: sprite sheets, rectangles and text, in the
   pixels of its screen, with colours as numbers (`#x8fd3ffff`). The
-  same calls work on both renderers below.
+  same calls work on both renderers below. A game that looks around
+  with the mouse says `[pointer lock]`: a click on its screen then locks
+  the pointer to it, and the mouse's movement and buttons reach the
+  game's step function through the input, as the keys do; Escape frees
+  the pointer.
   `tiles.sub` adds what a platformer or a top-down game needs: a level
   as a grid of tiles, bodies that move through it and are stopped by
   walls, floors and ceilings, and a camera that follows the player.
@@ -537,9 +548,8 @@ A site is made of static files only, so any web server can serve it.
     draws its scene first, then its sprites and text, which go on top.
     The blocks example (below) is all this in use.
   - Not done: lines, circles and paths on the GPU (a game that needs
-    them uses the canvas renderer), mouse look (which needs pointer
-    lock from the dom module), and the swap of the overlay canvas for
-    text drawn by the GPU.
+    them uses the canvas renderer), and the swap of the overlay canvas
+    for text drawn by the GPU.
 - **Guests** (`host/web/guest.mjs`, `web/guest.sub`): running code that is
   not trusted. A program can start another program as a "guest": a
   separate sandbox with its own memory. The two share nothing, and they
@@ -653,7 +663,9 @@ block is at their boundary. The player is a body that the grid stops
 when there is room above it (`body-free?`). What the player looks at
 is the first block a ray from the eye meets (`ray-hit!`), with the
 face it entered through, which is where a placed block goes. The
-camera is a yaw and a pitch (`game/math.sub`).
+camera is a yaw and a pitch (`game/math.sub`), turned by the arrow
+keys or, once a click has locked the pointer to the screen, by the
+mouse, whose buttons then dig and place.
 
 The asset is `assets/atlas.png`, a row of eight tiles of 16 by 16
 pixels, one for each face kind. `art/make-atlas.mjs` draws them from
@@ -662,18 +674,22 @@ not part of the game.
 
 The game is tested without a browser (`tests/ui/blocks.sub`): the
 world is made, the player falls, walks, jumps, looks down, digs and
-builds by made-up key presses, and a tree put in the way stops them.
-The browser test reads the GPU's picture: sky at the top, land at the
-bottom, and a view that changes when walking and when digging. The
-compiled program is 120 KB, and its asset 3 KB.
+builds by made-up key presses and mouse movements, and a tree put in
+the way stops them. The browser test reads the GPU's picture: sky at
+the top, land at the bottom, a view that changes when walking and when
+digging, and, after a click has locked the pointer, when the mouse
+moves and its button digs. The compiled program is 120 KB, and its
+asset 3 KB.
 
 ```sh
 next/web/site.sh next/web/examples/blocks/blocks.sub build/next/web/blocks next/web/examples/blocks/page.html
 host/web/serve.mjs build/next/web/blocks
 ```
 
-W, A, S and D walk, the arrows turn and look up and down, Space jumps,
-X digs, C places, 1 to 6 choose what to place.
+Click the screen to look around with the mouse (Escape frees it); W,
+A, S and D walk, the arrows also turn and look, Space jumps, the left
+button or X digs, the right button or C places, 1 to 6 choose what to
+place.
 
 ### Measurements
 
