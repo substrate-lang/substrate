@@ -22,14 +22,17 @@
 ;;
 ;; Lit by the sun (light.sub): a surface facing the sun is lit, one
 ;; facing away is in shade, with a sharp edge between, as in a drawn
-;; picture rather than a photograph; a rim of light outlines shapes
-;; against the light; shadows fall from the sun, from a shadow map
-;; drawn each frame; near things hide far ones; back faces are culled;
-;; and fog fades everything to the horizon's haze by distance. A mesh
-;; can be water instead: drawn after the others, see-through, with
-;; waves of light from the sun, deep where the land below it (a height
-;; map the program gives) is far down and pale where it is close, with
-;; foam at the edge.
+;; picture rather than a photograph; the shade is lit by the ambient
+;; light, more from the sky above than from below; a rim of light
+;; outlines shapes against the light; shadows fall from the sun, from
+;; a shadow map drawn each frame, and from the clouds; near things
+;; hide far ones; back faces are culled; and fog fades everything to
+;; the horizon's haze by distance, which glows towards the sun, with
+;; mist on the low ground if the light has it. A mesh can be water
+;; instead: drawn after the others, see-through, with waves of light
+;; from the sun, deep where the land below it (a height map the
+;; program gives) is far down and pale where it is close, with foam at
+;; the edge.
 ;;
 ;;   (meshes-init! r atlas)
 ;;       Makes the GPU resources: the atlas from the image file at
@@ -46,7 +49,13 @@
 ;;   (struct placement [x] [y] [z] [yaw] [scale] [tint])
 ;;       Where a copy of a mesh goes: f32s, and the tint a colour as
 ;;       mesh-color gives it (#xffffffff for none), whose alpha says
-;;       whether the copy gets outlines (1) or not (0): grass does not.
+;;       whether the copy is a small thing (0) or not (1): a small
+;;       thing, such as a tuft of grass, gets no outlines, and shrinks
+;;       to nothing beyond 40 units, so that a meadow is drawn where it
+;;       can be seen and is the ground's colour beyond.
+;;   (meshes-casts! r mesh casts)
+;;       Whether the mesh casts shadows (1, as made) or not (0): grass
+;;       does not, which spares the shadow map its stubble.
 ;;   (mesh-color c sway) -> u32
 ;;       The colour #xRRGGBBAA as a vertex or a placement holds it,
 ;;       with the sway (0 to 1) in place of its alpha.
@@ -67,7 +76,8 @@
 ;;   (meshes-shadow-map r) -> texture the shadow map, for the shadow
 ;;                                    pass's depth
 ;;   (meshes-shadow-pass! r)          inside that pass: draws the lit
-;;                                    meshes into it from the sun
+;;                                    meshes that cast shadows into it
+;;                                    from the sun
 ;;   (meshes-pass! r)                 inside the scene pass, whose colour
 ;;                                    targets are post.sub's: draws the
 ;;                                    lit meshes, then the water
@@ -101,16 +111,19 @@
 ;; of the angle to the sun, then pushed to a dark band and a lit band
 ;; with a narrow blend between them. Wind: a vertex whose colour's
 ;; alpha is above 0 is moved sideways by a wave over the world and the
-;; time, by that much.
+;; time, by that much. Clouds shadow the land: the same noise the sky
+;; draws them with, over the world and drifting with time, dims the
+;; sun where it is dense.
 (require-unqualified base "../../../compiler/base/base.sub")
 (require-unqualified gpu "../gpu.sub")
 (require-unqualified shader "shader.sub")
 (require-unqualified color "../../shade/color.sub")
+(require-unqualified noise "../../shade/noise.sub")
 (require-unqualified math "math.sub")
 (require-unqualified camera "camera.sub")
 (require-unqualified light "light.sub")
 
-(provide meshes mesh-lit mesh-water mesh-color meshes-init! meshes-add! meshes-set! placement meshes-place! meshes-heights!
+(provide meshes mesh-lit mesh-water mesh-color meshes-init! meshes-add! meshes-set! placement meshes-place! meshes-casts! meshes-heights!
          meshes-frame! meshes-shadow-map meshes-shadow-pass! meshes-pass!)
 
 (memory from base)
@@ -129,7 +142,7 @@
 (define (clamp-unit [x f64]) -> f64 (if (< x 0.0) 0.0 (if (> x 1.0) 1.0 x)))
 
 (struct mesh
-  [material u32]
+  [material u32] [casts u32]
   [vertices u32] [vertex-room u32]   ; the GPU buffer and its size in bytes
   [indices u32] [index-room u32]
   [places u32] [place-room u32]
@@ -151,7 +164,7 @@
     [camera vec3] [shadow-texel f32]
     [sun vec3] [time f32]
     [sun-color vec4] [ambient vec4] [sky vec4]
-    [fog vec2] [heights-size vec2]]
+    [fog vec2] [heights-size vec2] [mist vec2]]
   [sampler atlas-sampler 1 0 (fragment)]
   [texture atlas 1 1 (vertex fragment)]
   [comparison-sampler shadow-sampler 1 2 (fragment)]
@@ -162,12 +175,16 @@
   [varyings [world vec3] [normal vec3] [uv vec2] [shade f32] [color vec4] [shadow vec3] [outline f32]]
   [outputs [color vec4] [normal vec4]]
   [use color]
+  [use noise]
   ;; A vertex in the world: scaled, turned about the vertical axis, moved
   ;; to its placement, and swayed by the wind by its colour's alpha; then
-  ;; pushed out along its normal by `push`.
+  ;; pushed out along its normal by `push`. A small thing (its tint's
+  ;; alpha is 0) shrinks to nothing between 32 and 44 units away.
   [define (placed [in vertex] [push f32]) -> vec3
     (let* ([c (cos in.yaw)] [s (sin in.yaw)]
-           [p (* in.position in.scale)]
+           [away (distance frame.camera in.place)]
+           [scale (if (< in.tint.a 0.5) (* in.scale (- 1.0 (smoothstep 32.0 44.0 away))) in.scale)]
+           [p (* in.position scale)]
            [world (+ in.place (vec3 (- (* c p.x) (* s p.z)) p.y (+ (* s p.x) (* c p.z))))]
            [wind (* (vec3 (sin (+ (* frame.time 1.7) (* world.x 0.35) (* world.z 0.2))) 0.0
                           (cos (+ (* frame.time 1.3) (* world.z 0.3))))
@@ -204,26 +221,43 @@
               (+= sum (texture-sample-compare-level shadow-map shadow-sampler
                                                     (+ p.xy (* (vec2 (f32 i) (f32 j)) frame.shadow-texel)) (- p.z 0.0015)))))
           (/ sum 9.0)))]
-  ;; The fog between a point and the camera, 0 to 1, and what it fades
-  ;; to: the haze at the sky's horizon (sky.sub).
+  ;; The fog between a point and the camera, 0 to 1: by distance, and
+  ;; the mist on the low ground; and what it fades to: the haze at the
+  ;; sky's horizon (sky.sub), which glows towards the sun.
   [define (fog-at [world vec3]) -> f32
-    (clamp (/ (- (distance frame.camera world) frame.fog.x) (- frame.fog.y frame.fog.x)) 0.0 1.0)]
-  [define (haze) -> vec3 (mix frame.sky.rgb (vec3 1.0) 0.5)]
+    (let* ([away (distance frame.camera world)]
+           [fog (clamp (/ (- away frame.fog.x) (- frame.fog.y frame.fog.x)) 0.0 1.0)]
+           [mist (* frame.mist.y (- 1.0 (smoothstep frame.mist.x (+ frame.mist.x 15.0) world.y)) (smoothstep 10.0 90.0 away))])
+      (- 1.0 (* (- 1.0 fog) (- 1.0 mist))))]
+  [define (haze [world vec3]) -> vec3
+    (let ([towards (max (dot (normalize (- world frame.camera)) (normalize frame.sun)) 0.0)])
+      (+ (mix frame.sky.rgb (vec3 1.0) 0.3) (* frame.sun-color.rgb (pow towards 8.0) 0.3)))]
+  ;; How much the clouds dim the sun at a point of the land: the sky's
+  ;; cloud noise over the world, drifting as the sky's does.
+  [define (cloud-shade [world vec3]) -> f32
+    (- 1.0 (* 0.55 (smoothstep 0.5 0.68 (fbm (* (+ world.xz (vec2 (* frame.time 1.5) (* frame.time 0.4))) 0.012) 4))))]
   [fragment (fragment [in varyings]) -> outputs
     (let* ([albedo (linear (* (-> (texture-sample atlas atlas-sampler in.uv) rgb) in.color.rgb))]
            [n (normalize in.normal)]
            [towards-sun (normalize frame.sun)]
-           ;; Lit or in shade, with a narrow blend between the two bands.
-           [facing (* (smoothstep -0.1 0.15 (dot n towards-sun)) (sunlit in.shadow))]
-           [light (+ 0.15 (* 0.85 (smoothstep 0.4 0.6 facing)))]
+           ;; Lit or in shade, with a narrow blend between the two bands;
+           ;; the clouds take some of the sun.
+           [facing (* (smoothstep -0.1 0.15 (dot n towards-sun)) (sunlit in.shadow) (cloud-shade in.world))]
+           [light (+ 0.08 (* 0.92 (smoothstep 0.4 0.6 facing)))]
            ;; A rim of light where a lit surface turns away from the camera.
            [v (normalize (- frame.camera in.world))]
            [rim (* (pow (- 1.0 (max (dot n v) 0.0)) 6.0) facing 0.25)]
-           [ambient (* frame.ambient.rgb (mix 0.5 1.0 in.shade))]
-           [color (+ (* albedo (+ ambient (* frame.sun-color.rgb light 0.9 (mix 0.7 1.0 in.shade))))
+           ;; The ambient light: the sky's from above, dimmer from below,
+           ;; and dimmed where the surface is closed in.
+           [hemisphere (+ (* n.y 0.5) 0.5)]
+           [ambient (* (mix (* frame.ambient.rgb 0.65) (mix frame.ambient.rgb frame.sky.rgb 0.2) hemisphere) (mix 0.5 1.0 in.shade))]
+           ;; A little mottling over the world, so that a plain colour is
+           ;; not flat up close.
+           [mottle (+ 0.95 (* 0.1 (noise (* in.world.xz 1.1))))]
+           [color (+ (* albedo mottle (+ ambient (* frame.sun-color.rgb light 0.85 (mix 0.7 1.0 in.shade))))
                      (* frame.sun-color.rgb rim 0.5))])
       ;; The normal target's alpha says whether the pixel gets outlines.
-      (outputs [color (vec4 (mix color (haze) (fog-at in.world)) 1.0)]
+      (outputs [color (vec4 (mix color (haze in.world) (fog-at in.world)) 1.0)]
                [normal (vec4 (+ (* n 0.5) 0.5) in.outline)]))]
   ;; The land's height under a point, from the height map.
   [define (land-at [world vec3]) -> f32
@@ -236,8 +270,10 @@
   ;; the land is just below.
   [fragment (water [in varyings]) -> outputs
     (let* ([depth (max (- in.world.y (land-at in.world)) 0.0)]
-           [ripple (+ (* (sin (+ (* in.world.x 2.3) (* frame.time 1.1))) 0.5) (* (sin (+ (* in.world.z 1.7) (* frame.time 0.9))) 0.5))]
-           [n (normalize (vec3 (* ripple 0.08) 1.0 (* (cos (+ (* in.world.x 1.3) (* frame.time 0.7))) 0.08)))]
+           ;; Ripples: two waves of noise drifting across each other.
+           [drift (vec2 (* frame.time 0.6) (* frame.time 0.35))]
+           [ripple (- (+ (noise (+ (* in.world.xz 0.9) drift)) (noise (- (* in.world.xz 1.7) drift)) (* 0.5 (noise (+ (* in.world.xz 3.6) (* drift 1.5))))) 1.25)]
+           [n (normalize (vec3 (* ripple 0.22) 1.0 (* (- (noise (+ (* in.world.xz 1.3) (vec2 drift.y (- 0.0 drift.x)))) 0.5) 0.3)))]
            [v (normalize (- frame.camera in.world))]
            [towards-sun (normalize frame.sun)]
            [shallow (linear (vec3 0.35 0.75 0.7))]
@@ -247,12 +283,13 @@
            [light (+ 0.4 (* 0.6 (smoothstep 0.3 0.5 facing)))]
            [glint (* (pow (max (dot (reflect (- towards-sun) n) v) 0.0) 64.0) 0.8)]
            [fresnel (pow (- 1.0 (max (dot n v) 0.0)) 3.0)]
-           [foam (* (- 1.0 (smoothstep 0.05 0.35 depth)) (smoothstep 0.3 0.7 (+ 0.5 (* 0.5 (sin (+ (* in.world.x 6.0) (* in.world.z 5.0) (* frame.time 2.0)))))))]
+           ;; Foam where the land is just below, in patches that drift.
+           [foam (* (- 1.0 (smoothstep 0.05 0.4 depth)) (smoothstep 0.45 0.6 (noise (+ (* in.world.xz 2.5) (vec2 (* frame.time 0.5) (* frame.time -0.3))))))]
            [color (+ (* water (+ frame.ambient.rgb (* frame.sun-color.rgb light)))
                      (* frame.sun-color.rgb glint))])
-      (set! color (mix color (* (haze) 0.9) (* fresnel 0.5)))
+      (set! color (mix color (* (haze in.world) 0.9) (* fresnel 0.5)))
       (set! color (mix color (vec3 0.9) foam))
-      (outputs [color (vec4 (mix color (haze) (fog-at in.world)) (mix 0.75 0.95 (smoothstep 0.0 1.5 depth)))]
+      (outputs [color (vec4 (mix color (haze in.world) (fog-at in.world)) (mix 0.75 0.95 (smoothstep 0.0 1.5 depth)))]
                [normal (vec4 0.5 1.0 0.5 1.0)]))])
 
 (define vertex-bytes u32 40)
@@ -315,8 +352,12 @@
   (let ([m (+ (-> r items) (-> r count))])
     (memset m 0 (sizeof mesh))
     (set! (-> m material) material)
+    (set! (-> m casts) 1)
     (+= (-> r count) 1)
     (- (-> r count) 1)))
+
+(define (meshes-casts! [r (ptr meshes)] [mesh u32] [casts u32])
+  (set! (-> (+ (-> r items) mesh) casts) casts))
 
 ;; A GPU buffer with room for n bytes: the one there is, or a bigger one
 ;; in its place.
@@ -343,11 +384,13 @@
       (room! (& (-> m places)) (& (-> m place-room)) (* count (sizeof placement)) gpu-vertex)
       (gpu-write-buffer! (-> m places) 0 places (* count (sizeof placement))))))
 
-;; Draws every mesh of a material with the pipeline that is set.
-(define (draw-all! [r (ptr meshes)] [material u32])
+;; Draws every mesh of a material with the pipeline that is set; for
+;; the shadow map, only those that cast shadows.
+(define (draw-all! [r (ptr meshes)] [material u32] [shadows i32])
   (for ([i u32 0]) (< i (-> r count)) (+= i 1)
     (let ([m (+ (-> r items) i)])
-      (when (and (== (-> m material) material) (> (-> m index-count) 0) (> (-> m place-count) 0))
+      (when (and (== (-> m material) material) (> (-> m index-count) 0) (> (-> m place-count) 0)
+                 (or (not shadows) (!= (-> m casts) 0)))
         (gpu-vertex-buffer! 0 (-> m vertices) 0)
         (gpu-vertex-buffer! 1 (-> m places) 0)
         (gpu-index-buffer! (-> m indices) gpu-u32-indexes 0)
@@ -378,6 +421,7 @@
     (linear-color! (-> frame sky) (-> l sky))
     (vec2! (-> frame fog) (-> l fog-near) (-> l fog-far))
     (vec2! (-> frame heights-size) (-> r heights-width) (-> r heights-height))
+    (vec2! (-> frame mist) (-> l mist-height) (-> l mist))
     (gpu-write-copy! (-> r frame-uniforms) 0 (& frame) (sizeof lit-frame))))
 
 (define (meshes-shadow-map [r (ptr meshes)]) -> u32 (-> r shadow-map))
@@ -385,12 +429,12 @@
 (define (meshes-shadow-pass! [r (ptr meshes)])
   (gpu-pipeline! (-> r shadow-pipeline))
   (gpu-bind-group-set! 0 (-> r frame-group) 0)
-  (draw-all! r mesh-lit))
+  (draw-all! r mesh-lit 1))
 
 (define (meshes-pass! [r (ptr meshes)])
   (gpu-pipeline! (-> r lit-pipeline))
   (gpu-bind-group-set! 0 (-> r frame-group) 0)
   (gpu-bind-group-set! 1 (-> r material-group) 0)
-  (draw-all! r mesh-lit)
+  (draw-all! r mesh-lit 0)
   (gpu-pipeline! (-> r water-pipeline))
-  (draw-all! r mesh-water))
+  (draw-all! r mesh-water 0))
