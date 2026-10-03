@@ -1,0 +1,271 @@
+;; Lifecycle: experimental.
+;;
+;; Props: the things that stand in a world and do not move. A tree, a
+;; boulder, a hut, a tuft of grass: each a model (../scene/models.sub)
+;; at a pose with a tint, and, if it takes up room, a shape in the
+;; space (space.sub). Props are kept by the cell of the world they
+;; stand in, and each frame the cells the camera can see submit their
+;; props to be drawn (meshes-submit!), so that a forest behind the
+;; camera costs nothing; and a cell can have props made for it only
+;; while the player is near, which is how a meadow of ten thousand
+;; tufts is drawn around the player and nowhere else.
+;;
+;; This file is part of the game library.
+;;
+;;   (struct props ...)
+;;       Zero bytes are not ready: call props-init!.
+;;   (props-init! p space)
+;;       Over the same cells as the space, which the props with shapes
+;;       go into.
+;;   (props-free! p)
+;;   (props-add! p model x y z yaw scale tint) -> (handle prop)
+;;       A prop at that pose: for a model of several parts, their rest
+;;       pose. Fixed: it stays until removed.
+;;   (props-shape! p h shape kind)
+;;       Gives the prop a shape in the space, of that kind, at its
+;;       place; its id in the space is the handle's index, so a space
+;;       entry's id finds its prop with (props-of-entry p entry).
+;;   (props-remove! p h)
+;;   (props-count p)
+;;   (props-of-entry p entry) -> (ptr prop), or 0 if the entry is not a prop's
+;;   (props-get p h) -> (ptr prop)
+;;       Fields: model x y z yaw scale tint entry.
+;;
+;; The near field: props made for the cells within `reach` of a point,
+;; and unmade when the point moves on.
+;;
+;;   (props-near! p x z reach make)
+;;       For each cell within reach that has no near props yet, calls
+;;       (make p x0 z0 x1 z1), which adds props in that part of the
+;;       world; the props it adds become the cell's near props. The
+;;       near props of cells beyond reach + a cell are removed. Call it
+;;       every step with where the player is: it does nothing until a
+;;       cell comes near or goes far.
+;;
+;; Drawing:
+;;
+;;   (props-submit! p meshes camera far) -> how many props were submitted
+;;       Submits the props in the cells the camera can see, within
+;;       `far` units: a cell is seen if the ball around it (its width,
+;;       and the heights of its props) is inside the camera's view.
+;;
+;; ---- How it works ----
+;;
+;; A prop is a slot in a store; a cell is two vectors of handles, fixed
+;; and near, with the lowest and highest y of its props for the ball
+;; the camera test uses. A prop of one part is submitted as the one
+;; placement made from its pose when it was added; a prop of several
+;; parts is composed with a figure that every submit shares. The camera test is
+;; the ball against the four side planes of the camera's view (from
+;; camera.sub's axes and half sizes) and the far distance.
+(require-unqualified base "../../../compiler/base/base.sub")
+(require-unqualified vector "vector.sub")
+(require-unqualified store "store.sub")
+(require-unqualified space "space.sub")
+(require-unqualified math "../scene/math.sub")
+(require-unqualified camera "../scene/camera.sub")
+(require-unqualified meshes "../scene/meshes.sub")
+(require-unqualified models "../scene/models.sub")
+
+(provide props prop props-init! props-free! props-add! props-shape! props-remove! props-count props-of-entry props-get
+         props-near! props-submit!)
+
+(memory from base)
+(table from base)
+
+(struct prop
+  [model (ptr model)] [x f64] [y f64] [z f64] [yaw f64] [scale f64] [tint u32]
+  [place placement]   ; the placement of a prop of one part, made once
+  [entry (handle entry)] [shaped i32]
+  [cell i32] [near i32] [slot u32])
+
+(struct cell
+  [fixed (vector (handle prop))] [near (vector (handle prop))]
+  [made i32]        ; whether the near props have been made
+  [low f64] [high f64])
+
+(struct props
+  [space (ptr space)]
+  [cellsize f64] [columns i32] [rows i32]
+  [cells (ptr cell)]
+  [items (store prop)]
+  [handles (vector (handle prop))]   ; each slot's handle, by its index, for props-of-entry
+  [figure figure] [figured i32]   ; a figure for composing props of several parts
+  ;; What props-near! is making for, so that props-add! files them as near.
+  [making i32] [making-cell i32]
+  ;; The cell the near field was last placed around.
+  [near-column i32] [near-row i32] [near-reach f64])
+
+(define (props-init! [p (ptr props)] [s (ptr space)])
+  (memset p 0 (sizeof props))
+  (set! (-> p space) s)
+  (set! (-> p cellsize) (-> s cell))
+  (set! (-> p columns) (-> s columns))
+  (set! (-> p rows) (-> s rows))
+  (let ([n (cast u32 (* (-> p columns) (-> p rows)))])
+    (set! (-> p cells) (cast (ptr cell) (malloc (* n (sizeof cell)))))
+    (memset (-> p cells) 0 (* n (sizeof cell)))
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! (-> (+ (-> p cells) i) low) 1e9)
+      (set! (-> (+ (-> p cells) i) high) -1e9)))
+  (set! (-> p near-column) -1000)
+  (set! (-> p near-row) -1000))
+
+(define (props-free! [p (ptr props)])
+  (let ([n (cast u32 (* (-> p columns) (-> p rows)))])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (vector-free! (& (-> (+ (-> p cells) i) fixed)))
+      (vector-free! (& (-> (+ (-> p cells) i) near))))
+    (free (-> p cells))
+    (store-free! (& (-> p items)))
+    (when (-> p figured) (figure-free! (& (-> p figure))))
+    (memset p 0 (sizeof props))))
+
+(define (props-count [p (ptr props)]) -> u32 (store-count (& (-> p items))))
+
+(define (cell-of [p (ptr props)] [x f64] [z f64]) -> i32
+  (let ([column (cast i32 (clamp (floor (/ x (-> p cellsize))) 0.0 (cast f64 (- (-> p columns) 1))))]
+        [row (cast i32 (clamp (floor (/ z (-> p cellsize))) 0.0 (cast f64 (- (-> p rows) 1))))])
+    (+ (* row (-> p columns)) column)))
+
+(define (props-add! [p (ptr props)] [m (ptr model)] [x f64] [y f64] [z f64] [yaw f64] [scale f64] [tint u32]) -> (handle prop)
+  (let* ([pr (store-add! (& (-> p items)))] [h (store-handle (& (-> p items)) pr)]
+         [index (if (-> p making) (-> p making-cell) (cell-of p x z))]
+         [c (+ (-> p cells) index)]
+         [list (if (-> p making) (& (-> c near)) (& (-> c fixed)))])
+    (set! (-> pr model) m)
+    (set! (-> pr x) x)
+    (set! (-> pr y) y)
+    (set! (-> pr z) z)
+    (set! (-> pr yaw) yaw)
+    (set! (-> pr scale) scale)
+    (set! (-> pr tint) tint)
+    (placement-at! (& (-> pr place)) x y z yaw scale tint)
+    (set! (-> pr cell) index)
+    (set! (-> pr near) (-> p making))
+    (set! (-> pr slot) (vector-count list))
+    (vector-push! list h)
+    (while (<= (vector-count (& (-> p handles))) (-> h index)) (vector-add! (& (-> p handles))))
+    (set! (@ (vector-at (& (-> p handles)) (-> h index))) h)
+    ;; The cell's ball: the prop's height is taken as 8 scaled.
+    (when (< y (-> c low)) (set! (-> c low) y))
+    (when (> (+ y (* 8.0 scale)) (-> c high)) (set! (-> c high) (+ y (* 8.0 scale))))
+    h))
+
+(define (props-shape! [p (ptr props)] [h (handle prop)] [shape shape] [kind u32])
+  (let ([pr (store-get (& (-> p items)) h)])
+    (set! (-> pr entry) (space-add! (-> p space) shape kind (-> h index) (-> pr x) (-> pr y) (-> pr z)))
+    (set! (-> pr shaped) 1)))
+
+(define (props-get [p (ptr props)] [h (handle prop)]) -> (ptr prop) (store-get (& (-> p items)) h))
+
+;; A space entry whose id is a prop's handle index names that prop, if
+;; the prop still has that entry.
+(define (props-of-entry [p (ptr props)] [e (ptr entry)]) -> (ptr prop)
+  (if (< (-> e id) (vector-count (& (-> p handles))))
+      (let ([pr (store-find (& (-> p items)) (@ (vector-at-unchecked (& (-> p handles)) (-> e id))))])
+        (if (and (!= pr 0) (-> pr shaped) (== (-> pr x) (-> e x)) (== (-> pr z) (-> e z))) pr 0))
+      0))
+
+;; Takes a prop out of its cell's list: the last takes its place.
+(define (unfile! [p (ptr props)] [pr (ptr prop)])
+  (let* ([c (+ (-> p cells) (-> pr cell))]
+         [list (if (-> pr near) (& (-> c near)) (& (-> c fixed)))]
+         [last (- (vector-count list) 1)])
+    (when (!= (-> pr slot) last)
+      (let* ([moved (@ (vector-at list last))] [m (store-get (& (-> p items)) moved)])
+        (set! (@ (vector-at list (-> pr slot))) moved)
+        (set! (-> m slot) (-> pr slot))))
+    (vector-remove-last! list)))
+
+(define (props-remove! [p (ptr props)] [h (handle prop)])
+  (let ([pr (store-find (& (-> p items)) h)])
+    (when (!= pr 0)
+      (when (-> pr shaped) (space-remove! (-> p space) (-> pr entry)))
+      (unfile! p pr)
+      (store-remove! (& (-> p items)) h))))
+
+;; ---- The near field ----
+
+(define (props-near! [p (ptr props)] [x f64] [z f64] [reach f64] [make (fn ((ptr props) f64 f64 f64 f64))])
+  (let* ([size (-> p cellsize)]
+         [column (cast i32 (floor (/ x size)))] [row (cast i32 (floor (/ z size)))]
+         [cells-reach (cast i32 (ceil (/ reach size)))])
+    (unless (and (== column (-> p near-column)) (== row (-> p near-row)) (== reach (-> p near-reach)))
+      (set! (-> p near-column) column)
+      (set! (-> p near-row) row)
+      (set! (-> p near-reach) reach)
+      ;; Every cell: made and far, unmade; unmade and near, made.
+      (for ([r i32 0]) (< r (-> p rows)) (+= r 1)
+        (for ([c i32 0]) (< c (-> p columns)) (+= c 1)
+          (let* ([index (+ (* r (-> p columns)) c)] [cell (+ (-> p cells) index)]
+                 [dc (- c column)] [dr (- r row)]
+                 [near (and (<= (if (< dc 0) (- 0 dc) dc) cells-reach) (<= (if (< dr 0) (- 0 dr) dr) cells-reach))]
+                 [far (or (> (if (< dc 0) (- 0 dc) dc) (+ cells-reach 1)) (> (if (< dr 0) (- 0 dr) dr) (+ cells-reach 1)))])
+            (when (and (-> cell made) far)
+              (while (> (vector-count (& (-> cell near))) 0)
+                (props-remove! p (@ (vector-at (& (-> cell near)) (- (vector-count (& (-> cell near))) 1)))))
+              (set! (-> cell made) 0))
+            (when (and (not (-> cell made)) near)
+              (set! (-> cell made) 1)
+              (set! (-> p making) 1)
+              (set! (-> p making-cell) index)
+              (make p (* (cast f64 c) size) (* (cast f64 r) size) (* (cast f64 (+ c 1)) size) (* (cast f64 (+ r 1)) size))
+              (set! (-> p making) 0))))))))
+
+;; ---- Drawing ----
+
+;; Whether a ball is inside the camera's view: in front of the near
+;; plane, within the far distance, and inside the four side planes.
+(define (seen? [c (ptr camera)] [right (ptr f32)] [up (ptr f32)] [forward (ptr f32)] [half-w f64] [half-h f64]
+               [x f64] [y f64] [z f64] [radius f64] [far f64]) -> i32
+  (let* ([dx (- x (-> c x))] [dy (- y (-> c y))] [dz (- z (-> c z))]
+         [f (+ (* dx (cast f64 (@ forward 0))) (* dy (cast f64 (@ forward 1))) (* dz (cast f64 (@ forward 2))))]
+         [r (+ (* dx (cast f64 (@ right 0))) (* dy (cast f64 (@ right 1))) (* dz (cast f64 (@ right 2))))]
+         [u (+ (* dx (cast f64 (@ up 0))) (* dy (cast f64 (@ up 1))) (* dz (cast f64 (@ up 2))))]
+         ;; The side planes: |r| <= f * half-w, with the ball's radius
+         ;; scaled by the plane's slant.
+         [slant-w (sqrt (+ 1.0 (* half-w half-w)))]
+         [slant-h (sqrt (+ 1.0 (* half-h half-h)))])
+    (and (> (+ f radius) 0.0)
+         (< (- f radius) far)
+         (<= (fabs r) (+ (* f half-w) (* radius slant-w)))
+         (<= (fabs u) (+ (* f half-h) (* radius slant-h))))))
+
+(define (submit-prop! [p (ptr props)] [pr (ptr prop)] [r (ptr meshes)])
+  (let ([m (-> pr model)])
+    (if (== (model-count m) 1)
+        (meshes-submit! r (-> (vector-at (& (-> m parts)) 0) mesh) (& (-> pr place)))
+        (let ([f (& (-> p figure))])
+          (when (or (not (-> p figured)) (!= (-> f model) m))
+            (when (-> p figured) (figure-free! f))
+            (figure-init! f m)
+            (set! (-> p figured) 1))
+          (set! (-> f x) (-> pr x))
+          (set! (-> f y) (-> pr y))
+          (set! (-> f z) (-> pr z))
+          (set! (-> f yaw) (-> pr yaw))
+          (set! (-> f scale) (-> pr scale))
+          (figure-submit! f r (-> pr tint))))))
+
+(define (props-submit! [p (ptr props)] [r (ptr meshes)] [c (ptr camera)] [far f64]) -> u32
+  (let ([right (array f32 3)] [up (array f32 3)] [forward (array f32 3)] [n u32 0]
+        [half-w (camera-half-width c)] [half-h (camera-half-height c)]
+        [size (-> p cellsize)])
+    (camera-axes! c right up forward)
+    (for ([row i32 0]) (< row (-> p rows)) (+= row 1)
+      (for ([column i32 0]) (< column (-> p columns)) (+= column 1)
+        (let ([cell (+ (-> p cells) (+ (* row (-> p columns)) column))])
+          (when (or (> (vector-count (& (-> cell fixed))) 0) (> (vector-count (& (-> cell near))) 0))
+            (let* ([cx (* (+ (cast f64 column) 0.5) size)] [cz (* (+ (cast f64 row) 0.5) size)]
+                   [cy (/ (+ (-> cell low) (-> cell high)) 2.0)]
+                   [half-y (/ (- (-> cell high) (-> cell low)) 2.0)]
+                   [radius (sqrt (+ (* size size 0.5) (* half-y half-y)))])
+              (when (seen? c right up forward half-w half-h cx cy cz radius far)
+                (vector-each ([h (& (-> cell fixed))])
+                  (submit-prop! p (store-get (& (-> p items)) (@ h)) r)
+                  (+= n 1))
+                (vector-each ([h (& (-> cell near))])
+                  (submit-prop! p (store-get (& (-> p items)) (@ h)) r)
+                  (+= n 1))))))))
+    n))

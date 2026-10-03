@@ -1,0 +1,273 @@
+;; Lifecycle: experimental.
+;;
+;; Movers: things that move over the land among the things that stand
+;; on it; the player, a creature, anything with feet. A mover is a disc
+;; of a radius and a height that walks where it is told, falls, lands,
+;; stands on the land (terrain.sub) or on a walkway, is pushed out of
+;; whatever it walks into (space.sub's shapes), refuses slopes too steep
+;; to climb, and wades into water up to a depth. Steering functions
+;; turn a mover's heading towards or away from things, which is what a
+;; creature's mind does to it.
+;;
+;; This file is part of the game library. A game embeds a mover in its
+;; own structs: (struct deer [body mover] ...).
+;;
+;;   (struct mover [x] [y] [z] [vx] [vz] [vy] [heading] [speed]
+;;                 [radius] [height] [on-ground] [in-water] [kind] [entry] ...)
+;;       Where it is; its movement this step along the ground (vx, vz)
+;;       and up (vy); the way it faces (a yaw: 0 faces +z, positive
+;;       turns left towards +x) and how fast it means to go, which the
+;;       steering sets and mover-aim! turns into vx and vz; its size;
+;;       whether it stands on something; how deep it is in the water
+;;       (0 when it is not); and its entry in the space.
+;;   (mover-init! m x y z radius height)
+;;       At (x, y, z), that size, facing +z, with gravity 0.009 a step
+;;       (a jump of 0.15 a step rises 1.25), able to climb slopes up to
+;;       1.2 (50 degrees), wading 1 unit deep before the water holds
+;;       it up. These are fields (gravity, slope-limit, wade) to change.
+;;   (mover-enter! m space kind id)
+;;       Puts the mover in the space as a disc of that kind, so that
+;;       others are pushed out of it and find it; its entry follows it.
+;;   (mover-leave! m space)
+;;   (mover-step! m terrain space water-level)
+;;       One step: moves by (vx, vz), then by vy less gravity; lands
+;;       on the land or a walkway's deck; is pushed out of discs and
+;;       boxes it overlaps and kept on a walkway by its rails; is held
+;;       up by the water at `wade` below its level; and moves its
+;;       entry. Then vx and vz are kept, for whoever sets them again.
+;;   (mover-jump! m speed)
+;;       Up at that speed, if standing.
+;;   (mover-aim! m)
+;;       vx and vz from the heading and the speed.
+;;
+;; Steering, each a nudge to the heading or the speed, to call before
+;; mover-aim!:
+;;
+;;   (steer-toward! m x z turn)      turns the heading towards (x, z)
+;;                                   by at most `turn` radians
+;;   (steer-away! m x z turn)        away from it
+;;   (steer-wander! m seed time turn)
+;;                                   drifts the heading by noise, up to
+;;                                   `turn` a step
+;;   (steer-arrive! m x z slow top)  the speed is `top`, less within
+;;                                   `slow` of (x, z), 0 there
+;;   (steer-apart! m space kinds distance turn)
+;;                                   turns away from the others of those
+;;                                   kinds within `distance`
+;;   (steer-clear! m space kinds turn)
+;;                                   turns from what stands in the way
+;;                                   a few steps ahead, to whichever side
+;;                                   is clearer
+;;   (mover-distance m x z) -> f64   how far (x, z) is along the ground
+;;   (mover-bearing m x z) -> f64    the heading that would face it
+;;
+;; ---- How it works ----
+;;
+;; A step moves the mover and then puts right what the move broke, in
+;; this order: the slope (the land a little way ahead is too steep and
+;; higher: the sideways move is undone), the land (the mover is on it
+;; if it would be below), the shapes gathered from the space around the
+;; mover (a disc pushes it straight out, a box out through the nearest
+;; side, a walkway holds it up and its rails keep it on), the water,
+;; the edge of the land. Each is a small correction; a mover that walks
+;; into a tree stops at it and slides round, which is what the player
+;; expects and a creature does not notice.
+(require-unqualified base "../../../compiler/base/base.sub")
+(require-unqualified vector "vector.sub")
+(require-unqualified store "store.sub")
+(require-unqualified terrain "terrain.sub")
+(require-unqualified space "space.sub")
+(require-unqualified noise "noise.sub")
+(require-unqualified math "../scene/math.sub")
+
+(provide mover mover-init! mover-enter! mover-leave! mover-step! mover-jump! mover-aim!
+         steer-toward! steer-away! steer-wander! steer-arrive! steer-apart! steer-clear!
+         mover-distance mover-bearing)
+
+(memory from base)
+(table from base)
+
+(struct mover
+  [x f64] [y f64] [z f64]
+  [vx f64] [vz f64] [vy f64]
+  [heading f64] [speed f64]
+  [radius f64] [height f64]
+  [on-ground i32] [in-water f64]
+  [gravity f64] [slope-limit f64] [wade f64]
+  [kind u32] [entry (handle entry)] [entered i32]
+  ;; What the step gathers, kept to save making it again.
+  [touching (vector (handle entry))])
+
+(define (mover-init! [m (ptr mover)] [x f64] [y f64] [z f64] [radius f64] [height f64])
+  (memset m 0 (sizeof mover))
+  (set! (-> m x) x)
+  (set! (-> m y) y)
+  (set! (-> m z) z)
+  (set! (-> m radius) radius)
+  (set! (-> m height) height)
+  (set! (-> m gravity) 0.009)
+  (set! (-> m slope-limit) 1.2)
+  (set! (-> m wade) 1.0))
+
+(define (mover-enter! [m (ptr mover)] [s (ptr space)] [kind u32] [id u32])
+  (set! (-> m kind) kind)
+  (set! (-> m entry) (space-add! s (disc (-> m radius) (-> m height)) kind id (-> m x) (-> m y) (-> m z)))
+  (set! (-> m entered) 1))
+
+(define (mover-leave! [m (ptr mover)] [s (ptr space)])
+  (when (-> m entered)
+    (space-remove! s (-> m entry))
+    (set! (-> m entered) 0)))
+
+(define (mover-jump! [m (ptr mover)] [speed f64])
+  (when (-> m on-ground) (set! (-> m vy) speed)))
+
+(define (mover-aim! [m (ptr mover)])
+  (set! (-> m vx) (* (-> m speed) (sin (-> m heading))))
+  (set! (-> m vz) (* (-> m speed) (cos (-> m heading)))))
+
+(define (mover-distance [m (ptr mover)] [x f64] [z f64]) -> f64
+  (let ([dx (- x (-> m x))] [dz (- z (-> m z))])
+    (sqrt (+ (* dx dx) (* dz dz)))))
+
+(define (mover-bearing [m (ptr mover)] [x f64] [z f64]) -> f64
+  (atan2 (- x (-> m x)) (- z (-> m z))))
+
+;; Turns the heading towards a bearing by at most `turn`.
+(define (turn-toward! [m (ptr mover)] [bearing f64] [turn f64])
+  (let ([d (angle-between (-> m heading) bearing)])
+    (+= (-> m heading) (clamp d (- 0.0 turn) turn))))
+
+(define (steer-toward! [m (ptr mover)] [x f64] [z f64] [turn f64])
+  (turn-toward! m (mover-bearing m x z) turn))
+
+(define (steer-away! [m (ptr mover)] [x f64] [z f64] [turn f64])
+  (turn-toward! m (+ (mover-bearing m x z) pi) turn))
+
+(define (steer-wander! [m (ptr mover)] [seed u32] [time f64] [turn f64])
+  (+= (-> m heading) (* turn (- (* 2.0 (value-noise (* time 0.7) 0.0 seed)) 1.0))))
+
+(define (steer-arrive! [m (ptr mover)] [x f64] [z f64] [slow f64] [top f64])
+  (let ([d (mover-distance m x z)])
+    (set! (-> m speed) (* top (clamp (/ d slow) 0.0 1.0)))))
+
+;; Whether a handle is the mover's own entry.
+(define (own? [m (ptr mover)] [h (handle entry)]) -> i32
+  (and (-> m entered) (== (-> h index) (-> m entry index)) (== (-> h generation) (-> m entry generation))))
+
+;; The others pull the heading away from the average direction to them.
+(define (steer-apart! [m (ptr mover)] [s (ptr space)] [kinds u32] [distance f64] [turn f64])
+  (let ([found (& (-> m touching))] [sum-x 0.0] [sum-z 0.0] [n 0])
+    (vector-clear! found)
+    (space-gather! s (-> m x) (-> m z) distance kinds found)
+    (vector-each ([h found])
+      (let ([e (space-entry s (@ h))])
+        (unless (own? m (@ h))
+          (let ([dx (- (-> e x) (-> m x))] [dz (- (-> e z) (-> m z))])
+            (when (> (+ (* dx dx) (* dz dz)) 0.0001)
+              (+= sum-x dx)
+              (+= sum-z dz)
+              (+= n 1))))))
+    (when (> n 0)
+      (turn-toward! m (+ (atan2 sum-x sum-z) pi) turn))))
+
+;; Whether anything of those kinds stands at the point.
+(define (blocked? [m (ptr mover)] [s (ptr space)] [kinds u32] [x f64] [z f64]) -> i32
+  (let ([found (& (-> m touching))] [hit 0])
+    (vector-clear! found)
+    (space-touching! s x z (-> m y) (-> m radius) (-> m height) kinds found)
+    (vector-each ([h found])
+      (let ([e (space-entry s (@ h))])
+        (unless (own? m (@ h))
+          (match (-> e shape)
+            [(disc r height) (set! hit 1)]
+            [(box half-x half-z yaw height) (set! hit 1)]
+            [(walkway half-x half-z yaw deck rails) 0]))))
+    hit))
+
+(define (steer-clear! [m (ptr mover)] [s (ptr space)] [kinds u32] [turn f64])
+  (let* ([ahead (+ (* (-> m radius) 2.0) (* (-> m speed) 24.0))]
+         [h (-> m heading)]
+         [fx (+ (-> m x) (* ahead (sin h)))] [fz (+ (-> m z) (* ahead (cos h)))])
+    (when (blocked? m s kinds fx fz)
+      ;; Try each side, a right angle away; take the clear one, or the
+      ;; left if neither is.
+      (let* ([lx (+ (-> m x) (* ahead (sin (+ h 0.8))))] [lz (+ (-> m z) (* ahead (cos (+ h 0.8))))]
+             [rx (+ (-> m x) (* ahead (sin (- h 0.8))))] [rz (+ (-> m z) (* ahead (cos (- h 0.8))))]
+             [left-clear (not (blocked? m s kinds lx lz))]
+             [right-clear (not (blocked? m s kinds rx rz))])
+        (+= (-> m heading) (if (or left-clear (not right-clear)) turn (- 0.0 turn)))))))
+
+;; Pushes the mover out of a shape it overlaps, or stands it on a
+;; walkway.
+(define (resolve! [m (ptr mover)] [e (ptr entry)])
+  (let ([dx (- (-> m x) (-> e x))] [dz (- (-> m z) (-> e z))])
+    (match (-> e shape)
+      [(disc r height)
+       (let* ([d (sqrt (+ (* dx dx) (* dz dz)))] [want (+ r (-> m radius))])
+         (when (and (< d want) (> d 0.0001))
+           (set! (-> m x) (+ (-> e x) (* dx (/ want d))))
+           (set! (-> m z) (+ (-> e z) (* dz (/ want d))))))]
+      [(box half-x half-z yaw height)
+       (let* ([c (cos yaw)] [s (sin yaw)]
+              [lx (+ (* c dx) (* s dz))] [lz (- (* c dz) (* s dx))]
+              [out-x (- (+ half-x (-> m radius)) (fabs lx))]
+              [out-z (- (+ half-z (-> m radius)) (fabs lz))])
+         (when (and (> out-x 0.0) (> out-z 0.0))
+           (if (< out-x out-z)
+               (set! lx (* (if (< lx 0.0) -1.0 1.0) (+ half-x (-> m radius))))
+               (set! lz (* (if (< lz 0.0) -1.0 1.0) (+ half-z (-> m radius)))))
+           ;; Back to the world's frame.
+           (set! (-> m x) (+ (-> e x) (- (* c lx) (* s lz))))
+           (set! (-> m z) (+ (-> e z) (+ (* s lx) (* c lz))))))]
+      [(walkway half-x half-z yaw deck rails)
+       (let* ([c (cos yaw)] [s (sin yaw)]
+              [lx (+ (* c dx) (* s dz))] [lz (- (* c dz) (* s dx))]
+              [top (+ (-> e y) deck)])
+         ;; On the span, not well below the deck: the deck holds the
+         ;; mover up, and the rails keep it on, away from the ends.
+         (when (and (< (fabs lx) (+ half-x 0.3)) (< (fabs lz) half-z) (> (-> m y) (- top 1.2)))
+           (when (<= (-> m y) top)
+             (set! (-> m y) top)
+             (set! (-> m vy) 0.0)
+             (set! (-> m on-ground) 1))
+           (when (and rails (< (fabs lx) (- half-x 0.3)))
+             (let ([keep (- half-z 0.4)])
+               (set! lz (clamp lz (- 0.0 keep) keep))
+               (set! (-> m x) (+ (-> e x) (- (* c lx) (* s lz))))
+               (set! (-> m z) (+ (-> e z) (+ (* s lx) (* c lz))))))))])))
+
+(define (mover-step! [m (ptr mover)] [t (ptr terrain)] [s (ptr space)] [water-level f64])
+  ;; The slope ahead: too steep and uphill stops the move.
+  (let* ([ahead-x (+ (-> m x) (* (-> m vx) 8.0))] [ahead-z (+ (-> m z) (* (-> m vz) 8.0))])
+    (when (and (> (terrain-slope t ahead-x ahead-z) (-> m slope-limit))
+               (> (terrain-height t ahead-x ahead-z) (-> m y)))
+      (set! (-> m vx) 0.0)
+      (set! (-> m vz) 0.0)))
+  (+= (-> m x) (-> m vx))
+  (+= (-> m z) (-> m vz))
+  (-= (-> m vy) (-> m gravity))
+  (+= (-> m y) (-> m vy))
+  ;; The edge of the land.
+  (set! (-> m x) (clamp (-> m x) 0.5 (- (* (cast f64 (- (-> t columns) 1)) (-> t spacing)) 0.5)))
+  (set! (-> m z) (clamp (-> m z) 0.5 (- (* (cast f64 (- (-> t rows) 1)) (-> t spacing)) 0.5)))
+  ;; The land.
+  (let ([ground (terrain-height t (-> m x) (-> m z))])
+    (if (<= (-> m y) ground)
+        (begin (set! (-> m y) ground) (set! (-> m vy) 0.0) (set! (-> m on-ground) 1))
+        (set! (-> m on-ground) 0)))
+  ;; The shapes around.
+  (let ([found (& (-> m touching))])
+    (vector-clear! found)
+    (space-touching! s (-> m x) (-> m z) (-> m y) (-> m radius) (-> m height) (kinds-all) found)
+    (vector-each ([h found])
+      (let ([e (space-entry s (@ h))])
+        (unless (own? m (@ h))
+          (resolve! m e)))))
+  ;; The water holds the mover up at the wading depth.
+  (let ([held (- water-level (-> m wade))])
+    (if (< (-> m y) held)
+        (begin (set! (-> m y) held) (set! (-> m vy) 0.0) (set! (-> m on-ground) 1) (set! (-> m in-water) (-> m wade)))
+        (set! (-> m in-water) (if (< (-> m y) water-level) (- water-level (-> m y)) 0.0))))
+  (when (-> m entered)
+    (space-move! s (-> m entry) (-> m x) (-> m y) (-> m z))))

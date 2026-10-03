@@ -1,7 +1,8 @@
 ;; Lifecycle: experimental.
 ;;
 ;; The mathematics a 3D game needs and the language does not have:
-;; trigonometry, and 4 by 4 matrices for the GPU.
+;; trigonometry, 4 by 4 matrices for the GPU, and 3 by 4 matrices for
+;; placing things in the world.
 ;;
 ;; Trigonometry. Wasm has no instruction for these, so they are computed
 ;; here, in the program; the results are the same on every host.
@@ -10,6 +11,11 @@
 ;;   (radians degrees)      the angle in radians
 ;;   (sin x) (cos x)        for x in radians; the error is below 1e-10
 ;;   (tan x)
+;;   (atan2 y x)            the angle of the point (x, y), -pi to pi; the
+;;                          error is below 2e-5
+;;   (asin x) (acos x)
+;;   (angle-between a b)    the turn from the angle a to the angle b, -pi
+;;                          to pi: positive counter-clockwise
 ;;   (clamp x low high)     x, kept between low and high
 ;;
 ;; Matrices. A matrix is 16 floats (an (array f32 16)), column by column,
@@ -40,10 +46,36 @@
 ;;   (mat4-transform! out m x y z)
 ;;       The point (x, y, z) transformed by m, as four numbers (x, y,
 ;;       z, w) written into the array `out` of 4 f64.
+;;
+;; Placements. A 3 by 4 matrix is 12 floats, row by row (the top three
+;; rows of a 4 by 4 whose last row is 0 0 0 1): a turn and a scale in
+;; its left three columns, and a move in its last. It is what a mesh's
+;; placement holds (meshes.sub), and what a figure's parts compose
+;; (models.sub). Angles are the camera's: yaw about the vertical axis
+;; (0 faces +z, positive turns left towards +x), pitch about the thing's
+;; own x axis (positive raises its front), and roll about its own z axis
+;; (positive drops its right side).
+;;
+;;   (mat34-identity! out)
+;;   (mat34-pose! out x y z yaw pitch roll scale)
+;;       The matrix that moves a thing to (x, y, z), turned by those
+;;       angles and scaled by `scale`: scale first, then roll, pitch,
+;;       yaw, then the move.
+;;   (mat34-multiply! out a b)
+;;       out = a * b: the transformation b, then a; out must not be a
+;;       or b.
+;;   (mat34-point! out m x y z)
+;;       The point (x, y, z) transformed by m, as three f64 in `out`.
+;;   (mat34-direction! out m x y z)
+;;       The direction (x, y, z) transformed by m, without the move.
+;;   (mat34-yaw m) (mat34-pitch m)
+;;       The yaw and the pitch of the matrix's forward direction, its
+;;       third column.
 (require-unqualified base "../../../compiler/base/base.sub")
 
-(provide pi radians sin cos tan clamp
-         mat4-identity! mat4-perspective! mat4-orthographic! mat4-view! mat4-look! mat4-multiply! mat4-transform!)
+(provide pi radians sin cos tan atan2 asin acos angle-between clamp
+         mat4-identity! mat4-perspective! mat4-orthographic! mat4-view! mat4-look! mat4-multiply! mat4-transform!
+         mat34-identity! mat34-pose! mat34-multiply! mat34-point! mat34-direction! mat34-yaw mat34-pitch)
 
 (memory from base)
 (table from base)
@@ -69,6 +101,31 @@
 (define (cos [x f64]) -> f64 (sin (+ x (/ pi 2.0))))
 
 (define (tan [x f64]) -> f64 (/ (sin x) (cos x)))
+
+;; The arc tangent of t in [-1, 1], by a polynomial whose error is below
+;; 2e-5 (the usual fit of the odd powers up to the eleventh).
+(define (atan-unit [t f64]) -> f64
+  (let ([s (* t t)])
+    (* t (+ 0.99997726 (* s (+ -0.33262347 (* s (+ 0.19354346 (* s (+ -0.11643287 (* s (+ 0.05265332 (* s -0.01172120)))))))))))))
+
+(define (atan2 [y f64] [x f64]) -> f64
+  (cond [(and (== x 0.0) (== y 0.0)) 0.0]
+        [(> (fabs x) (fabs y))
+         (let ([a (atan-unit (/ y x))])
+           (if (>= x 0.0) a (if (>= y 0.0) (+ a pi) (- a pi))))]
+        [else
+         (let ([a (atan-unit (/ x y))])
+           (if (>= y 0.0) (- (/ pi 2.0) a) (- (- 0.0 (/ pi 2.0)) a)))]))
+
+(define (asin [x f64]) -> f64
+  (let ([c (clamp x -1.0 1.0)])
+    (atan2 c (sqrt (- 1.0 (* c c))))))
+
+(define (acos [x f64]) -> f64 (- (/ pi 2.0) (asin x)))
+
+(define (angle-between [a f64] [b f64]) -> f64
+  (let ([d (- b a)])
+    (- d (* (* 2.0 pi) (nearbyint (/ d (* 2.0 pi)))))))
 
 ;; ---- Matrices ----
 
@@ -152,3 +209,48 @@
 (define (mat4-transform! [out (ptr f64)] [m (ptr f32)] [x f64] [y f64] [z f64])
   (for ([row u32 0]) (< row 4) (+= row 1)
     (set! (@ out row) (+ (* (at m row 0) x) (* (at m row 1) y) (* (at m row 2) z) (at m row 3)))))
+
+;; ---- Placements ----
+
+(define (mat34-identity! [out (ptr f32)])
+  (for ([i u32 0]) (< i 12) (+= i 1)
+    (set! (@ out i) (if (== (% i 5) 0) 1.0 0.0))))
+
+;; Row by row: element (row, column) is at row * 4 + column.
+(define (mat34-pose! [out (ptr f32)] [x f64] [y f64] [z f64] [yaw f64] [pitch f64] [roll f64] [scale f64])
+  (let* ([cy (cos yaw)] [sy (sin yaw)] [cp (cos pitch)] [sp (sin pitch)] [cr (cos roll)] [sr (sin roll)]
+         ;; Ry(yaw) * Rx(pitch) * Rz(roll), with the camera's angles:
+         ;; forward (0, 0, 1) goes to (sin yaw cos pitch, sin pitch,
+         ;; cos yaw cos pitch), as mat4-view! has it.
+         [r00 (- (* cy cr) (* sy sp sr))] [r01 (- 0.0 (+ (* cy sr) (* sy sp cr)))] [r02 (* sy cp)]
+         [r10 (* cp sr)] [r11 (* cp cr)] [r12 sp]
+         [r20 (- 0.0 (+ (* sy cr) (* cy sp sr)))] [r21 (- (* sy sr) (* cy sp cr))] [r22 (* cy cp)])
+    (set! (@ out 0) (cast f32 (* r00 scale))) (set! (@ out 1) (cast f32 (* r01 scale))) (set! (@ out 2) (cast f32 (* r02 scale))) (set! (@ out 3) (cast f32 x))
+    (set! (@ out 4) (cast f32 (* r10 scale))) (set! (@ out 5) (cast f32 (* r11 scale))) (set! (@ out 6) (cast f32 (* r12 scale))) (set! (@ out 7) (cast f32 y))
+    (set! (@ out 8) (cast f32 (* r20 scale))) (set! (@ out 9) (cast f32 (* r21 scale))) (set! (@ out 10) (cast f32 (* r22 scale))) (set! (@ out 11) (cast f32 z))))
+
+(define (mat34-multiply! [out (ptr f32)] [a (ptr f32)] [b (ptr f32)])
+  (for ([row u32 0]) (< row 3) (+= row 1)
+    (for ([column u32 0]) (< column 4) (+= column 1)
+      (let ([sum f64 0.0])
+        (for ([k u32 0]) (< k 3) (+= k 1)
+          (+= sum (* (cast f64 (@ a (+ (* row 4) k))) (cast f64 (@ b (+ (* k 4) column))))))
+        (when (== column 3) (+= sum (cast f64 (@ a (+ (* row 4) 3)))))
+        (set! (@ out (+ (* row 4) column)) (cast f32 sum))))))
+
+(define (mat34-point! [out (ptr f64)] [m (ptr f32)] [x f64] [y f64] [z f64])
+  (for ([row u32 0]) (< row 3) (+= row 1)
+    (set! (@ out row) (+ (* (cast f64 (@ m (* row 4))) x) (* (cast f64 (@ m (+ (* row 4) 1))) y)
+                         (* (cast f64 (@ m (+ (* row 4) 2))) z) (cast f64 (@ m (+ (* row 4) 3)))))))
+
+(define (mat34-direction! [out (ptr f64)] [m (ptr f32)] [x f64] [y f64] [z f64])
+  (for ([row u32 0]) (< row 3) (+= row 1)
+    (set! (@ out row) (+ (* (cast f64 (@ m (* row 4))) x) (* (cast f64 (@ m (+ (* row 4) 1))) y)
+                         (* (cast f64 (@ m (+ (* row 4) 2))) z)))))
+
+;; The forward direction is the third column: (m02, m12, m22).
+(define (mat34-yaw [m (ptr f32)]) -> f64 (atan2 (cast f64 (@ m 2)) (cast f64 (@ m 10))))
+
+(define (mat34-pitch [m (ptr f32)]) -> f64
+  (let ([fx (cast f64 (@ m 2))] [fy (cast f64 (@ m 6))] [fz (cast f64 (@ m 10))])
+    (atan2 fy (sqrt (+ (* fx fx) (* fz fz))))))

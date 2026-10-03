@@ -220,8 +220,13 @@ do what it does: another language on the kernel can bring its own.
       camera's position, yaw and pitch and projection; the sun, the
       ambient light, the sky's colour, the fog and the mist, where
       shadows fall.
-    - `math.sub`: sin and cos, which wasm does not have, and the 4 by 4
-      matrices a camera needs.
+    - `models.sub`: things made of parts on joints: a model says what
+      a kind of thing is made of, a figure is one such thing posed,
+      composed parent down to child and submitted to be drawn;
+      procedural animation (a stride, a head that watches something).
+    - `math.sub`: sin, cos and atan2, which wasm does not have, the 4
+      by 4 matrices a camera needs, and the 3 by 4 matrices things are
+      placed with.
   - `game/`: a small library for games:
     - `game.sub`: the game loop. `(game World [size 320 180] init step
       draw)` turns three functions into a game in a page; with
@@ -236,6 +241,17 @@ do what it does: another language on the kernel can bring its own.
       the water, and walking on it.
     - `noise.sub`: noise to make worlds from: hashes, value noise and
       fbm, the same for a seed every time.
+    - `space.sub`: where things are: a grid of cells over the world
+      with a shape per thing (a disc, a box, a walkway), asked what is
+      near, what a disc touches, and what a line hits.
+    - `movers.sub`: things that move over the land among the shapes:
+      falling, landing, pushed out of what they walk into, kept on a
+      walkway by its rails, wading; and steering, towards, away, a
+      wander, apart from others, clear of what is ahead.
+    - `props.sub`: things that stand still: models at poses, with
+      shapes in the space, kept by cell and submitted when the camera
+      can see their cell; a near field made for the cells around a
+      point and unmade when it moves on.
     - `input.sub`: which keys and mouse buttons are held, and which were
       just pressed; how far the mouse moved.
     - `sound.sub`: sound files, music, and short synthesized tones.
@@ -737,7 +753,10 @@ for Testing build that Playwright's browsers package fetches, as
     the mesh is drawn once for all of them; a vertex colour's alpha
     sways it in the wind, a placement's tint's alpha marks a small
     thing, drawn without outlines and shrunk away beyond 40 units,
-    which is how a meadow of grass is drawn. The picture pass, one
+    which is how a meadow of grass is drawn; a placement is a 3 by 4
+    matrix, so a part of a figure can be turned any way, and a mesh
+    draws both the placements it keeps and those submitted for the
+    frame, which is how creatures are drawn. The picture pass, one
     triangle over the screen, draws the outlines where the depth or
     the normal breaks between a pixel and its neighbours (a line one
     pixel wide whatever the distance, on the near side of a
@@ -913,9 +932,12 @@ above the lake, where a jetty runs out into the water; a hut with a
 red roof stands by the bridge. Forests of firs, oaks and birches
 stand on the slopes, with bushes at their edges; meadows of grass and
 flowers sway in the wind; boulders lie about; birds circle over the
-lake; the sun crosses the sky in ten minutes, warm and low at each
-end, and its clouds' shadows cross the land; mist lies on the water
-at a distance. The land is 256 units across, from noise with a fixed
+lake; a herd of ten deer grazes on the meadow below the knoll, lifts
+its heads when the player comes near, and scatters when the player
+runs at it, drifting back when left alone; the sun crosses the sky in
+ten minutes, warm and low at each end, and its clouds' shadows cross
+the land, into four minutes of night; mist lies on the water at a
+distance. The land is 256 units across, from noise with a fixed
 seed, so it is the same every time. The player walks and runs on it,
 around the trees, the boulders and the stones, over the bridge and
 the jetty, into the river up to the waist, looks around with the
@@ -929,39 +951,51 @@ noise at their edges, as a drawn landscape has them, blended into each
 other over a short way (a sharp change between two vertices' colours
 is drawn as a sawtooth along the triangles between them); the
 mountains are ridged noise at two scales, the path a line the paint
-follows. Everything on it is a mesh placed many times
-(`scene/meshes.sub`). A crown is lobes: low balls, a little lumpy,
-whose normals point out from their middles, so that the light falls
-across each as a volume, darker towards the bottom; an oak is five of
-them on a flared trunk, a birch four narrow ones on a pale trunk with
-dark marks, a bush three on the ground, a fir four cones with
-drooping edges and dark bases. A boulder is flat facets; a standing
-stone leans. Around the player, placed again whenever they have
-walked six units, eight thousand tufts of grass, each three blades
-tapering and leaning over, dark at the foot, tinted with the ground's
-green and drawn without outlines, with normals that point up so that
-it takes the ground's light, and flowers, discs of petals in three
-colours. The bridge and the jetty are boxes, planks with posts and
-rails, that the player walks on and is kept on by the rails; the hut
-is boxes, gables and two slopes of roof on a plinth, with frames round
-its door and window, which the player is kept out of. The birds are
-one mesh placed nine times, placed again every step as they fly. The
-water is a square at the water level drawn with the water material,
-which reads the land's height from the height map as a texture.
+follows. Everything on it is a prop (`game/props.sub`):
+a model at a pose, kept by the cell it stands in and submitted to be
+drawn when the camera can see the cell, with a shape in the space
+(`game/space.sub`) if it takes up room, which the player and the
+deer, movers (`game/movers.sub`), are kept out of: a disc for a tree
+or a stone, a box for the hut, a walkway for the bridge and the
+jetty, whose rails keep a mover on. A crown is lobes of leaf cards
+with the lobe's normal, so that the light falls across each as a
+volume, darker towards the bottom; an oak is five of them on a flared
+trunk, a birch four narrow ones on a pale trunk with dark marks, a
+bush three on the ground, a fir four cones of needles with drooping
+edges and dark bases. A boulder is flat facets; a standing stone
+leans. The grass and the flowers are the near field: made for the
+cells around the player as they come near and unmade when they have
+moved on, seven thousand tufts of three blade cards, dark at the
+foot, tinted with the ground's green and drawn without outlines, and
+flowers, discs of petals in three colours. The bridge and the jetty
+are planks with posts and rails; the hut is boxes, gables and two
+slopes of roof on a plinth, with frames round its door and window. A
+deer is a figure (`scene/models.sub`) of eight parts on joints, a
+body, a neck, a head, four legs and a tail, posed every frame from
+what it is doing: its legs stride by its speed, its neck goes down to
+graze, up when it is alert and forward when it runs, and its head
+watches the player; its mind is a small state machine, grazing,
+wandering, alert, fleeing, that steers its mover towards a goal, away
+from the player, clear of the trees and apart from the herd. The
+birds are figures of a body and two wings that beat. The water is a
+square at the water level drawn with the water material, which reads
+the land's height from the height map as a texture.
 Everything is a plain colour in its vertices over a white texel. The
 shaders are Shade's. The scene is drawn at twice the screen's size
 and averaged down (`post.sub`), so its edges are smooth and its lines
 fine.
 
 The game is tested without a browser (`tests/ui/valley.sub`): the
-land's heights, the path, what grows on it, the day, and the player
-walking, running, jumping, looking around, crossing the bridge,
-stopped by a tree and by the hut, and wading into the river. The browser test reads
+land's heights, the path, what stands on it, every mesh checked to
+face outwards, the day, the player walking, running, jumping, looking
+around, crossing the bridge, stopped by a tree and by the hut, and
+wading into the river, and the herd watching and scattering (the
+space, the movers, the props and the models have tests of their own). The browser test reads
 the GPU's picture: sky, meadow, river, the bridge's wood, a view that
 changes with walking, and the lake from its shore through the game's
 `look` export, which puts the player anywhere (in the browser's
 console, `window.app.call('look', x, z, yaw, pitch)`). The compiled
-program is 197 KB, and its asset under 1 KB.
+program is 292 KB, and its asset under 1 KB.
 
 ```sh
 lib/web/site.sh lib/web/examples/valley/valley.sub build/lib/web/valley lib/web/examples/valley/page.html
@@ -1005,9 +1039,9 @@ In headless Chromium, on the development machine:
 
 | The valley example (GPU) | |
 |---|---|
-| Making the land (263,000 vertices), placing the trees, the bushes, the boulders and the stones, and 8,000 tufts of grass around the player, on the first frame | 200 ms |
-| A frame: a step, and the land, the trees, the grass, the boulders and the water drawn twice (shadow map, scene), the sky and the picture pass, in the program | 0.1 ms |
-| The same frame on the GPU, at twice the screen's size each way, from hand-over until done: RTX 5090 / SwiftShader | 2.3 ms / 0.5 s |
+| Making the land (263,000 vertices), placing the trees, the bushes, the boulders and the stones, 7,000 tufts of grass around the player, the herd and the flock, on the first frame | 170 ms |
+| A frame: a step with ten deer thinking and moving, the props of the cells in view and the figures submitted, and the land, the trees, the grass, the boulders, the creatures and the water drawn three times (two shadow maps, scene), the sky and the picture pass, in the program | 0.2 ms |
+| The same frame on the GPU, at twice the screen's size each way, from hand-over until done: RTX 5090 / SwiftShader | 2.6 ms / 0.8 s |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
 |---|---|---|---|
