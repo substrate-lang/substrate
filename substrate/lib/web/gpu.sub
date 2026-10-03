@@ -1,0 +1,577 @@
+;; Lifecycle: experimental.
+;;
+;; WebGPU from a program: the program's side of the host module "gpu".
+;; host/web/gpu.mjs documents every command, what it does and the codes
+;; it takes; this file writes the commands.
+;;
+;; The functions below append commands to a buffer. Nothing is sent to
+;; the GPU until whoever runs the program hands the buffer to the host
+;; with gpu.apply; the game loop does that at the end of each frame
+;; (game/game.sub). So a renderer written with this file needs no
+;; browser: a test can print what it wrote (trace.sub).
+;;
+;; Resources are numbered. A function that makes a resource returns its
+;; number, which the program uses from then on; the numbers of each kind
+;; are given out from 1. Commands that take lists are written in pieces:
+;; the command, then its items, as many as the command said, in the
+;; order the host expects them (shown below). Writing anything else
+;; before the items are complete stops the program with a message.
+;;
+;; Making resources:
+;;
+;;   (gpu-surface! node)                            -> surface
+;;   (gpu-shader! code)                             -> shader
+;;   (gpu-render-pipeline! shader vertex fragment topology cull front
+;;                         blend depth-format depth-compare depth-write
+;;                         layouts targets buffers) -> pipeline
+;;       then `layouts` times (gpu-layout-item! layout),
+;;       then `targets` times (gpu-target! format),
+;;       then `buffers` times (gpu-vertex-buffer-layout! stride step
+;;       attributes), each followed by its `attributes` times
+;;       (gpu-attribute! location offset format)
+;;   (gpu-compute-pipeline! shader entry layouts)   -> pipeline
+;;       then `layouts` times (gpu-layout-item! layout)
+;;   (gpu-buffer! size usage)                       -> buffer
+;;   (gpu-texture! width height layers mips format usage)
+;;                                                  -> texture
+;;   (gpu-texture-file! path)                       -> texture
+;;   (gpu-sampler! filter address compare)          -> sampler
+;;   (gpu-layout! n)                                -> layout
+;;       then n times (gpu-layout-entry! binding visibility kind)
+;;   (gpu-bind-group! layout pipeline group n)      -> bind group
+;;       then n times (gpu-bind-buffer! binding buffer offset size),
+;;       (gpu-bind-sampler! binding sampler) or
+;;       (gpu-bind-texture! binding texture)
+;;   (gpu-destroy! kind id)
+;;
+;; Writing and reading:
+;;
+;;   (gpu-write-buffer! buffer offset p n)          n bytes at p
+;;   (gpu-write-texture! texture mip layer x y w h p n)
+;;   (gpu-read-texture! texture mip layer x y w h)
+;;   (gpu-read-buffer! buffer offset n)
+;;
+;; The host reads the bytes of a write when the commands are handed
+;; over, not when the command is written, so they must stay where they
+;; are until then: in the program's own memory, such as an array of
+;; instances it keeps, not on the stack. For a few bytes made on the
+;; spot, such as a uniform, (gpu-frame-copy p n) returns a copy that
+;; lasts long enough. Text (code, names, paths) is copied by the
+;; functions that take it.
+;;
+;; Passes:
+;;
+;;   (gpu-render-pass! targets depth-texture depth-mip depth-layer
+;;                     depth-load depth-clear)
+;;       then `targets` times (gpu-pass-target! kind id mip layer load
+;;       r g b a)
+;;   (gpu-compute-pass!)
+;;   (gpu-end-pass!)
+;;   (gpu-pipeline! pipeline)
+;;   (gpu-bind-group-set! group bind-group n)
+;;       then n times (gpu-offset! offset)
+;;   (gpu-vertex-buffer! slot buffer offset)
+;;   (gpu-index-buffer! buffer format offset)
+;;   (gpu-draw! vertices instances first-vertex first-instance)
+;;   (gpu-draw-indexed! indexes instances first-index base-vertex
+;;                      first-instance)
+;;   (gpu-dispatch! x y z)
+;;   (gpu-viewport! x y w h)
+;;   (gpu-scissor! x y w h)
+;;
+;; The buffer:
+;;
+;;   (gpu-commands)        the buffer, for the code that hands it to the
+;;                         host or prints it
+;;   (gpu-commands-done!)  empties it, once it has been handed over
+;;   (gpu-frame-alloc n)   memory that lasts until then, for bytes that
+;;                         a command refers to
+;;   (gpu-frame-copy p n)  a copy of the n bytes at p in such memory
+;;
+;; The codes, named. Each is the number host/web/gpu.mjs gives it.
+;;
+;;   formats          gpu-format-surface gpu-rgba8 gpu-bgra8 gpu-r8 gpu-rg8
+;;                    gpu-rgba16f gpu-r32f gpu-rgba32f gpu-depth24 gpu-depth32f
+;;   vertex formats   gpu-f32 gpu-f32x2 gpu-f32x3 gpu-f32x4 gpu-u32
+;;                    gpu-u32x2 gpu-u32x4 gpu-i32 gpu-unorm8x4 gpu-snorm8x4
+;;                    gpu-f16x2 gpu-f16x4 gpu-u8x4 gpu-unorm16x2 gpu-unorm16x4
+;;   topology         gpu-triangles gpu-triangle-strip gpu-lines
+;;                    gpu-line-strip gpu-points
+;;   cull             gpu-cull-none gpu-cull-back gpu-cull-front
+;;   front            gpu-ccw gpu-cw
+;;   blend            gpu-blend-none gpu-blend-alpha gpu-blend-premultiplied
+;;                    gpu-blend-add
+;;   comparison       gpu-compare-none gpu-less gpu-less-equal gpu-greater
+;;                    gpu-greater-equal gpu-equal gpu-always gpu-never
+;;   buffer usage     gpu-vertex gpu-index gpu-uniform gpu-storage
+;;                    gpu-indirect (bits, added together)
+;;   texture usage    gpu-sampled gpu-target gpu-storage-texture (bits)
+;;   sampler          gpu-nearest gpu-linear; gpu-clamp gpu-repeat gpu-mirror
+;;   layout entries   gpu-uniform-entry gpu-storage-entry
+;;                    gpu-read-only-entry gpu-dynamic-uniform-entry
+;;                    gpu-dynamic-storage-entry gpu-dynamic-read-only-entry
+;;                    gpu-sampler-entry gpu-comparison-entry
+;;                    gpu-texture-entry gpu-depth-entry
+;;                    gpu-storage-texture-entry
+;;   visibility       gpu-in-vertex gpu-in-fragment gpu-in-compute (bits)
+;;   step             gpu-per-vertex gpu-per-instance
+;;   pass targets     gpu-on-surface gpu-on-texture; gpu-keep gpu-clear
+;;   index format     gpu-u16-indexes gpu-u32-indexes
+;;   resource kinds   gpu-kind-surface gpu-kind-shader gpu-kind-pipeline
+;;                    gpu-kind-buffer gpu-kind-texture gpu-kind-sampler
+;;                    gpu-kind-layout gpu-kind-bind-group
+;;   events           gpu-error gpu-loaded gpu-pixels gpu-bytes
+(require-unqualified base "../../compiler/base/base.sub")
+
+(provide gpu-surface! gpu-shader! gpu-render-pipeline! gpu-layout-item! gpu-target! gpu-vertex-buffer-layout! gpu-attribute!
+         gpu-compute-pipeline! gpu-buffer! gpu-texture! gpu-texture-file! gpu-sampler! gpu-layout! gpu-layout-entry!
+         gpu-bind-group! gpu-bind-buffer! gpu-bind-sampler! gpu-bind-texture! gpu-destroy!
+         gpu-write-buffer! gpu-write-texture! gpu-read-texture! gpu-read-buffer!
+         gpu-render-pass! gpu-pass-target! gpu-compute-pass! gpu-end-pass! gpu-pipeline! gpu-bind-group-set! gpu-offset!
+         gpu-vertex-buffer! gpu-index-buffer! gpu-draw! gpu-draw-indexed! gpu-dispatch! gpu-viewport! gpu-scissor!
+         gpu-commands gpu-commands-done! gpu-frame-alloc gpu-frame-copy
+         gpu-format-surface gpu-rgba8 gpu-bgra8 gpu-r8 gpu-rg8 gpu-rgba16f gpu-r32f gpu-rgba32f gpu-depth24 gpu-depth32f
+         gpu-f32 gpu-f32x2 gpu-f32x3 gpu-f32x4 gpu-u32 gpu-u32x2 gpu-u32x4 gpu-i32 gpu-unorm8x4 gpu-snorm8x4
+         gpu-f16x2 gpu-f16x4 gpu-u8x4 gpu-unorm16x2 gpu-unorm16x4
+         gpu-triangles gpu-triangle-strip gpu-lines gpu-line-strip gpu-points
+         gpu-cull-none gpu-cull-back gpu-cull-front gpu-ccw gpu-cw
+         gpu-blend-none gpu-blend-alpha gpu-blend-premultiplied gpu-blend-add
+         gpu-compare-none gpu-less gpu-less-equal gpu-greater gpu-greater-equal gpu-equal gpu-always gpu-never
+         gpu-vertex gpu-index gpu-uniform gpu-storage gpu-indirect gpu-sampled gpu-target gpu-storage-texture
+         gpu-nearest gpu-linear gpu-clamp gpu-repeat gpu-mirror
+         gpu-uniform-entry gpu-storage-entry gpu-read-only-entry gpu-dynamic-uniform-entry gpu-dynamic-storage-entry
+         gpu-dynamic-read-only-entry gpu-sampler-entry gpu-comparison-entry gpu-texture-entry gpu-depth-entry
+         gpu-storage-texture-entry gpu-in-vertex gpu-in-fragment gpu-in-compute
+         gpu-per-vertex gpu-per-instance gpu-on-surface gpu-on-texture gpu-keep gpu-clear gpu-u16-indexes gpu-u32-indexes
+         gpu-kind-surface gpu-kind-shader gpu-kind-pipeline gpu-kind-buffer gpu-kind-texture gpu-kind-sampler
+         gpu-kind-layout gpu-kind-bind-group
+         gpu-error gpu-loaded gpu-pixels gpu-bytes)
+
+(memory from base)
+(table from base)
+
+;; The host's function that stops the program with a message (spec 4).
+(import host-trap "host" "trap" (i32 i32 ->))
+(define (stop [message (ptr u8)]) (host-trap (cast i32 message) (cast i32 (strlen message))))
+
+;; ---- The codes ----
+
+(define gpu-format-surface u32 0)
+(define gpu-rgba8 u32 1)
+(define gpu-bgra8 u32 2)
+(define gpu-r8 u32 3)
+(define gpu-rg8 u32 4)
+(define gpu-rgba16f u32 5)
+(define gpu-r32f u32 6)
+(define gpu-rgba32f u32 7)
+(define gpu-depth24 u32 8)
+(define gpu-depth32f u32 9)
+
+(define gpu-f32 u32 1)
+(define gpu-f32x2 u32 2)
+(define gpu-f32x3 u32 3)
+(define gpu-f32x4 u32 4)
+(define gpu-u32 u32 5)
+(define gpu-u32x2 u32 6)
+(define gpu-u32x4 u32 7)
+(define gpu-i32 u32 8)
+(define gpu-unorm8x4 u32 9)
+(define gpu-snorm8x4 u32 10)
+(define gpu-f16x2 u32 11)
+(define gpu-f16x4 u32 12)
+(define gpu-u8x4 u32 13)
+(define gpu-unorm16x2 u32 14)
+(define gpu-unorm16x4 u32 15)
+
+(define gpu-triangles u32 1)
+(define gpu-triangle-strip u32 2)
+(define gpu-lines u32 3)
+(define gpu-line-strip u32 4)
+(define gpu-points u32 5)
+
+(define gpu-cull-none u32 0)
+(define gpu-cull-back u32 1)
+(define gpu-cull-front u32 2)
+(define gpu-ccw u32 0)
+(define gpu-cw u32 1)
+
+(define gpu-blend-none u32 0)
+(define gpu-blend-alpha u32 1)
+(define gpu-blend-premultiplied u32 2)
+(define gpu-blend-add u32 3)
+
+(define gpu-compare-none u32 0)
+(define gpu-less u32 1)
+(define gpu-less-equal u32 2)
+(define gpu-greater u32 3)
+(define gpu-greater-equal u32 4)
+(define gpu-equal u32 5)
+(define gpu-always u32 6)
+(define gpu-never u32 7)
+
+(define gpu-vertex u32 1)
+(define gpu-index u32 2)
+(define gpu-uniform u32 4)
+(define gpu-storage u32 8)
+(define gpu-indirect u32 16)
+(define gpu-sampled u32 1)
+(define gpu-target u32 2)
+(define gpu-storage-texture u32 4)
+
+(define gpu-nearest u32 0)
+(define gpu-linear u32 1)
+(define gpu-clamp u32 0)
+(define gpu-repeat u32 1)
+(define gpu-mirror u32 2)
+
+(define gpu-uniform-entry u32 1)
+(define gpu-storage-entry u32 2)
+(define gpu-read-only-entry u32 3)
+(define gpu-dynamic-uniform-entry u32 4)
+(define gpu-dynamic-storage-entry u32 5)
+(define gpu-dynamic-read-only-entry u32 6)
+(define gpu-sampler-entry u32 7)
+(define gpu-comparison-entry u32 8)
+(define gpu-texture-entry u32 9)
+(define gpu-depth-entry u32 10)
+(define gpu-storage-texture-entry u32 11)
+(define gpu-in-vertex u32 1)
+(define gpu-in-fragment u32 2)
+(define gpu-in-compute u32 4)
+
+(define gpu-per-vertex u32 0)
+(define gpu-per-instance u32 1)
+(define gpu-on-surface u32 1)
+(define gpu-on-texture u32 2)
+(define gpu-keep u32 0)
+(define gpu-clear u32 1)
+(define gpu-u16-indexes u32 0)
+(define gpu-u32-indexes u32 1)
+
+(define gpu-kind-surface u32 1)
+(define gpu-kind-shader u32 2)
+(define gpu-kind-pipeline u32 3)
+(define gpu-kind-buffer u32 4)
+(define gpu-kind-texture u32 5)
+(define gpu-kind-sampler u32 6)
+(define gpu-kind-layout u32 7)
+(define gpu-kind-bind-group u32 8)
+
+(define gpu-error u32 1)
+(define gpu-loaded u32 2)
+(define gpu-pixels u32 3)
+(define gpu-bytes u32 4)
+
+;; ---- The buffer ----
+
+(define commands buffer)
+(define frame arena)
+
+(define (gpu-commands) -> (ptr buffer) (& commands))
+
+(define (gpu-commands-done!)
+  (set! (-> commands length) 0)
+  (arena-free (& frame)))
+
+(define (gpu-frame-alloc [n u32]) -> (ptr void) (arena-alloc (& frame) n))
+
+(define (gpu-frame-copy [p (ptr void)] [n u32]) -> (ptr void)
+  (let ([copy (gpu-frame-alloc n)])
+    (memcpy copy p n)
+    copy))
+
+;; Appends n words.
+(define (words! [w (ptr u32)] [n u32]) (buffer-add! (& commands) (cast (ptr u8) w) (* 4 n)))
+
+(define (word! [w u32]) (buffer-add! (& commands) (cast (ptr u8) (array-of u32 w)) 4))
+
+(define (float! [x f64]) (buffer-add! (& commands) (cast (ptr u8) (array-of f32 (cast f32 x))) 4))
+
+;; A text operand: the address and length of a copy that lasts until
+;; the commands have been handed over.
+(define (text! [s (ptr u8)])
+  (let* ([n (strlen s)] [copy (cast (ptr u8) (gpu-frame-alloc (+ n 1)))])
+    (memcpy copy s (+ n 1))
+    (words! (array-of u32 (cast u32 copy) n) 2)))
+
+;; ---- The items a command still expects ----
+;;
+;; A command with lists is followed by its items. These counters say how
+;; many are still expected, so that an item written at the wrong time,
+;; or a command written before the items are complete, is caught here
+;; rather than confusing the host.
+
+(define expected-layouts u32 0)
+(define expected-targets u32 0)
+(define expected-buffers u32 0)
+(define expected-attributes u32 0)
+(define expected-entries u32 0)
+(define expected-bindings u32 0)
+(define expected-pass-targets u32 0)
+(define expected-offsets u32 0)
+
+(define (complete!)
+  (when (or (> expected-layouts 0) (> expected-targets 0) (> expected-buffers 0) (> expected-attributes 0)
+            (> expected-entries 0) (> expected-bindings 0) (> expected-pass-targets 0) (> expected-offsets 0))
+    (stop "gpu: the last command is still waiting for its items (layouts, targets, attributes, entries or offsets)")))
+
+;; Takes one expected item of a kind, or stops the program with the
+;; message `unexpected`.
+(define (item! [expected (ptr u32)] [unexpected (ptr u8)])
+  (when (== (@ expected) 0) (stop unexpected))
+  (-= (@ expected) 1))
+
+;; ---- Numbers ----
+
+(define next-surface u32 1)
+(define next-shader u32 1)
+(define next-pipeline u32 1)
+(define next-buffer u32 1)
+(define next-texture u32 1)
+(define next-sampler u32 1)
+(define next-layout u32 1)
+(define next-bind-group u32 1)
+
+(define (fresh! [next (ptr u32)]) -> u32
+  (let ([n (@ next)])
+    (+= (@ next) 1)
+    n))
+
+;; ---- Making resources ----
+
+(define (gpu-surface! [node u32]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-surface))])
+    (words! (array-of u32 1 id node) 3)
+    id))
+
+(define (gpu-shader! [code (ptr u8)]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-shader))])
+    (words! (array-of u32 2 id) 2)
+    (text! code)
+    id))
+
+(define (gpu-render-pipeline! [shader u32] [vertex (ptr u8)] [fragment (ptr u8)] [topology u32] [cull u32] [front u32]
+                              [blend u32] [depth-format u32] [depth-compare u32] [depth-write u32]
+                              [layouts u32] [targets u32] [buffers u32]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-pipeline))])
+    (words! (array-of u32 3 id shader) 3)
+    (text! vertex)
+    (text! fragment)
+    (words! (array-of u32 topology cull front blend depth-format depth-compare depth-write layouts) 8)
+    (set! expected-layouts layouts)
+    (set! expected-targets targets)
+    (set! expected-buffers buffers)
+    (set! rendering 1)
+    ;; The counts of targets and buffers are written when their turn
+    ;; comes (see gpu-layout-item! and gpu-target!), since the host reads
+    ;; each count just before its items.
+    (when (== layouts 0) (after-layouts!))
+    id))
+
+;; Whether the layouts being written are a render pipeline's, which are
+;; followed by the count of targets, and the targets by the count of
+;; buffers. A compute pipeline's are followed by nothing.
+(define rendering i32 0)
+
+(define (after-layouts!)
+  (when rendering
+    (word! expected-targets)
+    (when (== expected-targets 0) (after-targets!))))
+
+(define (after-targets!) (word! expected-buffers))
+
+(define (gpu-layout-item! [layout u32])
+  (item! (& expected-layouts) "gpu: no layout is expected here")
+  (word! layout)
+  (when (== expected-layouts 0) (after-layouts!)))
+
+(define (gpu-target! [format u32])
+  (item! (& expected-targets) "gpu: no target is expected here")
+  (word! format)
+  (when (== expected-targets 0) (after-targets!)))
+
+(define (gpu-vertex-buffer-layout! [stride u32] [step u32] [attributes u32])
+  (when (> expected-attributes 0) (stop "gpu: the attributes of the last vertex buffer are not complete"))
+  (item! (& expected-buffers) "gpu: no vertex buffer layout is expected here")
+  (words! (array-of u32 stride step attributes) 3)
+  (set! expected-attributes attributes))
+
+(define (gpu-attribute! [location u32] [offset u32] [format u32])
+  (item! (& expected-attributes) "gpu: no attribute is expected here")
+  (words! (array-of u32 location offset format) 3))
+
+(define (gpu-compute-pipeline! [shader u32] [entry (ptr u8)] [layouts u32]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-pipeline))])
+    (words! (array-of u32 4 id shader) 3)
+    (text! entry)
+    (word! layouts)
+    (set! expected-layouts layouts)
+    (set! rendering 0)
+    id))
+
+(define (gpu-buffer! [size u32] [usage u32]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-buffer))])
+    (words! (array-of u32 5 id size usage) 4)
+    id))
+
+(define (gpu-texture! [width u32] [height u32] [layers u32] [mips u32] [format u32] [usage u32]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-texture))])
+    (words! (array-of u32 6 id width height layers mips format usage) 8)
+    id))
+
+(define (gpu-texture-file! [path (ptr u8)]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-texture))])
+    (words! (array-of u32 7 id) 2)
+    (text! path)
+    id))
+
+(define (gpu-sampler! [filter u32] [address u32] [compare u32]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-sampler))])
+    (words! (array-of u32 8 id filter address compare) 5)
+    id))
+
+(define (gpu-layout! [n u32]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-layout))])
+    (words! (array-of u32 9 id n) 3)
+    (set! expected-entries n)
+    id))
+
+(define (gpu-layout-entry! [binding u32] [visibility u32] [kind u32])
+  (item! (& expected-entries) "gpu: no layout entry is expected here")
+  (words! (array-of u32 binding visibility kind) 3))
+
+(define (gpu-bind-group! [layout u32] [pipeline u32] [group u32] [n u32]) -> u32
+  (complete!)
+  (let ([id (fresh! (& next-bind-group))])
+    (words! (array-of u32 10 id layout pipeline group n) 6)
+    (set! expected-bindings n)
+    id))
+
+(define (gpu-bind-buffer! [binding u32] [buffer u32] [offset u32] [size u32])
+  (item! (& expected-bindings) "gpu: no binding is expected here")
+  (words! (array-of u32 binding 1 buffer offset size) 5))
+
+(define (gpu-bind-sampler! [binding u32] [sampler u32])
+  (item! (& expected-bindings) "gpu: no binding is expected here")
+  (words! (array-of u32 binding 2 sampler 0 0) 5))
+
+(define (gpu-bind-texture! [binding u32] [texture u32])
+  (item! (& expected-bindings) "gpu: no binding is expected here")
+  (words! (array-of u32 binding 3 texture 0 0) 5))
+
+(define (gpu-destroy! [kind u32] [id u32])
+  (complete!)
+  (words! (array-of u32 11 kind id) 3))
+
+;; ---- Writing and reading ----
+
+(define (gpu-write-buffer! [buffer u32] [offset u32] [p (ptr void)] [n u32])
+  (complete!)
+  (words! (array-of u32 12 buffer offset (cast u32 p) n) 5))
+
+(define (gpu-write-texture! [texture u32] [mip u32] [layer u32] [x u32] [y u32] [w u32] [h u32] [p (ptr void)] [n u32])
+  (complete!)
+  (words! (array-of u32 13 texture mip layer x y w h (cast u32 p) n) 10))
+
+(define (gpu-read-texture! [texture u32] [mip u32] [layer u32] [x u32] [y u32] [w u32] [h u32])
+  (complete!)
+  (words! (array-of u32 14 texture mip layer x y w h) 8))
+
+(define (gpu-read-buffer! [buffer u32] [offset u32] [n u32])
+  (complete!)
+  (words! (array-of u32 15 buffer offset n) 4))
+
+;; ---- Passes ----
+
+(define (gpu-render-pass! [targets u32] [depth-texture u32] [depth-mip u32] [depth-layer u32] [depth-load u32] [depth-clear f64])
+  (complete!)
+  (words! (array-of u32 16 targets) 2)
+  (set! expected-pass-targets targets)
+  ;; The depth attachment follows the targets, so it waits for them.
+  (set! pending-depth-texture depth-texture)
+  (set! pending-depth-mip depth-mip)
+  (set! pending-depth-layer depth-layer)
+  (set! pending-depth-load depth-load)
+  (set! pending-depth-clear depth-clear)
+  (when (== targets 0) (depth!)))
+
+(define pending-depth-texture u32 0)
+(define pending-depth-mip u32 0)
+(define pending-depth-layer u32 0)
+(define pending-depth-load u32 0)
+(define pending-depth-clear f64 0.0)
+
+(define (depth!)
+  (words! (array-of u32 pending-depth-texture pending-depth-mip pending-depth-layer pending-depth-load) 4)
+  (float! pending-depth-clear))
+
+(define (gpu-pass-target! [kind u32] [id u32] [mip u32] [layer u32] [load u32] [r f64] [g f64] [b f64] [a f64])
+  (item! (& expected-pass-targets) "gpu: no pass target is expected here")
+  (words! (array-of u32 kind id mip layer load) 5)
+  (float! r)
+  (float! g)
+  (float! b)
+  (float! a)
+  (when (== expected-pass-targets 0) (depth!)))
+
+(define (gpu-compute-pass!)
+  (complete!)
+  (word! 17))
+
+(define (gpu-end-pass!)
+  (complete!)
+  (word! 18))
+
+(define (gpu-pipeline! [pipeline u32])
+  (complete!)
+  (words! (array-of u32 19 pipeline) 2))
+
+(define (gpu-bind-group-set! [group u32] [bind-group u32] [n u32])
+  (complete!)
+  (words! (array-of u32 20 group bind-group n) 4)
+  (set! expected-offsets n))
+
+(define (gpu-offset! [offset u32])
+  (item! (& expected-offsets) "gpu: no offset is expected here")
+  (word! offset))
+
+(define (gpu-vertex-buffer! [slot u32] [buffer u32] [offset u32])
+  (complete!)
+  (words! (array-of u32 21 slot buffer offset) 4))
+
+(define (gpu-index-buffer! [buffer u32] [format u32] [offset u32])
+  (complete!)
+  (words! (array-of u32 22 buffer format offset) 4))
+
+(define (gpu-draw! [vertices u32] [instances u32] [first-vertex u32] [first-instance u32])
+  (complete!)
+  (words! (array-of u32 23 vertices instances first-vertex first-instance) 5))
+
+(define (gpu-draw-indexed! [indexes u32] [instances u32] [first-index u32] [base-vertex u32] [first-instance u32])
+  (complete!)
+  (words! (array-of u32 24 indexes instances first-index base-vertex first-instance) 6))
+
+(define (gpu-dispatch! [x u32] [y u32] [z u32])
+  (complete!)
+  (words! (array-of u32 25 x y z) 4))
+
+(define (gpu-viewport! [x f64] [y f64] [w f64] [h f64])
+  (complete!)
+  (word! 26)
+  (float! x)
+  (float! y)
+  (float! w)
+  (float! h))
+
+(define (gpu-scissor! [x u32] [y u32] [w u32] [h u32])
+  (complete!)
+  (words! (array-of u32 27 x y w h) 5))

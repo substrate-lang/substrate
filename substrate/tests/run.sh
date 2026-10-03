@@ -19,7 +19,8 @@
 # libraries that need no browser (lib/web): they print the page changes
 # a view produces, check the error messages for templates that are
 # wrong, test reading files and the game library (collision, keys,
-# timers, sound, its containers and its formatting), and play the two
+# timers, sound, its containers and its formatting), print the GPU
+# commands that a program and the sprite renderer write, and play the
 # example games without their pages. tests/session has the session
 # tests, which bin/sub eval runs. Then the cache (spec 3.7): each
 # program built again from it is the same, and a stale entry is not

@@ -23,8 +23,18 @@
 #      snake           the snake game (lib/web/examples/snake)
 #      platformer      the platformer (lib/web/examples/platformer),
 #                      built on the game library (lib/web/game)
+#      blocks          the world of blocks (lib/web/examples/blocks),
+#                      drawn in 3D by the GPU
 #      sounds          a game that plays a sound file, once and as music
 #                      (sounds.sub)
+#      gpu             the host module "gpu" (host/web/gpu.mjs) used
+#                      directly: drawing into a texture, a compute shader
+#                      and a shader error, each read back (gpu.sub)
+#      sprites, sprites-canvas
+#                      the game that draws many sprites (sprites-world.sub),
+#                      drawn by the GPU renderer (lib/web/game/sprites.sub)
+#                      and by the 2D canvas: both draw the same picture.
+#                      These are also the pages that sprites.mjs measures
 #      stopped, stopped-at-start
 #                      games that trap, in a step and while starting: the
 #                      game must stop and show the report (stopped.sub,
@@ -42,8 +52,9 @@
 #                      pack)
 #      repl            the REPL page (lib/web/repl)
 #
-# rows.mjs is not part of the tests. It measures how long the operations
-# of the rows example take.
+# rows.mjs and sprites.mjs are not part of the tests. They measure how
+# long the operations of the rows example take, and how long the two
+# renderers take to draw many sprites.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
@@ -77,15 +88,19 @@ lib/web/site.sh tests/web/assets.sub "$sites/assets"
 lib/web/site.sh tests/web/canvas.sub "$sites/canvas"
 lib/web/site.sh lib/web/examples/snake/snake.sub "$sites/snake" lib/web/examples/snake/page.html
 lib/web/site.sh lib/web/examples/platformer/platformer.sub "$sites/platformer" lib/web/examples/platformer/page.html
+lib/web/site.sh lib/web/examples/blocks/blocks.sub "$sites/blocks" lib/web/examples/blocks/page.html
 # The sounds page uses the platformer's page, which keeps the audio module
 # where the test can ask it what was played.
 lib/web/site.sh tests/web/sounds.sub "$sites/sounds" lib/web/examples/platformer/page.html
 lib/web/site.sh tests/web/stopped.sub "$sites/stopped"
 lib/web/site.sh tests/web/stopped-at-start.sub "$sites/stopped-at-start"
+lib/web/site.sh tests/web/gpu.sub "$sites/gpu" tests/web/gpu.html
+lib/web/site.sh tests/web/sprites.sub "$sites/sprites" tests/web/sprites.html
+lib/web/site.sh tests/web/sprites-canvas.sub "$sites/sprites-canvas" tests/web/sprites.html
 lib/web/site.sh tests/web/guests.sub "$sites/guests" tests/web/guests.html
 bin/sub build tests/web/a-guest.sub -o "$sites/guests/guest"
 host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
 rm -r "${sites:?}/guests/guest"
 node tests/web/pages.mjs "$sites" counter rows focus fields assets canvas snake platformer sounds stopped stopped-at-start \
-  guests repl || status=1
+  guests repl gpu sprites sprites-canvas blocks || status=1
 exit $status

@@ -1,0 +1,232 @@
+;; Lifecycle: experimental.
+;;
+;; Meshes drawn by the GPU: a renderer for a 3D scene built on ../gpu.sub,
+;; as sprites.sub is for 2D.
+;;
+;; A mesh is a list of textured triangles that the program builds
+;; (voxels.sub builds them for a world of blocks): vertices of six
+;; floats each, position (x, y, z), texel (u, v) in an atlas, and a
+;; shade from 0 to 1; and indexes, three u32 per triangle. Every mesh
+;; shares the one atlas, and each has an origin, where its (0, 0, 0)
+;; is in the world. A frame draws all the meshes from a camera, with
+;; depth so that near things hide far ones, back faces culled, and fog
+;; towards a colour by distance.
+;;
+;;   (meshes-init! r atlas width height)
+;;       Makes the GPU resources: the atlas from the image file at
+;;       `atlas` (loaded by the host), and a depth texture for a target
+;;       `width` by `height` pixels. Call it once.
+;;   (meshes-add! r) -> mesh
+;;       A new, empty mesh. Returns its number, from 0.
+;;   (meshes-set! r mesh vertices indices x y z)
+;;       Gives the mesh its triangles, from two buffers (c.sub's
+;;       buffer) of vertices and indexes, and its origin. The bytes are
+;;       read when the frame is handed over (gpu.sub), so the buffers
+;;       must keep them until then.
+;;   (meshes-draw! r kind target format projection x y z yaw pitch
+;;                 sky fog-near fog-far)
+;;       Writes the commands that draw the meshes on a target (as
+;;       sprites-draw! takes it: gpu-on-surface or gpu-on-texture, its
+;;       number and its format), which is first cleared to the colour
+;;       `sky` (#xRRGGBBAA), from the camera at (x, y, z) turned by
+;;       yaw and pitch (math.sub's mat4-view!), with the given
+;;       projection matrix. Beyond fog-near things fade to the sky
+;;       colour, and at fog-far they are gone.
+;;
+;; A game that draws sprites and text over the scene draws the scene
+;; first: the sprite batch is drawn after the game's draw function
+;; without clearing the target (draw.sub).
+;;
+;; ---- How it works ----
+;;
+;; One pipeline draws every mesh. A frame is a uniform buffer with the
+;; camera's matrix, the fog colour and the fog distances; each mesh's
+;; origin is in a second uniform buffer, 256 bytes apart as WebGPU
+;; requires, and chosen per draw with a dynamic offset (gpu-offset!),
+;; so that the meshes share one bind group. Each mesh has a vertex
+;; buffer and an index buffer on the GPU, replaced by bigger ones when
+;; the mesh outgrows them.
+(require-unqualified base "../../../compiler/base/base.sub")
+(require-unqualified gpu "../gpu.sub")
+(require-unqualified math "math.sub")
+
+(provide meshes meshes-init! meshes-add! meshes-set! meshes-draw!)
+
+(memory from base)
+(table from base)
+
+(struct mesh
+  [vertices u32] [vertex-room u32]   ; the GPU buffer and its size in bytes
+  [indices u32] [index-room u32]
+  [index-count u32]
+  [x f64] [y f64] [z f64])
+
+(struct meshes
+  [items (ptr mesh)] [count u32] [capacity u32]
+  [shader u32] [frame-layout u32] [mesh-layout u32] [sampler u32] [atlas u32]
+  [frame-uniforms u32] [frame-group u32]
+  ;; The origins, one 256-byte slot per mesh.
+  [origins u32] [origin-slots u32] [origin-group u32]
+  [depth u32]
+  ;; The pipeline for each target format, made when first needed.
+  [pipelines (array u32 10)])
+
+(define shader-code (ptr u8) "
+struct Frame { view_projection: mat4x4f, sky: vec4f, fog: vec4f }
+struct Origin { at: vec4f }
+@group(0) @binding(0) var<uniform> frame: Frame;
+@group(0) @binding(1) var atlas_sampler: sampler;
+@group(0) @binding(2) var atlas: texture_2d<f32>;
+@group(1) @binding(0) var<uniform> origin: Origin;
+
+struct In {
+  @location(0) position: vec3f,
+  @location(1) texel: vec2f,
+  @location(2) shade: f32,
+}
+
+struct Out {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) shade: f32,
+  @location(2) distance: f32,
+}
+
+@vertex fn vertex(in: In) -> Out {
+  var out: Out;
+  out.position = frame.view_projection * vec4f(in.position + origin.at.xyz, 1.0);
+  out.uv = in.texel / vec2f(textureDimensions(atlas));
+  out.shade = in.shade;
+  out.distance = out.position.w;
+  return out;
+}
+
+@fragment fn fragment(in: Out) -> @location(0) vec4f {
+  let color = textureSample(atlas, atlas_sampler, in.uv).rgb * in.shade;
+  let fog = clamp((in.distance - frame.fog.x) / (frame.fog.y - frame.fog.x), 0.0, 1.0);
+  return vec4f(mix(color, frame.sky.rgb, fog), 1.0);
+}
+")
+
+(define frame-bytes u32 96)
+(define origin-stride u32 256)
+(define vertex-bytes u32 24)
+
+(define (meshes-init! [r (ptr meshes)] [atlas (ptr u8)] [width u32] [height u32])
+  (memset r 0 (sizeof meshes))
+  (set! (-> r shader) (gpu-shader! shader-code))
+  ;; The vertex shader asks the atlas for its size, so the atlas is
+  ;; visible to both stages.
+  (set! (-> r frame-layout) (gpu-layout! 3))
+  (gpu-layout-entry! 0 (+ gpu-in-vertex gpu-in-fragment) gpu-uniform-entry)
+  (gpu-layout-entry! 1 gpu-in-fragment gpu-sampler-entry)
+  (gpu-layout-entry! 2 (+ gpu-in-vertex gpu-in-fragment) gpu-texture-entry)
+  (set! (-> r mesh-layout) (gpu-layout! 1))
+  (gpu-layout-entry! 0 gpu-in-vertex gpu-dynamic-uniform-entry)
+  (set! (-> r sampler) (gpu-sampler! gpu-nearest gpu-clamp gpu-compare-none))
+  (set! (-> r atlas) (gpu-texture-file! atlas))
+  (set! (-> r frame-uniforms) (gpu-buffer! frame-bytes gpu-uniform))
+  (set! (-> r frame-group) (gpu-bind-group! (-> r frame-layout) 0 0 3))
+  (gpu-bind-buffer! 0 (-> r frame-uniforms) 0 0)
+  (gpu-bind-sampler! 1 (-> r sampler))
+  (gpu-bind-texture! 2 (-> r atlas))
+  (origins! r 16)
+  (set! (-> r depth) (gpu-texture! width height 1 1 gpu-depth24 gpu-target)))
+
+;; The buffer of origins, with room for `slots` meshes, and its bind
+;; group, which sees one slot at a time. A bigger buffer in place of a
+;; full one gets the origins of the meshes there are.
+(define (origins! [r (ptr meshes)] [slots u32])
+  (when (!= (-> r origins) 0)
+    (gpu-destroy! gpu-kind-bind-group (-> r origin-group))
+    (gpu-destroy! gpu-kind-buffer (-> r origins)))
+  (set! (-> r origin-slots) slots)
+  (set! (-> r origins) (gpu-buffer! (* slots origin-stride) gpu-uniform))
+  (set! (-> r origin-group) (gpu-bind-group! (-> r mesh-layout) 0 0 1))
+  (gpu-bind-buffer! 0 (-> r origins) 0 16)
+  (for ([i u32 0]) (< i (-> r count)) (+= i 1)
+    (let ([m (+ (-> r items) i)])
+      (origin! r i (-> m x) (-> m y) (-> m z)))))
+
+(define (origin! [r (ptr meshes)] [mesh u32] [x f64] [y f64] [z f64])
+  (gpu-write-buffer! (-> r origins) (* mesh origin-stride)
+                     (gpu-frame-copy (array-of f32 (cast f32 x) (cast f32 y) (cast f32 z) 0.0) 16) 16))
+
+(define (meshes-add! [r (ptr meshes)]) -> u32
+  (when (== (-> r count) (-> r capacity))
+    (set! (-> r capacity) (if (== (-> r capacity) 0) 16 (* 2 (-> r capacity))))
+    (set! (-> r items) (cast (ptr mesh) (realloc (-> r items) (* (-> r capacity) (sizeof mesh))))))
+  (when (== (-> r count) (-> r origin-slots)) (origins! r (* 2 (-> r origin-slots))))
+  (let ([m (+ (-> r items) (-> r count))])
+    (memset m 0 (sizeof mesh))
+    (+= (-> r count) 1)
+    (- (-> r count) 1)))
+
+;; A GPU buffer with room for n bytes: the one there is, or a bigger one
+;; in its place.
+(define (room! [id (ptr u32)] [room (ptr u32)] [n u32] [usage u32])
+  (when (< (@ room) n)
+    (when (!= (@ id) 0) (gpu-destroy! gpu-kind-buffer (@ id)))
+    (set! (@ room) (if (== (@ room) 0) 4096 (@ room)))
+    (while (< (@ room) n) (*= (@ room) 2))
+    (set! (@ id) (gpu-buffer! (@ room) usage))))
+
+(define (meshes-set! [r (ptr meshes)] [mesh u32] [vertices (ptr buffer)] [indices (ptr buffer)] [x f64] [y f64] [z f64])
+  (let ([m (+ (-> r items) mesh)])
+    (set! (-> m x) x)
+    (set! (-> m y) y)
+    (set! (-> m z) z)
+    (set! (-> m index-count) (/ (-> indices length) 4))
+    (when (> (-> m index-count) 0)
+      (room! (& (-> m vertices)) (& (-> m vertex-room)) (-> vertices length) gpu-vertex)
+      (room! (& (-> m indices)) (& (-> m index-room)) (-> indices length) gpu-index)
+      (gpu-write-buffer! (-> m vertices) 0 (-> vertices bytes) (-> vertices length))
+      (gpu-write-buffer! (-> m indices) 0 (-> indices bytes) (-> indices length)))
+    (origin! r mesh x y z)))
+
+(define (pipeline! [r (ptr meshes)] [format u32]) -> u32
+  (when (== (@ (-> r pipelines) format) 0)
+    (set! (@ (-> r pipelines) format)
+          (gpu-render-pipeline! (-> r shader) "vertex" "fragment" gpu-triangles gpu-cull-back gpu-ccw gpu-blend-none
+                                gpu-depth24 gpu-less 1  2 1 1))
+    (gpu-layout-item! (-> r frame-layout))
+    (gpu-layout-item! (-> r mesh-layout))
+    (gpu-target! format)
+    (gpu-vertex-buffer-layout! vertex-bytes gpu-per-vertex 3)
+    (gpu-attribute! 0 0 gpu-f32x3)
+    (gpu-attribute! 1 12 gpu-f32x2)
+    (gpu-attribute! 2 20 gpu-f32))
+  (@ (-> r pipelines) format))
+
+(define (part [color u32] [shift u32]) -> f64 (/ (cast f64 (bit-and (>> color shift) 255)) 255.0))
+
+(define (meshes-draw! [r (ptr meshes)] [kind u32] [target u32] [format u32] [projection (ptr f32)]
+                      [x f64] [y f64] [z f64] [yaw f64] [pitch f64] [sky u32] [fog-near f64] [fog-far f64])
+  (let ([pipeline (pipeline! r format)]
+        [frame (cast (ptr f32) (gpu-frame-alloc frame-bytes))]
+        [view (array f32 16)])
+    ;; The frame's uniforms: the matrix, then the sky colour and the fog.
+    (mat4-view! view x y z yaw pitch)
+    (mat4-multiply! frame projection view)
+    (set! (@ frame 16) (cast f32 (part sky 24)))
+    (set! (@ frame 17) (cast f32 (part sky 16)))
+    (set! (@ frame 18) (cast f32 (part sky 8)))
+    (set! (@ frame 19) 1.0)
+    (set! (@ frame 20) (cast f32 fog-near))
+    (set! (@ frame 21) (cast f32 fog-far))
+    (set! (@ frame 22) 0.0)
+    (set! (@ frame 23) 0.0)
+    (gpu-write-buffer! (-> r frame-uniforms) 0 frame frame-bytes)
+    (gpu-render-pass! 1 (-> r depth) 0 0 gpu-clear 1.0)
+    (gpu-pass-target! kind target 0 0 gpu-clear (part sky 24) (part sky 16) (part sky 8) (part sky 0))
+    (gpu-pipeline! pipeline)
+    (gpu-bind-group-set! 0 (-> r frame-group) 0)
+    (for ([i u32 0]) (< i (-> r count)) (+= i 1)
+      (let ([m (+ (-> r items) i)])
+        (when (> (-> m index-count) 0)
+          (gpu-bind-group-set! 1 (-> r origin-group) 1)
+          (gpu-offset! (* i origin-stride))
+          (gpu-vertex-buffer! 0 (-> m vertices) 0)
+          (gpu-index-buffer! (-> m indices) gpu-u32-indexes 0)
+          (gpu-draw-indexed! (-> m index-count) 1 0 0 0))))
+    (gpu-end-pass!)))

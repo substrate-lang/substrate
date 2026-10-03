@@ -168,13 +168,28 @@ do what it does: another language on the kernel can bring its own.
     update, view) and its connection to the browser.
   - `canvas.sub`: drawing on a `<canvas>` element: rectangles, paths,
     circles, text, and sprites from image files.
+  - `gpu.sub`: the program's side of the host module `gpu`, which is
+    WebGPU: functions that write its commands.
   - `files.sub`: reading and writing files, which works on every host.
   - `guest.sub`: functions for running another program in a sandbox (a
     "guest"), on hosts that support it.
   - `game/`: a small library for 2D games:
     - `game.sub`: the game loop. `(game World [size 320 180] init step
-      draw)` turns three functions into a game in a page.
-    - `input.sub`: which keys are held, and which were just pressed.
+      draw)` turns three functions into a game in a page; with
+      `[renderer gpu]` after the size, the GPU draws its screen.
+    - `draw.sub`: what a game draws with: sprite sheets, rectangles and
+      text, on either renderer.
+    - `sprites.sub`: the GPU renderer: a frame's sprites gathered into
+      a batch and drawn with a few commands, on `../gpu.sub`.
+    - `meshes.sub`: the GPU renderer for 3D: textured meshes drawn
+      from a camera, with depth and fog.
+    - `voxels.sub`: worlds made of blocks: the grid, bodies that move
+      through it, the block a line of sight hits, and the mesh of a
+      part of it. tiles.sub for three dimensions.
+    - `math.sub`: sin and cos, which wasm does not have, and the 4 by 4
+      matrices a camera needs.
+    - `input.sub`: which keys and mouse buttons are held, and which were
+      just pressed; how far the mouse moved.
     - `sound.sub`: sound files, music, and short synthesized tones.
     - `timers.sub`: things that happen later: a message that the game
       is handed after a number of steps.
@@ -200,7 +215,9 @@ do what it does: another language on the kernel can bring its own.
     around it, and `page.html` its HTML; and `platformer/`, a platform
     game built on `game/`: `world.sub` is the game, `platformer.sub`
     puts it in a page, and `assets/` holds its levels, which are text
-    files, and its sheet of sprites.
+    files, and its sheet of sprites; and `blocks/`, a world of blocks
+    in 3D, built on the same library: `world.sub`, `blocks.sub` and
+    the texture atlas in `assets/`.
   - `repl/`: the REPL page. `repl.sub` is the page's program (the user
     interface); `session.sub` is the compiler, which the page runs in a
     sandbox; `page.html` and `site.sh` make the site.
@@ -381,9 +398,10 @@ for Testing build that Playwright's browsers package fetches, as
 - **Host modules.** Besides the standard `host` imports, a page can give
   a program extra modules of host functions, each under a name. A
   program can only use the modules it is given, so they also work as
-  permissions. There are three: `dom` (`host/web/dom.mjs`), for drawing
-  on the page; `audio` (`host/web/audio.mjs`), for sound; and
-  `guest` (`host/web/guest.mjs`), for running other programs in a
+  permissions. There are four: `dom` (`host/web/dom.mjs`), for drawing
+  on the page; `audio` (`host/web/audio.mjs`), for sound; `gpu`
+  (`host/web/gpu.mjs`), for WebGPU; and `guest`
+  (`host/web/guest.mjs`), for running other programs in a
   sandbox. The compiler is run with no extra modules, so
   code that runs at compile time cannot use them, and builds stay
   reproducible (spec 4).
@@ -408,9 +426,15 @@ for Testing build that Playwright's browsers package fetches, as
   state), a message type (everything that can happen), an `update`
   function, and a view. The design is Elm's. An event listener in a
   template names the message to send, and the message can carry data
-  from the event, such as `(event value)` for the text of a field.
-  Messages are data rather than callbacks, because the C-like Lisp's
-  closures cannot be stored. Things that happen outside the page, such
+  from the event, such as `(event value)` for the text of a field, or
+  `(event movement-x)` for how far the mouse moved. Messages are data
+  rather than callbacks, because the C-like Lisp's closures cannot be
+  stored. A few things a page does are not changes to its content but
+  requests to the browser, written as attributes whose integer changes:
+  `[focus e]`, `[scroll-end e]` and `[pointer-lock e]`, which hides the
+  cursor and reports the mouse's movement without limits, as a game
+  that looks around with the mouse needs; the browser grants it only in
+  response to a click. Things that happen outside the page, such
   as a reply from a guest, are turned into messages with `send!`.
   `lib/web/examples/counter.sub` is a minimal example; its compiled program
   is 20 KB.
@@ -463,7 +487,14 @@ for Testing build that Playwright's browsers package fetches, as
   which were pressed since the last step), plays the sounds the game
   asked for, and draws every frame on a canvas of exactly the size
   given, which the browser stretches to the window without blurring.
-  It is a macro that expands into an ordinary page program.
+  It is a macro that expands into an ordinary page program. A game
+  draws with `draw.sub`: sprite sheets, rectangles and text, in the
+  pixels of its screen, with colours as numbers (`#x8fd3ffff`). The
+  same calls work on both renderers below. A game that looks around
+  with the mouse says `[pointer lock]`: a click on its screen then locks
+  the pointer to it, and the mouse's movement and buttons reach the
+  game's step function through the input, as the keys do; Escape frees
+  the pointer.
   `tiles.sub` adds what a platformer or a top-down game needs: a level
   as a grid of tiles, bodies that move through it and are stopped by
   walls, floors and ceilings, and a camera that follows the player.
@@ -502,6 +533,72 @@ for Testing build that Playwright's browsers package fetches, as
 
   What they do not do: plain arrays and pointers are still unchecked,
   so code that uses those directly is as unsafe as before.
+- **WebGPU** (`host/web/gpu.mjs`, `lib/web/gpu.sub`). The host module
+  `gpu` is WebGPU for a program, the way `dom` is the page for it. It
+  knows nothing about sprites, meshes or text. The program numbers its
+  own resources (shaders, pipelines, buffers, textures, samplers, bind
+  group layouts, bind groups, and surfaces, which are canvases of the
+  page), writes commands that make and use them into a buffer, and
+  hands the buffer to the host once a frame; the host carries the
+  commands out one for one on the WebGPU API and submits the frame.
+  The commands cover what a 2D or a 3D renderer needs: render passes
+  with several colour targets and a depth attachment, compute passes,
+  explicit layouts with dynamic offsets, culling, blending, instanced
+  and indexed draws, textures from files, writing and reading buffers
+  and textures. WebGPU reports most mistakes later, and reading data
+  back takes time, so those arrive as events: the host calls the
+  program's `on-gpu` for an error (a shader that does not compile, a
+  draw with a buffer that is too small), a texture file that arrived,
+  and pixels or bytes read back. A mistake in the commands themselves
+  stops the program, as a bad patch does. `lib/web/gpu.sub` writes the
+  commands from a program, and checks that a command's lists are
+  complete before the next one. `tests/web/gpu.sub` is the module used
+  directly: a pipeline of the program's own drawing into a texture, a
+  compute shader doubling numbers, and a shader with a mistake, each
+  read back.
+  - Renderers are libraries in the program's language. The first is
+    `lib/web/game/sprites.sub`: a frame's sprites and rectangles are
+    gathered into a batch, in order, and drawn with one upload and one
+    draw call per run of sprites from the same sheet. The vertex
+    shader makes each sprite's two triangles and finds its cell in the
+    sheet; a bind group per sheet gives the shader the texture. A game
+    gets it with `[renderer gpu]` (`game.sub`); the game's text is
+    drawn by the 2D context on a see-through canvas over the screen.
+    The platformer runs this way.
+  - What it costs (`tests/web/sprites.mjs`; the table below). On the
+    processor, a frame of 20,000 sprites takes the program 0.45 ms,
+    where the 2D context takes 42 ms. On the development machine's
+    GPU, 200,000 sprites are 2.7 ms in the program and 5.7 ms on the
+    GPU, at 60 frames a second.
+  - The headless browser of the tests has no GPU. It runs WebGPU on
+    SwiftShader with the flags `webgpuFlags` in `host/web/browser.mjs`
+    and its GPU process on; with the process off it destroys the
+    device as soon as a canvas is drawn on. On macOS, where every
+    machine has a GPU and Chromium's WebGPU runs on Metal, the flags
+    only turn WebGPU on, since SwiftShader's device is lost there as
+    soon as it is used. The machine's own GPU can
+    be used with `hardwareGpuFlags`, but then the browser cannot
+    present a canvas, so the module has an off-screen mode in which a
+    surface is a texture; `sprites.mjs hardware` measures that way.
+    What a WebGPU canvas shows cannot be read back through a 2D
+    context in either browser, so the module has `readSurface`, which
+    copies the next frame drawn on a surface for a test
+    (`tests/web/pages.mjs`: `gpu`, `platformer`, `sprites`).
+  - The 3D side (`lib/web/game/meshes.sub`, `voxels.sub`, `math.sub`).
+    A mesh is textured triangles the program builds; the renderer
+    draws every mesh from a camera, with a depth texture, back faces
+    culled, and fog, and the meshes' origins come from one uniform
+    buffer through dynamic offsets. `voxels.sub` builds meshes for a
+    world of blocks (each face of a block that touches air, with
+    lighting baked into the vertices: tops bright, undersides dark, and
+    corners that are closed in darker), and gives the world its
+    bodies and its line of sight. `math.sub` has what the camera needs
+    and wasm does not provide: sin, cos, and 4 by 4 matrices. A game
+    draws its scene first, then its sprites and text, which go on top.
+    The blocks example (below) is all this in use.
+  - Not done: lines, circles and paths on the GPU (a game that needs
+    them uses the canvas renderer), and the swap of the overlay canvas
+    for text drawn by the GPU.
 - **Guests** (`host/web/guest.mjs`, `lib/web/guest.sub`): running code that is
   not trusted. A program can start another program as a "guest": a
   separate sandbox with its own memory. The two share nothing, and they
@@ -595,6 +692,54 @@ host/web/serve.mjs build/web/platformer
 
 Arrows (or A and D) run, Space (or the up arrow, or W) jumps.
 
+### The blocks example
+
+`lib/web/examples/blocks` is a world of blocks in 3D, built on the game
+library's 3D side: hills of grass over dirt over stone, sand in the low
+places, trees, 64 blocks wide and deep and 32 high, made from noise
+with a fixed seed. The player walks and jumps through it, looks
+around, removes the block in front of them and places blocks of six
+kinds. Nothing is won or lost; it is the 3D counterpart of the
+platformer. The game is one file, `world.sub`; `blocks.sub` is one
+line that hands its three functions to the game loop, with
+`[renderer gpu]`, since a scene needs the GPU.
+
+The world is a grid (`game/voxels.sub`) drawn in chunks of 16 by 32 by
+16 blocks, each a mesh (`game/meshes.sub`); a chunk is built again
+when a block in it changes, and so is a neighbouring chunk when the
+block is at their boundary. The player is a body that the grid stops
+(`move-body!`), and a step one block high is jumped over by itself
+when there is room above it (`body-free?`). What the player looks at
+is the first block a ray from the eye meets (`ray-hit!`), with the
+face it entered through, which is where a placed block goes. The
+camera is a yaw and a pitch (`game/math.sub`), turned by the arrow
+keys or, once a click has locked the pointer to the screen, by the
+mouse, whose buttons then dig and place.
+
+The asset is `assets/atlas.png`, a row of eight tiles of 16 by 16
+pixels, one for each face kind. `art/make-atlas.mjs` draws them from
+a few colours and seeded noise; like the platformer's `art/`, it is
+not part of the game.
+
+The game is tested without a browser (`tests/ui/blocks.sub`): the
+world is made, the player falls, walks, jumps, looks down, digs and
+builds by made-up key presses and mouse movements, and a tree put in
+the way stops them. The browser test reads the GPU's picture: sky at
+the top, land at the bottom, a view that changes when walking and when
+digging, and, after a click has locked the pointer, when the mouse
+moves and its button digs. The compiled program is 120 KB, and its
+asset 3 KB.
+
+```sh
+lib/web/site.sh lib/web/examples/blocks/blocks.sub build/web/blocks lib/web/examples/blocks/page.html
+host/web/serve.mjs build/web/blocks
+```
+
+Click the screen to look around with the mouse (Escape frees it); W,
+A, S and D walk, the arrows also turn and look, Space jumps, the left
+button or X digs, the right button or C places, 1 to 6 choose what to
+place.
+
 ### Measurements
 
 In headless Chromium, on the development machine:
@@ -620,6 +765,28 @@ In headless Chromium, on the development machine:
 | Draw 10,000 rectangles in one frame | 2 ms |
 | One frame of snake, including drawing the board | under 0.1 ms |
 | One frame of the platformer: a step, and about 70 sprites drawn | under 0.1 ms |
+
+| The blocks example (GPU) | |
+|---|---|
+| Making the world and the meshes of its 16 chunks (16,360 faces), on the first frame | 14 ms |
+| A frame: a step, and the 16 meshes drawn, in the program | 0.1 ms |
+| The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 0.6 ms / 3.8 ms |
+
+| Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
+|---|---|---|---|
+| 1,000 sprites: a frame | 0.75 ms | 0.08 ms | 1.1 ms |
+| 5,000 sprites | 8.8 ms | 0.17 ms | 2.2 ms |
+| 20,000 sprites | 42 ms (22 frames a second) | 0.45 ms | 2.2 ms |
+| 100,000 sprites | | 1.5 ms | 3.9 ms |
+| 200,000 sprites | | 2.7 ms | 5.7 ms |
+
+The 2D context draws in software in the headless browser; its time is
+the drawing. The WebGPU renderer's time in the program is building the
+frame and handing it over, after which the GPU draws it: the last
+column is the development machine's GPU (an RTX 5090, drawing off
+screen), from the hand-over until it was done. SwiftShader, which
+stands in for a GPU in the test browser, takes 12 ms, 150 ms and 600 ms
+for the first three frames instead.
 
 The rows are timed by `tests/web/rows.mjs`, from the click until the
 browser has laid the page out again.

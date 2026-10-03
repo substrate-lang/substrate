@@ -1,0 +1,157 @@
+;; A test page for the host module "gpu" (host/web/gpu.mjs).
+;; tests/web/pages.mjs runs it in a browser.
+;;
+;; The program draws two rectangles into a texture with a pipeline of its
+;; own, reads the texture back, doubles eight numbers with a compute
+;; shader and reads them back, and compiles a shader with a mistake in
+;; it. What comes back arrives as events (on-gpu), and the page shows it,
+;; so that the test can read it:
+;;
+;;   #pixels   the colours read at three places of the texture
+;;   #numbers  the numbers after the compute shader
+;;   #errors   the messages of the error events
+;;
+;; It also draws the same rectangles on a canvas of the page, which only
+;; shows that drawing on a surface raises no error: in a browser without
+;; a GPU, what a WebGPU canvas shows cannot be read back.
+(require-unqualified base "../../compiler/base/base.sub")
+(require-unqualified format "../../lib/web/game/format.sub")
+(require-unqualified ui "../../lib/web/ui.sub")
+(require-unqualified web "../../lib/web/web.sub")
+(require-unqualified gpu "../../lib/web/gpu.sub")
+(memory from base)
+(table from base)
+
+(import gpu-apply "gpu" "apply" (i32 i32 ->))
+(import gpu-take "gpu" "take" (i32 i32 -> i32))
+
+(struct model [pixels (array u8 128)] [numbers (array u8 128)] [errors (array u8 1024)] [errors-length u32]
+  [pipeline u32] [screen u32] [instances u32] [surface u32] [drawn i32] [frame u32]
+  ;; The canvas's node number, which the view stores here ([node ...]).
+  [canvas u32])
+(variant message [tick [time f64]] [refresh])
+(messages message)
+
+(define the-model (ptr model) 0)
+
+;; The shader: an instance is a rectangle (x, y, width, height) and a
+;; colour; the vertex shader makes two triangles from each.
+(define shader-code (ptr u8)
+  "struct Screen { size: vec2f }\n@group(0) @binding(0) var<uniform> screen: Screen;\nstruct In { @location(0) rect: vec4f, @location(1) color: vec4f, @builtin(vertex_index) vertex: u32 }\nstruct Out { @builtin(position) position: vec4f, @location(0) color: vec4f }\n@vertex fn vertex(in: In) -> Out {\n  var corners = array<vec2f, 6>(vec2f(0, 0), vec2f(1, 0), vec2f(0, 1), vec2f(1, 0), vec2f(1, 1), vec2f(0, 1));\n  let c = corners[in.vertex];\n  let p = in.rect.xy + c * in.rect.zw;\n  var out: Out;\n  out.position = vec4f(p.x / screen.size.x * 2.0 - 1.0, 1.0 - p.y / screen.size.y * 2.0, 0.0, 1.0);\n  out.color = in.color;\n  return out;\n}\n@fragment fn fragment(in: Out) -> @location(0) vec4f { return in.color; }\n")
+
+(define compute-code (ptr u8)
+  "@group(0) @binding(0) var<storage, read_write> data: array<u32>;\n@compute @workgroup_size(8) fn double(@builtin(global_invocation_id) id: vec3u) { data[id.x] = data[id.x] * 2u; }\n")
+
+;; Hands the commands written so far to the host.
+(define (flush-gpu!)
+  (let ([b (gpu-commands)])
+    (when (> (-> b length) 0) (gpu-apply (cast i32 (-> b bytes)) (cast i32 (-> b length))))
+    (gpu-commands-done!)))
+
+;; Two rectangles: red at (2, 2), 4 by 4, and green at (10, 10), 4 by 4,
+;; as instances of the pipeline. Returns the pipeline, writes the
+;; instances to `instances` and the screen size to `screen`.
+(define (rectangles! [m (ptr model)] [width f64] [height f64] [target-format u32]) -> u32
+  (let* ([shader (gpu-shader! shader-code)]
+         [pipeline (gpu-render-pipeline! shader "vertex" "fragment" gpu-triangles gpu-cull-none gpu-ccw gpu-blend-none 0 0 0
+                                         0 1 1)])
+    (gpu-target! target-format)
+    (gpu-vertex-buffer-layout! 32 gpu-per-instance 2)
+    (gpu-attribute! 0 0 gpu-f32x4)
+    (gpu-attribute! 1 16 gpu-f32x4)
+    ;; The bytes of a write are read when the commands are handed over,
+    ;; so these arrays, made on the stack, are copied first.
+    (let ([data (array-of f32 2.0 2.0 4.0 4.0 1.0 0.0 0.0 1.0  10.0 10.0 4.0 4.0 0.0 1.0 0.0 1.0)]
+          [size (array-of f32 (cast f32 width) (cast f32 height) 0.0 0.0)])
+      (gpu-write-buffer! (-> m instances) 0 (gpu-frame-copy data 64) 64)
+      (gpu-write-buffer! (-> m screen) 0 (gpu-frame-copy size 16) 16))
+    pipeline))
+
+(define (draw-rectangles! [m (ptr model)] [pipeline u32] [kind u32] [target u32])
+  (let ([group (gpu-bind-group! 0 pipeline 0 1)])
+    (gpu-bind-buffer! 0 (-> m screen) 0 0)
+    (gpu-render-pass! 1 0 0 0 0 0.0)
+    (gpu-pass-target! kind target 0 0 gpu-clear 0.0 0.0 0.0 0.0)
+    (gpu-pipeline! pipeline)
+    (gpu-bind-group-set! 0 group 0)
+    (gpu-vertex-buffer! 0 (-> m instances) 0)
+    (gpu-draw! 6 2 0 0)
+    (gpu-end-pass!)))
+
+(define (init [m (ptr model)])
+  (set! the-model m)
+  (set! (-> m instances) (gpu-buffer! 64 gpu-vertex))
+  (set! (-> m screen) (gpu-buffer! 16 gpu-uniform))
+  ;; Into a 16 by 16 texture, then read it all back.
+  (let ([texture (gpu-texture! 16 16 1 1 gpu-rgba8 (+ gpu-sampled gpu-target))]
+        [pipeline (rectangles! m 16.0 16.0 gpu-rgba8)])
+    (draw-rectangles! m pipeline gpu-on-texture texture)
+    (gpu-read-texture! texture 0 0 0 0 16 16))
+  ;; Eight numbers, doubled by a compute shader.
+  (let* ([shader (gpu-shader! compute-code)]
+         [pipeline (gpu-compute-pipeline! shader "double" 0)]
+         [data (gpu-buffer! 32 gpu-storage)]
+         [numbers (array-of u32 1 2 3 4 5 6 7 8)]
+         [group (gpu-bind-group! 0 pipeline 0 1)])
+    (gpu-bind-buffer! 0 data 0 0)
+    (gpu-write-buffer! data 0 (gpu-frame-copy numbers 32) 32)
+    (gpu-compute-pass!)
+    (gpu-pipeline! pipeline)
+    (gpu-bind-group-set! 0 group 0)
+    (gpu-dispatch! 1 1 1)
+    (gpu-end-pass!)
+    (gpu-read-buffer! data 0 32))
+  ;; A shader with a mistake, whose error arrives as an event.
+  (gpu-shader! "fn broken( {")
+  (flush-gpu!)
+  ;; The same rectangles on the page's canvas, once it exists: the view
+  ;; is drawn after init, so this waits for the first frame.
+  (set! (-> m pipeline) (rectangles! m 64.0 64.0 gpu-format-surface))
+  (format-into (-> m pixels) 128 "waiting")
+  (format-into (-> m numbers) 128 "waiting"))
+
+;; The host calls this for each event. The data is read with take while
+;; it runs; then the page is told to show it (refresh).
+(define (on-gpu [kind u32] [id u32])
+  (let ([m the-model])
+    (cond
+      [(== kind gpu-pixels)
+       (let ([bytes (array u8 1024)])
+         (gpu-take (cast i32 bytes) 1024)
+         ;; The pixels at (3, 3), (11, 11) and (0, 0): each 4 bytes, rows of 16.
+         (format-into (-> m pixels) 128 "3,3: ~d,~d,~d,~d  11,11: ~d,~d,~d,~d  0,0: ~d,~d,~d,~d"
+                      (@ bytes (* 4 (+ (* 3 16) 3))) (@ bytes (+ 1 (* 4 (+ (* 3 16) 3)))) (@ bytes (+ 2 (* 4 (+ (* 3 16) 3)))) (@ bytes (+ 3 (* 4 (+ (* 3 16) 3))))
+                      (@ bytes (* 4 (+ (* 11 16) 11))) (@ bytes (+ 1 (* 4 (+ (* 11 16) 11)))) (@ bytes (+ 2 (* 4 (+ (* 11 16) 11)))) (@ bytes (+ 3 (* 4 (+ (* 11 16) 11))))
+                      (@ bytes 0) (@ bytes 1) (@ bytes 2) (@ bytes 3)))]
+      [(== kind gpu-bytes)
+       (let ([numbers (array u32 8)])
+         (gpu-take (cast i32 numbers) 32)
+         (format-into (-> m numbers) 128 "~d,~d,~d,~d,~d,~d,~d,~d"
+                      (@ numbers 0) (@ numbers 1) (@ numbers 2) (@ numbers 3) (@ numbers 4) (@ numbers 5) (@ numbers 6) (@ numbers 7)))]
+      [(== kind gpu-error)
+       (let* ([n (gpu-take 0 0)] [text (cast (ptr u8) (malloc (+ n 1)))])
+         (gpu-take (cast i32 text) n)
+         (set! (@ text n) 0)
+         (+= (-> m errors-length) (format-into (+ (-> m errors) (-> m errors-length)) (- 1024 (-> m errors-length)) "[~d] ~s\n" id text))
+         (free text))])
+    (let ([r refresh]) (send! (& r)))))
+
+(define (update [m (ptr model)] [e (ptr message)])
+  (match e
+    [(tick time)
+     ;; On the first frame the canvas is on the page: draw on it once.
+     (unless (-> m drawn)
+       (set! (-> m drawn) 1)
+       (set! (-> m surface) (gpu-surface! (-> m canvas)))
+       (draw-rectangles! m (-> m pipeline) gpu-on-surface (-> m surface))
+       (flush-gpu!))
+     (+= (-> m frame) 1)]
+    [refresh (begin)]))
+
+(view (page [m (ptr model)])
+  (p ([id "pixels"]) (text (-> m pixels)))
+  (p ([id "numbers"]) (text (-> m numbers)))
+  (pre ([id "errors"]) (text (-> m errors)))
+  (canvas ([id "screen"] [width 64] [height 64] [node (-> m canvas)] [on-window frame (tick (event time))])))
+
+(app model message init update page)

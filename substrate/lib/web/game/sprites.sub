@@ -1,0 +1,274 @@
+;; Lifecycle: experimental.
+;;
+;; Sprites drawn by the GPU: a renderer built on ../gpu.sub.
+;;
+;; A frame's sprites are gathered into a batch, in the order they are to
+;; appear, and then drawn with a handful of commands: one upload of the
+;; whole batch, and one draw for each run of sprites that use the same
+;; sheet. The GPU does the rest, so twenty thousand sprites cost the
+;; program about as much as a few hundred cost the 2D canvas.
+;;
+;; A sprite is a cell of a sprite sheet (an image file holding a grid of
+;; pictures of one size, as ../canvas.sub describes), drawn into a
+;; rectangle of the screen, mirrored if asked, and multiplied by a
+;; colour. A rectangle without a sheet is a sprite of a plain colour.
+;;
+;;   (sprites-init! b)         Makes the batch's GPU resources. Call it
+;;                             once, before anything else.
+;;   (sprites-sheet! b path)   A sheet from the image file at `path`,
+;;                             loaded by the host; drawing it before it
+;;                             has loaded draws nothing. Returns the
+;;                             sheet's number, 1 and up.
+;;   (sprites-begin! b)        Starts a frame: the batch is empty.
+;;   (sprites-add! b sheet frame cell-width cell-height flip x y w h color)
+;;                             Adds a sprite: cell `frame` of the sheet,
+;;                             whose cells are cell-width by cell-height
+;;                             (numbered from 0, left to right then top
+;;                             to bottom), drawn in the rectangle with
+;;                             its top left corner at (x, y), w wide and
+;;                             h high, mirrored left to right if `flip`
+;;                             is not 0.
+;;   (sprites-rect! b x y w h color)
+;;                             Adds a rectangle of one colour.
+;;   (sprites-draw! b kind target format width height load clear)
+;;                             Writes the commands that draw the batch
+;;                             on a target: a surface (kind
+;;                             gpu-on-surface) or a texture (kind
+;;                             gpu-on-texture), which has the given
+;;                             format and size. With `load` gpu-clear
+;;                             the target is first cleared to the
+;;                             colour `clear`; with gpu-keep the batch
+;;                             goes on top of what is there, such as a
+;;                             scene drawn before it (meshes.sub).
+;;                             Positions are in the target's pixels,
+;;                             from its top left corner. One batch draws
+;;                             on one target per frame.
+;;
+;; Colours are 32-bit numbers, #xRRGGBBAA: red, green, blue and opacity,
+;; each 0 to 255. #xffffffff leaves a sprite as it is in the sheet; an
+;; opacity below 255 makes it see-through.
+;;
+;; The commands are written into gpu.sub's buffer and reach the GPU when
+;; the buffer is handed to the host, which the game loop does at the end
+;; of each frame (game.sub); a test can print them instead
+;; (../trace.sub). Nothing here needs a browser.
+;;
+;; ---- How it works ----
+;;
+;; An instance is 12 numbers, 48 bytes: the rectangle (x, y, w, h), the
+;; cell (frame, cell-width, cell-height, flip) and the colour (r, g, b,
+;; a, from 0 to 1). The batch keeps them in one array that grows as
+;; needed, so the upload is one write. The vertex shader makes the two
+;; triangles of each rectangle from six vertices, and finds the cell in
+;; the sheet from the frame number and the sheet's size, which it asks
+;; the texture for. A cell width of 0 means a plain colour.
+;;
+;; Sheets are loaded with alpha premultiplied (host/web/gpu.mjs), and
+;; sprites are blended that way. Sampling is "nearest", for sharp pixel
+;; art: a sprite drawn at a whole-number position, at its own size, is
+;; copied pixel for pixel.
+(require-unqualified base "../../../compiler/base/base.sub")
+(require-unqualified gpu "../gpu.sub")
+
+(provide sprites sprites-init! sprites-sheet! sprites-begin! sprites-add! sprites-rect! sprites-draw!)
+
+(memory from base)
+(table from base)
+
+;; A run of instances drawn with one sheet: the first and how many.
+(struct run [sheet u32] [first u32] [count u32])
+
+;; A sheet: its texture, and the bind group that gives it to the shader.
+(struct sheet [texture u32] [group u32])
+
+(struct sprites
+  ;; The instances of the frame being gathered: 12 floats each.
+  [items (ptr f32)] [count u32] [capacity u32]
+  [runs (ptr run)] [run-count u32] [run-capacity u32]
+  ;; The sheets, numbered from 1. Number 0 is a blank, one transparent
+  ;; pixel, bound for runs that only draw plain colours.
+  [sheets (ptr sheet)] [sheet-count u32] [sheet-capacity u32]
+  ;; GPU resources.
+  [shader u32] [screen-layout u32] [sheet-layout u32] [sampler u32]
+  [uniforms u32] [screen-group u32]
+  [buffer u32] [buffer-capacity u32]
+  ;; The pipeline for each target format, made when first needed.
+  [pipelines (array u32 10)])
+
+(define shader-code (ptr u8) "
+struct Screen { size: vec2f, unused: vec2f }
+@group(0) @binding(0) var<uniform> screen: Screen;
+@group(1) @binding(0) var sheet_sampler: sampler;
+@group(1) @binding(1) var sheet: texture_2d<f32>;
+
+struct Instance {
+  @location(0) rect: vec4f,
+  @location(1) cell: vec4f,
+  @location(2) color: vec4f,
+  @builtin(vertex_index) vertex: u32,
+}
+
+struct Vertex {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) color: vec4f,
+  @location(2) textured: f32,
+}
+
+@vertex fn vertex(in: Instance) -> Vertex {
+  var corners = array<vec2f, 6>(vec2f(0, 0), vec2f(1, 0), vec2f(0, 1), vec2f(1, 0), vec2f(1, 1), vec2f(0, 1));
+  let corner = corners[in.vertex];
+  let p = in.rect.xy + corner * in.rect.zw;
+  var out: Vertex;
+  out.position = vec4f(p.x / screen.size.x * 2.0 - 1.0, 1.0 - p.y / screen.size.y * 2.0, 0.0, 1.0);
+  // The cell: frame numbers run left to right, then top to bottom.
+  let size = vec2f(textureDimensions(sheet));
+  let columns = max(1u, u32(size.x) / u32(max(in.cell.y, 1.0)));
+  let frame = u32(in.cell.x);
+  let origin = vec2f(f32(frame % columns) * in.cell.y, f32(frame / columns) * in.cell.z);
+  let u = select(corner.x, 1.0 - corner.x, in.cell.w != 0.0);
+  out.uv = (origin + vec2f(u, corner.y) * in.cell.yz) / size;
+  out.color = vec4f(in.color.rgb * in.color.a, in.color.a);
+  out.textured = select(0.0, 1.0, in.cell.y > 0.0);
+  return out;
+}
+
+@fragment fn fragment(in: Vertex) -> @location(0) vec4f {
+  let sample = textureSample(sheet, sheet_sampler, in.uv);
+  return select(in.color, sample * in.color, in.textured > 0.5);
+}
+")
+
+(define floats-per-instance u32 12)
+(define bytes-per-instance u32 48)
+
+(define (sprites-init! [b (ptr sprites)])
+  (memset b 0 (sizeof sprites))
+  (set! (-> b shader) (gpu-shader! shader-code))
+  (set! (-> b screen-layout) (gpu-layout! 1))
+  (gpu-layout-entry! 0 gpu-in-vertex gpu-uniform-entry)
+  ;; The vertex shader asks the sheet for its size, so the sheet is
+  ;; visible to both stages.
+  (set! (-> b sheet-layout) (gpu-layout! 2))
+  (gpu-layout-entry! 0 gpu-in-fragment gpu-sampler-entry)
+  (gpu-layout-entry! 1 (+ gpu-in-vertex gpu-in-fragment) gpu-texture-entry)
+  (set! (-> b sampler) (gpu-sampler! gpu-nearest gpu-clamp gpu-compare-none))
+  (set! (-> b uniforms) (gpu-buffer! 16 gpu-uniform))
+  (set! (-> b screen-group) (gpu-bind-group! (-> b screen-layout) 0 0 1))
+  (gpu-bind-buffer! 0 (-> b uniforms) 0 0)
+  (set! (-> b buffer-capacity) 256)
+  (set! (-> b buffer) (gpu-buffer! (* 256 bytes-per-instance) gpu-vertex))
+  ;; Sheet 0, the blank.
+  (add-sheet! b (gpu-texture! 1 1 1 1 gpu-rgba8 gpu-sampled)))
+
+;; Adds a sheet for a texture and returns its number.
+(define (add-sheet! [b (ptr sprites)] [texture u32]) -> u32
+  (when (== (-> b sheet-count) (-> b sheet-capacity))
+    (set! (-> b sheet-capacity) (if (== (-> b sheet-capacity) 0) 8 (* 2 (-> b sheet-capacity))))
+    (set! (-> b sheets) (cast (ptr sheet) (realloc (-> b sheets) (* (-> b sheet-capacity) (sizeof sheet))))))
+  (let ([s (+ (-> b sheets) (-> b sheet-count))])
+    (set! (-> s texture) texture)
+    (set! (-> s group) (gpu-bind-group! (-> b sheet-layout) 0 1 2))
+    (gpu-bind-sampler! 0 (-> b sampler))
+    (gpu-bind-texture! 1 texture)
+    (+= (-> b sheet-count) 1)
+    (- (-> b sheet-count) 1)))
+
+(define (sprites-sheet! [b (ptr sprites)] [path (ptr u8)]) -> u32
+  (add-sheet! b (gpu-texture-file! path)))
+
+(define (sprites-begin! [b (ptr sprites)])
+  (set! (-> b count) 0)
+  (set! (-> b run-count) 0))
+
+;; The run that the next instance joins: the current one if it uses the
+;; sheet, else a new one. A plain colour (sheet 0) does not look at the
+;; sheet, so it joins any run, and a run of plain colours takes the sheet
+;; of the first sprite that joins it.
+(define (join-run! [b (ptr sprites)] [sheet u32])
+  (let ([r (if (> (-> b run-count) 0) (+ (-> b runs) (- (-> b run-count) 1)) (cast (ptr run) 0))])
+    (if (and (!= r 0) (or (== sheet 0) (== (-> r sheet) 0) (== (-> r sheet) sheet)))
+        (begin
+          (when (== (-> r sheet) 0) (set! (-> r sheet) sheet))
+          (+= (-> r count) 1))
+        (begin
+          (when (== (-> b run-count) (-> b run-capacity))
+            (set! (-> b run-capacity) (if (== (-> b run-capacity) 0) 16 (* 2 (-> b run-capacity))))
+            (set! (-> b runs) (cast (ptr run) (realloc (-> b runs) (* (-> b run-capacity) (sizeof run))))))
+          (let ([n (+ (-> b runs) (-> b run-count))])
+            (set! (-> n sheet) sheet)
+            (set! (-> n first) (-> b count))
+            (set! (-> n count) 1))
+          (+= (-> b run-count) 1)))))
+
+;; Room for one more instance, and its address.
+(define (next-instance! [b (ptr sprites)]) -> (ptr f32)
+  (when (== (-> b count) (-> b capacity))
+    (set! (-> b capacity) (if (== (-> b capacity) 0) 256 (* 2 (-> b capacity))))
+    (set! (-> b items) (cast (ptr f32) (realloc (-> b items) (* (-> b capacity) bytes-per-instance)))))
+  (+= (-> b count) 1)
+  (+ (-> b items) (* (- (-> b count) 1) floats-per-instance)))
+
+(define (instance! [b (ptr sprites)] [sheet u32] [frame u32] [cell-width f64] [cell-height f64] [flip i32]
+                   [x f64] [y f64] [w f64] [h f64] [color u32])
+  (join-run! b sheet)
+  (let ([i (next-instance! b)])
+    (set! (@ i 0) (cast f32 x))
+    (set! (@ i 1) (cast f32 y))
+    (set! (@ i 2) (cast f32 w))
+    (set! (@ i 3) (cast f32 h))
+    (set! (@ i 4) (cast f32 frame))
+    (set! (@ i 5) (cast f32 cell-width))
+    (set! (@ i 6) (cast f32 cell-height))
+    (set! (@ i 7) (if flip 1.0 0.0))
+    (set! (@ i 8) (/ (cast f32 (>> color 24)) 255.0))
+    (set! (@ i 9) (/ (cast f32 (bit-and (>> color 16) 255)) 255.0))
+    (set! (@ i 10) (/ (cast f32 (bit-and (>> color 8) 255)) 255.0))
+    (set! (@ i 11) (/ (cast f32 (bit-and color 255)) 255.0))))
+
+(define (sprites-add! [b (ptr sprites)] [sheet u32] [frame u32] [cell-width f64] [cell-height f64] [flip i32]
+                      [x f64] [y f64] [w f64] [h f64] [color u32])
+  (instance! b sheet frame cell-width cell-height flip x y w h color))
+
+(define (sprites-rect! [b (ptr sprites)] [x f64] [y f64] [w f64] [h f64] [color u32])
+  (instance! b 0 0 0.0 0.0 0 x y w h color))
+
+;; The pipeline that draws on targets of a format, made the first time
+;; it is needed.
+(define (pipeline! [b (ptr sprites)] [format u32]) -> u32
+  (when (== (@ (-> b pipelines) format) 0)
+    (set! (@ (-> b pipelines) format)
+          (gpu-render-pipeline! (-> b shader) "vertex" "fragment" gpu-triangles gpu-cull-none gpu-ccw gpu-blend-premultiplied
+                                0 gpu-compare-none 0  2 1 1))
+    (gpu-layout-item! (-> b screen-layout))
+    (gpu-layout-item! (-> b sheet-layout))
+    (gpu-target! format)
+    (gpu-vertex-buffer-layout! bytes-per-instance gpu-per-instance 3)
+    (gpu-attribute! 0 0 gpu-f32x4)
+    (gpu-attribute! 1 16 gpu-f32x4)
+    (gpu-attribute! 2 32 gpu-f32x4))
+  (@ (-> b pipelines) format))
+
+(define (part [color u32] [shift u32]) -> f64 (/ (cast f64 (bit-and (>> color shift) 255)) 255.0))
+
+(define (sprites-draw! [b (ptr sprites)] [kind u32] [target u32] [format u32] [width u32] [height u32] [load u32] [clear u32])
+  (let ([pipeline (pipeline! b format)])
+    (gpu-write-buffer! (-> b uniforms) 0
+                       (gpu-frame-copy (array-of f32 (cast f32 width) (cast f32 height) 0.0 0.0) 16) 16)
+    (when (> (-> b count) 0)
+      ;; A bigger buffer when the batch has outgrown it.
+      (when (> (-> b count) (-> b buffer-capacity))
+        (gpu-destroy! gpu-kind-buffer (-> b buffer))
+        (while (> (-> b count) (-> b buffer-capacity)) (*= (-> b buffer-capacity) 2))
+        (set! (-> b buffer) (gpu-buffer! (* (-> b buffer-capacity) bytes-per-instance) gpu-vertex)))
+      (gpu-write-buffer! (-> b buffer) 0 (-> b items) (* (-> b count) bytes-per-instance)))
+    (gpu-render-pass! 1 0 0 0 0 0.0)
+    (gpu-pass-target! kind target 0 0 load (part clear 24) (part clear 16) (part clear 8) (part clear 0))
+    (gpu-pipeline! pipeline)
+    (gpu-bind-group-set! 0 (-> b screen-group) 0)
+    (gpu-vertex-buffer! 0 (-> b buffer) 0)
+    (for ([i u32 0]) (< i (-> b run-count)) (+= i 1)
+      (let ([r (+ (-> b runs) i)])
+        (gpu-bind-group-set! 1 (-> (+ (-> b sheets) (-> r sheet)) group) 0)
+        (gpu-draw! 6 (-> r count) 0 (-> r first))))
+    (gpu-end-pass!)))

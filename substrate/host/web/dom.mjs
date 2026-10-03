@@ -20,6 +20,13 @@
 // `rootElement` is the element that the program draws into. The program
 // knows it as node 0.
 //
+// dom() returns the module function with one extra property, for other
+// host modules that the page gives a node of the program's:
+//
+//   nodeOf(number)   the DOM node the program calls by that number, or
+//                    null. The "gpu" module (gpu.mjs) draws on a canvas
+//                    named this way.
+//
 // What a program can call (pointers are addresses in its memory):
 //
 //   apply (ptr, len)
@@ -34,12 +41,15 @@
 //   event_flags () -> i32
 //       Yes/no facts about the event being handled, as bits: 1 = Shift
 //       was held, 2 = Control, 4 = Alt, 8 = Meta, 16 = the element the
-//       event came from is a ticked checkbox.
+//       event came from is a ticked checkbox, 32 = the pointer is locked
+//       (see patch 15).
 //   event_number (which) -> f64
 //       A number about the event being handled. which = 0: when the
 //       event happened, in milliseconds. which = 1 and 2: the x and y
 //       position of the mouse, in pixels from the top left corner of
-//       the element the event came from.
+//       the element the event came from. which = 3 and 4: how far the
+//       mouse moved since the last mouse event, in pixels. which = 5:
+//       the mouse button (0 left, 1 middle, 2 right).
 //   images_loading () -> i32
 //       How many images are still being loaded (see patch 14, below).
 //   prevent_default ()
@@ -55,7 +65,9 @@
 // listener is attached to the browser window. It is used for events that
 // do not belong to one element, such as a key pressed anywhere on the
 // page. Its event name "frame" is special: it is not a DOM event, and
-// asks for a call on every animation frame (requestAnimationFrame).
+// asks for a call on every animation frame (requestAnimationFrame). The
+// events pointerlockchange and pointerlockerror are listened for on the
+// document, where they fire without bubbling.
 //
 // A "draw" patch (number 13) draws on a canvas element. It carries a
 // list of drawing commands, which lib/web/canvas.sub documents, and
@@ -71,6 +83,16 @@
 // if the image is a sheet of sprites. Loading takes time: until an image
 // is ready, drawing it does nothing, and images_loading says how many
 // are still on their way.
+//
+// A "pointer-lock" patch (number 15) asks the browser to lock the
+// pointer to an element, or releases it. While the pointer is locked
+// the cursor is hidden and mouse events report movement without limits,
+// which a game that looks around with the mouse needs. Browsers only
+// grant the lock while the user is clicking or typing; the patch is
+// applied right after the batch it is in, so a program that asks in
+// response to a click is in time. The request can fail (the browser
+// then fires pointerlockerror), and the user can end the lock with
+// Escape; pointerlockchange reports both, as a window event.
 import { resolvePath } from './subhost-web.mjs';
 
 const text = new TextDecoder();
@@ -188,17 +210,21 @@ export function dom(root) {
       if (applying) waiting.push(() => deliver(e));
       else deliver(e);
     };
-    window.addEventListener(type, entry.handler);
+    windowTarget(type).addEventListener(type, entry.handler);
     if (!windowListeners.has(id)) windowListeners.set(id, []);
     windowListeners.get(id).push(entry);
   }
+
+  // Where a window listener is attached. The pointer lock's events fire
+  // on the document and do not bubble, so they are listened for there.
+  const windowTarget = (type) => (type === 'pointerlockchange' || type === 'pointerlockerror' ? document : window);
 
   // Forgets the listeners of the node numbered `id`, including its window
   // and frame listeners. Called when the number is freed.
   const unlisten = (id) => {
     const n = nodes.get(id);
     if (n instanceof Node && n.subListeners) n.subListeners = null;
-    for (const { type, handler } of windowListeners.get(id) || []) window.removeEventListener(type, handler);
+    for (const { type, handler } of windowListeners.get(id) || []) windowTarget(type).removeEventListener(type, handler);
     windowListeners.delete(id);
     frames.delete(id);
   };
@@ -443,6 +469,19 @@ export function dom(root) {
           listenWindow(w[i + 1], string(i + 2), w[i + 4]);
           i += 5;
           break;
+        case 15: {
+          const node = nodes.get(w[i + 1]);
+          if (w[i + 2] !== 0) {
+            // The failure is reported by the pointerlockerror event; the
+            // promise that newer browsers return must not be left to fail
+            // on its own.
+            after.push(() => { const p = node.requestPointerLock(); if (p && p.catch) p.catch(() => {}); });
+          } else {
+            after.push(() => document.exitPointerLock());
+          }
+          i += 3;
+          break;
+        }
         case 14: {
           const name = string(i + 2);
           const image = new Image();
@@ -506,7 +545,7 @@ export function dom(root) {
   // The functions the program imports. `caller` gives access to the
   // memory of the instance that calls them; `theApp` is the running
   // program.
-  return (caller, theApp) => {
+  const module = (caller, theApp) => {
     app = theApp;
     // Copies the string s, as UTF-8, into the program's memory at `buf`,
     // at most `cap` bytes. Returns the full length in bytes.
@@ -529,12 +568,19 @@ export function dom(root) {
       event_flags() {
         if (!event) return 0;
         return (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0) |
-          (event.target && event.target.checked === true ? 16 : 0);
+          (event.target && event.target.checked === true ? 16 : 0) | (document.pointerLockElement ? 32 : 0);
       },
       event_number(which) {
         if (!event) return 0;
-        if (which === 0) return event.timeStamp || 0;
-        return (which === 1 ? event.offsetX : event.offsetY) || 0;
+        switch (which) {
+          case 0: return event.timeStamp || 0;
+          case 1: return event.offsetX || 0;
+          case 2: return event.offsetY || 0;
+          case 3: return event.movementX || 0;
+          case 4: return event.movementY || 0;
+          case 5: return event.button || 0;
+          default: return 0;
+        }
       },
       images_loading() {
         return loading;
@@ -544,4 +590,6 @@ export function dom(root) {
       },
     };
   };
+  module.nodeOf = (id) => (nodes.has(id) ? nodeOf(id) : null);
+  return module;
 }

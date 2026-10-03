@@ -1,0 +1,923 @@
+// Lifecycle: experimental.
+//
+// The host module "gpu": WebGPU for a program, the way the module "dom"
+// is the page for it. The program numbers its own resources (buffers,
+// textures, pipelines, ...), writes commands that create and use them
+// into a buffer, and hands the buffer to the host in one call per frame.
+// The host carries the commands out one for one on the WebGPU API and
+// knows nothing about sprites, meshes or text: renderers are libraries
+// in the program's own language. lib/web/gpu.sub is the program's side
+// of this module, and lib/web/game/sprites.sub a renderer built on it.
+//
+// Usage, in the page:
+//
+//   import { gpu } from './gpu.mjs';
+//   const theDom = dom(root);
+//   boot({ ..., modules: { dom: theDom, gpu: await gpu({ dom: theDom }) } })
+//
+// gpu() asks the browser for a GPU device. If the browser has no WebGPU,
+// or gives no device, it returns a stand-in module: a program that uses
+// it stops with a message saying so. The `dom` option is needed for
+// drawing on a canvas of the page: a surface (below) names its canvas by
+// its DOM node number, which the dom module resolves.
+//
+// ---- What a program can call ----
+//
+// Pointers are addresses in the calling program's memory.
+//
+//   apply (ptr, len)
+//       Carries out a batch of commands, `len` bytes of 32-bit words,
+//       then submits the frame's work to the GPU. The commands are
+//       listed below.
+//   take (buf, cap) -> len
+//       Only meaningful while the program's on-gpu function is running
+//       (below). Copies the event's data to `buf`, at most `cap` bytes,
+//       and returns the data's full length.
+//   loading () -> i32
+//       How many textures are still being loaded from files.
+//
+// ---- What a program is told ----
+//
+// WebGPU reports most mistakes later, not when the command that made
+// them is carried out, and reading data back from the GPU takes time.
+// So the host calls the program's exported function `on-gpu (kind, id)`,
+// if it has one, when:
+//
+//   1  error     Something went wrong: a shader did not compile, a
+//                pipeline or a bind group was invalid, a draw used a
+//                buffer that was too small, or the device was lost. The
+//                data is the message. `id` is the shader's number for a
+//                compile error, the texture's for a file that could not
+//                be loaded, and 0 otherwise.
+//   2  loaded    The texture numbered `id`, loaded from a file, is ready.
+//   3  pixels    The pixels that read-texture asked for, from texture
+//                `id`: the rows from the top, tightly packed, each
+//                pixel's bytes as the format lays them out (rgba8unorm:
+//                r, g, b, a).
+//   4  bytes     The bytes that read-buffer asked for, from buffer `id`.
+//
+// A mistake in the commands themselves (a resource number that was never
+// made, a draw outside a pass) is the program's, and stops it with a
+// message, as a mistake in a dom patch does.
+//
+// ---- Resources ----
+//
+// Each kind of resource has its own numbers, which the program chooses,
+// from 1. Number 0 means "none". A resource exists from the command that
+// makes it until `destroy`. The kinds, as `destroy` names them:
+//
+//   1 surface   2 shader   3 pipeline   4 buffer   5 texture   6 sampler
+//   7 layout    8 bind group
+//
+// ---- The commands ----
+//
+// A command is its number, then its operands, one word each. A number
+// is a u32, and a decimal number (marked f32) is a 32-bit float in the
+// word. A text operand is two words: the address and the length of the
+// bytes in the program's memory. Several of the commands have lists: a
+// count, then that many items.
+//
+// Making resources:
+//
+//   1 surface id node
+//       The canvas that is DOM node `node` becomes surface `id`: a
+//       target for render passes, drawn in the browser's own canvas
+//       format (format 0 below). Its size follows the canvas's width and
+//       height.
+//   2 shader id code len
+//       Compiles the WGSL text as shader `id`. Errors arrive as an event.
+//   3 render-pipeline id shader vertex len fragment len topology cull
+//     front blend depth-format depth-compare depth-write
+//     layouts n (layout)... targets n (format)...
+//     buffers n (stride step attributes n (location offset format)...)...
+//       A render pipeline. `vertex` and `fragment` name the shader's
+//       entry points; an empty fragment name makes a pipeline without a
+//       fragment stage (for a depth-only pass), which then has no
+//       targets. The bind group layouts are given, one per group number,
+//       or, with a count of 0, taken from the shader. Each vertex buffer
+//       slot has a stride, a step (0 per vertex, 1 per instance) and its
+//       attributes.
+//   4 compute-pipeline id shader entry len layouts n (layout)...
+//   5 buffer id size usage
+//       A buffer of `size` bytes, which the host rounds up to a multiple
+//       of 4. `usage` is bits: 1 vertex, 2 index, 4 uniform, 8 storage,
+//       16 indirect. Every buffer can be written and read back.
+//   6 texture id width height layers mips format usage
+//       A texture; `layers` above 1 makes an array of 2D textures, and
+//       `mips` is the number of mip levels (1 for none). `usage` is bits:
+//       1 sampled in shaders, 2 a render pass target, 4 written by
+//       shaders (a storage texture). Every texture can be written and
+//       read back. Its content starts as zeros.
+//   7 texture-file id path len
+//       A texture loaded from an image file: one of the program's files
+//       (its assets are among them), or else a URL. Any format the
+//       browser decodes will do. The texture is rgba8unorm, with one mip
+//       level, its colours multiplied by their alpha, which is what
+//       blend 2 below expects. Loading takes a moment: `loading` counts
+//       it, and the event `loaded` says when it is ready. Until then the
+//       texture is 1 by 1 and transparent.
+//   8 sampler id filter address compare
+//       filter: 0 nearest, 1 linear (for magnifying, minifying and mip
+//       levels alike). address: 0 clamp to the edge, 1 repeat, 2 mirror.
+//       compare: 0 for an ordinary sampler, or a comparison (below) for
+//       one that compares, as shadow maps are read.
+//   9 layout id n (binding visibility kind)...
+//       A bind group layout, for pipelines that share bind groups or use
+//       dynamic offsets. visibility is bits: 1 vertex, 2 fragment,
+//       4 compute. kind: 1 uniform buffer, 2 storage buffer, 3 read-only
+//       storage buffer, 4 uniform buffer with a dynamic offset,
+//       5 storage buffer with one, 6 read-only storage buffer with one,
+//       7 sampler, 8 comparison sampler, 9 texture, 10 depth texture,
+//       11 storage texture (written by shaders; rgba8unorm).
+//   10 bind-group id layout pipeline group n (binding kind id offset size)...
+//       A bind group. Its layout is `layout`, or, if that is 0, group
+//       `group` of `pipeline`'s. Each entry is a buffer (kind 1; a
+//       `size` of 0 means to its end), a sampler (2) or a texture (3).
+//       A bind group names its resources by number, and keeps naming
+//       them: when a texture loaded from a file arrives, the bind groups
+//       that name it are remade with it.
+//   11 destroy kind id
+//
+// Writing and reading:
+//
+//   12 write-buffer buffer offset ptr len
+//       Copies `len` bytes from the program's memory into the buffer.
+//       `offset` and `len` are multiples of 4.
+//   13 write-texture texture mip layer x y w h ptr len
+//       Copies pixels into part of a texture: `len` bytes, the rows one
+//       after another, tightly packed.
+//   14 read-texture texture mip layer x y w h
+//       Asks for pixels, which arrive as the event `pixels`. A
+//       depth24plus texture cannot be read.
+//   15 read-buffer buffer offset len
+//       Asks for bytes, which arrive as the event `bytes`.
+//
+// Passes. A frame is one or more passes; the commands between a pass
+// and `end-pass` belong to it.
+//
+//   16 render-pass n (kind id mip layer load r g b a)...
+//      depth-texture depth-mip depth-layer depth-load depth-clear
+//       Begins a render pass on n targets: each a surface (kind 1) or a
+//       texture (kind 2; at the mip level and layer given), either kept
+//       as it is (load 0) or cleared to the colour (load 1; r g b a are
+//       f32, from 0 to 1). A pass with no targets draws depth only. If
+//       depth-texture is not 0, it is attached, kept or cleared to
+//       depth-clear (f32).
+//   17 compute-pass
+//   18 end-pass
+//   19 pipeline id
+//   20 bind-group group id n (offset)...
+//       Sets the bind group for a group number, with n dynamic offsets
+//       for the entries whose layout kinds have one.
+//   21 vertex-buffer slot buffer offset
+//   22 index-buffer buffer format offset
+//       format: 0 for 16-bit indexes, 1 for 32-bit.
+//   23 draw vertices instances first-vertex first-instance
+//   24 draw-indexed indexes instances first-index base-vertex
+//      first-instance
+//   25 dispatch x y z
+//       Runs a compute pipeline over x by y by z workgroups.
+//   26 viewport x y w h
+//       f32, in pixels of the target. The default is the whole target.
+//   27 scissor x y w h
+//       Pixels outside this rectangle are left alone.
+//
+// Codes used above:
+//
+//   formats       0 the browser's canvas format (surfaces only)
+//                 1 rgba8unorm  2 bgra8unorm  3 r8unorm  4 rg8unorm
+//                 5 rgba16float  6 r32float  7 rgba32float
+//                 8 depth24plus  9 depth32float
+//   vertex formats
+//                 1 float32  2 float32x2  3 float32x3  4 float32x4
+//                 5 uint32  6 uint32x2  7 uint32x4  8 sint32
+//                 9 unorm8x4  10 snorm8x4  11 float16x2  12 float16x4
+//                 13 uint8x4  14 unorm16x2  15 unorm16x4
+//   topology      1 triangle list  2 triangle strip  3 line list
+//                 4 line strip  5 point list. A strip is drawn with
+//                 32-bit indexes when drawn indexed.
+//   cull          0 none  1 back faces  2 front faces
+//   front         0 counter-clockwise  1 clockwise
+//   blend         0 none: what is drawn replaces what was there
+//                 1 alpha: the usual mixing by the drawn alpha
+//                 2 premultiplied: the same for colours that were
+//                   multiplied by their alpha first
+//                 3 add
+//   comparison    0 none  1 less  2 less or equal  3 greater  4 greater
+//                 or equal  5 equal  6 always  7 never
+//
+// ---- For tests and measurements ----
+//
+// gpu() returns the module function with extra properties:
+//   available                   whether the browser gave a device
+//   adapter                     what it says about the GPU
+//   read(texture, x, y, w, h)   the pixels of a texture, as a promise
+//                               of bytes, as read-texture gives them
+//   readSurface(surface, x, y, w, h)
+//                               the pixels of a surface, as a promise of
+//                               bytes, r, g, b, a per pixel whatever the
+//                               canvas format: the next frame drawn on
+//                               the surface is copied before it is shown
+//   timing                      { measure, frames, ms }: while `measure`
+//                               is true, each frame's time on the GPU,
+//                               from handing it over until it is done,
+//                               is added to `ms` and `frames` counted
+// A WebGPU canvas cannot be read back through a 2D context in a browser
+// without a GPU, so a test reads the surface this way, or draws into a
+// texture and reads that.
+//
+// gpu({ offscreen: true }) makes surfaces that are not canvases: a
+// surface is then a texture of the canvas's size, and nothing is shown.
+// A headless browser on a real GPU cannot show a WebGPU canvas, but can
+// draw this way, which is how the renderers are measured on one
+// (tests/web/sprites.mjs).
+import { resolvePath } from './subhost-web.mjs';
+
+const utf8 = new TextEncoder();
+const text = new TextDecoder();
+
+const formats = {
+  1: 'rgba8unorm', 2: 'bgra8unorm', 3: 'r8unorm', 4: 'rg8unorm', 5: 'rgba16float', 6: 'r32float', 7: 'rgba32float',
+  8: 'depth24plus', 9: 'depth32float',
+};
+// Bytes per pixel, for reading back; depth24plus cannot be read.
+const pixelBytes = {
+  rgba8unorm: 4, bgra8unorm: 4, r8unorm: 1, rg8unorm: 2, rgba16float: 8, r32float: 4, rgba32float: 16, depth32float: 4,
+};
+const vertexFormats = {
+  1: 'float32', 2: 'float32x2', 3: 'float32x3', 4: 'float32x4', 5: 'uint32', 6: 'uint32x2', 7: 'uint32x4', 8: 'sint32',
+  9: 'unorm8x4', 10: 'snorm8x4', 11: 'float16x2', 12: 'float16x4', 13: 'uint8x4', 14: 'unorm16x2', 15: 'unorm16x4',
+};
+const topologies = { 1: 'triangle-list', 2: 'triangle-strip', 3: 'line-list', 4: 'line-strip', 5: 'point-list' };
+const cullModes = { 0: 'none', 1: 'back', 2: 'front' };
+const frontFaces = { 0: 'ccw', 1: 'cw' };
+const blends = {
+  1: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } },
+  2: { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } },
+  3: { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } },
+};
+const comparisons = { 1: 'less', 2: 'less-equal', 3: 'greater', 4: 'greater-equal', 5: 'equal', 6: 'always', 7: 'never' };
+const addressModes = { 0: 'clamp-to-edge', 1: 'repeat', 2: 'mirror-repeat' };
+const kindNames = { 1: 'surface', 2: 'shader', 3: 'pipeline', 4: 'buffer', 5: 'texture', 6: 'sampler', 7: 'layout', 8: 'bind group' };
+
+// The events, as on-gpu is told them.
+const ERROR = 1;
+const LOADED = 2;
+const PIXELS = 3;
+const BYTES = 4;
+
+// The module when the browser gives no device: it stops the program.
+function unavailable(reason) {
+  const module = (caller) => ({
+    apply() { caller.trap(`gpu: WebGPU is not available: ${reason}`); },
+    take() { return 0; },
+    loading() { return 0; },
+  });
+  module.available = false;
+  module.adapter = {};
+  module.read = () => Promise.reject(new Error(reason));
+  module.readSurface = module.read;
+  module.timing = { measure: false, frames: 0, ms: 0 };
+  return module;
+}
+
+export async function gpu(options = {}) {
+  if (!navigator.gpu) return unavailable('this browser has no WebGPU');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return unavailable('the browser found no GPU to use');
+  let device;
+  try {
+    device = await adapter.requestDevice();
+  } catch (e) {
+    return unavailable(e.message);
+  }
+  const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  const theDom = options.dom || null;
+
+  // The resources, by kind and number.
+  const surfaces = new Map();   // id -> { canvas, context } or, off screen, { canvas, texture }
+  const shaders = new Map();    // id -> GPUShaderModule
+  const pipelines = new Map();  // id -> { pipeline, compute }
+  const buffers = new Map();    // id -> GPUBuffer
+  const textures = new Map();   // id -> { texture, format, width, height, layers }
+  const samplers = new Map();   // id -> GPUSampler
+  const layouts = new Map();    // id -> GPUBindGroupLayout
+  const bindGroups = new Map(); // id -> { group: GPUBindGroup, layout, entries: [{ binding, kind, id, offset, size }] }
+  const tables = { 1: surfaces, 2: shaders, 3: pipelines, 4: buffers, 5: textures, 6: samplers, 7: layouts, 8: bindGroups };
+  let loading = 0;
+
+  // The program, and the event being delivered to it. Events come from
+  // things that finish later (promises), so the program is idle when one
+  // arrives; they are still delivered one at a time.
+  let app = null;
+  let caller = null;
+  let eventData = null;
+  const pending = [];
+  function event(kind, id, data) {
+    pending.push({ kind, id, data });
+    if (pending.length > 1) return;
+    while (pending.length > 0) {
+      const e = pending[0];
+      eventData = e.data;
+      try {
+        if (app) app.call('on-gpu', e.kind, e.id);
+      } finally {
+        eventData = null;
+        pending.shift();
+      }
+    }
+  }
+  const error = (id, message) => event(ERROR, id, utf8.encode(message));
+
+  device.addEventListener('uncapturederror', (e) => error(0, e.error.message));
+  device.lost.then((info) => error(0, `the device was lost (${info.reason}): ${info.message}`));
+
+  // A resource by its kind and number, or a stop with a message.
+  function get(kind, id) {
+    const r = tables[kind].get(id);
+    if (r === undefined) caller.trap(`gpu: there is no ${kindNames[kind]} ${id}`);
+    return r;
+  }
+  function formatOf(code) {
+    if (code === 0) return canvasFormat;
+    const f = formats[code];
+    if (!f) caller.trap(`gpu: there is no texture format ${code}`);
+    return f;
+  }
+  const choose = (table, code, what) => {
+    const v = table[code];
+    if (v === undefined) caller.trap(`gpu: there is no ${what} ${code}`);
+    return v;
+  };
+
+  // Carries out the commands of one apply call. `w` are the words, `f`
+  // the same as floats, and `string(i)` reads the text operand at word i.
+  function run(memory, w, f, string) {
+    const encoder = device.createCommandEncoder();
+    let pass = null;        // the open render or compute pass
+    let computing = false;  // whether it is a compute pass
+    // Read-backs copy into a buffer during the frame; the buffer can only
+    // be mapped once the frame has been submitted, so they finish after.
+    const reads = [];
+    // The canvas textures drawn on in this frame, for readSurface.
+    const drawn = new Map();
+    const inPass = (what, compute) => {
+      if (!pass) caller.trap(`gpu: ${what} outside a pass`);
+      if (compute !== undefined && compute !== computing) caller.trap(`gpu: ${what} in the wrong kind of pass`);
+    };
+    let i = 0;
+    while (i < w.length) {
+      const op = w[i];
+      switch (op) {
+        case 1: {
+          const id = w[i + 1];
+          const node = theDom && theDom.nodeOf ? theDom.nodeOf(w[i + 2]) : null;
+          if (!node) caller.trap(`gpu: surface ${id}: the page gave this module no dom, or node ${w[i + 2]} is not on the page`);
+          if (!(node instanceof HTMLCanvasElement)) caller.trap(`gpu: surface ${id}: node ${w[i + 2]} is not a canvas`);
+          if (options.offscreen) {
+            const texture = device.createTexture({
+              label: `surface ${id}`, size: [node.width, node.height, 1], format: canvasFormat,
+              usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+            });
+            surfaces.set(id, { canvas: node, texture });
+            i += 3;
+            break;
+          }
+          const context = node.getContext('webgpu');
+          if (!context) caller.trap(`gpu: surface ${id}: the canvas cannot be used by WebGPU (it may already be used by a 2D context)`);
+          context.configure({ device, format: canvasFormat, alphaMode: 'premultiplied', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+          surfaces.set(id, { canvas: node, context });
+          i += 3;
+          break;
+        }
+        case 2: {
+          const id = w[i + 1];
+          // The error of a shader that does not compile is caught here, so
+          // that it is reported for the shader, with its lines, rather than
+          // as a general error of the device.
+          device.pushErrorScope('validation');
+          const module = device.createShaderModule({ label: `shader ${id}`, code: string(i + 2) });
+          shaders.set(id, module);
+          device.popErrorScope().then(async (e) => {
+            if (!e) return;
+            const errors = (await module.getCompilationInfo()).messages.filter((m) => m.type === 'error');
+            error(id, errors.length === 0 ? e.message : `shader ${id} does not compile:\n` +
+              errors.map((m) => `  line ${m.lineNum}, column ${m.linePos}: ${m.message}`).join('\n'));
+          });
+          i += 4;
+          break;
+        }
+        case 3: {
+          const id = w[i + 1];
+          const module = get(2, w[i + 2]);
+          const vertexEntry = string(i + 3);
+          const fragmentEntry = string(i + 5);
+          const topology = choose(topologies, w[i + 7], 'topology');
+          const cullMode = choose(cullModes, w[i + 8], 'cull mode');
+          const frontFace = choose(frontFaces, w[i + 9], 'front face');
+          const blend = w[i + 10] === 0 ? undefined : choose(blends, w[i + 10], 'blend');
+          const depthFormat = w[i + 11] === 0 ? null : formatOf(w[i + 11]);
+          const depthCompare = w[i + 12] === 0 ? 'always' : choose(comparisons, w[i + 12], 'comparison');
+          const depthWrite = w[i + 13] !== 0;
+          i += 14;
+          const layoutCount = w[i++];
+          const groupLayouts = [];
+          for (let k = 0; k < layoutCount; k++) groupLayouts.push(get(7, w[i++]));
+          const targetCount = w[i++];
+          const targets = [];
+          for (let k = 0; k < targetCount; k++) targets.push({ format: formatOf(w[i++]), blend });
+          const bufferCount = w[i++];
+          const vertexBuffers = [];
+          for (let k = 0; k < bufferCount; k++) {
+            const arrayStride = w[i++];
+            const stepMode = w[i++] === 0 ? 'vertex' : 'instance';
+            const attributeCount = w[i++];
+            const attributes = [];
+            for (let a = 0; a < attributeCount; a++) {
+              attributes.push({ shaderLocation: w[i], offset: w[i + 1], format: choose(vertexFormats, w[i + 2], 'vertex format') });
+              i += 3;
+            }
+            vertexBuffers.push({ arrayStride, stepMode, attributes });
+          }
+          const description = {
+            label: `pipeline ${id}`,
+            layout: layoutCount === 0 ? 'auto' : device.createPipelineLayout({ bindGroupLayouts: groupLayouts }),
+            vertex: { module, entryPoint: vertexEntry, buffers: vertexBuffers },
+            primitive: { topology, cullMode, frontFace },
+          };
+          if (topology === 'triangle-strip' || topology === 'line-strip') description.primitive.stripIndexFormat = 'uint32';
+          if (fragmentEntry.length > 0) description.fragment = { module, entryPoint: fragmentEntry, targets };
+          if (depthFormat) description.depthStencil = { format: depthFormat, depthWriteEnabled: depthWrite, depthCompare };
+          pipelines.set(id, { pipeline: device.createRenderPipeline(description), compute: false });
+          break;
+        }
+        case 4: {
+          const id = w[i + 1];
+          const module = get(2, w[i + 2]);
+          const entryPoint = string(i + 3);
+          i += 5;
+          const layoutCount = w[i++];
+          const groupLayouts = [];
+          for (let k = 0; k < layoutCount; k++) groupLayouts.push(get(7, w[i++]));
+          const pipeline = device.createComputePipeline({
+            label: `pipeline ${id}`,
+            layout: layoutCount === 0 ? 'auto' : device.createPipelineLayout({ bindGroupLayouts: groupLayouts }),
+            compute: { module, entryPoint },
+          });
+          pipelines.set(id, { pipeline, compute: true });
+          break;
+        }
+        case 5: {
+          const id = w[i + 1];
+          const size = (w[i + 2] + 3) & ~3;
+          const bits = w[i + 3];
+          let usage = GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+          if (bits & 1) usage |= GPUBufferUsage.VERTEX;
+          if (bits & 2) usage |= GPUBufferUsage.INDEX;
+          if (bits & 4) usage |= GPUBufferUsage.UNIFORM;
+          if (bits & 8) usage |= GPUBufferUsage.STORAGE;
+          if (bits & 16) usage |= GPUBufferUsage.INDIRECT;
+          buffers.set(id, device.createBuffer({ label: `buffer ${id}`, size, usage }));
+          i += 4;
+          break;
+        }
+        case 6: {
+          const id = w[i + 1];
+          const [width, height, layers, mips] = [w[i + 2], w[i + 3], w[i + 4], w[i + 5]];
+          const format = formatOf(w[i + 6]);
+          const bits = w[i + 7];
+          let usage = GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC;
+          if (bits & 1) usage |= GPUTextureUsage.TEXTURE_BINDING;
+          if (bits & 2) usage |= GPUTextureUsage.RENDER_ATTACHMENT;
+          if (bits & 4) usage |= GPUTextureUsage.STORAGE_BINDING;
+          if (format.startsWith('depth')) usage |= GPUTextureUsage.RENDER_ATTACHMENT;
+          const texture = device.createTexture({ label: `texture ${id}`, size: [width, height, layers], format, usage, mipLevelCount: mips });
+          textures.set(id, { texture, format, width, height, layers });
+          i += 8;
+          break;
+        }
+        case 7: {
+          const id = w[i + 1];
+          const name = string(i + 2);
+          // Until the file arrives: one transparent pixel.
+          const placeholder = device.createTexture({
+            size: [1, 1, 1], format: 'rgba8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+          });
+          textures.set(id, { texture: placeholder, format: 'rgba8unorm', width: 1, height: 1, layers: 1 });
+          loadTexture(id, name);
+          i += 4;
+          break;
+        }
+        case 8: {
+          const id = w[i + 1];
+          const filter = w[i + 2] === 0 ? 'nearest' : 'linear';
+          const address = choose(addressModes, w[i + 3], 'address mode');
+          const description = {
+            magFilter: filter, minFilter: filter, mipmapFilter: filter,
+            addressModeU: address, addressModeV: address, addressModeW: address,
+          };
+          if (w[i + 4] !== 0) description.compare = choose(comparisons, w[i + 4], 'comparison');
+          description.label = `sampler ${id}`;
+          samplers.set(id, device.createSampler(description));
+          i += 5;
+          break;
+        }
+        case 9: {
+          const id = w[i + 1];
+          const count = w[i + 2];
+          i += 3;
+          const entries = [];
+          for (let k = 0; k < count; k++) {
+            const binding = w[i];
+            const visibility = (w[i + 1] & 1 ? GPUShaderStage.VERTEX : 0) | (w[i + 1] & 2 ? GPUShaderStage.FRAGMENT : 0) |
+              (w[i + 1] & 4 ? GPUShaderStage.COMPUTE : 0);
+            const kind = w[i + 2];
+            const entry = { binding, visibility };
+            switch (kind) {
+              case 1: entry.buffer = { type: 'uniform' }; break;
+              case 2: entry.buffer = { type: 'storage' }; break;
+              case 3: entry.buffer = { type: 'read-only-storage' }; break;
+              case 4: entry.buffer = { type: 'uniform', hasDynamicOffset: true }; break;
+              case 5: entry.buffer = { type: 'storage', hasDynamicOffset: true }; break;
+              case 6: entry.buffer = { type: 'read-only-storage', hasDynamicOffset: true }; break;
+              case 7: entry.sampler = { type: 'filtering' }; break;
+              case 8: entry.sampler = { type: 'comparison' }; break;
+              case 9: entry.texture = { sampleType: 'float' }; break;
+              case 10: entry.texture = { sampleType: 'depth' }; break;
+              case 11: entry.storageTexture = { access: 'write-only', format: 'rgba8unorm' }; break;
+              default: caller.trap(`gpu: there is no layout entry kind ${kind}`);
+            }
+            entries.push(entry);
+            i += 3;
+          }
+          layouts.set(id, device.createBindGroupLayout({ label: `layout ${id}`, entries }));
+          break;
+        }
+        case 10: {
+          const id = w[i + 1];
+          const layoutId = w[i + 2];
+          const layout = layoutId !== 0 ? get(7, layoutId) : get(3, w[i + 3]).pipeline.getBindGroupLayout(w[i + 4]);
+          const count = w[i + 5];
+          i += 6;
+          const entries = [];
+          for (let k = 0; k < count; k++) {
+            const kind = w[i + 1];
+            if (kind !== 1 && kind !== 2 && kind !== 3) caller.trap(`gpu: there is no bind group entry kind ${kind}`);
+            entries.push({ binding: w[i], kind, id: w[i + 2], offset: w[i + 3], size: w[i + 4] });
+            i += 5;
+          }
+          const description = { id, layout, entries };
+          description.group = makeBindGroup(description);
+          bindGroups.set(id, description);
+          break;
+        }
+        case 11: {
+          const kind = w[i + 1];
+          const id = w[i + 2];
+          const table = tables[kind];
+          if (!table) caller.trap(`gpu: there is no resource kind ${kind}`);
+          const r = table.get(id);
+          if (r !== undefined) {
+            if (kind === 1) { if (r.context) r.context.unconfigure(); else r.texture.destroy(); }
+            else if (kind === 4) r.destroy();
+            else if (kind === 5) r.texture.destroy();
+            table.delete(id);
+          }
+          i += 3;
+          break;
+        }
+        case 12:
+          device.queue.writeBuffer(get(4, w[i + 1]), w[i + 2], memory.buffer, memory.byteOffset + w[i + 3], w[i + 4]);
+          i += 5;
+          break;
+        case 13: {
+          const t = get(5, w[i + 1]);
+          const [mip, layer, x, y, width, height, ptr, len] = [w[i + 2], w[i + 3], w[i + 4], w[i + 5], w[i + 6], w[i + 7], w[i + 8], w[i + 9]];
+          device.queue.writeTexture(
+            { texture: t.texture, mipLevel: mip, origin: [x, y, layer] },
+            memory.buffer, { offset: memory.byteOffset + ptr, bytesPerRow: len / height, rowsPerImage: height },
+            [width, height, 1]);
+          i += 10;
+          break;
+        }
+        case 14: {
+          const id = w[i + 1];
+          const read = readTexture(encoder, id, w[i + 2], w[i + 3], w[i + 4], w[i + 5], w[i + 6], w[i + 7]);
+          reads.push(() => read().then((bytes) => event(PIXELS, id, bytes), (e) => error(id, e.message)));
+          i += 8;
+          break;
+        }
+        case 15: {
+          const id = w[i + 1];
+          const len = w[i + 3];
+          const staging = device.createBuffer({ size: (len + 3) & ~3, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+          encoder.copyBufferToBuffer(get(4, id), w[i + 2], staging, 0, (len + 3) & ~3);
+          reads.push(() => readStaging(staging, len).then((bytes) => event(BYTES, id, bytes), (e) => error(id, e.message)));
+          i += 4;
+          break;
+        }
+        case 16: {
+          if (pass) caller.trap('gpu: render-pass inside a pass');
+          const count = w[i + 1];
+          i += 2;
+          const colorAttachments = [];
+          for (let k = 0; k < count; k++) {
+            const kind = w[i];
+            const id = w[i + 1];
+            let view;
+            if (kind === 1) {
+              const surface = get(1, id);
+              const texture = surface.context ? surface.context.getCurrentTexture() : surface.texture;
+              drawn.set(id, texture);
+              view = texture.createView();
+            } else if (kind === 2) {
+              view = get(5, id).texture.createView({ baseMipLevel: w[i + 2], mipLevelCount: 1, baseArrayLayer: w[i + 3], arrayLayerCount: 1, dimension: '2d' });
+            } else {
+              caller.trap(`gpu: there is no target kind ${kind}`);
+            }
+            colorAttachments.push({
+              view, loadOp: w[i + 4] === 0 ? 'load' : 'clear', storeOp: 'store',
+              clearValue: { r: f[i + 5], g: f[i + 6], b: f[i + 7], a: f[i + 8] },
+            });
+            i += 9;
+          }
+          const description = { colorAttachments };
+          if (w[i] !== 0) {
+            const depth = get(5, w[i]);
+            description.depthStencilAttachment = {
+              view: depth.texture.createView({ baseMipLevel: w[i + 1], mipLevelCount: 1, baseArrayLayer: w[i + 2], arrayLayerCount: 1, dimension: '2d' }),
+              depthLoadOp: w[i + 3] === 0 ? 'load' : 'clear',
+              depthClearValue: f[i + 4],
+              depthStoreOp: 'store',
+            };
+          }
+          i += 5;
+          pass = encoder.beginRenderPass(description);
+          computing = false;
+          break;
+        }
+        case 17:
+          if (pass) caller.trap('gpu: compute-pass inside a pass');
+          pass = encoder.beginComputePass();
+          computing = true;
+          i += 1;
+          break;
+        case 18:
+          inPass('end-pass');
+          pass.end();
+          pass = null;
+          i += 1;
+          break;
+        case 19: {
+          inPass('pipeline');
+          const p = get(3, w[i + 1]);
+          if (p.compute !== computing) caller.trap(`gpu: pipeline ${w[i + 1]} is not for this kind of pass`);
+          pass.setPipeline(p.pipeline);
+          i += 2;
+          break;
+        }
+        case 20: {
+          inPass('bind-group');
+          const group = w[i + 1];
+          const bindGroup = get(8, w[i + 2]).group;
+          const count = w[i + 3];
+          i += 4;
+          if (count === 0) {
+            pass.setBindGroup(group, bindGroup);
+          } else {
+            const offsets = [];
+            for (let k = 0; k < count; k++) offsets.push(w[i++]);
+            pass.setBindGroup(group, bindGroup, offsets);
+          }
+          break;
+        }
+        case 21:
+          inPass('vertex-buffer', false);
+          pass.setVertexBuffer(w[i + 1], get(4, w[i + 2]), w[i + 3]);
+          i += 4;
+          break;
+        case 22:
+          inPass('index-buffer', false);
+          pass.setIndexBuffer(get(4, w[i + 1]), w[i + 2] === 0 ? 'uint16' : 'uint32', w[i + 3]);
+          i += 4;
+          break;
+        case 23:
+          inPass('draw', false);
+          pass.draw(w[i + 1], w[i + 2], w[i + 3], w[i + 4]);
+          i += 5;
+          break;
+        case 24:
+          inPass('draw-indexed', false);
+          pass.drawIndexed(w[i + 1], w[i + 2], w[i + 3], w[i + 4], w[i + 5]);
+          i += 6;
+          break;
+        case 25:
+          inPass('dispatch', true);
+          pass.dispatchWorkgroups(w[i + 1], w[i + 2], w[i + 3]);
+          i += 4;
+          break;
+        case 26:
+          inPass('viewport', false);
+          pass.setViewport(f[i + 1], f[i + 2], f[i + 3], f[i + 4], 0, 1);
+          i += 5;
+          break;
+        case 27:
+          inPass('scissor', false);
+          pass.setScissorRect(w[i + 1], w[i + 2], w[i + 3], w[i + 4]);
+          i += 5;
+          break;
+        default:
+          caller.trap(`gpu: there is no command ${op}`);
+      }
+    }
+    if (pass) {
+      pass.end();
+      caller.trap('gpu: a pass was not ended');
+    }
+    // Tests waiting for a surface's picture get this frame's.
+    for (const want of surfaceReads.splice(0)) {
+      const texture = drawn.get(want.id);
+      if (!texture) {
+        surfaceReads.push(want);
+        continue;
+      }
+      const read = readCanvasTexture(encoder, texture, want.x, want.y, want.width, want.height);
+      reads.push(() => read().then(want.resolve, want.reject));
+    }
+    device.queue.submit([encoder.finish()]);
+    if (timing.measure) {
+      const started = performance.now();
+      device.queue.onSubmittedWorkDone().then(() => {
+        timing.ms += performance.now() - started;
+        timing.frames++;
+      });
+    }
+    for (const read of reads) read();
+  }
+
+  // readSurface's requests: each waits for the next frame drawn on its
+  // surface.
+  const surfaceReads = [];
+  const timing = { measure: false, frames: 0, ms: 0 };
+
+  // Like readTexture, for a canvas's texture: the bytes come back as
+  // r, g, b, a, whatever the canvas format.
+  function readCanvasTexture(encoder, texture, x, y, width, height) {
+    const bytesPerRow = (width * 4 + 255) & ~255;
+    const staging = device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    encoder.copyTextureToBuffer({ texture, origin: [x, y, 0] }, { buffer: staging, bytesPerRow, rowsPerImage: height }, [width, height, 1]);
+    return () => readStaging(staging, bytesPerRow * height).then((padded) => {
+      const bytes = new Uint8Array(width * 4 * height);
+      for (let row = 0; row < height; row++) {
+        bytes.set(padded.subarray(row * bytesPerRow, row * bytesPerRow + width * 4), row * width * 4);
+      }
+      if (canvasFormat === 'bgra8unorm') {
+        for (let i = 0; i < bytes.length; i += 4) {
+          const b = bytes[i];
+          bytes[i] = bytes[i + 2];
+          bytes[i + 2] = b;
+        }
+      }
+      return bytes;
+    });
+  }
+
+  // Loads an image file as texture `id`: its pixels, read through a 2D
+  // context and multiplied by their alpha. (copyExternalImageToTexture
+  // would do this in one step, but fails without a GPU.)
+  async function loadTexture(id, name) {
+    loading++;
+    try {
+      const bytes = app && app.files.get(resolvePath(app.cwd, name));
+      const blob = bytes ? new Blob([bytes]) : await fetch(name).then((r) => {
+        if (!r.ok) throw new Error(`the server answered ${r.status}`);
+        return r.blob();
+      });
+      const bitmap = await createImageBitmap(blob);
+      const reader = document.createElement('canvas');
+      reader.width = bitmap.width;
+      reader.height = bitmap.height;
+      const context = reader.getContext('2d', { willReadFrequently: true });
+      context.drawImage(bitmap, 0, 0);
+      const pixels = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
+      for (let k = 0; k < pixels.length; k += 4) {
+        const a = pixels[k + 3];
+        if (a !== 255) {
+          pixels[k] = (pixels[k] * a + 127) / 255;
+          pixels[k + 1] = (pixels[k + 1] * a + 127) / 255;
+          pixels[k + 2] = (pixels[k + 2] * a + 127) / 255;
+        }
+      }
+      // The texture may have been destroyed while the file was on its way.
+      const t = textures.get(id);
+      if (!t) return;
+      const texture = device.createTexture({
+        label: `texture ${id}`, size: [bitmap.width, bitmap.height, 1], format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+      });
+      device.queue.writeTexture({ texture }, pixels, { bytesPerRow: bitmap.width * 4 }, [bitmap.width, bitmap.height]);
+      textures.set(id, { texture, format: 'rgba8unorm', width: bitmap.width, height: bitmap.height, layers: 1 });
+      // The bind groups that name the texture are remade with it, and
+      // only then is the placeholder destroyed.
+      for (const description of bindGroups.values()) {
+        if (description.entries.some((e) => e.kind === 3 && e.id === id)) description.group = makeBindGroup(description);
+      }
+      t.texture.destroy();
+      event(LOADED, id, new Uint8Array(0));
+    } catch (e) {
+      error(id, `cannot load the texture ${name}: ${e.message}`);
+    } finally {
+      loading--;
+    }
+  }
+
+  // Makes the GPUBindGroup of a bind group's description: its layout and
+  // entries, which name resources by number.
+  function makeBindGroup({ id, layout, entries }) {
+    return device.createBindGroup({
+      label: `bind group ${id}`,
+      layout,
+      entries: entries.map((e) => {
+        let resource;
+        if (e.kind === 1) {
+          resource = { buffer: get(4, e.id), offset: e.offset };
+          if (e.size !== 0) resource.size = e.size;
+        } else if (e.kind === 2) {
+          resource = get(6, e.id);
+        } else {
+          resource = get(5, e.id).texture.createView();
+        }
+        return { binding: e.binding, resource };
+      }),
+    });
+  }
+
+  // Records in `encoder` the copy of part of a texture into a buffer that
+  // can be mapped, and returns the function that reads it, once the
+  // encoder's work has been submitted: the rows, tightly packed.
+  function readTexture(encoder, id, mip, layer, x, y, width, height) {
+    const t = get(5, id);
+    const bpp = pixelBytes[t.format];
+    if (!bpp) caller.trap(`gpu: a ${t.format} texture cannot be read`);
+    // A row of the copy must be a multiple of 256 bytes long.
+    const bytesPerRow = (width * bpp + 255) & ~255;
+    const staging = device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    encoder.copyTextureToBuffer(
+      { texture: t.texture, mipLevel: mip, origin: [x, y, layer] }, { buffer: staging, bytesPerRow, rowsPerImage: height },
+      [width, height, 1]);
+    return () => readStaging(staging, bytesPerRow * height).then((padded) => {
+      const bytes = new Uint8Array(width * bpp * height);
+      for (let row = 0; row < height; row++) {
+        bytes.set(padded.subarray(row * bytesPerRow, row * bytesPerRow + width * bpp), row * width * bpp);
+      }
+      return bytes;
+    });
+  }
+
+  async function readStaging(staging, len) {
+    await staging.mapAsync(GPUMapMode.READ);
+    const bytes = new Uint8Array(staging.getMappedRange().slice(0, len));
+    staging.unmap();
+    staging.destroy();
+    return bytes;
+  }
+
+  const module = (theCaller, theApp) => {
+    caller = theCaller;
+    app = theApp;
+    return {
+      apply(ptr, len) {
+        const memory = caller.memory();
+        // A Uint32Array must start at a multiple of 4, so a batch at any
+        // other address is copied first.
+        const w = ptr % 4 === 0
+          ? new Uint32Array(memory.buffer, memory.byteOffset + ptr, len >>> 2)
+          : new Uint32Array(memory.slice(ptr, ptr + len).buffer);
+        const f = new Float32Array(w.buffer, w.byteOffset, w.length);
+        const string = (at) => text.decode(memory.subarray(w[at], w[at] + w[at + 1]));
+        run(memory, w, f, string);
+      },
+      take(buf, cap) {
+        if (!eventData) return 0;
+        caller.memory().set(eventData.subarray(0, cap), caller.u(buf));
+        return eventData.length;
+      },
+      loading() {
+        return loading;
+      },
+    };
+  };
+  module.available = true;
+  module.adapter = adapter.info || {};
+  module.read = (id, x, y, width, height) => {
+    const encoder = device.createCommandEncoder();
+    const read = readTexture(encoder, id, 0, 0, x, y, width, height);
+    device.queue.submit([encoder.finish()]);
+    return read();
+  };
+  module.readSurface = (id, x, y, width, height) =>
+    new Promise((resolve, reject) => surfaceReads.push({ id, x, y, width, height, resolve, reject }));
+  module.timing = timing;
+  return module;
+}

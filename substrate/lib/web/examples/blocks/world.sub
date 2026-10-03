@@ -1,0 +1,331 @@
+;; Lifecycle: experimental.
+;;
+;; Blocks: a small world of blocks to walk through and dig in, the game
+;; itself, without its page.
+;;
+;; The world is 64 blocks wide and deep and 32 high, hills of grass over
+;; dirt over stone, with sand in the low places and a few trees, made
+;; from noise with a fixed seed, so it is the same world every time.
+;; The player walks and jumps through it, looks around, and removes the
+;; block in front of them or places one. Nothing wins or loses: it is
+;; the example of the game library's 3D side, as the platformer is of
+;; its 2D side.
+;;
+;;   the grid, the player's body, the ray that finds the block in front
+;;   of them, and the meshes of the chunks      ../../game/voxels.sub
+;;   drawing the meshes, with depth and fog     ../../game/meshes.sub
+;;   the camera's matrices, sin and cos         ../../game/math.sub
+;;   the cross-hair and the text over the scene ../../game/draw.sub
+;;   keys                                       ../../game/input.sub
+;;
+;; The functions the game loop calls:
+;;
+;;   (world-init! w)         makes the world and the GPU meshes; once
+;;   (world-step! w in)      one step, 60 times a second
+;;   (world-draw w)          draws the frame
+;;
+;; Keys: W, A, S and D walk, the arrow keys turn and look up and down,
+;; Space jumps, X removes the block in front, C places the block kind
+;; chosen with the keys 1 to 6. With the pointer locked to the screen
+;; (a click does that; see blocks.sub), the mouse looks around, its left
+;; button digs and its right button places. Walking into a step one
+;; block high jumps over it by itself, since the land is full of them.
+;;
+;; The world is drawn in chunks of 16 by 32 by 16 blocks, each a mesh.
+;; When a block changes, the chunk it is in is built again, and so is a
+;; neighbouring chunk if the block is at their boundary, since a face
+;; between two blocks belongs to the one that is not air.
+(require-unqualified base "../../../../compiler/base/base.sub")
+(require-unqualified format "../../game/format.sub")
+(require-unqualified math "../../game/math.sub")
+(require-unqualified voxels "../../game/voxels.sub")
+(require-unqualified meshes "../../game/meshes.sub")
+(require-unqualified draw "../../game/draw.sub")
+(require-unqualified input "../../game/input.sub")
+(require-unqualified gpu "../../gpu.sub")
+
+(provide world world-init! world-step! world-draw top-at
+         screen-width screen-height world-width world-height world-depth)
+
+(memory from base)
+(table from base)
+
+;; ---- Sizes ----
+
+(define screen-width u32 640)
+(define screen-height u32 360)
+
+(define world-width i32 64)
+(define world-height i32 32)
+(define world-depth i32 64)
+(define chunk-size i32 16)
+(define chunks-across i32 4)   ; world-width / chunk-size, and the same for the depth
+
+;; ---- Blocks ----
+
+(define grass u8 1)
+(define dirt u8 2)
+(define stone u8 3)
+(define sand u8 4)
+(define wood u8 5)
+(define leaves u8 6)
+(define kinds u32 7)
+
+;; The tiles of the atlas (art/make-atlas.mjs) each kind shows: on top,
+;; on its sides and underneath.
+(define tile-table (array tiles 7))
+
+(define (tiles-init!)
+  (set-tiles! grass 0 1 2)
+  (set-tiles! dirt 2 2 2)
+  (set-tiles! stone 3 3 3)
+  (set-tiles! sand 4 4 4)
+  (set-tiles! wood 6 5 6)
+  (set-tiles! leaves 7 7 7))
+
+(define (set-tiles! [kind u8] [top u32] [side u32] [bottom u32])
+  (let ([t (+ tile-table (cast u32 kind))])
+    (set! (-> t top) top)
+    (set! (-> t side) side)
+    (set! (-> t bottom) bottom)))
+
+(define (kind-name [kind u8]) -> (ptr u8)
+  (case (cast u32 kind) [(1) "grass"] [(2) "dirt"] [(3) "stone"] [(4) "sand"] [(5) "wood"] [(6) "leaves"] [else "air"]))
+
+;; ---- The world ----
+
+(struct chunk [mesh u32] [changed i32] [vertices buffer] [indices buffer])
+
+(struct world
+  [grid voxels]
+  [chunks (array chunk 16)]
+  [scene meshes]
+  [projection (array f32 16)]
+  [player body]
+  [yaw f64] [pitch f64]
+  ;; The block the player looks at, if `targeted`, and the face of it.
+  [targeted i32] [target hit]
+  [held u8]
+  [steps u32])
+
+;; ---- Making the land ----
+
+;; A number from 0 to 1 that depends only on x and z, with no pattern.
+(define (hash [x i32] [z i32]) -> f64
+  (let ([h (+ (* (cast u32 x) 374761393) (* (cast u32 z) 668265263))])
+    (set! h (* (bit-xor h (>> h 13)) 1274126177))
+    (set! h (bit-xor h (>> h 16)))
+    (/ (cast f64 (bit-and h 65535)) 65536.0)))
+
+;; Smooth noise: the hash at the four lattice points around (x, z),
+;; blended by a smooth step.
+(define (noise [x f64] [z f64]) -> f64
+  (let* ([x0 (cast i32 (floor x))] [z0 (cast i32 (floor z))]
+         [fx (- x (floor x))] [fz (- z (floor z))]
+         [sx (* fx fx (- 3.0 (* 2.0 fx)))] [sz (* fz fz (- 3.0 (* 2.0 fz)))]
+         [top (+ (* (hash x0 z0) (- 1.0 sx)) (* (hash (+ x0 1) z0) sx))]
+         [bottom (+ (* (hash x0 (+ z0 1)) (- 1.0 sx)) (* (hash (+ x0 1) (+ z0 1)) sx))])
+    (+ (* top (- 1.0 sz)) (* bottom sz))))
+
+;; The height of the land at a column: the y of its top block.
+(define (land-height [x i32] [z i32]) -> i32
+  (cast i32 (+ 7.0 (* 6.0 (noise (/ (cast f64 x) 13.0) (/ (cast f64 z) 13.0)))
+               (* 3.0 (noise (/ (cast f64 x) 4.7) (/ (cast f64 z) 4.7))))))
+
+(define (make-land! [w (ptr world)])
+  (let ([g (& (-> w grid))])
+    (for ([x i32 0]) (< x world-width) (+= x 1)
+      (for ([z i32 0]) (< z world-depth) (+= z 1)
+        (let ([top (land-height x z)])
+          (for ([y i32 0]) (<= y top) (+= y 1)
+            (block-set! g x y z (cond [(< y (- top 3)) stone]
+                                      [(< y top) dirt]
+                                      [(<= top 8) sand]
+                                      [else grass]))))))
+    ;; Trees, on grass, away from the edges: a trunk of four, and a crown
+    ;; of leaves 5 wide and 3 high with the corners left out, and one on
+    ;; top.
+    (for ([x i32 3]) (< x (- world-width 3)) (+= x 1)
+      (for ([z i32 3]) (< z (- world-depth 3)) (+= z 1)
+        (let ([top (land-height x z)])
+          (when (and (== (block-at g x top z) grass) (< (hash (* x 7) (* z 13)) 0.012) (< (+ top 8) world-height))
+            (for ([y i32 1]) (<= y 4) (+= y 1) (block-set! g x (+ top y) z wood))
+            (for ([dx i32 -2]) (<= dx 2) (+= dx 1)
+              (for ([dz i32 -2]) (<= dz 2) (+= dz 1)
+                (for ([dy i32 4]) (<= dy 6) (+= dy 1)
+                  (unless (or (and (== (abs dx) 2) (== (abs dz) 2)) (and (== dy 6) (> (+ (abs dx) (abs dz)) 1))
+                              (and (== dx 0) (== dz 0) (== dy 4)))
+                    (block-set! g (+ x dx) (+ top dy) (+ z dz) leaves)))))
+            (block-set! g x (+ top 7) z leaves)))))))
+
+(define (abs [n i32]) -> i32 (if (< n 0) (- 0 n) n))
+
+;; The highest block of a column, trees included: for placing the
+;; player.
+(define (top-at [w (ptr world)] [x i32] [z i32]) -> i32
+  (let ([y (- world-height 1)])
+    (while (and (> y 0) (not (solid-at? (& (-> w grid)) x y z))) (-= y 1))
+    y))
+
+;; ---- Chunks ----
+
+(define (chunk-at [w (ptr world)] [cx i32] [cz i32]) -> (ptr chunk)
+  (+ (-> w chunks) (cast u32 (+ (* cz chunks-across) cx))))
+
+;; Marks the chunks that a change of block (x, y, z) affects.
+(define (changed! [w (ptr world)] [x i32] [y i32] [z i32])
+  (let ([cx (/ x chunk-size)] [cz (/ z chunk-size)])
+    (set! (-> (chunk-at w cx cz) changed) 1)
+    (when (and (== (% x chunk-size) 0) (> cx 0)) (set! (-> (chunk-at w (- cx 1) cz) changed) 1))
+    (when (and (== (% x chunk-size) (- chunk-size 1)) (< (+ cx 1) chunks-across)) (set! (-> (chunk-at w (+ cx 1) cz) changed) 1))
+    (when (and (== (% z chunk-size) 0) (> cz 0)) (set! (-> (chunk-at w cx (- cz 1)) changed) 1))
+    (when (and (== (% z chunk-size) (- chunk-size 1)) (< (+ cz 1) chunks-across)) (set! (-> (chunk-at w cx (+ cz 1)) changed) 1))))
+
+;; Builds the meshes of the chunks that changed, and hands them to the
+;; renderer.
+(define (rebuild-chunks! [w (ptr world)])
+  (for ([cz i32 0]) (< cz chunks-across) (+= cz 1)
+    (for ([cx i32 0]) (< cx chunks-across) (+= cx 1)
+      (let ([c (chunk-at w cx cz)])
+        (when (-> c changed)
+          (set! (-> c changed) 0)
+          (set! (-> c vertices length) 0)
+          (set! (-> c indices length) 0)
+          (mesh-blocks! (& (-> w grid)) (* cx chunk-size) 0 (* cz chunk-size) chunk-size world-height chunk-size
+                        tile-table 16 (& (-> c vertices)) (& (-> c indices)))
+          (meshes-set! (& (-> w scene)) (-> c mesh) (& (-> c vertices)) (& (-> c indices))
+                       (cast f64 (* cx chunk-size)) 0.0 (cast f64 (* cz chunk-size))))))))
+
+;; ---- The player ----
+
+(define walk-speed f64 0.072)     ; blocks per step: 4.3 a second
+(define turn-speed f64 0.04)      ; radians per step
+(define mouse-speed f64 0.003)    ; radians per pixel of mouse movement
+(define gravity f64 0.009)
+(define jump-speed f64 0.15)
+(define eye-height f64 1.6)
+(define reach f64 6.0)
+
+(define (eye-x [w (ptr world)]) -> f64 (+ (-> w player x) (/ (-> w player width) 2.0)))
+(define (eye-y [w (ptr world)]) -> f64 (+ (-> w player y) eye-height))
+(define (eye-z [w (ptr world)]) -> f64 (+ (-> w player z) (/ (-> w player depth) 2.0)))
+
+;; Where the player looks: the direction, as mat4-view! has it.
+(define (look-x [w (ptr world)]) -> f64 (* (sin (-> w yaw)) (cos (-> w pitch))))
+(define (look-y [w (ptr world)]) -> f64 (sin (-> w pitch)))
+(define (look-z [w (ptr world)]) -> f64 (* (cos (-> w yaw)) (cos (-> w pitch))))
+
+(define (find-target! [w (ptr world)])
+  (set! (-> w targeted)
+        (ray-hit! (& (-> w grid)) (eye-x w) (eye-y w) (eye-z w) (look-x w) (look-y w) (look-z w) reach (& (-> w target)))))
+
+;; Whether a block at (x, y, z) would overlap the player.
+(define (in-the-way? [w (ptr world)] [x i32] [y i32] [z i32]) -> i32
+  (let ([p (& (-> w player))])
+    (and (< (cast f64 x) (+ (-> p x) (-> p width))) (> (cast f64 (+ x 1)) (-> p x))
+         (< (cast f64 y) (+ (-> p y) (-> p height))) (> (cast f64 (+ y 1)) (-> p y))
+         (< (cast f64 z) (+ (-> p z) (-> p depth))) (> (cast f64 (+ z 1)) (-> p z)))))
+
+(define (world-init! [w (ptr world)])
+  (tiles-init!)
+  (voxels-init! (& (-> w grid)) world-width world-height world-depth)
+  (make-land! w)
+  (meshes-init! (& (-> w scene)) "assets/atlas.png" screen-width screen-height)
+  (for ([i u32 0]) (< i 16) (+= i 1)
+    (set! (-> (@ (-> w chunks) i) mesh) (meshes-add! (& (-> w scene))))
+    (set! (-> (@ (-> w chunks) i) changed) 1))
+  (mat4-perspective! (-> w projection) (radians 70.0) (/ (cast f64 screen-width) (cast f64 screen-height)) 0.1 100.0)
+  ;; The player stands in the middle, on top of whatever is there,
+  ;; looking along +z.
+  (let ([p (& (-> w player))])
+    (set! (-> p width) 0.6)
+    (set! (-> p height) 1.8)
+    (set! (-> p depth) 0.6)
+    (set! (-> p x) 31.7)
+    (set! (-> p z) 31.7)
+    (set! (-> p y) (cast f64 (+ (top-at w 32 32) 1))))
+  (set! (-> w held) stone)
+  (find-target! w))
+
+(define (world-step! [w (ptr world)] [in (ptr input)])
+  (set! locked (mouse-locked? in))
+  (let ([p (& (-> w player))])
+    ;; Looking around, with the keys or the mouse. Moving the mouse right
+    ;; turns right, which is a smaller yaw (math.sub).
+    (when (held? in key-left) (+= (-> w yaw) turn-speed))
+    (when (held? in key-right) (-= (-> w yaw) turn-speed))
+    (when (held? in key-up) (+= (-> w pitch) turn-speed))
+    (when (held? in key-down) (-= (-> w pitch) turn-speed))
+    (-= (-> w yaw) (* mouse-speed (mouse-dx in)))
+    (-= (-> w pitch) (* mouse-speed (mouse-dy in)))
+    (set! (-> w pitch) (clamp (-> w pitch) (radians -85.0) (radians 85.0)))
+    ;; Walking, along the direction looked at, flat on the ground.
+    (let ([forward f64 0.0] [sideways f64 0.0])
+      (when (held? in #\w) (+= forward 1.0))
+      (when (held? in #\s) (-= forward 1.0))
+      (when (held? in #\d) (+= sideways 1.0))
+      (when (held? in #\a) (-= sideways 1.0))
+      ;; Right is (-cos yaw, sin yaw), as in mat4-view!.
+      (set! (-> p vx) (* walk-speed (- (* forward (sin (-> w yaw))) (* sideways (cos (-> w yaw))))))
+      (set! (-> p vz) (* walk-speed (+ (* forward (cos (-> w yaw))) (* sideways (sin (-> w yaw)))))))
+    (when (and (pressed? in key-space) (-> p on-ground)) (set! (-> p vy) jump-speed))
+    (-= (-> p vy) gravity)
+    (when (< (-> p vy) -0.5) (set! (-> p vy) -0.5))
+    (let ([wanted-vx (-> p vx)] [wanted-vz (-> p vz)])
+      (move-body! (& (-> w grid)) p)
+      ;; Walking into a step of one block while on the ground, with room
+      ;; above it: jump, which clears the step.
+      (when (and (-> p hit-wall) (-> p on-ground) (or (!= wanted-vx 0.0) (!= wanted-vz 0.0))
+                 (body-free? (& (-> w grid)) p wanted-vx 1.0 wanted-vz))
+        (set! (-> p vy) jump-speed)))
+    ;; Choosing a kind of block to place.
+    (for ([k u32 1]) (< k kinds) (+= k 1)
+      (when (pressed? in (+ #\0 k)) (set! (-> w held) (cast u8 k))))
+    ;; Digging and placing.
+    (find-target! w)
+    (when (-> w targeted)
+      (let ([t (& (-> w target))])
+        (when (or (pressed? in #\x) (mouse-pressed? in mouse-left))
+          (block-set! (& (-> w grid)) (-> t x) (-> t y) (-> t z) 0)
+          (changed! w (-> t x) (-> t y) (-> t z))
+          (find-target! w))
+        (when (or (pressed? in #\c) (mouse-pressed? in mouse-right))
+          (let ([x (+ (-> t x) (face-normal (-> t face) 0))]
+                [y (+ (-> t y) (face-normal (-> t face) 1))]
+                [z (+ (-> t z) (face-normal (-> t face) 2))])
+            (when (and (>= x 0) (< x world-width) (>= y 0) (< y world-height) (>= z 0) (< z world-depth)
+                       (not (in-the-way? w x y z)))
+              (block-set! (& (-> w grid)) x y z (-> w held))
+              (changed! w x y z)
+              (find-target! w))))))
+    (+= (-> w steps) 1)))
+
+;; ---- Drawing ----
+
+(define sky u32 #x8fd3ffff)
+
+;; Whether the pointer is locked, for the help line: the loop tells the
+;; input, and the step function keeps it here for the draw function.
+(define locked i32 0)
+
+(define (world-draw [w (ptr world)])
+  (rebuild-chunks! w)
+  (meshes-draw! (& (-> w scene)) gpu-on-surface (draw-target) gpu-format-surface (-> w projection)
+                (eye-x w) (eye-y w) (eye-z w) (-> w yaw) (-> w pitch) sky 24.0 56.0)
+  ;; The cross-hair, and the text.
+  (let ([cx (/ (cast f64 screen-width) 2.0)] [cy (/ (cast f64 screen-height) 2.0)] [line (array u8 96)])
+    (draw-rect (- cx 6.0) (- cy 1.0) 12.0 2.0 #xffffffb0)
+    (draw-rect (- cx 1.0) (- cy 6.0) 2.0 12.0 #xffffffb0)
+    (text-font "12px monospace")
+    (text-color #x10141aff)
+    (format-into line 96 "at ~.1f ~.1f ~.1f" (eye-x w) (eye-y w) (eye-z w))
+    (draw-text line 8.0 8.0)
+    (if (-> w targeted)
+        (format-into line 96 "looking at ~s at ~d ~d ~d" (kind-name (block-at (& (-> w grid)) (-> w target x) (-> w target y) (-> w target z)))
+                     (-> w target x) (-> w target y) (-> w target z))
+        (format-into line 96 "looking at nothing"))
+    (draw-text line 8.0 24.0)
+    (if locked
+        (format-into line 96 "WASD walk, mouse look, left dig, right place ~s (1-6 choose), Escape frees the mouse" (kind-name (-> w held)))
+        (format-into line 96 "click to look with the mouse; WASD walk, arrows look, Space jump, X dig, C place ~s" (kind-name (-> w held))))
+    (draw-text line 8.0 (- (cast f64 screen-height) 20.0))))
