@@ -697,31 +697,42 @@ const checks = {
 
   // lib/web/examples/valley: a landscape drawn in 3D by the GPU: the
   // land from a height map, forests and grass placed many times, a
-  // river, mountains, under the sky. The picture is read through the
-  // gpu module's readSurface.
+  // river with a bridge, mountains, under the sky. The picture is read
+  // through the gpu module's readSurface. The player starts on the
+  // path by the river looking up the valley: the meadow's slope to the
+  // left, the river to the right, the bridge ahead.
   async valley(page) {
     const pixel = (x, y) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
+    // How many pixels of a part of the picture satisfy a test on r, g, b.
+    const count = (x, y, w, h, test) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, ${w}, ${h}).then((p) => {
+      let n = 0;
+      for (let i = 0; i < p.length; i += 4) { const r = p[i], g = p[i + 1], b = p[i + 2]; if (${test}) n++; }
+      return n;
+    })`);
     const picture = () => page.evaluate(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s; })`);
     // The atlas (one white texel) takes a moment to arrive; until then
     // the land is black.
     await page.waitFor('window.gpuModule.readSurface(1, 100, 330, 1, 1).then((p) => p[1] > 60)', 15000);
     const top = (await pixel(320, 10)).split(',').map(Number);
     check('valley: the sky is at the top, blue', top[2] > 200 && top[2] >= top[1] && top[1] > top[0], true);
-    const ground = (await pixel(100, 330)).split(',').map(Number);
-    check('valley: the meadow is at the bottom left, green', ground[1] > ground[0] + 30 && ground[1] > ground[2] + 30, true);
-    const river = (await pixel(560, 300)).split(',').map(Number);
-    check('valley: the river is at the bottom right, blue-green', river[2] > river[0] + 30 && river[1] > river[0], true);
-    check('valley: the forest has dark green in it', await page.evaluate(`window.gpuModule.readSurface(1, 0, 90, 640, 90).then((p) => {
-      let dark = 0;
-      for (let i = 0; i < p.length; i += 4) if (p[i + 1] > p[i] + 20 && p[i + 1] > p[i + 2] + 20 && p[i + 1] < 120) dark++;
-      return dark > 2000;
-    })`), true);
+    const atLeast = (n, least) => (n >= least ? true : n);
+    check('valley: the meadow is at the left, green (20,000 pixels)', atLeast(await count(0, 180, 300, 180, 'g > r + 30 && g > b + 30'), 20000), true);
+    check('valley: the river is at the right, blue (10,000 pixels)', atLeast(await count(400, 200, 240, 160, 'b > r + 30 && g > r'), 10000), true);
+    // The bridge's wood is brown, in sun or in a cloud's shadow; the
+    // river behind it is blue, the trees green, the sky blue.
+    check('valley: the bridge is ahead, wooden (100 brown pixels)', atLeast(await count(300, 170, 340, 60, 'r > g && g > b && r - b > 15'), 100), true);
     const before = await picture();
+    // Walking: W is held until the view has changed (a frame on
+    // SwiftShader takes a while).
     await page.keyDown('w');
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 30000);
     await page.keyUp('w');
-    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 5000);
     check('valley: walking changes the view', (await picture()) !== before, true);
+    // The view from the lake's shore, through the game's look export:
+    // water across the middle.
+    await page.evaluate('window.app.call("look", 146, 120, -2.2, 0.1)');
+    await page.waitFor(`window.gpuModule.readSurface(1, 0, 240, 640, 100).then((p) => { let n = 0; for (let i = 0; i < p.length; i += 4) if (p[i + 2] > p[i] + 30) n++; return n > 40000; })`, 30000);
+    check('valley: from the lake, water fills the lower picture (40,000 pixels)', atLeast(await count(0, 240, 640, 100, 'b > r + 30'), 40000), true);
     check('valley: the game has not stopped', await page.evaluate('document.querySelector(".game-stopped") === null'), true);
     check('valley: nothing is written to the console', page.log.join('\n'), '');
   },

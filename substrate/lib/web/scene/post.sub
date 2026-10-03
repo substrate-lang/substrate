@@ -4,25 +4,35 @@
 ;; the pass that turns them into the picture on the screen.
 ;;
 ;; A scene is not drawn on the screen directly. It is drawn into three
-;; textures of the screen's size that this file owns: its colour, with
-;; more range than a screen has (16-bit floats, so that a sun can be
-;; brighter than white and be toned down afterwards), its normals, and
-;; its depth. Then one pass over the screen's pixels, with no geometry,
-;; makes the picture:
+;; textures that this file owns, the screen's size or a multiple of it:
+;; its colour, with more range than a screen has (16-bit floats, so
+;; that a sun can be brighter than white and be toned down afterwards),
+;; its normals, and its depth. Then one pass over the screen's pixels,
+;; with no geometry, makes the picture:
 ;;
 ;;   - outlines: a dark line where the depth or the normal breaks
 ;;     between a pixel and its neighbours, one pixel wide whatever the
-;;     distance or the angle, as drawn pictures have them, fading with
-;;     the fog as the colours do, so that a far thing in the haze is
-;;     not drawn around in ink, and left out where the scene asks (the
-;;     normal target's alpha is 0: grass, which would be all lines);
+;;     distance or the angle, as drawn pictures have them. Lines are
+;;     for what is near: a silhouette's line fades out between 20 and
+;;     70 units away, a crease's between 10 and 35, so that a far
+;;     forest is not a thicket of ink; and the scene can leave them out
+;;     (the normal target's alpha is 0: grass, which would be all
+;;     lines);
 ;;   - tone mapping: the colours brought into the screen's range
 ;;     (ACES's curve, as films and games use), after an exposure;
+;;   - anti-aliasing: with a scale of 2, the scene is drawn at twice
+;;     the screen's size each way, and each pixel of the picture is
+;;     the mean of its four, so edges are smooth and the outlines
+;;     drawn at that size are fine half-pixel lines (supersampling);
+;;   - a vignette: the corners a little darker;
 ;;   - the sRGB encoding a screen expects.
 ;;
-;; Later steps of the same kind (bloom, anti-aliasing) go here too.
+;; Later steps of the same kind (bloom) go here too.
 ;;
-;;   (post-init! p width height)   makes the textures and the shader
+;;   (post-init! p width height scale)
+;;                                 makes the textures, `scale` times
+;;                                 the screen's `width` by `height`
+;;                                 (1 or 2), and the shader
 ;;   (post-color p) (post-normals p) (post-depth p)
 ;;                                 the textures, for the scene pass to
 ;;                                 draw into: the first two are its
@@ -31,14 +41,12 @@
 ;;                                 the third its depth, gpu-depth24
 ;;   (post-width p) (post-height p)
 ;;                                 their size
-;;   (post-draw! p kind target format camera light outline exposure)
+;;   (post-draw! p kind target format camera outline exposure)
 ;;                                 writes the pass that draws the
 ;;                                 picture on a target (as
 ;;                                 sprites-draw! takes it); the camera
 ;;                                 (camera.sub) gives the depth its
-;;                                 distances, and the light (light.sub)
-;;                                 the fog's, so the lines fade as the
-;;                                 scene does; `outline` is how dark
+;;                                 distances; `outline` is how dark
 ;;                                 the lines are, 0 to 1, 0 for none;
 ;;                                 `exposure` scales the colours, 1 for
 ;;                                 as drawn
@@ -53,7 +61,6 @@
 (require-unqualified screen "../../shade/screen.sub")
 (require-unqualified color "../../shade/color.sub")
 (require-unqualified camera "camera.sub")
-(require-unqualified light "light.sub")
 
 (provide post post-init! post-color post-normals post-depth post-width post-height post-draw!)
 
@@ -61,7 +68,7 @@
 (table from base)
 
 (struct post
-  [width u32] [height u32]
+  [width u32] [height u32] [scale u32]
   [color u32] [normals u32] [depth u32]
   [shader picture-shader] [uniforms u32] [group u32]
   [pipelines (array u32 10)])
@@ -69,7 +76,7 @@
 ;; The pass reads the textures pixel by pixel, so it needs no sampler.
 ;; It is written in Shade (lib/shade/core.sub).
 (shader picture
-  [uniform settings 0 0 (fragment) [near-far vec2] [size vec2] [fog vec2] [outline f32] [exposure f32]]
+  [uniform settings 0 0 (fragment) [near-far vec2] [size vec2] [outline f32] [exposure f32] [scale i32]]
   [texture color 0 1 (fragment)]
   [texture normals 0 2 (fragment)]
   [depth-texture depth 0 3 (fragment)]
@@ -90,11 +97,12 @@
     (- (* (-> (texture-load normals (within p) 0) xyz) 2.0) 1.0)]
   [define (outlined-at [p vec2i]) -> f32
     (-> (texture-load normals (within p) 0) w)]
-  ;; How much of a line a pixel gets: a full line where it is nearer than
-  ;; a neighbour by a jump (the near side of a silhouette, so a line is
-  ;; one pixel wide), half a line where its normal differs from a
-  ;; neighbour's (a crease). The sky, at the far distance, gets no crease
-  ;; lines. The line fades with the fog.
+  ;; How much of a line a pixel gets: a line where it is nearer than a
+  ;; neighbour by a jump (the near side of a silhouette, so a line is
+  ;; one pixel wide), fading between 20 and 70 units away; half a line
+  ;; where its normal differs from a neighbour's (a crease), fading
+  ;; between 10 and 35. The sky, at the far distance, gets no crease
+  ;; lines.
   [define (edge [p vec2i]) -> f32
     (let ([d (depth-at p)]
           [n (normal-at p)]
@@ -103,21 +111,35 @@
           [offsets (array vec2i (vec2i 1 0) (vec2i -1 0) (vec2i 0 1) (vec2i 0 -1))])
       (for ([i 0]) (< i 4) (+= i 1)
         (let* ([q (+ p (@ offsets i))] [dq (depth-at q)])
-          (when (> (- dq d) (+ (* 0.04 d) 0.03)) (set! line 1.0))
-          (when (and (< d (* far 0.99)) (< dq (* far 0.99)) (< (dot n (normal-at q)) 0.6)) (set! line (max line 0.5)))))
-      (* line (outlined-at p) (- 1.0 (clamp (/ (- d settings.fog.x) (- settings.fog.y settings.fog.x)) 0.0 1.0))))]
+          (when (> (- dq d) (+ (* 0.04 d) 0.03)) (set! line (max line (- 1.0 (smoothstep 20.0 70.0 d)))))
+          (when (and (< d (* far 0.99)) (< dq (* far 0.99)) (< (dot n (normal-at q)) 0.6))
+            (set! line (max line (* 0.5 (- 1.0 (smoothstep 10.0 35.0 d))))))))
+      (* line (outlined-at p)))]
+  ;; One texel of the scene as the picture shows it: toned, with its
+  ;; line.
+  [define (texel [p vec2i]) -> vec3
+    (let ([c (tone (* (-> (texture-load color p 0) rgb) settings.exposure))])
+      (mix c (vec3 0.02 0.02 0.03) (* (edge p) settings.outline)))]
   [fragment (fragment [in varyings]) -> vec4
-    (let* ([p (vec2i in.position.xy)]
-           [c (tone (* (-> (texture-load color p 0) rgb) settings.exposure))])
-      (vec4 (srgb (mix c (vec3 0.02 0.02 0.03) (* (edge p) settings.outline))) 1.0))])
+    (let* ([p (* (vec2i in.position.xy) settings.scale)]
+           [sum (vec3 0.0)])
+      (for ([i 0]) (< i settings.scale) (+= i 1)
+        (for ([j 0]) (< j settings.scale) (+= j 1)
+          (+= sum (texel (+ p (vec2i i j))))))
+      (let* ([c (/ sum (f32 (* settings.scale settings.scale)))]
+             ;; The vignette: from the centre of the screen outwards.
+             [centre (- (/ (* (vec2 p) 2.0) settings.size) 1.0)]
+             [vignette (- 1.0 (* 0.12 (smoothstep 0.5 1.6 (dot centre centre))))])
+        (vec4 (srgb (* c vignette)) 1.0)))])
 
-(define (post-init! [p (ptr post)] [width u32] [height u32])
+(define (post-init! [p (ptr post)] [width u32] [height u32] [scale u32])
   (memset p 0 (sizeof post))
-  (set! (-> p width) width)
-  (set! (-> p height) height)
-  (set! (-> p color) (gpu-texture! width height 1 1 gpu-rgba16f (+ gpu-sampled gpu-target)))
-  (set! (-> p normals) (gpu-texture! width height 1 1 gpu-rgba8 (+ gpu-sampled gpu-target)))
-  (set! (-> p depth) (gpu-texture! width height 1 1 gpu-depth24 (+ gpu-sampled gpu-target)))
+  (set! (-> p width) (* width scale))
+  (set! (-> p height) (* height scale))
+  (set! (-> p scale) scale)
+  (set! (-> p color) (gpu-texture! (-> p width) (-> p height) 1 1 gpu-rgba16f (+ gpu-sampled gpu-target)))
+  (set! (-> p normals) (gpu-texture! (-> p width) (-> p height) 1 1 gpu-rgba8 (+ gpu-sampled gpu-target)))
+  (set! (-> p depth) (gpu-texture! (-> p width) (-> p height) 1 1 gpu-depth24 (+ gpu-sampled gpu-target)))
   (picture-init! (& (-> p shader)))
   (set! (-> p uniforms) (gpu-buffer! (sizeof picture-settings) gpu-uniform))
   (set! (-> p group) (picture-bind-group-0! (& (-> p shader)) (-> p uniforms) (-> p color) (-> p normals) (-> p depth))))
@@ -136,14 +158,14 @@
       (set! (@ (-> p pipelines) format) (picture-render-pipeline! (& (-> p shader)) "vertex" "fragment" (& settings)))))
   (@ (-> p pipelines) format))
 
-(define (post-draw! [p (ptr post)] [kind u32] [target u32] [format u32] [c (ptr camera)] [l (ptr light)]
+(define (post-draw! [p (ptr post)] [kind u32] [target u32] [format u32] [c (ptr camera)]
                     [outline f64] [exposure f64])
   (let ([pipeline (pipeline! p format)] [settings picture-settings])
     (vec2! (-> settings near-far) (-> c near) (-> c far))
     (vec2! (-> settings size) (cast f64 (-> p width)) (cast f64 (-> p height)))
-    (vec2! (-> settings fog) (-> l fog-near) (-> l fog-far))
     (set! (-> settings outline) (cast f32 outline))
     (set! (-> settings exposure) (cast f32 exposure))
+    (set! (-> settings scale) (cast i32 (-> p scale)))
     (gpu-write-copy! (-> p uniforms) 0 (& settings) (sizeof picture-settings))
     (gpu-render-pass! 1 0 0 0 0 0.0)
     (gpu-pass-target! kind target 0 0 gpu-keep 0.0 0.0 0.0 0.0)

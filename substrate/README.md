@@ -199,16 +199,19 @@ do what it does: another language on the kernel can bring its own.
     - `meshes.sub`: the meshes, textured triangles with normals, each
       drawn at a list of placements (a chunk once, a tree a thousand
       times), and the passes that draw them: the shadow map from the
-      sun, the lit pass with its toon look, rim of light, shadows and
-      fog, and water, see-through, lit, with foam at its edge.
+      sun, the lit pass with its toon look, rim of light, shadows from
+      the sun and the clouds, fog and mist, and water, see-through,
+      rippled, with foam at its edge.
     - `sky.sub`: the sky, drawn where there is nothing: a gradient,
-      the sun's disc and glow, drifting clouds.
+      the sun's disc and glow, drifting clouds, far ridges all around.
     - `post.sub`: the textures a scene is drawn into (colour with
       more range than a screen, normals, depth) and the pass that
-      makes the picture from them: outlines, tone mapping, sRGB.
+      makes the picture from them: outlines, tone mapping,
+      supersampling, a vignette, sRGB.
     - `camera.sub` and `light.sub`: what a program fills in: the
       camera's position, yaw and pitch and projection; the sun, the
-      ambient light, the sky's colour, the fog, where shadows fall.
+      ambient light, the sky's colour, the fog and the mist, where
+      shadows fall.
     - `math.sub`: sin and cos, which wasm does not have, and the 4 by 4
       matrices a camera needs.
   - `game/`: a small library for games:
@@ -689,35 +692,46 @@ for Testing build that Playwright's browsers package fetches, as
     builds; the scene draws every mesh from a camera, lit by a sun,
     under a sky. A frame is three passes. The shadow map is drawn from the
     sun's view into a depth texture by a pipeline that has no fragment
-    stage. The scene pass draws into textures of the screen's size
-    that `post.sub` owns, colour (16-bit floats, so that a sun can be
-    brighter than white) and normals, with depth: first the sky, one
-    triangle over the screen whose fragments take their colour from
-    the direction they look in (a gradient, the sun's disc and glow
+    stage. The scene pass draws into textures of the screen's size, or
+    twice it each way, that `post.sub` owns, colour (16-bit floats, so
+    that a sun can be brighter than white) and normals, with depth:
+    first the sky, one triangle over the screen whose fragments take
+    their colour from the direction they look in (a gradient, haze at
+    the horizon that glows towards the sun, the sun's disc and glow
     from the same vector the shadows use, clouds from value noise on
-    a plane high up, drifting with time); then the meshes, where a
-    fragment looks itself up in the shadow map through a comparison
-    sampler (nine taps, softened), takes a lit band or a dark band
-    from its angle to the sun and the map, gets a rim of light where
-    it turns away from the camera, and fades into the horizon's haze
-    by distance, lighting computed on linear colours. The picture
-    pass, one triangle over the screen, draws the outlines where the
-    depth or the normal breaks between a pixel and its neighbours (a
-    line one pixel wide whatever the distance, on the near side of a
-    silhouette, fading with the fog as the colours do), maps the
-    colours into the screen's range with ACES's curve, and encodes
-    them for the screen. The meshes' origins come
-    from one uniform buffer through dynamic offsets. `voxels.sub`
+    a plane high up, white where thin and grey where thick, drifting
+    with time, and two lines of far ridges below the horizon from
+    noise over the bearing); then the meshes, where a fragment looks
+    itself up in the shadow map through a comparison sampler (nine
+    taps, softened), takes a lit band or a dark band from its angle to
+    the sun, the map and the clouds' noise over the world, is lit in
+    the dark band by the ambient light, more from the sky above than
+    from below, gets a rim of light where it turns away from the
+    camera, and fades into the horizon's haze by distance, and into
+    mist where it lies low, lighting computed on linear colours. A
+    mesh's placements are a vertex buffer read once per instance, so
+    the mesh is drawn once for all of them; a vertex colour's alpha
+    sways it in the wind, a placement's tint's alpha marks a small
+    thing, drawn without outlines and shrunk away beyond 40 units,
+    which is how a meadow of grass is drawn. The picture pass, one
+    triangle over the screen, draws the outlines where the depth or
+    the normal breaks between a pixel and its neighbours (a line one
+    pixel wide whatever the distance, on the near side of a
+    silhouette, kept to what is near: silhouettes fade out between 20
+    and 70 units away, creases between 10 and 35), maps the colours
+    into the screen's range with ACES's curve, averages each pixel's
+    four when the scene was drawn at twice the screen's size, which
+    smooths edges and makes the lines fine, darkens the corners a
+    little, and encodes them for the screen. `voxels.sub`
     builds meshes for a world of blocks (each face of a block that
     touches air, with how closed in each corner is baked into the
-    vertices), and gives the world its bodies and its line of sight.
+    vertices), and gives the world its bodies and its line of sight;
+    `terrain.sub` builds them for land from a height map.
     `math.sub` has what the cameras need and wasm does not provide:
     sin, cos, and 4 by 4 matrices, perspective and orthographic. A game
     draws its scene, which ends in the picture, then its sprites and
-    text, which go on top. The blocks example (below) is all this in
-    use. The shaders' own functions are WGSL text in the `shader`
-    forms, which is the plan's next step: a shader language on the
-    kernel, compiled to WGSL.
+    text, which go on top. The blocks and valley examples (below) are
+    all this in use. The shaders' own functions are written in Shade.
   - Not done: lines, circles and paths on the GPU (a game that needs
     them uses the canvas renderer), and the swap of the overlay canvas
     for text drawn by the GPU.
@@ -866,34 +880,52 @@ place.
 ### The valley example
 
 `lib/web/examples/valley` is a landscape to walk through, the scene
-library at the scale of one scene: a river winding along a valley
-floor between hills, forests on the slopes, meadows of grass that
-sways in the wind, boulders, mountains with snow rising to each side,
-the sun with its clouds and shadows, and the river's water, deep where
-the land below is far down, pale where it is close, with foam at the
-edge. The land is 256 units across, from noise with a fixed seed, so it
-is the same every time. The player walks on it, looks around with the
+library at the scale of one scene. A river comes in through a gorge,
+winds along a valley floor between hills, widens into a lake, and
+leaves through another gorge; the valley is closed in by mountains
+with snow on them. A path runs along the east bank, crosses the river
+by a wooden bridge, and climbs to a ring of standing stones on a knoll
+above the lake, where a jetty runs out into the water. Forests of
+firs, oaks and birches stand on the slopes, with bushes at their
+edges; meadows of grass and flowers sway in the wind; boulders lie
+about; the sun crosses the sky in ten minutes, warm and low at each
+end, and its clouds' shadows cross the land; mist lies on the water
+at a distance. The land is 256 units across, from noise with a fixed
+seed, so it is the same every time. The player walks and runs on it,
+around the trees, the boulders and the stones, over the bridge and
+the jetty, into the river up to the waist, looks around with the
 mouse, and jumps. Nothing is won or lost.
 
 The land is a height map (`game/terrain.sub`) meshed once, 66,000
 vertices, each coloured by what the land is there: sand by the water,
-grass, rock where it is steep or high, snow on the peaks, in sharp
-bands with a little noise at their edges, as a drawn landscape has
-them. Everything on it is a mesh placed many times (`scene/meshes.sub`):
-one tree, a trunk and two cones, 700 times; one tuft of grass, two
-crossed blades, 33,000 times, each tinted with the ground's green and
-drawn without outlines, with normals that point up so that it takes
-the ground's light; one boulder, a few dozen times. The water is a
-square at the water level drawn with the water material, which reads
-the land's height from the height map as a texture. The land, the
-trees, the grass, the boulders and the water are all plain colours in
-their vertices over a white texel. The shaders are Shade's.
+grass, rock in strata where it is steep or high, snow on the peaks, in
+sharp bands with a little noise at their edges, as a drawn landscape
+has them; the mountains are ridged noise, the path a line the paint
+follows. Everything on it is a mesh placed many times
+(`scene/meshes.sub`): a fir of three cones, an oak and a birch with
+lumpy crowns, a bush, a boulder in flat facets, a standing stone, a
+few hundred trees and boulders in all; and around the player, placed
+again whenever they have walked six units, a tuft of grass of three
+crossed blades, seven thousand of them, each tinted with the ground's
+green and drawn without outlines, with normals that point up so that
+it takes the ground's light, and flowers in three colours. The bridge
+and the jetty are boxes, planks with posts and rails, that the player
+walks on and is kept on by the rails. The water is a square at the
+water level drawn with the water material, which reads the land's
+height from the height map as a texture. Everything is a plain colour
+in its vertices over a white texel. The shaders are Shade's. The scene
+is drawn at twice the screen's size and averaged down (`post.sub`),
+so its edges are smooth and its lines fine.
 
 The game is tested without a browser (`tests/ui/valley.sub`): the
-land's heights, what grows on it, and the player walking, jumping,
-looking around and wading into the river. The browser test reads the
-GPU's picture: sky, meadow, river, forest, and a view that changes
-with walking. The compiled program is 163 KB, and its asset under 1 KB.
+land's heights, the path, what grows on it, the day, and the player
+walking, running, jumping, looking around, crossing the bridge,
+stopped by a tree, and wading into the river. The browser test reads
+the GPU's picture: sky, meadow, river, the bridge's wood, a view that
+changes with walking, and the lake from its shore through the game's
+`look` export, which puts the player anywhere (in the browser's
+console, `window.app.call('look', x, z, yaw, pitch)`). The compiled
+program is 185 KB, and its asset under 1 KB.
 
 ```sh
 lib/web/site.sh lib/web/examples/valley/valley.sub build/lib/web/valley lib/web/examples/valley/page.html
@@ -901,7 +933,7 @@ host/web/serve.mjs build/lib/web/valley
 ```
 
 Click the screen to look around with the mouse (Escape frees it); W,
-A, S and D walk, the arrows also look, Space jumps.
+A, S and D walk, Shift runs, the arrows also look, Space jumps.
 
 ### Measurements
 
@@ -937,9 +969,9 @@ In headless Chromium, on the development machine:
 
 | The valley example (GPU) | |
 |---|---|
-| Making the land (66,000 vertices), placing 34,000 trees, tufts and boulders, on the first frame | 60 ms |
+| Making the land (66,000 vertices), placing the trees, the bushes, the boulders and the stones, and 7,000 tufts of grass around the player, on the first frame | 75 ms |
 | A frame: a step, and the land, the trees, the grass, the boulders and the water drawn twice (shadow map, scene), the sky and the picture pass, in the program | 0.1 ms |
-| The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 2.3 ms / 1.1 s |
+| The same frame on the GPU, at twice the screen's size each way, from hand-over until done: RTX 5090 / SwiftShader | 2.2 ms / 0.3 s |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
 |---|---|---|---|
