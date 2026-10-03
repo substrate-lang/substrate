@@ -125,7 +125,8 @@ do what it does: another language on the kernel can bring its own.
 - `lib/bend/`: Bend, a port of Bend2's kernel, a dependently
   typed language with quantities, in s-expressions, written in the C-like
   Lisp (plan, 5):
-  - `core.sub`: the checker, function for
+  - `core.sub`: the checker, with a Nat literal a number among its
+    terms, however large, and function for
     function, its terms variants in arenas and its binders' bodies data,
     where the example's are Substrate closures; a definition is checked
     in an arena of its own, freed when it is done, and a template's
