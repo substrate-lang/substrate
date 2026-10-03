@@ -597,6 +597,48 @@ const checks = {
     check('sprites-canvas: nothing is written to the console', page.log.join('\n'), '');
   },
 
+  // next/web/examples/blocks: a world of blocks drawn in 3D by the GPU
+  // (next/web/game/meshes.sub). The picture is read through the gpu
+  // module's readSurface: the sky at the top, the land at the bottom.
+  // Walking changes the picture, and so does digging the block in front.
+  async blocks(page) {
+    // A number that stands for the picture: a sum over the middle rows.
+    const picture = () => page.evaluate(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s; })`);
+    const pixel = (x, y) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
+    // The atlas takes a moment to arrive; until then the land is drawn
+    // from a blank texture, black. The sky needs no texture. The player
+    // starts on a hill, so what is at the bottom of the screen depends
+    // on the land there: the top of a grass block or the side of one,
+    // which is dirt. Either is land, not sky.
+    await page.waitFor('window.gpuModule.readSurface(1, 320, 340, 1, 1).then((p) => p[0] > 40)', 10000);
+    check('blocks: the sky is at the top', await pixel(320, 20), '143,211,255,255');
+    const ground = (await pixel(320, 340)).split(',').map(Number);
+    check('blocks: the land is at the bottom, not the sky', ground[2] < 150 && ground[3] === 255, true);
+    check('blocks: the text is drawn on the overlay', await page.evaluate(`(() => {
+      const d = document.querySelectorAll("canvas")[1].getContext("2d").getImageData(0, 0, 200, 40).data;
+      let n = 0;
+      for (let i = 3; i < d.length; i += 4) if (d[i] > 0) n++;
+      return n > 100;
+    })()`), true);
+    const before = await picture();
+    await page.keyDown('w');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await page.keyUp('w');
+    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 5000);
+    check('blocks: walking changes the view', (await picture()) !== before, true);
+    // Looking down at the ground and digging: the block in front goes.
+    await page.keyDown('ArrowDown');
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await page.keyUp('ArrowDown');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const looking = await picture();
+    await page.press('x');
+    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${looking}; })`, 5000);
+    check('blocks: digging changes the view', (await picture()) !== looking, true);
+    check('blocks: the game has not stopped', await page.evaluate('document.querySelector(".game-stopped") === null'), true);
+    check('blocks: nothing is written to the console', page.log.join('\n'), '');
+  },
+
   // next/tests/web/sounds.sub: a game that loads a sound file and asks
   // for it as music (repeating) as soon as it starts. S stops the music,
   // M starts it again, and Space plays the sound once. The page keeps its
@@ -722,7 +764,7 @@ const checks = {
 
 // The pages that need WebGPU run in a browser of their own, started with
 // the flags that give it WebGPU without a GPU (host/web/browser.mjs).
-const needsGpu = new Set(['gpu', 'sprites', 'platformer']);
+const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks']);
 
 // Serve the sites (port 0 = any free port; serve.mjs prints its address),
 // then run each named check in a fresh page.

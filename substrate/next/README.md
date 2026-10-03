@@ -129,6 +129,13 @@ on them there.
       text, on either renderer.
     - `sprites.sub`: the GPU renderer: a frame's sprites gathered into
       a batch and drawn with a few commands, on `../gpu.sub`.
+    - `meshes.sub`: the GPU renderer for 3D: textured meshes drawn
+      from a camera, with depth and fog.
+    - `voxels.sub`: worlds made of blocks: the grid, bodies that move
+      through it, the block a line of sight hits, and the mesh of a
+      part of it. tiles.sub for three dimensions.
+    - `math.sub`: sin and cos, which wasm does not have, and the 4 by 4
+      matrices a camera needs.
     - `input.sub`: which keys are held, and which were just pressed.
     - `sound.sub`: sound files, music, and short synthesized tones.
     - `timers.sub`: things that happen later: a message that the game
@@ -155,7 +162,9 @@ on them there.
     around it, and `page.html` its HTML; and `platformer/`, a platform
     game built on `game/`: `world.sub` is the game, `platformer.sub`
     puts it in a page, and `assets/` holds its levels, which are text
-    files, and its sheet of sprites.
+    files, and its sheet of sprites; and `blocks/`, a world of blocks
+    in 3D, built on the same library: `world.sub`, `blocks.sub` and
+    the texture atlas in `assets/`.
   - `repl/`: the REPL page. `repl.sub` is the page's program (the user
     interface); `session.sub` is the compiler, which the page runs in a
     sandbox; `page.html` and `site.sh` make the site.
@@ -515,9 +524,22 @@ A site is made of static files only, so any web server can serve it.
     context in either browser, so the module has `readSurface`, which
     copies the next frame drawn on a surface for a test
     (`tests/web/pages.mjs`: `gpu`, `platformer`, `sprites`).
+  - The 3D side (`web/game/meshes.sub`, `voxels.sub`, `math.sub`).
+    A mesh is textured triangles the program builds; the renderer
+    draws every mesh from a camera, with a depth texture, back faces
+    culled, and fog, and the meshes' origins come from one uniform
+    buffer through dynamic offsets. `voxels.sub` builds meshes for a
+    world of blocks (each face of a block that touches air, with
+    lighting baked into the vertices: tops bright, undersides dark, and
+    corners that are closed in darker), and gives the world its
+    bodies and its line of sight. `math.sub` has what the camera needs
+    and wasm does not provide: sin, cos, and 4 by 4 matrices. A game
+    draws its scene first, then its sprites and text, which go on top.
+    The blocks example (below) is all this in use.
   - Not done: lines, circles and paths on the GPU (a game that needs
-    them uses the canvas renderer), a 3D renderer, and the swap of the
-    overlay canvas for text drawn by the GPU.
+    them uses the canvas renderer), mouse look (which needs pointer
+    lock from the dom module), and the swap of the overlay canvas for
+    text drawn by the GPU.
 - **Guests** (`host/web/guest.mjs`, `web/guest.sub`): running code that is
   not trusted. A program can start another program as a "guest": a
   separate sandbox with its own memory. The two share nothing, and they
@@ -611,6 +633,48 @@ host/web/serve.mjs build/next/web/platformer
 
 Arrows (or A and D) run, Space (or the up arrow, or W) jumps.
 
+### The blocks example
+
+`web/examples/blocks` is a world of blocks in 3D, built on the game
+library's 3D side: hills of grass over dirt over stone, sand in the low
+places, trees, 64 blocks wide and deep and 32 high, made from noise
+with a fixed seed. The player walks and jumps through it, looks
+around, removes the block in front of them and places blocks of six
+kinds. Nothing is won or lost; it is the 3D counterpart of the
+platformer. The game is one file, `world.sub`; `blocks.sub` is one
+line that hands its three functions to the game loop, with
+`[renderer gpu]`, since a scene needs the GPU.
+
+The world is a grid (`game/voxels.sub`) drawn in chunks of 16 by 32 by
+16 blocks, each a mesh (`game/meshes.sub`); a chunk is built again
+when a block in it changes, and so is a neighbouring chunk when the
+block is at their boundary. The player is a body that the grid stops
+(`move-body!`), and a step one block high is jumped over by itself
+when there is room above it (`body-free?`). What the player looks at
+is the first block a ray from the eye meets (`ray-hit!`), with the
+face it entered through, which is where a placed block goes. The
+camera is a yaw and a pitch (`game/math.sub`).
+
+The asset is `assets/atlas.png`, a row of eight tiles of 16 by 16
+pixels, one for each face kind. `art/make-atlas.mjs` draws them from
+a few colours and seeded noise; like the platformer's `art/`, it is
+not part of the game.
+
+The game is tested without a browser (`tests/ui/blocks.sub`): the
+world is made, the player falls, walks, jumps, looks down, digs and
+builds by made-up key presses, and a tree put in the way stops them.
+The browser test reads the GPU's picture: sky at the top, land at the
+bottom, and a view that changes when walking and when digging. The
+compiled program is 120 KB, and its asset 3 KB.
+
+```sh
+next/web/site.sh next/web/examples/blocks/blocks.sub build/next/web/blocks next/web/examples/blocks/page.html
+host/web/serve.mjs build/next/web/blocks
+```
+
+W, A, S and D walk, the arrows turn and look up and down, Space jumps,
+X digs, C places, 1 to 6 choose what to place.
+
 ### Measurements
 
 In headless Chromium, on the development machine:
@@ -636,6 +700,12 @@ In headless Chromium, on the development machine:
 | Draw 10,000 rectangles in one frame | 2 ms |
 | One frame of snake, including drawing the board | under 0.1 ms |
 | One frame of the platformer: a step, and about 70 sprites drawn | under 0.1 ms |
+
+| The blocks example (GPU) | |
+|---|---|
+| Making the world and the meshes of its 16 chunks (16,360 faces), on the first frame | 14 ms |
+| A frame: a step, and the 16 meshes drawn, in the program | 0.1 ms |
+| The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 0.6 ms / 3.8 ms |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
 |---|---|---|---|

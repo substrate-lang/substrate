@@ -23,6 +23,8 @@
 #      snake           the snake game (next/web/examples/snake)
 #      platformer      the platformer (next/web/examples/platformer),
 #                      built on the game library (next/web/game)
+#      blocks          the world of blocks (next/web/examples/blocks),
+#                      drawn in 3D by the GPU
 #      sounds          a game that plays a sound file, once and as music
 #                      (sounds.sub)
 #      gpu             the host module "gpu" (host/web/gpu.mjs) used
@@ -87,6 +89,7 @@ next/web/site.sh next/tests/web/assets.sub "$sites/assets"
 next/web/site.sh next/tests/web/canvas.sub "$sites/canvas"
 next/web/site.sh next/web/examples/snake/snake.sub "$sites/snake" next/web/examples/snake/page.html
 next/web/site.sh next/web/examples/platformer/platformer.sub "$sites/platformer" next/web/examples/platformer/page.html
+next/web/site.sh next/web/examples/blocks/blocks.sub "$sites/blocks" next/web/examples/blocks/page.html
 # The sounds page uses the platformer's page, which keeps the audio module
 # where the test can ask it what was played.
 next/web/site.sh next/tests/web/sounds.sub "$sites/sounds" next/web/examples/platformer/page.html
@@ -100,5 +103,5 @@ next/sub build next/tests/web/a-guest.sub -o "$sites/guests/guest"
 host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
 rm -r "${sites:?}/guests/guest"
 node next/tests/web/pages.mjs "$sites" counter rows focus fields assets canvas snake platformer sounds stopped stopped-at-start \
-  guests repl gpu sprites sprites-canvas || status=1
+  guests repl gpu sprites sprites-canvas blocks || status=1
 exit $status

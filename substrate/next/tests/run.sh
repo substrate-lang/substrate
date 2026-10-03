@@ -25,7 +25,7 @@
 # messages for templates that are wrong, test reading files and the game
 # library (collision, keys, timers, sound, its containers and its
 # formatting), print the GPU commands that a program and the sprite
-# renderer write, and play the two example games without their pages.
+# renderer write, and play the example games without their pages.
 # next/tests/session has the session tests, which
 # next/sub eval runs. Then,
 # as tests/run.sh does, the cache (spec 3.7): each program built again
