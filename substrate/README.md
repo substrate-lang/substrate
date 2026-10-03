@@ -172,6 +172,11 @@ do what it does: another language on the kernel can bring its own.
     circles, text, and sprites from image files.
   - `gpu.sub`: the program's side of the host module `gpu`, which is
     WebGPU: functions that write its commands.
+  - `shader.sub`: the `shader` form: a shader's bindings, buffers,
+    vertex inputs and varyings described once, from which the WGSL
+    declarations, the program's structs with the same layout, and the
+    functions that make the pipelines and bind groups are generated
+    and checked when the program is compiled.
   - `files.sub`: reading and writing files, which works on every host.
   - `guest.sub`: functions for running another program in a sandbox (a
     "guest"), on hosts that support it.
@@ -184,7 +189,8 @@ do what it does: another language on the kernel can bring its own.
     - `sprites.sub`: the GPU renderer: a frame's sprites gathered into
       a batch and drawn with a few commands, on `../gpu.sub`.
     - `meshes.sub`: the GPU renderer for 3D: textured meshes drawn
-      from a camera, with depth and fog.
+      from a camera and lit by a sun, with shadows from a shadow map,
+      a toon look with a rim of light and outlines, depth and fog.
     - `voxels.sub`: worlds made of blocks: the grid, bodies that move
       through it, the block a line of sight hits, and the mesh of a
       part of it. tiles.sub for three dimensions.
@@ -586,18 +592,41 @@ for Testing build that Playwright's browsers package fetches, as
     context in either browser, so the module has `readSurface`, which
     copies the next frame drawn on a surface for a test
     (`tests/web/pages.mjs`: `gpu`, `platformer`, `sprites`).
+  - **Shaders described once** (`lib/web/shader.sub`). A shader and the
+    program must agree on the layout of every uniform struct, the
+    attributes of every vertex buffer, which binding holds what, and
+    the locations of the values passed between stages; written twice,
+    in WGSL and in the program, they drift, and the result is a black
+    screen with no message. The `shader` form is the one place those
+    are written. At compile time it produces the WGSL declarations,
+    laid out as WGSL lays them out; the program's structs with the
+    same layout, so that a uniform is filled by name; the functions
+    that make the pipelines, with every layout, target and attribute
+    in place, and the bind groups, taking a group's resources in
+    binding order. The shader's own functions stay WGSL text, after
+    the declarations. It checks the types, the groups and bindings,
+    WGSL's rules for arrays in uniforms, and that an attribute has a
+    format. Both renderers are written with it.
   - The 3D side (`lib/web/game/meshes.sub`, `voxels.sub`, `math.sub`).
-    A mesh is textured triangles the program builds; the renderer
-    draws every mesh from a camera, with a depth texture, back faces
-    culled, and fog, and the meshes' origins come from one uniform
+    A mesh is textured triangles with normals that the program builds;
+    the renderer draws every mesh from a camera, lit by a sun. Each
+    frame is three passes over the meshes with one shader: the shadow
+    map, drawn from the sun's view into a depth texture with a
+    pipeline that has no fragment stage; the scene, where a fragment
+    looks itself up in the map through a comparison sampler (nine
+    taps, softened), takes a lit band or a dark band from its angle
+    to the sun and the map, gets a rim of light where it turns away
+    from the camera, and fades into the sky by distance; and the
+    outlines, each mesh drawn again pushed out along its normals with
+    its front faces culled. The meshes' origins come from one uniform
     buffer through dynamic offsets. `voxels.sub` builds meshes for a
-    world of blocks (each face of a block that touches air, with
-    lighting baked into the vertices: tops bright, undersides dark, and
-    corners that are closed in darker), and gives the world its
-    bodies and its line of sight. `math.sub` has what the camera needs
-    and wasm does not provide: sin, cos, and 4 by 4 matrices. A game
-    draws its scene first, then its sprites and text, which go on top.
-    The blocks example (below) is all this in use.
+    world of blocks (each face of a block that touches air, with how
+    closed in each corner is baked into the vertices), and gives the
+    world its bodies and its line of sight. `math.sub` has what the
+    cameras need and wasm does not provide: sin, cos, and 4 by 4
+    matrices, perspective and orthographic. A game draws its scene
+    first, then its sprites and text, which go on top. The blocks
+    example (below) is all this in use.
   - Not done: lines, circles and paths on the GPU (a game that needs
     them uses the canvas renderer), and the swap of the overlay canvas
     for text drawn by the GPU.
@@ -699,9 +728,10 @@ Arrows (or A and D) run, Space (or the up arrow, or W) jumps.
 `lib/web/examples/blocks` is a world of blocks in 3D, built on the game
 library's 3D side: hills of grass over dirt over stone, sand in the low
 places, trees, 64 blocks wide and deep and 32 high, made from noise
-with a fixed seed. The player walks and jumps through it, looks
-around, removes the block in front of them and places blocks of six
-kinds. Nothing is won or lost; it is the 3D counterpart of the
+with a fixed seed, lit by an afternoon sun that casts shadows, drawn
+in a toon style with outlines. The player walks and jumps through it,
+looks around, removes the block in front of them and places blocks of
+six kinds. Nothing is won or lost; it is the 3D counterpart of the
 platformer. The game is one file, `world.sub`; `blocks.sub` is one
 line that hands its three functions to the game loop, with
 `[renderer gpu]`, since a scene needs the GPU.
@@ -771,8 +801,8 @@ In headless Chromium, on the development machine:
 | The blocks example (GPU) | |
 |---|---|
 | Making the world and the meshes of its 16 chunks (16,360 faces), on the first frame | 14 ms |
-| A frame: a step, and the 16 meshes drawn, in the program | 0.1 ms |
-| The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 0.6 ms / 3.8 ms |
+| A frame: a step, and the 16 meshes drawn three times (shadow map, scene, outlines), in the program | 0.1 ms |
+| The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 2.2 ms / 13 ms |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
 |---|---|---|---|

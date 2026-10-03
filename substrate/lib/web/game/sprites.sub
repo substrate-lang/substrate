@@ -61,7 +61,8 @@
 ;; needed, so the upload is one write. The vertex shader makes the two
 ;; triangles of each rectangle from six vertices, and finds the cell in
 ;; the sheet from the frame number and the sheet's size, which it asks
-;; the texture for. A cell width of 0 means a plain colour.
+;; the texture for. A cell width of 0 means a plain colour. The shader
+;; and its layouts are described once, with ../shader.sub.
 ;;
 ;; Sheets are loaded with alpha premultiplied (host/web/gpu.mjs), and
 ;; sprites are blended that way. Sampling is "nearest", for sharp pixel
@@ -69,6 +70,7 @@
 ;; copied pixel for pixel.
 (require-unqualified base "../../../compiler/base/base.sub")
 (require-unqualified gpu "../gpu.sub")
+(require-unqualified shader "../shader.sub")
 
 (provide sprites sprites-init! sprites-sheet! sprites-begin! sprites-add! sprites-rect! sprites-draw!)
 
@@ -89,37 +91,27 @@
   ;; pixel, bound for runs that only draw plain colours.
   [sheets (ptr sheet)] [sheet-count u32] [sheet-capacity u32]
   ;; GPU resources.
-  [shader u32] [screen-layout u32] [sheet-layout u32] [sampler u32]
+  [shader quad-shader] [sampler u32]
   [uniforms u32] [screen-group u32]
   [buffer u32] [buffer-capacity u32]
   ;; The pipeline for each target format, made when first needed.
   [pipelines (array u32 10)])
 
-(define shader-code (ptr u8) "
-struct Screen { size: vec2f, unused: vec2f }
-@group(0) @binding(0) var<uniform> screen: Screen;
-@group(1) @binding(0) var sheet_sampler: sampler;
-@group(1) @binding(1) var sheet: texture_2d<f32>;
-
-struct Instance {
-  @location(0) rect: vec4f,
-  @location(1) cell: vec4f,
-  @location(2) color: vec4f,
-  @builtin(vertex_index) vertex: u32,
-}
-
-struct Vertex {
-  @builtin(position) position: vec4f,
-  @location(0) uv: vec2f,
-  @location(1) color: vec4f,
-  @location(2) textured: f32,
-}
-
-@vertex fn vertex(in: Instance) -> Vertex {
+;; The sheet is visible to the vertex stage too, which asks it for its
+;; size.
+(shader quad
+  [uniform screen 0 0 (vertex) [size vec2]]
+  [sampler sheet-sampler 1 0 (fragment)]
+  [texture sheet 1 1 (vertex fragment)]
+  [vertex-input instance per-instance [rect vec4] [cell vec4] [color vec4]]
+  [builtins vertex-index]
+  [varyings [uv vec2] [color vec4] [textured f32]]
+  [code "
+@vertex fn vertex(in: Vertex) -> Varyings {
   var corners = array<vec2f, 6>(vec2f(0, 0), vec2f(1, 0), vec2f(0, 1), vec2f(1, 0), vec2f(1, 1), vec2f(0, 1));
-  let corner = corners[in.vertex];
+  let corner = corners[in.vertex_index];
   let p = in.rect.xy + corner * in.rect.zw;
-  var out: Vertex;
+  var out: Varyings;
   out.position = vec4f(p.x / screen.size.x * 2.0 - 1.0, 1.0 - p.y / screen.size.y * 2.0, 0.0, 1.0);
   // The cell: frame numbers run left to right, then top to bottom.
   let size = vec2f(textureDimensions(sheet));
@@ -133,29 +125,21 @@ struct Vertex {
   return out;
 }
 
-@fragment fn fragment(in: Vertex) -> @location(0) vec4f {
+@fragment fn fragment(in: Varyings) -> @location(0) vec4f {
   let sample = textureSample(sheet, sheet_sampler, in.uv);
   return select(in.color, sample * in.color, in.textured > 0.5);
 }
-")
+"])
 
 (define floats-per-instance u32 12)
 (define bytes-per-instance u32 48)
 
 (define (sprites-init! [b (ptr sprites)])
   (memset b 0 (sizeof sprites))
-  (set! (-> b shader) (gpu-shader! shader-code))
-  (set! (-> b screen-layout) (gpu-layout! 1))
-  (gpu-layout-entry! 0 gpu-in-vertex gpu-uniform-entry)
-  ;; The vertex shader asks the sheet for its size, so the sheet is
-  ;; visible to both stages.
-  (set! (-> b sheet-layout) (gpu-layout! 2))
-  (gpu-layout-entry! 0 gpu-in-fragment gpu-sampler-entry)
-  (gpu-layout-entry! 1 (+ gpu-in-vertex gpu-in-fragment) gpu-texture-entry)
+  (quad-init! (& (-> b shader)))
   (set! (-> b sampler) (gpu-sampler! gpu-nearest gpu-clamp gpu-compare-none))
-  (set! (-> b uniforms) (gpu-buffer! 16 gpu-uniform))
-  (set! (-> b screen-group) (gpu-bind-group! (-> b screen-layout) 0 0 1))
-  (gpu-bind-buffer! 0 (-> b uniforms) 0 0)
+  (set! (-> b uniforms) (gpu-buffer! (sizeof quad-screen) gpu-uniform))
+  (set! (-> b screen-group) (quad-bind-group-0! (& (-> b shader)) (-> b uniforms)))
   (set! (-> b buffer-capacity) 256)
   (set! (-> b buffer) (gpu-buffer! (* 256 bytes-per-instance) gpu-vertex))
   ;; Sheet 0, the blank.
@@ -168,9 +152,7 @@ struct Vertex {
     (set! (-> b sheets) (cast (ptr sheet) (realloc (-> b sheets) (* (-> b sheet-capacity) (sizeof sheet))))))
   (let ([s (+ (-> b sheets) (-> b sheet-count))])
     (set! (-> s texture) texture)
-    (set! (-> s group) (gpu-bind-group! (-> b sheet-layout) 0 1 2))
-    (gpu-bind-sampler! 0 (-> b sampler))
-    (gpu-bind-texture! 1 texture)
+    (set! (-> s group) (quad-bind-group-1! (& (-> b shader)) (-> b sampler) texture))
     (+= (-> b sheet-count) 1)
     (- (-> b sheet-count) 1)))
 
@@ -237,24 +219,20 @@ struct Vertex {
 ;; it is needed.
 (define (pipeline! [b (ptr sprites)] [format u32]) -> u32
   (when (== (@ (-> b pipelines) format) 0)
-    (set! (@ (-> b pipelines) format)
-          (gpu-render-pipeline! (-> b shader) "vertex" "fragment" gpu-triangles gpu-cull-none gpu-ccw gpu-blend-premultiplied
-                                0 gpu-compare-none 0  2 1 1))
-    (gpu-layout-item! (-> b screen-layout))
-    (gpu-layout-item! (-> b sheet-layout))
-    (gpu-target! format)
-    (gpu-vertex-buffer-layout! bytes-per-instance gpu-per-instance 3)
-    (gpu-attribute! 0 0 gpu-f32x4)
-    (gpu-attribute! 1 16 gpu-f32x4)
-    (gpu-attribute! 2 32 gpu-f32x4))
+    (let ([settings render-settings])
+      (render-settings-init! (& settings))
+      (set! (-> settings blend) gpu-blend-premultiplied)
+      (set! (@ (-> settings targets) 0) format)
+      (set! (@ (-> b pipelines) format) (quad-render-pipeline! (& (-> b shader)) "vertex" "fragment" (& settings)))))
   (@ (-> b pipelines) format))
 
 (define (part [color u32] [shift u32]) -> f64 (/ (cast f64 (bit-and (>> color shift) 255)) 255.0))
 
 (define (sprites-draw! [b (ptr sprites)] [kind u32] [target u32] [format u32] [width u32] [height u32] [load u32] [clear u32])
   (let ([pipeline (pipeline! b format)])
-    (gpu-write-buffer! (-> b uniforms) 0
-                       (gpu-frame-copy (array-of f32 (cast f32 width) (cast f32 height) 0.0 0.0) 16) 16)
+    (let ([screen quad-screen])
+      (vec2! (-> screen size) (cast f64 width) (cast f64 height))
+      (gpu-write-copy! (-> b uniforms) 0 (& screen) (sizeof quad-screen)))
     (when (> (-> b count) 0)
       ;; A bigger buffer when the batch has outgrown it.
       (when (> (-> b count) (-> b buffer-capacity))

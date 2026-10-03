@@ -601,8 +601,10 @@ const checks = {
 
   // lib/web/examples/blocks: a world of blocks drawn in 3D by the GPU
   // (lib/web/game/meshes.sub). The picture is read through the gpu
-  // module's readSurface: the sky at the top, the land at the bottom.
-  // Walking changes the picture, and so does digging the block in front.
+  // module's readSurface: the sky at the top, the land at the bottom,
+  // and both lit faces and faces in shade or shadow, since the scene is
+  // lit by a sun with a shadow map. Walking changes the picture, and so
+  // does digging the block in front.
   // A click locks the pointer to the screen ([pointer lock] in game.sub);
   // then the mouse looks around and its left button digs. The browser
   // reports the mouse's movement itself, so the test dispatches
@@ -620,6 +622,16 @@ const checks = {
     check('blocks: the sky is at the top', await pixel(320, 20), '143,211,255,255');
     const ground = (await pixel(320, 340)).split(',').map(Number);
     check('blocks: the land is at the bottom, not the sky', ground[2] < 150 && ground[3] === 255, true);
+    // Grass is green in the light and a darker green in shade or shadow;
+    // a view of the hills has plenty of both.
+    const greens = await page.evaluate(`window.gpuModule.readSurface(1, 0, 60, 640, 300).then((p) => {
+      let lit = 0, shaded = 0;
+      for (let i = 0; i < p.length; i += 4) {
+        if (p[i + 1] > p[i] + 40 && p[i + 1] > p[i + 2] + 40) { if (p[i + 1] > 150) lit++; else if (p[i + 1] > 50) shaded++; }
+      }
+      return [lit, shaded];
+    })`);
+    check('blocks: the sun lights some grass and leaves some in shade', greens[0] > 5000 && greens[1] > 5000, true);
     check('blocks: the text is drawn on the overlay', await page.evaluate(`(() => {
       const d = document.querySelectorAll("canvas")[1].getContext("2d").getImageData(0, 0, 200, 40).data;
       let n = 0;
