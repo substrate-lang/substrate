@@ -7,6 +7,24 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      # The headless browser the web tests run in (tests/web/run.sh), which
+      # host/web/browser.mjs starts as `chromium`: nixpkgs' Chromium on
+      # Linux; on macOS, where nixpkgs builds none, the Chrome for Testing
+      # build that Playwright's browsers package fetches, run by a
+      # `chromium` script.
+      chromium = pkgs:
+        if pkgs.stdenv.isLinux then pkgs.chromium
+        else pkgs.runCommand "chromium" {
+          browsers = pkgs.playwright-driver.browsers-chromium.override { withFfmpeg = false; };
+        } ''
+          app="$(find -L "$browsers" -maxdepth 3 -name '*.app' | head -1)"
+          [ -n "$app" ] || { echo "no application bundle in $browsers" >&2; exit 1; }
+          mkdir -p "$out/bin"
+          { echo '#!${pkgs.runtimeShell}'
+            echo "exec \"$app/Contents/MacOS/$(basename "$app" .app)\" \"\$@\""
+          } > "$out/bin/chromium"
+          chmod +x "$out/bin/chromium"
+        '';
     in {
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
@@ -17,11 +35,11 @@
             pkgs.wasm-tools    # validate / print emitted modules
             pkgs.lld           # wasm-ld: links the C benchmarks' C to wasm (bench/base)
             pkgs.gnumake
-            pkgs.nodejs    # V8, to compare engines (host/subhost.mjs)
+            pkgs.nodejs        # V8, to compare engines (host/subhost.mjs), and the web tests' driver
+            (chromium pkgs)    # the headless browser of the web tests (above)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.gcc       # on macOS, the shell's clang is the C compiler
             pkgs.perf      # profile compiled wasm (SUBHOST_PERFMAP)
-            pkgs.chromium  # the headless browser used by the web tests (host/web/browser.mjs)
           ];
           WASMTIME_INCLUDE = "${pkgs.wasmtime.dev}/include";
           WASMTIME_LIB = "${pkgs.wasmtime.lib}/lib";

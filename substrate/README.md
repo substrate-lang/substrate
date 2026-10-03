@@ -361,9 +361,10 @@ tests/web/run.sh                        # run the browser tests (headless Chromi
 ```
 
 A site is made of static files only, so any web server can serve it.
-The browser tests need Chromium, which the flake's dev shell has on
-Linux; elsewhere `CHROMIUM` names the browser to run
-(`host/web/browser.mjs`).
+The browser tests need Chromium, which the flake's dev shell brings:
+nixpkgs' on Linux, and on macOS, where nixpkgs builds none, the Chrome
+for Testing build that Playwright's browsers package fetches, as
+`chromium`; `CHROMIUM` names another browser (`host/web/browser.mjs`).
 
 ### The pieces
 

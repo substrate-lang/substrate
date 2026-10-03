@@ -16,7 +16,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withBrowser } from '../../../host/web/browser.mjs';
+import { withBrowser } from '../../host/web/browser.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites, ...names] = process.argv.slice(2);
@@ -178,15 +178,18 @@ const checks = {
       await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
 
     // C-like Lisp code can write to any address. This input overwrites
-    // 4 MB of the session's memory, including the compiler's own data, so
-    // the session can no longer reply. The page is a separate program
-    // with separate memory: it notices, starts a new session, and
-    // restores the earlier definitions (fib).
-    await page.type('(memset (cast (ptr void) 8) 255 4000000)');
+    // the session's memory from byte 8 up to its break, (sbrk 0): the
+    // compiler's stack and heap, whatever their size, so the session can
+    // no longer reply; its value, 8, is printed first, since print.sub
+    // formats a number into bytes 32..63 as it prints it and keeps
+    // nothing in memory. The page is a separate program with separate
+    // memory: it notices, starts a new session, and restores the earlier
+    // definitions (fib).
+    await page.type('(memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8)))');
     await page.press('Enter');
     await idle();
     check('repl: an input that corrupts the session fails', (await last()).split('\n')[0],
-      '! (memset (cast (ptr void) 8) 255 4000000) => 8');
+      '! (memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8))) => 8');
     check('repl: the page reports that the session crashed', (await last()).split('\n').pop(),
       'The session crashed while evaluating this input. A new session was started.');
     await say('(fib 10)');
@@ -590,7 +593,7 @@ const checks = {
     check('stopped: the report starts with the message of the trap',
       report.split('\n')[0], 'trap: vector-at: there is no item 5: the vector holds 1');
     check('stopped: the report lists the game function that was running, and where it is',
-      /step! .*next\/tests\/web\/stopped\.sub:22:/.test(report), true);
+      /step! .*tests\/web\/stopped\.sub:22:/.test(report), true);
     check('stopped: the screen keeps what was drawn before the trap', await page.evaluate(
       '[...document.querySelector("canvas").getContext("2d").getImageData(10, 10, 1, 1).data].join(",")'), '46,125,50,255');
     // The game takes no more steps, so it does not trap again: there is
@@ -662,7 +665,7 @@ const checks = {
 
 // Serve the sites (port 0 = any free port; serve.mjs prints its address),
 // then run each named check in a fresh page.
-const server = spawn(path.join(here, '../../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
+const server = spawn(path.join(here, '../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 try {
   await withBrowser(async (open) => {
