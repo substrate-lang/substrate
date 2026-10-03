@@ -22,7 +22,7 @@ line says the same.
 | `docs/` | the kernel specification | permanent |
 | `host/` | the hosts, in C over wasmtime (`subhost.c`) and in JavaScript over Node's V8 (`subhost.mjs`): stores, linking, the `host` imports and the instantiate hook; what the JavaScript host shares with the browser is `subhost-core.mjs`, and `host/web/` (experimental) runs programs in a web page, where a program can also run another program in a sandbox (`host/web/guest.mjs`): "Web pages" below | permanent: they run programs, the compiler among them |
 | `compiler/` | the compiler, written in the C-like Lisp: reader, expander, kernel compiler, wasm encoder. It compiles itself (spec 1.4). With it, everything it rests on and carries into programs: the kernel module (`kernel.sub`, in kernel code), the data of every language, in memory, and the functions macros use on it; the forms kernel code is written with (`kernel-forms.sub`, `syntax-match.sub`, `patterns.sub`); the program's memory (`memory.sub`) and printing from it (`print.sub`); and the C-like Lisp itself (`base/`), whose macros are kernel code on the kernel module's data. Nothing here requires anything outside it | permanent, grows |
-| `lib/` | the languages built on the kernel, as libraries programs require: Substrate (`substrate/`), on its own values in memory, and Bend (`bend/`), both written in the C-like Lisp on `compiler/`; and `web/` (experimental), pages, GPU rendering, games and a REPL in the browser, in the C-like Lisp | permanent, grows |
+| `lib/` | the languages built on the kernel, as libraries programs require: Substrate (`substrate/`), on its own values in memory, Bend (`bend/`), and Shade (`shade/`, experimental), a language for GPU programs compiled to WGSL, all written in the C-like Lisp on `compiler/`; and `web/` (experimental), pages, GPU rendering, games and a REPL in the browser, in the C-like Lisp | permanent, grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error). `tests/*.sub` are the kernel's; `tests/base/`, `tests/substrate/` and `tests/bend/` each language's; `tests/ui/` the web libraries' that need no browser, and `tests/session/` the sessions', which `bin/sub eval` runs; `tests/fixtures/` holds the modules the tests require. `tests/web/` are the browser tests, run apart by `tests/web/run.sh` | grows |
 | `seed/` | the compiler, built by itself: what builds the compiler's source (spec 1.4) | permanent, replaced as the compiler grows |
 | `bench/` | benchmarks, each directory with its `run.sh`: `base/`, the C-like Lisp against C; `substrate/`, Substrate's programs; `bend/compile/`, checking and compiling Bend's proofs module; and `compare/`, the same programs in the three languages. `bench/README.md` has the measurements | grows |
@@ -163,6 +163,15 @@ do what it does: another language on the kernel can bring its own.
     made the first time a value is shared; dropping; and writing a Nat.
   - `base.sub`: a slice of Bend's Base: its first datatypes, and
     arithmetic and equality on Nat.
+- `lib/shade/` (experimental): Shade, a language for GPU programs,
+  compiled to WGSL when the program that holds them is compiled
+  ("Shade" below):
+  - `core.sub`: the language: its types, its expressions and
+    statements, the checker and the WGSL writer.
+  - `shade.sub`: the form a module writes it with, `shade-library`,
+    which binds definitions for shaders to use.
+  - `screen.sub`, `noise.sub`, `color.sub`: libraries: the triangle
+    that covers the screen, value noise, sRGB and tone mapping.
 - `lib/web/` (experimental): programs that run in a browser and draw a
   web page, written in the C-like Lisp ("Web pages" below):
   - `ui.sub`: a template language for pages ("views").
@@ -383,6 +392,50 @@ code too.
   (see "Guests" below).
 - **Memory grows.** What an input creates, its syntax and its code, is
   kept for as long as the session lasts: 10 to 30 KB per input.
+
+## Shade
+
+The GPU takes its programs as WGSL text, which the browser compiles;
+there is no stable GPU instruction set, so something compiles on the
+user's machine whatever the API, and WebGPU's choice is a language the
+browser can validate. Shade (`lib/shade/`) is that language in
+s-expressions, typed, checked by our compiler when the program is
+compiled and turned into WGSL text that the `shader` form embeds. A
+mistake is reported at the form that has it, with the types, rather
+than by the browser later; shaders have macros and definitions shared
+between them; and the reader is the same as everywhere.
+
+The language is WGSL's: f32, i32, u32 and bool; vectors, matrices,
+fixed arrays and structs; functions without recursion; let, set!, if,
+cond, for and while; the built-in functions under their names with
+hyphens (`texture-sample`, `smoothstep`); fields and swizzles as
+dotted names, `in.uv`, `v.xyz`. A number written out takes the type
+its place wants, as WGSL's own literals do. A function's body gives its
+result as the last form, through an if or a cond. A shader form's
+bindings are variables (a uniform is its struct, a storage buffer an
+array of its struct) and its structs are types, the vertex, varyings
+and outputs among them, so an entry point is written against them:
+
+```lisp
+[vertex (vertex [in vertex]) -> varyings
+  (varyings [position (* frame.view-projection (vec4 in.position 1.0))]
+            [uv (/ in.texel (vec2 (texture-dimensions atlas)))])]
+```
+
+The checker types every expression: vector sizes and element types,
+scalar and vector mixing, matrix shapes, swizzles, struct fields,
+calls against the functions' signatures and the built-ins' (a table of
+patterns generic over vector size), results against declarations, and
+WGSL's own rules where they bite, such as a number written out not
+standing for a vector. The WGSL it writes is readable, since the
+browser's messages refer to it (`tests/ui/shade.sub` prints one).
+`shade-library` shares definitions: the three in `lib/shade/` are the
+triangle that covers the screen, value noise, and colour (sRGB, ACES).
+Not there yet: pointers, atomics and workgroup memory, which compute
+kernels that cooperate across threads need, and which fit the checker
+as more types and built-ins; and a second back end to the C-like Lisp,
+so that a function such as terrain noise is written once and runs on
+the processor too.
 
 ## Web pages
 
@@ -616,10 +669,10 @@ for Testing build that Playwright's browsers package fetches, as
     same layout, so that a uniform is filled by name; the functions
     that make the pipelines, with every layout, target and attribute
     in place, and the bind groups, taking a group's resources in
-    binding order. The shader's own functions stay WGSL text, after
-    the declarations. It checks the types, the groups and bindings,
+    binding order. It checks the types, the groups and bindings,
     WGSL's rules for arrays in uniforms, and that an attribute has a
-    format. Both renderers are written with it.
+    format. The shader's own functions are written in Shade (below),
+    in the same form. Every renderer is written with it.
   - The 3D side (`lib/web/scene/`: `scene.sub` over `meshes.sub`,
     `sky.sub`, `post.sub`, `camera.sub`, `light.sub` and `math.sub`;
     the game library's `voxels.sub` builds meshes for it). A mesh is
@@ -1003,17 +1056,11 @@ plan, and what each step found:
    a location from another file by the nearest enclosing one (spec
    3.6). An instance's own file should count as its file: a change to
    the compiler's back end and to the spec.
-8. A shader language on the kernel. The GPU takes its programs as WGSL
-   text, which the browser compiles. The `shader` form
-   (`lib/web/scene/shader.sub`) generates and checks what the program
-   and the shader must agree on, but a shader's own functions are
-   still WGSL text in the form, written by hand, shared by copying,
-   and checked by the browser after the fact. WGSL is a small language:
-   scalars, vectors, matrices, arrays and structs, functions without
-   recursion, a few statements, some hundred built-in functions. A
-   language on the kernel in its place, compiled to WGSL text at
-   compile time, gives shaders macros, definitions shared between
-   shaders, and errors from our compiler at the form; and, with a
-   second back end to the C-like Lisp, functions written once that
-   run on both the processor and the GPU, such as the noise a terrain
-   is made from. As Bend and Substrate are, it would be a library.
+8. A shader language on the kernel: Shade (`lib/shade/`, "Shade"
+   above). Done: the language, its checker and its WGSL back end, the
+   shader form's clauses for it, libraries, and every renderer written
+   in it. Still to do: pointers, atomics and workgroup memory for
+   compute kernels that cooperate across threads, when such a kernel
+   is written (GPU-driven culling); and the second back end, to the
+   C-like Lisp, so that a function such as the noise a terrain is made
+   from is written once and runs on the processor too.
