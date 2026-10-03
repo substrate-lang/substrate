@@ -25,6 +25,8 @@
 #                      built on the game library (lib/web/game)
 #      blocks          the world of blocks (lib/web/examples/blocks),
 #                      drawn in 3D by the GPU
+#      valley          the valley (lib/web/examples/valley), a landscape
+#                      drawn in 3D by the GPU
 #      sounds          a game that plays a sound file, once and as music
 #                      (sounds.sub)
 #      gpu             the host module "gpu" (host/web/gpu.mjs) used
@@ -89,6 +91,7 @@ lib/web/site.sh tests/web/canvas.sub "$sites/canvas"
 lib/web/site.sh lib/web/examples/snake/snake.sub "$sites/snake" lib/web/examples/snake/page.html
 lib/web/site.sh lib/web/examples/platformer/platformer.sub "$sites/platformer" lib/web/examples/platformer/page.html
 lib/web/site.sh lib/web/examples/blocks/blocks.sub "$sites/blocks" lib/web/examples/blocks/page.html
+lib/web/site.sh lib/web/examples/valley/valley.sub "$sites/valley" lib/web/examples/valley/page.html
 # The sounds page uses the platformer's page, which keeps the audio module
 # where the test can ask it what was played.
 lib/web/site.sh tests/web/sounds.sub "$sites/sounds" lib/web/examples/platformer/page.html
@@ -102,5 +105,5 @@ bin/sub build tests/web/a-guest.sub -o "$sites/guests/guest"
 host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
 rm -r "${sites:?}/guests/guest"
 node tests/web/pages.mjs "$sites" counter rows focus fields assets canvas snake platformer sounds stopped stopped-at-start \
-  guests repl gpu sprites sprites-canvas blocks || status=1
+  guests repl gpu sprites sprites-canvas blocks valley || status=1
 exit $status

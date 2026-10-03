@@ -1,0 +1,157 @@
+;; Lifecycle: experimental.
+;;
+;; Land as a height map: a grid of heights, meshed for the scene
+;; renderer (../scene/meshes.sub), asked for its height and its slope
+;; anywhere, given to the water as a texture, and walked on.
+;;
+;;   (terrain-init! t columns rows spacing)
+;;       A grid of columns by rows heights, `spacing` units apart, all
+;;       0; it covers (columns - 1) by (rows - 1) times spacing units
+;;       from the origin, along x and z.
+;;   (terrain-free! t)
+;;   (terrain-set! t column row height)
+;;   (terrain-height t x z) -> f64
+;;       The land's height at a point, between the heights around it;
+;;       outside the grid, the nearest edge's.
+;;   (terrain-slope t x z) -> f64
+;;       How steep the land is there: 0 flat, 1 at 45 degrees, more
+;;       beyond.
+;;   (terrain-mesh! t vertices indices tile color-of)
+;;       Builds the mesh: a vertex per height, with its normal, texel
+;;       (tile-x, tile-y), a point in the atlas (for a mesh of plain
+;;       colours, a white texel), a shade of 1, and the colour
+;;       #xRRGGBBAA that `color-of` gives for (x z height slope); then
+;;       the triangles.
+;;   (terrain-texture! t) -> texture
+;;       The heights as a GPU texture, rgba16float, one texel per
+;;       height, for the water (meshes-heights!).
+;;
+;; Walking:
+;;
+;;   (struct walker [x] [y] [z] [vy] [on-ground])
+;;       Someone on the land: where they are (y is their feet), how
+;;       fast they fall or rise, and whether they stand on the ground.
+;;   (walker-move! t w dx dz)
+;;       Moves the walker sideways by (dx, dz), then by their vertical
+;;       speed, and stops them at the land: a walker never goes below it,
+;;       and a step up is taken as the land rises. Afterwards on-ground
+;;       says whether they stand on it.
+(require-unqualified base "../../../compiler/base/base.sub")
+(require numbers "../../../compiler/numbers.sub" f32-bits)
+(require-unqualified gpu "../gpu.sub")
+(require-unqualified meshes "../scene/meshes.sub")
+
+(provide terrain terrain-init! terrain-free! terrain-set! terrain-height terrain-slope terrain-mesh! terrain-texture!
+         walker walker-move!)
+
+(memory from base)
+(table from base)
+
+(struct terrain [columns i32] [rows i32] [spacing f64] [heights (ptr f32)])
+
+(define (terrain-init! [t (ptr terrain)] [columns i32] [rows i32] [spacing f64])
+  (set! (-> t columns) columns)
+  (set! (-> t rows) rows)
+  (set! (-> t spacing) spacing)
+  (set! (-> t heights) (cast (ptr f32) (calloc (cast u32 (* columns rows)) 4))))
+
+(define (terrain-free! [t (ptr terrain)])
+  (free (-> t heights))
+  (set! (-> t heights) 0))
+
+(define (clamp-index [i i32] [n i32]) -> i32 (if (< i 0) 0 (if (>= i n) (- n 1) i)))
+
+(define (height-at [t (ptr terrain)] [column i32] [row i32]) -> f64
+  (cast f64 (@ (-> t heights) (cast u32 (+ (* (clamp-index row (-> t rows)) (-> t columns)) (clamp-index column (-> t columns)))))))
+
+(define (terrain-set! [t (ptr terrain)] [column i32] [row i32] [height f64])
+  (set! (@ (-> t heights) (cast u32 (+ (* row (-> t columns)) column))) (cast f32 height)))
+
+(define (terrain-height [t (ptr terrain)] [x f64] [z f64]) -> f64
+  (let* ([u (/ x (-> t spacing))] [v (/ z (-> t spacing))]
+         [c (cast i32 (floor u))] [r (cast i32 (floor v))]
+         [fu (- u (floor u))] [fv (- v (floor v))]
+         [top (+ (* (height-at t c r) (- 1.0 fu)) (* (height-at t (+ c 1) r) fu))]
+         [bottom (+ (* (height-at t c (+ r 1)) (- 1.0 fu)) (* (height-at t (+ c 1) (+ r 1)) fu))])
+    (+ (* top (- 1.0 fv)) (* bottom fv))))
+
+(define (terrain-slope [t (ptr terrain)] [x f64] [z f64]) -> f64
+  (let ([d (* (-> t spacing) 0.5)])
+    (let ([dx (/ (- (terrain-height t (+ x d) z) (terrain-height t (- x d) z)) (* 2.0 d))]
+          [dz (/ (- (terrain-height t x (+ z d)) (terrain-height t x (- z d))) (* 2.0 d))])
+      (sqrt (+ (* dx dx) (* dz dz))))))
+
+(define (add-float! [b (ptr buffer)] [x f64]) (buffer-add! b (cast (ptr u8) (array-of f32 (cast f32 x))) 4))
+(define (add-u32! [b (ptr buffer)] [n u32]) (buffer-add! b (cast (ptr u8) (array-of u32 n)) 4))
+
+(define (terrain-mesh! [t (ptr terrain)] [vertices (ptr buffer)] [indices (ptr buffer)] [tile-x f64] [tile-y f64]
+                       [color-of (fn (f64 f64 f64 f64) -> u32)])
+  (let ([spacing (-> t spacing)])
+    (for ([row i32 0]) (< row (-> t rows)) (+= row 1)
+      (for ([column i32 0]) (< column (-> t columns)) (+= column 1)
+        (let* ([x (* (cast f64 column) spacing)] [z (* (cast f64 row) spacing)]
+               [h (height-at t column row)]
+               ;; The normal, from the heights on each side.
+               [dx (/ (- (height-at t (+ column 1) row) (height-at t (- column 1) row)) (* 2.0 spacing))]
+               [dz (/ (- (height-at t column (+ row 1)) (height-at t column (- row 1))) (* 2.0 spacing))]
+               [length (sqrt (+ (* dx dx) 1.0 (* dz dz)))]
+               [slope (sqrt (+ (* dx dx) (* dz dz)))])
+          (add-float! vertices x)
+          (add-float! vertices h)
+          (add-float! vertices z)
+          (add-float! vertices (/ (- 0.0 dx) length))
+          (add-float! vertices (/ 1.0 length))
+          (add-float! vertices (/ (- 0.0 dz) length))
+          (add-float! vertices tile-x)
+          (add-float! vertices tile-y)
+          (add-float! vertices 1.0)
+          (add-u32! vertices (mesh-color (color-of x z h slope) 0.0)))))
+    ;; Two triangles per cell, counter-clockwise seen from above.
+    (for ([row i32 0]) (< row (- (-> t rows) 1)) (+= row 1)
+      (for ([column i32 0]) (< column (- (-> t columns) 1)) (+= column 1)
+        (let* ([a (cast u32 (+ (* row (-> t columns)) column))]
+               [b (+ a 1)]
+               [c (+ a (cast u32 (-> t columns)))]
+               [d (+ c 1)])
+          (add-u32! indices a) (add-u32! indices c) (add-u32! indices b)
+          (add-u32! indices b) (add-u32! indices c) (add-u32! indices d))))))
+
+;; A 32-bit float as a 16-bit one (round to nearest), for the texture.
+(define (half [x f32]) -> u32
+  (let* ([bits (cast u32 (f32-bits x))]
+         [sign (bit-and (>> bits 16) #x8000)]
+         [exponent (- (cast i32 (bit-and (>> bits 23) 255)) 127)]
+         [mantissa (bit-and bits #x7fffff)])
+    (cond [(> exponent 15) (bit-or sign #x7c00)]
+          [(< exponent -14) sign]
+          [else
+           (let ([h (bit-or sign (<< (cast u32 (+ exponent 15)) 10) (>> mantissa 13))])
+             (if (!= (bit-and mantissa #x1000) 0) (+ h 1) h))])))
+
+(define (terrain-texture! [t (ptr terrain)]) -> u32
+  (let* ([n (cast u32 (* (-> t columns) (-> t rows)))]
+         [texels (cast (ptr u16) (gpu-frame-alloc (* n 8)))]
+         [texture (gpu-texture! (cast u32 (-> t columns)) (cast u32 (-> t rows)) 1 1 gpu-rgba16f gpu-sampled)])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! (@ texels (* i 4)) (cast u16 (half (@ (-> t heights) i))))
+      (set! (@ texels (+ (* i 4) 1)) 0)
+      (set! (@ texels (+ (* i 4) 2)) 0)
+      (set! (@ texels (+ (* i 4) 3)) (cast u16 #x3c00)))
+    (gpu-write-texture! texture 0 0 0 0 (cast u32 (-> t columns)) (cast u32 (-> t rows)) texels (* n 8))
+    texture))
+
+;; ---- Walking ----
+
+(struct walker [x f64] [y f64] [z f64] [vy f64] [on-ground i32])
+
+(define (walker-move! [t (ptr terrain)] [w (ptr walker)] [dx f64] [dz f64])
+  (+= (-> w x) dx)
+  (+= (-> w z) dz)
+  (+= (-> w y) (-> w vy))
+  (let ([ground (terrain-height t (-> w x) (-> w z))])
+    (if (<= (-> w y) ground)
+        (begin
+          (set! (-> w y) ground)
+          (set! (-> w vy) 0.0)
+          (set! (-> w on-ground) 1))
+        (set! (-> w on-ground) 0))))

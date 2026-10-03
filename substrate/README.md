@@ -196,9 +196,11 @@ do what it does: another language on the kernel can bring its own.
       a batch and drawn with a few commands.
     - `scene.sub`: a 3D scene, the file a program uses: meshes lit by
       a sun, under a sky, made into a picture with outlines. Its parts:
-    - `meshes.sub`: the meshes, textured triangles with normals, and
-      the passes that draw them: the shadow map from the sun, and the
-      lit pass with its toon look, rim of light, shadows and fog.
+    - `meshes.sub`: the meshes, textured triangles with normals, each
+      drawn at a list of placements (a chunk once, a tree a thousand
+      times), and the passes that draw them: the shadow map from the
+      sun, the lit pass with its toon look, rim of light, shadows and
+      fog, and water, see-through, lit, with foam at its edge.
     - `sky.sub`: the sky, drawn where there is nothing: a gradient,
       the sun's disc and glow, drifting clouds.
     - `post.sub`: the textures a scene is drawn into (colour with
@@ -218,6 +220,11 @@ do what it does: another language on the kernel can bring its own.
     - `voxels.sub`: worlds made of blocks: the grid, bodies that move
       through it, the block a line of sight hits, and the mesh of a
       part of it. tiles.sub for three dimensions.
+    - `terrain.sub`: land as a height map: its height and slope
+      anywhere, its mesh for the scene, its heights as a texture for
+      the water, and walking on it.
+    - `noise.sub`: noise to make worlds from: hashes, value noise and
+      fbm, the same for a seed every time.
     - `input.sub`: which keys and mouse buttons are held, and which were
       just pressed; how far the mouse moved.
     - `sound.sub`: sound files, music, and short synthesized tones.
@@ -245,9 +252,11 @@ do what it does: another language on the kernel can bring its own.
     around it, and `page.html` its HTML; and `platformer/`, a platform
     game built on `game/`: `world.sub` is the game, `platformer.sub`
     puts it in a page, and `assets/` holds its levels, which are text
-    files, and its sheet of sprites; and `blocks/`, a world of blocks
+    files, and its sheet of sprites; `blocks/`, a world of blocks
     in 3D, built on the same library: `world.sub`, `blocks.sub` and
-    the texture atlas in `assets/`.
+    the texture atlas in `assets/`; and `valley/`, a landscape to walk
+    through, the 3D side at the scale of one scene: `world.sub`,
+    `valley.sub`, and in `assets/` an atlas of one white tile.
   - `repl/`: the REPL page. `repl.sub` is the page's program (the user
     interface); `session.sub` is the compiler, which the page runs in a
     sandbox; `page.html` and `site.sh` make the site.
@@ -854,6 +863,46 @@ A, S and D walk, the arrows also turn and look, Space jumps, the left
 button or X digs, the right button or C places, 1 to 6 choose what to
 place.
 
+### The valley example
+
+`lib/web/examples/valley` is a landscape to walk through, the scene
+library at the scale of one scene: a river winding along a valley
+floor between hills, forests on the slopes, meadows of grass that
+sways in the wind, boulders, mountains with snow rising to each side,
+the sun with its clouds and shadows, and the river's water, deep where
+the land below is far down, pale where it is close, with foam at the
+edge. The land is 256 units across, from noise with a fixed seed, so it
+is the same every time. The player walks on it, looks around with the
+mouse, and jumps. Nothing is won or lost.
+
+The land is a height map (`game/terrain.sub`) meshed once, 66,000
+vertices, each coloured by what the land is there: sand by the water,
+grass, rock where it is steep or high, snow on the peaks, in sharp
+bands with a little noise at their edges, as a drawn landscape has
+them. Everything on it is a mesh placed many times (`scene/meshes.sub`):
+one tree, a trunk and two cones, 700 times; one tuft of grass, two
+crossed blades, 33,000 times, each tinted with the ground's green and
+drawn without outlines, with normals that point up so that it takes
+the ground's light; one boulder, a few dozen times. The water is a
+square at the water level drawn with the water material, which reads
+the land's height from the height map as a texture. The land, the
+trees, the grass, the boulders and the water are all plain colours in
+their vertices over a white texel. The shaders are Shade's.
+
+The game is tested without a browser (`tests/ui/valley.sub`): the
+land's heights, what grows on it, and the player walking, jumping,
+looking around and wading into the river. The browser test reads the
+GPU's picture: sky, meadow, river, forest, and a view that changes
+with walking. The compiled program is 163 KB, and its asset under 1 KB.
+
+```sh
+lib/web/site.sh lib/web/examples/valley/valley.sub build/lib/web/valley lib/web/examples/valley/page.html
+host/web/serve.mjs build/lib/web/valley
+```
+
+Click the screen to look around with the mouse (Escape frees it); W,
+A, S and D walk, the arrows also look, Space jumps.
+
 ### Measurements
 
 In headless Chromium, on the development machine:
@@ -885,6 +934,12 @@ In headless Chromium, on the development machine:
 | Making the world and the meshes of its 16 chunks (16,360 faces), on the first frame | 14 ms |
 | A frame: a step, the 16 meshes drawn twice (shadow map, scene), the sky and the picture pass, in the program | 0.1 ms |
 | The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 1.0 ms / 15 ms |
+
+| The valley example (GPU) | |
+|---|---|
+| Making the land (66,000 vertices), placing 34,000 trees, tufts and boulders, on the first frame | 60 ms |
+| A frame: a step, and the land, the trees, the grass, the boulders and the water drawn twice (shadow map, scene), the sky and the picture pass, in the program | 0.1 ms |
+| The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 2.3 ms / 1.1 s |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
 |---|---|---|---|
