@@ -885,10 +885,11 @@ winds along a valley floor between hills, widens into a lake, and
 leaves through another gorge; the valley is closed in by mountains
 with snow on them. A path runs along the east bank, crosses the river
 by a wooden bridge, and climbs to a ring of standing stones on a knoll
-above the lake, where a jetty runs out into the water. Forests of
-firs, oaks and birches stand on the slopes, with bushes at their
-edges; meadows of grass and flowers sway in the wind; boulders lie
-about; the sun crosses the sky in ten minutes, warm and low at each
+above the lake, where a jetty runs out into the water; a hut with a
+red roof stands by the bridge. Forests of firs, oaks and birches
+stand on the slopes, with bushes at their edges; meadows of grass and
+flowers sway in the wind; boulders lie about; birds circle over the
+lake; the sun crosses the sky in ten minutes, warm and low at each
 end, and its clouds' shadows cross the land; mist lies on the water
 at a distance. The land is 256 units across, from noise with a fixed
 seed, so it is the same every time. The player walks and runs on it,
@@ -910,7 +911,9 @@ crossed blades, seven thousand of them, each tinted with the ground's
 green and drawn without outlines, with normals that point up so that
 it takes the ground's light, and flowers in three colours. The bridge
 and the jetty are boxes, planks with posts and rails, that the player
-walks on and is kept on by the rails. The water is a square at the
+walks on and is kept on by the rails; the hut is boxes, gables and
+two slopes of roof, which the player is kept out of. The birds are
+one mesh placed nine times, placed again every step as they fly. The water is a square at the
 water level drawn with the water material, which reads the land's
 height from the height map as a texture. Everything is a plain colour
 in its vertices over a white texel. The shaders are Shade's. The scene
@@ -920,7 +923,7 @@ so its edges are smooth and its lines fine.
 The game is tested without a browser (`tests/ui/valley.sub`): the
 land's heights, the path, what grows on it, the day, and the player
 walking, running, jumping, looking around, crossing the bridge,
-stopped by a tree, and wading into the river. The browser test reads
+stopped by a tree and by the hut, and wading into the river. The browser test reads
 the GPU's picture: sky, meadow, river, the bridge's wood, a view that
 changes with walking, and the lake from its shore through the game's
 `look` export, which puts the player anywhere (in the browser's
