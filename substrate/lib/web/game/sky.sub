@@ -1,0 +1,144 @@
+;; Lifecycle: experimental.
+;;
+;; The sky: what a scene shows where there is nothing. Drawn by one
+;; pass over the screen with no geometry, from the direction each pixel
+;; looks in: the sky's colour from the horizon up to the zenith, haze
+;; below the horizon, the sun as a disc with a glow around it, where
+;; the scene's light comes from, and clouds that drift with time.
+;;
+;;   (sky-init! s)                       makes the shader; once
+;;   (sky-pass! s camera light time)     writes the commands that draw
+;;                                       the sky, inside the scene's
+;;                                       render pass (meshes.sub opens
+;;                                       it and calls this first);
+;;                                       `time` is in seconds, for the
+;;                                       clouds
+;;
+;; The light (meshes.sub) gives the sun's direction and colour and the
+;; sky's colour; the sky lightens towards the horizon by itself. The
+;; pass writes the scene's two targets, colour and normals (post.sub),
+;; and leaves the depth alone, so the scene draws over it.
+;;
+;; ---- How it works ----
+;;
+;; The uniform holds the camera's axes and the size of its view, so a
+;; pixel's direction is forward, plus right and up scaled by where the
+;; pixel is on the screen. The clouds are value noise, four octaves,
+;; on a plane high above the camera, so that they foreshorten towards
+;; the horizon; where the noise is above a threshold there is cloud,
+;; lit white on the sunward side and grey underneath.
+(require-unqualified base "../../../compiler/base/base.sub")
+(require-unqualified gpu "../gpu.sub")
+(require-unqualified shader "../shader.sub")
+(require-unqualified math "math.sub")
+(require-unqualified camera "camera.sub")
+
+(provide sky sky-init! sky-pass!)
+
+(memory from base)
+(table from base)
+
+(struct sky [shader dome-shader] [uniforms u32] [group u32] [pipeline u32])
+
+(shader dome
+  [uniform view 0 0 (fragment)
+    [right vec3] [time f32] [up vec3] [unused f32] [forward vec3] [unused2 f32]
+    [scale vec2] [size vec2]
+    [sun vec3] [unused3 f32] [sun-color vec4] [sky vec4]]
+  [builtins vertex-index]
+  [code "
+@vertex fn vertex(in: Vertex) -> Varyings {
+  var out: Varyings;
+  out.position = vec4f(f32(i32(in.vertex_index & 1u) * 4 - 1), f32(i32(in.vertex_index >> 1u) * 4 - 1), 0.0, 1.0);
+  return out;
+}
+
+fn hash(p: vec2f) -> f32 {
+  let h = dot(p, vec2f(127.1, 311.7));
+  return fract(sin(h) * 43758.5453);
+}
+
+// Value noise: the hash at the lattice points around p, blended.
+fn noise(p: vec2f) -> f32 {
+  let i = floor(p);
+  let f = fract(p);
+  let u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2f(1.0, 0.0)), u.x), mix(hash(i + vec2f(0.0, 1.0)), hash(i + vec2f(1.0, 1.0)), u.x), u.y);
+}
+
+fn clouds(p: vec2f) -> f32 {
+  var sum = 0.0;
+  var amplitude = 0.5;
+  var q = p;
+  for (var i = 0; i < 4; i++) {
+    sum += noise(q) * amplitude;
+    q = q * 2.1 + vec2f(13.0, 7.0);
+    amplitude *= 0.5;
+  }
+  return sum;
+}
+
+struct Picture { @location(0) color: vec4f, @location(1) normal: vec4f }
+
+@fragment fn fragment(in: Varyings) -> Picture {
+  let screen = vec2f(in.position.x / view.size.x * 2.0 - 1.0, 1.0 - in.position.y / view.size.y * 2.0);
+  let dir = normalize(view.forward + view.right * screen.x * view.scale.x + view.up * screen.y * view.scale.y);
+  let sun = normalize(view.sun);
+  let elevation = dir.y;
+  // The sky: haze at the horizon, the sky's colour above it, deeper
+  // and bluer towards the zenith; dimmer haze below the horizon.
+  let haze = mix(view.sky.rgb, vec3f(1.0, 1.0, 1.0), 0.5);
+  let zenith = view.sky.rgb * vec3f(0.7, 0.82, 1.0);
+  var color = mix(haze, view.sky.rgb, smoothstep(0.0, 0.2, elevation));
+  color = mix(color, zenith, smoothstep(0.2, 0.8, elevation));
+  color = mix(color, haze * 0.7, smoothstep(0.0, -0.3, elevation));
+  // The sun: a disc, a glow close around it, and a wide one.
+  let towards = max(dot(dir, sun), 0.0);
+  color += view.sun_color.rgb * (smoothstep(0.9988, 0.9994, towards) * 4.0 + pow(towards, 48.0) * 0.4 + pow(towards, 6.0) * 0.12);
+  // Clouds, on a plane 80 above, drifting.
+  if (elevation > 0.02) {
+    let p = dir.xz / elevation * 80.0 + vec2f(view.time * 1.5, view.time * 0.4);
+    let density = smoothstep(0.5, 0.68, clouds(p * 0.012));
+    let lit = mix(0.72, 1.0, smoothstep(0.0, 0.8, sun.y)) * mix(0.85, 1.05, towards);
+    let cloud = vec3f(lit) * mix(vec3f(1.0), view.sun_color.rgb, 0.3);
+    color = mix(color, cloud, density * smoothstep(0.02, 0.12, elevation));
+  }
+  var out: Picture;
+  out.color = vec4f(color, 1.0);
+  out.normal = vec4f(0.5, 0.5, 0.5, 0.0);
+  return out;
+}
+"])
+
+(define (sky-init! [s (ptr sky)])
+  (memset s 0 (sizeof sky))
+  (dome-init! (& (-> s shader)))
+  (set! (-> s uniforms) (gpu-buffer! (sizeof dome-view) gpu-uniform))
+  (set! (-> s group) (dome-bind-group-0! (& (-> s shader)) (-> s uniforms)))
+  ;; The sky is drawn first, under everything: it writes the colour and
+  ;; the normals and leaves the depth alone.
+  (let ([settings render-settings])
+    (render-settings-init! (& settings))
+    (set! (-> settings target-count) 2)
+    (set! (@ (-> settings targets) 0) gpu-rgba16f)
+    (set! (@ (-> settings targets) 1) gpu-rgba8)
+    (set! (-> settings depth-format) gpu-depth24)
+    (set! (-> settings depth-compare) gpu-always)
+    (set! (-> settings depth-write) 0)
+    (set! (-> s pipeline) (dome-render-pipeline! (& (-> s shader)) "vertex" "fragment" (& settings)))))
+
+(define (sky-pass! [s (ptr sky)] [c (ptr camera)] [sun-x f64] [sun-y f64] [sun-z f64] [sun-color u32] [sky-color u32]
+                   [width u32] [height u32] [time f64])
+  (let ([v dome-view])
+    (memset (& v) 0 (sizeof dome-view))
+    (camera-axes! c (-> v right) (-> v up) (-> v forward))
+    (vec2! (-> v scale) (camera-half-width c) (camera-half-height c))
+    (vec2! (-> v size) (cast f64 width) (cast f64 height))
+    (set! (-> v time) (cast f32 time))
+    (vec3! (-> v sun) sun-x sun-y sun-z)
+    (linear-color! (-> v sun-color) sun-color)
+    (linear-color! (-> v sky) sky-color)
+    (gpu-write-copy! (-> s uniforms) 0 (& v) (sizeof dome-view))
+    (gpu-pipeline! (-> s pipeline))
+    (gpu-bind-group-set! 0 (-> s group) 0)
+    (gpu-draw! 3 1 0 0)))
