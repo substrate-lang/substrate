@@ -22,7 +22,9 @@
 ;;    bound to a lambda (directly, or to a literal and then assigned the
 ;;    lambda once, as letrec and named let expand) that is only ever
 ;;    called, outside any other closure. A captured variable that is also
-;;    assigned is boxed, so the lambda and the surrounding code share it.
+;;    assigned is boxed, so the lambda and the surrounding code share it,
+;;    unless only the lambda bound to it refers to it, as a recursive
+;;    closure does: there the variable means the closure itself.
 ;;    Variables are told apart by local-binding (spec 2.3).
 ;; 3. Rewrite the code (rw), inserting ownership operations. A local
 ;;    function is lifted to a module-level function of its captured
@@ -30,6 +32,8 @@
 ;;    or box. Every other lambda, innermost first, is lifted to a
 ;;    module-level function of the closure and its parameters, and
 ;;    replaced by code that makes the closure from the captured values.
+;;    A call that can raise runs in a pad that drops what the frame owns
+;;    if it does (unwinding).
 ;;
 ;; Ownership. A value's owners are the variables, closures, boxes, pairs
 ;; and other nodes that hold it, counted in its header. A function owns
@@ -53,6 +57,9 @@
 ;;   (c-function types result)   recorded by the C-like Lisp for every
 ;;                               function; a datum result is owned if the
 ;;                               function is runtime.sub's, else borrowed
+;;   (raises)                    the function can raise a value by design:
+;;                               it raises one, calls a closure, or calls
+;;                               a function that can (unwinding, below)
 ;;
 ;; The pass takes its own reference to the result of a function it knows
 ;; nothing about (kernel-kind!).
@@ -358,6 +365,7 @@
          (let* ([k (index-of-lambda s)] [inner (cons (make-integer k) chain)] [lp (lambda-parts s)]
                 [ps (parts (car lp))] [rs (free-of s)])
            (table-set! marker-free (cast u64 k) (cast u32 (ids-of rs)))
+           (table-set! lambda-chain (cast u64 k) (cast u32 chain))
            (while (pair? rs)
              (mark! captured (cast i32 (integer-value (car (car rs)))))
              (set! rs (cdr rs)))
@@ -443,6 +451,50 @@
       (let ([id (cast i32 (integer-value (car sites)))])
         (when (marked? direct id) (infer-borrowed! id (get candidate id))))
       (set! sites (cdr sites)))))
+
+;; ---- recursive closures ----
+;;
+;; letrec and named let bind a variable to a lambda by assigning it once. If that lambda refers to the variable and is not a
+;; local function, it is a recursive closure that may escape. Captured as
+;; usual, the variable would be boxed, and the box would hold the closure
+;; that holds the box: a cycle that reference counting never frees. So
+;; inside such a lambda, and inside the lambdas within it, the variable
+;; means the closure itself, which the lambda's code is given (self in
+;; rw-lambda). The closure then holds no reference to itself, and the
+;; variable is boxed only if a lambda outside it captures it too.
+
+;; Each such lambda, by index -> its variable's id plus 1.
+(define self-of (ptr arena-table) 0)
+;; Each lambda, by index -> the lambdas it is in, innermost first.
+(define lambda-chain (ptr arena-table) 0)
+
+(define (lambda-free [k i32]) -> datum (cast datum (table-ref marker-free (cast u64 k))))
+
+;; The lambdas that refer to themselves through their variable, then what
+;; is captured again, without those references.
+(define (find-self-refs!)
+  (for ([k i32 1]) (<= k lambda-count) (+= k 1)
+    (let ([o (- (cast i32 (table-ref marker-owner (cast u64 k))) 1)] [m (lambda-at k)])
+      (when (and (>= o 0) (not (marked? direct o)) (has-id? (lambda-free k) o)
+                 (or (and (== (table-ref set-count (key o)) 0) (== (get candidate o) m))
+                     (and (== (table-ref set-count (key o)) 1) (== (get set-rhs o) m))))
+        (table-set! self-of (cast u64 k) (cast u32 (+ o 1))))))
+  (set! captured (make-table))
+  (for ([k i32 1]) (<= k lambda-count) (+= k 1)
+    (let ([ids (lambda-free k)])
+      (while (pair? ids)
+        (let ([id (cast i32 (integer-value (car ids)))])
+          (unless (self-inside? k id) (mark! captured id)))
+        (set! ids (cdr ids))))))
+
+;; Is lambda k, or a lambda it is in, a recursive closure of variable id?
+(define (self-inside? [k i32] [id i32]) -> i32
+  (when (== (cast i32 (table-ref self-of (cast u64 k))) (+ id 1)) (return 1))
+  (let ([chain (cast datum (table-ref lambda-chain (cast u64 k)))])
+    (while (pair? chain)
+      (when (== (cast i32 (table-ref self-of (cast u64 (integer-value (car chain))))) (+ id 1)) (return 1))
+      (set! chain (cdr chain)))
+    0))
 
 ;; ---- borrowed parameters of local functions ----
 ;;
@@ -586,7 +638,8 @@
 ;; changes. The result becomes the functions' facts (core.sub), which
 ;; callers in other modules read, just as callee-of reads them here.
 
-(struct mfn [name datum] [ids datum] [body datum] [candidates datum] [marked datum] [free i32] [index i32] [reaches datum])
+(struct mfn [name datum] [ids datum] [body datum] [candidates datum] [marked datum] [free i32] [index i32] [reaches datum]
+  [raises i32])
 
 (define module-fns (ptr arena-table) 0)      ; the module's functions by their names' symbols, once inferred
 (define fn-count i32 0)                      ; how many, each numbered in order
@@ -653,6 +706,7 @@
         (+= fn-count 1)
         (set! (-> m index) fn-count)
         (set! (-> m reaches) nil)
+        (set! (-> m raises) 0)
         (table-set! module-fns (cast u64 (syntax-e name)) (cast u32 m))
         (table-set! fn-by-index (cast u64 fn-count) (cast u32 m)))
       (set! l (cdr l))))
@@ -681,6 +735,27 @@
             (set! (-> m reaches) r)
             (when (!= (length r) before) (set! changed 1)))
           (set! l (cdr l))))))
+  ;; Which can raise by design (unwinding): each whose body can, its
+  ;; calls of the module's functions aside, and each that reaches one.
+  (let ([l fns] [raising nil])
+    (while (pair? l)
+      (let ([m (module-fn-of (car (car l)))])
+        (find-safe-locals! (-> m body))
+        (when (raises-each? (-> m body)) (set! raising (add-id raising (-> m index)))))
+      (set! l (cdr l)))
+    (set! l fns)
+    (while (pair? l)
+      (let* ([m (module-fn-of (car (car l)))] [r (-> m reaches)])
+        (set! (-> m raises) (has-id? raising (-> m index)))
+        (while (pair? r)
+          (when (has-id? raising (cast i32 (integer-value (car r)))) (set! (-> m raises) 1))
+          (set! r (cdr r)))
+        (when (-> m raises)
+          (syntax-local-lift-definition
+           (datum->syntax ctx (list3 (named (sym #%fact) (-> m name)) (-> m name)
+                                     (list2 (named (sym quote) (-> m name)) (list1 (sym raises))))
+                          (-> m name)))))
+      (set! l (cdr l))))
   ;; Until no parameter changes.
   (let ([changed 1])
     (while changed
@@ -1012,8 +1087,10 @@
 
 ;; What a function gives and takes: (substrate? result borrowed-or-consumed),
 ;; for a Substrate function the flags of its borrowed parameters, for
-;; another the positions of the arguments it takes ownership of.
-(struct callee [substrate i32] [result i32] [positions datum] [known i32] [kernel i32] [typed i32])
+;; another the positions of the arguments it takes ownership of; and
+;; whether it can raise by design: a (raises) fact, or for the module's
+;; own functions, the inference (infer-module!).
+(struct callee [substrate i32] [result i32] [positions datum] [known i32] [kernel i32] [typed i32] [raises i32])
 
 (define (callee-of [f datum]) -> (ptr callee)
   (let ([c (cast (ptr callee) (alloc-in (current-arena) (sizeof callee)))])
@@ -1023,11 +1100,13 @@
     (set! (-> c known) 0)
     (set! (-> c kernel) 0)
     (set! (-> c typed) 0)
+    (set! (-> c raises) 0)
     (let ([m (module-fn-of f)])
       (if (!= m 0)
           (begin
             (set! (-> c known) 1)
             (set! (-> c substrate) 1)
+            (set! (-> c raises) (-> m raises))
             (set! (-> c result) (if (-> m free) e-free e-owned))
             (set! (-> c positions) (mfn-flags m)))
           (read-facts! c f)))
@@ -1063,6 +1142,11 @@
   ;; which tells them apart.
   (let ([fs (try (syntax-local-facts f) [catch compile-error (m x l) (begin (set! (-> c kernel) 1) nil)])]
         [cfact datum 0] [sfact datum 0] [free 0])
+    (let ([l fs])
+      (while (pair? l)
+        (let ([v (syntax->datum (caddr (car l)))])
+          (when (and (pair? v) (== (car v) (sym raises))) (set! (-> c raises) 1)))
+        (set! l (cdr l))))
     (while (pair? fs)
       (let* ([entry (car fs)] [v (syntax->datum (caddr entry))])
         (when (pair? v)
@@ -1425,19 +1509,26 @@
 
 ;; (let ([x init] ...) body ...): a local function's binding is dropped,
 ;; its lambda lifted; a boxed variable's binding makes the box; a variable
-;; the body never uses is dropped first.
+;; the body never uses is dropped first. If an init can raise once an
+;; earlier one has given a value, each init is bound to a temporary, in a
+;; let of its own around the next, so that a pad can drop the earlier
+;; ones (unwinding), and the variables to the temporaries.
 (define (rw-let [s datum] [env datum] [live datum] [mode i32]) -> datum
   (let* ([l (parts s)] [bs (parts (cadr l))] [body (cddr l)] [inner env] [news nil] [bound nil]
-         [body-uses (uses-each-into body nil)])
+         [body-uses (uses-each-into body nil)] [staged 0] [given 0] [finals nil] [saved unwind])
     ;; The local functions first, named, so that each can call the others.
     (while (pair? bs)
       (let ([id (id-of (binding-name (car bs)))])
-        (when (marked? direct id) (set! inner (bind inner id 0 k-direct (fresh "lambda" (car bs))))))
+        (if (marked? direct id)
+            (set! inner (bind inner id 0 k-direct (fresh "lambda" (car bs))))
+            (begin (when (and given (raises? (binding-init (car bs)))) (set! staged 1))
+                   (set! given 1))))
       (set! bs (cdr bs)))
     (set! bs (parts (cadr l)))
     (while (pair? bs)
       (let* ([b (car bs)] [x (binding-name b)] [id (id-of x)] [init (binding-init b)]
-             [after (uses-each-into (cdr bs) (union-ids live (remove-bound body-uses bs)))])
+             [after (uses-each-into (cdr bs) (union-ids live (remove-bound body-uses bs)))]
+             [name (if staged (fresh "init" b) x)])
         (cond [(marked? direct id)
                (lift-direct id (get candidate id) inner (entry-name (lookup inner id)))]
               [(boxed? id)
@@ -1445,23 +1536,34 @@
                  (fail '"a variable holding a value the program does not own cannot be assigned and captured by a lambda" b))
                (set! inner (bind inner id 1 k-owned x))
                (set! bound (add-id bound id))
-               (set! news (cons (binding-code x (datum->syntax ctx (list2 (named (sym rt:make-box) b) (value init env after)) b) b) news))]
+               (set! news (cons (binding-code name (datum->syntax ctx (list2 (named (sym rt:make-box) b) (value init env after)) b) b) news))
+               (when staged
+                 (set! unwind (cons name unwind))
+                 (set! finals (cons (binding-code x name b) finals)))]
               ;; A local function's borrowed parameter, bound to its slot.
               [(marked? borrowed-params id)
                (set! inner (bind inner id 0 k-borrowed x))
-               (set! news (cons (syntax-rewrap b (cons x (append (binding-type b) (list1 (rw init env after m-any))))) news))]
+               (set! news (cons (syntax-rewrap b (cons name (append (binding-type b) (list1 (rw init env after m-any))))) news))
+               (when staged (set! finals (cons (syntax-rewrap b (cons x (append (binding-type b) (list1 name)))) finals)))]
               [else
                (let ([kind (variable-kind init env after b)])
                  (set! inner (bind inner id 0 kind x))
                  (set! bound (add-id bound id))
-                 (set! news (cons (syntax-rewrap b (cons x (append (binding-type b) (list1 (if (== kind k-raw) (rw init env after m-any) (value init env after))))))
-                                  news)))]))
+                 (set! news (cons (syntax-rewrap b (cons name (append (binding-type b) (list1 (if (== kind k-raw) (rw init env after m-any) (value init env after))))))
+                                  news))
+                 (when staged
+                   (when (== kind k-owned) (set! unwind (cons name unwind)))
+                   (set! finals (cons (syntax-rewrap b (cons x (append (binding-type b) (list1 name)))) finals))))]))
       (set! bs (cdr bs)))
+    (set! unwind saved)
     (let* ([drops (drops-of bound body-uses inner s)]
            [forms (append drops (rw-forms body inner live mode))])
       (cond [(and (null? forms) (== mode m-stmt) (null? news)) 0]
-            [(null? forms) (let-code (reverse news) (list1 (datum->syntax ctx (list1 (named (sym begin) s)) s)) s)]
-            [else (let-code (reverse news) forms s)]))))
+            [else
+             (when (null? forms) (set! forms (list1 (datum->syntax ctx (list1 (named (sym begin) s)) s))))
+             (if staged
+                 (nested-let-code (reverse news) (list1 (let-code (reverse finals) forms s)) s)
+                 (let-code (reverse news) forms s))]))))
 
 ;; ids without the variables bound by bindings bs.
 (define (remove-bound [ids datum] [bs datum]) -> datum
@@ -1636,16 +1738,27 @@
           [(== code 0) (datum->syntax ctx (cons (named (sym begin) s) drops) s)]
           [else (sequence-code drops code s)])))
 
+;; In a kernel try's body, a pad leaves alone what the clauses and the
+;; code after the try use, and the temporaries around the try, since the
+;; try may catch and go on with them. If it does not catch, they are not
+;; dropped.
 (define (rw-try [s datum] [env datum] [live datum] [mode i32]) -> datum
-  (let* ([l (parts s)] [cs (parts (cadr l))] [out nil])
+  (let* ([l (parts s)] [cs (parts (cadr l))] [out nil] [kept live]
+         [saved unwind] [saved-protected protected] [body nil])
     (while (pair? cs)
       (let* ([c (car cs)] [inner env] [xs (clause-binders c)] [cl (parts c)] [body (clause-body c)] [n (length body)])
         (while (pair? xs)
           (set! inner (bind inner (id-of (car xs)) 0 k-raw (car xs)))
           (set! xs (cdr xs)))
+        (set! kept (uses-each-into body kept))
         (set! out (cons (syntax-rewrap c (append (take cl (- (length cl) n)) (rw-forms body inner live mode))) out)))
       (set! cs (cdr cs)))
-    (syntax-rewrap s (cons (car l) (cons (syntax-rewrap (cadr l) (reverse out)) (rw-forms (cddr l) env live mode))))))
+    (set! unwind nil)
+    (set! protected (union-ids protected kept))
+    (set! body (rw-forms (cddr l) env live mode))
+    (set! unwind saved)
+    (set! protected saved-protected)
+    (syntax-rewrap s (cons (car l) (cons (syntax-rewrap (cadr l) (reverse out)) body)))))
 
 ;; (return e): the variables still alive that e does not use are dropped
 ;; first.
@@ -1655,6 +1768,179 @@
          [drops (drops-of live uses env s)]
          [code (if (== e 0) (syntax-rewrap s (list1 (car l))) (syntax-rewrap s (list2 (car l) (value e env nil))))])
     (sequence-code drops code s)))
+
+;; ---- unwinding ----
+;;
+;; A raise that a handler takes leaves every frame between the two at
+;; once, so the frames' own drops never run. So a call that can raise
+;; runs inside a pad, (try ([catch rt:exn (v) drop ... (throw rt:exn v)])
+;; call), which drops what the frame owns at the call and raises the
+;; value on: the owned variables used after the call, the call's
+;; temporaries, and the values that the code around the call holds while
+;; it runs (unwind), such as the operands evaluated before it. Those are
+;; bound to temporaries, each let around the next (nested-let-code), so
+;; the pad can see them, rather than left on the stack. The pad holds the
+;; call alone: an operand that can raise is evaluated before it, or its
+;; own pad and this one would both drop what they share. A call in a pad
+;; is not a tail call, but a tail call owns nothing after it, so it has
+;; none.
+;;
+;; A pad costs even when nothing raises: wasmtime saves every register a
+;; function might need at its entry once the function has one. So only a
+;; call that can raise by design has one: of a closure, of raise or
+;; error, of a function with a (raises) fact, such as runtime.sub's that
+;; call closures, or of one of the module's own functions whose body has
+;; such a call (infer-module!). A primitive that finds an argument of
+;; the wrong type, an index out of range or a zero divisor raises too,
+;; but has no pad: such a raise, caught, leaks what the frames it leaves
+;; owned.
+
+;; The temporaries the code around the code being rewritten owns, which
+;; a raise from it drops.
+(define unwind datum 0)
+;; The variables a kernel try around the code being rewritten may still
+;; use once it catches, which a pad inside the try leaves to it.
+(define protected datum 0)
+
+;; The local variables whose calls cannot raise: each bound once to a
+;; lambda (local-lambdas) whose body cannot, calling only these.
+(define safe-locals (ptr arena-table) 0)
+;; What raises? found, by form: 1 if it cannot raise, 2 if it can.
+(define raises-memo (ptr arena-table) 0)
+
+;; Can s raise by design: does it throw, call a closure other than a safe
+;; local one, or call a function that can?
+(define (raises? [s datum]) -> i32
+  (let ([k (cast i32 (table-ref raises-memo (cast u64 s)))])
+    (if (!= k 0)
+        (== k 2)
+        (let ([r (cond [(or (data-form? s) (identifier? s) (lambda-form? s)) 0]
+                       [(or (form? s (sym throw)) (form? s (sym throw-ref))) 1]
+                       [(!= (call-head-id s) -1) (or (not (marked? safe-locals (call-head-id s))) (raises-each? (parts s)))]
+                       [(form? s (sym call-indirect)) 1]
+                       [(and (form? s (sym #%app)) (-> (callee-of (cadr (parts s))) raises)) 1]
+                       [(code-form? s) (raises-each? (parts s))]
+                       [else 0])])
+          (table-set! raises-memo (cast u64 s) (cast u32 (if r 2 1)))
+          r))))
+
+(define (raises-each? [l datum]) -> i32
+  (while (pair? l)
+    (when (raises? (car l)) (return 1))
+    (set! l (cdr l)))
+  0)
+
+;; The safe local variables of forms (safe-locals): each of
+;; local-lambdas is, until its lambda's body is found to raise.
+(define (find-safe-locals! [forms datum])
+  (let* ([sets (set-targets-each forms nil)] [known (local-lambdas-each forms sets nil)] [changed 1])
+    (set! safe-locals (make-table))
+    (let ([l known])
+      (while (pair? l)
+        (mark! safe-locals (cast i32 (integer-value (car (car l)))))
+        (set! l (cdr l))))
+    (while changed
+      (set! changed 0)
+      (set! raises-memo (make-table))
+      (let ([l known])
+        (while (pair? l)
+          (let ([id (cast i32 (integer-value (car (car l))))])
+            (when (and (marked? safe-locals id) (raises-each? (caddr (lambda-parts (cdr (car l))))))
+              (table-set! safe-locals (key id) 0)
+              (set! changed 1)))
+          (set! l (cdr l)))))
+    (set! raises-memo (make-table))))
+
+;; Each set! in s, as (id . value), onto acc.
+(define (set-targets [s datum] [acc datum]) -> datum
+  (cond [(data-form? s) acc]
+        [(form? s (sym set!))
+         (let ([l (parts s)])
+           (set-targets (caddr l) (cons (cons (make-integer (id-of (cadr l))) (caddr l)) acc)))]
+        [(code-form? s) (set-targets-each (parts s) acc)]
+        [else acc]))
+
+(define (set-targets-each [l datum] [acc datum]) -> datum
+  (while (pair? l)
+    (set! acc (set-targets (car l) acc))
+    (set! l (cdr l)))
+  acc)
+
+;; The lambda variable id is given by its set!s, sets: 0 if none, -1 if
+;; more than one or not a lambda.
+(define (assigned-lambda [sets datum] [id i32]) -> datum
+  (let ([m datum 0])
+    (while (pair? sets)
+      (when (== (cast i32 (integer-value (car (car sets)))) id)
+        (if (and (== m 0) (lambda-form? (cdr (car sets)))) (set! m (cdr (car sets))) (return (cast datum -1))))
+      (set! sets (cdr sets)))
+    m))
+
+;; The variables in s bound once to a lambda, as (id . lambda), onto acc:
+;; let-bound to one and never assigned, or let-bound to a literal and
+;; given one by its only set!, as letrec and named let do.
+(define (local-lambdas [s datum] [sets datum] [acc datum]) -> datum
+  (cond [(data-form? s) acc]
+        [(form? s (sym let))
+         (let ([bs (parts (cadr (parts s)))])
+           (while (pair? bs)
+             (let* ([b (car bs)] [x (binding-name b)] [init (binding-init b)])
+               (when (identifier? x)
+                 (let ([m (assigned-lambda sets (id-of x))])
+                   (cond [(and (lambda-form? init) (== m 0)) (set! acc (cons (cons (make-integer (id-of x)) init) acc))]
+                         [(and (data-form? init) (!= m 0) (!= m (cast datum -1))) (set! acc (cons (cons (make-integer (id-of x)) m) acc))])))
+               (set! acc (local-lambdas init sets acc)))
+             (set! bs (cdr bs)))
+           (local-lambdas-each (cddr (parts s)) sets acc))]
+        [(code-form? s) (local-lambdas-each (parts s) sets acc)]
+        [else acc]))
+
+(define (local-lambdas-each [l datum] [sets datum] [acc datum]) -> datum
+  (while (pair? l)
+    (set! acc (local-lambdas (car l) sets acc))
+    (set! l (cdr l)))
+  acc)
+
+;; What the frame owns at a call, under env, live after it, besides the
+;; call's own temporaries: unwind, and the names of the owned variables
+;; that live has, unless protected.
+(define (owned-at [env datum] [live datum]) -> datum
+  (let ([acc nil] [seen nil])
+    ;; The first entry of an id is the one in scope.
+    (while (pair? env)
+      (let* ([entry (car env)] [id (cast i32 (integer-value (car entry)))])
+        (unless (has-id? seen id)
+          (set! seen (add-id seen id))
+          (when (and (== (entry-kind entry) k-owned) (has-id? live id) (not (has-id? protected id)))
+            (set! acc (cons (entry-name entry) acc)))))
+      (set! env (cdr env)))
+    (append unwind (reverse acc))))
+
+;; The drops of a pad at a call: of what the frame owns there, then extra.
+(define (pad-drops [env datum] [live datum] [extra datum] [loc datum]) -> datum
+  (let ([acc nil] [l (owned-at env live)])
+    (while (pair? l)
+      (set! acc (cons (drop-code (car l) loc) acc))
+      (set! l (cdr l)))
+    (append (reverse acc) extra)))
+
+;; call inside a pad of drops, or call itself if there are none.
+(define (pad-code [call datum] [drops datum] [loc datum]) -> datum
+  (if (null? drops)
+      call
+      (let* ([v (fresh "raised" loc)]
+             [clause (cons (named (sym catch) loc)
+                           (cons (named (sym rt:exn) loc)
+                                 (cons (datum->syntax ctx (list1 v) loc)
+                                       (append drops (list1 (datum->syntax ctx (list3 (named (sym throw) loc) (named (sym rt:exn) loc) v) loc))))))])
+        (datum->syntax ctx (list3 (named (sym try) loc) (datum->syntax ctx (list1 (datum->syntax ctx clause loc)) loc) call) loc))))
+
+;; The bindings, each in a let of its own around the next, the body
+;; innermost, so that a pad in one binding's init sees those before it.
+(define (nested-let-code [bindings datum] [body datum] [loc datum]) -> datum
+  (if (or (null? bindings) (null? (cdr bindings)))
+      (let-code bindings body loc)
+      (let-code (list1 (car bindings)) (list1 (nested-let-code (cdr bindings) body loc)) loc)))
 
 ;; ---- calls ----
 ;;
@@ -1684,7 +1970,9 @@
 ;; The operands of a call as they are emitted: the code of each, latest
 ;; first; the temporaries bound before the call and the drops after it,
 ;; latest first; and whether any operand needs a temporary.
-(struct operands [out datum] [temps datum] [drops datum] [any-temp i32])
+;; padded: the call may have a pad, inside which only it runs: each
+;; operand that can raise is then held in a temporary, made before it.
+(struct operands [out datum] [temps datum] [drops datum] [any-temp i32] [padded i32])
 
 ;; Does operand o, read by the call, need a temporary: is it a value
 ;; made for the call, not a variable, a literal or a value read where it
@@ -1695,9 +1983,12 @@
 
 ;; Is operand o, taken as om says, held in a temporary once one operand
 ;; needs one: not a variable, a literal, an operand given as it is, or a
-;; borrowed value read where it is?
-(define (hoisted? [o datum] [om i32] [env datum]) -> i32
-  (and (!= om 2) (not (identifier? o)) (not (data-form? o)) (not (and (== om 0) (borrowed-readable? o env)))))
+;; borrowed value read where it is, unless that can raise and the call
+;; has a pad?
+(define (hoisted? [o datum] [om i32] [env datum] [acc (ptr operands)]) -> i32
+  (and (!= om 2) (not (identifier? o)) (not (data-form? o))
+       (or (not (and (== om 0) (borrowed-readable? o env)))
+           (and (-> acc padded) (raises? o)))))
 
 ;; Operand o emitted onto acc: om 2 as it is, 1 as an owned value, 0 read
 ;; where it is: a variable, dropped after the call if used for the last
@@ -1706,9 +1997,10 @@
 ;; temporary if one is needed, so the operands still run in order.
 (define (emit-operand! [acc (ptr operands)] [o datum] [om i32] [env datum] [after datum])
   (cond [(== om 2) (set! (-> acc out) (cons o (-> acc out)))]
-        [(and (== om 1) (-> acc any-temp) (hoisted? o om env))
+        [(and (== om 1) (-> acc any-temp) (hoisted? o om env acc))
          (let ([t (fresh "arg" o)])
            (set! (-> acc temps) (cons (binding-code t (value o env after) o) (-> acc temps)))
+           (set! unwind (cons t unwind))
            (set! (-> acc out) (cons t (-> acc out))))]
         [(== om 1) (set! (-> acc out) (cons (value o env after) (-> acc out)))]
         [(identifier? o)
@@ -1717,10 +2009,12 @@
            (when (and (!= e 0) (== (entry-kind e) k-owned) (not (has-id? after (id-of o))))
              (set! (-> acc drops) (cons (drop-code (entry-name e) o) (-> acc drops)))))]
         [(data-form? o) (set! (-> acc out) (cons o (-> acc out)))]
-        [(borrowed-readable? o env) (set! (-> acc out) (cons (rw-read o env) (-> acc out)))]
+        [(and (borrowed-readable? o env) (not (and (-> acc any-temp) (hoisted? o om env acc))))
+         (set! (-> acc out) (cons (rw-read o env) (-> acc out)))]
         [(== (kind-of o env after) e-owned)
          (let ([t (fresh "arg" o)])
            (set! (-> acc temps) (cons (binding-code t (rw o env after m-owned) o) (-> acc temps)))
+           (set! unwind (cons t unwind))
            (set! (-> acc drops) (cons (drop-code t o) (-> acc drops)))
            (set! (-> acc out) (cons t (-> acc out))))]
         [(-> acc any-temp)
@@ -1733,9 +2027,9 @@
 
 ;; The variables the operands l from position i on that the call reads
 ;; where they are, not held in temporaries, use, into acc.
-(define (at-call-uses [l datum] [i i32] [kind i32] [c (ptr callee)] [env datum] [acc datum]) -> datum
+(define (at-call-uses [l datum] [i i32] [kind i32] [c (ptr callee)] [env datum] [ops (ptr operands)] [acc datum]) -> datum
   (while (pair? l)
-    (unless (hoisted? (car l) (operand-mode kind c i) env) (set! acc (uses-into (car l) acc)))
+    (unless (hoisted? (car l) (operand-mode kind c i) env ops) (set! acc (uses-into (car l) acc)))
     (+= i 1)
     (set! l (cdr l)))
   acc)
@@ -1746,6 +2040,7 @@
     (set! (-> acc temps) nil)
     (set! (-> acc drops) nil)
     (set! (-> acc any-temp) 0)
+    (set! (-> acc padded) 0)
     acc))
 
 ;; The variable operand o reads, if o is read where it is: o itself, or
@@ -1782,11 +2077,28 @@
 (define (rw-call [s datum] [l datum] [kind i32] [c (ptr callee)] [env datum] [live datum] [mode i32]) -> datum
   (let* ([result (cond [(== kind 2) (-> c result)] [(== kind 0) e-owned] [else e-raw])]
          [n (length l)] [acc (new-operands)] [i 0] [ops l]
-         [held (held-variables l kind c env live)] [kept (union-ids live held)])
-    ;; Does any operand need a temporary?
+         [held (held-variables l kind c env live)] [kept (union-ids live held)] [saved unwind] [owning 0])
+    ;; Does any operand need a temporary? One does too if it owns a value
+    ;; that a later operand can raise past, as the stack holds it.
     (while (pair? ops)
-      (when (and (== (operand-mode kind c i) 0) (temp-operand? (car ops) env (uses-each-into (cdr ops) kept)))
-        (set! (-> acc any-temp) 1))
+      (let ([om (operand-mode kind c i)])
+        (when (and (== om 0) (temp-operand? (car ops) env (uses-each-into (cdr ops) kept)))
+          (set! (-> acc any-temp) 1))
+        (when (and owning (!= om 2) (raises? (car ops))) (set! (-> acc any-temp) 1))
+        (when (and (== om 1) (not (data-form? (car ops)))) (set! owning 1)))
+      (+= i 1)
+      (set! ops (cdr ops)))
+    ;; A call that can raise while the frame owns something has a pad,
+    ;; which holds the call alone: each operand that can raise is held in
+    ;; a temporary, made first (unwinding).
+    (set! (-> acc padded)
+          (and (or (and (== kind 0) (or (== (call-head-id s) -1) (not (marked? safe-locals (call-head-id s)))))
+                   (and (== kind 2) (-> c raises)) (form? s (sym throw)) (form? s (sym throw-ref)))
+               (or (pair? held) (-> acc any-temp) (pair? (owned-at env live)))))
+    (set! i 0)
+    (set! ops l)
+    (while (pair? ops)
+      (when (and (-> acc padded) (!= (operand-mode kind c i) 2) (raises? (car ops))) (set! (-> acc any-temp) 1))
       (+= i 1)
       (set! ops (cdr ops)))
     ;; What is used after each operand: with temporaries, the operands
@@ -1798,38 +2110,45 @@
     (while (pair? ops)
       (let* ([om (operand-mode kind c i)]
              [after (cond [(not (-> acc any-temp)) (uses-each-into (cdr ops) kept)]
-                          [(hoisted? (car ops) om env) (uses-each-into (cdr ops) (at-call-uses l 0 kind c env kept))]
-                          [else (at-call-uses (cdr ops) (+ i 1) kind c env kept)])])
+                          [(hoisted? (car ops) om env acc) (uses-each-into (cdr ops) (at-call-uses l 0 kind c env acc kept))]
+                          [else (at-call-uses (cdr ops) (+ i 1) kind c env acc kept)])])
         (emit-operand! acc (car ops) om env after))
       (+= i 1)
       (set! ops (cdr ops)))
+    (set! unwind saved)
     (set! (-> acc drops) (append (held-drops held env s) (-> acc drops)))
-    (call-code s (syntax-rewrap s (reverse (-> acc out))) acc result mode)))
+    (call-code s (syntax-rewrap s (reverse (-> acc out))) acc result mode
+               (if (-> acc padded) (pad-drops env live (reverse (-> acc drops)) s) nil))))
 
-;; The call, whose operands acc holds, with its temporaries bound before
+;; The call, whose operands acc holds, in a pad that drops what pad
+;; lists, if it lists any (unwinding), with its temporaries bound before
 ;; it and dropped after, and its result as mode wants.
-(define (call-code [s datum] [call datum] [acc (ptr operands)] [result i32] [mode i32]) -> datum
+(define (call-code [s datum] [call datum] [acc (ptr operands)] [result i32] [mode i32] [pad datum]) -> datum
   (let ([drops (reverse (-> acc drops))] [temps (reverse (-> acc temps))])
-    (cond [(and (null? drops) (null? temps))
-           (cond [(and (== mode m-stmt) (== result e-owned)) (drop-code call s)]
-                 [(and (== mode m-owned) (== result e-borrowed)) (dup-code call s)]
-                 [(and (== mode m-owned) (== result e-raw)) (fail-datum '"a value the program does not own is used where it must own one: make it with dup-value" s)]
-                 [(and (== mode m-owned) (== result e-void)) (fail-datum '"this expression gives no value" s)]
-                 [else call])]
+    (set! call (pad-code call pad s))
+    ;; Nothing to drop after: the call last, so a tail call stays one.
+    (cond [(null? drops)
+           (nested-let-code temps
+                            (list1 (cond [(and (== mode m-stmt) (== result e-owned)) (drop-code call s)]
+                                         [(and (== mode m-owned) (== result e-borrowed)) (dup-code call s)]
+                                         [(and (== mode m-owned) (== result e-raw)) (fail-datum '"a value the program does not own is used where it must own one: make it with dup-value" s)]
+                                         [(and (== mode m-owned) (== result e-void)) (fail-datum '"this expression gives no value" s)]
+                                         [else call]))
+                            s)]
           ;; A call that never returns: nothing after it.
-          [(== result e-div) (let-code temps (list1 call) s)]
+          [(== result e-div) (nested-let-code temps (list1 call) s)]
           ;; The call, its temporaries dropped after; its result, if it
           ;; has one, kept meanwhile, made owned if borrowed, since what
           ;; it borrows from may be dropped.
           [(or (== result e-void) (== mode m-stmt))
            (let ([body (cons (if (and (== mode m-stmt) (== result e-owned)) (drop-code call s) call) drops)])
-             (let-code temps body s))]
+             (nested-let-code temps body s))]
           [else
            (let ([r (fresh "result" s)])
-             (let-code temps
-                       (list1 (let-code (list1 (typed-binding-code r s (if (== result e-borrowed) (dup-code call s) call) s))
-                                        (append drops (list1 r)) s))
-                       s))])))
+             (nested-let-code temps
+                              (list1 (let-code (list1 (typed-binding-code r s (if (== result e-borrowed) (dup-code call s) call) s))
+                                               (append drops (list1 r)) s))
+                              s))])))
 
 ;; A call of a closure: (call-indirect sig (#%app closure-code* x) x n
 ;; a0 a1 a2 a3): of a local function, the direct call of its lifted
@@ -1838,7 +2157,8 @@
   (let* ([id (call-head-id s)] [e (lookup env id)])
     (if (and (!= e 0) (== (entry-kind e) k-direct))
         (let* ([l (parts s)] [args (cdr (cdddr l))] [caps (get direct-caps id)] [flags (get direct-flags id)]
-               [acc (new-operands)] [cs caps] [k 0] [rest (cdr args)] [held nil] [kept live])
+               [acc (new-operands)] [cs caps] [k 0] [rest (cdr args)] [held nil] [kept live]
+               [saved unwind] [owning (pair? caps)])
           ;; The variables the arguments read that die in the call, kept
           ;; through it (held-variables).
           (while (pair? rest)
@@ -1849,33 +2169,66 @@
             (+= k 1)
             (set! rest (cdr rest)))
           (set! kept (union-ids live held))
-          ;; Each captured variable, as an owned value, then the number of
+          ;; Does any argument need a temporary, and does the call have a
+          ;; pad (rw-call)? The captured variables' values come first,
+          ;; owned.
+          (set! k 0)
+          (set! rest (cdr args))
+          (while (pair? rest)
+            (let ([om (if (flag-at flags k) 0 1)])
+              (when (and (== om 0) (temp-operand? (car rest) env (uses-each-into (cdr rest) kept)))
+                (set! (-> acc any-temp) 1))
+              (when (and owning (raises? (car rest))) (set! (-> acc any-temp) 1))
+              (when (and (== om 1) (not (data-form? (car rest)))) (set! owning 1)))
+            (+= k 1)
+            (set! rest (cdr rest)))
+          (set! (-> acc padded) (and (not (marked? safe-locals id)) (or (pair? held) (-> acc any-temp) (pair? (owned-at env live)))))
+          (set! rest (cdr args))
+          (while (pair? rest)
+            (when (and (-> acc padded) (raises? (car rest))) (set! (-> acc any-temp) 1))
+            (set! rest (cdr rest)))
+          ;; Each captured variable, as an owned value, held in a
+          ;; temporary if the arguments use any, then the number of
           ;; arguments and the arguments, each owned or read as the
           ;; function's parameter is.
           (while (pair? cs)
             (let* ([v (cast i32 (integer-value (car cs)))] [ce (lookup env v)]
                    [after (union-ids (uses-each-into args kept) (cdr cs))])
               (when (== ce 0) (fail '"a local function's captured variable is not in scope at its call" s))
-              (set! (-> acc out) (cons (use-as-holder ce v s after) (-> acc out))))
+              (let ([code (use-as-holder ce v s after)])
+                (if (-> acc any-temp)
+                    (let ([t (fresh "captured" s)])
+                      (set! (-> acc temps) (cons (binding-code t code s) (-> acc temps)))
+                      (set! unwind (cons t unwind))
+                      (set! (-> acc out) (cons t (-> acc out))))
+                    (set! (-> acc out) (cons code (-> acc out))))))
             (set! cs (cdr cs)))
-          (set! k 0)
-          (set! rest (cdr args))
-          (while (pair? rest)
-            (when (and (flag-at flags k) (temp-operand? (car rest) env (uses-each-into (cdr rest) kept)))
-              (set! (-> acc any-temp) 1))
-            (+= k 1)
-            (set! rest (cdr rest)))
           (set! (-> acc out) (cons (car args) (-> acc out)))
           (set! k 0)
           (set! rest (cdr args))
           (while (pair? rest)
-            (emit-operand! acc (car rest) (if (flag-at flags k) 0 1) env (uses-each-into (cdr rest) kept))
+            (let* ([om (if (flag-at flags k) 0 1)]
+                   [after (cond [(not (-> acc any-temp)) (uses-each-into (cdr rest) kept)]
+                                [(hoisted? (car rest) om env acc) (uses-each-into (cdr rest) (args-at-call (cdr args) 0 flags env acc kept))]
+                                [else (args-at-call (cdr rest) (+ k 1) flags env acc kept)])])
+              (emit-operand! acc (car rest) om env after))
             (+= k 1)
             (set! rest (cdr rest)))
+          (set! unwind saved)
           (set! (-> acc drops) (append (held-drops held env s) (-> acc drops)))
           (call-code s (datum->syntax ctx (cons (named (sym #%app) s) (cons (entry-name e) (reverse (-> acc out)))) s)
-                     acc e-owned mode))
+                     acc e-owned mode (if (-> acc padded) (pad-drops env live (reverse (-> acc drops)) s) nil)))
         (rw-call s (parts s) 0 0 env live mode))))
+
+;; The variables the arguments l of a local function's call, from
+;; position k on, that the call reads where they are use, into acc
+;; (at-call-uses).
+(define (args-at-call [l datum] [k i32] [flags datum] [env datum] [ops (ptr operands)] [acc datum]) -> datum
+  (while (pair? l)
+    (unless (hoisted? (car l) (if (flag-at flags k) 0 1) env ops) (set! acc (uses-into (car l) acc)))
+    (+= k 1)
+    (set! l (cdr l)))
+  acc)
 
 ;; ---- lambdas ----
 
@@ -1917,17 +2270,23 @@
       (set! lifts (cons func lifts)))))
 
 ;; The body forms of a function, under env, as one expression: the owned
-;; variables it never uses dropped first.
+;; variables it never uses dropped first. Its pads drop only its own
+;; values (unwinding).
 (define (body-code [forms datum] [env datum] [loc datum]) -> datum
-  (let* ([uses (uses-each-into forms nil)] [drops nil] [e env])
+  (let* ([uses (uses-each-into forms nil)] [drops nil] [e env] [saved unwind] [saved-protected protected] [code nil])
     (while (pair? e)
       (let ([entry (car e)])
         (when (and (== (entry-kind entry) k-owned) (not (has-id? uses (cast i32 (integer-value (car entry))))))
           (set! drops (cons (drop-code (entry-name entry) loc) drops))))
       (set! e (cdr e)))
+    (set! unwind nil)
+    (set! protected nil)
+    (set! code (rw-forms forms env nil m-owned))
+    (set! unwind saved)
+    (set! protected saved-protected)
     ;; A begin, located at loc, even for one form: an error in the body
     ;; is then reported there.
-    (datum->syntax ctx (cons (named (sym begin) loc) (append drops (rw-forms forms env nil m-owned))) loc)))
+    (datum->syntax ctx (cons (named (sym begin) loc) (append drops code)) loc)))
 
 ;; A lambda that is a closure: lifted as a function of the closure and its
 ;; parameters, reading each captured variable from the closure into a
@@ -1939,16 +2298,23 @@
 (define (rw-lambda [s datum] [env datum] [live datum]) -> datum
   (let* ([lp (lambda-parts s)] [params (car lp)] [result (cadr lp)] [body (caddr lp)]
          [frees (free-of s)] [name (fresh "lambda" s)] [self (fresh "self" s)]
+         [self-id (- (cast i32 (table-ref self-of (cast u64 (index-of-lambda s)))) 1)]
          [inner nil] [reads nil] [capture-ids nil] [i u32 0] [ps (parts params)] [preludes nil])
+    ;; A captured variable is boxed in the closure if it is boxed where
+    ;; the closure is made. A recursive closure's own variable is not
+    ;; captured: it means the closure (recursive closures, above).
     (while (pair? frees)
-      (let* ([r (car frees)] [id (cast i32 (integer-value (car r)))] [x (cdr r)] [cv (fresh "captured" x)])
-        (when (marked? direct id) (fail '"a closure refers to a local function" x))
-        (set! inner (bind inner id (boxed? id) k-borrowed cv))
-        (set! reads (cons (binding-code cv (datum->syntax ctx (list3 (named (sym closure-cap) x) self (make-integer i)) x) x) reads))
-        (set! capture-ids (cons (cons (make-integer id) x) capture-ids))
-        (+= i 1))
+      (let* ([r (car frees)] [id (cast i32 (integer-value (car r)))] [x (cdr r)] [cv (fresh "captured" x)]
+             [e (lookup env id)])
+        (unless (== id self-id)
+          (when (marked? direct id) (fail '"a closure refers to a local function" x))
+          (set! inner (bind inner id (if (!= e 0) (entry-boxed? e) (boxed? id)) k-borrowed cv))
+          (set! reads (cons (binding-code cv (datum->syntax ctx (list3 (named (sym closure-cap) x) self (make-integer i)) x) x) reads))
+          (set! capture-ids (cons (cons (make-integer id) x) capture-ids))
+          (+= i 1)))
       (set! frees (cdr frees)))
     (set! capture-ids (reverse capture-ids))
+    (when (>= self-id 0) (set! inner (bind inner self-id 0 k-borrowed self)))
     ;; The parameters: a mark's, nargs and slots; or, for a lambda of
     ;; kernel code with parameters of its own, owned, each boxed if
     ;; assigned and captured.
@@ -2016,7 +2382,13 @@
   (set! marker-of (make-table))
   (set! marker-owner (make-table))
   (set! marker-free (make-table))
+  (set! self-of (make-table))
+  (set! lambda-chain (make-table))
   (set! call-sites nil)
+  (set! unwind nil)
+  (set! protected nil)
+  (set! safe-locals (make-table))
+  (set! raises-memo (make-table))
   (set! lifts nil))
 
 ;; The functions lifted while converting, lifted, as one form.
@@ -2042,6 +2414,8 @@
     (reset! c)
     (scan-each! expanded nil)
     (find-direct!)
+    (find-self-refs!)
+    (find-safe-locals! expanded)
     (set! l params)
     (while (pair? l)
       (let* ([x (car l)] [id (id-of x)] [b (borrowed-param? x borrowed)])
@@ -2072,6 +2446,8 @@
     (reset! c)
     (scan! expanded nil)
     (find-direct!)
+    (find-self-refs!)
+    (find-safe-locals! (list1 expanded))
     (let ([code (rw expanded nil nil m-owned)])
       (lift-all! s)
       code)))
