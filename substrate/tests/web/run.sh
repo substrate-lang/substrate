@@ -32,7 +32,7 @@
 #                      and a shader error, each read back (gpu.sub)
 #      sprites, sprites-canvas
 #                      the game that draws many sprites (sprites-world.sub),
-#                      drawn by the GPU renderer (lib/web/game/sprites.sub)
+#                      drawn by the GPU renderer (lib/web/scene/sprites.sub)
 #                      and by the 2D canvas: both draw the same picture.
 #                      These are also the pages that sprites.mjs measures
 #      stopped, stopped-at-start

@@ -1,7 +1,7 @@
 // Lifecycle: experimental.
 //
 // Measures the two renderers of the game library: the canvas's 2D
-// context, and WebGPU (lib/web/game/sprites.sub on host/web/gpu.mjs).
+// context, and WebGPU (lib/web/scene/sprites.sub on host/web/gpu.mjs).
 // It opens the many-sprites game (tests/web/sprites-world.sub) with
 // each, for several numbers of sprites, and prints how long a frame
 // takes. Build the sites first, as tests/web/run.sh does, then:
