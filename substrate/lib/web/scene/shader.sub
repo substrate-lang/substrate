@@ -49,9 +49,40 @@
 ;;       What the vertex stage passes to the fragment stage, with
 ;;       locations in order; the position is always there, and a
 ;;       full-screen pass can leave the clause out.
+;;   [outputs [field type] ...]
+;;       What the fragment stage writes, one field per colour target in
+;;       order. Without it a fragment entry gives a vec4 for the one
+;;       target.
+;;
+;; The shader's functions are written in Shade (lib/shade/core.sub),
+;; which is checked and turned into WGSL when the program is compiled:
+;;
+;;   [define (f [x T] ...) -> R body ...]   a function, as Shade's define
+;;   [struct name [field T] ...]            a struct of the shader's own
+;;   [const name T e]                       a constant
+;;   [use library]                          the definitions of a library
+;;                                          (shade-library in
+;;                                          lib/shade/shade.sub)
+;;   [vertex (name [in vertex]) -> varyings body ...]
+;;       The vertex entry point: the parameter is the Vertex struct, the
+;;       result the Varyings.
+;;   [fragment (name [in varyings]) -> outputs body ...]
+;;       The fragment entry point, giving the outputs, or a vec4 when
+;;       there is no outputs clause.
+;;   [compute size (name [id global-invocation-id] ...) body ...]
+;;       A compute entry point, with its workgroup's size, a number or
+;;       (x y z), and the values it takes: global-invocation-id,
+;;       local-invocation-id, workgroup-id, num-workgroups (vec3u) or
+;;       local-invocation-index (u32).
+;;
+;; In Shade, the bindings are variables: a uniform is its struct, a
+;; storage buffer an array of its struct, a texture or a sampler
+;; itself; the structs are types, by their clause names, with vertex,
+;; varyings and outputs among them.
+;;
 ;;   [code "WGSL"]
-;;       The shader's functions. Several code clauses are joined in
-;;       order, after the declarations.
+;;       WGSL text, for what Shade cannot say yet. Several code clauses
+;;       are joined in order, after the declarations.
 ;;
 ;; Types: f32, i32, u32, vec2, vec3, vec4 (of f32), mat3, mat4, and
 ;; (array T n) for a fixed count of those. A vertex attribute can also
@@ -196,8 +227,21 @@
   (require-unqualified base "../../../compiler/base/base.sub")
   (require-unqualified kd "../../../compiler/kernel.sub")
   (require sm "../../../compiler/base/syntax-match.sub" syntax-match _ ... ?)
+  (require-unqualified shade "../../shade/core.sub")
 
   (define (fail [where datum] [message datum]) -> datum (raise-syntax-error 'shader message where))
+
+  ;; A field's type as Shade has it: the type symbol, or (array T n).
+  (define (shade-field-type [t datum]) -> datum
+    (if (and (identifier? t) (== (syntax-e t) 'unorm8x4)) '(vec 4 f32) (shade-type t)))
+
+  ;; The Shade types of a clause's fields: ((name . type) ...).
+  (define (shade-fields [fields datum]) -> datum
+    (let ([result nil])
+      (while (pair? fields)
+        (set! result (cons (cons (syntax-e (car (car fields))) (shade-field-type (cadr (car fields)))) result))
+        (set! fields (cdr fields)))
+      (reverse result)))
 
   (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
   (define (number [n i64]) -> datum (literal (make-integer n)))
@@ -454,7 +498,8 @@
     (syntax-match s
       [(_ (? identifier? name) c ...)
        (let ([bindings nil] [inputs nil] [varyings nil] [varied 0] [builtins nil] [code '""] [names nil]
-             [definitions nil] [wgsl '""] [groups i64 0])
+             [definitions nil] [wgsl '""] [groups i64 0]
+             [outputs nil] [shaded nil] [entries nil] [libraries nil])
          ;; Read the clauses.
          (while (pair? c)
            (let* ([form (car c)] [l (syntax->list form)] [read (clause form)])
@@ -476,14 +521,47 @@
                       (unless (or (== b 'vertex-index) (== b 'instance-index)) (fail (car bl) '"the built-ins are vertex-index and instance-index"))
                       (set! builtins (cons b builtins)))
                     (set! bl (cdr bl))))]
+               [(== (syntax-e (car l)) 'outputs)
+                (when (pair? outputs) (fail form '"there can be one outputs clause"))
+                (set! outputs (fields-of (cdr l) form))]
+               [(or (== (syntax-e (car l)) 'define) (== (syntax-e (car l)) 'struct) (== (syntax-e (car l)) 'const))
+                (set! shaded (cons form shaded))]
+               [(== (syntax-e (car l)) 'use)
+                (unless (and (== (length l) 2) (identifier? (cadr l))) (fail form '"expected [use library]"))
+                (unless (== (identifier-binding-kind (cadr l)) 'compile-time-value)
+                  (fail (cadr l) '"this is not a Shade library: a library is made with shade-library, and required"))
+                (let ([v (syntax-local-value (cadr l))])
+                  (unless (and (pair? v) (== (car v) 'shade-library)) (fail (cadr l) '"this is not a Shade library"))
+                  (set! libraries (append libraries (syntax->list (cadr v)))))]
+               [(or (== (syntax-e (car l)) 'vertex) (== (syntax-e (car l)) 'fragment))
+                (set! entries (cons `(,(syntax-e (car l)) ,form "") entries))]
+               [(== (syntax-e (car l)) 'compute)
+                (unless (>= (length l) 4) (fail form '"expected [compute size (name [id value] ...) body ...]"))
+                (let* ([size (cadr l)] [sl (syntax->list size)]
+                       [text (if (== sl 0)
+                                 (begin (unless (integer? (syntax-e size)) (fail size '"expected the workgroup's size, a number or (x y z)"))
+                                        (format '"~a" `(,(syntax-e size))))
+                                 (let ([t '""] [first 1])
+                                   (unless (and (>= (length sl) 1) (<= (length sl) 3)) (fail size '"expected the workgroup's size, a number or (x y z)"))
+                                   (while (pair? sl)
+                                     (unless (integer? (syntax-e (car sl))) (fail (car sl) '"expected a number"))
+                                     (set! t (join `(,t ,(if first '"" '", ") ,(syntax-e (car sl)))))
+                                     (set! first 0)
+                                     (set! sl (cdr sl)))
+                                   t))])
+                  ;; The entry as a definition: (compute (name ...) body ...).
+                  (set! entries (cons `(compute ,(datum->syntax form `(,(car l) ,@(cddr l)) form) ,text) entries)))]
                [(== (syntax-e (car l)) 'code)
                 (unless (and (== (length l) 2) (string? (syntax-e (cadr l)))) (fail form '"expected [code \"WGSL\"]"))
                 (set! code (join `(,code ,(syntax-e (cadr l)) "\n")))]
-               [else (fail form '"unknown clause: the clauses are uniform, uniform-array, storage, sampler, comparison-sampler, texture, depth-texture, vertex-input, builtins, varyings and code")]))
+               [else (fail form '"unknown clause: the clauses are uniform, uniform-array, storage, sampler, comparison-sampler, texture, depth-texture, vertex-input, builtins, varyings, outputs, define, struct, const, use, vertex, fragment, compute and code")]))
            (set! c (cdr c)))
          (set! bindings (reverse bindings))
          (set! inputs (reverse inputs))
          (set! builtins (reverse builtins))
+         (set! shaded (append libraries (reverse shaded)))
+         (set! entries (reverse entries))
+         (shade-begin!)
 
          ;; The groups: 0, 1, ... with none missing, and distinct bindings.
          (let ([b bindings])
@@ -511,6 +589,9 @@
                           [laid (layout (clause-fields cl) space)]
                           [struct-name (wgsl-struct-name (syntax-e (clause-name cl)))]
                           [size (laid-size laid)])
+                     (shade-struct! (syntax-e (clause-name cl)) struct-name (shade-fields (clause-fields cl)))
+                     (shade-global! (syntax-e (clause-name cl))
+                                    (if (== (clause-kind cl) 'storage) `(array (struct ,(syntax-e (clause-name cl)))) `(struct ,(syntax-e (clause-name cl)))))
                      (set! wgsl (join `(,wgsl ,(wgsl-struct struct-name laid))))
                      (set! definitions (cons (program-struct (named name (symbol->string (syntax-e (clause-name cl)))) laid) definitions))
                      (when (== (clause-kind cl) 'uniform-array)
@@ -518,7 +599,12 @@
                      (when (== (clause-kind cl) 'storage)
                        (set! definitions (cons #`(define #,(named name (join `(,(syntax-e (clause-name cl)) "-stride"))) u32 #,(number size)) definitions)))
                      (set! wgsl (join `(,wgsl ,(wgsl-binding cl struct-name)))))
-                   (set! wgsl (join `(,wgsl ,(wgsl-binding cl '""))))))
+                   (begin
+                     (shade-global! (syntax-e (clause-name cl))
+                                    (let ([k (clause-kind cl)])
+                                      (cond [(== k 'sampler) 'sampler] [(== k 'comparison-sampler) 'sampler-comparison]
+                                            [(== k 'texture) 'texture-2d] [else 'texture-depth-2d])))
+                     (set! wgsl (join `(,wgsl ,(wgsl-binding cl '"")))))))
              (set! b (cdr b))))
 
          ;; Vertex inputs: the WGSL struct Vertex with locations across
@@ -541,13 +627,18 @@
                                             #,@(reverse attributes))
                                    buffers)))
              (set! i (cdr i)))
-           (let ([b builtins])
+           (let ([b builtins] [fields nil] [i inputs])
+             (while (pair? i)
+               (set! fields (append fields (shade-fields (clause-fields (car i)))))
+               (set! i (cdr i)))
              (while (pair? b)
                (set! vertex-wgsl (join `(,vertex-wgsl " @builtin(" ,(wgsl-name (car b)) ") " ,(wgsl-name (car b)) ": u32,")))
-               (set! b (cdr b))))
+               (set! fields (append fields `((,(car b) . u32))))
+               (set! b (cdr b)))
+             (shade-struct! 'vertex '"Vertex" fields))
            (set! wgsl (join `(,wgsl ,vertex-wgsl " }\n")))
 
-           ;; The varyings.
+           ;; The varyings, and the outputs.
            (let ([v-wgsl '"struct Varyings { @builtin(position) position: vec4f,"] [loc i64 0] [v varyings])
              (while (pair? v)
                (let* ([f (car v)] [t (cadr f)] [info (type-info (syntax-e t) t)])
@@ -555,7 +646,21 @@
                  (set! v-wgsl (join `(,v-wgsl " @location(" ,(make-integer loc) ") " ,(wgsl-name (syntax-e (car f))) ": " ,(type-wgsl info) ",")))
                  (set! loc (+ loc 1)))
                (set! v (cdr v)))
-             (set! wgsl (join `(,wgsl ,v-wgsl " }\n" ,code))))
+             (shade-struct! 'varyings '"Varyings" (append '((position . (vec 4 f32))) (shade-fields varyings)))
+             (set! wgsl (join `(,wgsl ,v-wgsl " }\n"))))
+           (when (pair? outputs)
+             (let ([o-wgsl '"struct Outputs {"] [loc i64 0] [o outputs])
+               (while (pair? o)
+                 (let* ([f (car o)] [t (cadr f)] [info (type-info (syntax-e t) t)])
+                   (when (or (== (type-floats info) 12) (== (type-floats info) 16) (== (syntax-e t) 'unorm8x4)) (fail t '"an output is a scalar or a vector"))
+                   (set! o-wgsl (join `(,o-wgsl " @location(" ,(make-integer loc) ") " ,(wgsl-name (syntax-e (car f))) ": " ,(type-wgsl info) ",")))
+                   (set! loc (+ loc 1)))
+                 (set! o (cdr o)))
+               (shade-struct! 'outputs '"Outputs" (shade-fields outputs))
+               (set! wgsl (join `(,wgsl ,o-wgsl " }\n")))))
+           ;; The Shade definitions and entry points, then any WGSL text.
+           (shade-compile! shaded entries)
+           (set! wgsl (join `(,wgsl ,(shade-text) ,code)))
 
            ;; The layouts, the pipelines and the bind groups.
            (let ([shader-struct (named name '"shader")] [entries nil] [group-functions nil] [layout-items nil])
