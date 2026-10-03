@@ -634,8 +634,9 @@ for Testing build that Playwright's browsers package fetches, as
     pass, one triangle over the screen, draws the outlines where the
     depth or the normal breaks between a pixel and its neighbours (a
     line one pixel wide whatever the distance, on the near side of a
-    silhouette), maps the colours into the screen's range with ACES's
-    curve, and encodes them for the screen. The meshes' origins come
+    silhouette, fading with the fog as the colours do), maps the
+    colours into the screen's range with ACES's curve, and encodes
+    them for the screen. The meshes' origins come
     from one uniform buffer through dynamic offsets. `voxels.sub`
     builds meshes for a world of blocks (each face of a block that
     touches air, with how closed in each corner is baked into the
