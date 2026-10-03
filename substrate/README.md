@@ -934,10 +934,14 @@ stand on the slopes, with bushes at their edges; meadows of grass and
 flowers sway in the wind; boulders lie about; birds circle over the
 lake; a herd of ten deer grazes on the meadow below the knoll, lifts
 its heads when the player comes near, and scatters when the player
-runs at it, drifting back when left alone; the sun crosses the sky in
-ten minutes, warm and low at each end, and its clouds' shadows cross
-the land, into four minutes of night; mist lies on the water at a
-distance. The land is 256 units across, from noise with a fixed
+runs at it, drifting back when left alone; a shoal of fourteen fish
+turns in the lake off the jetty and darts away from anyone who wades
+in; the sun crosses the sky in ten minutes, warm and low at each end,
+and its clouds' shadows cross the land, into four minutes of night;
+mist lies on the water at a distance. The player is a character seen
+from behind, by a camera that follows and swings round with the
+mouse, pulled in where the land is in the way, or, with V, is looked
+through. The land is 256 units across, from noise with a fixed
 seed, so it is the same every time. The player walks and runs on it,
 around the trees, the boulders and the stones, over the bridge and
 the jetty, into the river up to the waist, looks around with the
@@ -976,8 +980,16 @@ what it is doing: its legs stride by its speed, its neck goes down to
 graze, up when it is alert and forward when it runs, and its head
 watches the player; its mind is a small state machine, grazing,
 wandering, alert, fleeing, that steers its mover towards a goal, away
-from the player, clear of the trees and apart from the herd. The
-birds are figures of a body and two wings that beat. The water is a
+from the player, clear of the trees and apart from the herd. A fish
+is a mover that swims, kept between the lake bed and the surface,
+with a figure of a body and a tail that swings; its mind wanders,
+keeps with the shoal and apart from its neighbours, turns from the
+shallows, and takes fright at a wader. The character is a figure of
+six parts, a torso, a head, two arms and two legs, driven by the
+player's mover: it turns to face the way it walks, its legs stride
+and its arms swing with its speed, it leans into a run and tucks its
+legs in a jump. The birds are figures of a body and two wings that
+beat. The water is a
 square at the water level drawn with the water material, which reads
 the land's height from the height map as a texture.
 Everything is a plain colour in its vertices over a white texel. The
@@ -989,13 +1001,16 @@ The game is tested without a browser (`tests/ui/valley.sub`): the
 land's heights, the path, what stands on it, every mesh checked to
 face outwards, the day, the player walking, running, jumping, looking
 around, crossing the bridge, stopped by a tree and by the hut, and
-wading into the river, and the herd watching and scattering (the
-space, the movers, the props and the models have tests of their own). The browser test reads
-the GPU's picture: sky, meadow, river, the bridge's wood, a view that
-changes with walking, and the lake from its shore through the game's
+wading into the river, the herd watching and scattering, the shoal
+taking fright, and the camera behind the character and through its
+eyes (the space, the movers, the props and the models have tests of
+their own). The browser test reads
+the GPU's picture: sky, meadow, river, the bridge's wood, the
+character in its blue tunic, gone when V looks through its eyes, a
+view that changes with walking, and the lake from its shore through the game's
 `look` export, which puts the player anywhere (in the browser's
 console, `window.app.call('look', x, z, yaw, pitch)`). The compiled
-program is 292 KB, and its asset under 1 KB.
+program is 302 KB, and its asset under 1 KB.
 
 ```sh
 lib/web/site.sh lib/web/examples/valley/valley.sub build/lib/web/valley lib/web/examples/valley/page.html
@@ -1003,7 +1018,8 @@ host/web/serve.mjs build/lib/web/valley
 ```
 
 Click the screen to look around with the mouse (Escape frees it); W,
-A, S and D walk, Shift runs, the arrows also look, Space jumps.
+A, S and D walk the way the camera looks, Shift runs, the arrows also
+look, Space jumps, V changes the view.
 
 ### Measurements
 
@@ -1040,7 +1056,7 @@ In headless Chromium, on the development machine:
 | The valley example (GPU) | |
 |---|---|
 | Making the land (263,000 vertices), placing the trees, the bushes, the boulders and the stones, 7,000 tufts of grass around the player, the herd and the flock, on the first frame | 170 ms |
-| A frame: a step with ten deer thinking and moving, the props of the cells in view and the figures submitted, and the land, the trees, the grass, the boulders, the creatures and the water drawn three times (two shadow maps, scene), the sky and the picture pass, in the program | 0.2 ms |
+| A frame: a step with ten deer and fourteen fish thinking and moving, the character posed, the props of the cells in view and the figures submitted, and the land, the trees, the grass, the boulders, the creatures and the water drawn three times (two shadow maps, scene), the sky and the picture pass, in the program | 0.3 ms |
 | The same frame on the GPU, at twice the screen's size each way, from hand-over until done: RTX 5090 / SwiftShader | 2.6 ms / 0.8 s |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |

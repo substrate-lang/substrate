@@ -721,6 +721,16 @@ const checks = {
     // The bridge's wood is brown, in sun or in a cloud's shadow; the
     // river behind it is blue, the trees green, the sky blue.
     check('valley: the bridge is ahead, wooden (100 brown pixels)', atLeast(await count(300, 170, 340, 60, 'r > g && g > b && r - b > 15'), 100), true);
+    // The character stands in the middle of the picture in its blue
+    // tunic; V looks through its eyes, and it is gone.
+    const tunic = () => count(270, 150, 100, 150, 'b > r + 50 && b > g + 20 && b > 120');
+    check('valley: the character is seen from behind (300 blue pixels)', atLeast(await tunic(), 300), true);
+    await page.keyDown('v');
+    await page.keyUp('v');
+    await page.waitFor(`window.gpuModule.readSurface(1, 270, 150, 100, 150).then((p) => { let n = 0; for (let i = 0; i < p.length; i += 4) if (p[i + 2] > p[i] + 50 && p[i + 2] > p[i + 1] + 20 && p[i + 2] > 120) n++; return n < 50; })`, 30000);
+    check('valley: through its eyes, the character is not seen', (await tunic()) < 50, true);
+    await page.keyDown('v');
+    await page.keyUp('v');
     const before = await picture();
     // Walking: W is held until the view has changed (a frame on
     // SwiftShader takes a while).
