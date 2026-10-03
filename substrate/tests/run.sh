@@ -33,6 +33,9 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 host="$root/${HOST:-build/subhost}"
 builds="${OUT:-build}/tests"
+# Every test is built again, so what an earlier run left, such as the
+# programs of tests since removed, goes first.
+rm -rf "${builds:?}"
 mkdir -p "$builds"
 
 # The suite keeps compiled modules in a cache of its own, removed first,
