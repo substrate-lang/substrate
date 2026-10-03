@@ -499,7 +499,7 @@ const checks = {
   // screen, and the camera sits at the bottom, so the player, who starts
   // at (35, 146) in the level, is drawn with its top at y = 134.
   //
-  // The platformer draws with the GPU (lib/web/game/sprites.sub on
+  // The platformer draws with the GPU (lib/web/scene/sprites.sub on
   // host/web/gpu.mjs), so the page runs in the browser that has WebGPU,
   // and the picture is read through the module's readSurface, which
   // gives the next frame drawn on the game's screen. The text is on the
@@ -600,7 +600,7 @@ const checks = {
   },
 
   // lib/web/examples/blocks: a world of blocks drawn in 3D by the GPU
-  // (lib/web/game/meshes.sub). The picture is read through the gpu
+  // (lib/web/scene/scene.sub). The picture is read through the gpu
   // module's readSurface: the sky at the top, the land at the bottom,
   // and both lit faces and faces in shade or shadow, since the scene is
   // lit by a sun with a shadow map; turned towards the sun, the sun's

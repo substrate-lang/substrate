@@ -22,7 +22,7 @@ line says the same.
 | `docs/` | the kernel specification | permanent |
 | `host/` | the hosts, in C over wasmtime (`subhost.c`) and in JavaScript over Node's V8 (`subhost.mjs`): stores, linking, the `host` imports and the instantiate hook; what the JavaScript host shares with the browser is `subhost-core.mjs`, and `host/web/` (experimental) runs programs in a web page, where a program can also run another program in a sandbox (`host/web/guest.mjs`): "Web pages" below | permanent: they run programs, the compiler among them |
 | `compiler/` | the compiler, written in the C-like Lisp: reader, expander, kernel compiler, wasm encoder. It compiles itself (spec 1.4). With it, everything it rests on and carries into programs: the kernel module (`kernel.sub`, in kernel code), the data of every language, in memory, and the functions macros use on it; the forms kernel code is written with (`kernel-forms.sub`, `syntax-match.sub`, `patterns.sub`); the program's memory (`memory.sub`) and printing from it (`print.sub`); and the C-like Lisp itself (`base/`), whose macros are kernel code on the kernel module's data. Nothing here requires anything outside it | permanent, grows |
-| `lib/` | the languages built on the kernel, as libraries programs require: Substrate (`substrate/`), on its own values in memory, and Bend (`bend/`), both written in the C-like Lisp on `compiler/`; and `web/` (experimental), pages, games and a REPL in the browser, in the C-like Lisp | permanent, grows |
+| `lib/` | the languages built on the kernel, as libraries programs require: Substrate (`substrate/`), on its own values in memory, and Bend (`bend/`), both written in the C-like Lisp on `compiler/`; and `web/` (experimental), pages, GPU rendering, games and a REPL in the browser, in the C-like Lisp | permanent, grows |
 | `tests/` | regression tests: `.sub` programs with `.out` (expected output) or `.err` (expected error). `tests/*.sub` are the kernel's; `tests/base/`, `tests/substrate/` and `tests/bend/` each language's; `tests/ui/` the web libraries' that need no browser, and `tests/session/` the sessions', which `bin/sub eval` runs; `tests/fixtures/` holds the modules the tests require. `tests/web/` are the browser tests, run apart by `tests/web/run.sh` | grows |
 | `seed/` | the compiler, built by itself: what builds the compiler's source (spec 1.4) | permanent, replaced as the compiler grows |
 | `bench/` | benchmarks, each directory with its `run.sh`: `base/`, the C-like Lisp against C; `substrate/`, Substrate's programs; `bend/compile/`, checking and compiling Bend's proofs module; and `compare/`, the same programs in the three languages. `bench/README.md` has the measurements | grows |
@@ -172,36 +172,43 @@ do what it does: another language on the kernel can bring its own.
     circles, text, and sprites from image files.
   - `gpu.sub`: the program's side of the host module `gpu`, which is
     WebGPU: functions that write its commands.
-  - `shader.sub`: the `shader` form: a shader's bindings, buffers,
-    vertex inputs and varyings described once, from which the WGSL
-    declarations, the program's structs with the same layout, and the
-    functions that make the pipelines and bind groups are generated
-    and checked when the program is compiled.
   - `files.sub`: reading and writing files, which works on every host.
   - `guest.sub`: functions for running another program in a sandbox (a
     "guest"), on hosts that support it.
-  - `game/`: a small library for 2D games:
-    - `game.sub`: the game loop. `(game World [size 320 180] init step
-      draw)` turns three functions into a game in a page; with
-      `[renderer gpu]` after the size, the GPU draws its screen.
-    - `draw.sub`: what a game draws with: sprite sheets, rectangles and
-      text, on either renderer.
-    - `sprites.sub`: the GPU renderer: a frame's sprites gathered into
-      a batch and drawn with a few commands, on `../gpu.sub`.
-    - `meshes.sub`: the GPU renderer for 3D: textured meshes drawn
-      from a camera and lit by a sun, with shadows from a shadow map,
-      a toon look with a rim of light, depth and fog, under the sky.
+  - `scene/`: rendering with the GPU, on `gpu.sub`: what the game
+    library draws with, and what any program drawing in 2D or 3D
+    would use.
+    - `shader.sub`: the `shader` form: a shader's bindings, buffers,
+      vertex inputs and varyings described once, from which the WGSL
+      declarations, the program's structs with the same layout, and
+      the functions that make the pipelines and bind groups are
+      generated and checked when the program is compiled.
+    - `sprites.sub`: the 2D renderer: a frame's sprites gathered into
+      a batch and drawn with a few commands.
+    - `scene.sub`: a 3D scene, the file a program uses: meshes lit by
+      a sun, under a sky, made into a picture with outlines. Its parts:
+    - `meshes.sub`: the meshes, textured triangles with normals, and
+      the passes that draw them: the shadow map from the sun, and the
+      lit pass with its toon look, rim of light, shadows and fog.
     - `sky.sub`: the sky, drawn where there is nothing: a gradient,
       the sun's disc and glow, drifting clouds.
     - `post.sub`: the textures a scene is drawn into (colour with
       more range than a screen, normals, depth) and the pass that
       makes the picture from them: outlines, tone mapping, sRGB.
-    - `camera.sub`: the camera: position, yaw and pitch, projection.
+    - `camera.sub` and `light.sub`: what a program fills in: the
+      camera's position, yaw and pitch and projection; the sun, the
+      ambient light, the sky's colour, the fog, where shadows fall.
+    - `math.sub`: sin and cos, which wasm does not have, and the 4 by 4
+      matrices a camera needs.
+  - `game/`: a small library for games:
+    - `game.sub`: the game loop. `(game World [size 320 180] init step
+      draw)` turns three functions into a game in a page; with
+      `[renderer gpu]` after the size, the GPU draws its screen.
+    - `draw.sub`: what a game draws with: sprite sheets, rectangles and
+      text, on either renderer.
     - `voxels.sub`: worlds made of blocks: the grid, bodies that move
       through it, the block a line of sight hits, and the mesh of a
       part of it. tiles.sub for three dimensions.
-    - `math.sub`: sin and cos, which wasm does not have, and the 4 by 4
-      matrices a camera needs.
     - `input.sub`: which keys and mouse buttons are held, and which were
       just pressed; how far the mouse moved.
     - `sound.sub`: sound files, music, and short synthesized tones.
@@ -571,7 +578,7 @@ for Testing build that Playwright's browsers package fetches, as
   compute shader doubling numbers, and a shader with a mistake, each
   read back.
   - Renderers are libraries in the program's language. The first is
-    `lib/web/game/sprites.sub`: a frame's sprites and rectangles are
+    `lib/web/scene/sprites.sub`: a frame's sprites and rectangles are
     gathered into a batch, in order, and drawn with one upload and one
     draw call per run of sprites from the same sheet. The vertex
     shader makes each sprite's two triangles and finds its cell in the
@@ -598,7 +605,7 @@ for Testing build that Playwright's browsers package fetches, as
     context in either browser, so the module has `readSurface`, which
     copies the next frame drawn on a surface for a test
     (`tests/web/pages.mjs`: `gpu`, `platformer`, `sprites`).
-  - **Shaders described once** (`lib/web/shader.sub`). A shader and the
+  - **Shaders described once** (`lib/web/scene/shader.sub`). A shader and the
     program must agree on the layout of every uniform struct, the
     attributes of every vertex buffer, which binding holds what, and
     the locations of the values passed between stages; written twice,
@@ -613,11 +620,12 @@ for Testing build that Playwright's browsers package fetches, as
     the declarations. It checks the types, the groups and bindings,
     WGSL's rules for arrays in uniforms, and that an attribute has a
     format. Both renderers are written with it.
-  - The 3D side (`lib/web/game/meshes.sub`, `sky.sub`, `post.sub`,
-    `camera.sub`, `voxels.sub`, `math.sub`). A mesh is textured
-    triangles with normals and a colour that the program builds; the
-    renderer draws every mesh from a camera, lit by a sun, under a
-    sky. A frame is three passes. The shadow map is drawn from the
+  - The 3D side (`lib/web/scene/`: `scene.sub` over `meshes.sub`,
+    `sky.sub`, `post.sub`, `camera.sub`, `light.sub` and `math.sub`;
+    the game library's `voxels.sub` builds meshes for it). A mesh is
+    textured triangles with normals and a colour that the program
+    builds; the scene draws every mesh from a camera, lit by a sun,
+    under a sky. A frame is three passes. The shadow map is drawn from the
     sun's view into a depth texture by a pipeline that has no fragment
     stage. The scene pass draws into textures of the screen's size
     that `post.sub` owns, colour (16-bit floats, so that a sun can be
@@ -643,8 +651,11 @@ for Testing build that Playwright's browsers package fetches, as
     vertices), and gives the world its bodies and its line of sight.
     `math.sub` has what the cameras need and wasm does not provide:
     sin, cos, and 4 by 4 matrices, perspective and orthographic. A game
-    draws its scene, then the picture, then its sprites and text,
-    which go on top. The blocks example (below) is all this in use.
+    draws its scene, which ends in the picture, then its sprites and
+    text, which go on top. The blocks example (below) is all this in
+    use. The shaders' own functions are WGSL text in the `shader`
+    forms, which is the plan's next step: a shader language on the
+    kernel, compiled to WGSL.
   - Not done: lines, circles and paths on the GPU (a game that needs
     them uses the canvas renderer), and the swap of the overlay canvas
     for text drawn by the GPU.
@@ -992,3 +1003,17 @@ plan, and what each step found:
    a location from another file by the nearest enclosing one (spec
    3.6). An instance's own file should count as its file: a change to
    the compiler's back end and to the spec.
+8. A shader language on the kernel. The GPU takes its programs as WGSL
+   text, which the browser compiles. The `shader` form
+   (`lib/web/scene/shader.sub`) generates and checks what the program
+   and the shader must agree on, but a shader's own functions are
+   still WGSL text in the form, written by hand, shared by copying,
+   and checked by the browser after the fact. WGSL is a small language:
+   scalars, vectors, matrices, arrays and structs, functions without
+   recursion, a few statements, some hundred built-in functions. A
+   language on the kernel in its place, compiled to WGSL text at
+   compile time, gives shaders macros, definitions shared between
+   shaders, and errors from our compiler at the form; and, with a
+   second back end to the C-like Lisp, functions written once that
+   run on both the processor and the GPU, such as the noise a terrain
+   is made from. As Bend and Substrate are, it would be a library.
