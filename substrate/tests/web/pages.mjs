@@ -695,7 +695,39 @@ const checks = {
     check('blocks: nothing is written to the console', page.log.join('\n'), '');
   },
 
-  // tests/web/sounds.sub: a game that loads a sound file and asks  // for it as music (repeating) as soon as it starts. S stops the music,
+  // lib/web/examples/valley: a landscape drawn in 3D by the GPU: the
+  // land from a height map, forests and grass placed many times, a
+  // river, mountains, under the sky. The picture is read through the
+  // gpu module's readSurface.
+  async valley(page) {
+    const pixel = (x, y) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
+    const picture = () => page.evaluate(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s; })`);
+    // The atlas (one white texel) takes a moment to arrive; until then
+    // the land is black.
+    await page.waitFor('window.gpuModule.readSurface(1, 100, 330, 1, 1).then((p) => p[1] > 60)', 15000);
+    const top = (await pixel(320, 10)).split(',').map(Number);
+    check('valley: the sky is at the top, blue', top[2] > 200 && top[2] >= top[1] && top[1] > top[0], true);
+    const ground = (await pixel(100, 330)).split(',').map(Number);
+    check('valley: the meadow is at the bottom left, green', ground[1] > ground[0] + 30 && ground[1] > ground[2] + 30, true);
+    const river = (await pixel(560, 300)).split(',').map(Number);
+    check('valley: the river is at the bottom right, blue-green', river[2] > river[0] + 30 && river[1] > river[0], true);
+    check('valley: the forest has dark green in it', await page.evaluate(`window.gpuModule.readSurface(1, 0, 90, 640, 90).then((p) => {
+      let dark = 0;
+      for (let i = 0; i < p.length; i += 4) if (p[i + 1] > p[i] + 20 && p[i + 1] > p[i + 2] + 20 && p[i + 1] < 120) dark++;
+      return dark > 2000;
+    })`), true);
+    const before = await picture();
+    await page.keyDown('w');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await page.keyUp('w');
+    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 5000);
+    check('valley: walking changes the view', (await picture()) !== before, true);
+    check('valley: the game has not stopped', await page.evaluate('document.querySelector(".game-stopped") === null'), true);
+    check('valley: nothing is written to the console', page.log.join('\n'), '');
+  },
+
+  // tests/web/sounds.sub: a game that loads a sound file and asks
+  // for it as music (repeating) as soon as it starts. S stops the music,
   // M starts it again, and Space plays the sound once. The page keeps its
   // audio module in window.audio, which counts what happens.
   async sounds(page) {
@@ -819,7 +851,7 @@ const checks = {
 
 // The pages that need WebGPU run in a browser of their own, started with
 // the flags that give it WebGPU without a GPU (host/web/browser.mjs).
-const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks']);
+const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 
 // Serve the sites (port 0 = any free port; serve.mjs prints its address),
 // then run each named check in a fresh page.

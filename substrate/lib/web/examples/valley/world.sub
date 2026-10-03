@@ -1,0 +1,389 @@
+;; Lifecycle: experimental.
+;;
+;; The valley: a landscape to walk through, the game itself, without
+;; its page.
+;;
+;; A river winds along a valley floor between hills, with forests on
+;; the slopes, meadows of grass that sways, boulders, and mountains
+;; rising to each side, under the sun and its clouds. The land is 256
+;; units across each way, made from noise with a fixed seed, so it is
+;; the same every time. The player walks on it. Nothing wins or loses:
+;; it is the example of the scene library's 3D side at the scale of
+;; one scene, where the blocks example is of worlds that change.
+;;
+;;   the land, from a height map                ../../game/terrain.sub
+;;   noise, to make it from                     ../../game/noise.sub
+;;   the scene: meshes placed many times, lit   ../../scene/scene.sub
+;;   by a sun with shadows and fog, under a     (meshes.sub, sky.sub,
+;;   sky, water, as a picture with outlines     post.sub)
+;;   the camera and the light                   ../../scene/camera.sub,
+;;                                              ../../scene/light.sub
+;;   the camera's matrices, sin and cos         ../../scene/math.sub
+;;   the cross-hair and the text over the scene ../../game/draw.sub
+;;   keys and the mouse                         ../../game/input.sub
+;;
+;; The functions the game loop calls:
+;;
+;;   (world-init! w)         makes the land, the trees, the grass, the
+;;                           boulders and the water, and their GPU
+;;                           meshes; once
+;;   (world-step! w in)      one step, 60 times a second
+;;   (world-draw w)          draws the frame
+;;
+;; Keys: W, A, S and D walk, the mouse looks around once a click has
+;; locked the pointer to the screen (the arrow keys do too), Space
+;; jumps.
+(require-unqualified base "../../../../compiler/base/base.sub")
+(require-unqualified format "../../game/format.sub")
+(require-unqualified math "../../scene/math.sub")
+(require-unqualified noise "../../game/noise.sub")
+(require-unqualified terrain "../../game/terrain.sub")
+(require-unqualified scene "../../scene/scene.sub")
+(require-unqualified meshes "../../scene/meshes.sub")
+(require-unqualified camera "../../scene/camera.sub")
+(require-unqualified light "../../scene/light.sub")
+(require-unqualified draw "../../game/draw.sub")
+(require-unqualified input "../../game/input.sub")
+(require-unqualified gpu "../../gpu.sub")
+
+(provide world world-init! world-step! world-draw screen-width screen-height land-height
+         world-size water-level tree-count grass-count rock-count)
+
+(memory from base)
+(table from base)
+
+;; ---- Sizes ----
+
+(define screen-width u32 640)
+(define screen-height u32 360)
+
+;; The land: 256 units across, one height a unit.
+(define world-size i32 256)
+(define samples i32 257)
+(define water-level f64 6.5)
+(define seed u32 11)
+
+;; ---- The land ----
+
+;; Where the river runs: its x at each z.
+(define (river-x [z f64]) -> f64
+  (+ 128.0 (* 28.0 (sin (/ z 45.0))) (* 10.0 (sin (+ (/ z 17.0) 1.0)))))
+
+(define (smooth [low f64] [high f64] [x f64]) -> f64
+  (let ([t (clamp (/ (- x low) (- high low)) 0.0 1.0)])
+    (* t t (- 3.0 (* 2.0 t)))))
+
+;; The land's height at a point: the river bed, banks rising to a
+;; floor of rolling hills, and mountains towards the sides.
+(define (land-height [x f64] [z f64]) -> f64
+  (let* ([d (fabs (- x (river-x z)))]
+         [base (+ 4.0 (* 6.0 (smooth 2.0 16.0 d)))]
+         [hills (* (fbm (/ x 45.0) (/ z 45.0) 4 seed) 12.0 (smooth 14.0 70.0 d))]
+         [mountains (* (smooth 85.0 128.0 d) 50.0 (+ 0.6 (fbm (/ x 25.0) (/ z 25.0) 3 (+ seed 1))))])
+    (+ base hills mountains)))
+
+;; A colour varied a little by noise, so that a meadow is not one flat
+;; green: each part moved by up to `amount`.
+(define (varied [color u32] [x f64] [z f64] [amount f64]) -> u32
+  (let ([d (* (- (value-noise (* x 0.7) (* z 0.7) (+ seed 2)) 0.5) 2.0 amount)])
+    (packed (part color 24 d) (part color 16 d) (part color 8 d))))
+
+(define (part [color u32] [shift u32] [d f64]) -> u32
+  (cast u32 (clamp (+ (cast f64 (bit-and (>> color shift) 255)) d) 0.0 255.0)))
+
+(define (packed [r u32] [g u32] [b u32]) -> u32 (bit-or (<< r 24) (<< g 16) (<< b 8) 255))
+
+;; What the land is at a point: sand by the water, grass, rock where
+;; it is steep or high, snow on the peaks. The bands are sharp, with a
+;; little noise at their edges, as a drawn landscape has them.
+(define land-sand u32 0)
+(define land-grass u32 1)
+(define land-rock u32 2)
+(define land-snow u32 3)
+
+(define (land-kind [x f64] [z f64] [h f64] [slope f64]) -> u32
+  (let ([wobble (* (- (value-noise (/ x 9.0) (/ z 9.0) (+ seed 3)) 0.5) 6.0)])
+    (cond [(> h (+ 46.0 wobble)) land-snow]
+          [(or (> slope (+ 0.75 (* wobble 0.05))) (> h (+ 34.0 wobble))) land-rock]
+          [(< h (+ 7.4 (* wobble 0.1))) land-sand]
+          [else land-grass])))
+
+(define (paint [x f64] [z f64] [h f64] [slope f64]) -> u32
+  (let ([kind (land-kind x z h slope)])
+    (cond [(== kind land-snow) (varied #xe9eef3ff x z 6.0)]
+          [(== kind land-rock) (varied #x7d8088ff x z 12.0)]
+          [(== kind land-sand) (varied #xd2c48fff x z 10.0)]
+          ;; Grass: darker in the low, wet ground.
+          [(< h 10.0) (varied #x3f8c3cff x z 14.0)]
+          [else (varied #x58a84aff x z 16.0)])))
+
+;; ---- Things on the land ----
+
+(struct world
+  [land terrain]
+  [scene scene]
+  [view camera]
+  [light light]
+  [player walker] [yaw f64] [pitch f64]
+  [steps u32]
+  ;; The meshes' vertices and indexes, and the placements, which the
+  ;; GPU reads when the frame is handed over, so they stay here.
+  [land-vertices buffer] [land-indices buffer] [land-place placement]
+  [water-vertices buffer] [water-indices buffer] [water-place placement]
+  [tree-vertices buffer] [tree-indices buffer] [trees (ptr placement)] [tree-count u32]
+  [grass-vertices buffer] [grass-indices buffer] [grass (ptr placement)] [grass-count u32]
+  [rock-vertices buffer] [rock-indices buffer] [rocks (ptr placement)] [rock-count u32])
+
+(define (tree-count [w (ptr world)]) -> u32 (-> w tree-count))
+(define (grass-count [w (ptr world)]) -> u32 (-> w grass-count))
+(define (rock-count [w (ptr world)]) -> u32 (-> w rock-count))
+
+(define (add-float! [b (ptr buffer)] [x f64]) (buffer-add! b (cast (ptr u8) (array-of f32 (cast f32 x))) 4))
+(define (add-u32! [b (ptr buffer)] [n u32]) (buffer-add! b (cast (ptr u8) (array-of u32 n)) 4))
+
+;; A vertex of a mesh of plain colours: at (x, y, z) with its normal, the
+;; white texel, and a colour whose alpha is how much it sways.
+(define (vertex! [b (ptr buffer)] [x f64] [y f64] [z f64] [nx f64] [ny f64] [nz f64] [color u32] [sway f64])
+  (add-float! b x) (add-float! b y) (add-float! b z)
+  (add-float! b nx) (add-float! b ny) (add-float! b nz)
+  (add-float! b 8.0) (add-float! b 8.0)
+  (add-float! b 1.0)
+  (add-u32! b (mesh-color color sway)))
+
+(define (triangle! [b (ptr buffer)] [a u32] [c u32] [d u32]) (add-u32! b a) (add-u32! b c) (add-u32! b d))
+
+;; A ring of `sides` vertices around the vertical axis at height y and
+;; radius r, with normals leaning out by `lean` (0 straight out, 1 up).
+(define (ring! [b (ptr buffer)] [sides u32] [y f64] [r f64] [lean f64] [color u32] [sway f64])
+  (for ([i u32 0]) (< i sides) (+= i 1)
+    (let* ([a (* (/ (cast f64 i) (cast f64 sides)) 2.0 pi)] [c (cos a)] [s (sin a)]
+           [length (sqrt (+ 1.0 (* lean lean)))])
+      (vertex! b (* r c) y (* r s) (/ c length) (/ lean length) (/ s length) color sway))))
+
+;; The triangles between two rings of `sides` vertices, the first
+;; starting at vertex `lower` and the second at `upper`.
+(define (band! [b (ptr buffer)] [sides u32] [lower u32] [upper u32])
+  (for ([i u32 0]) (< i sides) (+= i 1)
+    (let ([j (% (+ i 1) sides)])
+      (triangle! b (+ lower i) (+ upper i) (+ lower j))
+      (triangle! b (+ lower j) (+ upper i) (+ upper j)))))
+
+;; A cone from a ring to a point above it.
+(define (cap! [b (ptr buffer)] [sides u32] [ring u32] [tip u32])
+  (for ([i u32 0]) (< i sides) (+= i 1)
+    (triangle! b (+ ring i) tip (+ ring (% (+ i 1) sides)))))
+
+;; A tree: a trunk of six sides, and a crown of two cones, the upper
+;; smaller, whose tops sway; the lower cone has a base, since it is
+;; seen from below.
+(define (tree-mesh! [vertices (ptr buffer)] [indices (ptr buffer)])
+  (let ([trunk #x6b4a2aff] [crown #x2f7d32ff] [top #x3f9a3fff] [under #x245f28ff])
+    (ring! vertices 6 0.0 0.35 0.0 trunk 0.0)
+    (ring! vertices 6 2.6 0.28 0.0 trunk 0.0)
+    (band! indices 6 0 6)
+    ;; The lower cone: a wide ring at 1.8, a narrower one at 3.6, a tip at 4.6.
+    (ring! vertices 8 1.8 2.2 0.5 crown 0.08)
+    (ring! vertices 8 3.6 1.4 0.6 crown 0.2)
+    (vertex! vertices 0.0 4.6 0.0 0.0 1.0 0.0 top 0.3)
+    (band! indices 8 12 20)
+    (cap! indices 8 20 28)
+    ;; The upper cone, from 3.4 to 6.4.
+    (ring! vertices 8 3.4 1.6 0.6 crown 0.2)
+    (vertex! vertices 0.0 6.4 0.0 0.0 1.0 0.0 top 0.4)
+    (cap! indices 8 29 37)
+    ;; The base of the lower cone: a ring facing down, and its centre.
+    (ring! vertices 8 1.8 2.2 -3.0 under 0.08)
+    (vertex! vertices 0.0 1.8 0.0 0.0 -1.0 0.0 under 0.0)
+    (for ([i u32 0]) (< i 8) (+= i 1) (triangle! indices (+ 38 i) (+ 38 (% (+ i 1) 8)) 46))))
+
+;; Grass: two crossed blades, each a tuft wider at the bottom than at
+;; the top, that sway at the top. White, so that its placement tints it
+;; with the ground's green; and its normals point up, so that it takes
+;; the ground's light rather than falling into shade on the side away
+;; from the sun.
+(define (grass-mesh! [vertices (ptr buffer)] [indices (ptr buffer)])
+  (let ([color #xffffffff])
+    (for ([k u32 0]) (< k 2) (+= k 1)
+      (let* ([a (if (== k 0) 0.0 (/ pi 2.0))] [dx (* (cos a) 0.16)] [dz (* (sin a) 0.16)] [first (* k 4)])
+        (vertex! vertices (- 0.0 dx) 0.0 (- 0.0 dz) 0.0 1.0 0.0 color 0.0)
+        (vertex! vertices dx 0.0 dz 0.0 1.0 0.0 color 0.0)
+        (vertex! vertices (* dx 0.3) 0.4 (* dz 0.3) 0.0 1.0 0.0 color 1.0)
+        (vertex! vertices (* dx -0.3) 0.4 (* dz -0.3) 0.0 1.0 0.0 color 1.0)
+        (triangle! indices first (+ first 1) (+ first 2))
+        (triangle! indices first (+ first 2) (+ first 3))
+        (triangle! indices first (+ first 2) (+ first 1))
+        (triangle! indices first (+ first 3) (+ first 2))))))
+
+;; A boulder: a lumpy shape of two rings and two tips.
+(define (rock-mesh! [vertices (ptr buffer)] [indices (ptr buffer)])
+  (let ([color #x74777dff])
+    (vertex! vertices 0.0 -0.6 0.0 0.0 -1.0 0.0 color 0.0)
+    (ring! vertices 7 0.0 1.0 -0.3 color 0.0)
+    (ring! vertices 7 0.7 0.75 0.6 color 0.0)
+    (vertex! vertices 0.15 1.15 0.1 0.0 1.0 0.0 color 0.0)
+    (for ([i u32 0]) (< i 7) (+= i 1) (triangle! indices (+ 1 i) (+ 1 (% (+ i 1) 7)) 0))
+    (band! indices 7 1 8)
+    (cap! indices 7 8 15)))
+
+;; The water: a square over the whole land at the water level.
+(define (water-mesh! [vertices (ptr buffer)] [indices (ptr buffer)])
+  (let ([size (cast f64 world-size)] [color #xffffffff])
+    (vertex! vertices 0.0 0.0 0.0 0.0 1.0 0.0 color 0.0)
+    (vertex! vertices size 0.0 0.0 0.0 1.0 0.0 color 0.0)
+    (vertex! vertices size 0.0 size 0.0 1.0 0.0 color 0.0)
+    (vertex! vertices 0.0 0.0 size 0.0 1.0 0.0 color 0.0)
+    (triangle! indices 0 2 1)
+    (triangle! indices 0 3 2)))
+
+;; Places things over the land: at each cell of a grid `spacing` apart,
+;; jittered, where `allowed` says so, with a random turn, a scale and a
+;; tint, outlined or not. Returns the placements made, and their number
+;; in `count`.
+(define (scatter! [w (ptr world)] [spacing f64] [seed-of u32] [scale-low f64] [scale-high f64] [tint u32] [tint-vary f64]
+                  [outlined f64] [allowed (fn (f64 f64 f64 f64) -> i32)] [count (ptr u32)]) -> (ptr placement)
+  (let* ([across (cast u32 (/ (cast f64 world-size) spacing))]
+         [places (cast (ptr placement) (malloc (* across across (sizeof placement))))]
+         [n u32 0])
+    (for ([i u32 0]) (< i across) (+= i 1)
+      (for ([j u32 0]) (< j across) (+= j 1)
+        (let* ([x (* (+ (cast f64 i) (hash-noise (cast i32 i) (cast i32 j) seed-of)) spacing)]
+               [z (* (+ (cast f64 j) (hash-noise (cast i32 i) (cast i32 j) (+ seed-of 1))) spacing)]
+               [h (terrain-height (& (-> w land)) x z)]
+               [slope (terrain-slope (& (-> w land)) x z)])
+          (when (allowed x z h slope)
+            (let ([p (+ places n)] [r (hash-noise (cast i32 i) (cast i32 j) (+ seed-of 2))])
+              (set! (-> p x) (cast f32 x))
+              (set! (-> p y) (cast f32 h))
+              (set! (-> p z) (cast f32 z))
+              (set! (-> p yaw) (cast f32 (* (hash-noise (cast i32 i) (cast i32 j) (+ seed-of 3)) 2.0 pi)))
+              (set! (-> p scale) (cast f32 (+ scale-low (* r (- scale-high scale-low)))))
+              (set! (-> p tint) (mesh-color (varied tint x z tint-vary) outlined))
+              (+= n 1))))))
+    (set! (@ count) n)
+    places))
+
+(define (tree-here? [x f64] [z f64] [h f64] [slope f64]) -> i32
+  (and (== (land-kind x z h slope) land-grass) (< slope 0.55) (> h 8.0)
+       (> (fbm (/ x 30.0) (/ z 30.0) 3 (+ seed 4)) 0.5)))
+
+(define (grass-here? [x f64] [z f64] [h f64] [slope f64]) -> i32
+  (and (== (land-kind x z h slope) land-grass) (< slope 0.7)))
+
+(define (rock-here? [x f64] [z f64] [h f64] [slope f64]) -> i32
+  (and (!= (land-kind x z h slope) land-sand) (> h water-level) (> slope 0.25) (< slope 0.9)
+       (< (hash-noise (cast i32 (* x 3.0)) (cast i32 (* z 3.0)) (+ seed 5)) 0.03)))
+
+;; ---- The player ----
+
+(define walk-speed f64 0.09)
+(define turn-speed f64 0.04)
+(define mouse-speed f64 0.003)
+(define gravity f64 0.009)
+(define jump-speed f64 0.15)
+(define eye-height f64 1.7)
+
+(define (eye-x [w (ptr world)]) -> f64 (-> w player x))
+(define (eye-y [w (ptr world)]) -> f64 (+ (-> w player y) eye-height))
+(define (eye-z [w (ptr world)]) -> f64 (-> w player z))
+
+(define (world-init! [w (ptr world)])
+  ;; The land.
+  (terrain-init! (& (-> w land)) samples samples 1.0)
+  (for ([r i32 0]) (< r samples) (+= r 1)
+    (for ([c i32 0]) (< c samples) (+= c 1)
+      (terrain-set! (& (-> w land)) c r (land-height (cast f64 c) (cast f64 r)))))
+  (scene-init! (& (-> w scene)) "assets/atlas.png" screen-width screen-height)
+  (let ([m (scene-meshes (& (-> w scene)))])
+    ;; The land as one mesh, placed once.
+    (terrain-mesh! (& (-> w land)) (& (-> w land-vertices)) (& (-> w land-indices)) 8.0 8.0 paint)
+    (let ([mesh (meshes-add! m mesh-lit)])
+      (meshes-set! m mesh (& (-> w land-vertices)) (& (-> w land-indices)))
+      (set! (-> w land-place scale) 1.0)
+      (set! (-> w land-place tint) #xffffffff)
+      (meshes-place! m mesh (& (-> w land-place)) 1))
+    (meshes-heights! m (terrain-texture! (& (-> w land))) (cast f64 world-size) (cast f64 world-size))
+    ;; The water.
+    (water-mesh! (& (-> w water-vertices)) (& (-> w water-indices)))
+    (let ([mesh (meshes-add! m mesh-water)])
+      (meshes-set! m mesh (& (-> w water-vertices)) (& (-> w water-indices)))
+      (set! (-> w water-place y) (cast f32 water-level))
+      (set! (-> w water-place scale) 1.0)
+      (set! (-> w water-place tint) #xffffffff)
+      (meshes-place! m mesh (& (-> w water-place)) 1))
+    ;; Trees, grass and boulders, each one mesh placed many times.
+    (tree-mesh! (& (-> w tree-vertices)) (& (-> w tree-indices)))
+    (set! (-> w trees) (scatter! w 4.5 20 0.7 1.4 #xffffffff 24.0 1.0 tree-here? (& (-> w tree-count))))
+    (let ([mesh (meshes-add! m mesh-lit)])
+      (meshes-set! m mesh (& (-> w tree-vertices)) (& (-> w tree-indices)))
+      (meshes-place! m mesh (-> w trees) (-> w tree-count)))
+    (grass-mesh! (& (-> w grass-vertices)) (& (-> w grass-indices)))
+    (set! (-> w grass) (scatter! w 1.1 40 0.6 1.1 #x4f9c44ff 36.0 0.0 grass-here? (& (-> w grass-count))))
+    (let ([mesh (meshes-add! m mesh-lit)])
+      (meshes-set! m mesh (& (-> w grass-vertices)) (& (-> w grass-indices)))
+      (meshes-place! m mesh (-> w grass) (-> w grass-count)))
+    (rock-mesh! (& (-> w rock-vertices)) (& (-> w rock-indices)))
+    (set! (-> w rocks) (scatter! w 3.0 60 0.5 2.2 #xffffffff 20.0 1.0 rock-here? (& (-> w rock-count))))
+    (let ([mesh (meshes-add! m mesh-lit)])
+      (meshes-set! m mesh (& (-> w rock-vertices)) (& (-> w rock-indices)))
+      (meshes-place! m mesh (-> w rocks) (-> w rock-count))))
+  ;; The camera sees far, to the mountains; the light is the afternoon
+  ;; with the shadows following the player.
+  (camera-perspective! (& (-> w view)) (radians 70.0) (/ (cast f64 screen-width) (cast f64 screen-height)) 0.1 400.0)
+  (light-init! (& (-> w light)))
+  (set! (-> w light shadow-radius) 56.0)
+  ;; The player starts on the river's east bank, looking up the valley.
+  (set! (-> w player x) (+ (river-x 24.0) 14.0))
+  (set! (-> w player z) 24.0)
+  (set! (-> w player y) (terrain-height (& (-> w land)) (-> w player x) (-> w player z)))
+  (set! (-> w yaw) 0.0))
+
+(define (world-step! [w (ptr world)] [in (ptr input)])
+  ;; Looking around.
+  (when (held? in key-left) (+= (-> w yaw) turn-speed))
+  (when (held? in key-right) (-= (-> w yaw) turn-speed))
+  (when (held? in key-up) (+= (-> w pitch) turn-speed))
+  (when (held? in key-down) (-= (-> w pitch) turn-speed))
+  (-= (-> w yaw) (* mouse-speed (mouse-dx in)))
+  (-= (-> w pitch) (* mouse-speed (mouse-dy in)))
+  (set! (-> w pitch) (clamp (-> w pitch) (radians -85.0) (radians 85.0)))
+  ;; Walking, along the direction looked at, flat on the ground; right
+  ;; is (-cos yaw, sin yaw), as in mat4-view!.
+  (let ([forward f64 0.0] [sideways f64 0.0])
+    (when (held? in #\w) (+= forward 1.0))
+    (when (held? in #\s) (-= forward 1.0))
+    (when (held? in #\d) (+= sideways 1.0))
+    (when (held? in #\a) (-= sideways 1.0))
+    (when (and (pressed? in key-space) (-> w player on-ground)) (set! (-> w player vy) jump-speed))
+    (-= (-> w player vy) gravity)
+    (walker-move! (& (-> w land)) (& (-> w player))
+                  (* walk-speed (- (* forward (sin (-> w yaw))) (* sideways (cos (-> w yaw)))))
+                  (* walk-speed (+ (* forward (cos (-> w yaw))) (* sideways (sin (-> w yaw))))))
+    ;; The land's edges.
+    (set! (-> w player x) (clamp (-> w player x) 1.0 (- (cast f64 world-size) 1.0)))
+    (set! (-> w player z) (clamp (-> w player z) 1.0 (- (cast f64 world-size) 1.0))))
+  (+= (-> w steps) 1))
+
+;; ---- Drawing ----
+
+(define (world-draw [w (ptr world)])
+  (let ([c (& (-> w view))] [l (& (-> w light))])
+    (set! (-> c x) (eye-x w))
+    (set! (-> c y) (eye-y w))
+    (set! (-> c z) (eye-z w))
+    (set! (-> c yaw) (-> w yaw))
+    (set! (-> c pitch) (-> w pitch))
+    (set! (-> l time) (/ (cast f64 (-> w steps)) 60.0))
+    (set! (-> l shadow-x) (eye-x w))
+    (set! (-> l shadow-y) (eye-y w))
+    (set! (-> l shadow-z) (eye-z w)))
+  (scene-draw! (& (-> w scene)) gpu-on-surface (draw-target) gpu-format-surface (& (-> w view)) (& (-> w light)))
+  ;; The cross-hair, and the text.
+  (let ([cx (/ (cast f64 screen-width) 2.0)] [cy (/ (cast f64 screen-height) 2.0)] [line (array u8 96)])
+    (draw-rect (- cx 6.0) (- cy 1.0) 12.0 2.0 #xffffffb0)
+    (draw-rect (- cx 1.0) (- cy 6.0) 2.0 12.0 #xffffffb0)
+    (text-font "12px monospace")
+    (text-color #x10141aff)
+    (format-into line 96 "at ~.1f ~.1f ~.1f" (eye-x w) (eye-y w) (eye-z w))
+    (draw-text line 8.0 8.0)
+    (format-into line 96 "WASD walk, mouse or arrows look, Space jump")
+    (draw-text line 8.0 (- (cast f64 screen-height) 20.0))))
