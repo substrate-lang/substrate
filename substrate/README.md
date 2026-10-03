@@ -190,7 +190,13 @@ do what it does: another language on the kernel can bring its own.
       a batch and drawn with a few commands, on `../gpu.sub`.
     - `meshes.sub`: the GPU renderer for 3D: textured meshes drawn
       from a camera and lit by a sun, with shadows from a shadow map,
-      a toon look with a rim of light and outlines, depth and fog.
+      a toon look with a rim of light, depth and fog, under the sky.
+    - `sky.sub`: the sky, drawn where there is nothing: a gradient,
+      the sun's disc and glow, drifting clouds.
+    - `post.sub`: the textures a scene is drawn into (colour with
+      more range than a screen, normals, depth) and the pass that
+      makes the picture from them: outlines, tone mapping, sRGB.
+    - `camera.sub`: the camera: position, yaw and pitch, projection.
     - `voxels.sub`: worlds made of blocks: the grid, bodies that move
       through it, the block a line of sight hits, and the mesh of a
       part of it. tiles.sub for three dimensions.
@@ -607,26 +613,37 @@ for Testing build that Playwright's browsers package fetches, as
     the declarations. It checks the types, the groups and bindings,
     WGSL's rules for arrays in uniforms, and that an attribute has a
     format. Both renderers are written with it.
-  - The 3D side (`lib/web/game/meshes.sub`, `voxels.sub`, `math.sub`).
-    A mesh is textured triangles with normals that the program builds;
-    the renderer draws every mesh from a camera, lit by a sun. Each
-    frame is three passes over the meshes with one shader: the shadow
-    map, drawn from the sun's view into a depth texture with a
-    pipeline that has no fragment stage; the scene, where a fragment
-    looks itself up in the map through a comparison sampler (nine
-    taps, softened), takes a lit band or a dark band from its angle
-    to the sun and the map, gets a rim of light where it turns away
-    from the camera, and fades into the sky by distance; and the
-    outlines, each mesh drawn again pushed out along its normals with
-    its front faces culled. The meshes' origins come from one uniform
-    buffer through dynamic offsets. `voxels.sub` builds meshes for a
-    world of blocks (each face of a block that touches air, with how
-    closed in each corner is baked into the vertices), and gives the
-    world its bodies and its line of sight. `math.sub` has what the
-    cameras need and wasm does not provide: sin, cos, and 4 by 4
-    matrices, perspective and orthographic. A game draws its scene
-    first, then its sprites and text, which go on top. The blocks
-    example (below) is all this in use.
+  - The 3D side (`lib/web/game/meshes.sub`, `sky.sub`, `post.sub`,
+    `camera.sub`, `voxels.sub`, `math.sub`). A mesh is textured
+    triangles with normals and a colour that the program builds; the
+    renderer draws every mesh from a camera, lit by a sun, under a
+    sky. A frame is three passes. The shadow map is drawn from the
+    sun's view into a depth texture by a pipeline that has no fragment
+    stage. The scene pass draws into textures of the screen's size
+    that `post.sub` owns, colour (16-bit floats, so that a sun can be
+    brighter than white) and normals, with depth: first the sky, one
+    triangle over the screen whose fragments take their colour from
+    the direction they look in (a gradient, the sun's disc and glow
+    from the same vector the shadows use, clouds from value noise on
+    a plane high up, drifting with time); then the meshes, where a
+    fragment looks itself up in the shadow map through a comparison
+    sampler (nine taps, softened), takes a lit band or a dark band
+    from its angle to the sun and the map, gets a rim of light where
+    it turns away from the camera, and fades into the horizon's haze
+    by distance, lighting computed on linear colours. The picture
+    pass, one triangle over the screen, draws the outlines where the
+    depth or the normal breaks between a pixel and its neighbours (a
+    line one pixel wide whatever the distance, on the near side of a
+    silhouette), maps the colours into the screen's range with ACES's
+    curve, and encodes them for the screen. The meshes' origins come
+    from one uniform buffer through dynamic offsets. `voxels.sub`
+    builds meshes for a world of blocks (each face of a block that
+    touches air, with how closed in each corner is baked into the
+    vertices), and gives the world its bodies and its line of sight.
+    `math.sub` has what the cameras need and wasm does not provide:
+    sin, cos, and 4 by 4 matrices, perspective and orthographic. A game
+    draws its scene, then the picture, then its sprites and text,
+    which go on top. The blocks example (below) is all this in use.
   - Not done: lines, circles and paths on the GPU (a game that needs
     them uses the canvas renderer), and the swap of the overlay canvas
     for text drawn by the GPU.
@@ -728,8 +745,8 @@ Arrows (or A and D) run, Space (or the up arrow, or W) jumps.
 `lib/web/examples/blocks` is a world of blocks in 3D, built on the game
 library's 3D side: hills of grass over dirt over stone, sand in the low
 places, trees, 64 blocks wide and deep and 32 high, made from noise
-with a fixed seed, lit by an afternoon sun that casts shadows, drawn
-in a toon style with outlines. The player walks and jumps through it,
+with a fixed seed, under a sky with the afternoon sun in it, which
+casts shadows, drawn in a toon style with outlines. The player walks and jumps through it,
 looks around, removes the block in front of them and places blocks of
 six kinds. Nothing is won or lost; it is the 3D counterpart of the
 platformer. The game is one file, `world.sub`; `blocks.sub` is one
@@ -801,8 +818,8 @@ In headless Chromium, on the development machine:
 | The blocks example (GPU) | |
 |---|---|
 | Making the world and the meshes of its 16 chunks (16,360 faces), on the first frame | 14 ms |
-| A frame: a step, and the 16 meshes drawn three times (shadow map, scene, outlines), in the program | 0.1 ms |
-| The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 2.2 ms / 13 ms |
+| A frame: a step, the 16 meshes drawn twice (shadow map, scene), the sky and the picture pass, in the program | 0.1 ms |
+| The same frame on the GPU, from hand-over until done: RTX 5090 / SwiftShader | 1.0 ms / 15 ms |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
 |---|---|---|---|

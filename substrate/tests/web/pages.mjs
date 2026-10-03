@@ -603,7 +603,8 @@ const checks = {
   // (lib/web/game/meshes.sub). The picture is read through the gpu
   // module's readSurface: the sky at the top, the land at the bottom,
   // and both lit faces and faces in shade or shadow, since the scene is
-  // lit by a sun with a shadow map. Walking changes the picture, and so
+  // lit by a sun with a shadow map; turned towards the sun, the sun's
+  // disc is in the sky (sky.sub). Walking changes the picture, and so
   // does digging the block in front.
   // A click locks the pointer to the screen ([pointer lock] in game.sub);
   // then the mouse looks around and its left button digs. The browser
@@ -619,7 +620,8 @@ const checks = {
     // on the land there: the top of a grass block or the side of one,
     // which is dirt. Either is land, not sky.
     await page.waitFor('window.gpuModule.readSurface(1, 320, 340, 1, 1).then((p) => p[0] > 40)', 10000);
-    check('blocks: the sky is at the top', await pixel(320, 20), '143,211,255,255');
+    const top = (await pixel(320, 20)).split(',').map(Number);
+    check('blocks: the sky is at the top, blue', top[2] > 200 && top[2] >= top[1] && top[1] > top[0], true);
     const ground = (await pixel(320, 340)).split(',').map(Number);
     check('blocks: the land is at the bottom, not the sky', ground[2] < 150 && ground[3] === 255, true);
     // Grass is green in the light and a darker green in shade or shadow;
@@ -632,6 +634,24 @@ const checks = {
       return [lit, shaded];
     })`);
     check('blocks: the sun lights some grass and leaves some in shade', greens[0] > 5000 && greens[1] > 5000, true);
+    // The sun is up and to the left (light-init! in meshes.sub): turning
+    // left and looking up brings its disc, brighter than anything else,
+    // onto the screen.
+    await page.keyDown('ArrowLeft');
+    await new Promise((resolve) => setTimeout(resolve, 430));
+    await page.keyUp('ArrowLeft');
+    await page.keyDown('ArrowUp');
+    await new Promise((resolve) => setTimeout(resolve, 330));
+    await page.keyUp('ArrowUp');
+    await page.waitFor(`window.gpuModule.readSurface(1, 0, 0, 640, 240).then((p) => { for (let i = 0; i < p.length; i += 4) if (p[i] >= 252 && p[i + 1] >= 252 && p[i + 2] >= 252) return true; return false; })`, 5000);
+    check('blocks: the sun is in the sky', true, true);
+    await page.keyDown('ArrowDown');
+    await new Promise((resolve) => setTimeout(resolve, 330));
+    await page.keyUp('ArrowDown');
+    await page.keyDown('ArrowRight');
+    await new Promise((resolve) => setTimeout(resolve, 430));
+    await page.keyUp('ArrowRight');
+    await new Promise((resolve) => setTimeout(resolve, 100));
     check('blocks: the text is drawn on the overlay', await page.evaluate(`(() => {
       const d = document.querySelectorAll("canvas")[1].getContext("2d").getImageData(0, 0, 200, 40).data;
       let n = 0;

@@ -1,0 +1,161 @@
+;; Lifecycle: experimental.
+;;
+;; The frame after the scene: the textures a scene is drawn into, and
+;; the pass that turns them into the picture on the screen.
+;;
+;; A scene is not drawn on the screen directly. It is drawn into three
+;; textures of the screen's size that this file owns: its colour, with
+;; more range than a screen has (16-bit floats, so that a sun can be
+;; brighter than white and be toned down afterwards), its normals, and
+;; its depth. Then one pass over the screen's pixels, with no geometry,
+;; makes the picture:
+;;
+;;   - outlines: a dark line where the depth or the normal breaks
+;;     between a pixel and its neighbours, one pixel wide whatever the
+;;     distance or the angle, as drawn pictures have them;
+;;   - tone mapping: the colours brought into the screen's range
+;;     (ACES's curve, as films and games use), after an exposure;
+;;   - the sRGB encoding a screen expects.
+;;
+;; Later steps of the same kind (bloom, anti-aliasing) go here too.
+;;
+;;   (post-init! p width height)   makes the textures and the shader
+;;   (post-color p) (post-normals p) (post-depth p)
+;;                                 the textures, for the scene pass to
+;;                                 draw into: the first two are its
+;;                                 colour targets, in this order, in
+;;                                 the formats gpu-rgba16f and gpu-rgba8,
+;;                                 the third its depth, gpu-depth24
+;;   (post-width p) (post-height p)
+;;                                 their size
+;;   (post-draw! p kind target format near far outline exposure)
+;;                                 writes the pass that draws the
+;;                                 picture on a target (as
+;;                                 sprites-draw! takes it); `near` and
+;;                                 `far` are the camera's, for the
+;;                                 depth; `outline` is how dark the
+;;                                 lines are, 0 to 1, 0 for none;
+;;                                 `exposure` scales the colours, 1 for
+;;                                 as drawn
+;;
+;; Colours in the scene are linear (lighting is computed on them), and
+;; the pass encodes them for the screen; what is drawn on the screen
+;; afterwards, such as a game's sprites and text, is in screen values
+;; already.
+(require-unqualified base "../../../compiler/base/base.sub")
+(require-unqualified gpu "../gpu.sub")
+(require-unqualified shader "../shader.sub")
+
+(provide post post-init! post-color post-normals post-depth post-width post-height post-draw!)
+
+(memory from base)
+(table from base)
+
+(struct post
+  [width u32] [height u32]
+  [color u32] [normals u32] [depth u32]
+  [shader picture-shader] [uniforms u32] [group u32]
+  [pipelines (array u32 10)])
+
+;; The pass reads the textures pixel by pixel, so it needs no sampler.
+(shader picture
+  [uniform settings 0 0 (fragment) [near-far vec2] [size vec2] [outline f32] [exposure f32]]
+  [texture color 0 1 (fragment)]
+  [texture normals 0 2 (fragment)]
+  [depth-texture depth 0 3 (fragment)]
+  [builtins vertex-index]
+  [code "
+// One triangle that covers the screen.
+@vertex fn vertex(in: Vertex) -> Varyings {
+  var out: Varyings;
+  out.position = vec4f(f32(i32(in.vertex_index & 1u) * 4 - 1), f32(i32(in.vertex_index >> 1u) * 4 - 1), 0.0, 1.0);
+  return out;
+}
+
+// The distance from the camera that a depth value stands for.
+fn distance_of(d: f32) -> f32 {
+  let n = settings.near_far.x;
+  let f = settings.near_far.y;
+  return f * n / (f - d * (f - n));
+}
+
+fn depth_at(p: vec2i) -> f32 {
+  let q = clamp(p, vec2i(0, 0), vec2i(settings.size) - vec2i(1, 1));
+  return distance_of(textureLoad(depth, q, 0));
+}
+
+fn normal_at(p: vec2i) -> vec3f {
+  let q = clamp(p, vec2i(0, 0), vec2i(settings.size) - vec2i(1, 1));
+  return textureLoad(normals, q, 0).xyz * 2.0 - 1.0;
+}
+
+// How much of a line a pixel gets: a full line where it is nearer than
+// a neighbour by a jump (the near side of a silhouette, so a line is one
+// pixel wide), half a line where its normal differs from a neighbour's
+// (a crease). The sky, at the far distance, gets no crease lines.
+fn edge(p: vec2i) -> f32 {
+  let d = depth_at(p);
+  let n = normal_at(p);
+  let far = settings.near_far.y;
+  var line = 0.0;
+  var offsets = array<vec2i, 4>(vec2i(1, 0), vec2i(-1, 0), vec2i(0, 1), vec2i(0, -1));
+  for (var i = 0; i < 4; i++) {
+    let q = p + offsets[i];
+    let dq = depth_at(q);
+    if (dq - d > 0.04 * d + 0.03) { line = 1.0; }
+    if (d < far * 0.99 && dq < far * 0.99 && dot(n, normal_at(q)) < 0.6) { line = max(line, 0.5); }
+  }
+  return line;
+}
+
+// ACES's curve, as fitted by Krzysztof Narkowicz.
+fn tone(c: vec3f) -> vec3f {
+  return clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
+}
+
+@fragment fn fragment(in: Varyings) -> @location(0) vec4f {
+  let p = vec2i(in.position.xy);
+  var c = tone(textureLoad(color, p, 0).rgb * settings.exposure);
+  c = mix(c, vec3f(0.02, 0.02, 0.03), edge(p) * settings.outline);
+  return vec4f(pow(c, vec3f(1.0 / 2.2)), 1.0);
+}
+"])
+
+(define (post-init! [p (ptr post)] [width u32] [height u32])
+  (memset p 0 (sizeof post))
+  (set! (-> p width) width)
+  (set! (-> p height) height)
+  (set! (-> p color) (gpu-texture! width height 1 1 gpu-rgba16f (+ gpu-sampled gpu-target)))
+  (set! (-> p normals) (gpu-texture! width height 1 1 gpu-rgba8 (+ gpu-sampled gpu-target)))
+  (set! (-> p depth) (gpu-texture! width height 1 1 gpu-depth24 (+ gpu-sampled gpu-target)))
+  (picture-init! (& (-> p shader)))
+  (set! (-> p uniforms) (gpu-buffer! (sizeof picture-settings) gpu-uniform))
+  (set! (-> p group) (picture-bind-group-0! (& (-> p shader)) (-> p uniforms) (-> p color) (-> p normals) (-> p depth))))
+
+(define (post-color [p (ptr post)]) -> u32 (-> p color))
+(define (post-normals [p (ptr post)]) -> u32 (-> p normals))
+(define (post-depth [p (ptr post)]) -> u32 (-> p depth))
+(define (post-width [p (ptr post)]) -> u32 (-> p width))
+(define (post-height [p (ptr post)]) -> u32 (-> p height))
+
+(define (pipeline! [p (ptr post)] [format u32]) -> u32
+  (when (== (@ (-> p pipelines) format) 0)
+    (let ([settings render-settings])
+      (render-settings-init! (& settings))
+      (set! (@ (-> settings targets) 0) format)
+      (set! (@ (-> p pipelines) format) (picture-render-pipeline! (& (-> p shader)) "vertex" "fragment" (& settings)))))
+  (@ (-> p pipelines) format))
+
+(define (post-draw! [p (ptr post)] [kind u32] [target u32] [format u32] [near f64] [far f64] [outline f64] [exposure f64])
+  (let ([pipeline (pipeline! p format)] [settings picture-settings])
+    (vec2! (-> settings near-far) near far)
+    (vec2! (-> settings size) (cast f64 (-> p width)) (cast f64 (-> p height)))
+    (set! (-> settings outline) (cast f32 outline))
+    (set! (-> settings exposure) (cast f32 exposure))
+    (gpu-write-copy! (-> p uniforms) 0 (& settings) (sizeof picture-settings))
+    (gpu-render-pass! 1 0 0 0 0 0.0)
+    (gpu-pass-target! kind target 0 0 gpu-keep 0.0 0.0 0.0 0.0)
+    (gpu-pipeline! pipeline)
+    (gpu-bind-group-set! 0 (-> p group) 0)
+    (gpu-draw! 3 1 0 0)
+    (gpu-end-pass!)))
