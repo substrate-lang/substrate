@@ -128,7 +128,11 @@
 //       storage buffer, 4 uniform buffer with a dynamic offset,
 //       5 storage buffer with one, 6 read-only storage buffer with one,
 //       7 sampler, 8 comparison sampler, 9 texture, 10 depth texture,
-//       11 storage texture (written by shaders; rgba8unorm).
+//       11 storage texture (written by shaders; rgba8unorm), 12 a
+//       texture with layers (an array of 2D textures), 13 a depth
+//       texture with layers. A bind group gives a texture to an entry of
+//       kind 12 or 13 as all its layers, and to the others as one 2D
+//       texture (its first layer).
 //   10 bind-group id layout pipeline group n (binding kind id offset size)...
 //       A bind group. Its layout is `layout`, or, if that is 0, group
 //       `group` of `pipeline`'s. Each entry is a buffer (kind 1; a
@@ -211,7 +215,8 @@
 // gpu() returns the module function with extra properties:
 //   available                   whether the browser gave a device
 //   adapter                     what it says about the GPU
-//   read(texture, x, y, w, h)   the pixels of a texture, as a promise
+//   read(texture, x, y, w, h, mip = 0, layer = 0)
+//                               the pixels of a texture, as a promise
 //                               of bytes, as read-texture gives them
 //   readSurface(surface, x, y, w, h)
 //                               the pixels of a surface, as a promise of
@@ -302,6 +307,7 @@ export async function gpu(options = {}) {
   const textures = new Map();   // id -> { texture, format, width, height, layers }
   const samplers = new Map();   // id -> GPUSampler
   const layouts = new Map();    // id -> GPUBindGroupLayout
+  const layered = new Map();    // layout id -> the bindings that take a texture's layers
   const bindGroups = new Map(); // id -> { group: GPUBindGroup, layout, entries: [{ binding, kind, id, offset, size }] }
   const tables = { 1: surfaces, 2: shaders, 3: pipelines, 4: buffers, 5: textures, 6: samplers, 7: layouts, 8: bindGroups };
   let loading = 0;
@@ -546,12 +552,17 @@ export async function gpu(options = {}) {
               case 9: entry.texture = { sampleType: 'float' }; break;
               case 10: entry.texture = { sampleType: 'depth' }; break;
               case 11: entry.storageTexture = { access: 'write-only', format: 'rgba8unorm' }; break;
+              case 12: entry.texture = { sampleType: 'float', viewDimension: '2d-array' }; break;
+              case 13: entry.texture = { sampleType: 'depth', viewDimension: '2d-array' }; break;
               default: caller.trap(`gpu: there is no layout entry kind ${kind}`);
             }
             entries.push(entry);
             i += 3;
           }
           layouts.set(id, checked(`layout ${id}`, id, () => device.createBindGroupLayout({ label: `layout ${id}`, entries })));
+          // Which bindings take a texture's layers, for the views of the
+          // bind groups made with this layout.
+          layered.set(id, new Set(entries.filter((e) => e.texture && e.texture.viewDimension === '2d-array').map((e) => e.binding)));
           break;
         }
         case 10: {
@@ -567,7 +578,7 @@ export async function gpu(options = {}) {
             entries.push({ binding: w[i], kind, id: w[i + 2], offset: w[i + 3], size: w[i + 4] });
             i += 5;
           }
-          const description = { id, layout, entries };
+          const description = { id, layout, entries, layers: layoutId !== 0 ? layered.get(layoutId) : new Set() };
           description.group = makeBindGroup(description);
           bindGroups.set(id, description);
           break;
@@ -845,7 +856,7 @@ export async function gpu(options = {}) {
 
   // Makes the GPUBindGroup of a bind group's description: its layout and
   // entries, which name resources by number.
-  function makeBindGroup({ id, layout, entries }) {
+  function makeBindGroup({ id, layout, entries, layers }) {
     return checked(`bind group ${id}`, id, () => device.createBindGroup({
       label: `bind group ${id}`,
       layout,
@@ -856,8 +867,10 @@ export async function gpu(options = {}) {
           if (e.size !== 0) resource.size = e.size;
         } else if (e.kind === 2) {
           resource = get(6, e.id);
+        } else if (layers.has(e.binding)) {
+          resource = get(5, e.id).texture.createView({ dimension: '2d-array' });
         } else {
-          resource = get(5, e.id).texture.createView();
+          resource = get(5, e.id).texture.createView({ dimension: '2d', baseArrayLayer: 0, arrayLayerCount: 1 });
         }
         return { binding: e.binding, resource };
       }),
@@ -921,9 +934,9 @@ export async function gpu(options = {}) {
   };
   module.available = true;
   module.adapter = adapter.info || {};
-  module.read = (id, x, y, width, height) => {
+  module.read = (id, x, y, width, height, mip = 0, layer = 0) => {
     const encoder = device.createCommandEncoder();
-    const read = readTexture(encoder, id, 0, 0, x, y, width, height);
+    const read = readTexture(encoder, id, mip, layer, x, y, width, height);
     device.queue.submit([encoder.finish()]);
     return read();
   };

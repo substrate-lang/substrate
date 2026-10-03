@@ -199,10 +199,17 @@ do what it does: another language on the kernel can bring its own.
       a sun, under a sky, made into a picture with outlines. Its parts:
     - `meshes.sub`: the meshes, textured triangles with normals, each
       drawn at a list of placements (a chunk once, a tree a thousand
-      times), and the passes that draw them: the shadow map from the
-      sun, the lit pass with its toon look, rim of light, shadows from
-      the sun and the clouds, fog and mist, and water, see-through,
-      rippled, with foam at its edge.
+      times), and the passes that draw them: two shadow maps from the
+      sun, near and far, the lit pass with its toon look, rim of
+      light, shadows from the sun and the clouds, fog and mist, cards
+      (leaves, blades of grass) seen from both sides and see-through
+      round their shapes, and water, see-through, rippled, with foam
+      at its edge.
+    - `materials.sub`: the materials the surfaces are drawn with,
+      grass, dirt, rock, sand, snow, bark, leaves, blades, planks,
+      roof tiles, plaster, needles, painted by the GPU from noise when
+      the scene starts into one texture of many layers with mip
+      levels, so that no images are shipped.
     - `sky.sub`: the sky, drawn where there is nothing: a gradient,
       the sun's disc and glow, drifting clouds, far ridges all around.
     - `post.sub`: the textures a scene is drawn into (colour with
@@ -692,9 +699,23 @@ for Testing build that Playwright's browsers package fetches, as
     the game library's `voxels.sub` builds meshes for it). A mesh is
     textured triangles with normals and a colour that the program
     builds; the scene draws every mesh from a camera, lit by a sun,
-    under a sky. A frame is three passes. The shadow map is drawn from the
-    sun's view into a depth texture by a pipeline that has no fragment
-    stage. The scene pass draws into textures of the screen's size, or
+    under a sky, drawn with painted materials: a vertex names its
+    material, and the fragment reads it from the materials texture,
+    the tiled ones (grass, rock, bark, planks...) at the world
+    position, projected along the axis the surface faces most and
+    blended between the axes (triplanar), with the derivatives given
+    so that the right mip level is read, the cards (leaves, blades)
+    at the vertex's texel, leaving out the texels whose alpha is low;
+    a material's strokes fade with distance, so that a far hillside is
+    its plain colour, as a drawn one is. A frame is four passes. Two
+    shadow maps are drawn from the sun's view into the layers of a
+    depth texture by a pipeline that has no fragment stage (and one
+    that has, for the cards, to leave out their see-through parts): a
+    near map, 56 units across, and a far one, 240, each moved only by
+    whole texels as the camera moves, so that the shadows' edges do
+    not crawl, read with a bias that grows as a surface turns from
+    the sun; the near map where it covers a point, the far one beyond,
+    blended at the edge. The scene pass draws into textures of the screen's size, or
     twice it each way, that `post.sub` owns, colour (16-bit floats, so
     that a sun can be brighter than white) and normals, with depth:
     first the sky, one triangle over the screen whose fragments take
@@ -705,7 +726,7 @@ for Testing build that Playwright's browsers package fetches, as
     white where thin and grey where thick, lit at the edge towards
     the sun, drifting with time, and two lines of far ridges below
     the horizon from noise over the bearing); then the meshes, where a fragment looks
-    itself up in the shadow map through a comparison sampler (nine
+    itself up in the shadow maps through a comparison sampler (nine
     taps, softened), takes a lit band or a dark band from its angle to
     the sun, the map and the clouds' noise over the world, is lit in
     the dark band by the ambient light, more from the sky above than
