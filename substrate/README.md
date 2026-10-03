@@ -171,7 +171,8 @@ do what it does: another language on the kernel can bring its own.
   - `shade.sub`: the form a module writes it with, `shade-library`,
     which binds definitions for shaders to use.
   - `screen.sub`, `noise.sub`, `color.sub`: libraries: the triangle
-    that covers the screen, value noise, sRGB and tone mapping.
+    that covers the screen, value and gradient noise, sRGB and tone
+    mapping.
 - `lib/web/` (experimental): programs that run in a browser and draw a
   web page, written in the C-like Lisp ("Web pages" below):
   - `ui.sub`: a template language for pages ("views").
@@ -442,7 +443,8 @@ WGSL's own rules where they bite, such as a number written out not
 standing for a vector. The WGSL it writes is readable, since the
 browser's messages refer to it (`tests/ui/shade.sub` prints one).
 `shade-library` shares definitions: the three in `lib/shade/` are the
-triangle that covers the screen, value noise, and colour (sRGB, ACES).
+triangle that covers the screen, noise (value and gradient, and their
+fbm), and colour (sRGB, ACES).
 Not there yet: pointers, atomics and workgroup memory, which compute
 kernels that cooperate across threads need, and which fit the checker
 as more types and built-ins; and a second back end to the C-like Lisp,
@@ -698,10 +700,11 @@ for Testing build that Playwright's browsers package fetches, as
     first the sky, one triangle over the screen whose fragments take
     their colour from the direction they look in (a gradient, haze at
     the horizon that glows towards the sun, the sun's disc and glow
-    from the same vector the shadows use, clouds from value noise on
-    a plane high up, white where thin and grey where thick, drifting
-    with time, and two lines of far ridges below the horizon from
-    noise over the bearing); then the meshes, where a fragment looks
+    from the same vector the shadows use, clouds from gradient noise
+    on a plane high up, warped by more noise into rounded shapes,
+    white where thin and grey where thick, lit at the edge towards
+    the sun, drifting with time, and two lines of far ridges below
+    the horizon from noise over the bearing); then the meshes, where a fragment looks
     itself up in the shadow map through a comparison sampler (nine
     taps, softened), takes a lit band or a dark band from its angle to
     the sun, the map and the clouds' noise over the world, is lit in
@@ -897,28 +900,37 @@ around the trees, the boulders and the stones, over the bridge and
 the jetty, into the river up to the waist, looks around with the
 mouse, and jumps. Nothing is won or lost.
 
-The land is a height map (`game/terrain.sub`) meshed once, 66,000
-vertices, each coloured by what the land is there: sand by the water,
-grass, rock in strata where it is steep or high, snow on the peaks, in
-sharp bands with a little noise at their edges, as a drawn landscape
-has them; the mountains are ridged noise, the path a line the paint
+The land is a height map (`game/terrain.sub`) with a height every
+half unit, meshed once, 263,000 vertices, each coloured by what the
+land is there: sand by the water, grass, rock in strata and crags
+where it is steep or high, snow on the peaks, bands with a little
+noise at their edges, as a drawn landscape has them, blended into each
+other over a short way (a sharp change between two vertices' colours
+is drawn as a sawtooth along the triangles between them); the
+mountains are ridged noise at two scales, the path a line the paint
 follows. Everything on it is a mesh placed many times
-(`scene/meshes.sub`): a fir of three cones, an oak and a birch with
-lumpy crowns, a bush, a boulder in flat facets, a standing stone, a
-few hundred trees and boulders in all; and around the player, placed
-again whenever they have walked six units, a tuft of grass of three
-crossed blades, seven thousand of them, each tinted with the ground's
+(`scene/meshes.sub`). A crown is lobes: low balls, a little lumpy,
+whose normals point out from their middles, so that the light falls
+across each as a volume, darker towards the bottom; an oak is five of
+them on a flared trunk, a birch four narrow ones on a pale trunk with
+dark marks, a bush three on the ground, a fir four cones with
+drooping edges and dark bases. A boulder is flat facets; a standing
+stone leans. Around the player, placed again whenever they have
+walked six units, eight thousand tufts of grass, each three blades
+tapering and leaning over, dark at the foot, tinted with the ground's
 green and drawn without outlines, with normals that point up so that
-it takes the ground's light, and flowers in three colours. The bridge
-and the jetty are boxes, planks with posts and rails, that the player
-walks on and is kept on by the rails; the hut is boxes, gables and
-two slopes of roof, which the player is kept out of. The birds are
-one mesh placed nine times, placed again every step as they fly. The water is a square at the
-water level drawn with the water material, which reads the land's
-height from the height map as a texture. Everything is a plain colour
-in its vertices over a white texel. The shaders are Shade's. The scene
-is drawn at twice the screen's size and averaged down (`post.sub`),
-so its edges are smooth and its lines fine.
+it takes the ground's light, and flowers, discs of petals in three
+colours. The bridge and the jetty are boxes, planks with posts and
+rails, that the player walks on and is kept on by the rails; the hut
+is boxes, gables and two slopes of roof on a plinth, with frames round
+its door and window, which the player is kept out of. The birds are
+one mesh placed nine times, placed again every step as they fly. The
+water is a square at the water level drawn with the water material,
+which reads the land's height from the height map as a texture.
+Everything is a plain colour in its vertices over a white texel. The
+shaders are Shade's. The scene is drawn at twice the screen's size
+and averaged down (`post.sub`), so its edges are smooth and its lines
+fine.
 
 The game is tested without a browser (`tests/ui/valley.sub`): the
 land's heights, the path, what grows on it, the day, and the player
@@ -928,7 +940,7 @@ the GPU's picture: sky, meadow, river, the bridge's wood, a view that
 changes with walking, and the lake from its shore through the game's
 `look` export, which puts the player anywhere (in the browser's
 console, `window.app.call('look', x, z, yaw, pitch)`). The compiled
-program is 185 KB, and its asset under 1 KB.
+program is 197 KB, and its asset under 1 KB.
 
 ```sh
 lib/web/site.sh lib/web/examples/valley/valley.sub build/lib/web/valley lib/web/examples/valley/page.html
@@ -972,9 +984,9 @@ In headless Chromium, on the development machine:
 
 | The valley example (GPU) | |
 |---|---|
-| Making the land (66,000 vertices), placing the trees, the bushes, the boulders and the stones, and 7,000 tufts of grass around the player, on the first frame | 75 ms |
+| Making the land (263,000 vertices), placing the trees, the bushes, the boulders and the stones, and 8,000 tufts of grass around the player, on the first frame | 200 ms |
 | A frame: a step, and the land, the trees, the grass, the boulders and the water drawn twice (shadow map, scene), the sky and the picture pass, in the program | 0.1 ms |
-| The same frame on the GPU, at twice the screen's size each way, from hand-over until done: RTX 5090 / SwiftShader | 2.2 ms / 0.3 s |
+| The same frame on the GPU, at twice the screen's size each way, from hand-over until done: RTX 5090 / SwiftShader | 2.3 ms / 0.5 s |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
 |---|---|---|---|
