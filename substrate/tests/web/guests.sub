@@ -1,0 +1,168 @@
+;; A web page that tests guests. lib/web/guest.sub explains what a guest
+;; is; tests/web/pages.mjs runs this page in a browser and checks
+;; what it shows.
+;;
+;; The page starts guests that run a-guest.sub and keeps a log, as text,
+;; of every event it receives from them and of what it does itself. The
+;; test compares the whole log with what is expected.
+;;
+;;   Guest 1  is sent the commands listed in `command`, one at a time:
+;;            the next command is sent when the reply to the previous one
+;;            arrives. The last command makes it exit.
+;;   Guest 2  has a time limit of 300 ms and is told to loop forever, so
+;;            the host ends it.
+;;   Guest 3  has no time limit and is told to loop forever. The test
+;;            then clicks the page's buttons: "tick" shows that the page
+;;            still responds, and "stop" ends the guest.
+;;   Finally the page tries three specs that are wrong.
+(require-unqualified base "../../compiler/base/base.sub")
+(require-unqualified ui "../../lib/web/ui.sub")
+(require-unqualified web "../../lib/web/web.sub")
+(require-unqualified guest "../../lib/web/guest.sub")
+(memory from base)
+(table from base)
+
+;; The log; the three guests' numbers; the index of the next command for
+;; guest 1; and how many times "tick" was clicked.
+(struct model [log buffer] [first u32] [second u32] [third u32] [step u32] [ticks u32])
+
+(variant message
+  ;; An event from a guest (see on-guest below).
+  [guest-event [guest u32] [kind u32]]
+  ;; The "tick" and "stop" buttons.
+  [tick] [stop])
+(messages message)
+
+;; Appends the C string s to the log. A 0 byte is kept just past the end
+;; of the log, so that it can be shown as a C string.
+(define (log! [m (ptr model)] [s (ptr u8)])
+  (buffer-add-string! (& (-> m log)) s)
+  (buffer-add-byte! (& (-> m log)) 0)
+  (-= (-> m log length) 1))
+
+;; Appends the number n, in decimal, to the log.
+(define (log-number! [m (ptr model)] [n i32])
+  (when (< n 0) (log! m "-") (set! n (- 0 n)))
+  (when (>= n 10) (log-number! m (/ n 10)))
+  (let ([digit (array u8 2)])
+    (set! (@ digit 0) (cast u8 (+ #\0 (% n 10))))
+    (set! (@ digit 1) 0)
+    (log! m digit)))
+
+;; The commands for guest 1, in order. Returns 0 when there are no more.
+;; a-guest.sub describes each command.
+(define (command [step u32]) -> (ptr u8)
+  (case step
+    [(0) "add 5"]
+    [(1) "add 37"]
+    [(2) "say hello"]
+    [(3) "warn careful"]
+    ;; The guest was granted /data for reading and /out for writing.
+    [(4) "read /data/note.txt"]
+    [(5) "read /secret/key.txt"]
+    [(6) "write /out/made.txt"]
+    [(7) "read /out/made.txt"]
+    [(8) "write /data/note.txt"]
+    ;; After a trap the guest keeps running, and keeps its total.
+    [(9) "trap"]
+    [(10) "add 1"]
+    [(11) "guest"]
+    ;; The guest's memory limit is 32 MiB. It keeps running after hitting
+    ;; the limit.
+    [(12) "grow 32"]
+    [(13) "add 1"]
+    [(14) "exit 3"]
+    [else 0]))
+
+;; Sends guest 1 its next command, if there is one.
+(define (send-next! [m (ptr model)])
+  (let ([c (command (-> m step))])
+    (when (!= c 0)
+      (+= (-> m step) 1)
+      (guest-send-text (-> m first) c))))
+
+;; Starts a guest with the given spec and returns its number. If it
+;; cannot be started, logs the reason and returns 0.
+(define (start! [m (ptr model)] [spec (ptr u8)]) -> u32
+  (let ([g (guest-start spec)])
+    (when (== g 0)
+      (let ([why (guest-error)])
+        (log! m "no guest: ")
+        (log! m why)
+        (log! m "\n")
+        (free why)))
+    g))
+
+;; Called once when the page loads: starts guest 1 and sends its first
+;; command.
+(define (init [m (ptr model)])
+  (set! (-> m log) (make-buffer))
+  (log! m "")
+  (set! (-> m first) (start! m "program /guest\narg one\narg two words\nread /data\nwrite /out\ntime 5000\nmemory 32"))
+  (send-next! m))
+
+;; Logs one event as a line: the guest's number, the kind of event, and
+;; the event's data if there is any.
+(define (log-event! [m (ptr model)] [g u32] [kind u32])
+  (let ([data (guest-take-text)])
+    (log-number! m (cast i32 g))
+    (log! m (cond [(== kind guest-message) " message"]
+                  [(== kind guest-stdout) " stdout"]
+                  [(== kind guest-stderr) " stderr"]
+                  [(== kind guest-done) " done"]
+                  [else " ended"]))
+    (when (!= (@ data) 0) (log! m ": "))
+    (log! m data)
+    ;; End the line, unless the data already ends with a newline.
+    (let ([n (strlen data)])
+      (when (or (== n 0) (!= (@ data (- n 1)) 10)) (log! m "\n")))
+    (free data)))
+
+(define (update [m (ptr model)] [e (ptr message)])
+  (match e
+    [(guest-event g kind)
+     (log-event! m g kind)
+     (cond
+       ;; Guest 1 replied: send its next command.
+       [(and (== g (-> m first)) (== kind guest-message)) (send-next! m)]
+       ;; Guest 1 exited. Sending to it now fails. Then start guest 2.
+       [(and (== g (-> m first)) (== kind guest-ended))
+        (log! m "send to guest 1 returned ")
+        (log-number! m (guest-send-text g "add 1"))
+        (log! m "\n")
+        (set! (-> m second) (start! m "program /guest\ntime 300"))
+        (guest-send-text (-> m second) "loop")]
+       ;; Guest 2 was ended by its time limit. Start guest 3.
+       [(and (== g (-> m second)) (== kind guest-ended))
+        (set! (-> m third) (start! m "program /guest"))
+        (guest-send-text (-> m third) "add 2")]
+       ;; Guest 3 replied to "add 2": now make it loop forever.
+       [(and (== g (-> m third)) (== kind guest-message))
+        (guest-send-text (-> m third) "loop")
+        (log! m "guest 3 is now looping\n")])]
+    [tick (+= (-> m ticks) 1)]
+    [stop
+     (guest-stop (-> m third))
+     (log! m "stopped guest 3; send to it returned ")
+     (log-number! m (guest-send-text (-> m third) "add 1"))
+     (log! m "\n")
+     ;; Three specs that are wrong. Each logs why no guest was started.
+     (start! m "program /nowhere")
+     (start! m "program /guest\nfrobnicate 1")
+     (start! m "program /guest\ntime soon")
+     (log! m "finished\n")]))
+
+;; The host calls this function, by name, for every event from a guest.
+;; send! (from web.sub) passes it to `update` as a message and redraws
+;; the page.
+(define (on-guest [g u32] [kind u32])
+  (let ([e message (guest-event g kind)])
+    (send! (& e))))
+
+(view (page [m (ptr model)])
+  (button ([id "tick"] [on click tick]) "tick")
+  (span ([id "ticks"]) (int (-> m ticks)))
+  (button ([id "stop"] [on click stop]) "stop")
+  (pre ([id "log"]) (text (-> m log bytes))))
+
+(app model message init update page)

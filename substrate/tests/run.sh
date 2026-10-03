@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lifecycle: test harness. Each tests/*.sub, tests/base/*.sub,
-# tests/substrate/*.sub and tests/bend/*.sub built by the compiler
+# tests/substrate/*.sub, tests/bend/*.sub and tests/ui/*.sub built by the compiler
 # (bin/sub), in its own directory, and run with a host, build/subhost
 # unless HOST names another (host/subhost.mjs runs programs on Node's
 # V8), which runs the compiler too. The output checked is the build's,
@@ -15,7 +15,13 @@
 # the kernel module (compiler/kernel.sub); tests/fixtures holds the
 # modules they require. tests/base has the C-like Lisp's tests
 # (compiler/base), tests/substrate Substrate's (lib/substrate), and
-# tests/bend Bend's (lib/bend). Then the cache (spec 3.7): each
+# tests/bend Bend's (lib/bend). tests/ui has the tests of the web
+# libraries that need no browser (lib/web): they print the page changes
+# a view produces, check the error messages for templates that are
+# wrong, test reading files and the game library (collision, keys,
+# timers, sound, its containers and its formatting), and play the two
+# example games without their pages. tests/session has the session
+# tests, which bin/sub eval runs. Then the cache (spec 3.7): each
 # program built again from it is the same, and a stale entry is not
 # used. OUT is where builds go (default build). In the dev shell:
 #
@@ -52,7 +58,7 @@ mkdir -p "$builds/compiled"
    -m "$root/$builds/compiled/geometry.subc" -c "$cache" > /dev/null) ||
   { echo "FAIL building tests/fixtures/geometry.sub as a compiled file"; fail=$((fail + 1)); }
 
-tests=(tests/*.sub tests/base/*.sub tests/substrate/*.sub tests/bend/*.sub)
+tests=(tests/*.sub tests/base/*.sub tests/substrate/*.sub tests/bend/*.sub tests/ui/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
@@ -80,6 +86,23 @@ for t in "${tests[@]}"; do
     fail=$((fail + 1))
     echo "FAIL $base: $problem"
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
+  fi
+done
+# The session tests (tests/session). `bin/sub eval NAME.sub` evaluates
+# the file's forms one at a time, each as one input of a session (see
+# "sessions" in compiler/expander.sub). Its output,
+# including the error messages of inputs that fail, must equal NAME.out.
+# Backtrace lines (which start with four spaces) are removed first,
+# because their content depends on the host.
+for t in tests/session/*.sub; do
+  name="$(basename "$t" .sub)"
+  actual="$(cd tests/session && "$root/bin/sub" eval "$name.sub" -c "$cache" 2>&1 | grep -v '^    ')"
+  if [ -f "tests/session/$name.out" ] && [ "$actual" = "$(cat "tests/session/$name.out")" ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL tests/session/$name: output differs"
+    diff <(echo "$actual") "tests/session/$name.out" | head -20
   fi
 done
 # A module compiles to the same bytes whatever the run compiled before it

@@ -16,7 +16,11 @@
 ;;                                          may name its type parameters P
 ;;                                          ...: a call makes an instance at
 ;;                                          the types its arguments give
-;;                                          them, (inst f T ...) at those
+;;                                          them, from left to right (a
+;;                                          constant written out, such as
+;;                                          5, decides a P only when no
+;;                                          other argument does), or (inst
+;;                                          f T ...) at those
 ;;   (define x T), (define x T init)        a global variable, in memory:
 ;;                                          zero, or init's value
 ;;   (struct S [field T] ...)               a struct type, laid out as C
@@ -101,6 +105,11 @@
 ;;   (memory.size) (memory.grow n) (memory.copy d s n) (memory.fill d v n)
 ;;   integers, decimals, #\c, #t and #f (1 and 0), and "text", a (ptr u8)
 ;;   to its bytes, followed by a 0
+;;   #%top-interaction                      used by the compiler's sessions (a
+;;                                          REPL): wraps an expression typed
+;;                                          at the top level, so that it is
+;;                                          compiled as C code and its value
+;;                                          is printed according to its type
 ;;
 ;; The types are i8 u8 i16 u16 i32 u32 i64 u64, f32 f64, void (a result
 ;; only), (ptr T), (array T n), n a count, (fn (T ...) -> R) and (fn (T
@@ -162,15 +171,21 @@
 ;; what it did with a list and a function, such as map, is a for form.
 
 (require memory "../memory.sub")
+(require print "../print.sub")
+;; The kernel module is required only for c-interaction (below), which
+;; uses it to print floating-point values in a session. Nothing else in
+;; this file calls it, so ordinary programs do not import it.
+(require kd kernel)
 (begin-for-syntax
   (require k kernel)
   (require sm "../syntax-match.sub" syntax-match _ ... ?)
   (require-unqualified kf "../kernel-forms.sub"))
 
 (provide [define c-define] [struct c-struct] [union c-union] [variant c-variant] [match c-match] [exception c-exception] [throw c-throw] [try c-try] [lambda c-lambda] inst typedef [let c-let] [let* c-let*] [set! c-set!]
-         [#%datum c-datum] when unless cond case while for break continue and or not cast sizeof offsetof array-of @ & ->
+         [#%datum c-datum] [#%top-interaction c-interaction]
+         when unless cond case while for break continue and or not cast sizeof offsetof array-of @ & ->
          + - * / % == != < <= > >= bit-and bit-or bit-xor bit-not << >>
-         += -= *= /= %= <<= >>= bit-and= bit-or= bit-xor= sbrk)
+         += -= *= /= %= <<= >>= bit-and= bit-or= bit-xor= sbrk reset-stack!)
 
 (memory from memory)
 
@@ -201,6 +216,13 @@
 ;; down.
 (global stack-base (mut i32) (sbrk 4194304))
 (global sp (mut i32) (i32.add stack-base 4194304))
+
+;; Resets the C stack pointer to the top of the stack, as if no function
+;; were running. Call it first thing after a trap. A trap abandons the
+;; functions that were running without popping their stack frames, so a
+;; program that carries on after a trap (as a web page's does) would
+;; otherwise lose that stack space for good (spec 4, on-trap).
+(func (reset-stack!) (set! sp (i32.add stack-base 4194304)))
 
 (begin-for-syntax
   ;; A compile error, message form with each ~a or ~s the next of args,
@@ -1251,21 +1273,47 @@
 
   ;; The types, ((P . type) ...), that make types ts, which name type
   ;; parameters as (tvar P), those of args.
+  ;;
+  ;; A type parameter takes its type from the arguments, from left to
+  ;; right. The arguments are gone through twice. The first time, a
+  ;; constant written out, such as 5 or 1.5, decides nothing, because it
+  ;; has no type of its own: it takes the type its place needs. The
+  ;; second time, a constant decides the type parameters that are still
+  ;; not known, at the type it has by itself, i32 or f64. An argument
+  ;; whose parameter's type is known by then is left to the check of the
+  ;; call itself, where it is accepted as an ordinary function's argument
+  ;; is: a constant takes that type, and a number of another type is
+  ;; converted.
   (func (infer [e i32] [ts i32] [args i32] [env i32]) -> i32
     (unless (i32.eq (k:length ts) (k:length args))
       (c-error e '"expected ~a argument~a, got ~a" `(,(k:fixnum (k:length ts)) ,(plural (k:length ts)) ,(k:fixnum (k:length args)))))
-    (infer-from ts args env '()))
+    (infer-from ts args env (infer-from ts args env '() 0) 1))
 
-  (func (infer-from [ts i32] [args i32] [env i32] [s i32]) -> i32
+  ;; constants: whether a constant written out decides a type parameter.
+  (func (infer-from [ts i32] [args i32] [env i32] [s i32] [constants i32]) -> i32
     (cond [(k:null? ts) s]
-          [(names-tvar? (k:car ts))
+          [(known-type? (k:car ts) s) (infer-from (k:cdr ts) (k:cdr args) env s constants)]
+          [else
            (let ([r (check (k:car args) env 0)])
              (infer-from (k:cdr ts) (k:cdr args) env
-                         (or (unify (k:car ts) (settled-type (k:car r)) s)
-                             (c-error (k:car args) '"expected ~s, got ~s" `(,(shown (k:car ts)) ,(shown (k:car r)))))))]
-          [else (infer-from (k:cdr ts) (k:cdr args) env s)]))
+                         (if (and (i32.eqz constants) (k:memq (k:car r) '(lit flit)))
+                             s
+                             (or (unify (k:car ts) (settled-type (k:car r)) s)
+                                 (c-error (k:car args) '"expected ~s, got ~s" `(,(shown (applied (k:car ts) s)) ,(shown (k:car r))))))
+                         constants))]))
 
-  (func (names-tvar? [t i32]) -> i32 (and (k:pair? t) (or (i32.eq (k:car t) 'tvar) (for/or ([u t]) (names-tvar? u)))))
+  ;; Whether every type parameter that type t names has its type in s.
+  (func (known-type? [t i32] [s i32]) -> i32
+    (cond [(and (k:pair? t) (i32.eq (k:car t) 'tvar)) (if (k:assq (k:cadr t) s) 1 0)]
+          [(k:pair? t) (for/and ([u t]) (known-type? u s))]
+          [else 1]))
+
+  ;; Type t with each type parameter whose type is in s replaced by it,
+  ;; for a message.
+  (func (applied [t i32] [s i32]) -> i32
+    (cond [(and (k:pair? t) (i32.eq (k:car t) 'tvar)) (let ([b (k:assq (k:cadr t) s)]) (if b (k:cdr b) t))]
+          [(k:pair? t) (for/list ([u t]) (applied u s))]
+          [else t]))
 
   ;; s, extended so that type t, with type parameters, is type u; or #f.
   (func (unify [t i32] [u i32] [s i32]) -> i32
@@ -1303,10 +1351,19 @@
                    [sub (for/list ([q p] [t ts]) (k:cons (k:syntax-e q) t))])
                (k:datum-put! (instances) key (k:syntax-local-introduce name))
                ;; Its body is checked now, as the rest of this one's is.
+               ;;
+               ;; The lifted definition is a begin, whose forms the
+               ;; expander locates at the begin itself when their own
+               ;; location is in another file (spec 6.2). The begin's
+               ;; template is in this file, so the instance's function
+               ;; would be located here, in lang.sub, and a trap in it
+               ;; would be reported here. Locating the begin at the
+               ;; generic's own definition, s, puts the function in the
+               ;; generic's file instead.
                (let ([s-result result] [s-loops loops] [s-frame frame] [s-frame-size frame-size] [s-addressed addressed]
                      [s-to to] [s-returned returned] [s-returns returns] [s-binders binders] [s-lambdas lambdas])
                  (drop (k:syntax-local-lift-definition
-                        (function s name x (for/list ([y a]) (replace y sub)) (replace r sub) (for/list ([b body]) (replace b sub)) f)))
+                        (at s (function s name x (for/list ([y a]) (replace y sub)) (replace r sub) (for/list ([b body]) (replace b sub)) f))))
                  (set! result s-result) (set! loops s-loops) (set! frame s-frame) (set! frame-size s-frame-size)
                  (set! addressed s-addressed) (set! to s-to) (set! returned s-returned) (set! returns s-returns)
                  (set! binders s-binders) (set! lambdas s-lambdas))
@@ -2015,8 +2072,66 @@
           (br-if done (i32.eqz j))
           (set! j (i32.sub j 1))
           (br next)))
-      w)))
+      w))
 
+  ;; ---- sessions ----
+  ;;
+  ;; (#%top-interaction e) is what the compiler turns an expression into
+  ;; when the expression is typed at the top level of a session (see
+  ;; "sessions" in compiler/expander.sub). C code normally has to be
+  ;; inside a function. This macro compiles e on its own: e is
+  ;; type-checked and lowered as a function body is, with a stack frame if
+  ;; it needs one. Then its value is printed, followed by a newline. How
+  ;; it is printed depends on its type:
+  ;;   a number            in decimal
+  ;;   a (ptr u8)          the text it points to, in quotes; or 0 if null
+  ;;   any other pointer   its address
+  ;;   any other type      the type's name, as #<type>
+  ;;   no value (void)     nothing
+  (func (c-interaction [s i32]) -> i32
+    (syntax-match s
+      [(_ e)
+       (let ([x (begin (set! quoter s) (start-function! 'void 0) (k:local-expand e))])
+         (scan x)
+         (with-frame (func-index interaction-walk) x))]))
+
+  (func (interaction-walk [e i32]) -> i32
+    (framed '() (k:cons 'void (written-value (settle (check e '() 0) 0 e) e))))
+
+  ;; r is the pair (type . code) of an expression. Returns code that
+  ;; evaluates the expression and prints its value as described above.
+  (func (written-value [r i32] [e i32]) -> i32
+    (let ([t (k:car r)] [c (k:cdr r)])
+      (cond [(k:memq t '(void none)) c]
+            [(i32.eq t 'i32) #`(begin (print:write-int #,c) (print:newline))]
+            [(i32.eq t 'u32) #`(begin (print:write-u64 (i64.extend_i32_u #,c)) (print:newline))]
+            [(i32.eq t 'i64) #`(begin (print:write-i64 #,c) (print:newline))]
+            [(i32.eq t 'u64) #`(begin (print:write-u64 #,c) (print:newline))]
+            [(i32.eq t 'f64) #`(begin (kd:write-datum (kd:make-flonum #,c)) (print:newline))]
+            [(i32.eq t 'f32) #`(begin (kd:write-datum (kd:make-flonum (f64.promote_f32 #,c))) (print:newline))]
+            [(k:equal? t '(ptr u8))
+             #`(let ([p #,c] [n 0])
+                 (if p
+                     (begin
+                       (block done
+                         (loop next
+                           (br-if done (i32.eqz (i32.load8_u (i32.add p n))))
+                           (set! n (i32.add n 1))
+                           (br next)))
+                       (print:write-byte 34)
+                       (print:write-bytes p n)
+                       (print:write-byte 34))
+                     (print:write-int 0))
+                 (print:newline))]
+            [(address-type? t) #`(begin (print:write-u64 (i64.extend_i32_u #,c)) (print:newline))]
+            [else
+             (let ([text (k:format '"#<~s>" `(,(shown t)))])
+               #`(begin
+                   #,(as-void r)
+                   (print:write-bytes #,(k:cdr (string-literal text)) #,(i32-const (k:string-length text)))
+                   (print:newline)))]))))
+
+(define-syntax c-interaction c-interaction)
 (define-syntax c-define c-define)
 (define-syntax c-body c-body)
 (define-syntax c-static c-static)

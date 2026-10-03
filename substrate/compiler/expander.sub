@@ -29,7 +29,8 @@
 (require-unqualified ser "serialize.sub")
 
 (provide set-repository-root! set-package-root! set-running-directory! compile-module-file expand-module-file
-         content-hash linklet program-linklets module-linklet-list trap-report set-cache-directory! compiled-file-bytes)
+         content-hash linklet program-linklets module-linklet-list trap-report set-cache-directory! compiled-file-bytes
+         session-open! session-eval! session-eval-text! session-eval-file! session-error session-recover!)
 
 (memory from base)
 (table from base)
@@ -371,11 +372,15 @@
     (unless (and (!= p 0) (== (car (cdr p)) (sym func))) (fail-at 0 "internal: the kernel module has no function ~a" (list1 name)))
     (cadr (cdr p))))
 
-;; The storage form a linklet at phase takes when it declares none of
-;; kind, memory or table: at phase 1 and above, the kernel module's, if
-;; the compiler was given its build; otherwise #f.
+;; Returns the memory or table declaration (`kind` says which) that a
+;; linklet at `phase` gets when its module declares none: an import of the
+;; running kernel module's memory or table. Returns 0 if there is none.
+;;
+;; This applies to compile-time code (phase 1 and above), and to a
+;; session's code at any phase, provided the compiler was told where the
+;; build that is running it is (running-directory).
 (define (running-storage [kind datum] [phase i32]) -> datum
-  (if (or (== phase 0) (== running-directory 0))
+  (if (or (and (== phase 0) (not (in-session?))) (== running-directory 0))
       0
       (begin
         (ensure-kernel!)
@@ -442,6 +447,7 @@
     (while (pair? uses)
       (set! id (remove-scope id (cast u32 (integer-value (car uses)))))
       (set! uses (cdr uses)))
+    (set! id (session-binding-id id phase meaning))
     (shadow-import! id phase meaning)
     (check-unbound! id phase meaning)
     (bind-module-level! (syntax-e id) (syntax-scopes id) phase meaning)))
@@ -817,13 +823,21 @@
           [else
            (let* ([text (source-text (package-file path) path)] [m (new-unit path (provisional-name path))] [saved current])
              (hash-set! (& registry) key (cast u32 m))
+             (set! compiling (keep-cons (string->symbol path) compiling))
              (begin-module-arena)
              (set! current (new-comp m))
              (set! (-> (unit-of m) code) (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0))
              (finish-module! text)
              (set! current saved)
              (end-module-arena)
+             (set! compiling (cdr compiling))
              m)])))
+
+;; The modules that are being compiled right now, innermost first, as a
+;; list of their paths (symbols). If an error interrupts a session input
+;; while modules it required are half compiled, session-recover! uses this
+;; list to forget them.
+(define compiling datum nil)
 
 ;; The fully expanded phase-0 forms of the module in file source (spec
 ;; 6.4), for sub expand: it is expanded, and what it requires compiled,
@@ -893,10 +907,13 @@
   (let ([f (assoc (make-integer phase) (if (== kind (sym memory)) (-> current memories) (-> current tables)))])
     (if (!= f 0) (cdr f) (running-storage kind phase))))
 
-;; Data placed in the running compiler's memory would overwrite what is
-;; there: data at phase 1 and above needs a memory of its own, declared.
+;; Rejects a `data` form in code that would share the running compiler's
+;; memory: the data would overwrite whatever the compiler has at that
+;; address. That is the case for compile-time code (phase 1 and above) and
+;; for a session's code at any phase, unless the module declares a memory
+;; of its own for that phase.
 (define (check-phase-data! [forms datum] [phase i32] [where datum])
-  (when (and (> phase 0) (== (assoc (make-integer phase) (-> current memories)) 0))
+  (when (and (or (> phase 0) (in-session?)) (== (assoc (make-integer phase) (-> current memories)) 0))
     (while (pair? forms)
       (when (== (car (car forms)) (sym data))
         (fail-at where "data at phase ~a needs a memory of its own, which compile-time code shares with the compiler otherwise: add (memory pages)"
@@ -1831,7 +1848,10 @@
       [((sym define-syntax)) (define-syntax! f phase)]
       [((sym begin-for-syntax)) (begin-for-syntax! f phase)]
       [((sym #%fact)) (item! b `(done ,(fact! f phase) ()))]
-      [else (item! b `(expr ,f))])))
+      [else
+       (if (and (in-session?) (== phase 0) (== only 0) (not interacting))
+           (interact! f0 f b)
+           (item! b `(expr ,f)))])))
 
 ;; Lift form, from a macro, to the module level of the body being expanded
 ;; (spec 6.4): declare it now, so its names can be used at once, and put
@@ -2423,9 +2443,10 @@
 (define (qualified [name datum] [sym datum]) -> datum
   (datum->syntax name (string->symbol (format-message "~a:~a" `(,(syntax-e name) ,sym))) name))
 
-(define (bind-import! [id datum] [phase i32] [meaning datum]) -> (ptr binding)
-  (check-unbound! id phase meaning)
-  (bind-module-level! (syntax-e id) (syntax-scopes id) phase meaning))
+(define (bind-import! [id0 datum] [phase i32] [meaning datum]) -> (ptr binding)
+  (let ([id (session-binding-id id0 phase meaning)])
+    (check-unbound! id phase meaning)
+    (bind-module-level! (syntax-e id) (syntax-scopes id) phase meaning)))
 
 (define (symbol<? [a datum] [b datum]) -> i32
   (let* ([x (symbol-bytes a)] [y (symbol-bytes b)] [n (symbol-length a)] [m (symbol-length b)]
@@ -2669,7 +2690,10 @@
           (throw compile-error message blamed loc)])
     (set-scope-map! 0 0)
     (buffer-free! (& m))
-    (unless ok (fail-at where "compile-time code failed: ~a" (list1 (host-error))))))
+    (unless ok
+      (if session-running
+          (fail-at where "~a" (list1 (session-failure (host-error))))
+          (fail-at where "compile-time code failed: ~a" (list1 (host-error)))))))
 
 ;; The run's scope for each index of a linklet's scope table, at phase
 ;; shift t: a module scope, module X's copy for phase shift s, becomes X's
@@ -2693,7 +2717,7 @@
 ;; Compile forms as the linklet named name and instantiate it, after what
 ;; it imports. A trap is reported at where.
 (define (instantiate-linklet! [name datum] [forms datum] [where datum])
-  (set-current-source! (string->symbol (-> (the-module) path)))
+  (set-current-source! (module-source))
   (let ([compiled (compile-module forms name)])
     (for-each (lambda ([imp datum]) (ensure-import! imp 0)) (cadr compiled))
     (instantiate! (ns-name name) (car compiled) (cadr compiled) (cadddr compiled) 0 where)
@@ -2708,12 +2732,15 @@
   (let ([name (next-linklet-name! (-> current module) phase)])
     (instantiate-linklet! name (append (linklet-storage-forms phase name) forms) where)))
 
-;; forms, added to the module's code of phase.
+;; Adds `forms` to the code that will be compiled into the module's
+;; linklet for `phase`. A session skips this: its inputs are compiled and
+;; run straight away, and it never produces a linklet per phase.
 (define (add-phase-forms! [phase i32] [forms datum])
-  (let ([e (assoc (make-integer phase) (-> current phase-forms))])
-    (if (!= e 0)
-        (set-cdr! e (append (reverse forms) (cdr e)))
-        (set! (-> current phase-forms) (cons (cons (make-integer phase) (reverse forms)) (-> current phase-forms))))))
+  (unless (in-session?)
+    (let ([e (assoc (make-integer phase) (-> current phase-forms))])
+      (if (!= e 0)
+          (set-cdr! e (append (reverse forms) (cdr e)))
+          (set! (-> current phase-forms) (cons (cons (make-integer phase) (reverse forms)) (-> current phase-forms)))))))
 
 ;; The memory and table forms for a compile-time linklet at phase, named
 ;; name (spec 3.3). A phase's linklets share one memory: the first linklet
@@ -2984,6 +3011,345 @@
                   [((sym type)) (set! (-> u types) (keep-cons (cadr f) (-> u types))) (own-type! m (cadr f))]
                   [((sym func) (sym global) (sym tag)) (set! (-> u infos) (keep-cons (cadr f) (-> u infos)))]))
               forms)))
+
+;; ==== sessions ====
+;;
+;; A session compiles and runs code one piece at a time, as a REPL does.
+;; `bin/sub eval FILE` uses it, and so does the REPL web page
+;; (lib/web/repl).
+;;
+;; How it works. A session is like a module whose source arrives in
+;; pieces, called inputs. Each input is compiled into a wasm module of its
+;; own (a "linklet"), which is instantiated at once, in the compiler's own
+;; store: the set of wasm instances that the compiler itself runs in.
+;; This is the mechanism the compiler already uses to run macros and other
+;; compile-time code (see "compile-time evaluation" above). The difference
+;; is that a session also runs ordinary run-time code (phase 0) this way.
+;; For a normal module, phase-0 code is only compiled into the program; the
+;; compiler never runs it.
+;;
+;; Two consequences:
+;;   - A session has no language of its own. As in a file, the language
+;;     is whatever the inputs `require`. The compiler treats an input just
+;;     like the text of a file.
+;;   - An input's code uses the compiler's memory and function table,
+;;     unless the session declares its own (see running-storage). It is
+;;     therefore exactly as trusted as the compiler: it can call or
+;;     overwrite anything in it. To run code that is not trusted, run the
+;;     whole compiler in a sandbox, as lib/web/repl does (lib/web/guest.sub).
+;;
+;; Definitions and redefinitions. Each input is expanded as a body of its
+;; own (expand-body), so its forms can refer to each other and to what
+;; earlier inputs defined. A later input may define a name again. That
+;; must not disturb code that was compiled earlier, so bindings are
+;; recorded as follows (using the "sets of scopes" model of binding):
+;;   - Every input gets a fresh scope, which is added to all of its forms.
+;;   - Normally a definition made by an input is recorded WITHOUT that
+;;     scope, so that later inputs, which do not have the scope, see it.
+;;   - If an earlier input already defined the same name as something
+;;     else, the new definition is recorded WITH the input's scope, and
+;;     from then on that scope is added to every later input too. Later
+;;     inputs therefore see the new definition, while code compiled
+;;     earlier keeps referring to the old one.
+;;   - Defining a name twice within one input is an error, as it is in a
+;;     module.
+;; So the number of scopes grows with the number of redefinitions, not
+;; with the number of inputs. (An earlier version kept a scope for every
+;; input; a session of 1,600 inputs then took 50 seconds.)
+;;
+;; Printing values. When an input contains an expression e, the compiler
+;; rewrites it to (#%top-interaction e) if the name #%top-interaction is
+;; bound to a macro in the session's language. That macro decides what to
+;; do with the value, usually print it. (A function call becomes
+;; (#%app f arg ...) by the same convention; see spec 5.3.) If there is no
+;; such macro, the expression is simply run.
+;;
+;; Errors. If an input fails, the session is left as it was before the
+;; input, except for whatever the input's code had already done when it
+;; failed. An input can fail in three ways:
+;;   - a compile error;
+;;   - a wasm exception that escapes the input's code;
+;;   - a trap in the input's code. The host reports a trap as a failed
+;;     `instantiate` call, so the compiler sees an ordinary error.
+;; One case is different: a trap inside a macro, which is code that the
+;; compiler calls directly. That unwinds the compiler's own stack all the
+;; way out to the host. The host then calls the program's on-trap
+;; function, and that function must call session-recover! to make the
+;; session usable again.
+
+;; The state of the open session. There is at most one.
+;;   session             the session's compilation state (a comp), or 0 if
+;;                       no session is open
+;;   session-mark        marks the session's memory arena; session-recover!
+;;                       frees every module arena opened after it
+;;                       (kernel.sub)
+;;   session-set         the scopes that are added to every input's forms
+;;   session-scope       the fresh scope of the input being evaluated, or 0
+;;                       between inputs
+;;   session-scope-kept  1 if the current input made a definition that
+;;                       kept its scope (that is, a redefinition)
+;;   session-first-key   a binding key taken when the current input began;
+;;                       a binding with a larger key was made by this
+;;                       input
+;;   session-source      the source name of the current input (a symbol),
+;;                       used in error locations
+;;   session-message     the error message of the last input that failed
+;;                       (a string)
+;;   session-running     1 while an input's compiled code is being
+;;                       instantiated, that is, run
+;;   interacting         1 while the result of a #%top-interaction macro is
+;;                       being processed
+
+(define session (ptr comp) 0)
+(define session-mark (ptr void) 0)
+(define session-set (ptr scope-set) 0)
+(define session-scope u32 0)
+(define session-scope-kept i32 0)
+(define session-first-key i64 0)
+(define session-source datum 0)
+(define session-message datum 0)
+(define session-running i32 0)
+(define interacting i32 0)
+
+;; Returns 1 if the code being compiled right now is a session input
+;; itself, and not a module that an input requires.
+(define (in-session?) -> i32 (and (!= session 0) (== current session)))
+
+;; Returns the source name (a symbol) to record in the source locations of
+;; the code being compiled (spec 3.6): the module's file, or, in a
+;; session, the source of the current input.
+(define (module-source) -> datum (if (in-session?) session-source (string->symbol (-> (the-module) path))))
+
+;; Opens a session called `name` (a string). The name appears in the names
+;; of the linklets compiled for the session's inputs. It also stands in
+;; for the session's file name when an input requires a file by a relative
+;; path, so such paths are relative to the package root.
+;;
+;; If a session is already open, it is abandoned: the new session replaces
+;; it, and the old one's memory is not freed.
+(define (session-open! [name datum])
+  (let ([m (new-unit name (provisional-name name))])
+    (begin-module-arena)
+    (set! session-mark (module-arena-mark))
+    (set! current (new-comp m))
+    (set! session current)
+    (install-base!)
+    (let ([msc (new-scope!)])
+      (set! (-> (the-module) scope) msc)
+      (hash-set! (& module-scope-origins) (scope-key msc) (cast u32 (keep (cons (-> (the-module) self) (make-integer 0)))))
+      (set! session-set (scopes-change core-scopes msc 0)))
+    (set! to-syntax 0)))
+
+;; Chooses the identifier under which a module-level definition is
+;; recorded. `id` is the name being defined, at `phase`, with the meaning
+;; `meaning`.
+;;
+;; Outside a session, or for a name that does not carry the current
+;; input's scope, the result is `id` itself. In a session, the current
+;; input's scope is removed, so that later inputs can see the definition.
+;; The exception is a redefinition: if an earlier input bound the name to
+;; something else, the scope is kept (see the section comment above).
+(define (session-binding-id [id datum] [phase i32] [meaning datum]) -> datum
+  (if (and (in-session?) (!= session-scope 0) (!= (scopes-change (syntax-scopes id) session-scope 1) (syntax-scopes id)))
+      (let ([base (remove-scope id session-scope)])
+        (if (bound-earlier? base phase meaning)
+            (begin (set! session-scope-kept 1) id)
+            base))
+      id))
+
+;; Returns 1 if an earlier input bound `id` (at the same phase, with the
+;; same scopes, in the same namespace) to something other than `meaning`.
+;;
+;; Binding keys increase over time, so a binding whose key is greater than
+;; session-first-key was made by the current input. Finding one of those
+;; makes this return 0. The definition is then treated as a duplicate
+;; within one input, which is reported as an error ("already bound"), just
+;; as in a module.
+(define (bound-earlier? [id datum] [phase i32] [meaning datum]) -> i32
+  (let ([b (bindings-under (syntax-e id) (binding-slot (syntax-scopes id)))] [found i32 0])
+    (while (!= b 0)
+      (when (and (== (-> b phase) phase) (== (-> b scopes) (syntax-scopes id))
+                 (== (-> b namespace) (meaning-namespace meaning))
+                 (not (equal? (-> b meaning) meaning)))
+        (when (> (integer-value (-> b key)) session-first-key) (return 0))
+        (set! found 1))
+      (set! b (-> b next)))
+    found))
+
+;; Removes the module-level bindings that the session's module made after
+;; `entries` (a saved position in the module's list of bindings). Used to
+;; undo the definitions of an input that failed.
+(define (session-unbind! [entries (ptr module-entry)])
+  (let ([e (-> (the-module) entries)])
+    (while (and (!= e 0) (!= e entries))
+      (let* ([b (-> e binding)] [k (slot-key (-> e symbol) (binding-slot (-> b scopes)))]
+             [c (cast (ptr binding) (hash-ref (& bindings) k))] [before (ptr binding) 0])
+        (while (and (!= c 0) (!= c b))
+          (set! before c)
+          (set! c (-> c next)))
+        (when (!= c 0)
+          (if (== before 0) (hash-set! (& bindings) k (cast u32 (-> b next))) (set! (-> before next) (-> b next)))))
+      (set! e (-> e next)))
+    (set! (-> (the-module) entries) entries)))
+
+;; Evaluates `forms` (syntax, as the reader returns it) as the session's
+;; next input. Returns 1 on success. On failure, returns 0, and
+;; (session-error) gives the message.
+;;
+;; After a failure, everything the input declared for the session is
+;; undone: its bindings, the names of the modules it required, and its
+;; memory and table declarations. This is done by restoring `was`, a copy
+;; of the session's comp struct taken before the input. Only the linklet
+;; counter is kept, so that a linklet name is never used twice.
+(define (session-eval! [forms datum]) -> i32
+  (let* ([sc (new-scope!)] [scopes (scopes-change session-set sc 0)] [entries (-> (the-module) entries)] [ok i32 0]
+         [was comp (@ session)])
+    (set! session-scope sc)
+    (set! session-scope-kept 0)
+    (set! session-first-key (integer-value (fresh-key!)))
+    (set! session-source (if (and (pair? forms) (!= (syntax-srcloc (car forms)) 0))
+                             (-> (syntax-srcloc (car forms)) source)
+                             (string->symbol (-> (the-module) path))))
+    (try
+      (run-session-linklet! (expand-body (map (lambda ([f datum]) -> datum (add-scopes f scopes)) forms) 0))
+      (set! ok 1)
+      [catch compile-error (message blamed loc) (session-fail! message blamed loc)]
+      [catch-all (session-fail! `"an exception escaped the input's code" 0 0)])
+    (if ok
+        (when session-scope-kept (set! session-set scopes))
+        (let ([n (-> session linklet-counter)])
+          (session-unbind! entries)
+          (set! (@ session) was)
+          (set! (-> session linklet-counter) n)))
+    (set! session-scope 0)
+    ok))
+
+;; Reads `text` (a string) and evaluates the forms in it as one input.
+;; `source` (a string) is the name given to the input in source locations.
+;; Returns 1 or 0, as session-eval! does.
+(define (session-eval-text! [text datum] [source datum]) -> i32
+  (let ([forms datum 0] [ok i32 0])
+    (try
+      (set! forms (read-all (string-bytes text) (string-length text) (string->symbol source)))
+      (set! ok 1)
+      [catch compile-error (message blamed loc) (session-fail! message blamed loc)])
+    (if ok (session-eval! forms) 0)))
+
+;; Reads the file `source` and evaluates each of its top-level forms as an
+;; input of its own. When an input fails, `report` is called with the
+;; error message, and evaluation continues with the next form.
+(define (session-eval-file! [source datum] [report (closure (datum))])
+  (let* ([path (canonical-path source)] [text (source-text (package-file path) path)]
+         [forms (read-all (string-bytes text) (string-length text) (string->symbol path))])
+    (while (pair? forms)
+      (unless (session-eval! (list1 (car forms))) (report (session-error)))
+      (set! forms (cdr forms)))))
+
+;; Returns the error message of the last input that failed, formatted the
+;; way the compiler formats errors (a string).
+(define (session-error) -> datum session-message)
+
+;; Compiles the expanded forms of an input into the session's next
+;; linklet and instantiates it. Instantiating it runs the input: its
+;; definitions are made and its expressions are evaluated, in order.
+(define (run-session-linklet! [forms datum])
+  (check-phase-data! forms 0 0)
+  (let ([name (next-linklet-name! (-> current module) 0)])
+    (set-current-source! (module-source))
+    (let ([compiled (compile-module (append (linklet-storage-forms 0 name) forms) name)])
+      (for-each (lambda ([imp datum]) (ensure-import! imp 0)) (cadr compiled))
+      (set! session-running 1)
+      (instantiate! (ns-name name) (car compiled) (cadr compiled) (cadddr compiled) 0 0)
+      (set! session-running 0)
+      (table-set! (-> current instances) (cast u64 (string->symbol (ns-name name))) 1))))
+
+;; Records that the current input failed, and recovers. The error message
+;; is formatted first, because formatting needs data (such as the syntax
+;; that is blamed) that lives in arenas which session-recover! frees.
+(define (session-fail! [message datum] [blamed datum] [loc (ptr srcloc)])
+  (let ([b (make-buffer)])
+    ;; An error that has no source location is printed as just
+    ;; "error: message". A trap in the input's code is one: its message
+    ;; contains a backtrace instead.
+    (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0))))
+        (begin
+          (buffer-add-string! (& b) "error: ")
+          (write-to (& b) message 1)
+          (buffer-add-byte! (& b) 10))
+        (write-compile-error (& b) message blamed loc))
+    (session-recover!)
+    (set! session-message (bytes->string (-> b bytes) (-> b length)))
+    (buffer-free! (& b))))
+
+;; Puts the compiler back into the state it has between inputs. It is
+;; called after every failure. That includes a trap that unwound the
+;; compiler in the middle of expanding an input, in which case the
+;; program's on-trap function calls it.
+;;   - Frees the arenas of the modules that were being compiled when the
+;;     failure happened.
+;;   - Forgets those half-compiled modules, so that they are compiled
+;;     again from the start the next time they are required.
+;;   - Resets the expander's global state to "expanding the session".
+(define (session-recover!)
+  (end-module-arenas-to! session-mark)
+  (while (pair? compiling)
+    (hash-set! (& registry) (cast u64 (car compiling)) 0)
+    (set! compiling (cdr compiling)))
+  (set! current session)
+  (set! current-body 0)
+  (set! current-function 0)
+  (set! to-syntax 0)
+  (set! lowered-closures 0)
+  (set! api-phase 0)
+  (set! api-where 0)
+  (set! api-intro 0)
+  (set! session-running 0)
+  (set! interacting 0)
+  (set-scope-map! 0 0))
+
+;; Tidies the host's message about a trap in an input's code, before it
+;; is shown to the user. `said` is the message of the failed `instantiate`
+;; call. This removes the leading "instantiate: ", and cuts the backtrace
+;; off at the frame where the compiler called the host (instantiate-bytes):
+;; the frames from there on are the compiler's, not the input's.
+(define (session-failure [said datum]) -> datum
+  (let* ([p (string-bytes said)] [n (string-length said)] [from u32 0] [to n] [at (find-bytes p n "instantiate-bytes")])
+    (when (and (>= n 13) (== (memcmp p "instantiate: " 13) 0)) (set! from 13))
+    (when (>= at 0)
+      (set! to (cast u32 at))
+      (while (and (> to from) (!= (@ p (- to 1)) 10)) (-= to 1)))
+    (while (and (> to from) (== (@ p (- to 1)) 10)) (-= to 1))
+    (bytes->string (+ p from) (- to from))))
+
+;; Returns the index of the first occurrence of the C string s in the n
+;; bytes at p, or -1 if there is none.
+(define (find-bytes [p (ptr u8)] [n u32] [s (ptr u8)]) -> i32
+  (let ([m (strlen s)])
+    (for ([i u32 0]) (<= (+ i m) n) (+= i 1)
+      (when (== (memcmp (+ p i) s m) 0) (return (cast i32 i))))
+    -1))
+
+;; Handles an expression among the forms of a session input. `f0` is the
+;; expression as written. `f` is the same expression after any macro at
+;; its head has been expanded. `b` is the body being built.
+;;
+;; If #%top-interaction is bound to a macro where f0 was written, the
+;; expression becomes (#%top-interaction f), and the macro's expansion is
+;; processed in its place. Otherwise the expression is added to the body
+;; unchanged, as it would be in a module.
+;;
+;; The name #%top-interaction is looked up with the scopes of f0, the
+;; original form, in the same way that #%app is looked up with the scopes
+;; of the call it wraps. Looking it up with f's scopes fails when the
+;; expression starts with a macro.
+(define (interact! [f0 datum] [f datum] [b (ptr body)])
+  (let* ([id (implicit-id f0 (sym #%top-interaction))] [t (transformer-of (meaning-of id 0))])
+    (if (== t 0)
+        (item! b `(expr ,f))
+        (begin
+          (set! interacting 1)
+          (declare-form! (apply-macro id t (syntax-rewrap f0 `(,id ,f)) 0 1) b 0)
+          (set! interacting 0)))))
 
 ;; ==== macros ====
 
