@@ -1,9 +1,9 @@
-/* Lifecycle: benchmark. What the C versions of the benchmarks share:
-   K&R's allocator, as the C-like Lisp's runtime has it
-   (compiler/base/runtime.sub),
-   over memory from sbrk, so that both allocate alike; and the entry. Built
-   natively, main prints what run gives; built for wasm, run is exported,
-   and wasmtime --invoke prints it. */
+/* Lifecycle: benchmark. What the C versions of the benchmarks share: the
+   same K&R allocator as the C-like Lisp's runtime
+   (compiler/base/runtime.sub), over memory from sbrk, so that both
+   languages allocate the same way; and the entry point. Built natively,
+   main prints what run returns; built for wasm, run is exported and
+   wasmtime --invoke prints it. */
 #include <stddef.h>
 #include <stdint.h>
 

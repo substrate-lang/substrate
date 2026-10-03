@@ -1,39 +1,47 @@
-;; Lifecycle: experimental. The lowering of Bend as the new compiler builds
-;; it (lib/bend): examples/bend/lower.sub, which follows Bend's compiler
-;; (bend2/comp.ts), but to code in linear memory, whose values are owned
-;; as Bend2's runtime owns them: a module's checked definitions to kernel
-;; code, as data, which bend.sub turns into syntax. A symbol in the code
-;; means what it means in the module it is lifted into, where bend.sub has
-;; required runtime.sub as %bend-rt; syntax in it, the function of a
-;; definition, is kept as it is.
+;; Lifecycle: permanent.
 ;;
-;; A value is held as its type's layout says (below): a word, a term that
-;; owns nothing, such as a U32, a Nat or a constructor of no live field;
-;; flat, a few words, the fields of a small datatype of words; or uniform,
-;; a term that may own a node in memory (runtime.sub), a constructor's of
-;; its live fields, or a closure's, the table index of its code, a function
-;; of the closure and its argument, and the values it captures. What is
-;; erased, a binder, argument or field of quantity -, a type, a proof's
-;; rewrite, is left out, and where a value is needed for it, it is 0. A
-;; definition is a function of its live parameters, each as many locals as
-;; its layout has words, of as many results as its result's layout has; an
-;; application of it to that many live arguments is a direct call, and
-;; any other, as of a variable, applies closures, one argument at a time: a
-;; definition given fewer is made a closure first, by eta-expansion. A
-;; closure's function is lifted, and its captured values found as its body
-;; is made (lookup).
+;; Bend's code generator: turns each checked definition into a kernel
+;; function over values in linear memory, following Bend2's compiler. The
+;; output is kernel code as data, which bend.sub turns into syntax and
+;; lifts into the module (where runtime.sub is required as %bend-rt).
 ;;
-;; A checked term is annotated with each node's type, which says what is
-;; erased, and how each value is held. Its binders are opened with probes,
-;; variables of ids of their own, which the function being made maps to
-;; its locals. The code is made in two steps: a term to a function's code,
-;; below (ir), whose variables are its locals; then that to kernel code,
-;; each variable that may own a node owned, used once on each path through
-;; the code: a use but the last of a variable on the way shares its value,
-;; one never used is dropped, and a match on a node frees it, or gives it
-;; to a constructor of as many fields on the way, which reuses it. The code
-;; is made in the current arena, from a checked term in core.sub's scratch
-;; arena.
+;; Entry points: lower-start! (once per module), def-function (a
+;; definition's function), print-code (the code of a `print`),
+;; lowered-forms! (the helper functions the last piece of code needs),
+;; and kernel-callable? and borrow-mask, for calls from kernel code.
+;;
+;; Values. Each type has a layout, decided from the type alone so that
+;; every module agrees:
+;;
+;;   word     a term that owns no memory: a U32, a Nat, or a constructor
+;;            without live fields
+;;   flat     up to 8 words: a small, non-recursive datatype whose fields
+;;            are words, held as its constructor number and fields and
+;;            passed as several values
+;;   uniform  a 64-bit term that may point to a node (runtime.sub): a
+;;            constructor's live fields, or a closure's code index and
+;;            captured values
+;;
+;; Erased things (binders, arguments and fields of quantity -, types, and
+;; rewrites) are left out; where a value is still needed, it is 0. A
+;; definition becomes a function of its live parameters, each taking as
+;; many locals as its layout has words, with as many results as its
+;; result's layout has. A call with all live arguments is a direct call;
+;; anything else applies closures one argument at a time, and a
+;; definition given too few arguments is first eta-expanded into a
+;; closure. A closure's code is lifted to its own function.
+;;
+;; How. A checked term carries each node's type, which says what is erased
+;; and how each value is held. Lowering has two steps. First the term
+;; becomes the function's code in a small IR whose variables are the
+;; function's locals (see "a function's code"). Then the IR becomes
+;; kernel code that owns each value exactly once on every path: a use
+;; before the last shares the value, an unused value is dropped, and a
+;; match on a node frees it or hands it to a constructor of the same size
+;; to reuse (see "owning"). Along the way, matches become switches,
+;; small definitions are inlined, and + parameters that are only read are
+;; borrowed. The code is built in the current arena from a checked term
+;; in core.sub's scratch arena.
 
 (require-unqualified base "../../compiler/base/base.sub")
 (require-unqualified kd "../../compiler/kernel.sub")
@@ -47,10 +55,11 @@
 
 ;; ---- the module ----
 ;;
-;; A module's code is made a piece at a time: each definition's function,
-;; and each print's code. What a piece needs at module level, its
-;; closures' functions, the functions that box and unbox its flat values,
-;; and those that write values, is lifted, taken with lowered-forms!.
+;; A module's code is made one piece at a time: a definition's function,
+;; or a print's code. The module-level helpers a piece needs (its
+;; closures' functions, the box and unbox functions of its flat values,
+;; and the functions that write values) are collected as it is made;
+;; lowered-forms! returns them.
 
 ;; A definition's function, an identifier, by the definition's name.
 (define code-of (fn (datum) -> datum) 0)
@@ -149,12 +158,12 @@
 
 ;; ---- erased definitions ----
 ;;
-;; A definition whose type ends, past all its domains, in an equality, a
-;; type or a quantity has values the code leaves out, as it does a proof
-;; and a type: its value is always 0, and it terminates, as the checker
-;; sees, with no effect. So it needs no function, and an application of
-;; it to its live arguments is 0, with no call; one given fewer is a
-;; closure, as another's is, whose code is 0.
+;; A definition whose type ends (after all its parameters) in an
+;; equality, a type or a quantity produces only erased values, like a
+;; proof. Its value is always 0, and the checker guarantees that it
+;; terminates without effects. So it gets no function: a call with all
+;; its live arguments is just 0, and a partial application is a closure
+;; whose code returns 0.
 
 ;; Each definition's name -> 1 if it is erased, 2 if not.
 (define erasures (ptr arena-table) 0)
@@ -172,13 +181,13 @@
 
 ;; ---- U32 ----
 ;;
-;; Base's U32 (base.sub), a word of 32 Bools to the checker, is a machine
-;; word here, packed in its term, as Bend2 compiles it: a number's U32 is
-;; its value; its operations, Base's definitions on words, are the word's
-;; instructions, at each application of one to its live arguments and in
-;; its function; a Bool or Cmp they give is packed, its constructor's
-;; number. A U32 of a computed word, or a U32's word, as only Base's own
-;; definitions on words make, is converted at run time (runtime.sub).
+;; The checker sees Base's U32 (base.sub) as a word of 32 Bools; the code
+;; holds it as a machine word packed into its term, as Bend2 compiles it.
+;; A number literal's U32 is its value. Base's U32 operations compile to
+;; machine instructions, both at each call with all live arguments and in
+;; their own functions; a Bool or Cmp they return is packed as its
+;; constructor number. Converting between a U32 and its Word, which only
+;; Base's own definitions do, happens at run time (runtime.sub).
 
 ;; Base's names this needs, and each operation's number, by its
 ;; definition's name, plus 1.
@@ -283,9 +292,10 @@
 
 ;; ---- nodes ----
 ;;
-;; A node of n words comes from runtime.sub's list of freed ones of n, if
-;; it has one, and goes back to it, here, in the code, as Bend2 inlines
-;; them; the runtime makes a new one, or one of more than 32 words.
+;; Allocating and freeing a node is inlined into the code, as Bend2 does:
+;; a node of n words is popped from or pushed onto runtime.sub's free list
+;; for size n. The runtime is called only when that list is empty, or for
+;; nodes of more than 32 words.
 
 ;; Kernel code for a new node of n words: its address.
 (define (node-code [n u32]) -> datum
@@ -403,17 +413,23 @@
 
 ;; ---- layouts ----
 ;;
-;; How a value of a type is held, decided from the type alone, so that
-;; every module decides it alike: a word, a term that owns nothing: of a
-;; word family, or what is erased; flat, words, up to max-flat of them: a
-;; datatype, not recursive, of more than one word, whose live fields are
-;; words, a single constructor's fields, or a sum's constructor number then
-;; its fields; or uniform, a term that may own a node, as every other
-;; datatype's value, a function's or a type variable's is. A node's
-;; fields, a closure's argument and result and a polymorphic parameter
-;; hold values uniform: a flat value is boxed into its constructor's node
-;; there, and unboxed from it where it is flat again, by functions made for
-;; its layout. A word value's term is its uniform one.
+;; A layout says how a value of a type is held. It depends only on the
+;; type, so every module decides it the same way:
+;;
+;;   word     a term that owns nothing: a value of a word family, or
+;;            anything erased
+;;   flat     up to max-flat words: a non-recursive datatype whose live
+;;            fields are all words, held as a single constructor's
+;;            fields, or as a sum's constructor number followed by its
+;;            fields
+;;   uniform  a term that may own a node: every other datatype, functions
+;;            and type variables
+;;
+;; Node fields, closure arguments and results, and polymorphic parameters
+;; always hold uniform values. A flat value is boxed into its
+;; constructor's node there, and unboxed again where it is needed flat,
+;; by functions made once per layout. A word's term is already its
+;; uniform form.
 
 (struct lay [kind u32] [words u32] [nc u32] [counts (ptr u32)] [box datum] [unbox datum])
 
@@ -532,10 +548,10 @@
 
 ;; ---- plain values ----
 ;;
-;; A word owns nothing in memory: sharing and dropping it do nothing, so
-;; the code does neither, for a variable whose layout says it is a word.
-;; Another value is tested at run time, as its term says: below a node's
-;; tag, it owns nothing.
+;; A word owns no memory, so sharing or dropping it does nothing, and the
+;; code skips both for a variable whose layout is a word. For any other
+;; value the code tests the term at run time: a term below the node tag
+;; owns nothing.
 
 ;; Each plain variable -> 1.
 (define plain (ptr arena-table) 0)
@@ -556,17 +572,22 @@
 
 ;; ---- a function's code ----
 ;;
-;; What a term's code does, its variables a function's locals, each a
-;; symbol holding a word or a term, before what owns what is said, each
-;; giving as many values as its layout has words: a variable; a term word;
-;; values, of parts; a call of a definition's function, by its name; a
-;; U32 operation (above); an application of a closure; a Nat's successor;
-;; a constructor's node, of its term's high bits, or its packed term; a
-;; closure of a lifted function, of the variables it captures; a flat
-;; value boxed, or unboxed; values bound; a match on a variable, or a flat
-;; value's variables, by constructor, of a kind, a node's (0), a Nat's
-;; (1), a U32's (2) or a flat value's (3), each branch's fields bound, and
-;; what the others do; or a fault.
+;; The IR: a function's code before ownership is decided. Its variables
+;; are the function's locals, each a symbol holding a word or a term, and
+;; each node gives as many values as its layout has words:
+;;
+;;   Use      a variable             Lit      a constant term
+;;   Values   several values         Call     a call of a definition's
+;;   Prim     a U32 operation                 function, by its name
+;;   Apply    a closure application  Succ     a Nat's successor
+;;   Make     a constructor's node   Pack     a packed constructor term
+;;   Close    a closure of a lifted function and its captured variables
+;;   Box      a flat value boxed     Unbox    a boxed value made flat
+;;   Bind     values bound to variables, then the rest
+;;   Case     a match on a variable (or a flat value's variables) by
+;;            constructor: kind 0 a node, 1 a Nat, 2 a U32, 3 a flat
+;;            value; each branch binds its fields
+;;   Fail     unreachable code
 
 (variant ir
   [Use [v datum]]
@@ -650,10 +671,12 @@
 
 ;; ---- functions being made ----
 ;;
-;; A function has its locals, each probe's binding, its layout and its
-;; variables, or erased; and the function it is in, if it is a closure's,
-;; whose variables it captures as it finds them: those, the latest first,
-;; and its own for them.
+;; A function being made maps each probe (a binder's variable) to its
+;; binding: a layout and the variables that hold it, or erased. A
+;; closure's function also points to the function around it. When the
+;; closure's body uses a variable of the outer function, the closure
+;; captures it: it records the outer variables it captured, newest first,
+;; with its own variable for each.
 
 (struct lfn [parent (ptr lfn)] [locals (ptr arena-table)] [captured datum] [caps datum] [ncap u32])
 
@@ -1023,13 +1046,13 @@
 
 ;; ---- inlining ----
 ;;
-;; A call of a definition whose code is small is that code, made here, of
-;; its value checked again (core.sub's checked-value), its parameters
-;; bound to the arguments: if the code made is of size inline-limit or
-;; less (ir-size), and the definition does not call itself. Code inlined
-;; inlines too, max-inline deep. Whether a definition's code is small is
-;; kept for the module; its checked value, in the arena of the piece of
-;; code being made, for that piece.
+;; A call of a small, non-recursive definition is replaced by its code.
+;; The definition's value is checked again here (core.sub's
+;; checked-value), lowered with its parameters bound to the arguments,
+;; and kept if its code is no bigger than inline-limit (by ir-size).
+;; Inlined code may inline further, up to max-inline levels. The verdict
+;; on each definition is kept for the whole module; its checked value is
+;; kept only for the piece of code being made, in that piece's arena.
 
 (define inline-limit u32 40)
 (define max-inline u32 2)
@@ -1164,22 +1187,27 @@
 
 ;; ---- borrowing ----
 ;;
-;; A + parameter of a definition, a term, that its code only reads is
-;; borrowed, as Bend2's borrow inference finds: its caller keeps it, and
-;; lends it for the call. The code matches it in place, neither taking
-;; its node nor freeing it, and reads its fields borrowed too; it never
-;; shares one, which would leave its owner's term out of date, nor drops
-;; one. Each + parameter of a term starts borrowed; one whose value, or a
-;; value read from it, reaches a place that owns it, as a constructor's
-;; field, a result, a closure or a parameter not borrowed, is owned, and
-;; again, until none does (infer-borrows!). A parameter of one use is
-;; owned: its caller, done with it, gives it, and its code frees it as it
-;; reads it, or reuses its nodes. A call lends a value it owns by holding
-;; it, and drops it after, so it is not a tail call: a call of the
-;; definition itself at the end of its way, then, owns what it would
-;; lend; and a definition that calls one not made yet, a law to fill
-;; later, which owns all its parameters, owns all its own, so that no
-;; loop of calls grows the stack.
+;; A + parameter that a definition only reads is borrowed, as in Bend2's
+;; borrow inference: the caller keeps ownership and lends the value for
+;; the call. The code matches a borrowed value in place, without taking
+;; or freeing its node, and its fields are borrowed too. A borrowed value
+;; is never shared (that would leave the owner's copy of the term out of
+;; date) and never dropped.
+;;
+;; infer-borrows! starts with every + parameter of a term type borrowed.
+;; If the parameter, or a value read from it, reaches a place that takes
+;; ownership (a constructor field, the result, a closure, or a parameter
+;; that is not borrowed), the parameter becomes owned; this repeats until
+;; nothing changes. A one-use parameter is always owned: its caller
+;; usually has no further use for it, and the code can free or reuse its
+;; nodes as it reads them.
+;;
+;; To lend a value it owns, a caller holds it during the call and drops
+;; it afterwards, so such a call is not a tail call. To keep loops in
+;; constant stack, a definition's tail call to itself owns what it would
+;; lend, and a definition that calls one not yet compiled (a law filled
+;; later, whose parameters are all owned) owns all of its parameters.
+;; Each definition's mask of borrowed parameters goes into its fact.
 
 ;; Each definition's name -> its mask, plus 1: bit j its j-th live
 ;; parameter's, if it is borrowed. A definition made has one.
@@ -1307,14 +1335,15 @@
 
 ;; ---- owning ----
 ;;
-;; A function's code made kernel code, gamma the variables it owns, each
-;; once, all of which it uses on its way or drops: those its code does
-;; not use are dropped as it starts; one that more than one part of an
-;; expression uses is shared, as many times more, before any of them
-;; runs; a match takes its scrutinee. A node a match takes, its own, is a
-;; spare, which the first constructor of as many fields on the way reuses;
-;; one no constructor reuses is freed where the way ends. A word owns
-;; nothing, and is neither shared nor dropped.
+;; Turns IR into kernel code. gamma is the set of variables the code owns;
+;; it must use each one exactly once on every path, or drop it. Variables
+;; that the code does not use are dropped at its start. A variable that
+;; several parts of an expression use is shared that many times less one,
+;; before any part runs. A match takes its scrutinee. A node that a match
+;; takes becomes a spare: the first constructor of the same size on the
+;; same path reuses it, and a spare that nothing reuses is freed where the
+;; path ends. Words own nothing and are never shared or dropped, and
+;; borrowed variables are not in gamma.
 
 (struct spare [at datum] [n u32] [used i32] [next (ptr spare)])
 
@@ -1754,10 +1783,10 @@
 
 ;; ---- boxing ----
 ;;
-;; A flat value boxed is its constructor's term, its uniform value: a node
-;; of its live fields, or, of none, packed; unboxed, its words again, the
-;; node taken and freed. Each is a function of the module's, made once for
-;; each layout that needs it.
+;; Boxing a flat value gives its uniform form: a node of the constructor's
+;; live fields, or a packed term if it has none. Unboxing gives the words
+;; back, taking and freeing the node. Both are module-level functions,
+;; made once for each layout that needs them.
 
 (define (result-types [l (ptr lay)]) -> datum
   (if (== (-> l words) 1)
@@ -1864,13 +1893,12 @@
 
 ;; ---- print ----
 ;;
-;; A print writes a value, and a newline, as the example writes terms: a
-;; constructor's name and its fields, a Nat as (nat n), a proof as refl;
-;; then drops it. What writes a value of a type is a function made for the
-;; type, as Bend's show_main makes a descriptor for its main's, which
-;; reads the value, uniform, and leaves it. A function, a type, or a
-;; datatype with an erased field, or one whose type depends on another,
-;; cannot be written.
+;; A print writes a value and a newline, in Bend's term syntax: a
+;; constructor's name and fields, a Nat as (nat n), a proof as refl. Then
+;; it drops the value. The writer for each type is a function made once
+;; per type, as Bend's show_main makes a descriptor for main's type; it
+;; reads the uniform value and leaves it alone. Functions, types, and
+;; datatypes with an erased or dependent field cannot be printed.
 
 ;; The type being printed, shown, for errors.
 (define printed datum 0)

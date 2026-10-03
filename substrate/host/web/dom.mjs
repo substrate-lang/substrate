@@ -55,44 +55,28 @@
 //   prevent_default ()
 //       Cancels the browser's default action for the event being handled.
 //
-// How events reach the program: a "listen" patch (number 9) attaches a
-// listener to a node, with a number chosen by the program. When the event
-// fires, this module calls the program's exported function `on-event`
-// with that number. The call happens inside the browser's event dispatch,
-// so the program can still call prevent_default.
+// How the host carries out some of the patches (ui.sub lists them all):
 //
-// A "listen-window" patch (number 12) is the same, except that the
-// listener is attached to the browser window. It is used for events that
-// do not belong to one element, such as a key pressed anywhere on the
-// page. Its event name "frame" is special: it is not a DOM event, and
-// asks for a call on every animation frame (requestAnimationFrame). The
-// events pointerlockchange and pointerlockerror are listened for on the
-// document, where they fire without bubbling.
-//
-// A "draw" patch (number 13) draws on a canvas element. It carries a
-// list of drawing commands, which lib/web/canvas.sub documents, and
-// which `draw` below carries out on the canvas's 2D context.
-//
-// An "image" patch (number 14) starts loading an image file and gives it
-// a number. The patch names the image by a path, such as
-// "assets/sprites.png". If that is one of the program's files (the page
-// usually downloads a program's assets for it before it starts: see
-// lib/web/site.sh), the image is made from the file's bytes, so it is
-// not downloaded a second time. Otherwise the path is taken as a URL and
-// fetched. A drawing command can then draw the image, or one cell of it
-// if the image is a sheet of sprites. Loading takes time: until an image
-// is ready, drawing it does nothing, and images_loading says how many
-// are still on their way.
-//
-// A "pointer-lock" patch (number 15) asks the browser to lock the
-// pointer to an element, or releases it. While the pointer is locked
-// the cursor is hidden and mouse events report movement without limits,
-// which a game that looks around with the mouse needs. Browsers only
-// grant the lock while the user is clicking or typing; the patch is
-// applied right after the batch it is in, so a program that asks in
-// response to a click is in time. The request can fail (the browser
-// then fires pointerlockerror), and the user can end the lock with
-// Escape; pointerlockchange reports both, as a window event.
+//   listen (9), listen-window (12)
+//       When the event fires, the host calls the program's exported
+//       function `on-event` with the listener's number. The call happens
+//       inside the browser's event dispatch, so prevent_default still
+//       works. A window listener for "frame" is called on every animation
+//       frame (requestAnimationFrame). pointerlockchange and
+//       pointerlockerror are listened for on the document, where they
+//       fire without bubbling.
+//   draw (13)
+//       `draw` below carries out the drawing commands (lib/web/canvas.sub
+//       lists them) on the canvas's 2D context.
+//   image (14)
+//       If the path names one of the program's files, the image is made
+//       from the file's bytes; otherwise the path is fetched as a URL.
+//       Until an image is ready, drawing it does nothing.
+//   pointer-lock (15)
+//       Applied right after the batch it is in, so a request made in
+//       response to a click is still in time: browsers only grant the
+//       lock while the user is clicking or typing. The request can fail,
+//       and Escape ends the lock; pointerlockchange reports both.
 import { resolvePath } from './subhost-web.mjs';
 
 const text = new TextDecoder();

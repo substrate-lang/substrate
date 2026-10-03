@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Lifecycle: benchmark. Writes proofs-N.sub, a Bend module of N blocks of
-# proofs by induction and rewriting after Bend2's proofs_N benchmark: the
-# prelude (header.sub), then block k, for k from 0 below N, a Nat's
-# (nat.sub), a list's (list.sub) or a tree's (tree.sub) in turn, with k
-# for @. Every block is checked and compiled when the module is built,
-# which is what bench/bend/compile/run.sh times.
+# proofs by induction and rewriting, modelled on Bend2's proofs_N
+# benchmark: the prelude (header.sub), then blocks k = 0 .. N-1, cycling
+# through a Nat block (nat.sub), a list block (list.sub) and a tree block
+# (tree.sub), each with k substituted for @. Building the module checks
+# and compiles every block, which is what bench/bend/compile/run.sh
+# times.
 #
 #   bench/bend/compile/proofs.sh N > proofs-N.sub
 set -euo pipefail

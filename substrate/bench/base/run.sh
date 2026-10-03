@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Lifecycle: benchmark. The C-like Lisp against C. Each NAME.sub is built
-# with bin/sub and run on build/subhost (wasmtime); NAME.c, the same
-# program in C, is built with clang -O2 natively, and for wasm, which the
-# wasmtime CLI runs, and for wasm without inlining, which our compiler
-# does not do for C functions. All allocate with K&R's malloc (bench.h),
-# and must print the same result. Prints each benchmark's result, the
-# least time of N runs (default 3) of each, in ms, interleaved, and ours
-# over the others. In the dev shell:
+# with bin/sub and run on build/subhost (wasmtime). NAME.c, the same
+# program in C, is built with clang -O2 three ways: natively, for wasm
+# (run by the wasmtime CLI), and for wasm without inlining, since our
+# compiler does not inline C functions. All versions allocate with K&R's
+# malloc (bench.h) and must print the same result. Prints each
+# benchmark's result, the least time of N runs (default 3) of each
+# version in ms, run interleaved, and the ratios of ours to the others.
+# In the dev shell:
 #
 #   bench/base/run.sh [N [NAME ...]]
 set -euo pipefail

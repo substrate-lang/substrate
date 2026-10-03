@@ -1,62 +1,68 @@
-;; Lifecycle: experimental. Closures and ownership for Substrate as the
-;; new compiler builds it (lib/substrate), at compile time, in the C-like
-;; Lisp.
-;; Substrate's values are values.sub's nodes, each with a count of owners
-;; (dup and drop), so a program frees what it is done with, and the
-;; kernel's lambda makes a GC closure, so Substrate makes its own, a node
-;; in memory (runtime.sub). Both come from one pass over a function's body
-;; once it is fully expanded. core.sub wraps each function's body in
-;; substrate-body, whose expansion in the module's second pass calls
-;; convert-body here:
+;; Lifecycle: permanent.
 ;;
-;; 1. The body is expanded (local-expand). A Substrate lambda in it has
-;;    expanded to the kernel's lambda form, left as a mark for this pass:
-;;    core.sub's lambda asks in-pass? first.
-;; 2. The body is read (scan!): which variables are assigned, which some
-;;    lambda captures, and which are local functions: a variable bound to
-;;    a lambda, or to a literal and then assigned the lambda once, as
-;;    letrec and a named let expand, and only ever called, outside any
-;;    other closure. A variable that some lambda captures and that is
-;;    assigned anywhere is boxed: its binding makes a box, its uses unbox
-;;    it, and its assignments set the box, so the lambda and the code
-;;    around it share it. Variables are told apart by local-binding (spec
-;;    2.3).
-;; 3. The code is rewritten (rw), owning its values. A local function is
-;;    lifted to a module-level function of the variables it captures and
-;;    its arguments, and each call of it is a direct call; it has no
-;;    closure, and no box. Any other lambda, innermost first, is lifted to
-;;    a module-level function of the closure and its parameters, which
-;;    reads the captured variables from the closure, and replaced by code
-;;    that makes the closure with their values, boxes as they are.
+;; Substrate's closure conversion and ownership pass, run at compile time
+;; and written in the C-like Lisp. The kernel's lambda makes a GC
+;; closure, so Substrate makes its own closures as nodes in memory
+;; (runtime.sub); and Substrate's values are reference counted (dup and
+;; drop), so the code must say where each value is shared or freed. Both
+;; come from one pass over each function body once it is fully expanded.
 ;;
-;; Ownership. A value has owners: the variables, closures, boxes, pairs
-;; and other nodes that hold it, counted in its header. A function owns its
-;; parameters and the value it returns; a closure owns its captured
-;; values, and its code borrows the closure from its caller, which keeps
-;; it through the call; a call of a function gives it the arguments. So in a
-;; body, the last use of a variable moves its value, an earlier use dups
-;; it, a variable never used is dropped where it is bound, a branch drops
-;; the variables only the other branch uses, set! drops the value it
-;; replaces, and a value in statement position is dropped. A parameter
-;; core.sub marks #:borrow is not owned: its caller keeps the value and
-;; the function only reads it. What a function gives, and what it does
-;; with its arguments, the pass reads from facts (spec 6.5): core.sub
-;; records (substrate-function b ...) for each Substrate function, b 1
-;; for a borrowed parameter; values.sub, runtime.sub and core.sub record
-;; (foreign kind i ...) for a function of the kernel's or the C-like
-;; Lisp's whose result is kind, owned, borrowed, raw (not a value), void
-;; or diverges, and which takes ownership of arguments i ...; and C
-;; records (c-function types result) for every function, from which a
-;; result that is a datum is owned if runtime.sub's and borrowed
-;; otherwise. A function about which nothing is known gives a value this
-;; pass takes a reference of its own to (kernel-kind!).
+;; Entry points: convert-body, called when core.sub's substrate-body
+;; wrapper is expanded in the module's second pass; convert-lambda, for
+;; a lambda written in kernel code; infer-module!, which decides the
+;; module's borrowed parameters; and in-pass?, which core.sub's lambda
+;; checks first.
 ;;
-;; A lambda outside such a body, in kernel code, is converted alone
-;; (convert-lambda): it captures the variables around it by value, which
-;; must be Substrate values, boxed if it assigns them, so its calls share
-;; them with each other but not with the code around it. The names this
-;; pass makes are ctx's, the module of core.sub, so that they mean the
-;; runtime's functions there.
+;; The pass, for one body:
+;;
+;; 1. Expand the body (local-expand). A Substrate lambda in it expands to
+;;    the kernel's lambda form, which serves as a marker for this pass.
+;; 2. Scan the body (scan!) for assigned variables, variables captured by
+;;    some lambda, and local functions. A local function is a variable
+;;    bound to a lambda (directly, or to a literal and then assigned the
+;;    lambda once, as letrec and named let expand) that is only ever
+;;    called, outside any other closure. A captured variable that is also
+;;    assigned is boxed, so the lambda and the surrounding code share it.
+;;    Variables are told apart by local-binding (spec 2.3).
+;; 3. Rewrite the code (rw), inserting ownership operations. A local
+;;    function is lifted to a module-level function of its captured
+;;    variables and its arguments, and called directly, with no closure
+;;    or box. Every other lambda, innermost first, is lifted to a
+;;    module-level function of the closure and its parameters, and
+;;    replaced by code that makes the closure from the captured values.
+;;
+;; Ownership. A value's owners are the variables, closures, boxes, pairs
+;; and other nodes that hold it, counted in its header. A function owns
+;; its parameters and its result. A closure owns its captured values, and
+;; its code borrows the closure from the caller. In a body, the last use
+;; of a variable moves its value and earlier uses dup it; a variable that
+;; is never used is dropped where it is bound; a branch drops the
+;; variables that only the other branch uses; set! drops the value it
+;; replaces; and a value in statement position is dropped. A borrowed
+;; parameter (marked #:borrow in core.sub, or inferred below) is not
+;; owned: the caller keeps the value and the function only reads it.
+;;
+;; How other functions treat values comes from facts (spec 6.5):
+;;
+;;   (substrate-function b ...)  a Substrate function; b is 1 for each
+;;                               borrowed parameter (core.sub)
+;;   (foreign kind i ...)        a kernel or C-like Lisp function whose
+;;                               result is owned, borrowed, raw (not a
+;;                               value), void or diverges, and which takes
+;;                               ownership of arguments i ...
+;;   (c-function types result)   recorded by the C-like Lisp for every
+;;                               function; a datum result is owned if the
+;;                               function is runtime.sub's, else borrowed
+;;
+;; The pass takes its own reference to the result of a function it knows
+;; nothing about (kernel-kind!).
+;;
+;; A lambda outside such a body, in kernel code, is converted on its own
+;; (convert-lambda). It captures the surrounding variables by value
+;; (they must be Substrate values), boxing those it assigns, so its calls
+;; share them with each other but not with the surrounding code. The
+;; names the pass generates use ctx, core.sub's module, so that they
+;; refer to the runtime's functions there.
 
 (require-unqualified base "../../compiler/base/base.sub")
 (require-unqualified kd "../../compiler/kernel.sub")
@@ -441,15 +447,16 @@
 ;; ---- borrowed parameters of local functions ----
 ;;
 ;; A parameter of a local function that its body only reads is borrowed:
-;; its caller keeps the value through the call, so a call dups nothing
+;; the caller keeps the value through the call, so a call dups nothing
 ;; for it and the body drops nothing, and a loop over a list its caller
-;; holds counts nothing. Read: in a position a call reads (borrowed
-;; parameters, a closure's head, a test, an operator's operand), not
-;; returned, bound, assigned, captured or given to a position a call
-;; owns. And each recursive call must give it a value that is read where
-;; it is, a borrowed variable or the car or cdr of one, since an owned
-;; value given to a borrowed parameter is dropped after the call, which
-;; would make the call no tail call.
+;; holds does no counting. "Only reads" means every use is in a position
+;; a call reads (a borrowed parameter, a closure's head, a test, an
+;; operator's operand), and the parameter is never returned, bound,
+;; assigned, captured, or passed where a call takes ownership. Also,
+;; each recursive call must pass it a value that can be read in place (a
+;; borrowed variable, or the car or cdr of one): an owned value passed to
+;; a borrowed parameter is dropped after the call, which would make the
+;; call no longer a tail call.
 
 ;; The clause of a lambda mark of one clause with fixed parameters, as
 ;; core.sub's kernel-lambda writes it: (if (i32.eq nargs n) (let
@@ -560,25 +567,24 @@
 
 ;; ---- borrowed parameters of the module's functions ----
 ;;
-;; A parameter of a function of the module's that its body only reads is
-;; borrowed too (core.sub's #:borrow marks one by hand), by the rules a
-;; local function's parameter is: read in every use, neither assigned nor
-;; captured, not one the body would take apart and reuse if it owned it
-;; (reuses?), and given, by every call in tail position in a function of
-;; the module's, a value read where it is, a borrowed variable's, a
-;; function's, or the car or cdr of one, since an owned value given to a
-;; borrowed parameter is dropped after the call, which would make the
-;; call no tail call: a call that can come back to the function it is
-;; in, the called function reaching it, as a loop's does; another may
-;; stay no tail call. The bodies are expanded for it as the module's
-;; second pass begins (core.sub, ensure-inferred!), before any is
-;; converted, each in a let binding its parameters, so that every call
-;; among them is seen with the flags of the function it calls: these
-;; start borrowed wherever a body reads its parameter, and a parameter
-;; is owned from the first body found to own a value given to it, or to
-;; give it one in a tail call that is not read where it is, until none
-;; changes. The functions' facts are written from the result (core.sub),
-;; which callers in other modules read, as callee-of reads it here.
+;; A parameter of one of the module's functions that its body only reads
+;; is borrowed too (core.sub's #:borrow marks such parameters by hand).
+;; The rules are those for local functions: every use reads it; it is
+;; never assigned or captured; it is not something the body would take
+;; apart and reuse if it owned it (reuses?); and every tail call that can
+;; come back to the function (as a loop's does) passes it a value that
+;; can be read in place (a borrowed variable, a function, or the car or
+;; cdr of one). Other calls may lose their tail position.
+;;
+;; The bodies are expanded when the module's second pass begins
+;; (core.sub, ensure-inferred!), before any is converted, each inside a
+;; let that binds its parameters, so that every call among them is seen
+;; with its callee's flags. Every parameter that a body reads starts out
+;; borrowed. A parameter becomes owned when some body is found to take
+;; ownership of the value passed to it, or to pass it, in a tail call, a
+;; value that cannot be read in place; this repeats until nothing
+;; changes. The result becomes the functions' facts (core.sub), which
+;; callers in other modules read, just as callee-of reads them here.
 
 (struct mfn [name datum] [ids datum] [body datum] [candidates datum] [marked datum] [free i32] [index i32] [reaches datum])
 
@@ -959,10 +965,11 @@
 
 ;; ---- the environment ----
 ;;
-;; For each variable in scope, by id: (id boxed kind name): whether it is
-;; boxed; its kind; and the identifier its uses are written with, which
-;; in a lifted function is the name the captured value is read into, and
-;; for a local function the lifted function's name.
+;; For each variable in scope, by id, an entry (id boxed kind name):
+;; whether it is boxed, its kind, and the identifier its uses are written
+;; with. In a lifted function, that identifier is the local the captured
+;; value is read into; for a local function, it is the lifted function's
+;; name.
 
 (define k-owned i32 0)      ; owns its value
 (define k-slot i32 1)       ; an argument of a closure's code: owned, moved once, never dropped
@@ -990,10 +997,10 @@
 
 ;; ---- kinds of expressions ----
 ;;
-;; What an expression gives: a value it owns, a value owned by another (a
-;; variable's or a box's, say), a value this pass does not own (a count,
-;; or a function's about which nothing is known), a literal, which is
-;; permanent, nothing, or no return.
+;; What an expression produces: a value it owns; a value owned by
+;; something else (such as a variable or a box); a value this pass does
+;; not manage (a count, or the result of a function it knows nothing
+;; about); a literal, which is permanent; nothing; or no return at all.
 
 (define e-owned i32 0)
 (define e-borrowed i32 1)
@@ -1501,14 +1508,15 @@
 
 ;; ---- a pair taken apart ----
 ;;
-;; (if (pair? x) then else), x an owned variable that dies in the if and
-;; that then only takes the car or cdr of: x is taken apart as then
-;; starts, as Perceus does. Its fields are read; if x is owned once, its
-;; cell is freed without dropping them, which then now owns, and a cons
-;; soon takes it back; otherwise then takes references of its own to the
-;; fields it uses and gives x up. Within then, (car x) and (cdr x) are
-;; the fields' variables. A list a program is done with is so walked and
-;; rebuilt, as by map or reverse, making no nodes.
+;; In (if (pair? x) then else), where x is an owned variable that dies in
+;; the if and `then` only takes its car or cdr, x is taken apart when
+;; `then` starts, as in Perceus. Its fields are read. If x has a single
+;; owner, its cell is freed without dropping the fields, which `then` now
+;; owns, and the next cons usually reuses the cell; otherwise `then` takes
+;; its own references to the fields it uses and gives up x. Inside
+;; `then`, (car x) and (cdr x) become the fields' variables. So walking
+;; and rebuilding a list the program is done with, as map or reverse do,
+;; allocates no new nodes.
 
 ;; The id of the variable so taken apart, or -1.
 (define (pair-taken [test datum] [then datum] [env datum] [live datum]) -> i32
@@ -1650,16 +1658,16 @@
 
 ;; ---- calls ----
 ;;
-;; A call's operands are evaluated in order. One in a position the callee
-;; takes ownership of is given as an owned value; another is read where it
-;; is: a value made for it is held in a temporary and dropped after the
-;; call, and so is a variable used for the last time. Once one operand
-;; needs a temporary, every operand that is not a variable, a literal or
-;; a borrowed value read where it is is held in one (hoisted?), so they
-;; still run in order, before the others, which the call reads: a
-;; variable one of the first uses that one of the others reads is still
-;; in use after it, so a temporary's operand counts the others' uses as
-;; after its own (rw-call).
+;; A call's operands are evaluated in order. An operand in a position the
+;; callee takes ownership of is passed as an owned value. Any other
+;; operand is read in place: a value made for it, or a variable at its
+;; last use, is held in a temporary and dropped after the call. Once one
+;; operand needs a temporary, every operand that is not a variable, a
+;; literal or a borrowed value is also held in one (hoisted?), so that
+;; they still run in order before the call reads the rest. A variable
+;; used by an early operand and read by a later one is still live after
+;; the early one, so a temporary's operand counts the later operands' uses
+;; as coming after its own (rw-call).
 
 ;; How the call takes operand i: 1 to own it, 0 to read it, 2 as it is.
 ;; kind: 0 call-indirect, which owns its arguments and reads its head

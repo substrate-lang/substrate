@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Lifecycle: benchmark. Checking and compiling Bend: proofs-N.sub, N
-# blocks of proofs (proofs.sh, default 3200, after Bend2's proofs_3200),
-# built with bin/sub on wasmtime and on V8, Bend's own modules already in
-# the cache (warm.sub), so the time is the proofs module's: its wall
-# time and the compiler's maximum resident size, in MB. In the dev
-# shell:
+# Lifecycle: benchmark. Times checking and compiling Bend: proofs-N.sub, N
+# blocks of proofs (proofs.sh; default 3200, after Bend2's proofs_3200),
+# built with bin/sub on wasmtime and on V8. Bend's own modules are put in
+# the cache first (warm.sub), so the time is the proofs module's alone.
+# Prints the wall time and the compiler's maximum resident size in MB. In
+# the dev shell:
 #
 #   bench/bend/compile/run.sh [N]
 set -euo pipefail

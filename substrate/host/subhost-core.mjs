@@ -2,7 +2,7 @@
 //
 // The JavaScript host: the part that Node and the browser share.
 //
-// A "host" is what loads and runs a compiled Substrate program (spec
+// A "host" loads and runs a program that `sub build` compiled (spec
 // section 4). It instantiates the program's wasm modules, links them to
 // each other, and provides the "host" imports: writing output, reading
 // files, instantiating more modules at run time, and so on.

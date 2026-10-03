@@ -16,12 +16,9 @@
 //
 // In the browser each guest is a Web Worker (guest-worker.mjs), so it
 // runs on its own thread and the page stays responsive while it works.
-// The interface does not depend on workers, though. A single-threaded
-// host could give each guest its own wasm store, run the guest whenever
-// the main program is idle, and stop it with an instruction budget.
-// Everything a program sees here is "send a message" and "get an event
-// later", which both kinds of host can provide. So far only this browser
-// host implements the module.
+// The interface does not depend on workers: a program only sends
+// messages and receives events later, which a single-threaded host could
+// also provide. So far only this browser host implements the module.
 //
 // Usage, in the page:
 //
@@ -99,9 +96,8 @@
 //                 longer is ended.
 //   memory MB     A size limit, in mebibytes, for each wasm linear memory
 //                 of the guest. Growing a memory past the limit fails, as
-//                 if the machine were out of memory. Note that this does
-//                 not limit wasm GC objects (which Substrate uses for its
-//                 values): those live in the browser's own heap.
+//                 if the machine were out of memory. It does not limit
+//                 wasm GC objects, which live in the browser's own heap.
 //
 // Example: "program /worker\nread /data\ntime 500\nmemory 64"
 //

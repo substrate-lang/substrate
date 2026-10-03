@@ -1,46 +1,50 @@
-;; Lifecycle: experimental. Substrate's values, as the new compiler
-;; builds Substrate (lib/substrate): written in the C-like Lisp, in the
-;; memory the program shares, owned and freed by the program, whose code
-;; (lower.sub) drops the last owner's reference. The kernel module (compiler/kernel.sub) keeps the
-;; compiler's data, which these never are: Substrate does not run at
-;; compile time, and its macros are written in the C-like Lisp on the
-;; kernel module's data.
+;; Lifecycle: permanent.
 ;;
-;; A value is a datum, an i32. A fixnum, an integer from -2^30 to 2^30
-;; - 1, is odd, its value in the bits above the lowest; a character is
-;; its code shifted up two, with 10 below; #f is 0; anything else is the
-;; address of a node, a multiple of 4. A node's first word is its
-;; header: its tag in the low byte, its count of owners above. The count
-;; 2^24 - 1 marks a node permanent, never counted or freed: nil, #t,
-;; every symbol and keyword, and a module's quoted data. The tags, and
-;; the words after the header:
+;; Substrate's run-time values, written in the C-like Lisp. They live in
+;; the program's shared memory and are reference counted: the program
+;; owns and frees them, and its compiled code (lower.sub) drops each value
+;; when its last owner is done with it. These are never the compiler's
+;; data. Substrate does not run at compile time; its macros are C-like
+;; Lisp code over the kernel module's data.
 ;;
-;;   0 pair         car, cdr
-;;   1 ()           nothing: the one node nil
-;;   2 #t           nothing: the one node true-node
-;;   3 symbol       hash, length, then the name's bytes, interned
-;;   4 keyword      the same, interned apart
-;;   5 string       length, then its bytes, UTF-8
-;;   6 integer      low, high, negative: a 64-bit magnitude and its sign,
-;;                  for an integer the fixnum cannot hold
-;;   7 flonum       low, high: an f64's bits
-;;   9 and up       the runtime's (runtime.sub): a closure, box, vector,
-;;                  byte string, struct type, struct, hash table, port
-;;                  or exception, whose layouts it registers (set-layout!)
-;;                  so that the drop loop here frees them, or whose
-;;                  droppers it does (set-dropper!)
+;; A value is a datum, an i32:
 ;;
-;; Nodes come from a list of free ones per size up to 64 bytes, in
-;; words, filled from chunks of memory past the C heap (sbrk), and go
-;; back to the lists; larger ones from malloc. A node's owner, done with
-;; it, drops it: the count down by one, or at one the node freed, with
-;; its own references dropped in turn, a list's cdr by cdr without
+;;   fixnum     an integer from -2^30 to 2^30 - 1: odd, with the value in
+;;              the bits above the lowest
+;;   character  the code point shifted left 2 bits, low bits 10 (binary)
+;;   #f         0
+;;   otherwise  the address of a node (a multiple of 4)
+;;
+;; A node's first word is its header: the tag in the low byte, and the
+;; count of owners above it. A count of 2^24 - 1 marks a node permanent,
+;; never counted or freed: nil, #t, every symbol and keyword, and each
+;; module's quoted data. The tags, with the words after the header:
+;;
+;;   0 pair       car, cdr
+;;   1 ()         nothing (the single node nil)
+;;   2 #t         nothing (the single node true-node)
+;;   3 symbol     hash, length, the name's bytes; interned
+;;   4 keyword    the same; interned in a separate table
+;;   5 string     length, UTF-8 bytes
+;;   6 integer    low, high, negative: a 64-bit magnitude and a sign, for
+;;                integers too big for a fixnum
+;;   7 flonum     low, high: the bits of an f64
+;;   9 and up     runtime.sub's kinds: closure, box, vector, byte string,
+;;                struct type, struct, hash table, port and exception.
+;;                runtime.sub registers each kind's layout (set-layout!)
+;;                so the drop loop here can free it, or a dropper
+;;                (set-dropper!)
+;;
+;; Nodes up to 64 bytes come from per-size free lists, refilled from
+;; chunks taken with sbrk; bigger nodes come from malloc. dup adds an
+;; owner. drop removes one, and when the last owner goes it frees the node
+;; and drops what the node holds; it frees a list cdr by cdr, without
 ;; growing the stack.
 ;;
-;; Quoted data: (quote d), in kernel code, Substrate's compiled code, is
-;; datum d, made once as the module starts, permanent; (lit d), in C
-;; code, is the same, read as a C variable. A fixnum, a character, #f,
-;; () or #t is in place.
+;; Quoted data: (quote d) in kernel code (which is what Substrate compiles
+;; to) is the datum d, built once when the module starts and made
+;; permanent; (lit d) is the same for C code. Fixnums, characters, #f, ()
+;; and #t need no node.
 (require-unqualified base "../../compiler/base/base.sub")
 (require numbers "../../compiler/numbers.sub" f64-bits bits-f64 flonum-digits)
 (require print "../../compiler/print.sub")
@@ -192,12 +196,14 @@
 
 ;; ---- layouts and droppers ----
 ;;
-;; How a node of a tag of the runtime's is freed: the words that hold
-;; values start at byte offset fields and are datums many, or as many as
-;; the word at datums-at says if that is not -1, plus the word at extra
-;; if that is not -1; the node is base + per * m bytes, m the word at
-;; size-at or 1 if that is -1. A tag with no layout has a dropper, a
-;; function given the node, which drops what it holds and frees it.
+;; How the drop loop frees a node of one of runtime.sub's tags. A layout
+;; says where the node's values are: they start at byte offset `fields`
+;; and there are `datums` of them, or, if `datums-at` is not -1, as many
+;; as the word at that offset says; the word at offset `extra` is one
+;; more value, if `extra` is not -1. The node's size in bytes is base +
+;; per * m, where m is the word at `size-at`, or 1 if `size-at` is -1. A
+;; tag without a layout has a dropper instead: a function that drops what
+;; the node holds and frees it.
 (struct layout [set i32] [fields u32] [datums-at i32] [datums u32] [extra i32] [size-at i32] [base u32] [per u32]
                [dropper (fn (datum))])
 (struct layout-table [l (array layout 32)])
@@ -514,8 +520,9 @@
 
 ;; ---- symbols, keywords and strings ----
 ;;
-;; A symbol is interned: the one node of its name, found by the name's
-;; hash in a table that grows. Keywords likewise, in a table of their own.
+;; Symbols are interned: each name has one node, found by the name's hash
+;; in a growing table. Keywords are interned the same way, in their own
+;; table.
 
 (struct intern-table [entries (ptr u32)] [capacity u32] [count u32])
 (define symbols intern-table)
@@ -695,13 +702,14 @@
 
 ;; ---- writing ----
 ;;
-;; A datum written into a buffer (base/runtime.sub) as write (how 0) or
-;; display (how 1) writes it: a list in parentheses, a string in quotes
-;; with ", \ and control characters escaped, or as it is for display, a
-;; symbol's name, a keyword with #: before it, an integer in decimal, a
-;; flonum as write-flonum writes it, a character as #\c or its name, or
-;; itself for display, #f, #t, and a node of the runtime's as #<node n>:
-;; the runtime writes its own (write-value).
+;; Writes a datum into a buffer (base/runtime.sub), as write (how 0) or
+;; display (how 1) would. Lists are written in parentheses. A string is
+;; written in quotes with ", \ and control characters escaped (display
+;; writes it as is). Symbols are written by name, keywords with #: before
+;; them, integers in decimal, flonums as write-flonum writes them, and
+;; characters as #\c or by name (display writes the character itself).
+;; A node of one of runtime.sub's kinds is written as #<node n>; the
+;; runtime writes those itself (write-value).
 
 (define (write-datum [d datum])
   (let ([b (make-buffer)])
@@ -835,12 +843,13 @@
 
 ;; ---- quoted data ----
 ;;
-;; (quote d), in kernel code: datum d, the kernel module's at compile
-;; time, as Substrate's value. A fixnum, a character, #f, () or #t is in
-;; place; anything else is made once, as the module that quotes it
-;; starts, in a C global of that module's (lit, which C code reads) and
-;; a kernel global that holds the same value, made permanent. The
-;; transformers are C, at compile time, on the kernel module's data.
+;; (quote d) in kernel code turns d, which at compile time is the kernel
+;; module's datum, into a Substrate value. Fixnums, characters, #f, () and
+;; #t are immediate. Anything else is built once, when the quoting module
+;; starts, and made permanent; it is kept both in a C global of that
+;; module (which `lit` reads, for C code) and in a kernel global with the
+;; same value. The transformers are C-like Lisp code run at compile time
+;; on the kernel module's data.
 
 (begin-for-syntax
   (require-unqualified base "../../compiler/base/base.sub")
@@ -928,11 +937,12 @@
 
   ;; ---- quasiquote ----
   ;;
-  ;; (quasiquote t): template t as Substrate's value, made by cons and
-  ;; append of its quoted parts and the values of its ,e and ,@e, which
-  ;; are those of its depth: a `t inside it is one deeper, and a ,e or ,@e
-  ;; one shallower. quasiquote, unquote and unquote-splicing are compared
-  ;; by name, as kernel.sub's quasiquote compares them.
+  ;; (quasiquote t) builds template t as a Substrate value, using cons
+  ;; and append on its quoted parts and on the values of its ,e and ,@e
+  ;; at the template's own depth (a nested `t goes one level deeper, and
+  ;; ,e or ,@e one level shallower). quasiquote, unquote and
+  ;; unquote-splicing are compared by name, as in kernel.sub's
+  ;; quasiquote.
 
   (define (named? [x datum] [name datum]) -> i32 (and (identifier? x) (== (syntax-e x) name)))
 
@@ -986,8 +996,8 @@
 
 ;; ---- the predicates, for C code ----
 ;;
-;; Each a form whose expansion is the inline test on the datum's i32, so
-;; that C code pays no call for one.
+;; Each predicate is a form that expands to an inline test on the
+;; datum's i32, so C code pays no call for it.
 
 (begin-for-syntax
   (define (test-form [s datum] [test datum]) -> datum

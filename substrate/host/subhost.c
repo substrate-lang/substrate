@@ -1,20 +1,26 @@
-/* Lifecycle: permanent. The host of spec section 4 over the wasmtime C API;
- * it runs programs, the compiler among them.
+/* Lifecycle: permanent.
  *
- * subhost DIR [arg ...]: run the program sub build wrote to DIR. DIR/program
- * names the program's linklets, one per line, in the order they are
- * instantiated, each after those it imports from; the last is the
- * program's own. Each is instantiated from DIR/<name>.wasm under its name,
- * then the last one's main is called with the arguments.
+ * The native host (spec section 4), over the wasmtime C API. It runs
+ * programs, the compiler among them; bin/sub uses it by default.
  *
- * Exit status: 0 when main returns, 1 when the program cannot be loaded, 2
- * when it traps or an exception escapes it (the message goes to stderr,
- * unless the program's on-trap reports it), and whatever the program
- * passes to host.exit.
+ *   build/subhost DIR [arg ...]
  *
- * The host is one store and a linker. Instances are registered by name and
- * link to each other by name. The host owns no memory: each of its imports
- * reads pointers from the calling instance's own memory. */
+ * runs the program that `sub build` wrote to DIR. DIR/program lists the
+ * program's linklets, one per line, each after the ones it imports from;
+ * the last is the program's entry. The host instantiates each from
+ * DIR/<name>.wasm under its name, then calls the entry's `main`.
+ *
+ * Exit status: 0 when main returns, or when there is no main; 1 when
+ * DIR/program or a linklet's file cannot be read; 2 when a linklet fails
+ * to instantiate, or main traps or lets an exception escape; and
+ * whatever the program passes to host.exit. A trap's message and
+ * backtrace go to stderr, unless the entry exports `on-trap`, which then
+ * reports it.
+ *
+ * The host is one store and one linker. Instances are registered by name
+ * and link to each other by name. The host owns no memory: each host
+ * import reads and writes the calling instance's own memory. The wasm
+ * stack is 4 MiB. */
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>

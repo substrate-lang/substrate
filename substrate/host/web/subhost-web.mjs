@@ -1,7 +1,7 @@
 // Lifecycle: experimental.
 //
-// The host for a web page: runs a compiled Substrate program in a browser
-// (spec section 4).
+// The host for a web page: runs a compiled program in a browser (spec
+// section 4).
 //
 // Loading and linking modules, and the host functions, are in
 // host/subhost-core.mjs, which the Node host shares. This file adds what

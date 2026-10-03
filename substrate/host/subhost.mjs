@@ -1,13 +1,14 @@
 #!/usr/bin/env -S node --stack-size=4000
 // Lifecycle: permanent.
 //
-// The host for Node: runs a compiled Substrate program from the command
-// line (spec section 4). bin/sub runs the compiler with it.
+// The host for Node: runs a compiled program from the command line, on
+// V8 (spec section 4).
 //
 //   host/subhost.mjs DIR [arg ...]
 //
 // DIR is the program directory that `sub build` wrote. This behaves like
-// build/subhost, the C host: same output, same exit statuses.
+// build/subhost, the C host: same output, same exit statuses. bin/sub
+// runs the compiler with it when HOST=host/subhost.mjs.
 //
 // Loading and linking modules, and the host functions, are in
 // host/subhost-core.mjs, which the browser host shares (host/web). This
