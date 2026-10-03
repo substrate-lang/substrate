@@ -14,6 +14,13 @@
 //     console.log(await page.evaluate('document.title'));
 //   });
 //
+// withBrowser takes options: `dir`, where the browser's temporary profile
+// goes; `chromium`, the browser to run; `gpu`, which keeps the browser's
+// GPU process on (it is off otherwise, since a build machine has no GPU);
+// and `flags`, further command-line flags. `webgpuFlags` below are the
+// flags with which this browser runs WebGPU without a GPU, on
+// SwiftShader, which renders in software: pass them with gpu: true.
+//
 // `open(url)` opens a page and returns an object with:
 //
 //   evaluate(js)       Evaluates the JavaScript expression `js` in the
@@ -33,12 +40,32 @@
 //   keyUp(key, mods)   releases it. For testing keys that are held.
 //   screenshot(file, width, height)
 //                      Saves a PNG of the page at the given size.
+//   close()            Closes the page. A page that is left open stays in
+//                      the background once another is opened, where the
+//                      browser slows its animation frames down or stops
+//                      them, so a script that times pages closes each
+//                      one before opening the next.
 //   log                An array of lines: what the page wrote to its
 //                      console, and its uncaught exceptions.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+// Without a GPU, Chromium runs WebGPU on SwiftShader only with these
+// flags and its GPU process on. (With the GPU process off, it still
+// gives a WebGPU device, but destroys it as soon as a canvas is drawn on.)
+export const webgpuFlags = [
+  '--enable-unsafe-webgpu', '--enable-unsafe-swiftshader', '--enable-features=Vulkan', '--use-vulkan=swiftshader',
+  '--use-angle=vulkan',
+];
+
+// With these flags and its GPU process on, headless Chromium uses the
+// machine's GPU for WebGPU, if it has one with a Vulkan driver. It can
+// draw off screen on it, but not present to a canvas: the device is lost
+// (vkAllocateMemory fails) as soon as a canvas is drawn on. gpu.mjs has
+// an off-screen mode for this.
+export const hardwareGpuFlags = ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-angle=vulkan'];
 
 // The named keys that `press` supports. DevTools needs each key's code
 // and Windows virtual key number as well as its name. Any other key is
@@ -67,9 +94,13 @@ const keys = {
 // own, served from this machine.
 export async function withBrowser(use, options = {}) {
   const profile = fs.mkdtempSync(path.join(options.dir || os.tmpdir(), 'chromium-'));
+  // Chromium is told not to use a GPU, unless options.gpu is set: there is
+  // none on a build machine, and looking for one costs time. options.flags
+  // are further command-line flags.
   const browser = spawn(options.chromium || process.env.CHROMIUM || 'chromium', [
     '--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
-    '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--no-sandbox', 'about:blank',
+    '--no-first-run', '--no-default-browser-check', ...(options.gpu ? [] : ['--disable-gpu']), '--no-sandbox',
+    ...(options.flags || []), 'about:blank',
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let socket;
   try {
@@ -130,6 +161,9 @@ export async function withBrowser(use, options = {}) {
       const command = (method, params) => send(method, params, sessionId);
       await command('Runtime.enable');
       await command('Page.enable');
+      // The new page is brought to the front: the browser runs animation
+      // frames at full speed only for the page in front.
+      await send('Target.activateTarget', { targetId });
       const evaluate = async (js) => {
         const r = await command('Runtime.evaluate', { expression: js, awaitPromise: true, returnByValue: true });
         if (r.exceptionDetails) {
@@ -181,6 +215,10 @@ export async function withBrowser(use, options = {}) {
           const { data } = await command('Page.captureScreenshot', { format: 'png' });
           fs.writeFileSync(file, Buffer.from(data, 'base64'));
         },
+        async close() {
+          listeners.delete(sessionId);
+          await send('Target.closeTarget', { targetId });
+        },
       };
       await command('Page.navigate', { url });
       return page;
@@ -190,6 +228,9 @@ export async function withBrowser(use, options = {}) {
     if (socket) socket.close();
     browser.kill();
     await new Promise((resolve) => browser.on('exit', resolve));
-    fs.rmSync(profile, { recursive: true, force: true });
+    // The browser's GPU process can still be writing its caches for a
+    // moment after the browser has exited, so removing the profile may
+    // need a retry.
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }

@@ -20,6 +20,13 @@
 // `rootElement` is the element that the program draws into. The program
 // knows it as node 0.
 //
+// dom() returns the module function with one extra property, for other
+// host modules that the page gives a node of the program's:
+//
+//   nodeOf(number)   the DOM node the program calls by that number, or
+//                    null. The "gpu" module (gpu.mjs) draws on a canvas
+//                    named this way.
+//
 // What a program can call (pointers are addresses in its memory):
 //
 //   apply (ptr, len)
@@ -506,7 +513,7 @@ export function dom(root) {
   // The functions the program imports. `caller` gives access to the
   // memory of the instance that calls them; `theApp` is the running
   // program.
-  return (caller, theApp) => {
+  const module = (caller, theApp) => {
     app = theApp;
     // Copies the string s, as UTF-8, into the program's memory at `buf`,
     // at most `cap` bytes. Returns the full length in bytes.
@@ -544,4 +551,6 @@ export function dom(root) {
       },
     };
   };
+  module.nodeOf = (id) => (nodes.has(id) ? nodeOf(id) : null);
+  return module;
 }

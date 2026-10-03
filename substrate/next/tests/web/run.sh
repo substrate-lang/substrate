@@ -25,6 +25,14 @@
 #                      built on the game library (next/web/game)
 #      sounds          a game that plays a sound file, once and as music
 #                      (sounds.sub)
+#      gpu             the host module "gpu" (host/web/gpu.mjs) used
+#                      directly: drawing into a texture, a compute shader
+#                      and a shader error, each read back (gpu.sub)
+#      sprites, sprites-canvas
+#                      the game that draws many sprites (sprites-world.sub),
+#                      drawn by the GPU renderer (next/web/game/sprites.sub)
+#                      and by the 2D canvas: both draw the same picture.
+#                      These are also the pages that sprites.mjs measures
 #      stopped, stopped-at-start
 #                      games that trap, in a step and while starting: the
 #                      game must stop and show the report (stopped.sub,
@@ -42,8 +50,9 @@
 #                      pack)
 #      repl            the REPL page (next/web/repl)
 #
-# rows.mjs is not part of the tests. It measures how long the operations
-# of the rows example take.
+# rows.mjs and sprites.mjs are not part of the tests. They measure how
+# long the operations of the rows example take, and how long the two
+# renderers take to draw many sprites.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$root"
@@ -83,10 +92,13 @@ next/web/site.sh next/web/examples/platformer/platformer.sub "$sites/platformer"
 next/web/site.sh next/tests/web/sounds.sub "$sites/sounds" next/web/examples/platformer/page.html
 next/web/site.sh next/tests/web/stopped.sub "$sites/stopped"
 next/web/site.sh next/tests/web/stopped-at-start.sub "$sites/stopped-at-start"
+next/web/site.sh next/tests/web/gpu.sub "$sites/gpu" next/tests/web/gpu.html
+next/web/site.sh next/tests/web/sprites.sub "$sites/sprites" next/tests/web/sprites.html
+next/web/site.sh next/tests/web/sprites-canvas.sub "$sites/sprites-canvas" next/tests/web/sprites.html
 next/web/site.sh next/tests/web/guests.sub "$sites/guests" next/tests/web/guests.html
 next/sub build next/tests/web/a-guest.sub -o "$sites/guests/guest"
 host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
 rm -r "${sites:?}/guests/guest"
 node next/tests/web/pages.mjs "$sites" counter rows focus fields assets canvas snake platformer sounds stopped stopped-at-start \
-  guests repl || status=1
+  guests repl gpu sprites sprites-canvas || status=1
 exit $status

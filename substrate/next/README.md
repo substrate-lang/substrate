@@ -116,12 +116,19 @@ on them there.
     update, view) and its connection to the browser.
   - `canvas.sub`: drawing on a `<canvas>` element: rectangles, paths,
     circles, text, and sprites from image files.
+  - `gpu.sub`: the program's side of the host module `gpu`, which is
+    WebGPU: functions that write its commands.
   - `files.sub`: reading and writing files, which works on every host.
   - `guest.sub`: functions for running another program in a sandbox (a
     "guest"), on hosts that support it.
   - `game/`: a small library for 2D games:
     - `game.sub`: the game loop. `(game World [size 320 180] init step
-      draw)` turns three functions into a game in a page.
+      draw)` turns three functions into a game in a page; with
+      `[renderer gpu]` after the size, the GPU draws its screen.
+    - `draw.sub`: what a game draws with: sprite sheets, rectangles and
+      text, on either renderer.
+    - `sprites.sub`: the GPU renderer: a frame's sprites gathered into
+      a batch and drawn with a few commands, on `../gpu.sub`.
     - `input.sub`: which keys are held, and which were just pressed.
     - `sound.sub`: sound files, music, and short synthesized tones.
     - `timers.sub`: things that happen later: a message that the game
@@ -335,9 +342,10 @@ A site is made of static files only, so any web server can serve it.
 - **Host modules.** Besides the standard `host` imports, a page can give
   a program extra modules of host functions, each under a name. A
   program can only use the modules it is given, so they also work as
-  permissions. There are three: `dom` (`host/web/dom.mjs`), for drawing
-  on the page; `audio` (`host/web/audio.mjs`), for sound; and
-  `guest` (`host/web/guest.mjs`), for running other programs in a
+  permissions. There are four: `dom` (`host/web/dom.mjs`), for drawing
+  on the page; `audio` (`host/web/audio.mjs`), for sound; `gpu`
+  (`host/web/gpu.mjs`), for WebGPU; and `guest`
+  (`host/web/guest.mjs`), for running other programs in a
   sandbox. The compiler is run with no extra modules, so
   code that runs at compile time cannot use them, and builds stay
   reproducible (spec 4).
@@ -417,7 +425,10 @@ A site is made of static files only, so any web server can serve it.
   which were pressed since the last step), plays the sounds the game
   asked for, and draws every frame on a canvas of exactly the size
   given, which the browser stretches to the window without blurring.
-  It is a macro that expands into an ordinary page program.
+  It is a macro that expands into an ordinary page program. A game
+  draws with `draw.sub`: sprite sheets, rectangles and text, in the
+  pixels of its screen, with colours as numbers (`#x8fd3ffff`). The
+  same calls work on both renderers below.
   `tiles.sub` adds what a platformer or a top-down game needs: a level
   as a grid of tiles, bodies that move through it and are stopped by
   walls, floors and ceilings, and a camera that follows the player.
@@ -456,6 +467,57 @@ A site is made of static files only, so any web server can serve it.
 
   What they do not do: plain arrays and pointers are still unchecked,
   so code that uses those directly is as unsafe as before.
+- **WebGPU** (`host/web/gpu.mjs`, `web/gpu.sub`). The host module
+  `gpu` is WebGPU for a program, the way `dom` is the page for it. It
+  knows nothing about sprites, meshes or text. The program numbers its
+  own resources (shaders, pipelines, buffers, textures, samplers, bind
+  group layouts, bind groups, and surfaces, which are canvases of the
+  page), writes commands that make and use them into a buffer, and
+  hands the buffer to the host once a frame; the host carries the
+  commands out one for one on the WebGPU API and submits the frame.
+  The commands cover what a 2D or a 3D renderer needs: render passes
+  with several colour targets and a depth attachment, compute passes,
+  explicit layouts with dynamic offsets, culling, blending, instanced
+  and indexed draws, textures from files, writing and reading buffers
+  and textures. WebGPU reports most mistakes later, and reading data
+  back takes time, so those arrive as events: the host calls the
+  program's `on-gpu` for an error (a shader that does not compile, a
+  draw with a buffer that is too small), a texture file that arrived,
+  and pixels or bytes read back. A mistake in the commands themselves
+  stops the program, as a bad patch does. `web/gpu.sub` writes the
+  commands from a program, and checks that a command's lists are
+  complete before the next one. `tests/web/gpu.sub` is the module used
+  directly: a pipeline of the program's own drawing into a texture, a
+  compute shader doubling numbers, and a shader with a mistake, each
+  read back.
+  - Renderers are libraries in the program's language. The first is
+    `web/game/sprites.sub`: a frame's sprites and rectangles are
+    gathered into a batch, in order, and drawn with one upload and one
+    draw call per run of sprites from the same sheet. The vertex
+    shader makes each sprite's two triangles and finds its cell in the
+    sheet; a bind group per sheet gives the shader the texture. A game
+    gets it with `[renderer gpu]` (`game.sub`); the game's text is
+    drawn by the 2D context on a see-through canvas over the screen.
+    The platformer runs this way.
+  - What it costs (`tests/web/sprites.mjs`; the table below). On the
+    processor, a frame of 20,000 sprites takes the program 0.45 ms,
+    where the 2D context takes 42 ms. On the development machine's
+    GPU, 200,000 sprites are 2.7 ms in the program and 5.7 ms on the
+    GPU, at 60 frames a second.
+  - The headless browser of the tests has no GPU. It runs WebGPU on
+    SwiftShader with the flags `webgpuFlags` in `host/web/browser.mjs`
+    and its GPU process on; with the process off it destroys the
+    device as soon as a canvas is drawn on. The machine's own GPU can
+    be used with `hardwareGpuFlags`, but then the browser cannot
+    present a canvas, so the module has an off-screen mode in which a
+    surface is a texture; `sprites.mjs hardware` measures that way.
+    What a WebGPU canvas shows cannot be read back through a 2D
+    context in either browser, so the module has `readSurface`, which
+    copies the next frame drawn on a surface for a test
+    (`tests/web/pages.mjs`: `gpu`, `platformer`, `sprites`).
+  - Not done: lines, circles and paths on the GPU (a game that needs
+    them uses the canvas renderer), a 3D renderer, and the swap of the
+    overlay canvas for text drawn by the GPU.
 - **Guests** (`host/web/guest.mjs`, `web/guest.sub`): running code that is
   not trusted. A program can start another program as a "guest": a
   separate sandbox with its own memory. The two share nothing, and they
@@ -574,6 +636,22 @@ In headless Chromium, on the development machine:
 | Draw 10,000 rectangles in one frame | 2 ms |
 | One frame of snake, including drawing the board | under 0.1 ms |
 | One frame of the platformer: a step, and about 70 sprites drawn | under 0.1 ms |
+
+| Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
+|---|---|---|---|
+| 1,000 sprites: a frame | 0.75 ms | 0.08 ms | 1.1 ms |
+| 5,000 sprites | 8.8 ms | 0.17 ms | 2.2 ms |
+| 20,000 sprites | 42 ms (22 frames a second) | 0.45 ms | 2.2 ms |
+| 100,000 sprites | | 1.5 ms | 3.9 ms |
+| 200,000 sprites | | 2.7 ms | 5.7 ms |
+
+The 2D context draws in software in the headless browser; its time is
+the drawing. The WebGPU renderer's time in the program is building the
+frame and handing it over, after which the GPU draws it: the last
+column is the development machine's GPU (an RTX 5090, drawing off
+screen), from the hand-over until it was done. SwiftShader, which
+stands in for a GPU in the test browser, takes 12 ms, 150 ms and 600 ms
+for the first three frames instead.
 
 The rows are timed by `tests/web/rows.mjs`, from the click until the
 browser has laid the page out again.

@@ -16,7 +16,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withBrowser } from '../../../host/web/browser.mjs';
+import { withBrowser, webgpuFlags } from '../../../host/web/browser.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites, ...names] = process.argv.slice(2);
@@ -496,22 +496,31 @@ const checks = {
   // "red,green,blue,alpha". The level is 12 pixels taller than the
   // screen, and the camera sits at the bottom, so the player, who starts
   // at (35, 146) in the level, is drawn with its top at y = 134.
+  //
+  // The platformer draws with the GPU (next/web/game/sprites.sub on
+  // host/web/gpu.mjs), so the page runs in the browser that has WebGPU,
+  // and the picture is read through the module's readSurface, which
+  // gives the next frame drawn on the game's screen. The text is on the
+  // second canvas, the overlay, which a 2D context can read.
   async platformer(page) {
     const pixel = (x, y) => page.evaluate(
-      `[...document.querySelector("canvas").getContext("2d").getImageData(${x}, ${y}, 1, 1).data].join(",")`);
+      `window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
     const sky = '143,211,255,255';
     const dirt = '160,103,63,255';
     const shirt = '83,155,245,255';
     // The sprite sheet takes a moment to load. Until then no tile is drawn.
-    await page.waitFor(`(() => {
-      const d = document.querySelector("canvas").getContext("2d").getImageData(8, 170, 1, 1).data;
-      return d[0] === 160 && d[1] === 103;
-    })()`, 10000);
+    await page.waitFor(`window.gpuModule.readSurface(1, 8, 170, 1, 1).then((p) => p[0] === 160 && p[1] === 103)`, 10000);
     check('platformer: the ground is drawn from the sprite sheet', await pixel(8, 170), dirt);
     check('platformer: the sky is drawn', await pixel(100, 100), sky);
     check('platformer: the player is drawn where the level puts it', await pixel(40, 140), shirt);
+    check('platformer: the text is drawn on the overlay', await page.evaluate(`(() => {
+      const d = document.querySelectorAll("canvas")[1].getContext("2d").getImageData(0, 0, 160, 16).data;
+      let n = 0;
+      for (let i = 3; i < d.length; i += 4) if (d[i] > 0) n++;
+      return n > 100;
+    })()`), true);
     // The page downloaded the sprite sheet with the program's other
-    // assets, before the program started. The image is made from that
+    // assets, before the program started. The texture is made from that
     // file, so the browser must not have requested it a second time.
     check('platformer: the sprite sheet is downloaded only once', await page.evaluate(
       'performance.getEntriesByType("resource").filter((e) => e.name.endsWith("/assets/sprites.png")).length'), 1);
@@ -521,13 +530,15 @@ const checks = {
       const c = document.querySelector("canvas");
       return c.clientWidth > 320 && Math.abs(c.clientWidth / c.clientHeight - 320 / 180) < 0.01;
     })()`), true);
+    check('platformer: the overlay lies exactly over the screen', await page.evaluate(`(() => {
+      const [a, b] = document.querySelectorAll("canvas");
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      return ra.left === rb.left && ra.top === rb.top && ra.width === rb.width && ra.height === rb.height;
+    })()`), true);
 
     // A held key keeps the player running: its starting place empties.
     await page.keyDown('ArrowRight');
-    await page.waitFor(`(() => {
-      const d = document.querySelector("canvas").getContext("2d").getImageData(40, 140, 1, 1).data;
-      return d[0] === 143 && d[1] === 211;
-    })()`, 5000);
+    await page.waitFor(`window.gpuModule.readSurface(1, 40, 140, 1, 1).then((p) => p[0] === 143 && p[1] === 211)`, 5000);
     check('platformer: holding the right arrow moves the player away', await pixel(40, 140), sky);
     await page.keyUp('ArrowRight');
 
@@ -535,6 +546,55 @@ const checks = {
     await page.press(' ');
     await page.waitFor(`window.audio.played() > ${before}`, 5000);
     check('platformer: a jump plays a sound', (await page.evaluate('window.audio.played()')) > before, true);
+  },
+
+  // next/tests/web/gpu.sub: the host module "gpu" (host/web/gpu.mjs) used
+  // directly. The program draws two rectangles into a texture and reads
+  // it back, doubles numbers with a compute shader and reads them back,
+  // and compiles a shader with a mistake. Each result arrives as an
+  // event, and the page shows it.
+  async gpu(page) {
+    const shown = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    await page.waitFor('document.getElementById("pixels").textContent !== "waiting"', 10000);
+    await page.waitFor('document.getElementById("numbers").textContent !== "waiting"', 10000);
+    await page.waitFor('document.getElementById("errors").textContent !== ""', 10000);
+    check('gpu: the rectangles are in the texture', await shown('pixels'), '3,3: 255,0,0,255  11,11: 0,255,0,255  0,0: 0,0,0,0');
+    check('gpu: the compute shader doubled the numbers', await shown('numbers'), '2,4,6,8,10,12,14,16');
+    check('gpu: the broken shader reports its error', await shown('errors'),
+      "[3] shader 3 does not compile:\n  line 1, column 12: expected ')' for function declaration\n  line 1, column 13: expected '}' for function body\n");
+    check('gpu: nothing is written to the console', page.log.join('\n'), '');
+  },
+
+  // next/tests/web/sprites-world.sub, the game that draws many sprites,
+  // on each renderer: sprites.sub is drawn by the GPU and sprites-canvas.sub
+  // by the 2D canvas. Each page is opened with one sprite, the grass
+  // tile at (8, 8): grass in its first rows, dirt below, on the sky. The
+  // GPU's picture is read through the module's readSurface; the
+  // canvas's through its 2D context. That the two agree is the check of
+  // the GPU renderer.
+  async sprites(page) {
+    await page.evaluate('location.search = "?n=1"');
+    await page.waitFor('window.ready && location.search === "?n=1"', 20000);
+    const pixel = (x, y) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
+    // The sprite sheet takes a moment to arrive.
+    await page.waitFor('window.gpuModule.readSurface(1, 11, 13, 1, 1).then((p) => p[0] === 160 && p[1] === 103)', 10000);
+    check('sprites: the GPU draws the sprite', await pixel(11, 13), '160,103,63,255');
+    check('sprites: the GPU draws its top rows', await pixel(8, 8), '87,171,90,255');
+    check('sprites: the GPU fills the background', await pixel(300, 200), '143,211,255,255');
+    check('sprites: the GPU draws nothing outside the sprite', await pixel(7, 7), '143,211,255,255');
+    check('sprites: nothing is written to the console', page.log.join('\n'), '');
+  },
+  async 'sprites-canvas'(page) {
+    await page.evaluate('location.search = "?n=1"');
+    await page.waitFor('window.ready && location.search === "?n=1"', 20000);
+    const pixel = (x, y) => page.evaluate(
+      `[...document.querySelector("canvas").getContext("2d").getImageData(${x}, ${y}, 1, 1).data].join(",")`);
+    await page.waitFor('(() => { const d = document.querySelector("canvas").getContext("2d").getImageData(11, 13, 1, 1).data; return d[0] === 160 && d[1] === 103; })()', 10000);
+    check('sprites-canvas: the canvas draws the sprite', await pixel(11, 13), '160,103,63,255');
+    check('sprites-canvas: the canvas draws its top rows', await pixel(8, 8), '87,171,90,255');
+    check('sprites-canvas: the canvas fills the background', await pixel(300, 200), '143,211,255,255');
+    check('sprites-canvas: the canvas draws nothing outside the sprite', await pixel(7, 7), '143,211,255,255');
+    check('sprites-canvas: nothing is written to the console', page.log.join('\n'), '');
   },
 
   // next/tests/web/sounds.sub: a game that loads a sound file and asks
@@ -660,13 +720,17 @@ const checks = {
   },
 };
 
+// The pages that need WebGPU run in a browser of their own, started with
+// the flags that give it WebGPU without a GPU (host/web/browser.mjs).
+const needsGpu = new Set(['gpu', 'sprites', 'platformer']);
+
 // Serve the sites (port 0 = any free port; serve.mjs prints its address),
 // then run each named check in a fresh page.
 const server = spawn(path.join(here, '../../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
-try {
+async function run(group) {
   await withBrowser(async (open) => {
-    for (const name of names) {
+    for (const name of group) {
       const before = failed;
       const page = await open(`${url}${name}/index.html`);
       try {
@@ -680,7 +744,13 @@ try {
       if (failed === before) console.log(`ok   ${name}`);
       else console.log(`--- browser console of ${name}\n${page.log.join('\n')}`);
     }
-  }, { dir: sites });
+  }, needsGpu.has(group[0]) ? { dir: sites, gpu: true, flags: webgpuFlags } : { dir: sites });
+}
+try {
+  const plain = names.filter((n) => !needsGpu.has(n));
+  const gpu = names.filter((n) => needsGpu.has(n));
+  if (plain.length) await run(plain);
+  if (gpu.length) await run(gpu);
 } finally {
   server.kill();
 }
