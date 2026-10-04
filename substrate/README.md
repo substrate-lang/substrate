@@ -118,6 +118,11 @@ do what it does: another language on the kernel can bring its own.
     the value through the call: the module's functions' bodies are
     expanded as its second pass begins, and their flags inferred
     together and written as their facts (`tests/substrate/borrowed.sub`).
+    A recursive closure refers to itself rather than to a box that holds
+    it. A call that can raise (a closure, `raise`, `error` or a failure
+    of the host's) runs in a pad that drops what its frame owns if it
+    does; a mistake, such as `car` of a value that is not a pair, stops
+    the program rather than raising.
   - `core.sub`: `lib/substrate-core.sub`, its transformers kernel code on
     the kernel module's data, its run-time functions kernel code on
     `values.sub`'s and `runtime.sub`'s, which the lowering owns.
@@ -1230,9 +1235,10 @@ plan, and what each step found:
    ran as macros, Substrate at compile time, which this design does not
    run: Bend on the compiler is `lib/bend/`, in the C-like Lisp. Next: a
    closure given to a call that does not keep it, which the facts could
-   tell, made on the stack rather than freed; and what still leaks: a
-   value a raise unwinds past, and a closure that refers to itself
-   through a box, as a letrec's that escapes does.
+   tell, made on the stack rather than freed. The two leaks it had are
+   closed: a closure that refers to itself, as a letrec's that escapes
+   does, no longer does so through a box, and a raise drops what the
+   frames it leaves own.
 7. Sessions and web pages, from the web-repl branch, which did its work
    on the compiler while it was `next/`, merged once `next/` was
    promoted: a session (`compiler/expander.sub`), the browser host
