@@ -207,9 +207,9 @@ do what it does: another language on the kernel can bring its own.
       at its edge.
     - `materials.sub`: the materials the surfaces are drawn with,
       grass, dirt, rock, sand, snow, bark, leaves, blades, planks,
-      roof tiles, plaster, needles, painted by the GPU from noise when
-      the scene starts into one texture of many layers with mip
-      levels, so that no images are shipped.
+      roof tiles, plaster, needles and a face, painted by the GPU from
+      noise when the scene starts into one texture of many layers with
+      mip levels, so that no images are shipped.
     - `sky.sub`: the sky, drawn where there is nothing: a gradient,
       the sun's disc and glow, drifting clouds, far ridges all around.
     - `post.sub`: the textures a scene is drawn into (colour with
@@ -221,9 +221,14 @@ do what it does: another language on the kernel can bring its own.
       ambient light, the sky's colour, the fog and the mist, where
       shadows fall.
     - `models.sub`: things made of parts on joints: a model says what
-      a kind of thing is made of, a figure is one such thing posed,
-      composed parent down to child and submitted to be drawn;
-      procedural animation (a stride, a head that watches something).
+      a kind of thing is made of (`define-model` writes one out, and
+      names its parts), a figure is one such thing posed, composed
+      parent down to child and submitted to be drawn; procedural
+      animation (a stride with a knee that bends, a body that bobs, a
+      head that watches something).
+    - `particles.sub`: smoke, fireflies, splashes: particles born at
+      emitters, moved by a compute shader and drawn as soft discs
+      facing the camera.
     - `math.sub`: sin, cos and atan2, which wasm does not have, the 4
       by 4 matrices a camera needs, and the 3 by 4 matrices things are
       placed with.
@@ -974,21 +979,31 @@ foot, tinted with the ground's green and drawn without outlines, and
 flowers, discs of petals in three colours. The bridge and the jetty
 are planks with posts and rails; the hut is boxes, gables and two
 slopes of roof on a plinth, with frames round its door and window. A
-deer is a figure (`scene/models.sub`) of eight parts on joints, a
-body, a neck, a head, four legs and a tail, posed every frame from
-what it is doing: its legs stride by its speed, its neck goes down to
-graze, up when it is alert and forward when it runs, and its head
-watches the player; its mind is a small state machine, grazing,
+deer is a figure (`scene/models.sub`) of twelve parts on joints, a
+body, a neck, a head, four legs of two parts each and a tail, posed
+every frame from what it is doing: its legs trot by its speed, in
+diagonal pairs with the knees bending, its body rising as they pass,
+its neck goes down to graze, up when it is alert and forward when it
+runs, and its head watches the player; its mind is a small state machine, grazing,
 wandering, alert, fleeing, that steers its mover towards a goal, away
 from the player, clear of the trees and apart from the herd. A fish
 is a mover that swims, kept between the lake bed and the surface,
 with a figure of a body and a tail that swings; its mind wanders,
 keeps with the shoal and apart from its neighbours, turns from the
 shallows, and takes fright at a wader. The character is a figure of
-six parts, a torso, a head, two arms and two legs, driven by the
-player's mover: it turns to face the way it walks, its legs stride
-and its arms swing with its speed, it leans into a run and tucks its
-legs in a jump. The birds are figures of a body and two wings that
+eleven parts, a torso, a head with a face (a card of the face
+material: eyes, brows and a mouth, painted), arms with forearms and
+legs with shins, driven by the player's mover: it turns to face the
+way it walks, leaning into the turn, its legs stride with the knees
+bending as each foot comes forward and its arms swing against them
+with the elbows bent, more at a run, its body rises as the legs pass
+and its shoulders twist against its hips, it leans into a run, tucks
+its legs in a jump, and standing still it breathes and shifts its
+weight; its skin and face are lit softly, without the toon edge.
+Smoke rises from the hut's chimney, the water splashes about the
+player wading, and at night fireflies come out over the meadows under
+stars (`scene/particles.sub`: 16 emitters of 64 particles, stepped
+by a compute shader). The birds are figures of a body and two wings that
 beat. The water is a
 square at the water level drawn with the water material, which reads
 the land's height from the height map as a texture.
@@ -1001,16 +1016,16 @@ The game is tested without a browser (`tests/ui/valley.sub`): the
 land's heights, the path, what stands on it, every mesh checked to
 face outwards, the day, the player walking, running, jumping, looking
 around, crossing the bridge, stopped by a tree and by the hut, and
-wading into the river, the herd watching and scattering, the shoal
-taking fright, and the camera behind the character and through its
-eyes (the space, the movers, the props and the models have tests of
-their own). The browser test reads
+wading into the river, the gait's joints, the herd watching and
+scattering, the shoal taking fright, and the camera behind the
+character and through its eyes (the space, the movers, the props,
+the models and the particles have tests of their own). The browser test reads
 the GPU's picture: sky, meadow, river, the bridge's wood, the
 character in its blue tunic, gone when V looks through its eyes, a
 view that changes with walking, and the lake from its shore through the game's
 `look` export, which puts the player anywhere (in the browser's
 console, `window.app.call('look', x, z, yaw, pitch)`). The compiled
-program is 302 KB, and its asset under 1 KB.
+program is 336 KB, and its asset under 1 KB.
 
 ```sh
 lib/web/site.sh lib/web/examples/valley/valley.sub build/lib/web/valley lib/web/examples/valley/page.html
@@ -1056,7 +1071,7 @@ In headless Chromium, on the development machine:
 | The valley example (GPU) | |
 |---|---|
 | Making the land (263,000 vertices), placing the trees, the bushes, the boulders and the stones, 7,000 tufts of grass around the player, the herd and the flock, on the first frame | 170 ms |
-| A frame: a step with ten deer and fourteen fish thinking and moving, the character posed, the props of the cells in view and the figures submitted, and the land, the trees, the grass, the boulders, the creatures and the water drawn three times (two shadow maps, scene), the sky and the picture pass, in the program | 0.3 ms |
+| A frame: a step with ten deer and fourteen fish thinking and moving, the character posed, the props of the cells in view and the figures submitted, and the particles' step, the land, the trees, the grass, the boulders, the creatures and the water drawn three times (two shadow maps, scene), the particles, the sky and the picture pass, in the program | 0.3 ms |
 | The same frame on the GPU, at twice the screen's size each way, from hand-over until done: RTX 5090 / SwiftShader | 2.6 ms / 0.8 s |
 
 | Sprites, the two renderers (`tests/web/sprites.mjs`) | 2D context | WebGPU, the program | WebGPU, the GPU |
