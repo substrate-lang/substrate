@@ -1,29 +1,6 @@
-;; Lifecycle: permanent.
-;;
-;; The expander. It turns a module's syntax into the compiler's input, the
-;; lowered code of core.sub, building it as it expands; or, when
-;; `sub expand` or a macro's local-expand asks, into fully expanded code
-;; (spec 6.4). It also owns modules, the cache and compiled files, and
-;; sessions.
-;;
-;; Entry points: compile-module-file and expand-module-file (used by
-;; main.sub); program-linklets and module-linklet-list, which give what a
-;; program loads; set-cache-directory! and compiled-file-bytes (spec 3.7);
-;; and the session functions session-open!, session-eval!,
-;; session-eval-text!, session-eval-file! and session-recover!.
-;;
-;; Binding uses sets of scopes (spec 6.1). A module is a file, and each of
-;; its phases compiles to one wasm module, a linklet (spec 3.1). While a
-;; module is expanded, each begin-for-syntax is compiled into a linklet and
-;; run at once in the module's compile-time store (spec 3.2), and macros
-;; are called there. Macros work on the kernel module's data, which lives
-;; in the running compiler's memory ("the kernel module", below).
-;;
-;; Memory. What lasts the whole run lives in the run's arena (kernel.sub):
-;; the binding table, the compiled modules and what they record, their
-;; linklets, and the definitions (core.sub). Everything a module's
-;; expansion and compilation make lives in its module arena and is freed
-;; when the module is done, along with its compile-time store.
+;; The expander: syntax to lowered code, with modules, the cache and sessions.
+;; What lasts the whole run is in the run's arena (keep); what a module's expansion
+;; makes is in its module arena, freed when the module is done.
 (require-unqualified base "base/base.sub")
 (require-unqualified k "kernel.sub")
 (require-unqualified core "core.sub")
@@ -47,8 +24,6 @@
     array.len array.copy array.fill
     ref.null ref.is_null ref.eq ref.as_non_null ref.test ref.cast ref.i31 i31.get_s i31.get_u))
 
-;; The implicit forms (spec 5.3, 5.4), and facts, which a language records
-;; about definitions (6.5).
 (define core-forms datum
   (append (quoted (func global import memory table data type rec tag define-syntax begin-for-syntax
             begin require require-unqualified provide freestanding set! let let* lambda if block loop br br-if br-table
@@ -64,22 +39,15 @@
 
 ;; ==== errors ====
 
-;; A compile error at where, syntax or #f, with template and args
-;; (format-message).
 (define (fail-at [where datum] [template (ptr u8)] [args datum]) -> datum
   (raise-compile-error (if (syntax? where) (syntax-srcloc where) 0) (format-message template args))
   0)
 
-;; What a form x that none of the patterns a syntax-match had would match
-;; raises, as Substrate's syntax-match does: "expected" and the patterns,
-;; texts, a syntax error blamed on x, named for x's head.
 (define (no-match [x datum] [patterns (ptr u8)]) -> datum
   (let ([name (form-name x)] [message (format-message "expected ~a" (cons (bytes->string patterns (strlen patterns)) nil))])
     (throw compile-error (if (== name 0) message (format-message "~a: ~a" `(,name ,message))) x 0)
     0))
 
-;; The name an error about x takes: an identifier's own, or that of the
-;; identifier heading a list; or #f.
 (define (form-name [x datum]) -> datum
   (cond [(identifier? x) (syntax-e x)]
         [(and (syntax? x) (pair? (syntax-e x)) (identifier? (car (syntax-e x)))) (syntax-e (car (syntax-e x)))]
@@ -88,70 +56,34 @@
 (define (list1 [x datum]) -> datum (cons x nil))
 
 ;; ==== the run ====
-;;
-;; Everything below is shared by all modules compiled in one run of the
-;; compiler: the binding table, scope ids, and compiled modules. A macro's
-;; template identifiers keep resolving to its own module's bindings when
-;; another module expands it, because those bindings stay in the table.
+;; The binding table lasts the run: a macro's template identifiers keep resolving to
+;; its own module's bindings when another module expands it.
 
-;; A binding: kept under the greatest scope of its set, or none if the
-;; set is empty, with the others of the same symbol there, the latest
-;; first; an identifier can refer to it only if the identifier has that
-;; scope too. phase: a phase, or all-phases. namespace: type or value (spec
-;; 6.1). key identifies the binding to compiled code (local-binding, spec
-;; 2.3).
+;; A binding is kept under the greatest scope of its set (none-slot if empty), so an
+;; identifier is resolved by looking only under its own scopes.
 (struct binding [scopes (ptr scope-set)] [phase i32] [namespace datum] [key datum] [meaning datum] [next (ptr binding)])
 
 (define all-phases i32 -1)
 
-;; (symbol, slot) -> its bindings kept there; the slot of the empty set is
-;; none-slot.
 (define bindings hash-table)
 (define none-slot u32 4294967295)
 
-;; The bindings require-unqualified made, each -> 1, or 2 once a macro use
-;; has relied on it: a definition of the same name may shadow one it has
-;; not (spec 3.1).
 (define unqualified-imports hash-table)
 (define scope-counter u32 0)
 (define base-installed i32 0)
-(define registry hash-table)                ; path, a symbol -> its module
-(define units-by-hash hash-table)           ; hash, a symbol -> its module
+(define registry hash-table)
+(define units-by-hash hash-table)
 
-;; meaning: (core name) (prim name) (func info) (global info) (data info)
-;;          (type info) (tag info) (local key) (label key) (compile-time-value getter-info)
-;; A type meaning is in the type namespace, every other one in the value
-;; namespace. Locals and labels are bound before their meaning is set, so
-;; #f counts as a value.
+;; Locals and labels are bound before their meaning is set, so #f counts as a value.
 (define (meaning-namespace [meaning datum]) -> datum
   (if (and (!= meaning 0) (== (car meaning) (sym type))) (sym type) (sym value)))
 
-;; One phase of a module, compiled: bytes, a string; the instance names it
-;; imports from (relative to the module at phase shift 0); whether it uses
-;; GC; and the scope table of its syntax literals (spec 3.5): the run's
-;; scope for each index. A module's linklets are a list, next.
 (struct linklet [phase i32] [bytes datum] [imports datum] [gc i32] [scopes datum] [next (ptr linklet)])
 
-;; A compiled (or compiling) module. linklets: its linklets, one per phase;
-;; phase 0's is its program's. requires: list of (module . shift).
-;; provides: list of (symbol . meaning). entries: its module-level
-;; bindings, the latest first. scope: its module scope. code: its lowered
-;; phase-0 forms, while it compiles. hash: its identity, of its source and
-;; its requires' hashes (spec 3.2). name: what its instance names start
-;; with, its stem and hash. path: its file, which its source locations name
-;; (3.6). facts: the facts it recorded, newest first, each (definition
-;; phase value): the definition it is about (fact-key), the phase, and its
-;; datum or syntax. types and infos: the types and definitions it made,
-;; newest first. scope-count and type-count: how many scopes its
-;; expansion made and types it declared, each numbered in it, so that an
-;; interface can name them (the cache). A module loaded from a compiled
-;; file has (compiled file hash) for its path (3.7).
 (struct unit [self datum] [path datum] [name datum] [hash datum] [state datum] [requires datum] [provides datum]
         [entries (ptr module-entry)] [code datum] [scope u32] [types datum] [infos datum] [facts datum]
         [linklets (ptr linklet)] [scope-count u32] [type-count u32] [memories datum])
 
-;; A module-level binding of a module, which one that requires it at a
-;; phase shift can install a shifted copy of.
 (struct module-entry [symbol datum] [scopes (ptr scope-set)] [phase i32] [binding (ptr binding)] [next (ptr module-entry)])
 
 (define unit-kind u32 20)
@@ -179,21 +111,11 @@
 
 (define (unit-of [m datum]) -> (ptr unit) (cast (ptr unit) (record-pointer m)))
 
-;; The state of one module's compilation. use-site-scopes: integers.
-;; phase-forms, memories and tables: alists from phases to forms.
-;; provide-ids: (name . id) ..., newest first. require-names: ((name .
-;; phase) . module).
-;; Its compile-time store (spec 3.2), a namespace in the compiler's: ns,
-;; the namespace's name; instances, the instance names instantiated in it,
-;; as symbols; values, getter -> (value), the compile-time values fetched
-;; so far; linklet-counter, the number of compile-time linklets so far;
-;; storage-linklets, ((memory-or-table . phase) . the compile-time linklet
-;; that defines it).
 (struct comp [module datum] [use-site-scopes datum] [freestanding-form datum] [phase-forms datum] [memories datum]
         [tables datum] [provide-ids datum] [require-names datum]
         [ns datum] [instances (ptr arena-table)] [values (ptr arena-table)] [linklet-counter u32] [storage-linklets datum])
 
-(define current (ptr comp) 0)                ; the comp being expanded
+(define current (ptr comp) 0)
 
 (define (the-module) -> (ptr unit) (unit-of (-> current module)))
 
@@ -217,11 +139,8 @@
     (set! (-> c storage-linklets) nil)
     c))
 
-;; Scopes are even; a local binding form's (new-local-scope!) is odd, so
-;; that quote-syntax can prune the local ones from a literal (spec 6.2).
-;; A scope of the module being expanded is numbered in it (own-scope!); a
-;; module scope's copy for a phase shift, and the kernel ids' scope,
-;; belong to the run.
+;; Scopes are even; a local binding form's is odd, so that quote-syntax can prune the
+;; local ones from a literal.
 (define (new-scope!) -> u32
   (let ([sc (new-run-scope!)])
     (when (!= current 0) (own-scope! (-> current module) sc))
@@ -241,24 +160,8 @@
 (define core-scopes (ptr scope-set) (scopes-change no-scopes 0 0))
 
 ;; ==== the kernel module ====
-;;
-;; The kernel module is kernel.sub together with the run-time modules that
-;; give it its memory and allocator. Compile-time code links to the
-;; running compiler's instances of these modules (spec 1.4), so the
-;; compiler and every macro share the kernel module's data and state:
-;;   - (require k kernel) binds kernel.sub's functions and tags, at any
-;;     phase;
-;;   - (memory from k) and (table from k) take its memory and table, and a
-;;     linklet at phase 1 or above that declares neither takes them too;
-;;   - quote and its relatives make its data.
-;; A program whose code uses the kernel module carries the running build's
-;; linklets of it (program-linklets).
-;;
-;; bin/sub passes the directory of the running build (-r DIR). Its program
-;; file lists the linklets the host registered, and the kernel module's
-;; functions are read from kernel.sub's linklet there (running.sub). When
-;; the compiler builds itself, kernel.sub compiled from source gets that
-;; linklet's name (kernel-infos).
+;; Compile-time code links to the running compiler's instances of the kernel module
+;; and the modules it rests on, so the compiler and every macro share its data.
 
 (define repository-root datum 0)
 (define (set-repository-root! [root datum]) (set! repository-root (keep root)))
@@ -266,34 +169,16 @@
 (define running-directory datum 0)
 (define (set-running-directory! [dir datum]) (set! running-directory (keep dir)))
 
-;; The running kernel module: a unit whose provides are kernel.sub's
-;; functions and tags, sorted by name; the name of kernel.sub's instance;
-;; and the running build's linklets, their names in the order its program
-;; lists them.
 (define kernel datum 0)
 (define kernel-instance datum 0)
 (define running-names datum 0)
 
-;; The infos of the kernel module's functions and tags, which its
-;; bindings hold. When the compiler builds itself, kernel.sub compiled from
-;; source has infos of its own, and its linklet the name of the running
-;; build's (kernel-name?): the same module, by its hash (spec 3.2), but
-;; its definitions are a module's, while the kernel module's are none, and
-;; at compile time the kernel module is the running build's.
+;; When the compiler builds itself, kernel.sub compiled from source has the running
+;; build's linklet name, but compile-time code still links to the running build's.
 (define kernel-infos hash-table)
 
 (define (kernel-name? [name datum]) -> i32 (and (!= kernel-instance 0) (string=? name kernel-instance)))
 
-;; The kernel module's group: its linklet, and the running build's
-;; linklets it imports, directly or not, which give it its memory and
-;; allocator (print, lang, runtime, c, numbers): one instance of each in
-;; the compiler's store, the running compiler's, which compile-time code
-;; links to at any phase shift, whether it requires the kernel module as
-;; kernel or requires these modules by path. They are the same modules,
-;; by their hashes (spec 3.2), when the sources are the running build's,
-;; as bin/sub keeps them. So compile-time code, C code included, works
-;; in the memory that holds the compiler's syntax, with its allocator and
-;; stack.
 (define kernel-group datum 0)
 
 (define (group-of [name datum]) -> datum
@@ -309,8 +194,6 @@
           (set! imports (cdr imports)))))
     out))
 
-;; The running build's instance of the kernel module's group that instance
-;; name stands for: for S@0+t, S@0+0 if it is one of the group's; or #f.
 (define (group-instance [name datum]) -> datum
   (when (== running-directory 0) (return 0))
   (ensure-kernel!)
@@ -351,8 +234,6 @@
       (set! kernel m)
       (set-kernel-definitions! (kernel-function (sym literal-buffer)) (kernel-function (sym deserialize))))))
 
-;; The name of kernel.sub's linklet among names: the one of the module
-;; whose stem is kernel.
 (define (kernel-linklet [names datum]) -> datum
   (while (pair? names)
     (let ([n (car names)])
@@ -360,30 +241,20 @@
     (set! names (cdr names)))
   0)
 
-;; The bytes of the running build's linklet named name.
 (define (running-bytes [name datum]) -> datum
   (let ([bytes (file-string (string-append-2 running-directory (string-append-2 `"/" (string-append-2 name `".wasm"))))])
     (when (== bytes 0) (fail-at 0 "cannot read the running compiler's linklet ~a" (list1 name)))
     bytes))
 
-;; Is name one of the running build's linklets?
 (define (running-linklet? [name datum]) -> i32
   (and (!= running-names 0) (!= (member name running-names) 0)))
 
-;; The kernel module's function named name.
 (define (kernel-function [name datum]) -> datum
   (ensure-kernel!)
   (let ([p (assq name (-> (unit-of kernel) provides))])
     (unless (and (!= p 0) (== (car (cdr p)) (sym func))) (fail-at 0 "internal: the kernel module has no function ~a" (list1 name)))
     (cadr (cdr p))))
 
-;; Returns the memory or table declaration (`kind` says which) that a
-;; linklet at `phase` gets when its module declares none: an import of the
-;; running kernel module's memory or table. Returns 0 if there is none.
-;;
-;; This applies to compile-time code (phase 1 and above), and to a
-;; session's code at any phase, provided the compiler was told where the
-;; build that is running it is (running-directory).
 (define (running-storage [kind datum] [phase i32]) -> datum
   (if (or (and (== phase 0) (not (in-session?))) (== running-directory 0))
       0
@@ -395,15 +266,12 @@
 
 (define (slot-key [symbol datum] [slot u32]) -> u64 (bit-or (<< (cast u64 symbol) 32) slot))
 
-;; The scope a binding with these scopes is kept under.
 (define (binding-slot [scopes (ptr scope-set)]) -> u32
   (if (== (-> scopes count) 0) none-slot (@ (-> scopes ids) 0)))
 
-;; The bindings of sym kept under scope slot.
 (define (bindings-under [sym datum] [slot u32]) -> (ptr binding)
   (cast (ptr binding) (hash-ref (& bindings) (slot-key sym slot))))
 
-;; Bind sym with these scopes at phase to meaning: the binding.
 (define (bind-raw! [sym datum] [scopes (ptr scope-set)] [phase i32] [meaning datum]) -> (ptr binding)
   (let ([b (cast (ptr binding) (alloc-in (& run-arena) (sizeof binding)))] [k (slot-key sym (binding-slot scopes))])
     (set! (-> b scopes) scopes)
@@ -415,8 +283,6 @@
     (hash-set! (& bindings) k (cast u32 b))
     b))
 
-;; A module-level binding of the current module: recorded, so that a
-;; module requiring this one at a phase shift can install a shifted copy.
 (define (bind-module-level! [sym datum] [scopes (ptr scope-set)] [phase i32] [meaning datum]) -> (ptr binding)
   (let ([b (bind-raw! sym scopes phase meaning)])
     (when (!= current 0)
@@ -442,11 +308,8 @@
                  `(,(syntax-e id) ,(if (> phase 0) (format-message " at phase ~a" (list1 (make-integer phase))) `""))))
       (set! b (-> b next)))))
 
-;; Bind a module-level definition. Use-site scopes come off the name, so a
-;; definition a macro makes from its input is visible to the rest of the
-;; module (spec 6.2). A second binding of the same name with the same
-;; scopes at the same phase is an error, except that a definition shadows
-;; what require-unqualified imports (spec 3.1).
+;; Use-site scopes come off the name, so a definition a macro makes from its input
+;; is visible to the rest of the module.
 (define (bind-definition! [id0 datum] [phase i32] [meaning datum]) -> (ptr binding)
   (let ([id id0] [uses (-> current use-site-scopes)])
     (while (pair? uses)
@@ -457,10 +320,6 @@
     (check-unbound! id phase meaning)
     (bind-module-level! (syntax-e id) (syntax-scopes id) phase meaning)))
 
-;; A definition shadows a binding require-unqualified made with the same
-;; name, scopes, phase and namespace: that binding goes, here and in the
-;; module's recorded entries (spec 3.1). It is an error if a macro use in
-;; this module already relied on it.
 (define (shadow-import! [id datum] [phase i32] [meaning datum])
   (let* ([k (slot-key (syntax-e id) (binding-slot (syntax-scopes id)))]
          [b (cast (ptr binding) (hash-ref (& bindings) k))]
@@ -479,7 +338,6 @@
       (set! before b)
       (set! b (-> b next)))))
 
-;; Binding b out of the current module's entries.
 (define (remove-entry! [b (ptr binding)])
   (let* ([m (the-module)] [e (-> m entries)] [before (ptr module-entry) 0])
     (while (!= e 0)
@@ -492,17 +350,9 @@
 (define (phase-matches? [b (ptr binding)] [phase i32]) -> i32
   (or (== (-> b phase) all-phases) (== (-> b phase) phase)))
 
-;; Can an identifier with scopes refer to binding b at phase in namespace
-;; ns?
 (define (candidate? [b (ptr binding)] [phase i32] [ns datum] [scopes (ptr scope-set)]) -> i32
   (and (phase-matches? b phase) (== (-> b namespace) ns) (scopes-subset? (-> b scopes) scopes)))
 
-;; The binding id refers to at phase in namespace ns, or 0 if unbound. A
-;; binding whose scopes are a subset of id's is kept under one of id's
-;; scopes, or none-slot, so only those are candidates: those of the empty
-;; set first, then under each of id's scopes in turn. The best has the
-;; most scopes, the first of those; every other must have a subset of its
-;; scopes, and not the same ones with another meaning.
 (define (resolve [id datum] [phase i32] [ns datum]) -> (ptr binding)
   (let* ([scopes (syntax-scopes id)] [sym (syntax-e id)] [best (ptr binding) 0] [count u32 0] [b (ptr binding) 0])
     (for ([i -1]) (< i (cast i32 (-> scopes count))) (+= i 1)
@@ -523,16 +373,12 @@
           (set! b (-> b next)))))
     best))
 
-;; What id means at phase in the value namespace, or #f. Only type
-;; positions (parse-heap, type-of) look in the type namespace, with
-;; type-meaning-of.
 (define (meaning-of [id datum] [phase i32]) -> datum
   (let ([b (resolve id phase (sym value))]) (if (== b 0) 0 (-> b meaning))))
 
 (define (type-meaning-of [id datum] [phase i32]) -> datum
   (let ([b (resolve id phase (sym type))]) (if (== b 0) 0 (-> b meaning))))
 
-;; Is id bound to the core form name?
 (define (core-id? [id datum] [name datum] [phase i32]) -> i32
   (and (identifier? id)
        (let ([m (meaning-of id phase)])
@@ -540,25 +386,20 @@
 
 (define (internal-name? [sym datum]) -> i32 (== (@ (symbol-bytes sym) 0) #\%))
 
-;; Core forms and primitive operators, at every phase (spec 5.5). Nothing
-;; else is bound until a module requires it.
 (define (install-base!)
   (unless base-installed
     (set! base-installed 1)
     (for-each (lambda ([name datum]) (bind-raw! name core-scopes all-phases `(core ,name))) core-forms)
     (for-each (lambda ([name datum]) (bind-raw! name core-scopes all-phases `(prim ,name))) (prim-names))
-    ;; The kernel module's queries are answered here from now on.
     (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
                   query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier)))
 
 ;; ---- phase shifting ----
 
-;; A pair of a record and a phase shift, as a table's key.
 (define (shift-key [d datum] [k u32]) -> u64 (bit-or (<< (cast u64 d) 32) k))
 
-;; A meaning as seen k phases up: its linklet instances move by the phase
-;; shift. Shifted infos are cached so each is one record.
-(define shifted-infos hash-table)           ; (info . k) -> info
+;; Shifted infos are cached so each is one record.
+(define shifted-infos hash-table)
 
 (define (shift-instance [inst datum] [k u32]) -> datum
   (let ([r (if (string? inst) (linklet-ref inst) 0)])
@@ -589,8 +430,6 @@
                          (cast u32 (keep (if (!= o 0) (cons (car o) (make-integer (+ (integer-value (cdr o)) k))) (cons info (make-integer k))))))
               new)))))
 
-;; A shifted info -> (info . k): the unshifted info it is a copy of, at
-;; phase shift k.
 (define shift-origins hash-table)
 
 (define (shift-meaning [meaning datum] [k u32]) -> datum
@@ -598,19 +437,15 @@
       `(,(car meaning) ,(shift-info (cadr meaning) k))
       meaning))
 
-;; The unshifted info that info is, or is a copy of.
 (define (base-info [info datum]) -> datum
   (let ([o (cast datum (hash-ref (& shift-origins) (cast u64 info)))]) (if (!= o 0) (car o) info)))
 
-;; The phase shift of info from its base-info.
 (define (info-shift [info datum]) -> u32
   (let ([o (cast datum (hash-ref (& shift-origins) (cast u64 info)))]) (if (!= o 0) (cast u32 (integer-value (cdr o))) 0)))
 
-;; A module's scope at phase shift s (spec 6.1). A module used at two phase
-;; shifts has bindings at the same phase from both; giving each phase
-;; shift its own copy of the module scope keeps them apart. Phase shift 0
-;; uses the module scope itself.
-(define shifted-scopes hash-table)          ; (module . shift) -> scope
+;; A module used at two phase shifts has bindings at one phase from both; each shift's
+;; own copy of the module scope keeps them apart.
+(define shifted-scopes hash-table)
 
 (define (module-scope-at [m datum] [s u32]) -> u32
   (if (== s 0)
@@ -622,15 +457,10 @@
           (hash-set! (& module-scope-origins) (scope-key sc) (cast u32 (keep (cons m (make-integer s))))))
         sc)))
 
-;; Every module scope, and its copies, as scope -> (module . shift).
 (define module-scope-origins hash-table)
 (define (scope-key [sc u32]) -> u64 (bit-or (<< (cast u64 1) 32) sc))
 (define (scope-origin [sc u32]) -> datum (cast datum (hash-ref (& module-scope-origins) (scope-key sc))))
 
-;; Scope set scopes at phase shift s: each module scope in it, some
-;; module's copy for a phase shift, becomes that module's copy for the
-;; shift + s (spec 6.1). A definition a macro from another module made can
-;; carry that module's scopes.
 (define (shift-scopes [scopes (ptr scope-set)] [s u32]) -> (ptr scope-set)
   (let ([out scopes] [origin datum 0])
     (for ([i u32 0]) (< i (-> scopes count)) (+= i 1)
@@ -640,10 +470,8 @@
                                  (module-scope-at (car origin) (+ (cast u32 (integer-value (cdr origin))) s)) 0))))
     out))
 
-;; Make module m's bindings resolvable at phase shift s, and those of the
-;; modules it requires. Needed for m's macros: their templates carry m's
-;; scopes.
-(define installed hash-table)               ; (module . shift) -> 1
+;; The modules m requires are installed too: m's macros' templates carry m's scopes.
+(define installed hash-table)
 
 (define (install-module-bindings! [m datum] [s u32])
   (when (== (hash-ref (& installed) (shift-key m s)) 0)
@@ -665,7 +493,6 @@
 
 ;; ==== modules ====
 
-;; path without its . and .. segments, absolute.
 (define package-root datum 0)
 (define (set-package-root! [dir datum]) (set! package-root (keep dir)))
 
@@ -681,13 +508,7 @@
 
 (define (absolute-path? [p datum]) -> i32 (and (> (string-length p) 0) (== (@ (string-bytes p) 0) #\/)))
 
-;; The name of the file at path p, which names the module in it and which
-;; its source locations carry (spec 3.6), as Racket names a module: p
-;; completed from the package root and its . and .. segments resolved,
-;; then relative to the package root if it is in it, and absolute if not.
-;; So a file has one name however a require spells it. Symbolic links are
-;; not resolved. The root may be relative, to the working directory, as
-;; in tests.
+;; So a file has one name however a require spells it; symbolic links are not resolved.
 (define (package-directory) -> datum (if (!= package-root 0) package-root repository-root))
 
 (define (canonical-path [p datum]) -> datum
@@ -699,8 +520,6 @@
         (substring full n (string-length full))
         full)))
 
-;; Path p with its . and .. segments resolved: absolute if p is, else
-;; with the .. segments that go above where it starts first.
 (define (resolve-segments [p datum]) -> datum
   (let ([kept nil] [bytes (string-bytes p)] [n (string-length p)] [start u32 0] [out (make-buffer)] [s datum 0]
         [absolute (absolute-path? p)])
@@ -722,7 +541,6 @@
     (buffer-free! (& out))
     s))
 
-;; The byte index of the last byte b in string s, or -1.
 (define (last-byte-index [s datum] [b i32]) -> i32
   (let ([i (- (cast i32 (string-length s)) 1)])
     (while (>= i 0)
@@ -734,8 +552,6 @@
   (let ([slash (last-byte-index path #\/)])
     (if (>= slash 0) (substring path 0 (+ slash 1)) `"")))
 
-;; A module's name while it is expanded, for its compile-time linklets:
-;; its stem, numbered to be unique in this run.
 (define provisional-names hash-table)
 
 (define (provisional-name [path datum]) -> datum
@@ -747,16 +563,12 @@
         (return name))
       (+= n 1))))
 
-;; The stem of the file name at path: its letters, digits, - and _, each
-;; other character made _.
 (define (file-stem [path datum]) -> datum
   (let* ([slash (last-byte-index path #\/)]
          [base (if (>= slash 0) (substring path (+ slash 1) (string-length path)) path)]
          [dot (last-byte-index base #\.)]
          [stem (if (>= dot 0) (substring base 0 dot) base)]
          [out (make-buffer)] [bytes (string-bytes stem)] [i u32 0] [s datum 0])
-    ;; Each character, of one byte or more, is kept if it is one of those,
-    ;; and is otherwise one _.
     (while (< i (string-length stem))
       (let ([b (@ bytes i)])
         (cond [(or (and (>= b #\a) (<= b #\z)) (and (>= b #\A) (<= b #\Z)) (and (>= b #\0) (<= b #\9)) (== b #\-) (== b #\_))
@@ -770,9 +582,6 @@
     (buffer-free! (& out))
     s))
 
-;; A hash of the strings in list ss, as 12 hexadecimal digits: 64-bit
-;; FNV-1a over their bytes, each string followed by a zero byte, keeping
-;; the top 48 bits.
 (define (content-hash [ss datum]) -> datum
   (let ([h u64 14695981039346656037] [digits (array u8 12)])
     (while (pair? ss)
@@ -787,11 +596,8 @@
         (set! (@ digits k) (if (< d 10) (+ 48 d) (+ 87 d)))))
     (bytes->string digits 12)))
 
-;; The hash that is a module's identity once it is expanded: of its path,
-;; which its source locations name (spec 3.6), its source text, and the
-;; hashes of the modules it requires, at the phase shifts it requires
-;; them, each (hash shift) (spec 3.2). Modules with the same hash are the
-;; same module, the same bytes.
+;; A module's identity covers its path, which its source locations name, so modules
+;; with the same hash are the same bytes.
 (define (module-hash [path datum] [text datum] [requires datum]) -> datum
   (let ([parts `(,path ,text)])
     (while (pair? requires)
@@ -799,12 +605,9 @@
       (set! requires (cdr requires)))
     (content-hash parts)))
 
-;; The file at a module's path, which is the package root's if relative.
 (define (package-file [path datum]) -> datum
   (if (absolute-path? path) path (string-append-2 (package-directory) (string-append-2 `"/" path))))
 
-;; The text of file, a string; or a compile error if there is none, which
-;; names it path.
 (define (source-text [file datum] [path datum]) -> datum
   (let* ([name (make-buffer)] [n u32 0] [p (ptr u8) 0] [s datum 0])
     (buffer-add! (& name) (string-bytes file) (string-length file))
@@ -816,9 +619,6 @@
     (free p)
     s))
 
-;; Compile the module in file source (and, first, what it requires), or
-;; load it from the cache. Returns the module. Each module is compiled
-;; once per run.
 (define (compile-module-file [source datum]) -> datum
   (let* ([path (canonical-path source)] [key (cast u64 (string->symbol path))]
          [known (cast datum (hash-ref (& registry) key))] [cached datum 0])
@@ -838,16 +638,8 @@
              (set! compiling (cdr compiling))
              m)])))
 
-;; The modules that are being compiled right now, innermost first, as a
-;; list of their paths (symbols). If an error interrupts a session input
-;; while modules it required are half compiled, session-recover! uses this
-;; list to forget them.
 (define compiling datum nil)
 
-;; The fully expanded phase-0 forms of the module in file source (spec
-;; 6.4), for sub expand: it is expanded, and what it requires compiled,
-;; but it is not compiled itself. Each form is given to f, while the forms
-;; last.
 (define (expand-module-file [source datum] [f (closure (datum))])
   (let ([path (canonical-path source)])
     (let* ([text (source-text (package-file path) path)] [m (new-unit path (provisional-name path))])
@@ -860,8 +652,6 @@
           (set! forms (cdr forms))))
       (end-module-arena))))
 
-;; Expand a module body at phase 0. The result is its lowered code, or,
-;; syntax being 1, its fully expanded code (spec 6.4).
 (define (expand-module-body [forms datum] [syntax i32]) -> datum
   (install-base!)
   (let ([msc (new-scope!)] [saved to-syntax] [out datum 0])
@@ -872,12 +662,9 @@
     (set! to-syntax saved)
     out))
 
-;; Take the phase-0 code, resolve provides, take the module's hash and
-;; name, and compile the linklets.
 (define (finish-module! [text datum])
   (let ([m (the-module)] [items (reverse (-> current provide-ids))] [provides nil])
     (add-phase-forms! 0 (-> m code))
-    ;; A provided name exports its binding in each namespace it has one.
     (while (pair? items)
       (let* ([item (car items)] [id (cdr item)]
              [v (meaning-of id 0)]
@@ -889,8 +676,6 @@
         (when (!= value 0) (set! provides (cons (cons (syntax-e (car item)) value) provides))))
       (set! items (cdr items)))
     (set! (-> m provides) (keep (reverse provides)))
-    ;; Its requires known, the module takes its hash, and the name its
-    ;; instance names start with: its stem and hash.
     (set! (-> m hash) (keep (module-hash (-> m path) text
                                          (map (lambda ([r datum]) -> datum `(,(-> (unit-of (car r)) hash) ,(cdr r)))
                                               (-> m requires)))))
@@ -901,22 +686,16 @@
 
 ;; ---- linklets ----
 
-;; The memory and table forms declared for phase (spec 3.3).
 (define (storage-forms [phase i32]) -> datum
   (let ([mem (storage-form (sym memory) phase)] [tbl (storage-form (sym table) phase)])
     (append (if (!= mem 0) (list1 mem) nil) (if (!= tbl 0) (list1 tbl) nil))))
 
-;; The memory or table form, kind, declared for phase, or else the running
-;; kernel module's at phase 1 and above; or #f.
 (define (storage-form [kind datum] [phase i32]) -> datum
   (let ([f (assoc (make-integer phase) (if (== kind (sym memory)) (-> current memories) (-> current tables)))])
     (if (!= f 0) (cdr f) (running-storage kind phase))))
 
-;; Rejects a `data` form in code that would share the running compiler's
-;; memory: the data would overwrite whatever the compiler has at that
-;; address. That is the case for compile-time code (phase 1 and above) and
-;; for a session's code at any phase, unless the module declares a memory
-;; of its own for that phase.
+;; Data in code that shares the running compiler's memory would overwrite whatever the
+;; compiler has at that address.
 (define (check-phase-data! [forms datum] [phase i32] [where datum])
   (when (and (or (> phase 0) (in-session?)) (== (assoc (make-integer phase) (-> current memories)) 0))
     (while (pair? forms)
@@ -925,8 +704,6 @@
                  (list1 (make-integer phase))))
       (set! forms (cdr forms)))))
 
-;; Module m's phase linklet, as compile-module gave it: (bytes imports
-;; gc? scopes), kept.
 (define (add-linklet! [m datum] [phase i32] [compiled datum])
   (let ([l (cast (ptr linklet) (alloc-in (& run-arena) (sizeof linklet)))] [u (unit-of m)])
     (set! (-> l phase) phase)
@@ -937,14 +714,11 @@
     (set! (-> l next) (-> u linklets))
     (set! (-> u linklets) l)))
 
-;; Module m's linklet of phase, or 0.
 (define (linklet-of [m datum] [phase i32]) -> (ptr linklet)
   (let ([l (-> (unit-of m) linklets)])
     (while (and (!= l 0) (!= (-> l phase) phase)) (set! l (-> l next)))
     l))
 
-;; Compile the linklet of the module being compiled, its phase 0's; check
-;; (freestanding); done.
 (define (compile-linklets!)
   (let* ([m (the-module)] [forms datum 0]
          [phases (sort (let ([ps (map (lambda ([e datum]) -> datum (car e)) (-> current phase-forms))])
@@ -958,7 +732,6 @@
         (set! (-> m memories) (keep-cons (cons (make-integer p) (storage-form (sym memory) p)) (-> m memories)))
         (note-definitions! (-> m self) forms))
       (set! phases (cdr phases)))
-    ;; Its functions' values, resolved now for its interface (5.2).
     (for-each (lambda ([f datum]) (when (and (func-info? f) (has-value? f)) (function-value f))) (-> m infos))
     (hash-set! (& installed) (shift-key (-> m self) 0) 1)
     (set! (-> m state) (sym done))
@@ -967,8 +740,6 @@
     (set! (-> m code) 0)
     (store-cached! (-> m self))))
 
-;; The modules whose linklets a program instantiates at run time: phase 0
-;; at phase shift 0, reached through phase-0 requires.
 (define (runtime-closure [m datum]) -> datum
   (let ([todo (list1 m)] [seen nil])
     (while (pair? todo)
@@ -984,14 +755,10 @@
               (set! imports (cdr imports)))))))
     (reverse seen)))
 
-;; (freestanding): the program's run-time parts import only from the host
-;; and each other, and use no GC (spec 3.4).
 (define (check-freestanding! [m datum] [form datum])
   (let ([ms (runtime-closure m)])
     (while (pair? ms)
       (let* ([mm (car ms)] [p (linklet-of mm 0)] [extra nil] [imports (-> p imports)])
-        ;; The kernel module's instance is named kernel here, as the old
-        ;; compiler's is.
         (while (pair? imports)
           (unless (or (string=? (car imports) `"host") (!= (linklet-ref (car imports)) 0))
             (set! extra (cons (if (and (!= kernel-instance 0) (string=? (car imports) kernel-instance)) `"kernel" (car imports))
@@ -1004,13 +771,8 @@
                      ,(if (pair? extra) (format-message "imports from ~a" (list1 extra)) `"uses GC objects")))))
       (set! ms (cdr ms)))))
 
-;; The linklets m's program instantiates at run time, each after those it
-;; imports from, as (instance-name . bytes): phase-0 linklets at phase
-;; shift 0, and the running build's linklets of the kernel module if they
-;; use it. m's own comes last. A linklet compiled in this run is taken
-;; over the running build's of the same name, the same module's (spec
-;; 3.2), so that when the compiler builds itself, its program is the bytes
-;; it compiled.
+;; A linklet compiled in this run is taken over the running build's of the same name,
+;; so that when the compiler builds itself, its program is the bytes it compiled.
 (define (program-linklets [m datum]) -> datum
   (let ([seen (make-table)] [out nil])
     (set! out (visit-linklets m seen out))
@@ -1026,8 +788,6 @@
         (set! imports (cdr imports)))
       (cons (cons name (-> p bytes)) out))))
 
-;; The linklets of a program that an import imp names: a module's
-;; compiled in this run, or else the running build's.
 (define (visit-import [imp datum] [seen (ptr arena-table)] [out datum]) -> datum
   (let ([l (linklet-ref imp)])
     (cond [(!= l 0)
@@ -1037,8 +797,6 @@
           [(running-linklet? imp) (visit-running imp seen out)]
           [else out])))
 
-;; The running build's linklet named name, a linklet of the kernel module,
-;; after the linklets it imports from.
 (define (visit-running [name datum] [seen (ptr arena-table)] [out datum]) -> datum
   (when (!= (datum-get seen name) 0) (return out))
   (datum-put! seen name (boolean 1))
@@ -1048,7 +806,6 @@
       (set! imports (cdr imports)))
     (cons (cons name bytes) out)))
 
-;; (phase . bytes) for each linklet of m, in phase order.
 (define (module-linklet-list [m datum]) -> datum
   (let ([l (-> (unit-of m) linklets)] [out nil])
     (while (!= l 0)
@@ -1057,31 +814,16 @@
     (sort out (lambda ([a datum] [b datum]) -> i32 (< (integer-value (car a)) (integer-value (car b)))))))
 
 ;; ==== the cache ====
-;;
-;; With a cache directory (build -c DIR), a module that was compiled once
-;; is loaded from the cache for as long as its source and its requires are
-;; unchanged (spec 3.7). What is cached is the module's interface: what
-;; the expander keeps of a compiled module, with its linklets inside, as
-;; quoted data in the kernel's format (spec 3.5). An interface starts with
-;; what it was built from: the interface format, the compiler, and the
-;; module and its requires, by hash. The compiler is identified by the
-;; names of its build's linklets, which carry the hashes of its modules
-;; (spec 3.2). So any change to the compiler invalidates the cache, and
-;; the cache needs -r, which names the running build. The cache holds one
-;; file per source path (cache-name), which each compilation of the path
-;; replaces, so the cache does not grow as sources change.
+;; The compiler is identified by its build's linklet names, which carry its modules'
+;; hashes, so any change to the compiler invalidates the cache.
 
 (define cache-directory datum 0)
 (define (set-cache-directory! [dir datum]) (set! cache-directory (keep dir)))
 
 (define interface-format i64 2)
 
-;; The running compiler, by the hash of its build's linklet names, read
-;; with the kernel module (ensure-kernel!).
 (define compiler-hash datum 0)
 
-;; The compiler the cache is for, when there is a cache directory and the
-;; running build is known; else #f.
 (define (cache-compiler) -> datum
   (if (or (== cache-directory 0) (== running-directory 0))
       0
@@ -1089,15 +831,11 @@
 
 (define (cache-file [name datum]) -> datum (string-append-2 cache-directory (string-append-2 `"/" name)))
 
-;; Datum d in the kernel's data format, a string.
 (define (data-bytes [d datum]) -> datum
   (let ([s (make-serializer)])
     (serialize! s d)
     (serializer-bytes s)))
 
-;; The datum in the file at path, as data-bytes wrote it: the last of its
-;; objects, which serialize! writes after those it is made of; or #f if
-;; there is no such file.
 (define (read-data [path datum]) -> datum
   (let ([s (file-string path)])
     (if (or (== s 0) (== (string-length s) 0))
@@ -1110,7 +848,6 @@
             (+= shift 7))
           (if (== count 0) 0 (@ (deserialize p (string-length s)) (cast u32 (- count 1))))))))
 
-;; d written to the file at path: 1, or 0 if it cannot be.
 (define (write-data [path datum] [d datum]) -> i32
   (let ([name (make-buffer)] [bytes (data-bytes d)] [ok i32 0])
     (buffer-add! (& name) (string-bytes path) (string-length path))
@@ -1119,21 +856,13 @@
     (buffer-free! (& name))
     ok))
 
-;; Section key of interface d.
 (define (section [d datum] [key datum]) -> datum (cdr (assq key d)))
 
-;; Is d an interface of this format, by this compiler?
 (define (current-interface? [d datum]) -> i32
   (and (pair? d) (!= (assq (sym format) d) 0)
        (equal? (section d (sym format)) (make-integer interface-format))
        (equal? (section d (sym compiler)) compiler-hash)))
 
-;; The module at path, from the cache, if the cache has one for it that
-;; is of this format and compiler, and of the source and requires as they
-;; are now; else #f. The source is checked first, with the hashes its
-;; requires had; then the requires are compiled or loaded in order, as
-;; they would be, until one is not as it was. What it reads is in an
-;; arena of its own.
 (define (load-cached [path datum]) -> datum
   (if (== (cache-compiler) 0)
       0
@@ -1150,56 +879,40 @@
          [hash datum 0] [requires datum 0] [known datum 0] [m datum 0])
     (unless (current-interface? d) (return 0))
     (set! hash (section d (sym hash)))
-    (set! requires (section d (sym requires)))            ; each (path hash shift)
+    (set! requires (section d (sym requires)))
     (unless (and (string? hash)
                  (string=? (module-hash path (source-text (package-file path) path)
                                         (map (lambda ([r datum]) -> datum (cdr r)) requires))
                            hash))
       (return 0))
-    ;; A cycle through the requires is an error, as when compiling.
     (hash-set! (& registry) key (cast u32 (new-unit path path)))
     (while (pair? requires)
       (unless (string=? (-> (unit-of (module-of (car (car requires)))) hash) (cadr (car requires)))
         (hash-set! (& registry) key 0)
         (return 0))
       (set! requires (cdr requires)))
-    ;; A module a compiled file brought is the one the run has (3.7).
     (set! known (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol hash)))))
     (set! m (if (!= known 0) known (load-compiled-module d path)))
     (hash-set! (& registry) key (cast u32 m))
     m))
 
-;; The module a recorded require names: the module in a file, compiled
-;; or loaded as it would be, or the entry of a compiled file.
 (define (module-of [spec datum]) -> datum
   (if (pair? spec) (load-compiled-file (cadr spec)) (compile-module-file spec)))
 
-;; Write module m to the cache, in the file for its source path, over
-;; whatever was there. A cache that cannot be written is passed over.
 (define (store-cached! [m datum])
   (when (!= (cache-compiler) 0)
     (let ([u (unit-of m)])
       (write-data (cache-file (cache-name (-> u path))) (list1 (write-interface m))))))
 
-;; The name of the cache's file for the module at path: one file per
-;; source path, so the cache does not grow as sources change.
+;; One file per source path, so the cache does not grow as sources change.
 (define (cache-name [path datum]) -> datum (string-append-2 (content-hash (list1 path)) `".subc"))
 
 ;; ---- compiled files ----
-;;
-;; A compiled file (spec 3.7) holds modules, each as its interface with
-;; its linklets inside. Every module comes after the modules it requires,
-;; and the entry module is last. A cache file holds one module; build -m
-;; writes a program's module and everything it requires to one file, for
-;; (require name (compiled file)).
 
-;; The bytes of the compiled file of module m and its requires.
 (define (compiled-file-bytes [m datum]) -> datum
   (ensure-kernel!)
   (data-bytes (map (lambda ([x datum]) -> datum (write-interface x)) (module-closure m))))
 
-;; Module m and every module it requires, at any phase shift,
-;; transitively, each once, after those it requires.
 (define (module-closure [m datum]) -> datum
   (let ([seen (make-table)] [out nil])
     (set! out (closure-visit m seen out))
@@ -1214,8 +927,6 @@
       (set! rs (cdr rs))))
   (cons m out))
 
-;; The entry of the compiled file at path, its modules loaded in order,
-;; but for those this run has made already.
 (define (load-compiled-file [path datum]) -> datum
   (ensure-kernel!)
   (begin-module-arena)
@@ -1229,9 +940,6 @@
     (end-module-arena)
     entry))
 
-;; Module d of a compiled file or the cache, loaded, its requires being
-;; modules this run has; known by path. It must be of this interface
-;; format and compiler.
 (define (load-compiled-module [d datum] [path datum]) -> datum
   (unless (and (pair? d) (!= (assq (sym format) d) 0) (equal? (section d (sym format)) (make-integer interface-format)))
     (fail-at 0 "the compiled module ~a is of another interface format" (list1 path)))
@@ -1249,33 +957,15 @@
     m))
 
 ;; ---- interfaces ----
-;;
-;; An interface is an alist of sections of quoted data; the first three
-;; say what it was built from. Scopes and definitions belong to one run of
-;; the compiler, so an interface names them relative to modules, by hash:
-;;   - a scope is core, kernel-ids, (m hash shift) for a module scope's
-;;     copy at a phase shift, or (s hash index) for the index-th scope
-;;     that a module's expansion made;
-;;   - a type is (%type i), the module's i-th type, (%type hash i), another
-;;     module's, or a closure, code or box type described by its contents;
-;;   - a definition is (%info own i), the i-th entry of the infos section;
-;;     (%info foreign instance kind export), another module's;
-;;     (%info kernel kind export), the kernel module's; or
-;;     (%info shifted d k), definition d shifted by k phases (spec 6.1);
-;;   - a syntax object is (%syntax e scopes srcloc props), where srcloc is
-;;     (source line col pos span) or #f.
-;; A list that starts with %type, %info, %syntax or %quote as ordinary
-;; data gets %quote put in front of it. encode writes these forms, and
-;; load-module! reads them back with decode.
+;; Scopes and definitions belong to one run of the compiler, so an interface names
+;; them relative to modules, by hash.
 
-;; Each scope a module's expansion made, by its number in the module, and
-;; each type it declared, by its number among its types.
-(define scope-owners hash-table)            ; scope -> its module
-(define scope-numbers hash-table)           ; scope -> its number
-(define module-scopes hash-table)           ; (module . number) -> scope
-(define type-owners hash-table)             ; type -> its module
-(define type-numbers hash-table)            ; type -> its number
-(define module-types hash-table)            ; (module . number) -> type
+(define scope-owners hash-table)
+(define scope-numbers hash-table)
+(define module-scopes hash-table)
+(define type-owners hash-table)
+(define type-numbers hash-table)
+(define module-types hash-table)
 
 (define (own-scope! [m datum] [sc u32])
   (let ([u (unit-of m)])
@@ -1284,7 +974,6 @@
     (hash-set! (& module-scopes) (shift-key m (-> u scope-count)) sc)
     (+= (-> u scope-count) 1)))
 
-;; Scope i of module m: made now, if m was loaded from the cache.
 (define (unit-scope-at [m datum] [i u32]) -> u32
   (let ([sc (hash-ref (& module-scopes) (shift-key m i))])
     (when (== sc 0)
@@ -1322,10 +1011,7 @@
 (define (info-export [info datum]) -> datum
   (cond [(func-info? info) (func-info-export info)] [(global-info? info) (global-info-export info)] [else (tag-info-export info)]))
 
-;; The definition of kind with export name export in the instance named
-;; instance, one of a module's linklets, or #f. A module's definitions
-;; are indexed at the first search, by "instance kind export".
-(define definition-indexes hash-table)      ; module -> (ptr arena-table)
+(define definition-indexes hash-table)
 
 (define (definition-key [instance datum] [kind datum] [export datum]) -> u64
   (cast u64 (string->symbol (format-message "~a ~a ~a" `(,instance ,kind ,export)))))
@@ -1345,7 +1031,6 @@
       (hash-set! (& definition-indexes) (cast u64 m) (cast u32 index)))
     (cast datum (table-ref index (definition-key instance kind export)))))
 
-;; The kernel module's definition of kind with export name export.
 (define (kernel-definition [kind datum] [export datum]) -> datum
   (ensure-kernel!)
   (let ([p (assq (string->symbol export) (-> (unit-of kernel) provides))])
@@ -1355,8 +1040,6 @@
 
 ;; ---- writing an interface ----
 
-;; The module whose interface is being written, and its own definitions
-;; so far: info -> its number + 1, and the list of them, the latest first.
 (define writing datum 0)
 (define own-numbers (ptr arena-table) 0)
 (define own-list datum 0)
@@ -1413,7 +1096,6 @@
 
 (define (filter-out-false [l datum]) -> datum (filter (lambda ([x datum]) -> i32 (!= x 0)) l))
 
-;; Module m's linklets, in phase order: (phase bytes imports gc? scopes).
 (define (linklet-forms [m datum]) -> datum
   (let ([l (-> (unit-of m) linklets)] [out nil])
     (while (!= l 0)
@@ -1423,8 +1105,6 @@
       (set! l (-> l next)))
     (sort out (lambda ([a datum] [b datum]) -> i32 (< (integer-value (car a)) (integer-value (car b)))))))
 
-;; Module m's module-level bindings, the oldest first: (symbol scopes
-;; phase meaning).
 (define (entry-forms [m datum]) -> datum
   (let ([e (-> (unit-of m) entries)] [out nil])
     (while (!= e 0)
@@ -1433,8 +1113,6 @@
       (set! e (-> e next)))
     out))
 
-;; The recursion groups of types, a module's in order, as lists of their
-;; members' numbers; a group's members are consecutive.
 (define (group-forms [types datum]) -> datum
   (let ([out nil] [i i64 0] [ts types])
     (while (pair? ts)
@@ -1451,10 +1129,8 @@
 (define (tag-symbol? [x datum]) -> i32 (or (object-tag? x) (== x (sym %quote))))
 (define (object-tag? [x datum]) -> i32 (or (== x (sym %type)) (== x (sym %info)) (== x (sym %syntax))))
 
-;; x with what belongs to the run named relative to modules (above).
 (define (encode [x datum]) -> datum
   (cond [(pair? x)
-         ;; A list's spine is walked, as encode of its cdr would be.
          (let ([head nil] [last datum 0] [l x] [p datum 0])
            (while (pair? l)
              (set! p (if (tag-symbol? (car l)) `(%quote ,(car l)) (list1 (encode (car l)))))
@@ -1488,8 +1164,6 @@
           [(!= (code-closure t) 0) `(code ,(encode (code-closure t)))]
           [else (fail-at 0 "internal: the type ~a belongs to no module" (list1 (type-info-name t))) 0])))
 
-;; The closure type whose code type t is, or #f: its first parameter is
-;; the closure.
 (define (code-closure [t datum]) -> datum
   (let ([fields (type-info-fields t)])
     (if (and (== (type-info-kind t) (sym func)) (pair? (car fields)) (ref-type? (car (car fields))))
@@ -1517,8 +1191,6 @@
       (table-set! own-numbers (cast u64 info) i))
     `(own ,(make-integer (- i 1)))))
 
-;; Definition info as a list, (kind field ...), its fields in the order its
-;; constructor takes them; and the definition such a list describes.
 (define (info->list [info datum]) -> datum
   (cond [(func-info? info)
          `(func ,(func-info-name info) ,(func-info-params info) ,(func-info-results info) ,(func-info-instance info)
@@ -1550,8 +1222,6 @@
     (for ([i u32 0]) (< i (-> s count)) (+= i 1) (set! out (cons (scope-ref (@ (-> s ids) i)) out)))
     (sort out (lambda ([a datum] [b datum]) -> i32 (scope-ref<? a b)))))
 
-;; A module's copies first, then a module's own, then core and kernel-ids;
-;; each by its module's hash, then its number.
 (define (scope-ref<? [a datum] [b datum]) -> i32
   (let ([ra (scope-ref-rank a)] [rb (scope-ref-rank b)])
     (cond [(!= ra rb) (< ra rb)]
@@ -1563,21 +1233,17 @@
 (define (scope-ref-rank [r datum]) -> i32
   (cond [(== r (sym core)) 2] [(== r (sym kernel-ids)) 3] [(== (car r) (sym m)) 0] [else 1]))
 
-;; -1, 0 or 1, as string a is before, the same as or after string b.
 (define (string-compare [a datum] [b datum]) -> i32
   (let* ([n (string-length a)] [k (string-length b)] [c (memcmp (string-bytes a) (string-bytes b) (if (< n k) n k))])
     (cond [(< c 0) -1] [(> c 0) 1] [(< n k) -1] [(> n k) 1] [else 0])))
 
 ;; ---- loading an interface ----
 
-;; The module being loaded: its type forms, its types as they are made,
-;; and its definitions, each by number.
 (define loading datum 0)
 (define loaded-type-forms (ptr datum) 0)
 (define loaded-types (ptr datum) 0)
 (define loaded-infos (ptr datum) 0)
 
-;; The elements of list l in a new array of n, in the current arena.
 (define (array-of [l datum] [n u32]) -> (ptr datum)
   (let ([a (cast (ptr datum) (alloc-in (current-arena) (* 4 (+ n 1))))] [i u32 0])
     (while (< i n)
@@ -1586,8 +1252,6 @@
       (+= i 1))
     a))
 
-;; Load module m from its interface d, as if it had been compiled in this
-;; run.
 (define (load-module! [m datum] [d datum])
   (let* ([u (unit-of m)] [type-forms (section d (sym types))] [infos (section d (sym infos))]
          [nt (length type-forms)] [ni (length infos)]
@@ -1601,8 +1265,7 @@
     (set! loaded-type-forms (array-of type-forms nt))
     (set! loaded-types (array-of nil nt))
     (set! loaded-infos (array-of nil ni))
-    ;; Types, in any order: each made, then its fields, which may name any
-    ;; of them, then their groups and identities.
+    ;; Types: each made, then its fields, which may name any of them, then their groups.
     (for ([i u32 0]) (< i nt) (+= i 1) (type-shell i))
     (for ([i u32 0]) (< i nt) (+= i 1)
       (set-type-info-fields! (@ loaded-types i) (decode (list-ref (@ loaded-type-forms i) 4))))
@@ -1614,22 +1277,17 @@
     (for ([i u32 0]) (< i nt) (+= i 1)
       (own-type! m (@ loaded-types i))
       (set! (-> u types) (keep-cons (@ loaded-types i) (-> u types))))
-    ;; Its linklets, their names known.
     (for-each (lambda ([l datum])
                 (let ([phase (cast i32 (integer-value (car l)))])
                   (add-linklet! m phase `(,(cadr l) ,(caddr l) ,(cadddr l)
                                           ,(map (lambda ([r datum]) -> datum (make-integer (scope-at r))) (list-ref l 4))))
                   (linklet-name m phase 0)))
               (section d (sym linklets)))
-    ;; Definitions: the first are its own, as note-definitions! notes them;
-    ;; the rest are what else its sections refer to.
     (for ([i u32 0]) (< i ni) (+= i 1)
       (let ([info (list->info (decode (car infos)))])
         (set! (@ loaded-infos i) info)
         (when (< i definitions) (set! (-> u infos) (keep-cons info (-> u infos)))))
       (set! infos (cdr infos)))
-    ;; Its bindings, provides, function values, inline bodies, macros and
-    ;; facts.
     (for-each (lambda ([e datum])
                 (let* ([scopes (scope-set-of (cadr e))] [phase (cast i32 (integer-value (caddr e)))]
                        [b (bind-raw! (car e) scopes phase (decode (cadddr e)))]
@@ -1654,12 +1312,8 @@
       (for-each (lambda ([f datum]) (index-fact! m f)) (reverse (-> u facts))))
     (set! loading 0)
     (set! (-> u state) (sym done))
-    ;; As its requires would have when it was compiled: its own bindings
-    ;; are made, and its requires' installed at their shifts.
     (install-module-bindings! m 0)))
 
-;; An inline body, x (info params results body returns? assigned-keys
-;; memory?), kept as record-inline! keeps one.
 (define (load-inline! [x datum])
   (let* ([saved (use-arena (& run-arena))] [params (keep (cadr x))]
          [assigned (filter (lambda ([p datum]) -> i32 (!= (member (car p) (list-ref x 5)) 0)) params)]
@@ -1667,8 +1321,7 @@
     (use-arena saved)
     (hash-set! (& inlines) (cast u64 (car x)) (cast u32 b))))
 
-;; Its i-th type, made the first time something names it: a supertype is
-;; made before its subtypes, wherever it is listed.
+;; A supertype is made before its subtypes, wherever it is listed.
 (define (type-shell [i u32]) -> datum
   (let ([t (@ loaded-types i)])
     (if (!= t 0)
@@ -1678,8 +1331,7 @@
           (set! (@ loaded-types i) new)
           new))))
 
-;; The identity of t's group, once the groups of the types its members
-;; name have theirs; wasm allows no cycle between groups.
+;; t's group is identified after the groups its members name; wasm allows no cycles.
 (define (identify! [t datum])
   (when (== (type-info-identity t) 0)
     (let ([group (if (!= (type-info-group t) 0) (type-info-group t) (list1 t))] [members datum 0] [refs datum 0])
@@ -1692,8 +1344,6 @@
         (set! members (cdr members)))
       (identify-group! group))))
 
-;; The declared types type t names: its supertype, and those its fields or
-;; signature refer to.
 (define (type-references [t datum]) -> datum
   (let* ([fs (type-info-fields t)] [kind (type-info-kind t)]
          [vals (cond [(== kind (sym struct)) (map (lambda ([f datum]) -> datum (cadr f)) fs)]
@@ -1706,7 +1356,6 @@
       (set! vals (cdr vals)))
     out))
 
-;; x as encode wrote it, read back.
 (define (decode [x datum]) -> datum
   (if (not (pair? x))
       x
@@ -1716,8 +1365,6 @@
         [((sym %syntax))
          (make-syntax (decode (cadr x)) (scope-set-of (caddr x)) (srcloc-of (cadddr x)) (decode (list-ref x 4)))]
         [else
-         ;; A list's spine is walked: a tail that starts with %type, %info or
-         ;; %syntax is an object, and %quote quotes the next element.
          (let ([head nil] [last datum 0] [l x] [p datum 0])
            (while (and (pair? l) (not (object-tag? (car l))))
              (if (== (car l) (sym %quote))
@@ -1770,14 +1417,12 @@
 
 ;; ==== module bodies ====
 
-;; The core form name if s is (core-id ...), else #f.
 (define (core-head [s datum] [phase i32]) -> datum
   (if (and (syntax? s) (pair? (syntax-e s)) (identifier? (car (syntax-e s))))
       (let ([m (meaning-of (car (syntax-e s)) phase)])
         (if (and (!= m 0) (== (car m) (sym core))) (cadr m) 0))
       0))
 
-;; Expand macro uses at the head of s until it is something else.
 (define (head-expand [s datum] [phase i32]) -> datum
   (let* ([head (cond [(identifier? s) s]
                      [(and (syntax? s) (pair? (syntax-e s)) (identifier? (car (syntax-e s)))) (car (syntax-e s))]
@@ -1787,17 +1432,10 @@
         (head-expand (apply-macro head t s phase 1) phase)
         s)))
 
-;; A module body being expanded: its phase, whether its code is built as
-;; fully expanded code, the items pass 1 found (reversed), whether pass 2
-;; has started, and the forms lifted while pass 2 expands the current
-;; item (reversed).
 (struct body [phase i32] [syntax i32] [items datum] [pass2 i32] [lifted datum])
 
-(define current-body (ptr body) 0)          ; the innermost body being expanded
+(define current-body (ptr body) 0)
 
-;; A module body -> its code: lowered forms for the compiler (core.sub),
-;; or fully expanded code (spec 6.4). Other module-level forms take
-;; effect during expansion and leave nothing.
 (define (expand-body [forms datum] [phase i32]) -> datum
   (let ([b (cast (ptr body) (alloc-in (current-arena) (sizeof body)))] [saved current-body] [out datum 0])
     (set! (-> b phase) phase)
@@ -1811,8 +1449,6 @@
     (set! current-body saved)
     out))
 
-;; Pass 2 for body b: expand bodies and expressions, in the order pass 1
-;; declared them. What an item lifts goes before it.
 (define (finish-body! [b (ptr body)]) -> datum
   (set! (-> b pass2) 1)
   (let ([items (reverse (-> b items))] [out nil] [item-out datum 0] [lifted datum 0])
@@ -1829,10 +1465,6 @@
 
 (define (item! [b (ptr body)] [x datum]) (set! (-> b items) (cons x (-> b items))))
 
-;; Pass 1 for module-level form f0 of body b: expand macro uses at its
-;; head, then declare it, run it, or keep it for pass 2. only is 0, or
-;; says where the form came from if it may only be a definition or an
-;; expression (what a macro lifts).
 (define (declare-form! [f0 datum] [b (ptr body)] [only (ptr u8)])
   (let* ([phase (-> b phase)] [f (head-expand f0 phase)] [kind (core-head f phase)])
     (when (and (!= only 0)
@@ -1840,7 +1472,7 @@
       (fail-at f "~a (~a ...), but only func, global, import, type, tag, data and #%fact forms and expressions are allowed there"
                `(,(bytes->string only (strlen only)) ,kind)))
     (case kind
-      ;; A form a macro's begin splices is its output too (spec 6.2).
+      ;; A form a macro's begin splices is its output too.
       [((sym begin))
        (let ([forms (cdr (form-list f "(begin form ...)"))])
          (for-each (lambda ([g datum]) (declare-form! (at-use f g) b only)) forms))]
@@ -1864,17 +1496,14 @@
            (interact! f0 f b)
            (item! b `(expr ,f)))])))
 
-;; Lift form, from a macro, to the module level of the body being expanded
-;; (spec 6.4): declare it now, so its names can be used at once, and put
-;; its code before the form whose expansion lifted it.
+;; Declared now, so its names can be used at once; its code goes before the form that
+;; lifted it.
 (define (lift! [form datum] [where datum] [phase i32])
   (let ([b current-body] [before datum 0] [new nil] [l datum 0] [saved to-syntax])
     (unless (and (!= b 0) (== (-> b phase) phase))
       (fail-at where "syntax-local-lift-definition: no module body is being expanded at phase ~a" (list1 (make-integer phase))))
     (set! before (-> b items))
     (declare-form! form b "syntax-local-lift-definition was given")
-    ;; In pass 2 the new items, those before the old ones, are expanded
-    ;; now, in order; in pass 1 they wait for pass 2 like the others.
     (when (-> b pass2)
       (set! l (-> b items))
       (while (!= l before)
@@ -1887,13 +1516,10 @@
         (set! new (cdr new)))
       (set! to-syntax saved))))
 
-;; The elements of syntax list f, or an error: f matched none of the
-;; patterns.
 (define (form-list [f datum] [patterns (ptr u8)]) -> datum
   (let ([l (syntax->list f)])
     (if (== l 0) (no-match f patterns) l)))
 
-;; Pass 2 for one item: its forms, in the body's code.
 (define (expand-item [item datum] [phase i32]) -> datum
   (case (car item)
     [((sym func)) (expand-func item phase)]
@@ -1909,8 +1535,6 @@
   `((anyref . any) (eqref . eq) (i31ref . i31) (structref . struct) (arrayref . array)
     (funcref . func) (externref . extern) (exnref . exn)))
 
-;; A heap type: an abstract name, a type declared with `type`, or
-;; (closure (t ... -> r ...)), the closure type of a signature (spec 5.3).
 (define (parse-heap [s datum] [phase i32]) -> datum
   (cond [(and (identifier? s) (!= (memq (syntax-e s) abstract-heaps) 0)) (syntax-e s)]
         [(identifier? s)
@@ -1923,7 +1547,6 @@
            (let ([sig (parse-signature (cadr l) phase)]) (closure-type (car sig) (cdr sig))))]
         [else (fail-at s "expected a heap type, got ~s" (list1 (syntax->datum s)))]))
 
-;; A value type.
 (define (parse-type [s datum] [phase i32]) -> datum
   (let* ([d (syntax-e s)] [short (assq d shorthand-refs)])
     (cond [(!= (memq d `(i32 i64 f32 f64)) 0) d]
@@ -1936,9 +1559,8 @@
                    [(and (pair? d) (named? (car d) (sym ref))) (fail-at s "expected (ref T) or (ref null T)" nil)]
                    [else (fail-at s "expected a type (i32, i64, f32, f64 or a reference type), got ~s" (list1 (syntax->datum s)))]))])))
 
-;; Is x an identifier named name? The words of type syntax are compared by
-;; name, like wasm's keywords, so they are reserved: no declared type may
-;; be named by one (spec 5.1).
+;; The words of type syntax are compared by name, like wasm's keywords, so no declared
+;; type may be named by one.
 (define (named? [x datum] [name datum]) -> i32 (and (identifier? x) (== (syntax-e x) name)))
 
 (define (parse-reftype [s datum] [phase i32]) -> datum
@@ -1948,7 +1570,6 @@
 
 (define type-keywords datum `(ref null mut struct array field sub final func rec ->))
 
-;; A kind of declared type, with its article, for messages.
 (define (kind-word [kind datum]) -> datum
   (case kind [((sym struct)) `"a struct"] [((sym array)) `"an array"] [((sym func)) `"a function"] [else `"a"]))
 
@@ -1959,8 +1580,6 @@
           [(!= (memq name type-keywords) 0)
            (fail-at id "~a is a word of type syntax, so it cannot name a type" (list1 name))])))
 
-;; A field or element type: a storage type, optionally (mut storage), as
-;; (storage mutable?).
 (define (parse-field-type [s datum] [phase i32]) -> datum
   (let ([l (syntax->list s)])
     (if (and (!= l 0) (== (length l) 2) (named? (car l) (sym mut)))
@@ -1971,20 +1590,12 @@
   (if (and (identifier? s) (or (== (syntax-e s) (sym i8)) (== (syntax-e s) (sym i16)))) (syntax-e s) (parse-type s phase)))
 
 ;; ---- macros in types ----
-;;
-;; In a type position, a form whose head is a macro is expanded until its
-;; head is not a macro (a type function, spec 5.1). The expand- functions
-;; return type syntax with every such use expanded, which is what fully
-;; expanded code holds; the parse- functions then read that syntax.
 
-;; The transformer of s's head if s is (macro ...), else #f.
 (define (type-macro-use [s datum] [phase i32]) -> datum
   (if (and (syntax? s) (pair? (syntax-e s)) (identifier? (car (syntax-e s))))
       (transformer-of (meaning-of (car (syntax-e s)) phase))
       0))
 
-;; A type name or heap type: macro uses at its head expanded, and the
-;; types in a closure type's signature.
 (define (expand-type-name [s datum] [phase i32]) -> datum
   (let ([t (type-macro-use s phase)])
     (cond [(!= t 0) (expand-type-name (apply-macro (car (syntax-e s)) t s phase 0) phase)]
@@ -1994,14 +1605,12 @@
              (syntax-rewrap s `(,(car l) ,(expand-signature (cadr l) phase))))]
           [else s])))
 
-;; A value type.
 (define (expand-type [s0 datum] [phase i32]) -> datum
   (let* ([s (expand-type-name s0 phase)] [l (syntax->list s)])
     (if (and (!= l 0) (pair? l) (named? (car l) (sym ref)) (pair? (cdr l)))
         (syntax-rewrap s (append (take l (- (length l) 1)) (list1 (expand-type-name (last l) phase))))
         s)))
 
-;; A field, element or global type: a type, i8, i16, or (mut ...) of one.
 (define (expand-field-type [s datum] [phase i32]) -> datum
   (let ([l (syntax->list s)])
     (cond [(and (!= l 0) (== (length l) 2) (named? (car l) (sym mut)))
@@ -2009,13 +1618,11 @@
           [(or (== (syntax-e s) (sym i8)) (== (syntax-e s) (sym i16))) s]
           [else (expand-type s phase)])))
 
-;; A signature (t ... -> r ...).
 (define (expand-signature [s datum] [phase i32]) -> datum
   (let ([l (syntax->list s)])
     (when (== l 0) (fail-at s "expected a signature (type ... -> type ...)" nil))
     (syntax-rewrap s (map (lambda ([t datum]) -> datum (if (named? t (sym ->)) t (expand-type t phase))) l))))
 
-;; A type definition: (struct (field name t) ...), (array t), or (sub ... def).
 (define (expand-type-def [s datum] [phase i32]) -> datum
   (let ([l (syntax->list s)])
     (cond [(and (!= l 0) (pair? l) (pair? (cdr l)) (named? (car l) (sym sub)))
@@ -2033,18 +1640,14 @@
            (syntax-rewrap s `(,(car l) ,(expand-field-type (cadr l) phase)))]
           [else s])))
 
-;; (type name def), where def is (struct (field fname ftype) ...),
-;; (array etype), or (sub [final] [super] def) as in wasm (spec 5.2). A def
-;; without sub is final, with no supertype. The name is bound before the
-;; fields are read, so a type may refer to itself.
+;; The name is bound before the fields are read, so a type may refer to itself.
 (define (declare-type [f datum] [phase i32]) -> datum
   (let* ([m (begin-type-member f phase)] [xdef (finish-type-member! m phase)])
     (identify-group! (list1 (cadddr m)))
     `(plain ,(type-member-out m xdef) ((type ,(cadddr m))))))
 
-;; (rec (type name def) ...): types that may refer to each other, one wasm
-;; recursion group (spec 5.2). Every name is bound before any fields are
-;; read. A supertype must still come earlier, as in wasm.
+;; Every name is bound before any fields are read; a supertype must still come
+;; earlier, as in wasm.
 (define (declare-rec [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (>= (length l) 2)) (no-match f "(rec type0 type ...)"))
@@ -2067,7 +1670,6 @@
           (set! xdefs (cdr xdefs)))
         `(plain ,(out f (sym rec) (reverse outs)) ,(map (lambda ([i datum]) -> datum `(type ,i)) infos))))))
 
-;; A member of a rec group whose supertype is a later member.
 (define (check-super-not-later [t datum] [later datum])
   (let ([l (syntax->list t)])
     (when (and (!= l 0) (== (length l) 3))
@@ -2084,13 +1686,8 @@
                           later))
           (fail-at super "~a must be declared before its subtype ~a, as in wasm" `(,(syntax-e super) ,(syntax-e name))))))))
 
-;; A type declaration being read: (form name written info), the (type name
-;; def) form and the declared type. Its fully expanded form holds xdef,
-;; def with its types expanded, once read.
 (define (type-member-out [m datum] [xdef datum]) -> datum (out (car m) (sym type) `(,(cadr m) ,xdef)))
 
-;; Check (type name def), resolve its supertype, and bind name. The fields
-;; are read afterwards (finish-type-member!).
 (define (begin-type-member [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l)) (syntax? (caddr l)) (pair? (syntax->list (caddr l))))
@@ -2112,9 +1709,7 @@
           (bind-definition! name phase `(type ,info))
           `(,f ,name ,written ,info))))))
 
-;; Read the fields of a type whose name is bound. They are expanded after
-;; the name is bound, so a type function may be given the type itself.
-;; Returns def expanded.
+;; Expanded after the name is bound, so a type function may be given the type itself.
 (define (finish-type-member! [m datum] [phase i32]) -> datum
   (let* ([info (cadddr m)]
          [xdef (expand-type-def (caddr m) phase)]
@@ -2123,7 +1718,6 @@
     (when (!= (type-info-super info) 0) (check-subtype-fields! info (type-info-super info) xinner))
     xdef))
 
-;; (sub [final] [super] def) -> (def final? super-type-info-or-#f).
 (define (parse-sub [s datum] [phase i32]) -> datum
   (let ([l (syntax->list s)])
     (cond [(or (== l 0) (not (pair? l)) (not (named? (car l) (sym sub)))) `(,s #t #f)]
@@ -2146,10 +1740,7 @@
       [((sym func)) (let ([sig (parse-signature (cadr l) phase)]) `(,(car sig) ,(cdr sig)))]
       [else (parse-field-type (cadr l) phase)])))
 
-;; Wasm's rule for a declared supertype: a struct starts with its
-;; supertype's fields, and an array's element matches. An immutable field
-;; may narrow its type; a mutable one keeps it.
-(define (field<=? [a datum] [b datum]) -> i32               ; (storage mutable?)
+(define (field<=? [a datum] [b datum]) -> i32
   (and (== (cadr a) (cadr b))
        (if (or (== (car a) (sym i8)) (== (car a) (sym i16)) (== (car b) (sym i8)) (== (car b) (sym i16)))
            (== (car a) (car b))
@@ -2170,8 +1761,6 @@
     [((sym array))
      (unless (field<=? (type-info-fields info) (type-info-fields super))
        (fail-at where "~a's element type does not match its supertype ~a's" `(,(type-info-name info) ,(type-info-name super))))]
-    ;; A function subtype accepts at least its supertype's parameters and
-    ;; returns at most its results.
     [else
      (let ([mine (type-info-fields info)] [theirs (type-info-fields super)])
        (unless (and (types<=? (car theirs) (car mine)) (types<=? (cadr mine) (cadr theirs)))
@@ -2194,12 +1783,10 @@
 
 ;; ==== other module-level forms ====
 
-;; A string literal, and a count: a fixnum from 0.
 (define (string-literal? [s datum]) -> i32 (string? (syntax-e s)))
 (define (count-literal? [s datum]) -> i32
   (let ([n (syntax-e s)]) (and (integer? n) (>= (integer-value n) 0) (< (integer-value n) 1073741824))))
 
-;; `-> t` or `-> (t ...)`: (results . the rest of body).
 (define (parse-results [body datum] [phase i32]) -> datum
   (cond [(and (pair? body) (named? (car body) (sym ->)) (pair? (cdr body)))
          (let* ([r (cadr body)] [l (syntax->list r)])
@@ -2210,9 +1797,7 @@
         [(and (pair? body) (named? (car body) (sym ->))) (fail-at (car body) "expected a type after ->" nil)]
         [else (cons nil body)]))
 
-;; The `-> r` that starts rest, a func's or a lambda's, as a list of the
-;; two, or (). r is one type or a list of them, and has its types
-;; expanded; a macro use is one type, though it looks like a list.
+;; A macro use is one type, though it looks like a list.
 (define (arrow-of [rest datum] [phase i32]) -> datum
   (cond [(and (pair? rest) (named? (car rest) (sym ->)) (pair? (cdr rest)))
          (let* ([r (cadr rest)] [l (syntax->list r)])
@@ -2222,7 +1807,6 @@
         [(and (pair? rest) (named? (car rest) (sym ->))) (fail-at (car rest) "expected a type after ->" nil)]
         [else nil]))
 
-;; (t ... -> r ...): (params . results).
 (define (parse-signature [s datum] [phase i32]) -> datum
   (let ([l (syntax->list s)] [params nil])
     (when (or (== l 0) (not (ormap (lambda ([t datum]) -> i32 (named? t (sym ->))) l)))
@@ -2233,9 +1817,6 @@
     (cons (map (lambda ([t datum]) -> datum (parse-type t phase)) (reverse params))
           (map (lambda ([t datum]) -> datum (parse-type t phase)) (cdr l)))))
 
-;; The options after a func's head, [#:inline] [#:value g] (spec 5.2), as
-;; (inline value rest): the #:inline keyword or #f, the list (#:value g)
-;; or #f, and what follows them.
 (define (func-options [rest datum]) -> datum
   (let* ([inline (if (and (pair? rest) (== (syntax-e (car rest)) `#:inline)) (car rest) 0)]
          [rest (if (!= inline 0) (cdr rest) rest)]
@@ -2247,7 +1828,6 @@
                     0)])
     `(,inline ,value ,(if (!= value 0) (cddr rest) rest))))
 
-;; (func (name [p t] ...) [#:inline] [#:value g] [-> r] body ...)
 (define (declare-func [f datum] [phase i32]) -> datum
   (let* ([l (syntax->list f)] [head (if (and (!= l 0) (>= (length l) 2)) (syntax->list (cadr l)) 0)])
     (unless (and (!= head 0) (pair? head) (identifier? (car head))) (no-match f "(func (name param ...) . body)"))
@@ -2265,15 +1845,11 @@
       (when (!= value 0) (hash-set! (& function-values) (cast u64 info) (cast u32 (keep (cons (cadr value) (make-integer phase))))))
       `(func ,name ,params ,arrow ,(caddr ct) ,f ,(car ct) ,inline ,value ,info))))
 
-;; A parameter [name type], as (name type) with the type expanded.
 (define (param-of [p datum] [phase i32]) -> datum
   (let ([l (syntax->list p)])
     (unless (and (!= l 0) (== (length l) 2) (identifier? (car l))) (no-match p "(name type)"))
     `(,(car l) ,(expand-type (cadr l) phase))))
 
-;; An optional (type T) first in a func's body declares its function type
-;; T, as in wasm (spec 5.2): the type other modules and ref.func see it
-;; at. Its parameters and results must be T's. Returns (clause T body).
 (define (func-type-clause [body datum] [params datum] [results datum] [phase i32]) -> datum
   (let ([first (if (pair? body) (syntax->list (car body)) 0)])
     (if (and (!= first 0) (== (length first) 2) (named? (car first) (sym type)))
@@ -2284,8 +1860,6 @@
           `(,(syntax-rewrap (car body) `(,(car first) ,tname)) ,t ,(cdr body)))
         `(#f #f ,body))))
 
-;; The body forms of a function or a lambda, each expanded with scope sc
-;; added: (forms . whether they have closures, #t or #f).
 (define (expand-scoped [body datum] [sc u32] [phase i32]) -> datum
   (let ([outer lowered-closures] [r datum 0] [flag 0])
     (set! lowered-closures 0)
@@ -2294,8 +1868,6 @@
     (set! lowered-closures outer)
     (cons r (boolean flag))))
 
-;; (func (name [p t] ...) [-> r] body ...), expanded: its lowered form,
-;; for the compiler, or its fully expanded form.
 (define (expand-func [p datum] [phase i32]) -> datum
   (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
          [f (list-ref p 5)] [clause (list-ref p 6)] [inline (list-ref p 7)] [value (list-ref p 8)] [info (list-ref p 9)]
@@ -2325,7 +1897,6 @@
           (when (!= value 0) (function-value info))
           (list1 `(func ,info ,ps ,code ,(cdr r)))))))
 
-;; (global name type init) or (global name (mut type) init), as in wasm.
 (define (declare-global [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 4) (identifier? (cadr l))) (no-match f "(global name type init)"))
@@ -2342,7 +1913,6 @@
         (list1 (out (cadr p) (sym global) `(,(cadr l) ,(caddr p) ,(car r))))
         (list1 `(global ,(cadddr p) ,(car r) ,(cdr r))))))
 
-;; Expression e expanded: (its code . whether it has closures).
 (define (expand-noted [e datum] [phase i32]) -> datum
   (let ([outer lowered-closures] [r datum 0] [flag 0])
     (set! lowered-closures 0)
@@ -2353,9 +1923,6 @@
 
 (define (closures-noted-expr [e datum] [phase i32]) -> datum (expand-noted e phase))
 
-;; (import name "module" "field" (t ... -> r ...)), or with a function
-;; type's name in place of the signature, to import the function at that
-;; type (spec 5.2).
 (define (declare-import [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 5) (identifier? (cadr l)) (string-literal? (caddr l)) (string-literal? (cadddr l)))
@@ -2373,7 +1940,6 @@
       (bind-definition! name phase `(func ,(func-info (syntax-e name) (car pr) (cdr pr) (syntax-e module) (syntax-e field) ftype)))
       `(plain ,(out f (sym import) `(,name ,module ,field ,sig)) ()))))
 
-;; (data name offset "bytes" ...): an active segment in the module's memory.
 (define (declare-data [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (>= (length l) 3) (identifier? (cadr l)) (count-literal? (caddr l))
@@ -2389,8 +1955,6 @@
         (bind-definition! (cadr l) phase `(data ,info))
         `(plain ,(core-headed f (sym data)) ((data ,info)))))))
 
-;; (tag name (t ...)): a tag, whose exceptions carry values of types t ...
-;; (spec 5.2).
 (define (declare-tag [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l)) (syntax? (caddr l)) (!= (syntax->list (caddr l)) 0))
@@ -2407,13 +1971,6 @@
 
 ;; ---- require, provide, storage ----
 
-;; (require name source item ...), where source is "path" or kernel (the
-;; kernel module). Everything the source provides is bound as name:thing.
-;; Each item also binds one thing unqualified: x as itself, or [new old] as
-;; new. A require at phase p imports at phase p (spec 3.1).
-;; (require-unqualified name source) is require with every name the source
-;; provides also bound unqualified, with the scopes of name. It is meant
-;; for a language's core forms, and little else (spec 3.1).
 (define (require! [f datum] [phase i32] [all i32])
   (let ([l (syntax->list f)])
     (if all
@@ -2444,13 +2001,11 @@
             (for-each (lambda ([p datum]) (bind-import! (car names) phase (cdr p))) ps))
           (set! items (cdr items)))))))
 
-;; A module's source in a require: a path, kernel, or (compiled file).
 (define (module-source? [s datum]) -> i32
   (let ([l (syntax->list s)])
     (or (string-literal? s) (named? s (sym kernel))
         (and (!= l 0) (== (length l) 2) (named? (car l) (sym compiled)) (string-literal? (cadr l))))))
 
-;; name:thing, with the scopes of name.
 (define (qualified [name datum] [sym datum]) -> datum
   (datum->syntax name (string->symbol (format-message "~a:~a" `(,(syntax-e name) ,sym))) name))
 
@@ -2464,9 +2019,6 @@
          [c (memcmp x y (if (< n m) n m))])
     (or (< c 0) (and (== c 0) (< n m)))))
 
-;; The kernel module's contract (spec 2.3), required as name at phase:
-;; kernel.sub's functions and tags, sorted by name, from the running
-;; compiler's instance, the same at every phase.
 (define (require-kernel! [name datum] [phase i32]) -> datum
   (ensure-kernel!)
   (let* ([key (cons (syntax-e name) (make-integer phase))] [named (assoc key (-> current require-names))])
@@ -2475,29 +2027,20 @@
     (when (== named 0) (set! (-> current require-names) (cons (cons key kernel) (-> current require-names))))
     (-> (unit-of kernel) provides)))
 
-;; The file that require form f's source spec names. A relative path is
-;; resolved from the file the spec is written in, or, if the spec has no
-;; location, from the file f is in. So a require that a macro makes names
-;; a file relative to the macro's own file.
+;; A relative path is from the file the path is written in, so a require a macro makes
+;; names a file relative to the macro's own file.
 (define (module-path-of [f datum] [spec datum]) -> datum
   (let* ([loc (if (!= (syntax-srcloc spec) 0) (syntax-srcloc spec) (syntax-srcloc f))]
          [dir (if (!= loc 0) (directory-of (symbol->string (-> loc source))) `"")]
          [given (syntax-e spec)])
     (if (absolute-path? given) given (string-append-2 dir given))))
 
-;; Compile the module if needed and make its own bindings resolvable for
-;; its macros. Returns what it provides, as seen from phase.
 (define (require-module! [f datum] [name datum] [spec datum] [phase i32]) -> datum
   (require-unit! name (compile-module-file (module-path-of f spec)) phase))
 
-;; (require name (compiled file) item ...): the entry of the compiled
-;; file, loaded with its requires (spec 3.7).
 (define (require-compiled! [f datum] [name datum] [spec datum] [phase i32]) -> datum
   (require-unit! name (load-compiled-file (canonical-path (module-path-of f (cadr (syntax-e spec))))) phase))
 
-;; Module m, required as name at phase: recorded; what it provides, as
-;; seen from phase. A module required at a phase above 0 comes with
-;; compile-time code.
 (define (require-unit! [name datum] [m datum] [phase i32]) -> datum
   (let* ([me (the-module)] [key (cons (syntax-e name) (make-integer phase))]
          [named (assoc key (-> current require-names))] [req (cons m (make-integer phase))])
@@ -2509,17 +2052,11 @@
       (install-module-bindings! m (cast u32 phase)))
     (map (lambda ([p datum]) -> datum (cons (car p) (shift-meaning (cdr p) (cast u32 phase)))) (-> (unit-of m) provides))))
 
-;; The module a require named at this phase.
 (define (required-module [name datum] [phase i32]) -> datum
   (let ([named (if (identifier? name) (assoc (cons (syntax-e name) (make-integer phase)) (-> current require-names)) 0)])
     (when (== named 0) (fail-at name "~s is not the name of a module required at this phase" (list1 (syntax->datum name))))
     (cdr named)))
 
-;; (provide item ...): x provides x, and [new old] provides old under the
-;; name new; (all-from-out m) provides what module m, required at phase 0,
-;; provides, and (except-out (all-from-out m) x ...) all that but the
-;; names x ... (spec 3.1). Recorded as (name . id), resolved when the
-;; module is done.
 (define (provide! [f datum] [phase i32])
   (unless (== phase 0) (fail-at f "provide belongs at phase 0" nil))
   (let ([l (syntax->list f)] [items nil])
@@ -2537,7 +2074,6 @@
                   (set! (-> current provide-ids) (cons item (-> current provide-ids)))))
               items)))
 
-;; A provide item as a list of (name . id).
 (define (provide-items [item datum]) -> datum
   (let ([l (syntax->list item)])
     (cond [(identifier? item) (list1 (cons item item))]
@@ -2549,8 +2085,6 @@
           [(and (!= l 0) (== (length l) 2) (identifier? (car l)) (identifier? (cadr l))) (list1 (cons (car l) (cadr l)))]
           [else (no-match item "name, (all-from-out module), (except-out (all-from-out module) name ...) or (new-name name)")])))
 
-;; What the module required as name provides, but the names excluded, as
-;; provide items: each one's qualified binding, name:thing.
 (define (all-from-items [name datum] [excluded datum]) -> datum
   (let* ([m (unit-of (required-module name 0))] [out (map (lambda ([x datum]) -> datum (syntax-e x)) excluded)]
          [syms nil] [ps (-> m provides)])
@@ -2563,9 +2097,6 @@
     (map (lambda ([sym datum]) -> datum (cons (datum->syntax name sym name) (qualified name sym)))
          (filter (lambda ([sym datum]) -> i32 (== (memq sym out) 0)) (reverse syms)))))
 
-;; (memory pages) or (memory from name), and likewise (table ...): the
-;; module's memory or table at this phase. name is a module required at
-;; this phase (spec 3.3).
 (define (declare-storage! [f datum] [phase i32])
   (let* ([l (syntax->list f)] [kind (syntax-e (car l))] [memory (== kind (sym memory))]
          [table (if memory (-> current memories) (-> current tables))] [form datum 0])
@@ -2580,12 +2111,9 @@
         (set! (-> current memories) (cons (cons (make-integer phase) form) (-> current memories)))
         (set! (-> current tables) (cons (cons (make-integer phase) form) (-> current tables))))))
 
-;; Instance names (spec 3.2): "<module>@<phase>+<shift>" for a module's
-;; linklet at a phase shift. The compiler reads a name back only through
-;; this table: name, a symbol -> (module phase shift).
+;; The compiler reads an instance name back only through this table.
 (define instance-refs hash-table)
 
-;; The name of module m's phase-q linklet at phase shift t.
 (define (linklet-name [m datum] [q i32] [t i32]) -> datum
   (let* ([name (format-message "~a@~a+~a" `(,(-> (unit-of m) name) ,(make-integer q) ,(make-integer t)))]
          [key (cast u64 (string->symbol name))])
@@ -2593,23 +2121,16 @@
       (hash-set! (& instance-refs) key (cast u32 (keep `(,m ,(make-integer q) ,(make-integer t))))))
     name))
 
-;; The module linklet an instance name names, as (module phase shift), or
-;; #f. The table also names compile-time linklets, as (module phase).
 (define (linklet-ref [name datum]) -> datum
   (let ([r (cast datum (hash-ref (& instance-refs) (cast u64 (string->symbol name))))])
     (if (and (!= r 0) (pair? (cddr r))) r 0)))
 
-;; The module whose linklet the instance named name is, or #f: the kernel
-;; module's is its unit, unless kernel.sub compiled from source has the
-;; name (kernel-infos).
 (define (instance-unit [name datum]) -> datum
   (let ([r (linklet-ref name)])
     (cond [(!= r 0) (car r)]
           [(kernel-name? name) kernel]
           [else 0])))
 
-;; (freestanding): after expansion, the program needs nothing beyond the
-;; host at run time (spec 3.4).
 (define (freestanding! [f datum] [phase i32])
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 1)) (no-match f "(freestanding)"))
@@ -2617,40 +2138,20 @@
     (set! (-> current freestanding-form) f)))
 
 ;; ==== compile-time evaluation ====
-;;
-;; A module's compile-time code runs while the module is expanded. Each
-;; begin-for-syntax, and each define-syntax whose value needs code to run,
-;; is compiled into a linklet and instantiated in the module's
-;; compile-time store (spec 3.2), after the linklets of the modules it
-;; requires. The same code also goes into the module's linklet for that
-;; phase. The compile-time store is a namespace inside the compiler's own
-;; store; the running compiler's instances, including the kernel module,
-;; are outside it ("the kernel module", above).
 
-;; The name of the next compile-time linklet of module m's phase q.
 (define (next-linklet-name! [m datum] [q i32]) -> datum
   (let ([name (format-message "~a@~a#~a" `(,(-> (unit-of m) name) ,(make-integer q) ,(make-integer (-> current linklet-counter))))])
     (+= (-> current linklet-counter) 1)
     (hash-set! (& instance-refs) (cast u64 (string->symbol name)) (cast u32 (keep `(,m ,(make-integer q)))))
     name))
 
-;; Instance name, in the namespace of the module being compiled.
 (define (ns-name [name datum]) -> datum (format-message "~a/~a" `(,(-> current ns) ,name)))
 
-;; Is the instance named name one of a namespace: a module's linklet or a
-;; compile-time linklet? The running compiler's, the kernel module's among
-;; them, and the host's are the store's own.
 (define (namespaced? [name datum]) -> i32
   (and (== (group-instance name) 0) (!= (hash-ref (& instance-refs) (cast u64 (string->symbol name))) 0)))
 
 (define (integer-at [l datum] [n u32]) -> i32 (cast i32 (integer-value (list-ref l n))))
 
-;; What a linklet's imports link to when it is instantiated at phase shift
-;; t: each (import . instance) for the module names its code imports from
-;; that are linklets. A linklet of the kernel module's group is the running
-;; build's at any shift (kernel-group); another module linklet's name,
-;; relative to shift 0, moves by t; a compile-time linklet is in the
-;; namespace; the others keep their names.
 (define (import-map [imports datum] [t u32]) -> datum
   (let ([out nil] [r datum 0] [g datum 0])
     (while (pair? imports)
@@ -2664,14 +2165,10 @@
       (set! imports (cdr imports)))
     out))
 
-;; Make sure the instance an import names exists: imp is relative to a
-;; linklet instantiated at phase shift shift.
 (define (ensure-import! [imp datum] [shift u32])
   (let ([r (if (!= (group-instance imp) 0) 0 (linklet-ref imp))])
     (when (!= r 0) (ensure-linklet! (car r) (integer-at r 1) (+ (cast u32 (integer-at r 2)) shift)))))
 
-;; Instantiate module m's phase-q linklet at phase shift t, dependencies
-;; first.
 (define (ensure-linklet! [m datum] [q i32] [t u32])
   (let* ([name (ns-name (linklet-name m q (cast i32 t)))] [key (cast u64 (string->symbol name))] [p (ptr linklet) 0])
     (when (== (table-ref (-> current instances) key) 0)
@@ -2681,10 +2178,6 @@
       (instantiate! name (-> p bytes) (-> p imports) (-> p scopes) t 0)
       (table-set! (-> current instances) key 1))))
 
-;; Instantiate bytes as the instance named name, its imports linked as
-;; import-map says for phase shift t, while the kernel module maps the
-;; linklet's scope table, scopes, to the run's scopes at t (spec 3.5). If
-;; that fails, the compile error is at where, the code it comes from.
 (define (instantiate! [name datum] [bytes datum] [imports datum] [scopes datum] [t u32] [where datum])
   (let ([m (make-buffer)] [map (import-map imports t)] [ok i32 0])
     (while (pair? map)
@@ -2707,10 +2200,6 @@
           (fail-at where "~a" (list1 (session-failure (host-error))))
           (fail-at where "compile-time code failed: ~a" (list1 (host-error)))))))
 
-;; The run's scope for each index of a linklet's scope table, at phase
-;; shift t: a module scope, module X's copy for phase shift s, becomes X's
-;; copy for s + t, which shifts the literals of a linklet instantiated at a
-;; phase shift (spec 6.1); any other scope is itself.
 (define (scope-map-of [scopes datum] [t u32]) -> (ptr u32)
   (let ([p (cast (ptr u32) (alloc-in (current-arena) (* 4 (+ (length scopes) 1))))] [i u32 0] [sc u32 0] [o datum 0])
     (while (pair? scopes)
@@ -2721,13 +2210,10 @@
       (set! scopes (cdr scopes)))
     p))
 
-;; The host's message for its last failure.
 (define (host-error) -> datum
   (let* ([p (cast (ptr u8) (alloc-in (current-arena) 2048))] [n (error-message p 2048)])
     (bytes->string p n)))
 
-;; Compile forms as the linklet named name and instantiate it, after what
-;; it imports. A trap is reported at where.
 (define (instantiate-linklet! [name datum] [forms datum] [where datum])
   (set-current-source! (module-source))
   (let ([compiled (compile-module forms name)])
@@ -2735,18 +2221,12 @@
     (instantiate! (ns-name name) (car compiled) (cadr compiled) (cadddr compiled) 0 where)
     (table-set! (-> current instances) (cast u64 (string->symbol (ns-name name))) 1)))
 
-;; A linklet of this module's phase-phase code, run now, as each
-;; begin-for-syntax is. Its code also goes into the module's linklet of
-;; that phase.
 (define (run-compile-time-linklet! [forms datum] [phase i32] [where datum])
   (check-phase-data! forms phase where)
   (add-phase-forms! phase forms)
   (let ([name (next-linklet-name! (-> current module) phase)])
     (instantiate-linklet! name (append (linklet-storage-forms phase name) forms) where)))
 
-;; Adds `forms` to the code that will be compiled into the module's
-;; linklet for `phase`. A session skips this: its inputs are compiled and
-;; run straight away, and it never produces a linklet per phase.
 (define (add-phase-forms! [phase i32] [forms datum])
   (unless (in-session?)
     (let ([e (assoc (make-integer phase) (-> current phase-forms))])
@@ -2754,10 +2234,6 @@
           (set-cdr! e (append (reverse forms) (cdr e)))
           (set! (-> current phase-forms) (cons (cons (make-integer phase) (reverse forms)) (-> current phase-forms)))))))
 
-;; The memory and table forms for a compile-time linklet at phase, named
-;; name (spec 3.3). A phase's linklets share one memory: the first linklet
-;; after (memory pages) defines it, and later ones import it from that
-;; linklet. Tables likewise.
 (define (linklet-storage-forms [phase i32] [name datum]) -> datum
   (let ([out nil] [kinds `(memory table)] [form datum 0] [owner datum 0])
     (while (pair? kinds)
@@ -2773,8 +2249,6 @@
       (set! kinds (cdr kinds)))
     (reverse out)))
 
-;; The index in the compiler's table of function info, whose instance is
-;; made if need be.
 (define (function-index [info datum]) -> i32
   (let* ([instance (func-info-instance info)] [export (func-info-export info)] [target datum 0] [i i32 -1])
     (ensure-import! instance 0)
@@ -2783,8 +2257,6 @@
     (when (< i 0) (fail-at 0 "internal: no function ~a in ~a" `(,export ,instance)))
     i))
 
-;; A compile-time value, from its getter function. Fetched when first
-;; needed.
 (define (compile-time-value [getter datum]) -> datum
   (let ([cached (cast datum (table-ref (-> current values) (cast u64 getter)))] [v datum 0])
     (if (!= cached 0)
@@ -2794,23 +2266,11 @@
           (table-set! (-> current values) (cast u64 getter) (cast u32 (cons v nil)))
           v))))
 
-;; The transformer meaning m is bound to, if m is a compile-time value
-;; that is a transformer; otherwise #f.
 (define (transformer-of [m datum]) -> datum
   (if (and (!= m 0) (== (car m) (sym compile-time-value)))
       (let ([v (compile-time-value (cadr m))]) (if (transformer? v) v 0))
       0))
 
-;; (define-syntax name expr): name is bound to expr's value at phase+1, a
-;; datum in memory, a compile-time value, which macros read with
-;; syntax-local-value; if the value is a transformer, name is a macro.
-;; In (define-syntax name f), where f names a phase+1 function of type
-;; (i32) -> i32, the value is a transformer that calls f. The value lives
-;; in a global of the phase+1 linklet, computed when the linklet is
-;; instantiated; while this module is expanded, it is computed now, and
-;; only new code is compiled for it (spec 3.1). A value that needs none, a
-;; transformer that calls f or what plain? accepts, the expander makes
-;; itself; any other is compiled and run now.
 (define (define-syntax! [f datum] [phase i32])
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l))) (no-match f "(define-syntax id rhs)"))
@@ -2841,28 +2301,19 @@
       (hash-set! (& macro-modules) (cast u64 getter) (cast u32 (-> current module)))
       (bind-definition! id phase `(compile-time-value ,getter)))))
 
-;; The define-syntax getter of each macro -> the module that defines it.
 (define macro-modules hash-table)
 
-;; Is lowered expression e plainly a GC value, not a datum in memory: a
-;; closure, or what a function of another result gives?
 (define (gc-value? [e datum]) -> i32
   (cond [(or (== (car e) (sym at)) (== (car e) (sym as))) (gc-value? (caddr e))]
         [(== (car e) (sym lambda)) 1]
         [(== (car e) (sym call)) (not (equal? (func-info-results (cadr e)) `(i32)))]
         [else 0]))
 
-;; ---- values the expander makes (spec 3.1) ----
+;; ---- values the expander makes ----
 
-;; The compile-time value of getter, made by the expander: the getter,
-;; whose unit is not compiled until the module's linklet is, is never
-;; called in this compilation.
 (define (made-value! [getter datum] [v datum])
   (table-set! (-> current values) (cast u64 getter) (cast u32 (cons v nil))))
 
-;; Can the expander make the value of lowered expression e itself, with no
-;; new code? Quoted data can, and so can a call, on such values, of an
-;; instantiated function from data to a datum.
 (define (plain? [e datum]) -> i32
   (cond [(== (car e) (sym at)) (plain? (caddr e))]
         [(== (car e) (sym quote)) 1]
@@ -2870,8 +2321,6 @@
          (and (callable? (cadr e) (length (caddr e))) (andmap (lambda ([a datum]) -> i32 (plain? a)) (caddr e)))]
         [else 0]))
 
-;; Can the expander call function info with n data: is it instantiated,
-;; from data to a datum, and are there few enough for call-function?
 (define (callable? [info datum] [n u32]) -> i32
   (let ([ps (func-info-params info)])
     (unless (and (!= (func-info-instance info) 0) (<= n 6) (== (length ps) n) (equal? (func-info-results info) `(i32)))
@@ -2881,8 +2330,6 @@
       (set! ps (cdr ps)))
     1))
 
-;; The value of lowered expression e, which plain? accepts. While its calls
-;; run, a trap in them is reported at where, the code they come from.
 (define (plain-value [e datum] [where datum]) -> datum
   (cond [(== (car e) (sym at)) (plain-value (caddr e) where)]
         [(== (car e) (sym quote)) (cadr e)]
@@ -2893,8 +2340,6 @@
            (set! api-where saved)
            v)]))
 
-;; The function at index in the compiler's table, of as many data as args
-;; holds, called with them.
 (define (call-function [index i32] [args datum]) -> datum
   (let ([n (length args)] [a datum 0] [b datum 0] [c datum 0] [d datum 0] [e datum 0] [g datum 0])
     (when (> n 0) (set! a (list-ref args 0)))
@@ -2912,8 +2357,6 @@
       [(5) (let ([f (cast (fn (datum datum datum datum datum) -> datum) index)]) (f a b c d e))]
       [else (let ([f (cast (fn (datum datum datum datum datum datum) -> datum) index)]) (f a b c d e g))])))
 
-;; The phase+1 function id names, checked to take and return syntax and
-;; to be defined already: a transformer.
 (define (syntax-function-of [id datum] [phase i32]) -> datum
   (let ([m (meaning-of id (+ phase 1))] [info datum 0])
     (unless (and (!= m 0) (== (car m) (sym func)))
@@ -2928,8 +2371,6 @@
       (fail-at id "~a must be defined by an earlier begin-for-syntax" (list1 (syntax-e id))))
     info))
 
-;; (begin-for-syntax form ...): phase+1 code, compiled into a linklet and
-;; run now (spec 3.1).
 (define (begin-for-syntax! [f datum] [phase i32])
   (let ([forms (cdr (form-list f "(begin-for-syntax form ...)"))] [saved to-syntax] [code datum 0])
     (set! to-syntax 0)
@@ -2937,11 +2378,7 @@
     (set! to-syntax saved)
     (run-compile-time-linklet! code (+ phase 1) f)))
 
-;; After a trap, which wasm code cannot catch, the host calls the
-;; compiler's on-trap (spec 4). A trap unwinds without restoring the state
-;; below, so it still says what was running: the report, a line, is at
-;; where the running macro or other compile-time function was used, or
-;; else in the module being compiled.
+;; A trap unwinds without restoring the state below, so it still says what was running.
 (define (trap-report) -> datum
   (let ([msg (host-error)] [loc (if (syntax? api-where) (syntax-srcloc api-where) 0)])
     (cond [(!= loc 0)
@@ -2950,12 +2387,8 @@
           [(!= current 0) (format-message "~a: error: ~a\n" `(,(-> (the-module) path) ,msg))]
           [else (format-message "error: ~a\n" (list1 msg))])))
 
-;; ---- facts (spec 6.5) ----
+;; ---- facts ----
 
-;; (#%fact id 'datum) or (#%fact id #'stx): the datum, or the syntax as
-;; quote-syntax keeps it (spec 6.2), recorded as a fact about the
-;; definition id refers to at phase: data the module keeps. The form, as
-;; fully expanded code holds it.
 (define (fact! [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l)))
@@ -2971,25 +2404,20 @@
       (index-fact! (-> m self) fact)
       (core-headed f (sym #%fact)))))
 
-;; The facts of every module compiled, by the definition each is about:
-;; definition -> ((module phase value) ...), the latest first.
 (define facts-by-key hash-table)
 
 (define (index-fact! [m datum] [f datum])
   (let ([k (cast u64 (car f))])
     (hash-set! (& facts-by-key) k (cast u32 (keep-cons (cons m (cdr f)) (cast datum (hash-ref (& facts-by-key) k)))))))
 
-;; (cons x l) in the run's arena, x kept, for l a list already kept, which
-;; is not copied again: keep of the whole would copy it at each cons.
+;; l is already kept: keep of the whole would copy it again at each cons.
 (define (keep-cons [x datum] [l datum]) -> datum
   (let* ([k (keep x)] [saved (use-arena (& run-arena))] [p (cons k l)])
     (use-arena saved)
     p))
 
-;; What a fact is written with, quote or quote-syntax, by name: whether
-;; it records a datum or syntax. The position holds data, not an
-;; expression, so a module that binds quote to a form of its own, as
-;; Substrate does, writes its facts as any module does.
+;; Compared by name: the position holds data, so a module that binds quote to a form
+;; of its own writes its facts as any module does.
 (define (fact-quote [written datum]) -> datum
   (let* ([l (syntax->list written)]
          [kind (if (and (!= l 0) (== (length l) 2) (identifier? (car l))) (syntax-e (car l)) 0)])
@@ -2997,25 +2425,18 @@
       (fail-at written "a fact is a datum or syntax: expected (#%fact id 'datum) or (#%fact id #'syntax)" nil))
     kind))
 
-;; The definition meaning m is of, if it is a module's: the info of its
-;; function, global or tag, or the getter of its compile-time value;
-;; otherwise #f. Core forms, locals and the kernel module's definitions,
-;; which every language shares, are none.
 (define (definition-of [m datum]) -> datum
   (let ([info (if (and (!= m 0) (!= (memq (car m) `(func global tag compile-time-value)) 0)) (base-info (cadr m)) 0)])
     (if (and (!= info 0) (not (kernel-definition? info))) info 0)))
 
 (define (kernel-definition? [info datum]) -> i32 (!= (hash-ref (& kernel-infos) (cast u64 info)) 0))
 
-;; The definition id refers to at phase, which a fact is about.
 (define (fact-key [id datum] [phase i32]) -> datum
   (let* ([m (meaning-of id phase)] [base (definition-of m)])
     (when (== m 0) (fail-at id "~a is unbound: a fact is about a definition made before it" (list1 (syntax-e id))))
     (when (== base 0) (fail-at id "a fact is about a module's definition, and ~a is not one" (list1 (syntax-e id))))
     base))
 
-;; The types and definitions in module m's lowered forms: its types in
-;; order, and its functions, globals and tags, newest first.
 (define (note-definitions! [m datum] [forms datum])
   (let ([u (unit-of m)])
     (for-each (lambda ([f datum])
@@ -3025,92 +2446,12 @@
               forms)))
 
 ;; ==== sessions ====
-;;
-;; A session compiles and runs code one piece at a time, as a REPL does.
-;; `bin/sub eval FILE` uses it, and so does the REPL web page
-;; (lib/web/repl).
-;;
-;; How it works. A session is like a module whose source arrives in
-;; pieces, called inputs. Each input is compiled into a wasm module of its
-;; own (a "linklet"), which is instantiated at once, in the compiler's own
-;; store: the set of wasm instances that the compiler itself runs in.
-;; This is the mechanism the compiler already uses to run macros and other
-;; compile-time code (see "compile-time evaluation" above). The difference
-;; is that a session also runs ordinary run-time code (phase 0) this way.
-;; For a normal module, phase-0 code is only compiled into the program; the
-;; compiler never runs it.
-;;
-;; Two consequences:
-;;   - A session has no language of its own. As in a file, the language
-;;     is whatever the inputs `require`. The compiler treats an input just
-;;     like the text of a file.
-;;   - An input's code uses the compiler's memory and function table,
-;;     unless the session declares its own (see running-storage). It is
-;;     therefore exactly as trusted as the compiler: it can call or
-;;     overwrite anything in it. To run code that is not trusted, run the
-;;     whole compiler in a sandbox, as lib/web/repl does (lib/web/guest.sub).
-;;
-;; Definitions and redefinitions. Each input is expanded as a body of its
-;; own (expand-body), so its forms can refer to each other and to what
-;; earlier inputs defined. A later input may define a name again. That
-;; must not disturb code that was compiled earlier, so bindings are
-;; recorded as follows (using the "sets of scopes" model of binding):
-;;   - Every input gets a fresh scope, which is added to all of its forms.
-;;   - Normally a definition made by an input is recorded WITHOUT that
-;;     scope, so that later inputs, which do not have the scope, see it.
-;;   - If an earlier input already defined the same name as something
-;;     else, the new definition is recorded WITH the input's scope, and
-;;     from then on that scope is added to every later input too. Later
-;;     inputs therefore see the new definition, while code compiled
-;;     earlier keeps referring to the old one.
-;;   - Defining a name twice within one input is an error, as it is in a
-;;     module.
-;; So the number of scopes grows with the number of redefinitions, not
-;; with the number of inputs. (An earlier version kept a scope for every
-;; input; a session of 1,600 inputs then took 50 seconds.)
-;;
-;; Printing values. When an input contains an expression e, the compiler
-;; rewrites it to (#%top-interaction e) if the name #%top-interaction is
-;; bound to a macro in the session's language. That macro decides what to
-;; do with the value, usually print it. (A function call becomes
-;; (#%app f arg ...) by the same convention; see spec 5.3.) If there is no
-;; such macro, the expression is simply run.
-;;
-;; Errors. If an input fails, the session is left as it was before the
-;; input, except for whatever the input's code had already done when it
-;; failed. An input can fail in three ways:
-;;   - a compile error;
-;;   - a wasm exception that escapes the input's code;
-;;   - a trap in the input's code. The host reports a trap as a failed
-;;     `instantiate` call, so the compiler sees an ordinary error.
-;; One case is different: a trap inside a macro, which is code that the
-;; compiler calls directly. That unwinds the compiler's own stack all the
-;; way out to the host. The host then calls the program's on-trap
-;; function, and that function must call session-recover! to make the
-;; session usable again.
-
-;; The state of the open session. There is at most one.
-;;   session             the session's compilation state (a comp), or 0 if
-;;                       no session is open
-;;   session-mark        marks the session's memory arena; session-recover!
-;;                       frees every module arena opened after it
-;;                       (kernel.sub)
-;;   session-set         the scopes that are added to every input's forms
-;;   session-scope       the fresh scope of the input being evaluated, or 0
-;;                       between inputs
-;;   session-scope-kept  1 if the current input made a definition that
-;;                       kept its scope (that is, a redefinition)
-;;   session-first-key   a binding key taken when the current input began;
-;;                       a binding with a larger key was made by this
-;;                       input
-;;   session-source      the source name of the current input (a symbol),
-;;                       used in error locations
-;;   session-message     the error message of the last input that failed
-;;                       (a string)
-;;   session-running     1 while an input's compiled code is being
-;;                       instantiated, that is, run
-;;   interacting         1 while the result of a #%top-interaction macro is
-;;                       being processed
+;; An input's code runs in the compiler's store, with its memory and table, so it is
+;; as trusted as the compiler; to run untrusted code, sandbox the whole compiler.
+;; An input's definition is recorded without its scope, so later inputs see it; a
+;; redefinition keeps the scope, which every later input then gets.
+;; A trap in a macro unwinds the compiler out to the host, whose call of on-trap must
+;; call session-recover!.
 
 (define session (ptr comp) 0)
 (define session-mark (ptr void) 0)
@@ -3123,22 +2464,10 @@
 (define session-running i32 0)
 (define interacting i32 0)
 
-;; Returns 1 if the code being compiled right now is a session input
-;; itself, and not a module that an input requires.
 (define (in-session?) -> i32 (and (!= session 0) (== current session)))
 
-;; Returns the source name (a symbol) to record in the source locations of
-;; the code being compiled (spec 3.6): the module's file, or, in a
-;; session, the source of the current input.
 (define (module-source) -> datum (if (in-session?) session-source (string->symbol (-> (the-module) path))))
 
-;; Opens a session called `name` (a string). The name appears in the names
-;; of the linklets compiled for the session's inputs. It also stands in
-;; for the session's file name when an input requires a file by a relative
-;; path, so such paths are relative to the package root.
-;;
-;; If a session is already open, it is abandoned: the new session replaces
-;; it, and the old one's memory is not freed.
 (define (session-open! [name datum])
   (let ([m (new-unit name (provisional-name name))])
     (begin-module-arena)
@@ -3152,15 +2481,6 @@
       (set! session-set (scopes-change core-scopes msc 0)))
     (set! to-syntax 0)))
 
-;; Chooses the identifier under which a module-level definition is
-;; recorded. `id` is the name being defined, at `phase`, with the meaning
-;; `meaning`.
-;;
-;; Outside a session, or for a name that does not carry the current
-;; input's scope, the result is `id` itself. In a session, the current
-;; input's scope is removed, so that later inputs can see the definition.
-;; The exception is a redefinition: if an earlier input bound the name to
-;; something else, the scope is kept (see the section comment above).
 (define (session-binding-id [id datum] [phase i32] [meaning datum]) -> datum
   (if (and (in-session?) (!= session-scope 0) (!= (scopes-change (syntax-scopes id) session-scope 1) (syntax-scopes id)))
       (let ([base (remove-scope id session-scope)])
@@ -3169,14 +2489,7 @@
             base))
       id))
 
-;; Returns 1 if an earlier input bound `id` (at the same phase, with the
-;; same scopes, in the same namespace) to something other than `meaning`.
-;;
-;; Binding keys increase over time, so a binding whose key is greater than
-;; session-first-key was made by the current input. Finding one of those
-;; makes this return 0. The definition is then treated as a duplicate
-;; within one input, which is reported as an error ("already bound"), just
-;; as in a module.
+;; Binding keys increase, so a key above session-first-key was made by this input.
 (define (bound-earlier? [id datum] [phase i32] [meaning datum]) -> i32
   (let ([b (bindings-under (syntax-e id) (binding-slot (syntax-scopes id)))] [found i32 0])
     (while (!= b 0)
@@ -3188,9 +2501,6 @@
       (set! b (-> b next)))
     found))
 
-;; Removes the module-level bindings that the session's module made after
-;; `entries` (a saved position in the module's list of bindings). Used to
-;; undo the definitions of an input that failed.
 (define (session-unbind! [entries (ptr module-entry)])
   (let ([e (-> (the-module) entries)])
     (while (and (!= e 0) (!= e entries))
@@ -3204,15 +2514,7 @@
       (set! e (-> e next)))
     (set! (-> (the-module) entries) entries)))
 
-;; Evaluates `forms` (syntax, as the reader returns it) as the session's
-;; next input. Returns 1 on success. On failure, returns 0, and
-;; (session-error) gives the message.
-;;
-;; After a failure, everything the input declared for the session is
-;; undone: its bindings, the names of the modules it required, and its
-;; memory and table declarations. This is done by restoring `was`, a copy
-;; of the session's comp struct taken before the input. Only the linklet
-;; counter is kept, so that a linklet name is never used twice.
+;; Undoing a failed input keeps the linklet counter, so no linklet name is used twice.
 (define (session-eval! [forms datum]) -> i32
   (let* ([sc (new-scope!)] [scopes (scopes-change session-set sc 0)] [entries (-> (the-module) entries)] [ok i32 0]
          [was comp (@ session)])
@@ -3236,9 +2538,6 @@
     (set! session-scope 0)
     ok))
 
-;; Reads `text` (a string) and evaluates the forms in it as one input.
-;; `source` (a string) is the name given to the input in source locations.
-;; Returns 1 or 0, as session-eval! does.
 (define (session-eval-text! [text datum] [source datum]) -> i32
   (let ([forms datum 0] [ok i32 0])
     (try
@@ -3247,9 +2546,6 @@
       [catch compile-error (message blamed loc) (session-fail! message blamed loc)])
     (if ok (session-eval! forms) 0)))
 
-;; Reads the file `source` and evaluates each of its top-level forms as an
-;; input of its own. When an input fails, `report` is called with the
-;; error message, and evaluation continues with the next form.
 (define (session-eval-file! [source datum] [report (closure (datum))])
   (let* ([path (canonical-path source)] [text (source-text (package-file path) path)]
          [forms (read-all (string-bytes text) (string-length text) (string->symbol path))])
@@ -3257,13 +2553,8 @@
       (unless (session-eval! (list1 (car forms))) (report (session-error)))
       (set! forms (cdr forms)))))
 
-;; Returns the error message of the last input that failed, formatted the
-;; way the compiler formats errors (a string).
 (define (session-error) -> datum session-message)
 
-;; Compiles the expanded forms of an input into the session's next
-;; linklet and instantiates it. Instantiating it runs the input: its
-;; definitions are made and its expressions are evaluated, in order.
 (define (run-session-linklet! [forms datum])
   (check-phase-data! forms 0 0)
   (let ([name (next-linklet-name! (-> current module) 0)])
@@ -3275,14 +2566,9 @@
       (set! session-running 0)
       (table-set! (-> current instances) (cast u64 (string->symbol (ns-name name))) 1))))
 
-;; Records that the current input failed, and recovers. The error message
-;; is formatted first, because formatting needs data (such as the syntax
-;; that is blamed) that lives in arenas which session-recover! frees.
+;; The message is formatted first: formatting needs data in arenas session-recover! frees.
 (define (session-fail! [message datum] [blamed datum] [loc (ptr srcloc)])
   (let ([b (make-buffer)])
-    ;; An error that has no source location is printed as just
-    ;; "error: message". A trap in the input's code is one: its message
-    ;; contains a backtrace instead.
     (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0))))
         (begin
           (buffer-add-string! (& b) "error: ")
@@ -3293,15 +2579,6 @@
     (set! session-message (bytes->string (-> b bytes) (-> b length)))
     (buffer-free! (& b))))
 
-;; Puts the compiler back into the state it has between inputs. It is
-;; called after every failure. That includes a trap that unwound the
-;; compiler in the middle of expanding an input, in which case the
-;; program's on-trap function calls it.
-;;   - Frees the arenas of the modules that were being compiled when the
-;;     failure happened.
-;;   - Forgets those half-compiled modules, so that they are compiled
-;;     again from the start the next time they are required.
-;;   - Resets the expander's global state to "expanding the session".
 (define (session-recover!)
   (end-module-arenas-to! session-mark)
   (while (pair? compiling)
@@ -3319,11 +2596,6 @@
   (set! interacting 0)
   (set-scope-map! 0 0))
 
-;; Tidies the host's message about a trap in an input's code, before it
-;; is shown to the user. `said` is the message of the failed `instantiate`
-;; call. This removes the leading "instantiate: ", and cuts the backtrace
-;; off at the frame where the compiler called the host (instantiate-bytes):
-;; the frames from there on are the compiler's, not the input's.
 (define (session-failure [said datum]) -> datum
   (let* ([p (string-bytes said)] [n (string-length said)] [from u32 0] [to n] [at (find-bytes p n "instantiate-bytes")])
     (when (and (>= n 13) (== (memcmp p "instantiate: " 13) 0)) (set! from 13))
@@ -3333,27 +2605,14 @@
     (while (and (> to from) (== (@ p (- to 1)) 10)) (-= to 1))
     (bytes->string (+ p from) (- to from))))
 
-;; Returns the index of the first occurrence of the C string s in the n
-;; bytes at p, or -1 if there is none.
 (define (find-bytes [p (ptr u8)] [n u32] [s (ptr u8)]) -> i32
   (let ([m (strlen s)])
     (for ([i u32 0]) (<= (+ i m) n) (+= i 1)
       (when (== (memcmp (+ p i) s m) 0) (return (cast i32 i))))
     -1))
 
-;; Handles an expression among the forms of a session input. `f0` is the
-;; expression as written. `f` is the same expression after any macro at
-;; its head has been expanded. `b` is the body being built.
-;;
-;; If #%top-interaction is bound to a macro where f0 was written, the
-;; expression becomes (#%top-interaction f), and the macro's expansion is
-;; processed in its place. Otherwise the expression is added to the body
-;; unchanged, as it would be in a module.
-;;
-;; The name #%top-interaction is looked up with the scopes of f0, the
-;; original form, in the same way that #%app is looked up with the scopes
-;; of the call it wraps. Looking it up with f's scopes fails when the
-;; expression starts with a macro.
+;; #%top-interaction is looked up with f0's scopes, as #%app is with its call's: f's
+;; fail when the expression starts with a macro.
 (define (interact! [f0 datum] [f datum] [b (ptr body)])
   (let* ([id (implicit-id f0 (sym #%top-interaction))] [t (transformer-of (meaning-of id 0))])
     (if (== t 0)
@@ -3365,17 +2624,10 @@
 
 ;; ==== macros ====
 
-;; State the queries read: the running macro's phase, the form it was
-;; given, and its introduction scope.
 (define api-phase i32 0)
 (define api-where datum 0)
 (define api-intro u32 0)
 
-;; Hygiene (spec 6.2): a fresh introduction scope is flipped on the input
-;; and on the output, so only what the transformer introduced carries it.
-;; In a definition context (use-site 1), a macro the module being expanded
-;; defines also gets a fresh use-site scope on its input, which stays. t
-;; is a transformer.
 (define (apply-macro [head datum] [t datum] [s0 datum] [phase i32] [use-site i32]) -> datum
   (note-macro-use! head phase)
   (let* ([intro (new-scope!)] [s (flip-scope s0 intro)])
@@ -3385,25 +2637,18 @@
         (set! s (add-scope s use))))
     (at-use s0 (flip-scope (call-syntax-function (format-message "macro ~a" (list1 (syntax-e head))) t s phase intro) intro))))
 
-;; Is head bound to a macro the module being expanded defines?
 (define (defined-here? [head datum] [phase i32]) -> i32
   (let ([m (meaning-of head phase)])
     (and (!= m 0) (== (car m) (sym compile-time-value))
          (== (cast datum (hash-ref (& macro-modules) (cast u64 (cadr m)))) (-> current module)))))
 
-;; A macro's output, located at its use if the output comes from another
-;; file, as a library macro's template does (spec 6.2): what the macro
-;; introduced then has the use's location (spec 3.6).
 (define (at-use [use datum] [out datum]) -> datum
   (let ([u (if (syntax? use) (syntax-srcloc use) 0)] [o (if (syntax? out) (syntax-srcloc out) 0)])
     (if (and (!= u 0) (syntax? out) (not (and (!= o 0) (== (-> o source) (-> u source)))))
         (make-syntax (syntax-e out) (syntax-scopes out) u (syntax-props out))
         out)))
 
-;; Call transformer t with s. While it runs, the queries answer for phase,
-;; blame s, and local-expand uses intro, its introduction scope. Calls
-;; nest: a query can expand code, which calls more macros. A compile error
-;; from the call that has no location is located at s, the use.
+;; Calls nest: a query can expand code, which calls more macros.
 (define (call-syntax-function [who datum] [t datum] [s datum] [phase i32] [intro u32]) -> datum
   (let ([saved-phase api-phase] [saved-where api-where] [saved-intro api-intro] [result datum 0])
     (set! api-phase phase)
@@ -3422,25 +2667,17 @@
     (unless (syntax? result) (fail-at s "~a returned a non-syntax value: ~s" `(,who ,(syntax->datum result))))
     result))
 
-;; A macro use relied on id's binding: if require-unqualified made it, no
-;; definition may shadow it now.
 (define (note-macro-use! [id datum] [phase i32])
   (let ([b (resolve id phase (sym value))])
     (when (and (!= b 0) (== (hash-ref (& unqualified-imports) (cast u64 b)) 1))
       (hash-set! (& unqualified-imports) (cast u64 b) 2))))
 
 ;; ---- the queries ----
-;;
-;; The expander's answers to the kernel module's queries (spec 2.3), for
-;; the macro that is running. The kernel module calls them through the
-;; functions registered with set-queries!.
 
 (define (query-local-value [id datum]) -> datum
   (let ([m (if (identifier? id) (meaning-of id api-phase) 0)])
     (if (and (!= m 0) (== (car m) (sym compile-time-value))) (compile-time-value (cadr m)) 0)))
 
-;; The same meanings, as a value and as a type, so an import and what it
-;; imports are equal.
 (define (query-free-identifier=? [x datum] [y datum]) -> datum
   (unless (and (identifier? x) (identifier? y)) (fail-at api-where "free-identifier=?: expected identifiers" nil))
   (let ([vx (meaning-of x api-phase)] [vy (meaning-of y api-phase)]
@@ -3462,9 +2699,6 @@
       [((sym core) (sym prim)) (sym core)]
       [else (if (!= (type-meaning-of id api-phase) 0) (sym type) 0)])))
 
-;; The signature of the function id is bound to, (t ... -> r ...), each
-;; type written as in the kernel: a numeric type's name, (ref T) or (ref
-;; null T) with T a heap type's name; #f if id is not a function.
 (define (query-function-signature [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "identifier-function-signature: expected an identifier" nil))
   (let ([m (meaning-of id api-phase)])
@@ -3480,10 +2714,7 @@
         (if (!= (ref-nullable? t) 0) `(ref null ,name) `(ref ,name)))
       t))
 
-;; s, expanded to fully expanded code (spec 6.4). The running macro's
-;; introduction scope is flipped around the expansion, so code from the
-;; macro's input expands as it would at the use site. If a compile error
-;; leaves the expansion, the expander is as it was, since the macro may
+;; A compile error leaving the expansion leaves the expander as it was: the macro may
 ;; handle it and go on.
 (define (query-local-expand [s datum]) -> datum
   (unless (syntax? s) (fail-at api-where "local-expand: expected syntax" nil))
@@ -3498,8 +2729,6 @@
     (set! to-syntax saved-output)
     out))
 
-;; The form gets the macro's introduction scope, as its output does. The
-;; macro gets back the form it gave, which its output can hold.
 (define (query-lift [form datum]) -> datum
   (unless (syntax? form) (fail-at api-where "syntax-local-lift-definition: expected syntax" nil))
   (lift! (flip-scope form api-intro) api-where api-phase)
@@ -3509,9 +2738,6 @@
   (unless (syntax? s) (fail-at api-where "syntax-local-introduce: expected syntax" nil))
   (flip-scope s api-intro))
 
-;; The module being expanded and each module it requires, directly or
-;; not, as (module . shift): dependencies first, in the order of their
-;; requires, each module once at each phase shift it is required at.
 (define (dependencies) -> datum
   (reverse (visit-dependencies (-> current module) 0 (make-table) nil)))
 
@@ -3524,11 +2750,6 @@
       (set! rs (cdr rs))))
   (cons (cons m (make-integer shift)) out))
 
-;; The facts about the definition id refers to, at the running macro's
-;; phase (spec 6.5): those of the module being expanded, recorded so far,
-;; and of each module it requires (dependencies). Each is (module phase
-;; value): the file of the module that recorded it, the phase that module
-;; recorded it at, and its datum or syntax.
 (define (query-local-facts [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "syntax-local-facts: expected an identifier" nil))
   (let* ([facts (reverse (cast datum (hash-ref (& facts-by-key) (cast u64 (fact-key id api-phase)))))]
@@ -3543,8 +2764,6 @@
       (set! deps (cdr deps)))
     (reverse out)))
 
-;; A fact's datum or syntax v, seen at phase shift k: its syntax's module
-;; scopes shifted, as a linklet's literals are (spec 3.5, 6.1).
 (define fact-shift u32 0)
 (define (shift-by-fact-shift [s (ptr scope-set)]) -> (ptr scope-set) (shift-scopes s fact-shift))
 (define (shift-fact [v datum] [k u32]) -> datum
@@ -3552,10 +2771,8 @@
       v
       (begin (set! fact-shift k) (map-scopes v shift-by-fact-shift))))
 
-;; ---- names (spec 6.6) ----
+;; ---- names ----
 
-;; The module that makes definition base: the module being compiled for a
-;; function not yet compiled.
 (define (definition-module [base datum]) -> datum
   (let ([m (cast datum (hash-ref (& macro-modules) (cast u64 base)))] [i datum 0])
     (when (!= m 0) (return m))
@@ -3569,24 +2786,14 @@
         [(tag-info? info) (tag-info-instance info)]
         [else 0]))
 
-;; Module m's names, from its entries in order: each of its own
-;; definitions -> its name, in by-base, and each name -> its entry, in
-;; by-name. The n-th definition of a symbol at a phase, which hygiene can
-;; make, is file:symbol@phase#n, without @0 and #0; counts has how many
-;; there are so far. Kept, in the run's arena, as m's entries are, with the
-;; entry they were made up to, and extended as m's entries grow, so a
-;; module's names are made once each however often they are asked, as the
-;; compiler's are (compiler/expander.sub).
 (struct names [upto (ptr module-entry)] [by-base (ptr arena-table)] [by-name (ptr arena-table)] [counts (ptr arena-table)])
-(define name-tables hash-table)             ; module -> (ptr names)
+(define name-tables hash-table)
 
 (define (module-names [m datum]) -> (ptr names)
   (let ([head (-> (unit-of m) entries)] [known (cast (ptr names) (hash-ref (& name-tables) (cast u64 m)))])
     (when (and (!= known 0) (== (-> known upto) head)) (return known))
     (let ([saved (use-arena (& run-arena))] [n known] [new nil] [e head])
-      ;; Entries only grow at the front, so the tables named the ones they
-      ;; were made from, and the new ones are named after them; entries
-      ;; that are otherwise are named anew.
+      ;; Entries only grow at the front, so the new ones are named after those already named.
       (when (!= n 0)
         (while (and (!= e 0) (!= e (-> n upto)))
           (set! new (cons (cast datum e) new))
@@ -3608,7 +2815,6 @@
       (use-arena saved)
       n)))
 
-;; Name m's entries, oldest first, in n.
 (define (name-entries! [m datum] [n (ptr names)] [entries datum])
   (while (pair? entries)
     (let* ([e (cast (ptr module-entry) (car entries))] [base (definition-of (-> e binding meaning))])
@@ -3624,8 +2830,6 @@
           (table-set! (-> n by-name) (cast u64 name) (cast u32 e)))))
     (set! entries (cdr entries))))
 
-;; The name of the definition id refers to at the running macro's phase,
-;; or #f (spec 6.6).
 (define (query-identifier-name [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "identifier-name: expected an identifier" nil))
   (let ([base (definition-of (meaning-of id api-phase))])
@@ -3633,10 +2837,6 @@
         0
         (cast datum (table-ref (-> (module-names (definition-module base)) by-base) (cast u64 base))))))
 
-;; An identifier that refers to the definition name names, at the running
-;; macro's phase, if the module being expanded made it or requires,
-;; directly or not, the module that did: its symbol, with its scopes at
-;; the phase shift that module is required at (spec 6.6).
 (define (query-name-identifier [name datum]) -> datum
   (unless (symbol? name) (fail-at api-where "name-identifier: expected a name, a symbol" nil))
   (let ([deps (dependencies)])
@@ -3649,41 +2849,24 @@
     (fail-at api-where "name-identifier: ~a names no definition of this module, or of one it requires, at this phase" (list1 name))))
 
 ;; ==== fully expanded code ====
-;;
-;; Fully expanded code (spec 6.4) is syntax in the kernel's core grammar,
-;; with every macro use expanded and every application and literal made
-;; explicit. local-expand gives it to macros and sub expand prints it.
-;; The expression walk builds it instead of lowered code when asked to
-;; (to-syntax).
-;;
-;; Core forms in fully expanded code are named by identifiers that have
-;; only the core scope, so they mean the core forms in any module,
-;; whatever that module binds. Every other identifier keeps its scopes. So
-;; fully expanded code can be expanded again, and macros can embed the
-;; result of local-expand in their output.
+;; Core forms are named by identifiers with only the core scope, so they mean the core
+;; forms in any module, and fully expanded code can be expanded again.
 
 (define (loc-of [where datum]) -> (ptr srcloc) (if (syntax? where) (syntax-srcloc where) 0))
 
-;; The identifier for core form name in fully expanded code.
 (define (core-id [name datum] [where datum]) -> datum (make-syntax name core-scopes (loc-of where) nil))
 
-;; A list in fully expanded code, located at where.
 (define (out-list [where datum] [items datum]) -> datum (make-syntax items core-scopes (loc-of where) nil))
 
-;; The core form (name part ...), located at where.
 (define (out [where datum] [name datum] [parts datum]) -> datum (out-list where (cons (core-id name where) parts)))
 
-;; Module-level form f with its head replaced by the core identifier.
 (define (core-headed [f datum] [name datum]) -> datum
   (out-list f (cons (core-id name (car (syntax-e f))) (cdr (syntax-e f)))))
 
-;; An identifier for one of the kernel module's functions, for the calls
-;; quasiquote and quasisyntax expand into. Its private scope is on no
-;; module's code, so only fully expanded code can refer to it.
+;; Its private scope is on no module's code, so only fully expanded code can refer to it.
 (define kernel-id-scopes (ptr scope-set) 0)
 (define kernel-ids hash-table)
 
-;; The kernel ids' scope, made the first time it is needed.
 (define (kernel-id-scope) -> u32
   (when (== kernel-id-scopes 0) (set! kernel-id-scopes (scopes-change no-scopes (new-run-scope!) 0)))
   (@ (-> kernel-id-scopes ids) 0))
@@ -3699,28 +2882,15 @@
           id))))
 
 ;; ==== expressions ====
-;;
-;; One walk expands an expression and builds its output: either lowered
-;; code (core.sub), which is what a module's code becomes, or fully
-;; expanded code (spec 6.4) for local-expand and sub expand. The walk
-;; resolves and checks each form once and builds either output from the
-;; same result.
 
-;; Whether the walk builds fully expanded code, rather than lowered code.
 (define to-syntax i32 0)
 
-;; Lowered expression e, at s (spec 3.6): s is the syntax whose source
-;; location it is at.
 (define (at [s datum] [e datum]) -> datum `(at ,s ,e))
 
-;; The lowered expressions es in sequence, at s.
 (define (seq-at [s datum] [es datum]) -> datum (at s (cons (sym seq) es)))
 
-;; Whether the form being built has a lambda or an application of a
-;; function value, which the compiler looks for closures in (core.sub).
 (define lowered-closures i32 0)
 
-;; s has no value binding. It may still name a type.
 (define (unbound [s datum] [sym datum] [phase i32]) -> datum
   (if (!= (type-meaning-of s phase) 0)
       (fail-at s "~a is a type, not a value" (list1 sym))
@@ -3738,7 +2908,6 @@
             (let ([t (transformer-of m)])
               (when (== t 0) (fail-at s "~a is bound to a compile-time value: read it with syntax-local-value" (list1 e)))
               (expand-expr (apply-macro s t s phase 0) phase))]
-           ;; A function's name as an expression is its value (5.2).
            [((sym func))
             (unless (has-value? (cadr m)) (fail-at s "~a is a function: call it, or use (func-index ~a)" `(,e ,e)))
             (if to-syntax (with-local-binding s 0) (at s `(gref ,(function-value (cadr m)))))]
@@ -3755,8 +2924,6 @@
                [((sym core)) (expand-core (cadr m) s phase)]
                [((sym prim)) (expand-prim (cadr m) s phase)]
                [else
-                ;; Any other form is an application: (#%app f arg ...), where
-                ;; #%app has the scopes of the form (spec 5.3).
                 (when (and (identifier? head) (== (syntax-e head) (sym #%app)))
                   (if (!= m 0)
                       (fail-at s "#%app is bound here, but not to a macro or the core form" nil)
@@ -3764,8 +2931,6 @@
                 (expand-expr (syntax-rewrap s (cons (implicit-id s (sym #%app)) e)) phase)])))]
       [(null? e) (fail-at s "empty form ()" nil)]
       [(literal? e)
-       ;; A literal is (#%datum literal), where #%datum has the scopes of the
-       ;; literal (spec 5.4).
        (let* ([id (implicit-id s (sym #%datum))] [m (meaning-of id phase)] [t (transformer-of m)])
          (cond [(!= t 0) (expand-expr (apply-macro id t (syntax-rewrap s `(,id ,s)) phase 0) phase)]
                [(and (!= m 0) (== (car m) (sym core))) (datum-out s s)]
@@ -3776,12 +2941,8 @@
 
 (define (literal? [e datum]) -> i32 (or (integer? e) (flonum? e) (char? e) (boolean? e) (string? e)))
 
-;; The identifier name with the scopes and srcloc of s: the implicit #%app
-;; of a form or #%datum of a literal.
 (define (implicit-id [s datum] [name datum]) -> datum (datum->syntax s name s))
 
-;; The core #%datum: an unquoted literal is a wasm number (spec 5.4).
-;; Checks the literal, and gives its lowered form.
 (define (core-datum [s datum]) -> datum
   (let ([e (syntax-e s)])
     (cond [(integer? e) `(int ,e)]
@@ -3793,14 +2954,10 @@
            (fail-at s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for a kernel string" nil)]
           [else (fail-at s "~s is not a literal" (list1 (syntax->datum s)))])))
 
-;; (#%datum literal), the form where.
 (define (datum-out [where datum] [literal datum]) -> datum
   (let ([d (core-datum literal)])
     (if to-syntax (out where (sym #%datum) (list1 literal)) (at where d))))
 
-;; The core #%app: (#%app f arg ...) calls the function f, or is its body
-;; if f is inline (inline-call); with any other head, an expression, it
-;; applies a function value, a closure the compiler calls (spec 5.3).
 (define (core-app [s datum] [f datum] [args datum] [phase i32]) -> datum
   (let* ([m (if (identifier? f) (meaning-of f phase) 0)]
          [info (if (and (!= m 0) (== (car m) (sym func))) (cadr m) 0)]
@@ -3810,8 +2967,6 @@
           [(!= info 0) (at s (let ([inlined (inline-call info a phase)]) (if (!= inlined 0) inlined `(call ,info ,a))))]
           [else (set! lowered-closures 1) (at s `(apply-value ,h ,a))])))
 
-;; A numeric or memory instruction: (args . offset), its arguments and a
-;; trailing literal offset if it has one, else #f.
 (define (prim-args [name datum] [s datum]) -> datum
   (let* ([p (lookup-prim name)]
          [args (let ([l (syntax->list (cdr (syntax-e s)))]) (if (== l 0) (fail-at s "bad syntax" nil) l))]
@@ -3836,17 +2991,12 @@
     (unless (and (!= m 0) (== (car m) (sym data))) (fail-at id "~s is not data" (list1 (syntax->datum id))))
     (cadr m)))
 
-;; The declared type id names, which must be a struct or array type, as
-;; kind says.
 (define (kind-type-of [id datum] [kind datum] [phase i32]) -> datum
   (let ([t (type-of id phase)])
     (unless (== (type-info-kind t) kind)
       (fail-at id "~a is not a~a type" `(,(type-info-name t) ,(if (== kind (sym struct)) `" struct" `"n array"))))
     t))
 
-;; GC form s: (op immediate ... arg ...). Immediates are types, fields and
-;; reference types. Checks s and returns (immediates . arguments), the
-;; immediates resolved.
 (define (gc-parts [name datum] [s datum] [phase i32]) -> datum
   (let* ([l (syntax->list s)] [n (length l)] [text (lambda ([form (ptr u8)]) -> datum (no-match s form))])
     (case name
@@ -3882,15 +3032,12 @@
       [((sym ref.eq)) (if (== n 3) (cons nil (cdr l)) (text "(ref.eq a b)"))]
       [else (if (== n 2) (cons nil (cdr l)) (no-match s (format-string "(~a ref)" name)))])))
 
-;; format-message's template with one ~a, as a C string for a message.
 (define (format-string [template (ptr u8)] [x datum]) -> (ptr u8)
   (let* ([s (format-message template (list1 x))] [b (make-buffer)])
     (buffer-add! (& b) (string-bytes s) (string-length s))
     (buffer-add-byte! (& b) 0)
     (-> b bytes)))
 
-;; parts of GC form (name immediate ... arg ...) with the type immediates
-;; expanded (spec 5.1).
 (define (expand-gc-immediates [name datum] [parts datum] [phase i32]) -> datum
   (let ([n (cond [(!= (memq name `(ref.null ref.test ref.cast)) 0) 1]
                  [(== name (sym array.copy)) 2]
@@ -3923,8 +3070,6 @@
        (unless (== n 2) (no-match s "(#%datum literal)"))
        (datum-out s (cadr l))]
       [((sym closure)) (fail-at s "closure is a type, (ref (closure (type ... -> type ...))), not an expression" nil)]
-      ;; Quoted data is the kernel module's, in memory, which compiled code
-      ;; builds with its functions.
       [((sym quote))
        (unless (== n 2) (no-match s "(quote datum)"))
        (unless to-syntax (ensure-kernel!))
@@ -3933,7 +3078,6 @@
        (unless (== n 2) (no-match s "(quote-syntax datum)"))
        (unless to-syntax (ensure-kernel!))
        (let ([d (prune-local-scopes (cadr l))]) (if to-syntax (out s name (list1 d)) (at s `(quote ,d))))]
-      ;; A quasi form is calls of the kernel module (quasi), expanded.
       [((sym quasiquote))
        (unless (== n 2) (no-match s "(quasiquote template)"))
        (ex (quasi s (cadr l) 0 phase (sym quasiquote) (sym unquote) (sym unquote-splicing) 0))]
@@ -3950,8 +3094,7 @@
              (at s `(const i32 ,(if (== name (sym data-address))
                                     (data-info-offset info)
                                     (make-integer (string-length (data-info-bytes info))))))))]
-      ;; wasm's constants: a literal of that type, whatever #%datum means
-      ;; here (spec 5.3).
+      ;; wasm's constants: a literal of that type, whatever #%datum means here.
       [((sym i32.const) (sym i64.const) (sym f32.const) (sym f64.const))
        (unless (== n 2) (no-match s (format-string "(~a literal)" name)))
        (let ([v (const-literal name (cadr l))])
@@ -3977,9 +3120,6 @@
                     [keys (map (lambda ([x datum]) -> datum (bind-locals! x phase)) xs)])
                (let-out s (cadr l) bs xs keys inits (map (lambda ([x datum]) -> datum (expand-expr (add-scope x sc) phase)) body)))
              (expand-let* s bs body phase)))]
-      ;; (lambda ([x t] ...) [-> r] body ...): a function that uses the
-      ;; locals around it, a closure the compiler makes (spec 5.3). It
-      ;; cannot branch to the labels around it.
       [((sym lambda))
        (unless (and (>= n 2) (syntax? (cadr l)) (!= (syntax->list (cadr l)) 0)) (no-match s "(lambda (p ...) . rest)"))
        (let* ([ps (cadr l)] [rest (cddr l)]
@@ -4047,7 +3187,6 @@
        (unless (>= n 3) (no-match s "(call-indirect signature index arg ...)"))
        (let* ([sig (expand-signature (cadr l) phase)] [pr (parse-signature sig phase)] [i (ex (caddr l))] [a (map ex (cdddr l))])
          (if to-syntax (out s name (cons sig (cons i a))) (at s `(call-indirect ,(car pr) ,(cdr pr) ,i ,a))))]
-      ;; (ref.func f): a reference to f, at its declared function type.
       [((sym ref.func))
        (unless (and (== n 2) (identifier? (cadr l))) (no-match s "(ref.func f)"))
        (let* ([f (cadr l)] [m (meaning-of f phase)])
@@ -4055,7 +3194,6 @@
          (when (== (func-info-type (cadr m)) 0)
            (fail-at f "ref.func: ~a has no declared function type; give it one with (type T)" (list1 (syntax-e f))))
          (if to-syntax (out s name (list1 f)) (at s `(ref-func ,(cadr m)))))]
-      ;; (call-ref T f arg ...): call f, a (ref null T), with the args.
       [((sym call-ref))
        (unless (>= n 3) (no-match s "(call-ref type f arg ...)"))
        (let* ([tname (expand-type-name (cadr l) phase)] [t (type-of tname phase)])
@@ -4071,7 +3209,6 @@
        (unless (== n 4) (no-match s "(select a b test)"))
        (let* ([x (ex (cadr l))] [y (ex (caddr l))] [c (ex (cadddr l))])
          (if to-syntax (out s name `(,x ,y ,c)) (at s `(select ,x ,y ,c))))]
-      ;; (values e ...): each e's value, in order, as several values.
       [((sym values))
        (let ([vs (map (lambda ([x datum]) -> datum (expand-expr x phase)) (cdr l))])
          (if to-syntax (out s name vs) (at s `(values ,@vs))))]
@@ -4081,7 +3218,6 @@
       [((sym unreachable) (sym nop))
        (unless (== n 1) (no-match s (format-string "(~a)" name)))
        (if to-syntax (out s name nil) (at s (list1 name)))]
-      ;; (throw tag arg ...): throw an exception of tag, carrying the args.
       [((sym throw))
        (unless (>= n 2) (no-match s "(throw tag arg ...)"))
        (let* ([info (tag-info-of (cadr l) phase)] [a (map ex (cddr l))])
@@ -4089,8 +3225,6 @@
       [((sym throw-ref))
        (unless (== n 2) (no-match s "(throw-ref exn)"))
        (let ([v (ex (cadr l))]) (if to-syntax (out s name (list1 v)) (at s `(throw-ref ,v))))]
-      ;; (try (clause ...) body ...): body, with the exceptions the clauses
-      ;; catch handled by them (spec 5.3).
       [((sym try))
        (unless (and (>= n 2) (syntax? (cadr l)) (!= (syntax->list (cadr l)) 0)) (no-match s "(try (clause ...) body ...)"))
        (let* ([cs (map (lambda ([c datum]) -> datum (expand-catch c phase)) (syntax->list (cadr l)))] [b (map ex (cddr l))])
@@ -4100,8 +3234,6 @@
            (expand-gc name s phase)
            (fail-at s "~a is only allowed at module level" (list1 name)))])))
 
-;; The literal of constant form (name n): a number, and an integer for
-;; i32.const and i64.const.
 (define (const-literal [name datum] [s datum]) -> datum
   (let ([n (syntax-e s)] [integer (or (== name (sym i32.const)) (== name (sym i64.const)))])
     (unless (if integer (integer? n) (or (integer? n) (flonum? n)))
@@ -4111,11 +3243,6 @@
 (define (const-type [name datum]) -> datum
   (case name [((sym i32.const)) (sym i32)] [((sym i64.const)) (sym i64)] [((sym f32.const)) (sym f32)] [else (sym f64)]))
 
-;; The parts of try clause c, [catch tag (x ...) body ...], [catch-ref tag
-;; (x ... e) body ...], [catch-all body ...] or [catch-all-ref (e) body
-;; ...], whose first word is compared by name: (kind tag-or-#f
-;; variables-or-#f body). The variables are bound to the exception's
-;; values, then, for the -ref kinds, to the exception itself.
 (define (catch-parts [c datum]) -> datum
   (let* ([l (syntax->list c)] [n (if (== l 0) 0 (length l))]
          [ids? (lambda ([v datum] [least u32]) -> i32
@@ -4128,8 +3255,6 @@
            `(catch-all-ref #f ,(cadr l) ,(cddr l))]
           [else (no-match c "(catch tag (x ...) body ...), (catch-ref tag (x ... e) body ...), (catch-all body ...) or (catch-all-ref (e) body ...)")])))
 
-;; Try clause c, its variables bound and its body expanded: fully
-;; expanded, or lowered as (kind tag-info-or-#f keys body).
 (define (expand-catch [c datum] [phase i32]) -> datum
   (let* ([p (catch-parts c)] [kind (car p)] [tag (cadr p)] [vars (caddr p)] [body (cadddr p)]
          [xs (if (!= vars 0) (syntax->list vars) nil)]
@@ -4153,10 +3278,6 @@
                           ,@b)))
           `(,kind ,info ,keys ,(seq-at c b))))))
 
-;; A let binding [x init] or [x type init], as (x type-syntax type init),
-;; the type expanded and parsed, or #f and #f without one; or [(x ...)
-;; init] or [(x ...) (type ...) init], which binds each x to one of the
-;; values init gives, in order, as ((x ...) types-syntax types init).
 (define (let-binding [b datum] [phase i32]) -> datum
   (let ([l (syntax->list b)])
     (cond [(and (!= l 0) (== (length l) 2) (identifier? (car l))) `(,(car l) #f #f ,(cadr l))]
@@ -4169,7 +3290,6 @@
              `(,(syntax->list (car l)) ,ts ,(map (lambda ([t datum]) -> datum (parse-type t phase)) ts) ,(caddr l)))]
           [else (no-match b "(name init), (name type init), ((name ...) init) or ((name ...) (type ...) init)")])))
 
-;; Is x a list of identifiers, one or more?
 (define (names? [x datum]) -> i32
   (let ([l (syntax->list x)])
     (when (or (== l 0) (null? l)) (return 0))
@@ -4178,7 +3298,6 @@
       (set! l (cdr l)))
     1))
 
-;; A binding's name, or its names, with scope sc added; and each bound.
 (define (scoped [x datum] [sc u32]) -> datum
   (if (pair? x) (map (lambda ([y datum]) -> datum (add-scope y sc)) x) (add-scope x sc)))
 
@@ -4187,8 +3306,6 @@
 
 (define (let-init [bp datum]) -> datum (cadddr bp))
 
-;; The let, the form s whose binding list is bindings, of bindings bs,
-;; bound as the identifiers xs with the keys, to inits, around body.
 (define (let-out [s datum] [bindings datum] [bs datum] [xs datum] [keys datum] [inits datum] [body datum]) -> datum
   (let ([outs nil])
     (while (pair? bs)
@@ -4212,7 +3329,6 @@
         (out s (sym let) (cons (out-list bindings (reverse outs)) body))
         (at s `(let ,(reverse outs) ,(seq-at s body))))))
 
-;; (let* (b ...) body ...) as nested lets, one binding each.
 (define (expand-let* [s datum] [bs datum] [body datum] [phase i32]) -> datum
   (if (null? bs)
       (let-out s s nil nil nil nil (map (lambda ([x datum]) -> datum (expand-expr x phase)) body))
@@ -4227,8 +3343,6 @@
         (let-out s s (list1 bp) (list1 x) (list1 key) (list1 init)
                  (if (null? later) (map (lambda ([y datum]) -> datum (expand-expr y phase)) body) (list1 (expand-let* s later body phase)))))))
 
-;; A local variable with id's name and scopes already is one the same form
-;; binds: an error, rather than ambiguous uses.
 (define (bind-local! [id datum] [phase i32]) -> datum
   (let ([b (bindings-under (syntax-e id) (binding-slot (syntax-scopes id)))])
     (while (!= b 0)
@@ -4240,18 +3354,13 @@
     (set! (-> b meaning) (keep `(local ,(-> b key))))
     (-> b key)))
 
-;; id, recording that it binds or refers to the local variable with key,
-;; or, key #f, that it refers to none: in fully expanded code an
-;; identifier has the property if and only if it is a local variable's,
-;; whatever properties a macro copied onto it (syntax-rewrap).
+;; In fully expanded code an identifier has the property if and only if it is a
+;; local variable's, whatever properties a macro copied onto it.
 (define (with-local-binding [id datum] [key datum]) -> datum
   (if (or (!= key 0) (!= (syntax-property id (sym %local-binding)) 0))
       (syntax-property-set id (sym %local-binding) key)
       id))
 
-;; The function or lambda whose body is being expanded, as a unique list,
-;; or #f; and label key -> the one it was bound in. A branch must stay in
-;; its function.
 (define current-function datum 0)
 (define label-functions hash-table)
 
@@ -4261,8 +3370,6 @@
     (hash-set! (& label-functions) (cast u64 (integer-value key)) (cast u32 (if (== current-function 0) 1 (cast u32 current-function))))
     key))
 
-;; The key of label id, which must be a label of the function being
-;; expanded: a lambda cannot branch to the labels around it.
 (define (label-here [id datum] [phase i32]) -> datum
   (let ([key (label-key-of id phase)] [function (if (== current-function 0) 1 (cast u32 current-function))])
     (unless (== (hash-ref (& label-functions) (cast u64 (integer-value key))) function)
@@ -4275,15 +3382,7 @@
     (cadr m)))
 
 ;; ==== quasiquote / quasisyntax ====
-;;
-;; One walker for both. The result is code that calls the kernel module,
-;; in core forms with the unquoted expressions as written, for expand-expr
-;; to expand. For quasisyntax, unchanged subtemplates become syntax
-;; constants and changed lists are rewrapped with the template's own
-;; scopes and srcloc (syntax-rewrap).
 
-;; What a quasi form is: where it is, its phase, its names for itself, for
-;; unquote and for unquote-splicing, and whether it is quasisyntax.
 (struct quasi-form [where datum] [phase i32] [qname datum] [uname datum] [sname datum] [syntax i32])
 
 (define (quasi [where datum] [t datum] [depth i32] [phase i32] [qname datum] [uname datum] [sname datum] [syntax i32]) -> datum
@@ -4320,7 +3419,6 @@
       (out x (sym quote-syntax) (list1 (prune-local-scopes x)))
       (out x (sym quote) (list1 x))))
 
-;; Rebuild the pair chain e (elements of template x) as an expression.
 (define (quasi-list [q (ptr quasi-form)] [x datum] [e datum] [depth i32]) -> datum
   (cond [(null? e) (out x (sym quote) (list1 (make-syntax nil no-scopes 0 nil)))]
         [(syntax? e) (quasi-walk q e depth)]
@@ -4342,18 +3440,14 @@
            (if (-> q syntax) (quasi-call q (sym syntax-rewrap) `(,(quasi-constant q x) ,head)) head))]
         [else (quasi-constant q x)]))
 
-;; ---- function values (spec 5.2) ----
+;; ---- function values ----
 
-;; A function declared with #:value g -> (g . phase), then g's info once
-;; it is resolved: when the function's name is first expanded as an
-;; expression, in the second pass, so the global may be declared after
-;; the function, or lifted with it.
+;; Resolved in the second pass, so the global may be declared after the function,
+;; or lifted with it.
 (define function-values hash-table)
 
 (define (has-value? [info datum]) -> i32 (!= (hash-ref (& function-values) (cast u64 (base-info info))) 0))
 
-;; The info of the global that is func info's value, shifted as info is,
-;; or #f if info has none.
 (define (function-value [info datum]) -> datum
   (let* ([base (base-info info)] [v (cast datum (hash-ref (& function-values) (cast u64 base)))] [g datum 0])
     (cond [(== v 0) 0]
@@ -4366,20 +3460,15 @@
           [else (set! g v)])
     (shift-info g (info-shift info))))
 
-;; ---- inline functions (spec 5.2) ----
+;; ---- inline functions ----
 
-;; The inline functions' bodies: info -> (params results body returns?
-;; assigned), their parameters as (key . type), their result types, their
-;; lowered bodies, whether each has a return, and the parameters the body
-;; sets. Kept without source locations: an inlined call is at the call's.
+;; Kept without source locations: an inlined call is at the call's.
 (define inlines hash-table)
 
-;; Check that the lowered body of inline function info, named by id, does
-;; not depend on which module it is compiled in, and keep it, with
-;; whether it uses memory: then it is inlined only where that memory is
-;; the same (inline-call).
 (define inline-memory i32 0)
 
+;; An inline body must not depend on which module it is compiled in; one that uses
+;; memory is inlined only where the code uses the same memory.
 (define (record-inline! [info datum] [params datum] [body datum] [id datum])
   (set! inline-memory 0)
   (let ([returns (check-inline body id)])
@@ -4392,14 +3481,11 @@
   (fail-at id "~a is inline, so it may not ~a" `(,(syntax-e id) ,(bytes->string what (strlen what))))
   0)
 
-;; Check lowered form e of an inline body: 1 if it has a return.
 (define (check-inline [e datum] [id datum]) -> i32
   (let ([check (lambda ([x datum]) -> i32 (check-inline x id))]
         [each (lambda ([l datum]) -> i32 (check-each l id))])
     (case (car e)
       [((sym at) (sym as) (sym lset) (sym gset)) (check (caddr e))]
-      ;; Quoted data goes into the table of the module a call is compiled
-      ;; in, which needs the kernel module's memory as any quote does.
       [((sym int) (sym float) (sym const) (sym lref) (sym gref) (sym ref-func) (sym unreachable) (sym nop) (sym quote)) 0]
       [((sym let))
        (let ([r (check-each (map (lambda ([b datum]) -> datum (caddr b)) (cadr e)) id)]) (or (check (caddr e)) r))]
@@ -4427,8 +3513,6 @@
       [((sym apply-value)) (let ([a (check (cadr e))]) (or (each (caddr e)) a))]
       [else (fail-at id "internal: lowered form ~a" (list1 (car e))) 0])))
 
-;; check-inline of each of the forms in l, in order: 1 if one has a
-;; return.
 (define (check-each [l datum] [id datum]) -> i32
   (let ([returns 0])
     (while (pair? l)
@@ -4436,17 +3520,14 @@
       (set! l (cdr l)))
     returns))
 
-;; Whether lowered form e sets local key.
 (define (assigns? [e datum] [key datum]) -> i32
   (cond [(not (pair? e)) 0]
         [(== (car e) (sym quote)) 0]
         [(and (== (car e) (sym lset)) (equal? (cadr e) key)) 1]
         [else (ormap (lambda ([x datum]) -> i32 (assigns? x key)) (cdr e))]))
 
-;; e without the source locations around it.
 (define (unlocated [e datum]) -> datum (if (== (car e) (sym at)) (unlocated (caddr e)) e))
 
-;; Lowered form e without its source locations.
 (define (without-locations [e datum]) -> datum
   (cond [(not (pair? e)) e]
         [(== (car e) (sym at)) (without-locations (caddr e))]
@@ -4460,9 +3541,6 @@
                 (unless (== last 0) (set-cdr! last l))
                 head)]))
 
-;; A call of info with args, at phase, lowered, as info's body if it is
-;; inline, takes that many arguments and, if it uses memory, was
-;; compiled for the memory the code being compiled uses; #f otherwise.
 (define (inline-call [info datum] [args datum] [phase i32]) -> datum
   (let ([b (cast datum (hash-ref (& inlines) (cast u64 (base-info info))))])
     (if (or (== b 0) (!= (length args) (length (car b)))
@@ -4482,10 +3560,6 @@
     (memset (& t) 0 (sizeof hash-table))
     t))
 
-;; Does the code being compiled at phase use the memory the body of
-;; inline function info was compiled for? Each is known by the instance
-;; that owns it, the one whose linklet declares it, at run time, found
-;; through the instances each takes its memory from (spec 3.3).
 (define (same-memory? [info datum] [phase i32]) -> i32
   (let* ([i (info-instance (base-info info))]
          [def (cond [(== i 0) (use-memory-owner (- phase (cast i32 (info-shift info))))]
@@ -4494,19 +3568,12 @@
          [use (use-memory-owner phase)])
     (and (!= def 0) (!= use 0) (string=? def use))))
 
-;; The instance that owns the memory of the module being compiled at
-;; phase, or 0 if it has none.
 (define (use-memory-owner [phase i32]) -> datum
   (let ([form (storage-form (sym memory) phase)])
     (cond [(== form 0) 0]
           [(== (car form) (sym memory)) (linklet-name (-> current module) phase 0)]
           [else (memory-owner (cadr form))])))
 
-;; The instance that owns the memory of the instance named name: name
-;; itself if its linklet declares one, or the owner of the instance its
-;; memory is from, at name's shift; or 0. An instance of the kernel
-;; module's group, at any shift, is the running build's (group-instance),
-;; whose memory its linklet's bytes say.
 (define (memory-owner [name datum]) -> datum
   (cond [(== name 0) 0]
         [(!= (group-instance name) 0) (group-memory-owner (group-instance name))]
@@ -4520,13 +3587,8 @@
                        [(== (car form) (sym memory)) name]
                        [else (memory-owner (shifted-instance (cadr form) t))]))))]))
 
-;; The owners of the memories of the running build's linklets, by name,
-;; as found: (name . owner).
 (define memory-owners datum nil)
 
-;; The instance that owns the memory of the running build's linklet named
-;; name: name if its linklet declares one, else the owner of the linklet
-;; it imports its memory from.
 (define (group-memory-owner [name datum]) -> datum
   (let ([p (assoc name memory-owners)])
     (if (!= p 0)
@@ -4537,25 +3599,20 @@
           (set! memory-owners (keep-cons (cons name owner) memory-owners))
           (cdr (car memory-owners))))))
 
-;; The instance named name, at t more phase shift.
 (define (shifted-instance [name datum] [t i32]) -> datum
   (if (or (== t 0) (kernel-name? name))
       name
       (let ([r (linklet-ref name)])
         (if (== r 0) 0 (linklet-name (car r) (cast i32 (integer-value (cadr r))) (+ (cast i32 (integer-value (caddr r))) t))))))
 
-;; The memory form of module m's phase-q linklet: the module being
-;; compiled's as declared, another's as its interface says; or 0.
 (define (module-memory [m datum] [q i32]) -> datum
   (if (== m (-> current module))
       (storage-form (sym memory) q)
       (let ([p (assoc (make-integer q) (-> (unit-of m) memories))])
         (if (== p 0) 0 (cdr p)))))
 
-;; The let bindings of an inlined call's parameters params to its arguments
-;; args, recording each parameter's local in keys. A parameter the body
-;; does not set, given a local that no later argument sets, is that local,
-;; at the parameter's type, and needs no binding.
+;; A parameter the body does not set, given a local that no later argument sets, is
+;; that local, at the parameter's type, and needs no binding.
 (define (inline-bindings [params datum] [args datum] [assigned datum] [keys (ptr hash-table)]) -> datum
   (if (null? params)
       nil
@@ -4569,7 +3626,6 @@
               (hash-set! keys (cast u64 (integer-value (car p))) (cast u32 k))
               (cons `(,k ,(cdr p) ,(car args)) (inline-bindings (cdr params) (cdr args) assigned keys)))))))
 
-;; The local or label key is copied as, made the first time.
 (define (copied-key [table (ptr hash-table)] [key datum]) -> datum
   (let ([known (cast datum (hash-ref table (cast u64 (integer-value key))))])
     (if (!= known 0)
@@ -4578,14 +3634,9 @@
           (hash-set! table (cast u64 (integer-value key)) (cast u32 n))
           n))))
 
-;; The keys each of ks is copied as.
 (define (copied-keys [ks datum] [table (ptr hash-table)]) -> datum
   (map (lambda ([k datum]) -> datum (copied-key table k)) ks))
 
-;; Lowered form e of an inline body, for one inlined call: its locals and
-;; labels new, its infos shifted by inline-shift, as the inlined function
-;; is, and a return a br to label ret. A local that keys maps to a form, a
-;; parameter given a local, reads that.
 (define inline-shift u32 0)
 
 (define (copy-inline [e datum] [keys (ptr hash-table)] [labels (ptr hash-table)] [ret datum]) -> datum
@@ -4605,7 +3656,6 @@
                            (cons (cadr b) (cons (copy-inline (caddr b) keys labels ret) (cdddr b)))))
                    (cadr e))
              ,(copy (caddr e)))]
-      ;; A lambda copied has a key of its own, and its parameters new locals.
       [((sym lambda))
        (set! lowered-closures 1)
        `(lambda ,(fresh-key!) ,(map (lambda ([p datum]) -> datum (cons (copied-key keys (car p)) (cdr p))) (caddr e)) ,(cadddr e)
@@ -4634,10 +3684,7 @@
              ,(copy (caddr e)))]
       [else (fail-at 0 "internal: lowered form ~a" (list1 (car e)))])))
 
-;; copy-inline of each form in l.
 (define (copy-each [l datum] [keys (ptr hash-table)] [labels (ptr hash-table)] [ret datum]) -> datum
   (map (lambda ([x datum]) -> datum (copy-inline x keys labels ret)) l))
 
-;; Keep inline function info's body code, of parameters params, named by
-;; name.
 (define (note-inline! [info datum] [params datum] [code datum] [name datum]) (record-inline! info params code name))
