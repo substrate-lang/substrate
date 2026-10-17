@@ -2,7 +2,6 @@
 (require-unqualified base "base/base.sub")
 (require-unqualified k "kernel.sub")
 (require-unqualified core "core.sub")
-(require-unqualified cl "closures.sub")
 (require-unqualified ops "ops.sub")
 (require-unqualified w "wasm.sub")
 (require-unqualified ser "serialize.sub")
@@ -11,28 +10,24 @@
 
 ;; ---- state ----
 
-(struct fctx [locals (ptr arena-table)] [extra datum] [next u32] [results datum] [analysis (ptr closures)] [asm (ptr asm)])
+(struct fctx [locals (ptr arena-table)] [extra datum] [next u32] [results datum] [asm (ptr asm)])
 
 (struct label [key datum] [kind datum] [type datum] [next (ptr label)])
 
 (struct synth [self datum] [kind datum] [info datum])
 (const synth-kind u32 40)
 
-(struct lifted-fn [info datum] [params datum] [own datum] [body datum] [analysis (ptr closures)] [csub datum]
-        [captures datum] [next (ptr lifted-fn)])
-
 (struct mstate [self datum] [func-imports datum] [global-imports datum] [tag-imports datum] [synths datum] [fidx datum]
-        [uses-memory i32] [memory-loc (ptr srcloc)] [uses-table i32] [table-loc (ptr srcloc)] [uses-gc i32]
-        [literals (ptr serializer)] [literals-table datum]
-        [pending (ptr lifted-fn)] [exported (ptr arena-table)]
+        [uses-memory i32] [memory-loc (ptr srcloc)] [uses-table i32] [table-loc (ptr srcloc)]
+        [literals (ptr serializer)] [literals-table datum] [exported (ptr arena-table)]
         [fname datum] [types datum] [noted (ptr arena-table)] [imported (ptr arena-table)])
 
 (struct compiled [info datum] [sig datum] [locals datum] [asm (ptr asm)] [next (ptr compiled)])
 
 (struct type-collector [found datum] [seen (ptr arena-table)])
 
-(struct linker [funcs (ptr arena-table)] [globals (ptr arena-table)] [gcs (ptr arena-table)] [tags (ptr arena-table)]
-        [gc-count u32] [func-types datum] [func-type-count u32] [func-type-index (ptr arena-table)]
+(struct linker [funcs (ptr arena-table)] [globals (ptr arena-table)] [types (ptr arena-table)] [tags (ptr arena-table)]
+        [type-count u32] [func-types datum] [func-type-count u32] [func-type-index (ptr arena-table)]
         [declared datum] [declared-set (ptr arena-table)])
 
 (define literal-buffer-info datum 0)
@@ -41,7 +36,6 @@
   (set! literal-buffer-info buffer)
   (set! deserialize-info deserialize))
 
-(define eqref datum (make-ref (boolean 1) (sym eq)))
 (define exnref datum (make-ref (boolean 1) (sym exn)))
 
 ;; ---- error locations ----
@@ -186,7 +180,6 @@
     (set! (-> fc extra) nil)
     (set! (-> fc next) 0)
     (set! (-> fc results) results)
-    (set! (-> fc analysis) 0)
     (set! (-> fc asm) (new-asm))
     (while (pair? params)
       (add-local! fc (car (car params)) (cdr (car params)))
@@ -264,10 +257,8 @@
     (set! (-> ms memory-loc) 0)
     (set! (-> ms uses-table) 0)
     (set! (-> ms table-loc) 0)
-    (set! (-> ms uses-gc) 0)
     (set! (-> ms literals) 0)
     (set! (-> ms literals-table) 0)
-    (set! (-> ms pending) 0)
     (set! (-> ms exported) (make-table))
     (set! (-> ms fname) 0)
     (set! (-> ms types) nil)
@@ -337,77 +328,7 @@
         (return s))
       (+= n 1))))
 
-;; ---- closures ----
-
-(define (boxed? [fc (ptr fctx)] [key datum]) -> i32
-  (let ([a (-> fc analysis)]) (and (!= a 0) (closures-boxed? a key))))
-
-(define (known-of [fc (ptr fctx)] [key datum]) -> (ptr known-fn)
-  (let ([a (-> fc analysis)]) (if (== a 0) 0 (closures-known-of a key))))
-
-(define (box-local! [fc (ptr fctx)] [key datum] [type datum])
-  (let* ([old (car (lookup-local fc key))] [box (box-type type)] [new (add-local! fc key (make-ref 0 box))])
-    (emit! fc `(local.get ,old))
-    (emit! fc `(struct.new ,box))
-    (emit! fc `(local.set ,(small new)))))
-
-(define (box-params! [fc (ptr fctx)] [params datum])
-  (while (pair? params)
-    (let ([p (car params)]) (when (boxed? fc (car p)) (box-local! fc (car p) (cdr p))))
-    (set! params (cdr params))))
-
-(define (typed-keys [fc (ptr fctx)] [keys datum]) -> datum
-  (map (lambda ([key datum]) -> datum (cons key (cdr (lookup-local fc key)))) keys))
-
-(define (lifted-info [ms (ptr mstate)] [base datum] [params datum] [results datum] [type datum]) -> datum
-  (let ([name (string->symbol (format-message "~a.~a" `(,(-> ms fname) ,base)))])
-    (func-info name params results (-> ms self) (export-name! ms name) type)))
-
-(define (lift! [ms (ptr mstate)] [info datum] [params datum] [own datum] [body datum] [analysis (ptr closures)]
-               [csub datum] [captures datum])
-  (let ([l (cast (ptr lifted-fn) (alloc-in (current-arena) (sizeof lifted-fn)))])
-    (set! (-> l info) info)
-    (set! (-> l params) params)
-    (set! (-> l own) own)
-    (set! (-> l body) body)
-    (set! (-> l analysis) analysis)
-    (set! (-> l csub) csub)
-    (set! (-> l captures) captures)
-    (set! (-> l next) (-> ms pending))
-    (set! (-> ms pending) l)))
-
-(define (known-info! [ms (ptr mstate)] [fc (ptr fctx)] [k (ptr known-fn)]) -> datum
-  (if (!= (-> k info) 0)
-      (-> k info)
-      (let* ([node (-> k lambda)]
-             [captures (typed-keys fc (-> k captures))]
-             [info (lifted-info ms (-> k name) (append (map-cdr (caddr node)) (map-cdr captures)) (cadddr node) 0)])
-        (set! (-> k info) info)
-        info)))
-
-(define (lift-known! [ms (ptr mstate)] [fc (ptr fctx)] [k (ptr known-fn)])
-  (let ([info (known-info! ms fc k)] [node (-> k lambda)])
-    (unless (-> k lifted)
-      (set! (-> k lifted) 1)
-      (lift! ms info (append (caddr node) (typed-keys fc (-> k captures))) (caddr node)
-             `(at ,(carrier current-loc) ,(list-ref node 4)) (-> fc analysis) 0 nil))))
-
-(define (capture-type [closure datum] [types datum]) -> datum
-  (let ([fields nil] [i i64 0] [t datum 0])
-    (while (pair? types)
-      (set! fields (cons `(,(string->symbol (format-message "v~a" (cons (small i) nil))) ,(car types) #f) fields))
-      (+= i 1)
-      (set! types (cdr types)))
-    (set! t (make-type-info (sym closure) (sym struct)
-                            (cons `(code ,(make-ref 0 (closure-code closure)) #f) (reverse fields))
-                            closure (boolean 1) 0))
-    (identify-group! (cons t nil))
-    t))
-
 ;; ---- expressions ----
-
-(define (struct-field [tinfo datum] [index datum]) -> datum
-  (list-ref (type-info-fields tinfo) (cast u32 (integer-value index))))
 
 (define (code-of [ms (ptr mstate)] [fc (ptr fctx)] [labels (ptr label)] [e datum] [type datum]) -> datum
   (cx ms fc labels e (cons type nil) 0))
@@ -441,83 +362,22 @@
       (begin (emit! fc (cons (tail-call-op (car i)) (cdr i))) results)
       (begin (emit! fc i) (fit fc results expected))))
 
-(define (compile-gc [ms (ptr mstate)] [fc (ptr fctx)] [labels (ptr label)] [op datum] [imms datum] [args datum]
-                    [expected datum]) -> datum
+(define (compile-ref [ms (ptr mstate)] [fc (ptr fctx)] [labels (ptr label)] [op datum] [imms datum] [args datum]
+                     [expected datum]) -> datum
   (for-each (lambda ([i datum]) (note-type! ms i)) imms)
   (cond
-    [(== op (sym struct.new))
-     (let ([t (car imms)])
-       (gc! ms fc labels args (map (lambda ([f datum]) -> datum (unpacked (cadr f))) (type-info-fields t))
-            `(struct.new ,t) (cons (make-ref 0 t) nil) expected))]
-    [(!= (memq op `(struct.get struct.get_s struct.get_u)) 0)
-     (let* ([t (car imms)] [i (cadr imms)] [f (struct-field t i)] [packed (!= (memq (cadr f) `(i8 i16)) 0)])
-       (when (and packed (== op (sym struct.get)))
-         (fail "field ~a is packed: use struct.get_s or struct.get_u" (cons (car f) nil)))
-       (when (and (not packed) (!= op (sym struct.get)))
-         (fail "~a is only for packed fields" (cons op nil)))
-       (gc! ms fc labels args (cons (make-ref (boolean 1) t) nil) `(,op ,t ,i) (cons (unpacked (cadr f)) nil) expected))]
-    [(== op (sym struct.set))
-     (let* ([t (car imms)] [i (cadr imms)] [f (struct-field t i)])
-       (when (== (caddr f) 0) (fail "field ~a is not mutable" (cons (car f) nil)))
-       (gc! ms fc labels args `(,(make-ref (boolean 1) t) ,(unpacked (cadr f))) `(struct.set ,t ,i) nil expected))]
-    [(== op (sym array.new))
-     (let ([t (car imms)])
-       (gc! ms fc labels args `(,(element t) i32) `(array.new ,t) (cons (make-ref 0 t) nil) expected))]
-    [(== op (sym array.new_default))
-     (let ([t (car imms)]) (gc! ms fc labels args `(i32) `(array.new_default ,t) (cons (make-ref 0 t) nil) expected))]
-    [(== op (sym array.new_fixed))
-     (let* ([t (car imms)] [e (element t)])
-       (gc! ms fc labels args (map (lambda ([a datum]) -> datum e) args) `(array.new_fixed ,t ,(small (length args)))
-            (cons (make-ref 0 t) nil) expected))]
-    [(!= (memq op `(array.get array.get_s array.get_u)) 0)
-     (let* ([t (car imms)] [storage (car (type-info-fields t))] [packed (!= (memq storage `(i8 i16)) 0)])
-       (when (and packed (== op (sym array.get)))
-         (fail "~a has packed elements: use array.get_s or array.get_u" (cons (type-info-name t) nil)))
-       (when (and (not packed) (!= op (sym array.get)))
-         (fail "~a is only for packed elements" (cons op nil)))
-       (gc! ms fc labels args `(,(make-ref (boolean 1) t) i32) `(,op ,t) (cons (unpacked storage) nil) expected))]
-    [(== op (sym array.set))
-     (let ([t (car imms)])
-       (when (== (cadr (type-info-fields t)) 0) (fail "~a is not mutable" (cons (type-info-name t) nil)))
-       (gc! ms fc labels args `(,(make-ref (boolean 1) t) i32 ,(element t)) `(array.set ,t) nil expected))]
-    [(== op (sym array.len)) (gc! ms fc labels args (cons (make-ref (boolean 1) (sym array)) nil) `(array.len) `(i32) expected)]
-    [(== op (sym array.fill))
-     (let ([t (car imms)])
-       (gc! ms fc labels args `(,(make-ref (boolean 1) t) i32 ,(element t) i32) `(array.fill ,t) nil expected))]
-    [(== op (sym array.copy))
-     (let ([dst (car imms)] [src (cadr imms)])
-       (gc! ms fc labels args `(,(make-ref (boolean 1) dst) i32 ,(make-ref (boolean 1) src) i32 i32) `(array.copy ,dst ,src) nil expected))]
     [(== op (sym ref.null))
-     (gc! ms fc labels args nil `(ref.null ,(car imms)) (cons (make-ref (boolean 1) (car imms)) nil) expected)]
+     (args-code ms fc labels args nil)
+     (emit! fc `(ref.null ,(car imms)))
+     (fit fc (cons (make-ref (boolean 1) (car imms)) nil) expected)]
     [(== op (sym ref.is_null))
      (ref-arg ms fc labels (car args) `"ref.is_null")
      (emit! fc `(ref.is_null))
      (fit fc `(i32) expected)]
-    [(== op (sym ref.eq)) (gc! ms fc labels args (cons eqref (cons eqref nil)) `(ref.eq) `(i32) expected)]
-    [(== op (sym ref.as_non_null))
+    [else
      (let ([r (ref-arg ms fc labels (car args) `"ref.as_non_null")])
        (emit! fc `(ref.as_non_null))
-       (fit fc (cons (make-ref 0 (ref-heap r)) nil) expected))]
-    [(or (== op (sym ref.test)) (== op (sym ref.cast)))
-     (let ([target (car imms)])
-       (ref-arg ms fc labels (car args) op)
-       (emit! fc `(,(if (!= (ref-nullable? target) 0)
-                        (if (== op (sym ref.test)) (sym ref.test-null) (sym ref.cast-null))
-                        op)
-                   ,(ref-heap target)))
-       (fit fc (if (== op (sym ref.test)) `(i32) (cons target nil)) expected))]
-    [(== op (sym ref.i31)) (gc! ms fc labels args `(i32) `(ref.i31) (cons (make-ref 0 (sym i31)) nil) expected)]
-    [(or (== op (sym i31.get_s)) (== op (sym i31.get_u)))
-     (gc! ms fc labels args (cons (make-ref (boolean 1) (sym i31)) nil) (cons op nil) `(i32) expected)]
-    [else (fail "internal: unknown GC operation ~a" (cons op nil))]))
-
-(define (element [t datum]) -> datum (unpacked (car (type-info-fields t))))
-
-(define (gc! [ms (ptr mstate)] [fc (ptr fctx)] [labels (ptr label)] [args datum] [types datum] [i datum] [result datum]
-             [expected datum]) -> datum
-  (args-code ms fc labels args types)
-  (emit! fc i)
-  (fit fc result expected))
+       (fit fc (cons (make-ref 0 (ref-heap r)) nil) expected))]))
 
 ;; A call in a try's body is not a tail call, which would leave the try.
 (define (compile-try [ms (ptr mstate)] [fc (ptr fctx)] [labels (ptr label)] [clauses datum] [body datum]
@@ -588,19 +448,10 @@
             (set! ts (cdr ts))))
         ;; The values, the last on the stack first.
         (for-each (lambda ([key datum]) (emit! fc `(local.set ,(car (lookup-local fc key))))) (reverse (caddr c)))
-        (box-params! fc (pairs (caddr c) p))
         (set! t (cx ms fc (anonymous-blocks (- n i) outer) e expected tail))
         (when (< i n) (emit! fc `(br ,(small (- n i)))))
         (emit! fc `(end))
         t)))
-
-(define (pairs [as datum] [bs datum]) -> datum
-  (let ([out nil])
-    (while (pair? as)
-      (set! out (cons (cons (car as) (car bs)) out))
-      (set! as (cdr as))
-      (set! bs (cdr bs)))
-    (reverse out)))
 
 (define (cx [ms (ptr mstate)] [fc (ptr fctx)] [labels (ptr label)] [e datum] [expected datum] [tail i32]) -> datum
   (let ([kind (car e)] [args (cdr e)])
@@ -639,23 +490,14 @@
                          [else `(,(const-op t) ,n)]))
          (fit fc (cons t nil) expected))]
       [(== kind (sym lref))
-       (let* ([l (lookup-local fc (car args))] [box (if (boxed? fc (car args)) (ref-heap (cdr l)) 0)])
+       (let ([l (lookup-local fc (car args))])
          (emit! fc `(local.get ,(car l)))
-         (if (!= box 0)
-             (begin (emit! fc `(struct.get ,box 0)) (fit fc (cons (box-value-type box) nil) expected))
-             (fit fc (cons (cdr l) nil) expected)))]
+         (fit fc (cons (cdr l) nil) expected))]
       [(== kind (sym lset))
-       (let ([k (known-of fc (car args))])
-         (if (!= k 0)
-             (begin (lift-known! ms fc k) (fit fc nil expected))
-             (let* ([l (lookup-local fc (car args))] [box (if (boxed? fc (car args)) (ref-heap (cdr l)) 0)])
-               (if (!= box 0)
-                   (begin (emit! fc `(local.get ,(car l)))
-                          (code-of ms fc labels (cadr args) (box-value-type box))
-                          (emit! fc `(struct.set ,box 0)))
-                   (begin (code-of ms fc labels (cadr args) (cdr l))
-                          (emit! fc `(local.set ,(car l)))))
-               (fit fc nil expected))))]
+       (let ([l (lookup-local fc (car args))])
+         (code-of ms fc labels (cadr args) (cdr l))
+         (emit! fc `(local.set ,(car l)))
+         (fit fc nil expected))]
       [(== kind (sym gref))
        (let ([info (car args)])
          (note-global! ms info)
@@ -766,10 +608,7 @@
          (args-code ms fc labels (caddr args) (car (type-info-fields t)))
          (code-of ms fc labels (cadr args) (make-ref (boolean 1) t))
          (call! fc `(call_ref ,t) (cadr (type-info-fields t)) expected tail))]
-      [(== kind (sym gc))
-       ;; A null, and testing for one, touch no GC object.
-       (when (== (memq (car args) `(ref.null ref.is_null ref.as_non_null)) 0) (set! (-> ms uses-gc) 1))
-       (compile-gc ms fc labels (car args) (cadr args) (caddr args) expected)]
+      [(== kind (sym ref)) (compile-ref ms fc labels (car args) (cadr args) (caddr args) expected)]
       [(== kind (sym select))
        (let ([ta (cx ms fc labels (car args) 0 0)])
          (unless (single? ta) (fail "select needs single values, got ~a" (cons (type->string ta) nil)))
@@ -808,8 +647,6 @@
        (emit! fc `(throw_ref))
        (sym bottom)]
       [(== kind (sym try)) (compile-try ms fc labels (car args) (cadr args) expected tail)]
-      [(== kind (sym lambda)) (cx-lambda ms fc args expected)]
-      [(== kind (sym apply-value)) (cx-apply ms fc labels args expected tail)]
       [(== kind (sym quote))
        (let ([d (car args)])
          (if (== d 0)
@@ -829,7 +666,7 @@
 (define (cx-let [ms (ptr mstate)] [fc (ptr fctx)] [labels (ptr label)] [args datum] [expected datum] [tail i32]) -> datum
   (let ([bs (car args)])
     (while (pair? bs)
-      (let* ([b (car bs)] [key (car b)] [declared (cadr b)] [init (caddr b)] [k (if (pair? key) 0 (known-of fc key))])
+      (let* ([b (car bs)] [key (car b)] [declared (cadr b)] [init (caddr b)])
         ;; Several keys take the values of their init, the last on top of
         ;; the stack, so set first.
         (when (pair? key)
@@ -839,29 +676,15 @@
                     `(,(make-integer (length key)) ,(type->string t))))
             (set! t (reverse t))
             (while (pair? ks)
-              (if (boxed? fc (car ks))
-                  (let* ([box (box-type (car t))] [i (add-local! fc (car ks) (make-ref 0 box))])
-                    (emit! fc `(struct.new ,box))
-                    (emit! fc `(local.set ,(small i))))
-                  (emit! fc `(local.set ,(small (add-local! fc (car ks) (car t))))))
+              (emit! fc `(local.set ,(small (add-local! fc (car ks) (car t)))))
               (set! ks (cdr ks))
               (set! t (cdr t)))))
-        ;; A known function's lambda is lifted once every variable of the let is bound,
-        ;; since it may capture one bound after it.
-        (when (and (== k 0) (not (pair? key)))
+        (unless (pair? key)
           (let ([t (cx ms fc labels init (if (!= declared 0) (cons declared nil) 0) 0)])
             (unless (single? t)
               (fail "a let binding needs a single value, got ~a~a"
                     `(,(type->string t) ,(if (== t (sym bottom)) `"; give it a type" `""))))
-            (if (boxed? fc key)
-                (let* ([box (box-type (car t))] [i (add-local! fc key (make-ref 0 box))])
-                  (emit! fc `(struct.new ,box))
-                  (emit! fc `(local.set ,(small i))))
-                (emit! fc `(local.set ,(small (add-local! fc key (car t)))))))))
-      (set! bs (cdr bs)))
-    (set! bs (car args))
-    (while (pair? bs)
-      (let ([k (if (pair? (car (car bs))) 0 (known-of fc (car (car bs))))]) (when (!= k 0) (lift-known! ms fc k)))
+            (emit! fc `(local.set ,(small (add-local! fc key (car t))))))))
       (set! bs (cdr bs)))
     (cx ms fc labels (cadr args) expected tail)))
 
@@ -903,46 +726,6 @@
     (set-cell-value! c (blocktype t))
     t))
 
-(define (cx-lambda [ms (ptr mstate)] [fc (ptr fctx)] [args datum] [expected datum]) -> datum
-  (let ([key (car args)] [params (cadr args)] [results (caddr args)] [body (cadddr args)] [a (-> fc analysis)])
-    (when (== a 0) (fail "internal: a lambda in a function that was not analyzed" nil))
-    (let* ([captures (typed-keys fc (closures-captures-of a key))]
-           [closure (closure-type (map-cdr params) results)]
-           [csub (if (null? captures) closure (capture-type closure (map-cdr captures)))]
-           [info (lifted-info ms (sym lambda) (cons (make-ref 0 closure) (map-cdr params)) results (closure-code closure))])
-      (note-type! ms csub)
-      (note-type! ms (closure-code closure))
-      (lift! ms info (cons (cons key (make-ref 0 closure)) params) params `(at ,(carrier current-loc) ,body) a csub captures)
-      (set! (-> ms uses-gc) 1)
-      (emit! fc `(ref.func ,info))
-      (for-each (lambda ([c datum]) (emit! fc `(local.get ,(car (lookup-local fc (car c)))))) captures)
-      (emit! fc `(struct.new ,csub))
-      (fit fc (cons (make-ref 0 csub) nil) expected))))
-
-(define (cx-apply [ms (ptr mstate)] [fc (ptr fctx)] [labels (ptr label)] [args datum] [expected datum] [tail i32]) -> datum
-  (let* ([h (head-local (car args))] [k (if (!= h 0) (known-of fc (car h)) 0)])
-    (if (!= k 0)
-        ;; The captures go as they are, a boxed one as its box.
-        (let ([info (known-info! ms fc k)])
-          (args-code ms fc labels (cadr args) (map-cdr (caddr (-> k lambda))))
-          (for-each (lambda ([key datum]) (emit! fc `(local.get ,(car (lookup-local fc key))))) (-> k captures))
-          (call! fc `(call ,info) (func-info-results info) expected tail))
-        (let* ([t (cx ms fc labels (car args) 0 0)]
-               [code (if (and (single? t) (ref-type? (car t))) (closure-code (ref-heap (car t))) 0)])
-          (when (== code 0)
-            (fail "an application of ~a, which is not a function value: a function value has a closure type, (ref (closure (type ... -> type ...)))"
-                  (cons (type->string t) nil)))
-          (let ([closure (ref-heap (car t))] [sig (type-info-fields code)] [tmp u32 0])
-            (note-type! ms code)
-            (set! tmp (temp-local! fc (car t)))
-            (emit! fc `(local.tee ,(small tmp)))
-            (when (!= (ref-nullable? (car t)) 0) (emit! fc `(ref.as_non_null)))
-            (args-code ms fc labels (cadr args) (cdr (car sig)))
-            (emit! fc `(local.get ,(small tmp)))
-            (emit! fc `(struct.get ,closure 0))
-            (set! (-> ms uses-gc) 1)
-            (call! fc `(call_ref ,code) (cadr sig) expected tail))))))
-
 ;; ---- quoted data ----
 
 (define (module-literals [ms (ptr mstate)]) -> (ptr serializer)
@@ -954,33 +737,13 @@
 
 ;; ---- functions ----
 
-(define (form-analysis [form datum] [flag u32] [body datum] [params datum]) -> (ptr closures)
-  (let ([r (list-tail form flag)])
-    (if (and (pair? r) (== (car r) 0)) 0 (analyze-closures body params))))
-
-(define (compile-function [ms (ptr mstate)] [info datum] [params datum] [own datum] [body datum] [analysis (ptr closures)]
-                          [csub datum] [captures datum]) -> (ptr compiled)
+(define (compile-function [ms (ptr mstate)] [info datum] [params datum] [body datum]) -> (ptr compiled)
   (let ([fc (new-fctx params (func-info-results info))]
         [cf (cast (ptr compiled) (alloc-in (current-arena) (sizeof compiled)))])
-    (set! (-> fc analysis) analysis)
     (set! (-> ms fname) (func-info-name info))
     (set! compiling (func-info-name info))
     (set! current-loc 0)
-    ;; The function's own location comes first, before the prologue.
     (let ([loc (carrier-loc (loc-of body))]) (when (!= loc 0) (asm-location! (-> fc asm) loc)))
-    (when (!= csub 0)
-      (let ([env (temp-local! fc (make-ref 0 csub))] [i i64 1])
-        (emit! fc `(local.get 0))
-        (emit! fc `(ref.cast ,csub))
-        (emit! fc `(local.set ,(small env)))
-        (while (pair? captures)
-          (let ([l (add-local! fc (car (car captures)) (cdr (car captures)))])
-            (emit! fc `(local.get ,(small env)))
-            (emit! fc `(struct.get ,csub ,(small i)))
-            (emit! fc `(local.set ,(small l))))
-          (+= i 1)
-          (set! captures (cdr captures)))))
-    (box-params! fc own)
     (cx ms fc 0 body (func-info-results info) 1)
     (set! (-> cf info) info)
     (set! (-> cf sig) `(func ,(map-cdr params) ,(func-info-results info)))
@@ -989,44 +752,24 @@
     (set! (-> cf next) 0)
     cf))
 
-(define (compile-pending! [ms (ptr mstate)] [last (ptr compiled)]) -> (ptr compiled)
-  (while (!= (-> ms pending) 0)
-    (let ([batch (ptr lifted-fn) 0] [l (-> ms pending)] [next (ptr lifted-fn) 0])
-      (while (!= l 0)
-        (set! next (-> l next))
-        (set! (-> l next) batch)
-        (set! batch l)
-        (set! l next))
-      (set! (-> ms pending) 0)
-      (while (!= batch 0)
-        (let ([cf (compile-function ms (-> batch info) (-> batch params) (-> batch own) (-> batch body) (-> batch analysis)
-                                    (-> batch csub) (-> batch captures))])
-          (set! (-> last next) cf)
-          (set! last cf))
-        (set! batch (-> batch next)))))
-  last)
-
 ;; ---- module ----
 
-(define (constant-expr? [ms (ptr mstate)] [e datum] [earlier (ptr arena-table)]) -> i32
+;; A constant expression reads only imported globals, as wasm does without GC.
+(define (constant-expr? [ms (ptr mstate)] [e datum]) -> i32
   (let ([kind (car e)])
-    (cond [(or (== kind (sym at)) (== kind (sym as))) (constant-expr? ms (caddr e) earlier)]
-          [(!= (memq kind `(int float const ref-func lambda)) 0) 1]
+    (cond [(or (== kind (sym at)) (== kind (sym as))) (constant-expr? ms (caddr e))]
+          [(!= (memq kind `(int float const ref-func)) 0) 1]
           [(== kind (sym quote)) (== (cadr e) 0)]
           [(== kind (sym gref))
-           (let ([g (cadr e)])
-             (and (== (global-info-mutable? g) 0)
-                  (or (external? ms (global-info-instance g)) (!= (table-ref earlier (cast u64 g)) 0))))]
+           (let ([g (cadr e)]) (and (== (global-info-mutable? g) 0) (external? ms (global-info-instance g))))]
           [(== kind (sym prim))
-           (and (!= (memq (cadr e) `(i32.add i32.sub i32.mul i64.add i64.sub i64.mul)) 0) (all-constant? ms (cadddr e) earlier))]
-          [(== kind (sym gc))
-           (and (!= (memq (cadr e) `(struct.new array.new array.new_default array.new_fixed ref.null ref.i31)) 0)
-                (all-constant? ms (cadddr e) earlier))]
+           (and (!= (memq (cadr e) `(i32.add i32.sub i32.mul i64.add i64.sub i64.mul)) 0) (all-constant? ms (cadddr e)))]
+          [(== kind (sym ref)) (== (cadr e) (sym ref.null))]
           [else 0])))
 
-(define (all-constant? [ms (ptr mstate)] [es datum] [earlier (ptr arena-table)]) -> i32
+(define (all-constant? [ms (ptr mstate)] [es datum]) -> i32
   (while (pair? es)
-    (unless (constant-expr? ms (car es) earlier) (return 0))
+    (unless (constant-expr? ms (car es)) (return 0))
     (set! es (cdr es)))
   1)
 
@@ -1045,22 +788,12 @@
     (collect-walk! (& c) x)
     (reverse (-> c found))))
 
+;; A type comes after the types it names.
 (define (collect-add! [c (ptr type-collector)] [t datum])
   (when (== (table-ref (-> c seen) (cast u64 t)) 0)
-    (let ([members (if (!= (type-info-group t) 0) (type-info-group t) (cons t nil))] [m datum 0])
-      (set! m members)
-      (while (pair? m)
-        (table-set! (-> c seen) (cast u64 (car m)) 1)
-        (set! m (cdr m)))
-      (set! m members)
-      (while (pair? m)
-        (collect-walk! c (type-info-super (car m)))
-        (collect-walk! c (type-info-fields (car m)))
-        (set! m (cdr m)))
-      (set! m members)
-      (while (pair? m)
-        (set! (-> c found) (cons (car m) (-> c found)))
-        (set! m (cdr m))))))
+    (table-set! (-> c seen) (cast u64 t) 1)
+    (collect-walk! c (type-info-fields t))
+    (set! (-> c found) (cons t (-> c found)))))
 
 (define (collect-walk! [c (ptr type-collector)] [x datum])
   (cond [(type-info? x) (collect-add! c x)]
@@ -1077,15 +810,14 @@
       (set! imports (cdr imports)))
     (reverse acc)))
 
-(define (constant-inits [ms (ptr mstate)] [global-forms datum] [analyses (ptr arena-table)]) -> (ptr arena-table)
-  (let ([earlier (make-table)] [constants (make-table)])
+(define (constant-inits [ms (ptr mstate)] [global-forms datum]) -> (ptr arena-table)
+  (let ([constants (make-table)])
     (while (pair? global-forms)
       (let* ([f (car global-forms)] [info (cadr f)] [init (caddr f)] [t (global-info-type info)])
         (set! current-loc (carrier-loc (loc-of init)))
         (cond
-          [(and (!= init 0) (constant-expr? ms init earlier))
+          [(and (!= init 0) (constant-expr? ms init))
            (let ([fc (new-fctx nil nil)])
-             (set! (-> fc analysis) (cast (ptr closures) (table-ref analyses (cast u64 info))))
              (set! (-> ms fname) (global-info-name info))
              (cx ms fc 0 init (cons t nil) 0)
              (table-set! constants (cast u64 info) (cast u32 (-> fc asm))))]
@@ -1094,8 +826,7 @@
                  `(,(global-info-name info) ,(valtype->string t)))]
           [(not (defaultable? t))
            (fail "global ~a: a global computed when the module starts must have a numeric or nullable reference type"
-                 (cons (global-info-name info) nil))])
-        (table-set! earlier (cast u64 info) 1))
+                 (cons (global-info-name info) nil))]))
       (set! global-forms (cdr global-forms)))
     constants))
 
@@ -1125,7 +856,6 @@
          [tag-forms (forms-of forms (sym tag))]
          [memory-form (form-of forms (sym memory) (sym memory-import))]
          [table-form (form-of forms (sym table) (sym table-import))]
-         [analyses (make-table)]
          [constants (ptr arena-table) 0]
          [first (ptr compiled) 0]
          [last (ptr compiled) 0]
@@ -1145,24 +875,17 @@
                 (set-tag-info-instance! (cadr f) self)
                 (set-tag-info-export! (cadr f) (export-name! ms (tag-info-name (cadr f)))))
               tag-forms)
-    (for-each (lambda ([f datum])
-                (when (!= (caddr f) 0)
-                  (table-set! analyses (cast u64 (cadr f)) (cast u32 (form-analysis f 3 (caddr f) nil)))))
-              global-forms)
-    (set! constants (constant-inits ms global-forms analyses))
+    (set! constants (constant-inits ms global-forms))
     (set! last (cast (ptr compiled) (alloc-in (current-arena) (sizeof compiled))))
     (set! (-> last next) 0)
     (set! first last)
     (for-each (lambda ([f datum])
-                (let ([cf (compile-function ms (cadr f) (caddr f) (caddr f) (cadddr f)
-                                            (form-analysis f 4 (cadddr f) (map (lambda ([p datum]) -> datum (car p)) (caddr f)))
-                                            0 nil)])
+                (let ([cf (compile-function ms (cadr f) (caddr f) (cadddr f))])
                   (set! (-> last next) cf)
                   (set! last cf)))
               func-forms)
     (set! start-fc (new-fctx nil nil))
-    (for-each (lambda ([f datum]) (start-code! ms start-fc f constants analyses)) forms)
-    (set! last (compile-pending! ms last))
+    (for-each (lambda ([f datum]) (start-code! ms start-fc f constants)) forms)
     ;; The quoted data is complete only once all code is compiled.
     (when (!= (-> ms literals) 0) (set! literal-segment (serializer-bytes (-> ms literals))))
     ;; Table registration is the start function's first code, in the order the code met it.
@@ -1186,16 +909,14 @@
     (link-module ms (-> first next) start-fc setup literal-segment global-forms data-forms type-forms tag-forms
                  memory-form table-form constants)))
 
-(define (start-code! [ms (ptr mstate)] [fc (ptr fctx)] [f datum] [constants (ptr arena-table)] [analyses (ptr arena-table)])
+(define (start-code! [ms (ptr mstate)] [fc (ptr fctx)] [f datum] [constants (ptr arena-table)])
   (cond [(== (car f) (sym global))
          (let ([info (cadr f)] [init (caddr f)])
            (unless (or (== init 0) (!= (table-ref constants (cast u64 info)) 0))
-             (set! (-> fc analysis) (cast (ptr closures) (table-ref analyses (cast u64 info))))
              (set! (-> ms fname) (global-info-name info))
              (cx ms fc 0 init (cons (global-info-type info) nil) 0)
              (emit! fc `(global.set ,info))))]
         [(== (car f) (sym expr))
-         (set! (-> fc analysis) (form-analysis f 2 (cadr f) nil))
          (set! (-> ms fname) (sym __start))
          (cx ms fc 0 (cadr f) nil 0)]))
 
@@ -1231,7 +952,7 @@
 
 (define (heap-index [lk (ptr linker)] [h datum]) -> datum
   (if (type-info? h)
-      (let ([i (table-ref (-> lk gcs) (cast u64 h))]) (if (== i 0) 0 (small (- i 1))))
+      (let ([i (table-ref (-> lk types) (cast u64 h))]) (if (== i 0) 0 (small (- i 1))))
       h))
 
 (define (rv [lk (ptr linker)] [t datum]) -> datum
@@ -1239,14 +960,12 @@
 
 (define (rv-all [lk (ptr linker)] [ts datum]) -> datum (map (lambda ([t datum]) -> datum (rv lk t)) ts))
 
-(define (rstorage [lk (ptr linker)] [s datum]) -> datum (if (or (== s (sym i8)) (== s (sym i16))) s (rv lk s)))
-
 (define (type-index [lk (ptr linker)] [sig datum]) -> datum
   (let* ([resolved `(func ,(rv-all lk (cadr sig)) ,(rv-all lk (caddr sig)))]
          [known (datum-get (-> lk func-type-index) resolved)])
     (if (!= known 0)
         known
-        (let ([i (small (+ (-> lk gc-count) (-> lk func-type-count)))])
+        (let ([i (small (+ (-> lk type-count) (-> lk func-type-count)))])
           (set! (-> lk func-types) (cons resolved (-> lk func-types)))
           (+= (-> lk func-type-count) 1)
           (datum-put! (-> lk func-type-index) resolved i)
@@ -1255,7 +974,7 @@
 (define (tag-type-index [lk (ptr linker)] [t datum]) -> datum (type-index lk `(func ,(tag-info-params t) ())))
 
 (define (func-type-index [lk (ptr linker)] [info datum] [sig datum]) -> datum
-  (if (!= (func-info-type info) 0) (index-of (-> lk gcs) (func-info-type info) "a type") (type-index lk sig)))
+  (if (!= (func-info-type info) 0) (index-of (-> lk types) (func-info-type info) "a type") (type-index lk sig)))
 
 ;; A function that ref.func refers to is declared, as wasm requires.
 (define (resolve [lk (ptr linker)] [kind datum] [key datum]) -> datum
@@ -1267,7 +986,7 @@
              (set! (-> lk declared) (cons n (-> lk declared))))
            n)]
         [(== kind (sym global)) (index-of (-> lk globals) key "a global")]
-        [(== kind (sym type)) (if (type-info? key) (index-of (-> lk gcs) key "a type") (type-index lk key))]
+        [(== kind (sym type)) (if (type-info? key) (index-of (-> lk types) key "a type") (type-index lk key))]
         [(== kind (sym tag)) (index-of (-> lk tags) key "a tag")]
         [(== kind (sym heap)) (heap-index lk key)]
         [(== kind (sym valtype)) (rv lk key)]
@@ -1290,27 +1009,7 @@
   n)
 
 (define (type-entry [lk (ptr linker)] [t datum]) -> datum
-  (let ([fields (type-info-fields t)] [kind (type-info-kind t)])
-    `(sub ,(type-info-final? t)
-          ,(if (!= (type-info-super t) 0) (cons (heap-index lk (type-info-super t)) nil) nil)
-          ,(cond [(== kind (sym struct))
-                  `(struct ,(map (lambda ([f datum]) -> datum `(,(rstorage lk (cadr f)) ,(caddr f))) fields))]
-                 [(== kind (sym array)) `(array (,(rstorage lk (car fields)) ,(cadr fields)))]
-                 [else `(func ,(rv-all lk (car fields)) ,(rv-all lk (cadr fields)))]))))
-
-;; collect-types keeps a recursion group's members together and in order.
-(define (gc-type-entries [lk (ptr linker)] [ts datum]) -> datum
-  (let ([acc nil])
-    (while (pair? ts)
-      (if (!= (type-info-group (car ts)) 0)
-          (let ([n (length (type-info-group (car ts)))] [group nil])
-            (for ([i u32 0]) (< i n) (+= i 1)
-              (set! group (cons (type-entry lk (car ts)) group))
-              (set! ts (cdr ts)))
-            (set! acc (cons (cons (sym rec) (reverse group)) acc)))
-          (begin (set! acc (cons (type-entry lk (car ts)) acc))
-                 (set! ts (cdr ts)))))
-    (reverse acc)))
+  (let ([fields (type-info-fields t)]) `(func ,(rv-all lk (car fields)) ,(rv-all lk (cadr fields)))))
 
 (define (link-module [ms (ptr mstate)] [compiled (ptr compiled)] [start-fc (ptr fctx)] [setup (ptr asm)]
                      [literal-segment datum] [global-forms datum] [data-forms datum] [type-forms datum]
@@ -1322,12 +1021,12 @@
          [tag-imports (reverse (-> ms tag-imports))]
          [synths (reverse (-> ms synths))]
          [n-func-imports (length func-imports)]
-         [infos nil] [cf compiled] [start-index u32 0] [gc-types datum 0]
+         [infos nil] [cf compiled] [start-index u32 0] [types datum 0]
          [imports datum nil] [wfuncs nil] [wglobals nil] [exports nil] [names nil] [datas nil]
          [m wmodule] [out (make-buffer)] [bytes datum 0])
     (set! (-> lk funcs) (make-table))
     (set! (-> lk globals) (make-table))
-    (set! (-> lk gcs) (make-table))
+    (set! (-> lk types) (make-table))
     (set! (-> lk tags) (make-table))
     (set! (-> lk func-types) nil)
     (set! (-> lk func-type-count) 0)
@@ -1341,8 +1040,8 @@
       (set! cf (-> cf next)))
     (set! start-index (number! (-> lk funcs) (append func-imports (reverse infos)) 0))
     (number! (-> lk globals) (append global-imports (append (map (lambda ([f datum]) -> datum (cadr f)) global-forms) synths)) 0)
-    (set! gc-types (collect-types (list-of-types ms compiled type-forms func-imports global-imports global-forms tag-imports tag-forms)))
-    (set! (-> lk gc-count) (number! (-> lk gcs) gc-types 0))
+    (set! types (collect-types (list-of-types ms compiled type-forms func-imports global-imports global-forms tag-imports tag-forms)))
+    (set! (-> lk type-count) (number! (-> lk types) types 0))
     ;; ---- imports ----
     (for-each (lambda ([info datum])
                 (set! imports (cons `(,(func-info-instance info) ,(func-info-export info) func
@@ -1413,7 +1112,7 @@
     (when (!= literal-segment 0) (set! datas (cons (cons 0 literal-segment) datas)))
     (set! datas (reverse datas))
     ;; ---- the module ----
-    (set! (-> m types) (gc-type-entries lk gc-types))
+    (set! (-> m types) (map (lambda ([t datum]) -> datum (type-entry lk t)) types))
     (let ([tags (map (lambda ([f datum]) -> datum (tag-type-index lk (cadr f))) tag-forms)])
       (set! (-> m types) (append (-> m types) (reverse (-> lk func-types))))
       (set! (-> m tags) tags))
@@ -1430,15 +1129,7 @@
     (encode-module (& m) (& out))
     (set! bytes (bytes->string (-> out bytes) (-> out length)))
     (buffer-free! (& out))
-    `(,bytes ,(import-instances imports)
-      ,(boolean (or (-> ms uses-gc) (any-gc-type? gc-types)))
-      ,(if (!= (-> ms literals) 0) (serializer-scope-table (-> ms literals)) nil))))
-
-(define (any-gc-type? [ts datum]) -> i32
-  (while (pair? ts)
-    (unless (func-type? (car ts)) (return 1))
-    (set! ts (cdr ts)))
-  0)
+    `(,bytes ,(import-instances imports) ,(if (!= (-> ms literals) 0) (serializer-scope-table (-> ms literals)) nil))))
 
 (define (list-of-types [ms (ptr mstate)] [compiled (ptr compiled)] [type-forms datum] [func-imports datum] [global-imports datum]
                        [global-forms datum] [tag-imports datum] [tag-forms datum]) -> datum
