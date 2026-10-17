@@ -1,39 +1,6 @@
-;; Lifecycle: permanent.
-;;
-;; The runtime that Bend's compiled code runs with, written in the C-like
-;; Lisp: node allocation, reference counting, and the output that `print`
-;; uses. It follows Bend2's runtime. A module whose Bend definitions have
-;; code requires this file as %bend-rt and shares its memory and table.
-;;
-;; A value is a 64-bit term (see lower.sub):
-;;
-;;   bit 63      set if the value is shared
-;;   bits 56-62  the tag: 0 is a constructor with no live fields and 1 a
-;;               Nat (both packed into the term), 2 a node, 3 a closure
-;;   bits 32-55  for a node, the constructor number (low 12 bits) and the
-;;               field count (high 12 bits); for a closure, the table
-;;               index of its code
-;;   bits 0-31   the address of the node
-;;
-;; A node is just its fields, one term per 8-byte word. A closure's node
-;; is its capture count, then its captures. Nodes come from the shared
-;; allocator (compiler/base/nodes.sub); node and free-node are inline, so
-;; the code lower.sub writes for constructors and matches uses its free
-;; lists directly.
-;;
-;; There is no garbage collector. Each value has one owner, which either
-;; matches on it (freeing or reusing the node) or drops it (freeing
-;; everything it holds). Sharing a value for the first time allocates a
-;; one-word redirect holding the node's address and the owner count; the
-;; term then points at the redirect and keeps its tag. So a value that is
-;; never shared has no count at all. A match on a shared node copies it
-;; and gives each field another owner (`take`). Unlike Bend2, there is no
-;; whole-program analysis of which types can be shared.
-;;
-;; Entry points: node, free-node and static (memory); share, take, drop
-;; and node-of (ownership); live, the number of nodes and redirects in
-;; use, for leak tests; word-u32 and u32-word (U32 conversions); and
-;; write-u32, write-nat, write-byte and newline.
+;; The runtime of Bend's compiled code: nodes, reference counting and printing.
+;; A term: bit 63 shared; bits 56-62 tag (0 packed, 1 Nat, 2 node, 3 closure); bits 0-31 address;
+;; bits 32-55 a node's constructor (low 12) and field count (high 12), or a closure's table index.
 
 (require-unqualified base "../../compiler/base/base.sub")
 (require print "../../compiler/print.sub")
@@ -43,37 +10,23 @@
 
 (provide node free-node node-pop node-push static share take drop node-of live word-u32 u32-word write-u32 write-byte newline write-nat)
 
-;; ---- terms ----
-
 (define (shared? [t u64]) -> i32 (!= (>> t 63) 0))
 (define (tag-of [t u64]) -> u32 (cast u32 (bit-and (>> t 56) 127)))
 (define (loc-of [t u64]) -> (ptr u64) (cast (ptr u64) (cast u32 t)))
 
-;; Does t own nothing in memory: a packed term, or a closure of nothing?
 (define (trivial? [t u64]) -> i32
   (and (not (shared? t)) (or (< (tag-of t) 2) (== (cast u32 t) 0))))
 
-;; ---- nodes ----
-
-;; A node of n words: its address, from the shared allocator. Inline, so
-;; the code lower.sub writes for a constructor pops the free list itself.
 (define (node [n u32]) #:inline -> i32 (cast i32 (node-alloc (* n 8))))
 
-;; Node a, of n words, freed; none if a is 0. Inline, like node.
 (define (free-node [a i32] [n u32]) #:inline
   (unless (== a 0) (node-free (cast (ptr void) a) (* n 8))))
 
-;; n bytes for as long as the program runs, a module's constants: not a
-;; node, and not counted.
 (define (static [n u32]) -> i32 (cast i32 (malloc n)))
 
-;; How many nodes and redirects are in use.
 (define (live) -> i32 (cast i32 (nodes-live)))
 
-;; ---- owners ----
-
-;; t with k owners more: a packed term as it is; a shared one with its
-;; count raised; another given a redirect, its count k + 1.
+;; A shared term points at a one-word redirect: its node's address above, its owner count below.
 (define (share [t u64] [k u32]) -> u64
   (cond [(shared? t)
          (let ([r (loc-of t)])
@@ -85,10 +38,6 @@
            (set! (@ (cast (ptr u64) r) 0) (bit-or (<< (cast u64 (cast u32 t)) 32) (cast u64 (+ k 1))))
            (bit-or (bit-and t 9223372032559808512) (bit-or 9223372036854775808 (cast u64 (cast u32 r)))))]))
 
-;; The node of shared term t, of n fields, which a match takes, its own:
-;; t's, if t's owner was its last; else a copy, t's fields each given
-;; another owner, in t's node too, and t's owner gone. So a match always
-;; owns the node it takes, which it frees or reuses.
 (define (take [t u64] [n u32]) -> i32
   (let* ([r (loc-of t)] [w (@ r 0)] [nd (cast (ptr u64) (cast u32 (>> w 32)))])
     (if (== (cast u32 w) 1)
@@ -100,12 +49,9 @@
           (set! (@ r 0) (- w 1))
           (cast i32 c)))))
 
-;; The address of t's node, shared or not, for a print, which reads it.
 (define (node-of [t u64]) -> i32
   (if (shared? t) (cast i32 (>> (@ (loc-of t) 0) 32)) (cast i32 t)))
 
-;; t's owner gone: if it was its last, its node freed, and all it holds
-;; dropped, a stack of what is left to drop kept as it goes.
 (define stack (ptr u64) 0)
 (define room u32 0)
 
@@ -134,22 +80,15 @@
                 (+= top 1)))
             (free-node (cast i32 nd) n)))))))
 
-;; Room for t at top of the stack, which grows, and t there.
 (define (push! [top u32] [t u64])
   (when (>= top room)
     (set! room (if (== room 0) 64 (* room 2)))
     (set! stack (cast (ptr u64) (realloc stack (* room 8)))))
   (set! (@ stack top) t))
 
-;; ---- U32 ----
-;;
-;; At run time a U32 is a machine word packed into its term (lower.sub).
-;; The checker sees it as a Word: a chain of 32 WCon nodes, low bit
-;; first, each holding a packed Bool (False is 0, True is 1 << 32), and
-;; ending in WNil (0). Only Base's definitions on words convert between
-;; the two forms, using these functions.
+;; The checker's U32 is a Word: 32 WCon nodes, low bit first, each a packed Bool (True is 1 << 32),
+;; ending in WNil (0). At run time a U32 is a machine word.
 
-;; Word w's U32, w dropped.
 (define (word-u32 [w u64]) -> u64
   (let ([v u64 0] [bit u32 0] [x w])
     (while (and (not (trivial? x)) (< bit 32))
@@ -160,7 +99,6 @@
     (drop w)
     v))
 
-;; U32 t's word, a new chain of nodes.
 (define (u32-word [t u64]) -> u64
   (let ([w u64 0])
     (for ([i i32 31]) (>= i 0) (-= i 1)
@@ -170,14 +108,12 @@
         (set! w (bit-or 144150372447944704 (cast u64 (cast u32 nd))))))
     w))
 
-;; ---- printing ----
-
 (define (write-u32 [t u64]) (print:write-u64 (cast i64 (bit-and t 4294967295))))
 
 (define (write-byte [b i32]) (print:write-byte b))
 (define (newline) (print:newline))
 
-;; Writes the Nat t as Bend prints it: Zero, or (nat n).
+;; As Bend prints a Nat: Zero, or (nat n).
 (define (write-nat [t u64])
   (let ([n (bit-and t 281474976710655)])
     (if (== n 0)
