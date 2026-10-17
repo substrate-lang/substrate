@@ -607,7 +607,7 @@ const checks = {
     check('stopped: the report starts with the message of the trap',
       report.split('\n')[0], 'trap: vector-at: there is no item 5: the vector holds 1');
     check('stopped: the report lists the game function that was running, and where it is',
-      /step! .*tests\/web\/stopped\.sub:16:/.test(report), true);
+      /step! .*tests\/web\/stopped\.sub:14:/.test(report), true);
     check('stopped: the screen keeps what was drawn before the trap', await page.evaluate(
       '[...document.querySelector("canvas").getContext("2d").getImageData(10, 10, 1, 1).data].join(",")'), '46,125,50,255');
     await new Promise((resolve) => setTimeout(resolve, 300));
