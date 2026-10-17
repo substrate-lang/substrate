@@ -1,53 +1,20 @@
 #!/usr/bin/env bash
-# Lifecycle: test harness. Each tests/*.sub, tests/base/*.sub,
-# tests/substrate/*.sub, tests/bend/*.sub and tests/ui/*.sub built by the compiler
-# (bin/sub), in its own directory, and run with a host, build/subhost
-# unless HOST names another (host/subhost.mjs runs programs on Node's
-# V8), which runs the compiler too. The output checked is the build's,
-# then the run's:
-#
-#   NAME.out   expected output of a successful run
-#   NAME.err   a line that must appear in the output of a failing one
-#   NAME.args  the run's command-line arguments, on one line
-#
-# tests/*.sub are the kernel's tests: of the kernel language, of
-# compile-time code and of syntax-match (compiler/syntax-match.sub), on
-# the kernel module (compiler/kernel.sub); tests/fixtures holds the
-# modules they require. tests/base has the C-like Lisp's tests
-# (compiler/base), tests/substrate Substrate's (lib/substrate), and
-# tests/bend Bend's (lib/bend). tests/ui has the tests of the web
-# libraries that need no browser (lib/web): they print the page changes
-# a view produces, check the error messages for templates that are
-# wrong, test reading files and the game library (collision, keys,
-# timers, sound, its containers and its formatting), print the GPU
-# commands that a program and the sprite renderer write, and play the
-# example games without their pages. tests/session has the session
-# tests, which bin/sub eval runs. Then the cache (spec 3.7): each
-# program built again from it is the same, and a stale entry is not
-# used. OUT is where builds go (default build). In the dev shell:
-#
-#   tests/run.sh
+# Builds and runs every test, then checks that the cache gives each build back.
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 host="$root/${HOST:-build/subhost}"
 builds="${OUT:-build}/tests"
-# Every test is built again, so what an earlier run left, such as the
-# programs of tests since removed, goes first.
 rm -rf "${builds:?}"
 mkdir -p "$builds"
 
-# The suite keeps compiled modules in a cache of its own, removed first,
-# so that every test compiles its module: a test's expected output
-# includes what the module prints while compiling, and a module loaded
-# from the cache prints nothing. Each program is then built again from
-# the cache, which must give the same bytes (below).
+# A cache of the suite's own, emptied, so that each test compiles its module: an
+# expected output includes what a module prints while compiling, which a cached one does not.
 cache="$root/$builds/cache"
 rm -rf "${cache:?}"
 mkdir -p "$cache"
 
-# The program in directory $1 is byte for byte the one in $2.
 same_program() {
   cmp -s "$1/program" "$2/program" || return 1
   while read -r l; do cmp -s "$1/$l.wasm" "$2/$l.wasm" || return 1; done < "$1/program"
@@ -56,7 +23,7 @@ same_program() {
 pass=0
 fail=0
 
-# A compiled file for compiled-import.sub: a fixture's closure (spec 3.7).
+# The compiled file that compiled-import.sub requires.
 mkdir -p "$builds/compiled"
 (cd tests/fixtures && "$root/bin/sub" build geometry.sub -o "$root/$builds/compiled/geometry" \
    -m "$root/$builds/compiled/geometry.subc" -c "$cache" > /dev/null) ||
@@ -92,12 +59,7 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
-# The session tests (tests/session). `bin/sub eval NAME.sub` evaluates
-# the file's forms one at a time, each as one input of a session (see
-# "sessions" in compiler/expander.sub). Its output,
-# including the error messages of inputs that fail, must equal NAME.out.
-# Backtrace lines (which start with four spaces) are removed first,
-# because their content depends on the host.
+# The session tests. Backtrace lines are removed: they depend on the host.
 for t in tests/session/*.sub; do
   name="$(basename "$t" .sub)"
   actual="$(cd tests/session && "$root/bin/sub" eval "$name.sub" -c "$cache" 2>&1 | grep -v '^    ')"
@@ -109,17 +71,13 @@ for t in tests/session/*.sub; do
     diff <(echo "$actual") "tests/session/$name.out" | head -20
   fi
 done
-# A module compiles to the same bytes whatever the run compiled before it
-# (spec 3.5): tests/substrate/order-a and order-b require the same two modules in
-# either order.
+# order-a and order-b require the same two modules in either order: the same bytes.
 for f in "$builds"/substrate/order-a/order-[mn].*.wasm; do
   if ! cmp -s "$f" "$builds/substrate/order-b/$(basename "$f")"; then
     fail=$((fail + 1))
     echo "FAIL tests/substrate/order-b: $(basename "$f") differs from order-a's"
   fi
 done
-# The cache (spec 3.7): every program built again, its modules loaded
-# from the cache, is byte for byte what the first build wrote.
 again=0
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
@@ -138,9 +96,7 @@ for t in "${tests[@]}"; do
     again=$((again + 1))
   fi
 done
-# A cache entry for a module whose source has changed is not used, and
-# the requires it recorded are not looked at (spec 3.7): a required b,
-# and now does not, and b is gone.
+# A stale cache entry is not used: a required b, now does not, and b is gone.
 stale="$builds/stale"
 rm -rf "${stale:?}"
 mkdir -p "$stale"

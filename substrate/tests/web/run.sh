@@ -1,71 +1,11 @@
 #!/usr/bin/env bash
-# Lifecycle: experimental.
-#
-# The browser tests for the new compiler. They run in headless Chromium
-# (host/web/browser.mjs). They are separate from tests/run.sh, which
-# needs no browser. Run them in the dev shell:
-#
-#   tests/web/run.sh
-#
-# Each test page is built as a small static web site under build/web
-# (or OUT/web if OUT is set). There are two groups of tests.
-#
-# 1. The compiler running in a page. The site "session" contains the
-#    compiler's own build as the page's program, and a file pack with the
-#    library sources and the session tests (tests/session). The page
-#    session.html evaluates one session test, exactly as `bin/sub eval`
-#    does on the command line, and session.mjs checks that the output
-#    equals the test's .out file.
-#
-# 2. Pages written with lib/web/ui.sub. pages.mjs opens each one, clicks
-#    and types, and checks what the page shows:
-#      counter, rows   the examples in lib/web/examples
-#      snake           the snake game (lib/web/examples/snake)
-#      platformer      the platformer (lib/web/examples/platformer),
-#                      built on the game library (lib/web/game)
-#      blocks          the world of blocks (lib/web/examples/blocks),
-#                      drawn in 3D by the GPU
-#      valley          the valley (lib/web/examples/valley), a landscape
-#                      drawn in 3D by the GPU
-#      sounds          a game that plays a sound file, once and as music
-#                      (sounds.sub)
-#      gpu             the host module "gpu" (host/web/gpu.mjs) used
-#                      directly: drawing into a texture, a compute shader
-#                      and a shader error, each read back (gpu.sub)
-#      sprites, sprites-canvas
-#                      the game that draws many sprites (sprites-world.sub),
-#                      drawn by the GPU renderer (lib/web/scene/sprites.sub)
-#                      and by the 2D canvas: both draw the same picture.
-#                      These are also the pages that sprites.mjs measures
-#      stopped, stopped-at-start
-#                      games that trap, in a step and while starting: the
-#                      game must stop and show the report (stopped.sub,
-#                      stopped-at-start.sub)
-#      focus           an event that fires while the page is being updated
-#                      (focus.sub)
-#      fields          typed attributes and event data (fields.sub)
-#      assets          a program's assets: one read as a file, one drawn
-#                      on a canvas and shown by an <img> (assets.sub, and
-#                      the directory assets)
-#      canvas          canvas drawing, window listeners and animation
-#                      frames (canvas.sub)
-#      guests          sandboxed programs (guests.sub; its guests run
-#                      a-guest.sub, which is put in the site as a file
-#                      pack)
-#      repl            the REPL page (lib/web/repl)
-#
-# rows.mjs and sprites.mjs are not part of the tests. They measure how
-# long the operations of the rows example take, and how long the two
-# renderers take to draw many sprites.
+# The browser tests, in headless Chromium: the compiler in a page, then each test page.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 sites="${OUT:-build}/web"
 
-# Make sure the compiler's build (build/sub) is up to date before it
-# is copied into a site. bin/sub rebuilds it when the compiler's sources
-# have changed, and expanding an empty file is the cheapest command that
-# triggers this.
+# Expanding an empty file is the cheapest way to have bin/sub bring build/sub up to date.
 mkdir -p build
 : > build/empty.sub
 bin/sub expand build/empty.sub > /dev/null

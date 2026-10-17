@@ -1,15 +1,4 @@
-// Lifecycle: experimental.
-//
-// Measures how fast the rows example (lib/web/examples/rows.sub) is in a
-// browser. This is a benchmark, not a test: it checks only that the rows
-// exist. To run it, in the dev shell:
-//
-//   lib/web/site.sh lib/web/examples/rows.sub build/web/rows
-//   node tests/web/rows.mjs build/web
-//
-// Each operation (create 1,000 rows, swap two rows, ...) is timed inside
-// the page, from the click until the browser has laid the page out
-// again. The time printed is the fastest of a few runs.
+// Times the rows example's operations in a browser: a benchmark, not a test.
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,10 +13,7 @@ try {
   await withBrowser(async (open) => {
     const page = await open(`${url}rows/index.html`);
     await page.waitFor('window.ready', 60000);
-    // Clicks the element and returns how long the click took, in
-    // milliseconds, measured inside the page. Reading offsetHeight forces
-    // the browser to finish laying out the page, so the layout is part of
-    // the time.
+    // Reading offsetHeight makes the browser lay the page out, so layout is in the time.
     const click = (selector) => page.evaluate(`(() => {
       const e = document.querySelector(${JSON.stringify(selector)});
       const t = performance.now();
@@ -36,8 +22,6 @@ try {
       return performance.now() - t;
     })()`);
     const count = () => page.evaluate('document.querySelectorAll("tbody tr").length');
-    // Runs an operation n times and prints the fastest time. Before each
-    // run, the buttons listed in `setup` are clicked to prepare the table.
     const measure = async (what, setup, selector, n = 5) => {
       let best = Infinity;
       for (let i = 0; i < n; i++) {
