@@ -1,24 +1,5 @@
 #!/usr/bin/env node
-// Lifecycle: experimental.
-//
-// A drawing tool for the platformer's sprite sheet. It is not part of the
-// game or of its build: the game only uses the image file
-// ../assets/sprites.png, which is an ordinary PNG.
-//
-// That image was drawn as text, in art.txt, and this script turns the
-// text into the PNG:
-//
-//   lib/web/examples/platformer/art/make-sprites.mjs \
-//     lib/web/examples/platformer/art/art.txt \
-//     lib/web/examples/platformer/assets/sprites.png
-//
-// Run it again after changing art.txt. The PNG can just as well be
-// changed with any image editor instead, in which case art.txt and this
-// script are no longer needed.
-//
-// art.txt explains its own format: a palette that gives each character a
-// colour, then sprites of 16 lines of 16 characters. The sprites are
-// placed in the image in order, 8 to a row.
+// Makes the platformer's sprite sheet, ../assets/sprites.png, from the drawing in art.txt.
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 
@@ -28,13 +9,11 @@ if (!source || !target) {
   process.exit(64);
 }
 
-const size = 16; // the width and height of a sprite, in pixels
-const perRow = 8; // sprites in one row of the sheet
+const size = 16;
+const perRow = 8;
 
-// ---- Read the palette and the sprites ----
-
-const palette = new Map(); // character -> [red, green, blue, alpha]
-const sprites = []; // each is { name, rows: [16 strings] }
+const palette = new Map();
+const sprites = [];
 let section = null;
 fs.readFileSync(source, 'utf8').split('\n').forEach((line, index) => {
   const fail = (message) => {
@@ -67,11 +46,9 @@ for (const sprite of sprites) {
   }
 }
 
-// ---- Lay the sprites out as pixels ----
-
 const width = perRow * size;
 const height = Math.ceil(sprites.length / perRow) * size;
-const pixels = new Uint8Array(width * height * 4); // red, green, blue, alpha; all 0 is transparent
+const pixels = new Uint8Array(width * height * 4);
 sprites.forEach((sprite, n) => {
   const left = (n % perRow) * size;
   const top = Math.floor(n / perRow) * size;
@@ -81,13 +58,6 @@ sprites.forEach((sprite, n) => {
     });
   });
 });
-
-// ---- Write the PNG file ----
-//
-// A PNG file is a signature followed by "chunks". Each chunk is its
-// data's length, a four-letter type, the data, and a checksum (CRC-32) of
-// the type and the data. Three chunks are enough: IHDR (the image's size
-// and format), IDAT (the pixels, compressed) and IEND.
 
 const crcTable = Array.from({ length: 256 }, (_, n) => {
   let c = n;

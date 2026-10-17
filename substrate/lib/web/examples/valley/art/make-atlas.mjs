@@ -1,13 +1,5 @@
 #!/usr/bin/env node
-// Lifecycle: experimental.
-//
-// Makes the valley's texture atlas, ../assets/atlas.png: one white tile,
-// 16 pixels square, since the valley's meshes are plain colours (the
-// colour is in the vertices) and the scene's shader multiplies a texel
-// by it. Not part of the game or of its build. Run it to remake the
-// file:
-//
-//   lib/web/examples/valley/art/make-atlas.mjs lib/web/examples/valley/assets/atlas.png
+// Makes the valley's atlas, ../assets/atlas.png: one white tile; the colours are in the vertices.
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 
@@ -19,7 +11,6 @@ if (!target) {
 const size = 16;
 const pixels = new Uint8Array(size * size * 4).fill(255);
 
-// A PNG, as the platformer's make-sprites.mjs writes one.
 const crcTable = Array.from({ length: 256 }, (_, n) => {
   let c = n;
   for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
