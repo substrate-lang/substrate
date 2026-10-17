@@ -1,53 +1,4 @@
-;; Lifecycle: experimental.
-;;
 ;; The REPL web page: the user-interface half.
-;;
-;; This program runs on the page's main thread. It draws the list of
-;; inputs and outputs, the text box and the buttons, and nothing else. It
-;; does not contain the compiler.
-;;
-;; The compiler lives in a second program, session.sub. This page starts
-;; it as a "guest": a separate program running in its own sandbox (in a
-;; browser, a Web Worker). The page and the guest share no memory. They
-;; only exchange messages, which are plain bytes. The functions for this
-;; are in lib/web/guest.sub; host/web/guest.mjs is the browser side.
-;;
-;; Why the compiler runs in a guest: whatever the user types is compiled
-;; and run inside the guest, so its effects stay there.
-;;   - An infinite loop does not freeze the page. The Stop button kills
-;;     the guest.
-;;   - A crash, or code that overwrites memory, breaks only the guest.
-;;     The page notices and starts a new one.
-;;
-;; How one input is evaluated:
-;;   1. The user presses Enter. The page adds an "entry" to the list (the
-;;      input text, and room for its output) and sends the input to the
-;;      guest.
-;;   2. While the guest runs the input, whatever it prints arrives here
-;;      as output events, and is appended to the entry.
-;;   3. The guest sends one reply: did the input succeed, and if not,
-;;      the error message.
-;;   4. The host then tells the page that the guest has finished with
-;;      that message (a "done" event). If "done" arrives without a reply
-;;      before it, the guest is broken (for example, the input overwrote
-;;      the compiler's memory), so the page kills it and starts a new one.
-;;
-;; Message formats:
-;;   page -> guest   bytes 0-3: the input's number (u32, little-endian)
-;;                   the rest:  the input text
-;;   guest -> page   byte 0:    0 if the input succeeded, 1 if it failed
-;;                   the rest:  the error message, if any
-;;
-;; Restoring a session: when a guest is killed, everything defined in it
-;; is lost. To hide this, the page keeps a "history" of every input that
-;; succeeded, and sends them all again, in order, to the new guest. This
-;; replay is silent: its output is not shown.
-;;
-;; Languages: a session does not have a fixed language. Its language is
-;; whatever its first input `require`s. Each language button starts a new
-;; session and sends the matching `require` form as its first input.
-;;
-;; lib/web/repl/site.sh builds the complete site.
 (require-unqualified base "../../../compiler/base/base.sub")
 (require-unqualified ui "../ui.sub")
 (require-unqualified web "../web.sub")
@@ -58,118 +9,62 @@
 
 ;; ---- Data ----
 
-;; One input and its output, as shown in the list.
-;;   id       the input's number: 1, 2, 3, ... It appears in error
-;;            locations ("input-3:1:2") and identifies the entry's row.
-;;   input    the text the user typed (a heap-allocated copy)
-;;   output   what the input printed, then its error message if it
-;;            failed. One 0 byte is always kept just past the end of the
-;;            buffer, so (-> output bytes) can be used as a C string.
-;;   failed   1 if the input failed, was stopped, or crashed the session
-;;   running  1 until the session replies
-;;   cut      1 once the output reached max-output; later output is
-;;            dropped
 (struct entry [id u32] [input (ptr u8)] [output buffer] [failed i32] [running i32] [cut i32])
 
-;; One input that succeeded, kept so that it can be sent again to a new
-;; session.
 (struct history-item [id u32] [input (ptr u8)])
 
-;; All of the page's state.
 (struct model
-  ;; The entries shown on the page: a growable array, `count` used out of
-  ;; `capacity`.
   [entries (ptr entry)] [count u32] [capacity u32]
-  ;; The text currently in the text box.
   [draft (ptr u8)]
-  ;; How many inputs there have been. The next entry's id is this plus 1.
   [inputs u32]
-  ;; Two counters the view watches. Changing `focus` makes the text box
-  ;; take the keyboard focus. Changing `scroll` scrolls the list to its
-  ;; end.
   [focus u32] [scroll u32]
-  ;; For the up and down arrow keys: the index of the entry whose input
-  ;; was last copied into the text box, or `count` if none.
   [recalled u32]
-  ;; The session guest's number, as returned by guest-start. 0 if there
-  ;; is no session.
   [session u32]
-  ;; Which language button started the session (see language-input).
   [language u32]
-  ;; 1 once the guest has finished starting up.
   [started i32]
-  ;; The index of the entry being evaluated, or -1 if there is none.
   [pending i32]
-  ;; 1 once the reply for the pending entry has arrived.
   [answered i32]
-  ;; While a new session is being restored: how many of the re-sent
-  ;; inputs it has not finished yet. 0 at any other time.
   [replaying u32]
-  ;; How many sessions in a row ended before finishing a single input.
-  ;; restore-session! uses it to stop restarting a session that can
-  ;; never start.
   [failed-starts u32]
-  ;; The inputs that succeeded in this session: a growable array.
   [history (ptr history-item)] [history-count u32] [history-capacity u32]
-  ;; If no session could be started: the reason, to show on the page.
-  ;; Otherwise 0.
   [problem (ptr u8)])
 
-;; Everything that can happen on the page. `update` handles each case.
 (variant message
-  ;; The text box was edited. `text` is its new content.
   [draft-changed [text (ptr u8)]]
-  ;; A key was pressed in the text box. `key` is its name, such as
-  ;; "Enter"; `shift` is 1 if Shift was held.
   [key-pressed [key (ptr u8)] [shift i32]]
-  ;; The Run, Stop and Clear buttons.
   [run] [stop] [clear]
-  ;; A language button.
   [use [language u32]]
-  ;; Something happened in a guest. `kind` is one of the guest-...
-  ;; constants from guest.sub. See on-guest near the end of the file.
   [guest-event [guest u32] [kind u32]])
 (messages message)
 
 ;; ---- Small helpers ----
 
-;; Returns a heap-allocated copy of the C string s.
 (define (copy-text [s (ptr u8)]) -> (ptr u8)
   (let* ([n (+ (strlen s) 1)] [p (cast (ptr u8) (malloc n))])
     (memcpy p s n)
     p))
 
-;; Returns 1 if the C strings a and b are equal.
 (define (same? [a (ptr u8)] [b (ptr u8)]) -> i32
   (let ([i u32 0])
     (while (and (== (@ a i) (@ b i)) (!= (@ a i) 0)) (+= i 1))
     (== (@ a i) (@ b i))))
 
-;; Replaces the text box's content with a copy of s.
 (define (set-draft! [m (ptr model)] [s (ptr u8)])
   (let ([new (copy-text s)])
     (free (-> m draft))
     (set! (-> m draft) new)))
 
-;; Returns 1 while the session is working: either evaluating an input, or
-;; being restored. Run, Enter and Clear do nothing while this is 1.
 (define (busy? [m (ptr model)]) -> i32 (or (>= (-> m pending) 0) (> (-> m replaying) 0)))
 
 ;; ---- Entries ----
 
-;; The most output kept for one entry, in bytes. Without a limit, an
-;; input that prints forever would use up the page's memory.
+;; Without a limit, an input that prints forever would use up the page's memory.
 (define max-output u32 200000)
 
-;; Puts a 0 byte just past the end of b without counting it in b's
-;; length. After this, (-> b bytes) can be used as a C string.
 (define (terminate! [b (ptr buffer)])
   (buffer-add-byte! b 0)
   (-= (-> b length) 1))
 
-;; Appends the n bytes at p to e's output. If that would exceed
-;; max-output, appends only what fits, adds a notice, and marks the entry
-;; as cut so that later output is dropped.
 (define (add-output! [e (ptr entry)] [p (ptr u8)] [n u32])
   (let ([b (& (-> e output))])
     (cond [(-> e cut) (begin)]
@@ -180,16 +75,13 @@
            (buffer-add-string! b "\n... (more output not shown)")])
     (terminate! b)))
 
-;; Appends the C string s to e's output, starting on a new line. Used for
-;; error messages. It ignores max-output, so an error is always shown.
+;; Ignores max-output, so that an error is always shown.
 (define (add-line! [e (ptr entry)] [s (ptr u8)])
   (let ([b (& (-> e output))])
     (when (and (> (-> b length) 0) (!= (@ (-> b bytes) (- (-> b length) 1)) 10)) (buffer-add-byte! b 10))
     (buffer-add-string! b s)
     (terminate! b)))
 
-;; Adds a new entry for `input` at the end of the list and returns its
-;; index.
 (define (add-entry! [m (ptr model)] [input (ptr u8)]) -> u32
   (when (== (-> m count) (-> m capacity))
     (set! (-> m capacity) (if (== (-> m capacity) 0) 16 (* 2 (-> m capacity))))
@@ -207,8 +99,6 @@
     (+= (-> m count) 1)
     (- (-> m count) 1)))
 
-;; Removes all entries from the page. The session and its history are not
-;; affected.
 (define (clear! [m (ptr model)])
   (for ([i u32 0]) (< i (-> m count)) (+= i 1)
     (free (-> (+ (-> m entries) i) input))
@@ -219,18 +109,9 @@
 
 ;; ---- The session guest ----
 
-;; What the guest is given. host/web/guest.mjs documents the format.
-;;   program /session   run the program stored under /session. That is
-;;                      session.sub's build, which page.html loads from
-;;                      session.pack.
-;;   read /session      the compiler reads its own program files while it
-;;                      runs, so it needs read access to them
-;;   read /src          the library sources that inputs can `require`
-;; There is no `write` line, so the guest cannot write files. There is no
-;; `time` line either: the user decides when to stop a long computation.
+;; The compiler reads its own build under /session. No time limit: the user presses Stop.
 (define (session-spec) -> (ptr u8) "program /session\nread /session\nread /src")
 
-;; Sends one input to the session: its number, then its text.
 (define (send-input! [m (ptr model)] [id u32] [input (ptr u8)])
   (let ([b (make-buffer)] [number (array u32 1)])
     (set! (@ number 0) id)
@@ -239,7 +120,6 @@
     (guest-send (-> m session) (-> b bytes) (-> b length))
     (buffer-free! (& b))))
 
-;; Adds an input that succeeded to the history.
 (define (remember! [m (ptr model)] [id u32] [input (ptr u8)])
   (when (== (-> m history-count) (-> m history-capacity))
     (set! (-> m history-capacity) (if (== (-> m history-capacity) 0) 16 (* 2 (-> m history-capacity))))
@@ -250,15 +130,11 @@
     (set! (-> item input) (copy-text input))
     (+= (-> m history-count) 1)))
 
-;; Empties the history.
 (define (forget-history! [m (ptr model)])
   (for ([i u32 0]) (< i (-> m history-count)) (+= i 1)
     (free (-> (+ (-> m history) i) input)))
   (set! (-> m history-count) 0))
 
-;; Starts a new guest running session.sub and stores its number in
-;; `session`. If the guest cannot be started, `session` is 0 and
-;; `problem` holds the reason.
 (define (start-guest! [m (ptr model)])
   (free (-> m problem))
   (set! (-> m problem) 0)
@@ -266,8 +142,6 @@
   (set! (-> m session) (guest-start (session-spec)))
   (when (== (-> m session) 0) (set! (-> m problem) (guest-error))))
 
-;; Adds an entry for `input` and sends the input to the session. The
-;; entry shows as running until the reply arrives.
 (define (evaluate! [m (ptr model)] [input (ptr u8)])
   (let* ([i (add-entry! m input)] [e (+ (-> m entries) i)])
     (set! (-> e running) 1)
@@ -275,10 +149,6 @@
     (set! (-> m answered) 0)
     (send-input! m (-> e id) input)))
 
-;; Returns the first input of a session in the given language: a
-;; `require` of that language. Returns 0 for the "kernel" button, which
-;; sends nothing: a session that requires no language is in kernel code,
-;; the lowest-level language.
 (define (language-input [language u32]) -> (ptr u8)
   (case language
     [(0) "(require-unqualified substrate \"lib/substrate/substrate.sub\")"]
@@ -286,12 +156,7 @@
     [(2) "(begin (require-unqualified bend \"lib/bend/bend.sub\") (require-unqualified base \"lib/bend/base.sub\"))"]
     [else 0]))
 
-;; Starts a new, empty session in the given language. Kills the current
-;; session, if any, and clears the page and the history.
-;;
-;; Switching language always starts a new session. Requiring a second
-;; language inside a running session does not work well: basic forms such
-;; as `if` would keep the first language's meaning.
+;; A new session per language: requiring a second one leaves forms such as if the first's.
 (define (start-session! [m (ptr model)] [language u32])
   (when (!= (-> m session) 0) (guest-stop (-> m session)))
   (clear! m)
@@ -305,19 +170,7 @@
     (when (and (!= input 0) (!= (-> m session) 0)) (evaluate! m input)))
   (set! (-> m recalled) (-> m count)))
 
-;; Replaces a session guest that is gone: it was stopped, it crashed, or
-;; it exited. `why` is a short reason, shown to the user.
-;;
-;;   1. If an input was being evaluated, its entry is marked as failed,
-;;      with `why` as the error.
-;;   2. A new guest is started.
-;;   3. Every input in the history is sent to it again, so the new
-;;      session has the same definitions as the old one.
-;;
-;; If the guest dies as soon as it starts, this would repeat forever.
-;; `failed-starts` counts sessions that ended before finishing any input;
-;; after three in a row, no new guest is started and the page shows `why`
-;; instead.
+;; failed-starts keeps a guest that dies as soon as it starts from being restarted forever.
 (define (restore-session! [m (ptr model)] [why (ptr u8)])
   (when (>= (-> m pending) 0)
     (unless (-> m answered)
@@ -341,45 +194,32 @@
             (send-input! m (-> (+ (-> m history) i) id) (-> (+ (-> m history) i) input)))
           (set! (-> m replaying) (-> m history-count))))))
 
-;; Handles the session's reply to the pending input. The reply is one
-;; status byte (0 = succeeded, 1 = failed) followed by the error message,
-;; if any.
 (define (finish-entry! [m (ptr model)])
   (let* ([e (+ (-> m entries) (-> m pending))] [reply (make-buffer)] [n (guest-take! (& reply))] [out (& (-> e output))])
-    ;; End the reply with a 0 byte, so the error message is a C string.
     (buffer-add-byte! (& reply) 0)
     (when (> n 1) (add-line! e (+ (-> reply bytes) 1)))
     (set! (-> e failed) (and (> n 0) (!= (@ (-> reply bytes) 0) 0)))
     (set! (-> e running) 0)
-    ;; Drop one trailing newline, so the entry does not end with an empty
-    ;; line.
     (when (and (> (-> out length) 0) (== (@ (-> out bytes) (- (-> out length) 1)) 10))
       (-= (-> out length) 1)
       (terminate! out))
     (unless (-> e failed) (remember! m (-> e id) (-> e input)))
     (buffer-free! (& reply))
-    ;; The entry is finished, but `pending` stays set until the "done"
-    ;; event arrives (see handle-guest-event!).
+    ;; pending stays set until the guest's done event arrives.
     (set! (-> m answered) 1)
     (set! (-> m failed-starts) 0)
     (+= (-> m scroll) 1)))
 
-;; Handles one event from a guest. `kind` says what happened;
-;; guest-take! and guest-take-text read the data that came with it.
 (define (handle-guest-event! [m (ptr model)] [g u32] [kind u32])
-  ;; Only the current session matters. (No events arrive from a guest
-  ;; after guest-stop, so this test is only a safeguard.)
+  ;; Only a safeguard: no events arrive from a guest after guest-stop.
   (when (and (== g (-> m session)) (!= g 0))
     (cond
-      ;; The guest exited or crashed. Start a new one.
       [(== kind guest-ended)
        (let ([why (guest-take-text)])
          (restore-session! m why)
          (free why))]
 
-      ;; The guest finished one piece of work. "done" events arrive in the
-      ;; order the work was given: first the guest's own start-up, then
-      ;; each replayed input (when restoring), then the pending input.
+      ;; done events come in the order the work was given: start-up, replayed inputs, pending.
       [(== kind guest-done)
        (cond [(not (-> m started)) (set! (-> m started) 1)]
              [(> (-> m replaying) 0)
@@ -388,24 +228,17 @@
              [(< (-> m pending) 0) (begin)]
              [(-> m answered) (set! (-> m pending) -1)]
              [else
-              ;; The guest finished with the pending input but never
-              ;; replied. Its compiler is broken, most likely because the
-              ;; input overwrote the compiler's memory. Replace the guest.
+              ;; Done without a reply: the input broke the guest's compiler, most likely its memory.
               (guest-stop g)
               (restore-session! m "The session crashed while evaluating this input. A new session was started.")])]
 
-      ;; While history is being replayed into a new session, ignore
-      ;; replies and output: the user has seen them before.
+      ;; Replayed inputs' replies and output are not shown again.
       [(> (-> m replaying) 0) (begin)]
 
-      ;; Nothing is waiting for a reply or for output.
       [(or (< (-> m pending) 0) (-> m answered)) (begin)]
 
-      ;; The reply to the pending input.
       [(== kind guest-message) (finish-entry! m)]
 
-      ;; Otherwise the pending input printed something, to standard
-      ;; output or standard error. Append it to the entry.
       [else
        (let ([printed (make-buffer)])
          (guest-take! (& printed))
@@ -415,10 +248,6 @@
 
 ;; ---- Handling user actions ----
 
-;; Returns 1 if s is a complete input: it contains something other than
-;; white space and comments, and every opening bracket has been closed.
-;; Brackets inside strings, character literals (such as #\( ) and comments
-;; do not count.
 (define (complete? [s (ptr u8)]) -> i32
   (let ([depth 0] [i u32 0] [some 0])
     (while (!= (@ s i) 0)
@@ -438,7 +267,6 @@
       (+= i 1))
     (and some (<= depth 0))))
 
-;; Returns 1 if s has no line break in it.
 (define (one-line? [s (ptr u8)]) -> i32
   (let ([i u32 0])
     (while (!= (@ s i) 0)
@@ -446,8 +274,6 @@
       (+= i 1))
     1))
 
-;; Run button, or Enter: evaluates the text box's content, if it is a
-;; complete input and the session is free.
 (define (submit! [m (ptr model)])
   (when (and (complete? (-> m draft)) (not (busy? m)) (!= (-> m session) 0))
     (evaluate! m (-> m draft))
@@ -455,12 +281,7 @@
   (set! (-> m recalled) (-> m count))
   (+= (-> m focus) 1))
 
-;; Stop button: kills the session guest, then restores the session in a
-;; new guest (see restore-session!).
-;;
-;; If Stop is pressed while a session is being restored, the replay
-;; itself is stuck, and replaying again would get stuck the same way. In
-;; that case a fresh, empty session is started instead.
+;; Stopped while restoring, the replay itself is stuck, so a fresh session is started.
 (define (stop! [m (ptr model)])
   (cond [(> (-> m replaying) 0) (start-session! m (-> m language))]
         [(>= (-> m pending) 0)
@@ -469,23 +290,12 @@
          (restore-session! m "Stopped.")])
   (+= (-> m focus) 1))
 
-;; Up and down arrows: copies an earlier input into the text box. `by` is
-;; -1 for the previous entry and 1 for the next one. Moving past the last
-;; entry empties the text box.
 (define (recall! [m (ptr model)] [by i32])
   (let ([i (+ (cast i32 (-> m recalled)) by)])
     (when (and (>= i 0) (<= i (cast i32 (-> m count))))
       (set! (-> m recalled) (cast u32 i))
       (set-draft! m (if (== (cast u32 i) (-> m count)) "" (-> (+ (-> m entries) i) input))))))
 
-;; A key was pressed in the text box.
-;;   Enter        evaluates the input if it is complete. If it is not, or
-;;                if Shift is held, Enter inserts a line break as usual.
-;;   Up, Down     recall earlier inputs, but only while the text box holds
-;;                a single line. In a multi-line input they move the
-;;                cursor as usual.
-;; prevent-default! stops the browser from also applying the key's normal
-;; effect.
 (define (key! [m (ptr model)] [key (ptr u8)] [shift i32])
   (cond [(and (same? key "Enter") (not shift) (complete? (-> m draft)))
          (prevent-default!)
@@ -497,8 +307,6 @@
          (prevent-default!)
          (recall! m 1)]))
 
-;; Called for every message. It changes the model; the page is then
-;; redrawn from the model automatically (see the `app` form in web.sub).
 (define (update [m (ptr model)] [e (ptr message)])
   (match e
     [(draft-changed text) (set-draft! m text)]
@@ -509,38 +317,23 @@
     [(use language) (start-session! m language)]
     [(guest-event g kind) (handle-guest-event! m g kind)]))
 
-;; The host calls this function, by name, for every event from a guest.
-;; It turns the event into a message for `update`. send! (from web.sub)
-;; runs `update` and then redraws the page.
 (define (on-guest [g u32] [kind u32])
   (let ([e message (guest-event g kind)])
     (send! (& e))))
 
-;; Called if this program itself traps (crashes). That would be a bug in
-;; this file: the user's code never runs in this program. The page keeps
-;; working, and the text box gets the focus back.
 (define (trapped [m (ptr model)]) (+= (-> m focus) 1))
 
-;; Called once, when the page loads: starts a Substrate session.
 (define (init [m (ptr model)])
   (set! (-> m draft) (copy-text ""))
   (start-session! m 0))
 
 ;; ---- What the page looks like ----
-;;
-;; A view is a template (see lib/web/ui.sub). It is redrawn after every
-;; message, but only the parts whose values changed touch the page.
 
-;; One entry: the input, and its output if there is any. The CSS class
-;; shows its state: running, failed, or neither (page.html has the
-;; styles).
 (view (entry-view [e (ptr entry)])
   (section ([class (if (-> e running) "entry running" (if (-> e failed) "entry failed" "entry"))])
     (pre ([class "input"]) (text (-> e input)))
     (when (> (-> e output length) 0) (pre ([class "output"]) (text (-> e output bytes))))))
 
-;; The whole page: a header with the language buttons, the list of
-;; entries, and a footer with the text box and the Run or Stop button.
 (view (repl [m (ptr model)])
   (header
     (h1 "substrate")
@@ -564,6 +357,4 @@
         (button ([class "stop"] [on click stop]) "stop")
         (button ([on click run]) "run"))))
 
-;; Defines the program's entry points from the pieces above: the model
-;; type, the message type, and the init, update, view and trap functions.
 (app model message init update repl trapped)
