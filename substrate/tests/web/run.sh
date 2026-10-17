@@ -16,7 +16,7 @@ mkdir -p "$site/host/web"
 cp host/subhost-core.mjs "$site/host/"
 cp host/web/subhost-web.mjs "$site/host/web/"
 cp -r build/sub "$site/program"
-host/web/pack.mjs -o "$site/files.pack" compiler/print.sub compiler/memory.sub compiler/numbers.sub compiler/kernel.sub compiler/kernel-forms.sub compiler/syntax-match.sub compiler/patterns.sub compiler/base lib/substrate lib/bend tests/session
+host/web/pack.mjs -o "$site/files.pack" compiler/print.sub compiler/memory.sub compiler/numbers.sub compiler/writer.sub compiler/kernel.sub compiler/kernel-forms.sub compiler/syntax-match.sub compiler/patterns.sub compiler/base lib/substrate lib/bend tests/session
 cp tests/web/session.html "$site/index.html"
 status=0
 node tests/web/session.mjs "$site" kernel substrate c switch bend || status=1
