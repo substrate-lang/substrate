@@ -1,5 +1,4 @@
-// The primes below 100 million, by the sieve of Eratosthenes: a byte
-// array from calloc, and loops over it.
+// The primes below 100 million, by the sieve of Eratosthenes.
 #include "bench.h"
 
 static uint32_t sieve(uint32_t n) {

@@ -1,6 +1,4 @@
-// A random tree of expressions, 21 deep, tagged unions made in an arena,
-// evaluated 400 times by switch, each time with its numbers plus
-// another, so that no two are the same work.
+// A random tree of expressions, tagged unions in an arena, evaluated by switch.
 #include "bench.h"
 
 typedef struct expr {

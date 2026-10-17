@@ -1,22 +1,6 @@
 #!/usr/bin/env -S node --stack-size=4000
-// Lifecycle: permanent.
-//
-// The host for Node: runs a compiled program from the command line, on
-// V8 (spec section 4).
-//
-//   host/subhost.mjs DIR [arg ...]
-//
-// DIR is the program directory that `sub build` wrote. This behaves like
-// build/subhost, the C host: same output, same exit statuses. bin/sub
-// runs the compiler with it when HOST=host/subhost.mjs.
-//
-// Loading and linking modules, and the host functions, are in
-// host/subhost-core.mjs, which the browser host shares (host/web). This
-// file adds what is specific to Node: command-line arguments, real files,
-// standard output and error, and exiting the process.
-//
-// The first line raises V8's stack limit to 4000 KiB (the default is
-// under 1 MiB), which matches build/subhost's 4 MiB stack.
+// The host for Node: runs the program that `sub build` wrote to DIR, on V8.
+// The #! line's --stack-size gives V8 the 4 MiB stack that build/subhost has.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import util from 'node:util';
@@ -28,9 +12,7 @@ if (!dir) {
   process.exit(64);
 }
 
-// Converts the error of a failed file operation into an Error whose
-// message is the operating system's, worded as C's strerror words it
-// ("No such file or directory"), so that messages match build/subhost's.
+// Worded as C's strerror words it, as the tests' expected errors are.
 function systemError(e) {
   if (typeof e.errno !== 'number') return e;
   const m = util.getSystemErrorMessage(e.errno);
@@ -81,11 +63,6 @@ if (!entry) {
   process.stderr.write(`error: ${host.lastError}\n`);
   process.exit(2);
 }
-// Run the program's main function, if it has one. A trap in main, or a
-// wasm exception that escapes it, is reported as build/subhost reports
-// it: the message, then a backtrace for a trap. If the program exports
-// on-trap, the program reports the problem itself instead (spec 4). The
-// exit status is 2 either way.
 if (typeof entry.main === 'function' &&
     !host.call(entry, entry.main, [], (message) => process.stderr.write(`error: ${message}\n`))) {
   process.exit(2);

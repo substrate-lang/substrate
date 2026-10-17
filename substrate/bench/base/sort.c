@@ -1,5 +1,4 @@
-// Quicksort of 5 million integers, comparing through a function pointer,
-// as qsort does.
+// Quicksort of 5 million integers, comparing through a function pointer.
 #include "bench.h"
 
 static int less(int a, int b) { return a < b; }
@@ -12,7 +11,6 @@ static void quicksort(int *a, int lo, int hi, int (*before)(int, int)) {
       while (before(pivot, a[j])) j--;
       if (i <= j) { int t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
     }
-    // The smaller part by recursion, the larger by the loop.
     if (j - lo < hi - i) { quicksort(a, lo, j, before); lo = i; }
     else { quicksort(a, i, hi, before); hi = j; }
   }

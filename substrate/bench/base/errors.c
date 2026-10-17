@@ -1,5 +1,4 @@
-// 10 million calls, a tenth of which fail, as C reports a failure: a
-// result the caller tests.
+// 10 million calls, a tenth of which fail, reported by a result the caller tests.
 #include "bench.h"
 
 static int check(int i, int *failed) {

@@ -7,11 +7,8 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      # The headless browser the web tests run in (tests/web/run.sh), which
-      # host/web/browser.mjs starts as `chromium`: nixpkgs' Chromium on
-      # Linux; on macOS, where nixpkgs builds none, the Chrome for Testing
-      # build that Playwright's browsers package fetches, run by a
-      # `chromium` script.
+      # nixpkgs builds no Chromium for macOS: there, Playwright's Chrome for
+      # Testing, run by a `chromium` script.
       chromium = pkgs:
         if pkgs.stdenv.isLinux then pkgs.chromium
         else pkgs.runCommand "chromium" {

@@ -1,5 +1,4 @@
-// Binary trees, as the Benchmarks Game's: trees of depths 4 to 16 made,
-// walked and freed, 2 million nodes a depth; malloc, free and pointers.
+// Binary trees, as the Benchmarks Game's: made, walked and freed.
 #include "bench.h"
 
 typedef struct node { struct node *left, *right; } node;

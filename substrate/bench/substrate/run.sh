@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
-# Lifecycle: benchmark. Substrate's benchmarks: each NAME.sub built with
-# bin/sub and run on wasmtime (build/subhost) and on V8 (node, with its
-# optimizing compiler only, as programs are measured). Prints each
-# benchmark's first line of output and the least time of N runs (default
-# 3) on each, in ms. In the dev shell:
-#
-#   bench/substrate/run.sh [N [NAME ...]]
+# Substrate's benchmarks, timed on wasmtime and on V8.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"

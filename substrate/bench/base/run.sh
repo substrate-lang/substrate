@@ -1,15 +1,5 @@
 #!/usr/bin/env bash
-# Lifecycle: benchmark. The C-like Lisp against C. Each NAME.sub is built
-# with bin/sub and run on build/subhost (wasmtime). NAME.c, the same
-# program in C, is built with clang -O2 three ways: natively, for wasm
-# (run by the wasmtime CLI), and for wasm without inlining, since our
-# compiler does not inline C functions. All versions allocate with K&R's
-# malloc (bench.h) and must print the same result. Prints each
-# benchmark's result, the least time of N runs (default 3) of each
-# version in ms, run interleaved, and the ratios of ours to the others.
-# In the dev shell:
-#
-#   bench/base/run.sh [N [NAME ...]]
+# The C-like Lisp against the same programs in C, native and wasm, with and without inlining.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -22,9 +12,7 @@ mkdir -p "$out"
 
 for name in "${names[@]}"; do
   (cd "$here" && "$root/bin/sub" build "$name.sub" -o "$out/$name" -c "$root/build/bench/cache" > /dev/null)
-  # The shell's clang is nix's wrapper, whose hardening flags, on by
-  # default, are not clang's defaults and slow C down, and which warns of
-  # the wasm target: its messages are kept, and shown if it fails.
+  # nix's clang wrapper adds hardening flags that slow C down, and warns of the wasm target.
   NIX_HARDENING_ENABLE= clang -O2 -o "$out/$name.native" "$here/$name.c"
   NIX_HARDENING_ENABLE= clang --target=wasm32 -O2 -ffreestanding -nostdlib -mbulk-memory -Wl,--no-entry \
     -o "$out/$name.wasm" "$here/$name.c" 2> "$out/$name.wasm.log" || { cat "$out/$name.wasm.log"; exit 1; }
@@ -42,8 +30,6 @@ command_of() {
   esac
 }
 
-# Variant $1 of benchmark $2, run once: its time, in best if it is the
-# least yet, and its first line of output, in result.
 declare -A best result
 run() {
   local start=$EPOCHREALTIME

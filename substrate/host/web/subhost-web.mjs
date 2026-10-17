@@ -1,103 +1,16 @@
-// Lifecycle: experimental.
-//
-// The host for a web page: runs a compiled program in a browser (spec
-// section 4).
-//
-// Loading and linking modules, and the host functions, are in
-// host/subhost-core.mjs, which the Node host shares. This file adds what
-// is specific to a browser:
-//   - the program's modules are fetched over HTTP;
-//   - the program's "files" are a Map kept in memory, which can be filled
-//     with files downloaded from the site, one by one (`lists`) or many
-//     in one file (`packs`);
-//   - the program keeps running after its main function returns. On the
-//     command line a program is over when main returns. A page stays
-//     open, so the program's instances are kept, and the page calls the
-//     program's functions again later, for example for each event.
-//
-// Usage:
-//
-//   import { boot } from './subhost-web.mjs';
-//   const app = await boot({ program: 'program/', ... });
-//
-// boot's options:
-//
-//   program    the URL of the program's directory (what `sub build`
-//              wrote, served as static files)
-//   args       the program's command-line arguments (default: none)
-//   files      a Map from path to bytes (Uint8Array): the files that the
-//              program can read and write with host.read_file and
-//              host.write_file. Nothing is written to disk.
-//   lists      file lists to download and add to `files` first: a list of
-//              [url, directory] pairs. A file list is a text file with
-//              one path per line. Each file it names is downloaded from
-//              that path, relative to the list, and placed at the same
-//              path under the directory. lib/web/site.sh writes such a
-//              list for a program's assets.
-//   packs      file packs (host/web/pack.mjs) to download and add to
-//              `files` first: a list of [url, directory] pairs. Each
-//              pack's files are placed under its directory.
-//   cwd        the directory that relative paths start from (default "/")
-//   programAt  if given, the program's own files are also added to
-//              `files`, under this directory. The compiler needs this: it
-//              reads the files of the build that is running it.
-//   write      (fd, text) => ...: receives what the program writes to
-//              standard output (fd 1) and standard error (fd 2), as text.
-//              By default, lines go to console.log and console.error.
-//   output     (fd, bytes) => ...: like `write`, but receives the raw
-//              bytes. If given, `write` is not used.
-//   mayWrite   (path) => true or false: whether the program may write the
-//              file at this (absolute) path. By default it may write
-//              anywhere.
-//   memoryPages
-//              a limit, in 64 KiB pages, on the size of each wasm memory
-//              of the program (host/subhost-core.mjs). No limit by
-//              default.
-//   modules    extra host modules that the program may import from: an
-//              object from module name to a function
-//              (caller, app) => imports (host/subhost-core.mjs explains
-//              host modules). host/web/dom.mjs is one.
-//   onExit     (code) => ...: called if the program ends itself with
-//              host.exit. After that the program is not called again.
-//
-// boot returns an `app` object once main has returned:
-//
-//   app.entry      the exports of the program's entry module
-//   app.call(name, ...args)
-//                  calls the function `name` of the entry module. Returns
-//                  true if it returned normally; false if it trapped, or
-//                  if the program has ended; undefined if there is no
-//                  such function. A trap does not end the program: it is
-//                  reported (by the program's on-trap, or else on
-//                  standard error) and later calls still work (spec 4).
-//   app.files      the Map of files
-//   app.cwd        the directory that relative paths start from
-//   app.started    what calling main returned (as app.call returns it)
-//   app.ended      true once the program has ended itself
-//
-// run(options, names, linklets) is the same as boot for a program whose
-// modules are already in memory. `names` lists the modules in load order
-// and `linklets` is a Map from name to bytes. It does not fetch anything
-// (so `program`, `lists` and `packs` are not used) and returns `app`
-// immediately.
-// A guest's worker uses it (guest-worker.mjs).
+// The host for a web page: runs a program in a browser, its files kept in memory.
 import { createHost } from '../subhost-core.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
 
-// host.exit must stop the program's code at once, and the only way to do
-// that from a function wasm has called is to throw. This is what is
-// thrown; `running` (below) catches it.
+// host.exit must stop the program at once: from a host function, only a throw can.
 class Exit {
   constructor(code) {
     this.code = code;
   }
 }
 
-// Returns `path` as an absolute, normalised path: a relative path is
-// taken to start from the directory `cwd`, and "." and ".." segments are
-// resolved.
 export function resolvePath(cwd, path) {
   const out = [];
   for (const seg of (path.startsWith('/') ? path : `${cwd}/${path}`).split('/')) {
@@ -108,10 +21,6 @@ export function resolvePath(cwd, path) {
   return `/${out.join('/')}`;
 }
 
-// Unpacks a file pack (see host/web/pack.mjs) into the Map `files`. Each
-// file's path is placed under the directory `dir`. A pack is a sequence
-// of records: the path's length (32 bits, little-endian), the path, the
-// content's length (the same), and the content.
 export function unpack(bytes, dir, files) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (let at = 0; at < bytes.length; ) {
@@ -130,27 +39,16 @@ async function fetchBytes(url) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
-// Downloads every file that the file list at `url` names, and adds each
-// to the Map `files`, under the directory `dir`. A path in the list is
-// relative to the list itself: "assets/a.png" in the list
-// "https://example.org/game/assets.list" is downloaded from
-// "https://example.org/game/assets/a.png", and with `dir` "/" it becomes
-// the file "/assets/a.png". All the files are requested at once.
 async function fetchListed(url, dir, files) {
-  // A relative URL is resolved as `fetch` resolves it.
   const list = new URL(url, globalThis.document ? document.baseURI : globalThis.location.href);
   const paths = text.decode(await fetchBytes(list)).split('\n').filter((p) => p !== '');
   await Promise.all(paths.map(async (path) => {
-    // Each part of the path is escaped, so that a name may contain
-    // characters that mean something else in a URL, such as "#" or "?".
+    // Escaped part by part, so that a name may contain characters such as # or ?.
     const from = new URL(path.split('/').map(encodeURIComponent).join('/'), list);
     files.set(resolvePath(dir, path), await fetchBytes(from));
   }));
 }
 
-// Returns a function that accepts text in arbitrary pieces and calls
-// `line` once for each complete line. Used to send a program's output to
-// the console, which prints a line at a time.
 function lines(line) {
   let pending = '';
   return (piece) => {
@@ -187,9 +85,7 @@ export function run(options, names, linklets) {
   const out = lines((l) => console.log(l));
   const err = lines((l) => console.error(l));
   const write = options.write || ((fd, piece) => (fd === 2 ? err : out)(piece));
-  // One UTF-8 decoder per output stream. With { stream: true } a decoder
-  // remembers an incomplete character at the end of one write and
-  // finishes it with the next write.
+  // A decoder per stream: { stream: true } carries a split character over to the next write.
   const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 
@@ -218,9 +114,6 @@ export function run(options, names, linklets) {
   });
   app.host = host;
 
-  // Runs f, which calls into the program. Returns what f returns, or
-  // false if the program ended itself (host.exit) during the call or
-  // before it.
   const running = (f) => {
     if (app.ended) return false;
     try {

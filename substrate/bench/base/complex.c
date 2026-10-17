@@ -1,5 +1,4 @@
-// The Mandelbrot set on a 600 by 600 grid, at most 100 iterations a
-// point, with complex numbers as structs passed and returned by value.
+// The Mandelbrot set, with complex numbers as structs passed and returned by value.
 #include "bench.h"
 
 typedef struct { double re, im; } complex_t;
@@ -14,7 +13,6 @@ static complex_t mul(complex_t a, complex_t b) {
 
 static double magnitude2(complex_t a) { return a.re * a.re + a.im * a.im; }
 
-// How many points stay within 2 of 0 for limit iterations of z^2 + c.
 static int mandelbrot(int size, int limit) {
   int inside = 0;
   for (int y = 0; y < size; y++)

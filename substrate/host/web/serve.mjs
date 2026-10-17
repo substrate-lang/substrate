@@ -1,15 +1,5 @@
 #!/usr/bin/env node
-// Lifecycle: experimental.
-//
-// A minimal static file server, for trying a site on this machine. A site
-// built by lib/web/site.sh is only static files, so any other web server
-// works just as well.
-//
-//   host/web/serve.mjs DIR [PORT]
-//
-// Serves the files in DIR on 127.0.0.1, on PORT (default 8000). If PORT
-// is 0, a free port is chosen. Prints the address on standard output, as
-// "http://127.0.0.1:PORT/".
+// A minimal static file server on 127.0.0.1, for trying a site locally.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -50,8 +40,7 @@ const server = http.createServer((request, response) => {
     return;
   }
   let file = path.join(root, name);
-  // Only serve files inside the directory: reject any path that resolves
-  // to somewhere outside it (for example with "..").
+  // Only files inside the directory: reject a path that resolves outside it, as with "..".
   if (file !== root && !file.startsWith(root + path.sep)) {
     response.writeHead(403).end();
     return;

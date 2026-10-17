@@ -1,13 +1,8 @@
-// An open-addressing hash table of 64-bit keys, which doubles as it
-// fills: 4 million keys put, and 8 million got, half of them there; a
-// table of structs, found through a struct variable's address, and
-// 64-bit multiplication.
+// An open-addressing hash table of 64-bit keys that doubles as it fills.
 #include "bench.h"
 
-// A slot, empty if its key is 0.
 typedef struct { uint64_t key, value; } entry;
 
-// The table: its slots, a power of 2 of them, and how many are full.
 typedef struct { entry *slots; uint64_t size, count; } table;
 
 static entry *slot_of(table *t, uint64_t key) {

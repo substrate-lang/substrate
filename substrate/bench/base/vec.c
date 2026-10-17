@@ -1,5 +1,4 @@
-// An array that grows, written for i32 and for a struct: 10 million items
-// pushed onto each, and summed.
+// An array that grows, for i32 and for a struct: 10 million items pushed and summed.
 #include "bench.h"
 
 typedef struct { int x, y; } point;

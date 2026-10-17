@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-# Lifecycle: benchmark. The same programs in the C-like Lisp (base.sub),
-# Bend (bend.sub) and Substrate (substrate.sub), one directory per
-# program. Each is built with bin/sub and run on wasmtime
-# (build/subhost), or on V8 with ENGINE=v8. Prints each program's result,
-# which the three must agree on, the least time of N runs (default 3) of
-# each in ms, and Bend's and Substrate's times over the C-like Lisp's. In
-# the dev shell:
-#
-#   bench/compare/run.sh [N [NAME ...]]
+# The same programs in the C-like Lisp, Bend and Substrate, timed (ENGINE=v8 for V8).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"

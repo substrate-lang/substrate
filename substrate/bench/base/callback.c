@@ -1,6 +1,4 @@
-// A sum and a count over 10 million integers, 10 times, each item given
-// to a callback: a function pointer and a pointer to its caller's
-// variables, as C passes a closure.
+// A sum and a count over 10 million integers, through a function pointer and a context.
 #include "bench.h"
 
 static void each(int *a, int n, void (*f)(void *, int), void *context) {

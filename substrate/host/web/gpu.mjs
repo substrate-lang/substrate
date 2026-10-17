@@ -1,241 +1,4 @@
-// Lifecycle: experimental.
-//
-// The host module "gpu": WebGPU for a program, the way the module "dom"
-// is the page for it. The program numbers its own resources (buffers,
-// textures, pipelines, ...), writes commands that create and use them
-// into a buffer, and hands the buffer to the host in one call per frame.
-// The host carries the commands out one for one on the WebGPU API and
-// knows nothing about sprites, meshes or text: renderers are libraries
-// in the program's own language. lib/web/gpu.sub is the program's side
-// of this module, and lib/web/game/sprites.sub a renderer built on it.
-//
-// Usage, in the page:
-//
-//   import { gpu } from './gpu.mjs';
-//   const theDom = dom(root);
-//   boot({ ..., modules: { dom: theDom, gpu: await gpu({ dom: theDom }) } })
-//
-// gpu() asks the browser for a GPU device. If the browser has no WebGPU,
-// or gives no device, it returns a stand-in module: a program that uses
-// it stops with a message saying so. The `dom` option is needed for
-// drawing on a canvas of the page: a surface (below) names its canvas by
-// its DOM node number, which the dom module resolves.
-//
-// ---- What a program can call ----
-//
-// Pointers are addresses in the calling program's memory.
-//
-//   apply (ptr, len)
-//       Carries out a batch of commands, `len` bytes of 32-bit words,
-//       then submits the frame's work to the GPU. The commands are
-//       listed below.
-//   take (buf, cap) -> len
-//       Only meaningful while the program's on-gpu function is running
-//       (below). Copies the event's data to `buf`, at most `cap` bytes,
-//       and returns the data's full length.
-//   loading () -> i32
-//       How many textures are still being loaded from files.
-//
-// ---- What a program is told ----
-//
-// WebGPU reports most mistakes later, not when the command that made
-// them is carried out, and reading data back from the GPU takes time.
-// So the host calls the program's exported function `on-gpu (kind, id)`,
-// if it has one, when:
-//
-//   1  error     Something went wrong: a shader did not compile, a
-//                pipeline, a layout or a bind group was invalid, a draw
-//                used a buffer that was too small, or the device was
-//                lost. The data is the message. `id` is the number of
-//                the shader, pipeline, layout, bind group or texture
-//                file the message is about, and 0 otherwise.
-//   2  loaded    The texture numbered `id`, loaded from a file, is ready.
-//   3  pixels    The pixels that read-texture asked for, from texture
-//                `id`: the rows from the top, tightly packed, each
-//                pixel's bytes as the format lays them out (rgba8unorm:
-//                r, g, b, a).
-//   4  bytes     The bytes that read-buffer asked for, from buffer `id`.
-//
-// A mistake in the commands themselves (a resource number that was never
-// made, a draw outside a pass) is the program's, and stops it with a
-// message, as a mistake in a dom patch does.
-//
-// ---- Resources ----
-//
-// Each kind of resource has its own numbers, which the program chooses,
-// from 1. Number 0 means "none". A resource exists from the command that
-// makes it until `destroy`. The kinds, as `destroy` names them:
-//
-//   1 surface   2 shader   3 pipeline   4 buffer   5 texture   6 sampler
-//   7 layout    8 bind group
-//
-// ---- The commands ----
-//
-// A command is its number, then its operands, one word each. A number
-// is a u32, and a decimal number (marked f32) is a 32-bit float in the
-// word. A text operand is two words: the address and the length of the
-// bytes in the program's memory. Several of the commands have lists: a
-// count, then that many items.
-//
-// Making resources:
-//
-//   1 surface id node
-//       The canvas that is DOM node `node` becomes surface `id`: a
-//       target for render passes, drawn in the browser's own canvas
-//       format (format 0 below). Its size follows the canvas's width and
-//       height.
-//   2 shader id code len
-//       Compiles the WGSL text as shader `id`. Errors arrive as an event.
-//   3 render-pipeline id shader vertex len fragment len topology cull
-//     front blend depth-format depth-compare depth-write
-//     layouts n (layout)... targets n (format)...
-//     buffers n (stride step attributes n (location offset format)...)...
-//       A render pipeline. `vertex` and `fragment` name the shader's
-//       entry points; an empty fragment name makes a pipeline without a
-//       fragment stage (for a depth-only pass), which then has no
-//       targets. The bind group layouts are given, one per group number,
-//       or, with a count of 0, taken from the shader. Each vertex buffer
-//       slot has a stride, a step (0 per vertex, 1 per instance) and its
-//       attributes.
-//   4 compute-pipeline id shader entry len layouts n (layout)...
-//   5 buffer id size usage
-//       A buffer of `size` bytes, which the host rounds up to a multiple
-//       of 4. `usage` is bits: 1 vertex, 2 index, 4 uniform, 8 storage,
-//       16 indirect. Every buffer can be written and read back.
-//   6 texture id width height layers mips format usage
-//       A texture; `layers` above 1 makes an array of 2D textures, and
-//       `mips` is the number of mip levels (1 for none). `usage` is bits:
-//       1 sampled in shaders, 2 a render pass target, 4 written by
-//       shaders (a storage texture). Every texture can be written and
-//       read back. Its content starts as zeros.
-//   7 texture-file id path len
-//       A texture loaded from an image file: one of the program's files
-//       (its assets are among them), or else a URL. Any format the
-//       browser decodes will do. The texture is rgba8unorm, with one mip
-//       level, its colours multiplied by their alpha, which is what
-//       blend 2 below expects. Loading takes a moment: `loading` counts
-//       it, and the event `loaded` says when it is ready. Until then the
-//       texture is 1 by 1 and transparent.
-//   8 sampler id filter address compare
-//       filter: 0 nearest, 1 linear (for magnifying, minifying and mip
-//       levels alike). address: 0 clamp to the edge, 1 repeat, 2 mirror.
-//       compare: 0 for an ordinary sampler, or a comparison (below) for
-//       one that compares, as shadow maps are read.
-//   9 layout id n (binding visibility kind)...
-//       A bind group layout, for pipelines that share bind groups or use
-//       dynamic offsets. visibility is bits: 1 vertex, 2 fragment,
-//       4 compute. kind: 1 uniform buffer, 2 storage buffer, 3 read-only
-//       storage buffer, 4 uniform buffer with a dynamic offset,
-//       5 storage buffer with one, 6 read-only storage buffer with one,
-//       7 sampler, 8 comparison sampler, 9 texture, 10 depth texture,
-//       11 storage texture (written by shaders; rgba8unorm), 12 a
-//       texture with layers (an array of 2D textures), 13 a depth
-//       texture with layers. A bind group gives a texture to an entry of
-//       kind 12 or 13 as all its layers, and to the others as one 2D
-//       texture (its first layer).
-//   10 bind-group id layout pipeline group n (binding kind id offset size)...
-//       A bind group. Its layout is `layout`, or, if that is 0, group
-//       `group` of `pipeline`'s. Each entry is a buffer (kind 1; a
-//       `size` of 0 means to its end), a sampler (2) or a texture (3).
-//       A bind group names its resources by number, and keeps naming
-//       them: when a texture loaded from a file arrives, the bind groups
-//       that name it are remade with it.
-//   11 destroy kind id
-//
-// Writing and reading:
-//
-//   12 write-buffer buffer offset ptr len
-//       Copies `len` bytes from the program's memory into the buffer.
-//       `offset` and `len` are multiples of 4.
-//   13 write-texture texture mip layer x y w h ptr len
-//       Copies pixels into part of a texture: `len` bytes, the rows one
-//       after another, tightly packed.
-//   14 read-texture texture mip layer x y w h
-//       Asks for pixels, which arrive as the event `pixels`. A
-//       depth24plus texture cannot be read.
-//   15 read-buffer buffer offset len
-//       Asks for bytes, which arrive as the event `bytes`.
-//
-// Passes. A frame is one or more passes; the commands between a pass
-// and `end-pass` belong to it.
-//
-//   16 render-pass n (kind id mip layer load r g b a)...
-//      depth-texture depth-mip depth-layer depth-load depth-clear
-//       Begins a render pass on n targets: each a surface (kind 1) or a
-//       texture (kind 2; at the mip level and layer given), either kept
-//       as it is (load 0) or cleared to the colour (load 1; r g b a are
-//       f32, from 0 to 1). A pass with no targets draws depth only. If
-//       depth-texture is not 0, it is attached, kept or cleared to
-//       depth-clear (f32).
-//   17 compute-pass
-//   18 end-pass
-//   19 pipeline id
-//   20 bind-group group id n (offset)...
-//       Sets the bind group for a group number, with n dynamic offsets
-//       for the entries whose layout kinds have one.
-//   21 vertex-buffer slot buffer offset
-//   22 index-buffer buffer format offset
-//       format: 0 for 16-bit indexes, 1 for 32-bit.
-//   23 draw vertices instances first-vertex first-instance
-//   24 draw-indexed indexes instances first-index base-vertex
-//      first-instance
-//   25 dispatch x y z
-//       Runs a compute pipeline over x by y by z workgroups.
-//   26 viewport x y w h
-//       f32, in pixels of the target. The default is the whole target.
-//   27 scissor x y w h
-//       Pixels outside this rectangle are left alone.
-//
-// Codes used above:
-//
-//   formats       0 the browser's canvas format (surfaces only)
-//                 1 rgba8unorm  2 bgra8unorm  3 r8unorm  4 rg8unorm
-//                 5 rgba16float  6 r32float  7 rgba32float
-//                 8 depth24plus  9 depth32float
-//   vertex formats
-//                 1 float32  2 float32x2  3 float32x3  4 float32x4
-//                 5 uint32  6 uint32x2  7 uint32x4  8 sint32
-//                 9 unorm8x4  10 snorm8x4  11 float16x2  12 float16x4
-//                 13 uint8x4  14 unorm16x2  15 unorm16x4
-//   topology      1 triangle list  2 triangle strip  3 line list
-//                 4 line strip  5 point list. A strip is drawn with
-//                 32-bit indexes when drawn indexed.
-//   cull          0 none  1 back faces  2 front faces
-//   front         0 counter-clockwise  1 clockwise
-//   blend         0 none: what is drawn replaces what was there
-//                 1 alpha: the usual mixing by the drawn alpha
-//                 2 premultiplied: the same for colours that were
-//                   multiplied by their alpha first
-//                 3 add
-//   comparison    0 none  1 less  2 less or equal  3 greater  4 greater
-//                 or equal  5 equal  6 always  7 never
-//
-// ---- For tests and measurements ----
-//
-// gpu() returns the module function with extra properties:
-//   available                   whether the browser gave a device
-//   adapter                     what it says about the GPU
-//   read(texture, x, y, w, h, mip = 0, layer = 0)
-//                               the pixels of a texture, as a promise
-//                               of bytes, as read-texture gives them
-//   readSurface(surface, x, y, w, h)
-//                               the pixels of a surface, as a promise of
-//                               bytes, r, g, b, a per pixel whatever the
-//                               canvas format: the next frame drawn on
-//                               the surface is copied before it is shown
-//   timing                      { measure, frames, ms }: while `measure`
-//                               is true, each frame's time on the GPU,
-//                               from handing it over until it is done,
-//                               is added to `ms` and `frames` counted
-// A WebGPU canvas cannot be read back through a 2D context in a browser
-// without a GPU, so a test reads the surface this way, or draws into a
-// texture and reads that.
-//
-// gpu({ offscreen: true }) makes surfaces that are not canvases: a
-// surface is then a texture of the canvas's size, and nothing is shown.
-// A headless browser on a real GPU cannot show a WebGPU canvas, but can
-// draw this way, which is how the renderers are measured on one
-// (tests/web/sprites.mjs).
+// The host module "gpu": WebGPU, as batches of commands from the program, and events back.
 import { resolvePath } from './subhost-web.mjs';
 
 const utf8 = new TextEncoder();
@@ -245,7 +8,6 @@ const formats = {
   1: 'rgba8unorm', 2: 'bgra8unorm', 3: 'r8unorm', 4: 'rg8unorm', 5: 'rgba16float', 6: 'r32float', 7: 'rgba32float',
   8: 'depth24plus', 9: 'depth32float',
 };
-// Bytes per pixel, for reading back; depth24plus cannot be read.
 const pixelBytes = {
   rgba8unorm: 4, bgra8unorm: 4, r8unorm: 1, rg8unorm: 2, rgba16float: 8, r32float: 4, rgba32float: 16, depth32float: 4,
 };
@@ -265,13 +27,11 @@ const comparisons = { 1: 'less', 2: 'less-equal', 3: 'greater', 4: 'greater-equa
 const addressModes = { 0: 'clamp-to-edge', 1: 'repeat', 2: 'mirror-repeat' };
 const kindNames = { 1: 'surface', 2: 'shader', 3: 'pipeline', 4: 'buffer', 5: 'texture', 6: 'sampler', 7: 'layout', 8: 'bind group' };
 
-// The events, as on-gpu is told them.
 const ERROR = 1;
 const LOADED = 2;
 const PIXELS = 3;
 const BYTES = 4;
 
-// The module when the browser gives no device: it stops the program.
 function unavailable(reason) {
   const module = (caller) => ({
     apply() { caller.trap(`gpu: WebGPU is not available: ${reason}`); },
@@ -299,22 +59,18 @@ export async function gpu(options = {}) {
   const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
   const theDom = options.dom || null;
 
-  // The resources, by kind and number.
-  const surfaces = new Map();   // id -> { canvas, context } or, off screen, { canvas, texture }
-  const shaders = new Map();    // id -> GPUShaderModule
-  const pipelines = new Map();  // id -> { pipeline, compute }
-  const buffers = new Map();    // id -> GPUBuffer
-  const textures = new Map();   // id -> { texture, format, width, height, layers }
-  const samplers = new Map();   // id -> GPUSampler
-  const layouts = new Map();    // id -> GPUBindGroupLayout
-  const layered = new Map();    // layout id -> the bindings that take a texture's layers
-  const bindGroups = new Map(); // id -> { group: GPUBindGroup, layout, entries: [{ binding, kind, id, offset, size }] }
+  const surfaces = new Map();
+  const shaders = new Map();
+  const pipelines = new Map();
+  const buffers = new Map();
+  const textures = new Map();
+  const samplers = new Map();
+  const layouts = new Map();
+  const layered = new Map();
+  const bindGroups = new Map();
   const tables = { 1: surfaces, 2: shaders, 3: pipelines, 4: buffers, 5: textures, 6: samplers, 7: layouts, 8: bindGroups };
   let loading = 0;
 
-  // The program, and the event being delivered to it. Events come from
-  // things that finish later (promises), so the program is idle when one
-  // arrives; they are still delivered one at a time.
   let app = null;
   let caller = null;
   let eventData = null;
@@ -338,7 +94,6 @@ export async function gpu(options = {}) {
   device.addEventListener('uncapturederror', (e) => error(0, e.error.message));
   device.lost.then((info) => error(0, `the device was lost (${info.reason}): ${info.message}`));
 
-  // A resource by its kind and number, or a stop with a message.
   function get(kind, id) {
     const r = tables[kind].get(id);
     if (r === undefined) caller.trap(`gpu: there is no ${kindNames[kind]} ${id}`);
@@ -356,16 +111,13 @@ export async function gpu(options = {}) {
     return v;
   };
 
-  // Carries out the commands of one apply call. `w` are the words, `f`
-  // the same as floats, and `string(i)` reads the text operand at word i.
   function run(memory, w, f, string) {
     const encoder = device.createCommandEncoder();
-    let pass = null;        // the open render or compute pass
-    let computing = false;  // whether it is a compute pass
+    let pass = null;
+    let computing = false;
     // Read-backs copy into a buffer during the frame; the buffer can only
     // be mapped once the frame has been submitted, so they finish after.
     const reads = [];
-    // The canvas textures drawn on in this frame, for readSurface.
     const drawn = new Map();
     const inPass = (what, compute) => {
       if (!pass) caller.trap(`gpu: ${what} outside a pass`);
@@ -380,6 +132,7 @@ export async function gpu(options = {}) {
           const node = theDom && theDom.nodeOf ? theDom.nodeOf(w[i + 2]) : null;
           if (!node) caller.trap(`gpu: surface ${id}: the page gave this module no dom, or node ${w[i + 2]} is not on the page`);
           if (!(node instanceof HTMLCanvasElement)) caller.trap(`gpu: surface ${id}: node ${w[i + 2]} is not a canvas`);
+          // Offscreen, for measuring on a real GPU: a headless browser there cannot show a WebGPU canvas.
           if (options.offscreen) {
             const texture = device.createTexture({
               label: `surface ${id}`, size: [node.width, node.height, 1], format: canvasFormat,
@@ -398,8 +151,7 @@ export async function gpu(options = {}) {
         }
         case 2: {
           const id = w[i + 1];
-          // The error of a shader that does not compile is caught here, so
-          // that it is reported for the shader, with its lines, rather than
+          // A shader that does not compile is reported for the shader, with its lines, rather than
           // as a general error of the device.
           device.pushErrorScope('validation');
           const module = device.createShaderModule({ label: `shader ${id}`, code: string(i + 2) });
@@ -505,7 +257,6 @@ export async function gpu(options = {}) {
         case 7: {
           const id = w[i + 1];
           const name = string(i + 2);
-          // Until the file arrives: one transparent pixel.
           const placeholder = device.createTexture({
             size: [1, 1, 1], format: 'rgba8unorm',
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
@@ -560,8 +311,6 @@ export async function gpu(options = {}) {
             i += 3;
           }
           layouts.set(id, checked(`layout ${id}`, id, () => device.createBindGroupLayout({ label: `layout ${id}`, entries })));
-          // Which bindings take a texture's layers, for the views of the
-          // bind groups made with this layout.
           layered.set(id, new Set(entries.filter((e) => e.texture && e.texture.viewDimension === '2d-array').map((e) => e.binding)));
           break;
         }
@@ -746,7 +495,6 @@ export async function gpu(options = {}) {
       pass.end();
       caller.trap('gpu: a pass was not ended');
     }
-    // Tests waiting for a surface's picture get this frame's.
     for (const want of surfaceReads.splice(0)) {
       const texture = drawn.get(want.id);
       if (!texture) {
@@ -767,10 +515,8 @@ export async function gpu(options = {}) {
     for (const read of reads) read();
   }
 
-  // Makes a resource with WebGPU's validation errors caught: a mistake in
-  // a pipeline, a layout or a bind group is reported as an error event
-  // naming it, as a shader's is, rather than as the "previous error"
-  // that fails the frame later.
+  // Validation errors are caught per resource: a mistake is reported naming the pipeline,
+  // layout or bind group, rather than as the "previous error" that fails the frame later.
   function checked(what, id, make) {
     device.pushErrorScope('validation');
     const resource = make();
@@ -778,13 +524,11 @@ export async function gpu(options = {}) {
     return resource;
   }
 
-  // readSurface's requests: each waits for the next frame drawn on its
-  // surface.
+  // readSurface: a WebGPU canvas cannot be read through a 2D context without a GPU, so a test
+  // reads the next frame drawn on the surface this way.
   const surfaceReads = [];
   const timing = { measure: false, frames: 0, ms: 0 };
 
-  // Like readTexture, for a canvas's texture: the bytes come back as
-  // r, g, b, a, whatever the canvas format.
   function readCanvasTexture(encoder, texture, x, y, width, height) {
     const bytesPerRow = (width * 4 + 255) & ~255;
     const staging = device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -805,9 +549,7 @@ export async function gpu(options = {}) {
     });
   }
 
-  // Loads an image file as texture `id`: its pixels, read through a 2D
-  // context and multiplied by their alpha. (copyExternalImageToTexture
-  // would do this in one step, but fails without a GPU.)
+  // Through a 2D context: copyExternalImageToTexture fails without a GPU.
   async function loadTexture(id, name) {
     loading++;
     try {
@@ -840,8 +582,7 @@ export async function gpu(options = {}) {
       });
       device.queue.writeTexture({ texture }, pixels, { bytesPerRow: bitmap.width * 4 }, [bitmap.width, bitmap.height]);
       textures.set(id, { texture, format: 'rgba8unorm', width: bitmap.width, height: bitmap.height, layers: 1 });
-      // The bind groups that name the texture are remade with it, and
-      // only then is the placeholder destroyed.
+      // Remake the bind groups that name the texture before destroying the placeholder.
       for (const description of bindGroups.values()) {
         if (description.entries.some((e) => e.kind === 3 && e.id === id)) description.group = makeBindGroup(description);
       }
@@ -854,8 +595,6 @@ export async function gpu(options = {}) {
     }
   }
 
-  // Makes the GPUBindGroup of a bind group's description: its layout and
-  // entries, which name resources by number.
   function makeBindGroup({ id, layout, entries, layers }) {
     return checked(`bind group ${id}`, id, () => device.createBindGroup({
       label: `bind group ${id}`,
@@ -877,9 +616,6 @@ export async function gpu(options = {}) {
     }));
   }
 
-  // Records in `encoder` the copy of part of a texture into a buffer that
-  // can be mapped, and returns the function that reads it, once the
-  // encoder's work has been submitted: the rows, tightly packed.
   function readTexture(encoder, id, mip, layer, x, y, width, height) {
     const t = get(5, id);
     const bpp = pixelBytes[t.format];
@@ -913,8 +649,7 @@ export async function gpu(options = {}) {
     return {
       apply(ptr, len) {
         const memory = caller.memory();
-        // A Uint32Array must start at a multiple of 4, so a batch at any
-        // other address is copied first.
+        // A Uint32Array must start at a multiple of 4: a batch at any other address is copied first.
         const w = ptr % 4 === 0
           ? new Uint32Array(memory.buffer, memory.byteOffset + ptr, len >>> 2)
           : new Uint32Array(memory.slice(ptr, ptr + len).buffer);

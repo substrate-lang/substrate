@@ -1,78 +1,21 @@
-// Lifecycle: experimental.
-//
-// Drives a headless Chromium, for the browser tests (tests/web).
-//
-// It talks to Chromium directly over the DevTools protocol (a WebSocket),
-// so no test framework has to be installed: only the browser itself,
-// which the Nix flake provides.
-//
-//   import { withBrowser } from './browser.mjs';
-//   await withBrowser(async (open) => {
-//     const page = await open('http://127.0.0.1:8000/');
-//     await page.waitFor('window.ready');
-//     await page.click('#run');
-//     console.log(await page.evaluate('document.title'));
-//   });
-//
-// withBrowser takes options: `dir`, where the browser's temporary profile
-// goes; `chromium`, the browser to run; `gpu`, which keeps the browser's
-// GPU process on (it is off otherwise, since a build machine has no GPU);
-// and `flags`, further command-line flags. `webgpuFlags` below are the
-// flags with which this browser runs WebGPU without a GPU, on
-// SwiftShader, which renders in software: pass them with gpu: true.
-//
-// `open(url)` opens a page and returns an object with:
-//
-//   evaluate(js)       Evaluates the JavaScript expression `js` in the
-//                      page and returns its value. If the value is a
-//                      promise, waits for it. If the expression throws,
-//                      evaluate throws.
-//   waitFor(js, ms)    Waits until `js` evaluates to a true value. Throws
-//                      after `ms` milliseconds (default 10000).
-//   click(selector)    Clicks the mouse in the middle of the first
-//                      element that matches the CSS selector.
-//   type(text)         Types `text` into the element that has the focus.
-//   press(key, mods)   Presses and releases a key, such as "Enter" or
-//                      "ArrowUp". `mods` are the modifier keys held, as
-//                      DevTools numbers them: 1 Alt, 2 Control, 4 Meta,
-//                      8 Shift.
-//   keyDown(key, mods) Presses a key and keeps it down, until
-//   keyUp(key, mods)   releases it. For testing keys that are held.
-//   screenshot(file, width, height)
-//                      Saves a PNG of the page at the given size.
-//   close()            Closes the page. A page that is left open stays in
-//                      the background once another is opened, where the
-//                      browser slows its animation frames down or stops
-//                      them, so a script that times pages closes each
-//                      one before opening the next.
-//   log                An array of lines: what the page wrote to its
-//                      console, and its uncaught exceptions.
+// Drives a headless Chromium over the DevTools protocol, for the browser tests.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-// Without a GPU, Chromium runs WebGPU on SwiftShader only with these
-// flags and its GPU process on. (With the GPU process off, it still
-// gives a WebGPU device, but destroys it as soon as a canvas is drawn on.)
-// On macOS, where every machine has a GPU and Chromium's WebGPU runs on
-// Metal, the flags only turn WebGPU on: SwiftShader's device is lost
-// there as soon as it is used.
+// Without a GPU, Chromium runs WebGPU on SwiftShader only with these flags and its GPU process
+// on. On macOS (Metal) they only turn WebGPU on: SwiftShader's device is lost there.
 export const webgpuFlags = process.platform === 'darwin' ? ['--enable-unsafe-webgpu'] : [
   '--enable-unsafe-webgpu', '--enable-unsafe-swiftshader', '--enable-features=Vulkan', '--use-vulkan=swiftshader',
   '--use-angle=vulkan',
 ];
 
-// With these flags and its GPU process on, headless Chromium uses the
-// machine's GPU for WebGPU, if it has one with a Vulkan driver. It can
-// draw off screen on it, but not present to a canvas: the device is lost
-// (vkAllocateMemory fails) as soon as a canvas is drawn on. gpu.mjs has
-// an off-screen mode for this.
+// With these, headless Chromium uses a Vulkan GPU, but only off screen: drawing on a canvas
+// loses the device (vkAllocateMemory fails).
 export const hardwareGpuFlags = ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-angle=vulkan'];
 
-// The named keys that `press` supports. DevTools needs each key's code
-// and Windows virtual key number as well as its name. Any other key is
-// treated as a letter key.
+// DevTools needs each key's code and Windows virtual key number, not only its name.
 const keys = {
   Enter: { code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
   Tab: { code: 'Tab', windowsVirtualKeyCode: 9 },
@@ -84,22 +27,11 @@ const keys = {
   ArrowRight: { code: 'ArrowRight', windowsVirtualKeyCode: 39 },
 };
 
-// Starts Chromium, calls `use(open)`, and closes Chromium when `use` has
-// finished (or failed).
-//
-// Chromium gets a fresh, temporary profile directory, created under
-// options.dir (or the system's temporary directory) and deleted
-// afterwards.
-//
-// Chromium runs with --no-sandbox. Its sandbox needs kernel features
-// that build machines and containers often do not allow. That is
-// acceptable here because the only pages opened are this repository's
-// own, served from this machine.
+// --no-sandbox: Chromium's sandbox needs kernel features that build machines often lack;
+// the only pages opened are this repository's own, served from this machine.
 export async function withBrowser(use, options = {}) {
   const profile = fs.mkdtempSync(path.join(options.dir || os.tmpdir(), 'chromium-'));
-  // Chromium is told not to use a GPU, unless options.gpu is set: there is
-  // none on a build machine, and looking for one costs time. options.flags
-  // are further command-line flags.
+  // No GPU unless options.gpu: a build machine has none, and looking for one costs time.
   const browser = spawn(options.chromium || process.env.CHROMIUM || 'chromium', [
     '--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
     '--no-first-run', '--no-default-browser-check', ...(options.gpu ? [] : ['--disable-gpu']), '--no-sandbox',
@@ -107,8 +39,6 @@ export async function withBrowser(use, options = {}) {
   ], { stdio: ['ignore', 'ignore', 'pipe'] });
   let socket;
   try {
-    // Chromium prints the address of its DevTools WebSocket on standard
-    // error when it starts.
     const endpoint = await new Promise((resolve, reject) => {
       let said = '';
       browser.stderr.on('data', (d) => {
@@ -125,9 +55,6 @@ export async function withBrowser(use, options = {}) {
       socket.onerror = () => reject(new Error('cannot connect to chromium'));
     });
 
-    // Each command sent to DevTools carries a number, and the reply to it
-    // carries the same number. `waiting` maps a number to the promise
-    // callbacks that are waiting for that reply.
     let next = 0;
     const waiting = new Map();
     const listeners = new Map();
@@ -164,8 +91,7 @@ export async function withBrowser(use, options = {}) {
       const command = (method, params) => send(method, params, sessionId);
       await command('Runtime.enable');
       await command('Page.enable');
-      // The new page is brought to the front: the browser runs animation
-      // frames at full speed only for the page in front.
+      // In front: the browser runs animation frames at full speed only for the page in front.
       await send('Target.activateTarget', { targetId });
       const evaluate = async (js) => {
         const r = await command('Runtime.evaluate', { expression: js, awaitPromise: true, returnByValue: true });
@@ -178,8 +104,7 @@ export async function withBrowser(use, options = {}) {
       const page = {
         log,
         evaluate,
-        // An evaluation that never answers, such as a promise for a frame
-        // that is never drawn, is given up at the deadline too.
+        // An evaluation that never answers (a promise for a frame never drawn) ends at the deadline too.
         async waitFor(js, ms = 10000) {
           const until = Date.now() + ms;
           const late = {};
@@ -242,9 +167,8 @@ export async function withBrowser(use, options = {}) {
     if (socket) socket.close();
     browser.kill();
     await new Promise((resolve) => browser.on('exit', resolve));
-    // The browser's GPU process can still be writing its caches for a
-    // moment after the browser has exited, so removing the profile may
-    // need a retry.
+    // The GPU process may still write its caches after the browser exits,
+    // so removing the profile may need a retry.
     fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }

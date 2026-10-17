@@ -1,22 +1,13 @@
 #!/usr/bin/env bash
-# Lifecycle: benchmark. Times checking and compiling Bend: proofs-N.sub, N
-# blocks of proofs (proofs.sh; default 3200, after Bend2's proofs_3200),
-# built with bin/sub on wasmtime and on V8. Bend's own modules are put in
-# the cache first (warm.sub), so the time is the proofs module's alone.
-# Prints the wall time and the compiler's maximum resident size in MB. In
-# the dev shell:
-#
-#   bench/bend/compile/run.sh [N]
+# Times checking and compiling the module proofs.sh writes, on wasmtime and on V8.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
 n="${1:-3200}"
 out="$root/build/bench/bend"
 mkdir -p "$out"
-# The module goes in build/, beside the outputs, at the depth of this
-# directory, so the requires it copies from header.sub still resolve.
+# In build/, at this directory's depth, so the requires copied from header.sub resolve.
 "$here/proofs.sh" "$n" > "$out/proofs-$n.sub"
-# A V8 host for the compiler: node with the flags the compiler's wasm needs.
 printf '#!/bin/sh\nexec node --stack-size=4000 --experimental-wasm-exnref "%s/host/subhost.mjs" "$@"\n' "$root" > "$out/v8"
 chmod +x "$out/v8"
 case "$(uname)" in Darwin) rss=(-l); rssline="maximum resident set size";; *) rss=(-v); rssline="Maximum resident set size";; esac

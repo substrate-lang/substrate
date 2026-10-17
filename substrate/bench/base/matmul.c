@@ -1,5 +1,4 @@
-// A product of 500 by 500 matrices of f64: pointer arithmetic over
-// arrays, and float loops.
+// A product of 500 by 500 matrices of f64.
 #include "bench.h"
 
 static void matmul(int n, double *a, double *b, double *c) {
