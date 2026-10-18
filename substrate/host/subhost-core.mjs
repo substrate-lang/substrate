@@ -172,6 +172,10 @@ export function createHost(platform) {
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
 
+  // Code run while compiling gets only these, since a build's bytes must depend on its sources alone.
+  const COMPILE_TIME_HOST = new Set(['write', 'trap', 'error_message']);
+  const refused = (what) => () => hostTrap(`${what} is not available while compiling`);
+
   function hostTrap(message) {
     trapMessage = message;
     trapper.trap();
@@ -289,11 +293,12 @@ export function createHost(platform) {
       trap(ptr, len) {
         hostTrap(string(ptr, len));
       },
-      instantiate(np, nl, bp, bl, mp, ml) {
+      // compileTime is 1 for code the compiler runs while compiling, which gets less of the host.
+      instantiate(np, nl, bp, bl, mp, ml, compileTime) {
         const name = string(np, nl);
         const bytes = memory().slice(u(bp), u(bp) + bl);
         const map = importMap(memory().slice(u(mp), u(mp) + ml));
-        return instantiate(name, bytes, map) ? 0 : 1;
+        return instantiate(name, bytes, map, compileTime !== 0) ? 0 : 1;
       },
       export_index(ip, il, fp, fl) {
         const table = self.exports.table;
@@ -369,7 +374,7 @@ export function createHost(platform) {
     };
   }
 
-  function instantiate(name, bytes, map) {
+  function instantiate(name, bytes, map, compileTime = false) {
     let module;
     try {
       module = compile(bytes);
@@ -386,9 +391,14 @@ export function createHost(platform) {
       if (imp.module === 'host') {
         if (!made.has('host')) made.set('host', hostImports(self));
         value = made.get('host')[imp.name];
+        if (compileTime && value && !COMPILE_TIME_HOST.has(imp.name)) value = refused(`host.${imp.name}`);
       } else if (platform.modules && platform.modules.has(from)) {
-        if (!made.has(from)) made.set(from, platform.modules.get(from)(callerOf(self, from)));
-        value = made.get(from)[imp.name];
+        if (compileTime) {
+          value = refused(`${from}.${imp.name}`);
+        } else {
+          if (!made.has(from)) made.set(from, platform.modules.get(from)(callerOf(self, from)));
+          value = made.get(from)[imp.name];
+        }
       } else {
         const exports = registry.get(from);
         value = exports && exports[imp.name];
