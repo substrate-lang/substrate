@@ -10,12 +10,12 @@ compiler is written in it, builds itself, and runs in a browser.
   the kernel, which Substrate's macros expand into: wasm as s-expressions,
   with modules, phases and macros that run at compile time. `kernel.sub`
   holds the data macros work on.
-- `compiler/substrate/`: Substrate, as macros over the kernel.
+- `compiler/substrate/`: Substrate, as macros over the kernel, and
+  `syntax-match.sub` and `forms.sub` for writing macros in Substrate.
 - `lib/`: languages written in Substrate: `scheme/`, a Scheme;
   `bend/`, a dependently typed language; and, experimental, `shade/`, GPU
   programs compiled to WGSL, and `web/`, programs in a web page, a game
   library, examples and a REPL. Beside them is what they share:
-  `syntax-match.sub` and `forms.sub` for writing macros in Substrate, and
   `nodes.sub` for run-time nodes.
 - `host/`: what runs compiled programs: `subhost.mjs` on Node, and `web/` in a
   browser (experimental).

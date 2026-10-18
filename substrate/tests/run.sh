@@ -112,9 +112,8 @@ fi
 # builds from such sources and runs as it does here, unless a struct it relies on has changed.
 changed="$builds/changed"
 rm -rf "${changed:?}"
-mkdir -p "$changed/lib" "$changed/tests/substrate"
+mkdir -p "$changed/tests/substrate"
 cp -r compiler "$changed/"
-cp lib/forms.sub "$changed/lib/"
 cp tests/substrate/forms.sub "$changed/tests/substrate/"
 from_changed() {
   "$host" "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
