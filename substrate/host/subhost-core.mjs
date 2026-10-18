@@ -165,6 +165,9 @@ export function createHost(platform) {
   const registry = new Map();
   const modules = new Map();
   let lastError = '';
+  // The running program: its modules' names in load order, and how to get one's bytes.
+  let programNames = [];
+  let programBytes = null;
 
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
@@ -346,6 +349,23 @@ export function createHost(platform) {
       exit(code) {
         platform.exit(code);
       },
+      // The names of the modules the running program is made of, each followed by a newline.
+      program_modules(bp, cap) {
+        const b = utf8.encode(programNames.map((n) => `${n}\n`).join(''));
+        memory().set(b.subarray(0, cap), u(bp));
+        return b.length;
+      },
+      // One of those modules' bytes, or -1 if it is not one of them.
+      module_bytes(np, nl, bp, cap) {
+        const name = string(np, nl);
+        if (!programNames.includes(name)) {
+          lastError = `the running program has no module ${name}`;
+          return -1;
+        }
+        const b = programBytes(name);
+        memory().set(b.subarray(0, cap), u(bp));
+        return b.length;
+      },
     };
   }
 
@@ -397,6 +417,8 @@ export function createHost(platform) {
   }
 
   function load(names, bytesOf) {
+    programNames = names;
+    programBytes = bytesOf;
     for (const name of names) {
       let loaded;
       try {

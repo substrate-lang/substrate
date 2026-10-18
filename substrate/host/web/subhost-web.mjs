@@ -71,10 +71,6 @@ export async function boot(options) {
   await Promise.all(names.map(async (name) => {
     wasm.set(name, await fetchBytes(`${base}${encodeURIComponent(name)}.wasm`));
   }));
-  if (options.programAt) {
-    files.set(resolvePath(options.programAt, 'program'), utf8.encode(names.map((n) => `${n}\n`).join('')));
-    for (const [name, bytes] of wasm) files.set(resolvePath(options.programAt, `${name}.wasm`), bytes);
-  }
   return run({ ...options, files }, names, wasm);
 }
 
