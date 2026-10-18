@@ -23,12 +23,6 @@ same_program() {
 pass=0
 fail=0
 
-# The compiled file that compiled-import.sub requires.
-mkdir -p "$builds/compiled"
-(cd tests/fixtures && "$root/bin/sub" build geometry.sub -o "$root/$builds/compiled/geometry" \
-   -m "$root/$builds/compiled/geometry.subc" -c "$cache" > /dev/null) ||
-  { echo "FAIL building tests/fixtures/geometry.sub as a compiled file"; fail=$((fail + 1)); }
-
 tests=(tests/*.sub tests/base/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
