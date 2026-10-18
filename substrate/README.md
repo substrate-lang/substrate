@@ -17,8 +17,8 @@ compiler is written in it, builds itself, and runs in a browser.
   library, examples and a REPL. Beside them is what they share:
   `syntax-match.sub` and `forms.sub` for writing macros in Substrate, and
   `nodes.sub` for run-time nodes.
-- `host/`: what runs compiled programs: `subhost.c` on wasmtime,
-  `subhost.mjs` on Node, and `web/` in a browser (experimental).
+- `host/`: what runs compiled programs: `subhost.mjs` on Node, and `web/` in a
+  browser (experimental).
 - `seed/`: a checked-in build of the compiler, which builds it from source.
 - `tests/`, `bench/`.
 
@@ -27,12 +27,11 @@ compiler is written in it, builds itself, and runs in a browser.
 In the dev shell (`nix develop`):
 
     make check                        # the tests
-    HOST=host/subhost.mjs make check  # the same, on Node
     tests/web/run.sh                  # the browser tests
     make bootstrap                    # the compiler builds itself into the same bytes
     make seed                         # and becomes the seed
     bin/sub build FILE -o DIR         # FILE's program, into DIR
-    build/subhost DIR [ARG ...]       # run it
+    host/subhost.mjs DIR [ARG ...]    # run it
     bin/sub eval FILE                 # FILE's forms, one at a time, as a session
     bin/sub expand FILE               # FILE's expansion
     lib/web/site.sh FILE OUT          # a web site for a page program

@@ -26,21 +26,15 @@
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = [
-            pkgs.wasmtime      # wasm engine (CLI, for poking at modules)
-            pkgs.wasmtime.dev  # C API headers for host/subhost.c
-            pkgs.wasmtime.lib  # libwasmtime
             pkgs.wasm-tools    # validate / print emitted modules
             pkgs.lld           # wasm-ld: links the C benchmarks' C to wasm (bench/substrate)
             pkgs.gnumake
             pkgs.time          # GNU time: bench/bend/compile's time and memory
-            pkgs.nodejs        # V8, to compare engines (host/subhost.mjs), and the web tests' driver
+            pkgs.nodejs        # V8: the host (host/subhost.mjs), and the web tests' driver
             (chromium pkgs)    # the headless browser of the web tests (above)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-            pkgs.gcc       # on macOS, the shell's clang is the C compiler
-            pkgs.perf      # profile compiled wasm (SUBHOST_PERFMAP)
+            pkgs.clang     # the C benchmarks' compiler (bench/substrate); on macOS, the shell's own
           ];
-          WASMTIME_INCLUDE = "${pkgs.wasmtime.dev}/include";
-          WASMTIME_LIB = "${pkgs.wasmtime.lib}/lib";
         };
       });
     };

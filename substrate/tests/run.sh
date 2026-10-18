@@ -4,7 +4,7 @@ set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-host="$root/${HOST:-build/subhost}"
+host="$root/host/subhost.mjs"
 builds="${OUT:-build}/tests"
 rm -rf "${builds:?}"
 mkdir -p "$builds"

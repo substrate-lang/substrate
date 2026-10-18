@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The same programs in Substrate, Bend and Scheme, timed (ENGINE=v8 for V8).
+# The same programs in Substrate, Bend and Scheme, timed on V8.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -20,10 +20,7 @@ node=(node --stack-size=4000 --experimental-wasm-exnref --no-liftoff "$root/host
 declare -A best result
 run() { # name lang
   local start=$EPOCHREALTIME line end us
-  case ${ENGINE:-wasmtime} in
-    v8) line="$("${node[@]}" "$out/$1-$2" 2>/dev/null | head -1)" ;;
-    *) line="$("$root/build/subhost" "$out/$1-$2" 2>/dev/null | head -1)" ;;
-  esac
+  line="$("${node[@]}" "$out/$1-$2" 2>/dev/null | head -1)"
   end=$EPOCHREALTIME
   us=$(( ${end/./} - ${start/./} ))
   result[$1.$2]="$line"
@@ -32,7 +29,7 @@ run() { # name lang
 for ((i = 0; i < n; i++)); do
   for name in "${names[@]}"; do for lang in "${langs[@]}"; do run "$name" "$lang"; done; done
 done
-printf "%-8s %-12s %10s %7s %10s %7s %10s   (%s)\n" program result substrate bend scheme "bend/" "scheme/" "${ENGINE:-wasmtime}"
+printf "%-8s %-12s %10s %7s %10s %7s %10s\n" program result substrate bend scheme "bend/" "scheme/"
 for name in "${names[@]}"; do
   r="${result[$name.substrate]}"
   [ "$r" = "${result[$name.bend]}" ] && [ "$r" = "${result[$name.scheme]}" ] ||

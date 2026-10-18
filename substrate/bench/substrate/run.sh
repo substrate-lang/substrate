@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Substrate against the same programs in C, native and wasm, with and without inlining.
+# Substrate against the same programs in C, native and wasm (with and without inlining), the
+# wasm on V8.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -12,29 +13,32 @@ mkdir -p "$out"
 
 for name in "${names[@]}"; do
   (cd "$here" && "$root/bin/sub" build "$name.sub" -o "$out/$name" -c "$root/build/bench/cache" > /dev/null)
-  # nix's clang wrapper adds hardening flags that slow C down, and warns of the wasm target.
+  # nix's clang wrapper adds hardening flags that slow C down, warns of the wasm target, and
+  # passes native link flags, so wasm-ld links the wasm itself.
   NIX_HARDENING_ENABLE= clang -O2 -o "$out/$name.native" "$here/$name.c"
-  NIX_HARDENING_ENABLE= clang --target=wasm32 -O2 -ffreestanding -nostdlib -mbulk-memory -Wl,--no-entry \
-    -o "$out/$name.wasm" "$here/$name.c" 2> "$out/$name.wasm.log" || { cat "$out/$name.wasm.log"; exit 1; }
-  NIX_HARDENING_ENABLE= clang --target=wasm32 -O2 -fno-inline -ffreestanding -nostdlib -mbulk-memory -Wl,--no-entry \
-    -o "$out/$name.noinline.wasm" "$here/$name.c" 2> "$out/$name.wasm.log" || { cat "$out/$name.wasm.log"; exit 1; }
+  for v in wasm noinline; do
+    NIX_HARDENING_ENABLE= clang --target=wasm32 -O2 $([ $v = noinline ] && echo -fno-inline) -ffreestanding -nostdlib \
+      -mbulk-memory -c -o "$out/$name.$v.o" "$here/$name.c" 2> "$out/$name.wasm.log" &&
+      wasm-ld --no-entry -o "$out/$name.$v.wasm" "$out/$name.$v.o" 2>> "$out/$name.wasm.log" ||
+      { cat "$out/$name.wasm.log"; exit 1; }
+  done
 done
 
 variants=(ours native wasm noinline)
-command_of() {
-  case $1 in
-    ours) echo "$root/build/subhost $out/$2" ;;
-    native) echo "$out/$2.native" ;;
-    wasm) echo "wasmtime run --invoke run $out/$2.wasm" ;;
-    noinline) echo "wasmtime run --invoke run $out/$2.noinline.wasm" ;;
-  esac
-}
+node=(node --stack-size=4000 --experimental-wasm-exnref --no-liftoff)
+# The C wasm exports run, whose result it prints.
+c_wasm='const fs = require("fs");
+console.log(String(new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1]))).exports.run()))'
 
 declare -A best result
 run() {
   local start=$EPOCHREALTIME
   local line
-  line="$($(command_of "$1" "$2") 2>/dev/null | head -1)"
+  case $1 in
+    ours) line="$("${node[@]}" "$root/host/subhost.mjs" "$out/$2" 2>/dev/null | head -1)" ;;
+    native) line="$("$out/$2.native" 2>/dev/null | head -1)" ;;
+    wasm | noinline) line="$("${node[@]}" -e "$c_wasm" "$out/$2.$1.wasm" 2>/dev/null | head -1)" ;;
+  esac
   local end=$EPOCHREALTIME
   local us=$(( ${end/./} - ${start/./} ))
   result[$1.$2]="$line"
