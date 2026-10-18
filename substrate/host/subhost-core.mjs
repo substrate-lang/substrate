@@ -377,7 +377,8 @@ export function createHost(platform) {
       if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError ||
             e instanceof WebAssembly.LinkError)) throw e;
       const where = backtrace(e);
-      lastError = `instantiate: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}${where ? `\n${where}` : ''}`;
+      const what = e instanceof WebAssembly.LinkError ? 'instantiate' : 'trap';
+      lastError = `${what}: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}${where ? `\n${where}` : ''}`;
       return false;
     }
     registry.set(name, self.exports);
@@ -391,7 +392,7 @@ export function createHost(platform) {
         loaded = instantiate(name, bytesOf(name), new Map());
       } catch (e) {
         if (!(e instanceof WebAssembly.Exception)) throw e;
-        lastError = 'instantiate: uncaught exception';
+        lastError = 'uncaught exception';
       }
       if (!loaded) return null;
     }
