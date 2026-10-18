@@ -38,6 +38,13 @@ const host = createHost({
       throw systemError(e);
     }
   },
+  makeDir(path) {
+    try {
+      fs.mkdirSync(path, { recursive: true });
+    } catch (e) {
+      throw systemError(e);
+    }
+  },
   exit(code) {
     process.exit(code);
   },

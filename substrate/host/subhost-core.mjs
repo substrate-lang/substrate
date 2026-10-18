@@ -332,6 +332,17 @@ export function createHost(platform) {
         }
         return 0;
       },
+      // A directory and those it is in. Where files are only names, as in a page, there is none.
+      make_dir(pp, pl) {
+        const path = string(pp, pl);
+        try {
+          if (platform.makeDir) platform.makeDir(path);
+        } catch (e) {
+          lastError = `${path}: ${e.message}`;
+          return -1;
+        }
+        return 0;
+      },
       exit(code) {
         platform.exit(code);
       },
