@@ -50,9 +50,9 @@ const checks = {
     };
     const fieldText = () => page.evaluate('document.querySelector("textarea").value');
 
-    const substrate = '(require-unqualified substrate "lib/substrate/substrate.sub") => ';
+    const scheme = '(require-unqualified scheme "lib/scheme/scheme.sub") => ';
     await idle();
-    check('repl: the page starts a Substrate session', await shown(), substrate);
+    check('repl: the page starts a Scheme session', await shown(), scheme);
     check('repl: the text box has the focus', await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
 
     await say('(define (sq x) (* x x))');
@@ -64,8 +64,8 @@ const checks = {
     await say('(nope)');
     await say('(define (sq x) (* x x x))');
     await say('(sq 3)');
-    check('repl: definitions, values and errors in Substrate', await shown(), [
-      substrate,
+    check('repl: definitions, values and errors in Scheme', await shown(), [
+      scheme,
       '(define (sq x) (* x x)) => ',
       '(sq 7) => 49',
       '! (car 5) => error: car: expected a pair, got 5',
@@ -124,7 +124,7 @@ const checks = {
     await say('(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))');
     await say('(+ (fib 20) 0.5)');
     await say('(sq 2)');
-    check('repl: a session in the C-like Lisp', await shown(), [
+    check('repl: a session in base', await shown(), [
       '(require-unqualified base "compiler/base/base.sub") => ',
       '(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) => ',
       '(+ (fib 20) 0.5) => 6765.5',

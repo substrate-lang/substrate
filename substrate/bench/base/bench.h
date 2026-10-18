@@ -1,4 +1,4 @@
-/* The C benchmarks' allocator, the C-like Lisp's K&R malloc, and their entry point. */
+/* The C benchmarks' allocator, base's K&R malloc, and their entry point. */
 #include <stddef.h>
 #include <stdint.h>
 

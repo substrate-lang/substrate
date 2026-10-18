@@ -29,7 +29,7 @@ mkdir -p "$builds/compiled"
    -m "$root/$builds/compiled/geometry.subc" -c "$cache" > /dev/null) ||
   { echo "FAIL building tests/fixtures/geometry.sub as a compiled file"; fail=$((fail + 1)); }
 
-tests=(tests/*.sub tests/base/*.sub tests/substrate/*.sub tests/bend/*.sub tests/ui/*.sub)
+tests=(tests/*.sub tests/base/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
@@ -72,10 +72,10 @@ for t in tests/session/*.sub; do
   fi
 done
 # order-a and order-b require the same two modules in either order: the same bytes.
-for f in "$builds"/substrate/order-a/order-[mn].*.wasm; do
-  if ! cmp -s "$f" "$builds/substrate/order-b/$(basename "$f")"; then
+for f in "$builds"/scheme/order-a/order-[mn].*.wasm; do
+  if ! cmp -s "$f" "$builds/scheme/order-b/$(basename "$f")"; then
     fail=$((fail + 1))
-    echo "FAIL tests/substrate/order-b: $(basename "$f") differs from order-a's"
+    echo "FAIL tests/scheme/order-b: $(basename "$f") differs from order-a's"
   fi
 done
 again=0

@@ -1,0 +1,1269 @@
+;; The core of Scheme: its basic forms and its primitives, in kernel code.
+
+(require rt "runtime.sub")
+(require v "values.sub" quote quasiquote)
+
+(provide [define scheme-define] [lambda scheme-lambda] [case-lambda scheme-case-lambda]
+         [set! scheme-set!] [#%app app] [#%datum datum] [#%module-begin scheme-module-begin]
+         [if scheme-if] [let scheme-let] [let* scheme-let*] letrec
+         [struct scheme-struct] quote quasiquote scheme-body scheme-wrapper
+         eq? eqv? equal? not boolean? procedure?
+         live-nodes
+         cons car cdr caar cadr cdar cddr caddr cdddr cadddr pair? null? list? list length unshared-pair?
+         reverse append apply unsafe-car unsafe-cdr
+         number? integer? fixnum? + - * quotient remainder modulo < > <= >= = zero? positive?
+         negative? even? odd? abs min max bitwise-and bitwise-ior bitwise-xor bitwise-not
+         arithmetic-shift number->string string->number fixnum fixnum-value
+         char? char->integer integer->char char=? char<? char>? char<=? char>=?
+         char-alphabetic? char-numeric? char-whitespace? char-upcase char-downcase
+         char-utf-8-length
+         string? string=? string<? string>? string<=? string>=? string-append string->list
+         list->string string string->bytes/utf-8 bytes->string/utf-8
+         string-utf-8-length string-utf-8-byte string-ref/utf-8 substring/utf-8
+         symbol? symbol->string string->symbol symbol<? keyword? keyword->string string->keyword
+         box box? unbox set-box!
+         vector? vector make-vector vector-length vector-ref vector-set! vector->list
+         list->vector vector-fill! vector-copy
+         bytes? bytes make-bytes bytes-length bytes-ref bytes-set! subbytes bytes-copy
+         bytes-copy! bytes-append bytes->list list->bytes
+         make-hash make-hasheq make-hasheqv hash? hash-count hash-ref hash-has-key? hash-set!
+         hash-update! hash-remove! hash-clear! hash-keys hash-values hash->list hash-for-each
+         write display newline write-byte write-bytes open-output-bytes get-output-bytes
+         call-with-output-bytes file-position printf eprintf format error interaction-value
+         raise call-with-handlers dynamic-wind exn? exn-message
+         file->bytes file->string file-exists? display-to-file current-command-line-arguments instantiate exit)
+
+(memory from rt)
+(table from rt)
+
+;; ---- forms -----------------------------------------------------------------------------
+
+(begin-for-syntax
+  (require k kernel)
+  (require lower "lower.sub" convert-body convert-lambda infer-module! in-pass?)
+
+  (func (named? [x i32] [name i32]) -> i32
+    (if (k:identifier? x) (i32.eq (k:syntax-e x) name) 0))
+
+  (func (nth [l i32] [i i32]) -> i32
+    (if (i32.eqz i) (k:car l) (nth (k:cdr l) (i32.sub i 1))))
+
+  (func (take [l i32] [n i32]) -> i32
+    (if (i32.eqz n) '() (k:cons (k:car l) (take (k:cdr l) (i32.sub n 1)))))
+
+  (func (drop-n [l i32] [n i32]) -> i32
+    (if (i32.eqz n) l (drop-n (k:cdr l) (i32.sub n 1))))
+
+  (func (number [n i32]) -> i32 (k:datum->syntax #'here (k:fixnum n) '#f))
+
+  ;; ---- fresh names ----
+
+  (func (digits [n i32]) -> i32
+    (let ([d (nth '("0" "1" "2" "3" "4" "5" "6" "7" "8" "9") (i32.rem_u n 10))])
+      (if (i32.lt_u n 10) d (k:string-append (digits (i32.div_u n 10)) d))))
+
+  (func (numbered [prefix i32] [n i32]) -> i32
+    (k:datum->syntax #'here (k:string->symbol (k:string-append (k:symbol->string prefix) (digits n))) '#f))
+
+  (global counter (mut i32) 0)
+  (func (fresh-name [prefix i32]) -> i32
+    (set! counter (i32.add counter 1))
+    (numbered prefix counter))
+
+  ;; ---- modules ----
+
+  ;; The require's path is relative to this file, where it is written.
+  (func (scheme-module-begin [stx i32]) -> i32
+    #`(begin #,(k:datum->syntax #'here '(begin (require %rt "runtime.sub") (memory from %rt) (table from %rt)) #'here)
+             #,@(k:cdr (k:syntax->list stx))))
+
+  ;; ---- bodies ----
+
+  (func (scheme-body [stx i32]) -> i32
+    (let* ([parts (k:syntax->list stx)] [name (k:cadr parts)] [params (k:syntax->list (k:caddr parts))])
+      (convert-body #'here params (borrowed-of name params (k:syntax->list (k:cadddr parts))) (k:cdr (k:cdddr parts)))))
+
+  (func (scheme-expr [stx i32]) -> i32
+    (ensure-inferred!)
+    (convert-body #'here '() '() (k:cdr (k:syntax->list stx))))
+
+  ;; ---- the module's functions ----
+  ;; Inferred together at the first conversion after they are defined, before any body is
+  ;; converted: a call needs the flags of the function it calls.
+  (global functions (mut i32) 0)
+  (global inferred (mut i32) 0)
+  (func (record-function! [name i32] [params i32] [body i32] [bs i32]) -> i32
+    (set! functions (k:cons (k:cons name (k:cons params (k:cons body (k:cons (k:fixnum defined-free) (k:cons bs '())))))
+                            (if functions functions '())))
+    0)
+
+  (func (ensure-inferred!) -> i32
+    (if (i32.eqz inferred) (set! inferred '()))
+    (if functions
+        (let ([waiting functions])
+          (set! functions 0)
+          (let ([flags (infer-module! #'here waiting)])
+            (set! inferred (k:append flags inferred))
+            (lift-facts! flags))))
+    inferred)
+
+  (func (lift-facts! [l i32]) -> i32
+    (if (k:pair? l)
+        (let ([name (k:car (k:car l))] [flags (flags-syntax (k:cdr (k:car l)))])
+          (k:syntax-local-lift-definition #`(#%fact #,name '(scheme-function #,@flags)))
+          (lift-facts! (k:cdr l)))
+        0))
+
+  (func (flags-syntax [flags i32]) -> i32
+    (if (k:pair? flags)
+        (k:cons (if (i32.eq (k:fixnum-value (k:car flags)) 1) #'1 #'0) (flags-syntax (k:cdr flags)))
+        '()))
+
+  (func (flags-for [name i32] [l i32]) -> i32
+    (if (k:pair? l)
+        (if (i32.eq (k:syntax-e (k:car (k:car l))) (k:syntax-e name)) (k:cdr (k:car l)) (flags-for name (k:cdr l)))
+        '()))
+
+  (func (borrowed-of [name i32] [params i32] [bs i32]) -> i32
+    (add-flagged params (flags-for name (ensure-inferred!)) bs))
+
+  (func (add-flagged [params i32] [flags i32] [bs i32]) -> i32
+    (if (k:pair? params)
+        (add-flagged (k:cdr params) (if (k:pair? flags) (k:cdr flags) '())
+                     (if (if (k:pair? flags) (i32.eq (k:fixnum-value (k:car flags)) 1) 0)
+                         (if (borrowed? (k:car params) bs) bs (k:cons (k:car params) bs))
+                         bs))
+        bs))
+
+  (func (recorded-function? [f i32]) -> i32
+    (recorded-in? f (if functions functions '())))
+  (func (recorded-in? [f i32] [l i32]) -> i32
+    (if (k:pair? l)
+        (if (k:free-identifier=? f (k:car (k:car l))) 1 (recorded-in? f (k:cdr l)))
+        0))
+
+  ;; ---- define, lambda, calls, literals ----
+
+  (func (parse-params [ps i32]) -> i32
+    (if (k:identifier? ps) (return (k:cons '() ps)))
+    (let ([l (k:splice-list ps)] [required '()])
+      (block done
+        (loop next
+          (br-if done (i32.eqz (k:pair? l)))
+          (if (i32.eqz (k:identifier? (k:car l))) (k:raise-syntax-error '#f '"expected a parameter name" (k:car l)))
+          (set! required (k:cons (k:car l) required))
+          (set! l (k:cdr l))
+          (br next)))
+      (if (k:null? l) (return (k:cons (k:reverse required) '#f)))
+      (if (i32.eqz (k:identifier? l)) (k:raise-syntax-error '#f '"expected a parameter name after the dot" ps))
+      (k:cons (k:reverse required) l)))
+
+  (func (param-inits [ps i32] [i i32]) -> i32
+    (if (k:null? ps) (return '()))
+    (k:cons #`[#,(k:car ps) i32 #,(if (i32.lt_u i 4)
+                                      (nth (k:syntax->list #'(a0 a1 a2 a3)) i)
+                                      #`(rt:extra-arg #,(number (i32.sub i 4))))]
+            (param-inits (k:cdr ps) (i32.add i 1))))
+
+  (func (slots-from [n i32]) -> i32
+    (let ([l '()] [i 4])
+      (block done
+        (loop next
+          (br-if done (i32.eqz i))
+          (set! i (i32.sub i 1))
+          (set! l (k:cons (if (i32.lt_s i n) #'0 (nth (k:syntax->list #'(a0 a1 a2 a3)) i)) l))
+          (br next)))
+      l))
+
+  (func (dispatch [cs i32] [name i32] [single i32]) -> i32
+    (if (k:null? cs) (return #`(rt:no-clause-error '#,name nargs)))
+    (let* ([c (k:car cs)]
+           [p (parse-params (k:car c))]
+           [rest (k:cdr p)]
+           [n (k:length (k:car p))]
+           [inits (k:append (param-inits (k:car p) 0)
+                            (if (i32.eqz rest)
+                                '()
+                                (k:cons #`[#,rest i32 (rt:rest-arguments #,(number n) nargs #,@(slots-from n))] '())))])
+      #`(if #,(if (i32.eqz rest) #`(i32.eq nargs #,(number n)) #`(i32.ge_u nargs #,(number n)))
+            (let (#,@inits) #,@(k:cdr c))
+            #,(if single
+                  #`(rt:arity-error '#,name #,(number n) #,(number (i32.eqz (i32.eqz rest))) nargs)
+                  (dispatch (k:cdr cs) name 0)))))
+
+  ;; A lambda: a let of its parameters, marked for lower.sub to convert. The mark is a
+  ;; quote-syntax, since quote here is values.sub's, which makes data.
+  (func (kernel-lambda [cs i32] [name i32] [single i32] [where i32]) -> i32
+    (k:syntax-rewrap
+     where
+     (k:syntax-e #`(#%app (quote-syntax #%scheme-lambda)
+                          (let ([nargs i32 0] [a0 i32 0] [a1 i32 0] [a2 i32 0] [a3 i32 0])
+                            #,(dispatch cs (if (i32.eqz name) #'#f name) single))))))
+
+  (func (case-lambda-clauses [clauses i32]) -> i32
+    (if (k:null? clauses)
+        '()
+        (let ([c (k:syntax->list (k:car clauses))])
+          (if (i32.or (i32.eqz c) (k:null? c))
+              (k:raise-syntax-error 'case-lambda '"expected a clause: [params body ...]" (k:car clauses)))
+          (k:cons c (case-lambda-clauses (k:cdr clauses))))))
+
+  (func (kernel-lambda-of [e i32] [name i32]) -> i32
+    (let ([parts (k:syntax->list e)])
+      (if (i32.eqz parts) (return '#f))
+      (if (k:null? parts) (return '#f))
+      (if (i32.eqz (k:identifier? (k:car parts))) (return '#f))
+      (if (k:free-identifier=? (k:car parts) #'scheme-lambda)
+          (return (kernel-lambda (k:cons (k:cdr parts) '()) name 1 e)))
+      (if (k:free-identifier=? (k:car parts) #'scheme-case-lambda)
+          (return (kernel-lambda (case-lambda-clauses (k:cdr parts)) name 0 e)))
+      '#f))
+
+  (func (placed-lambda [m i32]) -> i32
+    (if (in-pass?) m (convert-lambda #'here m)))
+
+  ;; #:borrow (x ...): read without being owned, for a primitive that neither keeps nor
+  ;; gives back its arguments.
+  (func (scheme-define [stx i32]) -> i32
+    (set! defined-free 0)
+    (let* ([parts (k:syntax->list stx)]
+           [opts (define-options (k:cddr parts) 0 '#f)]
+           [inline (k:car opts)]
+           [borrowed (k:cadr opts)]
+           [body (k:caddr opts)])
+      (if (k:identifier? (k:cadr parts))
+          (let* ([name (k:cadr parts)] [e (k:car body)] [fixed (fixed-lambda e)] [clauses (case-lambda-of e)]
+                 [k (if (i32.eqz clauses) '#f (first-fixed clauses))])
+            (if (i32.eqz (i32.eqz fixed))
+                (return (known-function name (k:car fixed) (k:cdr fixed) '#f inline borrowed)))
+            (if (i32.eqz (i32.eqz k)) (return (known-case-lambda name clauses k inline borrowed e)))
+            (if inline (k:raise-syntax-error 'define '"only a function with fixed parameters can be #:inline" stx))
+            (if borrowed (k:raise-syntax-error 'define '"only a function with fixed parameters can borrow them" stx))
+            (let ([f (kernel-lambda-of e name)])
+              (return (if (i32.eqz f)
+                          #`(global #,name (mut i32) (scheme-expr #,e))
+                          #`(global #,name (mut i32) (scheme-expr #,f))))))
+      (let* ([head (k:splice-list (k:cadr parts))] [name (k:car head)] [p (parse-params (k:cdr head))])
+        (if (i32.eqz (k:cdr p)) (return (known-function name (k:car p) body '#f inline borrowed)))
+        (if inline (k:raise-syntax-error 'define '"only a function with fixed parameters can be #:inline" stx))
+        (if borrowed (k:raise-syntax-error 'define '"only a function with fixed parameters can borrow them" stx))
+        #`(global #,name (mut i32) (scheme-expr #,(kernel-lambda (k:cons (k:cons (k:cdr head) body) '()) name 1 stx)))))))
+
+  ;; #:free: the function's value needs no counting: a fixnum, a boolean or ().
+  (global defined-free (mut i32) 0)
+  (func (define-options [forms i32] [inline i32] [borrowed i32]) -> i32
+    (if (k:pair? forms)
+        (let ([o (k:syntax-e (k:car forms))])
+          (if (i32.eq o '#:inline) (return (define-options (k:cdr forms) 1 borrowed)))
+          (if (i32.eq o '#:free) (begin (set! defined-free 1) (return (define-options (k:cdr forms) inline borrowed))))
+          (if (i32.eq o '#:borrow)
+              (begin
+                (if (i32.eqz (k:pair? (k:cdr forms)))
+                    (k:raise-syntax-error 'define '"expected the borrowed parameters, (x ...), after #:borrow" (k:car forms)))
+                (if (i32.eqz (k:syntax->list (k:cadr forms)))
+                    (k:raise-syntax-error 'define '"expected the borrowed parameters, (x ...), after #:borrow" (k:cadr forms)))
+                (return (define-options (k:cddr forms) inline (k:cadr forms)))))))
+    (k:cons inline (k:cons borrowed (k:cons forms '()))))
+
+  (func (case-lambda-of [e i32]) -> i32
+    (let ([parts (k:syntax->list e)])
+      (if (i32.eqz parts) (return '#f))
+      (if (k:null? parts) (return '#f))
+      (if (i32.eqz (k:identifier? (k:car parts))) (return '#f))
+      (if (i32.eqz (k:free-identifier=? (k:car parts) #'scheme-case-lambda)) (return '#f))
+      (case-lambda-clauses (k:cdr parts))))
+
+  (func (first-fixed [cs i32]) -> i32
+    (let ([fewest-rest -1] [p '#f] [n 0])
+      (block done
+        (loop next
+          (br-if done (k:null? cs))
+          (set! p (parse-params (k:car (k:car cs))))
+          (set! n (k:length (k:car p)))
+          (if (i32.eqz (k:cdr p))
+              (if (i32.or (i32.lt_s fewest-rest 0) (i32.gt_s fewest-rest n)) (return (k:car cs)))
+              (if (i32.or (i32.lt_s fewest-rest 0) (i32.lt_s n fewest-rest)) (set! fewest-rest n)))
+          (set! cs (k:cdr cs))
+          (br next)))
+      '#f))
+
+  (func (known-case-lambda [name i32] [cs i32] [k i32] [inline i32] [borrowed i32] [where i32]) -> i32
+    (let* ([params (k:car (parse-params (k:car k)))]
+           [calling (replace-clause cs k (k:cons (k:car k) (k:cons #`(#,name #,@params) '())))])
+      (known-function name params (k:cdr k) (kernel-lambda calling name 0 where) inline borrowed)))
+
+  (func (replace-clause [cs i32] [k i32] [new i32]) -> i32
+    (if (k:null? cs) (return '()))
+    (k:cons (if (i32.eq (k:car cs) k) new (k:car cs)) (replace-clause (k:cdr cs) k new)))
+
+  (func (fixed-lambda [e i32]) -> i32
+    (let ([parts (k:syntax->list e)] [p '#f])
+      (if (i32.eqz parts) (return '#f))
+      (if (k:null? parts) (return '#f))
+      (if (i32.eqz (k:identifier? (k:car parts))) (return '#f))
+      (if (i32.eqz (k:free-identifier=? (k:car parts) #'scheme-lambda)) (return '#f))
+      (if (k:null? (k:cdr parts)) (return '#f))
+      (set! p (parse-params (k:cadr parts)))
+      (if (i32.eqz (k:cdr p)) (k:cons (k:car p) (k:cddr parts)) '#f)))
+
+  (func (known-function [name i32] [params i32] [body i32] [closure i32] [inline i32] [borrowed i32]) -> i32
+    (let ([n (k:length params)] [value (hidden-name name '".value")] [code (hidden-name name '".code")]
+          [bs (if borrowed (k:syntax->list borrowed) '())])
+      (check-borrowed bs params)
+      (record-function! name params body bs)
+      #`(begin
+          (func (#,name #,@(i32-params params)) #,@(if inline (k:syntax->list #'(#:inline)) '())
+            #:value #,value -> i32 (scheme-body #,name (#,@params) (#,@bs) #,@body))
+          #,@(if defined-free (k:cons #`(#%fact #,name '(result free)) '()) '())
+          #,@(if (i32.eqz closure)
+                 (k:cons #`(func (#,code [self i32] [nargs i32] [a0 i32] [a1 i32] [a2 i32] [a3 i32]) -> i32
+                             (if (i32.eq nargs #,(number n))
+                                 (scheme-wrapper #,name (#,@params) (#,@bs) #,@(arguments-from 0 n))
+                                 (rt:arity-error '#,name #,(number n) 0 nargs)))
+                         '())
+                 '())
+          (global #,value (mut i32) #,(if (i32.eqz closure)
+                                   #`(rt:make-closure (func-index #,code) 0)
+                                   #`(scheme-expr #,closure))))))
+
+  (func (check-borrowed [bs i32] [params i32]) -> i32
+    (if (k:null? bs) (return 0))
+    (if (i32.eqz (borrowed? (k:car bs) params))
+        (k:raise-syntax-error 'define '"#:borrow names a parameter the function does not have" (k:car bs)))
+    (check-borrowed (k:cdr bs) params))
+
+  (func (borrowed? [x i32] [l i32]) -> i32
+    (if (k:null? l) (return 0))
+    (if (i32.eq (k:syntax-e x) (k:syntax-e (k:car l))) (return 1))
+    (borrowed? x (k:cdr l)))
+
+  ;; The arguments come through the use, so that they are the code's.
+  (func (scheme-wrapper [stx i32]) -> i32
+    (let* ([parts (k:syntax->list stx)] [name (k:cadr parts)] [params (k:syntax->list (k:caddr parts))]
+           [bs (borrowed-of name params (k:syntax->list (k:cadddr parts)))] [args (k:cdr (k:cdddr parts))]
+           [call #`(#,name #,@args)])
+      (if (k:null? bs)
+          call
+          #`(let ([r i32 #,call]) #,@(borrowed-drops params bs args) r))))
+
+  (func (borrowed-drops [params i32] [bs i32] [args i32]) -> i32
+    (if (k:null? params) (return '()))
+    (let ([rest (borrowed-drops (k:cdr params) bs (k:cdr args))])
+      (if (borrowed? (k:car params) bs)
+          (k:cons #`(drop-value #,(k:car args)) rest)
+          rest)))
+
+  ;; An identifier of this macro's, so no other code can refer to it.
+  (func (hidden-name [id i32] [suffix i32]) -> i32
+    (k:datum->syntax #'here (k:string->symbol (k:string-append (k:symbol->string (k:syntax-e id)) suffix)) id))
+
+  (func (i32-params [ps i32]) -> i32
+    (if (k:null? ps) '() (k:cons #`[#,(k:car ps) i32] (i32-params (k:cdr ps)))))
+
+  (func (arguments-from [i i32] [n i32]) -> i32
+    (if (i32.ge_u i n) (return '()))
+    (k:cons (if (i32.lt_u i 4)
+                (nth (k:syntax->list #'(a0 a1 a2 a3)) i)
+                #`(rt:extra-arg #,(number (i32.sub i 4))))
+            (arguments-from (i32.add i 1) n)))
+
+  (func (scheme-lambda [stx i32]) -> i32
+    (placed-lambda (kernel-lambda-of stx '#f)))
+
+  (func (scheme-case-lambda [stx i32]) -> i32
+    (placed-lambda (kernel-lambda-of stx '#f)))
+
+  (func (scheme-set! [stx i32]) -> i32
+    #`(begin (set! #,@(k:cdr (k:syntax->list stx))) '#f))
+
+  (func (first-four [args i32]) -> i32
+    (let ([n (k:length args)])
+      (if (i32.ge_u n 4) (return (take args 4)))
+      (k:append args (take (k:syntax->list #'(0 0 0 0)) (i32.sub 4 n)))))
+
+  (func (temporaries [n i32]) -> i32
+    (let ([l '()] [i n])
+      (block done
+        (loop next
+          (br-if done (i32.eqz i))
+          (set! i (i32.sub i 1))
+          (set! l (k:cons (numbered 't i) l))
+          (br next)))
+      l))
+
+  (func (temporary-bindings [ts i32] [args i32]) -> i32
+    (if (k:null? ts) '() (k:cons #`[#,(k:car ts) i32 #,(k:car args)] (temporary-bindings (k:cdr ts) (k:cdr args)))))
+
+  (func (extra-stores [ts i32] [i i32]) -> i32
+    (if (k:null? ts) '() (k:cons #`(rt:set-extra-arg! #,(number i) #,(k:car ts)) (extra-stores (k:cdr ts) (i32.add i 1)))))
+
+  (func (app [stx i32]) -> i32
+    (let* ([parts (k:cdr (k:syntax->list stx))]
+           [f (k:car parts)]
+           [args (k:cdr parts)])
+      ;; Outside a body's pass, at a module's level say, an application is converted on
+      ;; its own (scheme-expr), so that it owns its values as a body does.
+      (if (i32.eqz (in-pass?))
+          (if (if (function-name? f) (if (recorded-function? f) 1 (scheme-function? f)) 1)
+              (return #`(scheme-expr #,stx))))
+      (if (function-name? f)
+          (return (if (takes? f (k:length args)) #`(#%app #,f #,@args) (call-value #`(begin #,f) args))))
+      (if (k:identifier? f) (return (call-value f args)))
+      #`(let ([fv i32 #,f]) #,(call-value #'fv args))))
+
+  (func (call-value [head i32] [args i32]) -> i32
+    (let ([n (k:length args)])
+      (if (i32.le_u n 4)
+          (return #`(call-indirect (i32 i32 i32 i32 i32 i32 -> i32) (closure-code* #,head) #,head #,(number n) #,@(first-four args))))
+      (let ([ts (temporaries n)])
+        #`(let (#,@(temporary-bindings ts args))
+            #,@(extra-stores (drop-n ts 4) 0)
+            (call-indirect (i32 i32 i32 i32 i32 i32 -> i32) (closure-code* #,head) #,head #,(number n) #,@(take ts 4))))))
+
+  (func (function-name? [f i32]) -> i32
+    (if (k:identifier? f) (i32.eq (k:identifier-binding-kind f) 'function) 0))
+
+  (func (scheme-function? [f i32]) -> i32
+    (let ([fs (try ([catch k:compile-error (m x l) '()]) (k:syntax-local-facts f))])
+      (block done
+        (loop next
+          (br-if done (i32.eqz (k:pair? fs)))
+          (if (scheme-function-fact? (k:car fs)) (return 1))
+          (set! fs (k:cdr fs))
+          (br next)))
+      0))
+
+  (func (scheme-function-fact? [entry i32]) -> i32
+    (let ([v (k:syntax->datum (k:caddr entry))])
+      (if (k:pair? v) (i32.eq (k:car v) 'scheme-function) 0)))
+
+  (func (takes? [f i32] [n i32]) -> i32
+    (let ([sig (k:identifier-function-signature f)] [k 0])
+      (block done
+        (loop next
+          (br-if done (i32.eq (k:car sig) '->))
+          (set! k (i32.add k 1))
+          (set! sig (k:cdr sig))
+          (br next)))
+      (i32.eq k n)))
+
+  (func (datum [stx i32]) -> i32 #`(quote #,(k:cadr (k:syntax->list stx))))
+
+  (func (list-form [stx i32]) -> i32
+    (let ([parts (k:syntax->list stx)])
+      (if (i32.eqz parts) #'list-function (cons-chain (k:cdr parts)))))
+
+  (func (cons-chain [es i32]) -> i32
+    (if (k:null? es) #''() #`(cons #,(k:car es) #,(cons-chain (k:cdr es)))))
+
+  ;; ---- control ----
+
+  (func (scheme-if [stx i32]) -> i32
+    (let ([parts (k:syntax->list stx)])
+      #`(if #,(k:cadr parts)
+            #,(k:caddr parts)
+            #,(if (i32.eq (k:length parts) 4) (k:car (k:cdddr parts)) #''#f))))
+
+  (func (binding-names [bs i32]) -> i32
+    (if (k:null? bs) '() (k:cons (k:car (k:syntax->list (k:car bs))) (binding-names (k:cdr bs)))))
+
+  (func (binding-inits [bs i32]) -> i32
+    (if (k:null? bs) '() (k:cons (k:cadr (k:syntax->list (k:car bs))) (binding-inits (k:cdr bs)))))
+
+  (func (scheme-let [stx i32]) -> i32
+    (let ([parts (k:syntax->list stx)])
+      (if (k:identifier? (k:cadr parts))
+          (let* ([bs (k:syntax->list (k:caddr parts))]
+                 [f (k:datum->syntax '#f (k:syntax-e #`(scheme-lambda (#,@(binding-names bs)) #,@(k:cdddr parts))) stx)])
+            (return #`(letrec ([#,(k:cadr parts) #,f]) (app #,(k:cadr parts) #,@(binding-inits bs))))))
+      #`(let (#,@(i32-bindings (k:syntax->list (k:cadr parts)))) #,@(k:cddr parts))))
+
+  (func (scheme-let* [stx i32]) -> i32
+    (let ([parts (k:syntax->list stx)])
+      #`(let* (#,@(i32-bindings (k:syntax->list (k:cadr parts)))) #,@(k:cddr parts))))
+
+  (func (i32-bindings [bs i32]) -> i32
+    (if (k:null? bs)
+        '()
+        (let ([b (k:syntax->list (k:car bs))])
+          (k:cons (if (i32.eq (k:length b) 2) #`[#,(k:car b) i32 #,(k:cadr b)] (k:car bs))
+                  (i32-bindings (k:cdr bs))))))
+
+  (func (false-bindings [xs i32]) -> i32
+    (if (k:null? xs) '() (k:cons #`[#,(k:car xs) i32 '#f] (false-bindings (k:cdr xs)))))
+
+  (func (assignments [bs i32]) -> i32
+    (if (k:null? bs)
+        '()
+        (let ([b (k:syntax->list (k:car bs))])
+          (k:cons #`(set! #,(k:car b) #,(k:cadr b)) (assignments (k:cdr bs))))))
+
+  (func (letrec [stx i32]) -> i32
+    (let* ([parts (k:syntax->list stx)] [bs (k:syntax->list (k:cadr parts))])
+      #`(let (#,@(false-bindings (binding-names bs)))
+          #,@(assignments bs)
+          (let () #,@(k:cddr parts)))))
+
+  (func (scheme-struct [stx i32]) -> i32
+    (let* ([parts (k:syntax->list stx)]
+           [name (k:cadr parts)]
+           [specs (k:syntax->list (k:caddr parts))]
+           [all-mutable (struct-options (k:cdddr parts))]
+           [fields (struct-fields specs)]
+           ;; name as this macro sees it, so that only the transformer names the constructor.
+           [make (k:datum->syntax #'here (k:syntax-e name) name)]
+           [pred (named-after name '"" '"?")])
+      (if (i32.eqz (k:identifier? name))
+          (k:raise-syntax-error '#f '"expected (struct name (field ...) option ...)" stx))
+      (if (i32.eqz specs) (k:raise-syntax-error 'struct '"expected a list of fields" (k:caddr parts)))
+      #`(begin
+          (global D (mut i32) (rt:make-struct-type '#,name '(#,@fields)))
+          (scheme-define (#,make #,@fields)
+            (let ([s i32 (struct-inline D #,(number (k:length fields)))])
+              #,@(field-stores fields 0)
+              s))
+          (define-syntax #,name
+            (struct-transformer
+             (quote-syntax (struct-info #,name #,make #,pred (#,@(accessor-names name specs)) (#,@fields)))))
+          (scheme-define (#,pred v) (bool (struct-is? v D)))
+          #,@(accessors name specs all-mutable 0))))
+
+  (func (field-stores [fields i32] [i i32]) -> i32
+    (if (k:null? fields)
+        '()
+        (k:cons #`(rt:struct-init! s #,(number i) #,(k:car fields)) (field-stores (k:cdr fields) (i32.add i 1)))))
+
+  (func (struct-use [info i32] [stx i32]) -> i32
+    (let ([make (k:caddr (k:syntax->list info))])
+      (if (k:identifier? stx)
+          make
+          (k:datum->syntax make (k:cons make (k:cdr (k:syntax->list stx))) stx))))
+  (func (struct-transformer [info i32]) -> i32 (k:make-transformer (func-index struct-use) info))
+
+  (func (struct-options [opts i32]) -> i32
+    (if (k:null? opts) (return 0))
+    (if (i32.eqz (i32.eq (k:syntax-e (k:car opts)) '#:mutable))
+        (k:raise-syntax-error 'struct '"the only option is #:mutable" (k:car opts)))
+    (drop (struct-options (k:cdr opts)))
+    1)
+
+  (func (field-name [spec i32]) -> i32
+    (if (k:identifier? spec) (return spec))
+    (let ([l (k:syntax->list spec)])
+      (if (i32.eqz (if (i32.eqz l) 0
+                       (if (i32.eq (k:length l) 2)
+                           (if (k:identifier? (k:car l)) (i32.eq (k:syntax-e (k:cadr l)) '#:mutable) 0)
+                           0)))
+          (k:raise-syntax-error 'struct '"expected a field: id or [id #:mutable]" spec))
+      (k:car l)))
+
+  (func (struct-fields [specs i32]) -> i32
+    (if (k:null? specs) '() (k:cons (field-name (k:car specs)) (struct-fields (k:cdr specs)))))
+
+  (func (named-after [id i32] [prefix i32] [suffix i32]) -> i32
+    (k:datum->syntax id (k:string->symbol (k:string-append prefix (k:string-append (k:symbol->string (k:syntax-e id)) suffix))) id))
+
+  (func (accessor-name [name i32] [spec i32]) -> i32
+    (named-after (field-name spec) (k:string-append (k:symbol->string (k:syntax-e name)) '"-") '""))
+
+  (func (accessor-names [name i32] [specs i32]) -> i32
+    (if (k:null? specs) '() (k:cons (accessor-name name (k:car specs)) (accessor-names name (k:cdr specs)))))
+
+  (func (accessors [name i32] [specs i32] [all-mutable i32] [i i32]) -> i32
+    (if (k:null? specs) (return '()))
+    (let* ([spec (k:car specs)]
+           [field (field-name spec)]
+           [prefix (k:string-append (k:symbol->string (k:syntax-e name)) '"-")]
+           [get (accessor-name name spec)]
+           [rest (accessors name (k:cdr specs) all-mutable (i32.add i 1))]
+           [getter #`(scheme-define (#,get v) #:borrow (v)
+                       (if (struct-is? v D) (struct-field v #,(number i)) (rt:not-a-struct v D '#,get)))])
+      (if (i32.eqz (i32.or all-mutable (i32.eqz (k:identifier? spec))))
+          (return (k:cons getter rest)))
+      (let ([set (named-after field (k:string-append '"set-" prefix) '"!")])
+        (k:cons getter
+                (k:cons #`(scheme-define (#,set v x) #:borrow (v)
+                            (if (struct-is? v D)
+                                (begin (rt:struct-set! v #,(number i) x) '#f)
+                                (rt:not-a-struct v D '#,set)))
+                        rest)))))
+
+)
+
+(define-syntax scheme-module-begin scheme-module-begin)
+(define-syntax scheme-define scheme-define)
+(define-syntax scheme-lambda scheme-lambda)
+(define-syntax scheme-case-lambda scheme-case-lambda)
+(define-syntax scheme-set! scheme-set!)
+(define-syntax app app)
+(define-syntax datum datum)
+(define-syntax list list-form)
+(define-syntax scheme-if scheme-if)
+(define-syntax scheme-let scheme-let)
+(define-syntax scheme-let* scheme-let*)
+(define-syntax letrec letrec)
+(define-syntax scheme-struct scheme-struct)
+(define-syntax scheme-body scheme-body)
+(define-syntax scheme-expr scheme-expr)
+(define-syntax scheme-wrapper scheme-wrapper)
+
+;; ---- functions -------------------------------------------------------------------------
+;; Kernel code: a literal is a wasm number unless quoted, and a value is an i32.
+
+(func (dup-value [d i32]) #:inline -> i32 (v:dup-inline d))
+(#%fact dup-value '(foreign owned))
+(func (drop-value [d i32]) #:inline (v:drop-inline d))
+
+;; ---- fixnums inline ----
+;; The tagged sum a + b - 1 overflows i32 exactly when the sum leaves the fixnum range;
+;; tagging preserves order, so comparisons compare the words.
+
+;; Defined before the comparisons, whose inline bodies hold it.
+(func (bool [x i32]) #:inline -> i32 (if x (v:true-value) 0))
+(#%fact bool '(foreign free))
+
+(func (both-fixnums? [a i32] [b i32]) #:inline -> i32 (i32.and (i32.and a b) 1))
+
+;; An identity, for the pass, which owns a value it does not know is a fixnum.
+(func (fixnum-word [w i32]) #:inline -> i32 w)
+(#%fact fixnum-word '(foreign owned))
+
+(func (add-values [a i32] [b i32]) #:inline -> i32
+  (if (both-fixnums? a b)
+      (let ([r (i32.add a (i32.sub b 1))])
+        (if (i32.lt_s (i32.and (i32.xor a r) (i32.xor (i32.sub b 1) r)) 0) (rt:add a b) r))
+      (rt:add a b)))
+(#%fact add-values '(foreign owned))
+
+(func (sub-values [a i32] [b i32]) #:inline -> i32
+  (if (both-fixnums? a b)
+      (let ([d (i32.sub a b)])
+        (if (i32.lt_s (i32.and (i32.xor a b) (i32.xor a d)) 0) (rt:sub a b) (i32.add d 1)))
+      (rt:sub a b)))
+(#%fact sub-values '(foreign owned))
+
+(func (mul-values [a i32] [b i32]) #:inline -> i32
+  (if (both-fixnums? a b)
+      (let ([m (i64.mul (i64.extend_i32_s (i32.shr_s a 1)) (i64.extend_i32_s (i32.sub b 1)))])
+        (if (i64.eq (i64.extend_i32_s (i32.wrap_i64 m)) m) (i32.add (i32.wrap_i64 m) 1) (rt:mul a b)))
+      (rt:mul a b)))
+(#%fact mul-values '(foreign owned))
+
+;; Division by zero, and the least fixnum by -1, which is not one, go to the runtime.
+(func (quo-values [a i32] [b i32]) #:inline -> i32
+  (if (i32.and (both-fixnums? a b) (i32.ne b 1))
+      (let ([q (i32.div_s (i32.shr_s a 1) (i32.shr_s b 1))])
+        (if (i32.eq q 1073741824) (rt:quo a b) (i32.or (i32.shl q 1) 1)))
+      (rt:quo a b)))
+(#%fact quo-values '(foreign owned))
+
+(func (rem-values [a i32] [b i32]) #:inline -> i32
+  (if (i32.and (both-fixnums? a b) (i32.ne b 1))
+      (i32.or (i32.shl (i32.rem_s (i32.shr_s a 1) (i32.shr_s b 1)) 1) 1)
+      (rt:rem a b)))
+(#%fact rem-values '(foreign owned))
+
+(func (mod-values [a i32] [b i32]) #:inline -> i32
+  (if (i32.and (both-fixnums? a b) (i32.ne b 1))
+      (let ([r (i32.rem_s (i32.shr_s a 1) (i32.shr_s b 1))])
+        (i32.or (i32.shl (if (i32.and (i32.ne r 0) (i32.lt_s (i32.xor r b) 0)) (i32.add r (i32.shr_s b 1)) r) 1) 1))
+      (rt:floor-remainder a b)))
+(#%fact mod-values '(foreign owned))
+
+(func (lt-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.lt_s a b) (rt:compare 0 a b))))
+(#%fact lt-values '(foreign owned))
+(func (gt-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.gt_s a b) (rt:compare 1 a b))))
+(#%fact gt-values '(foreign owned))
+(func (le-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.le_s a b) (rt:compare 2 a b))))
+(#%fact le-values '(foreign owned))
+(func (ge-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.ge_s a b) (rt:compare 3 a b))))
+(#%fact ge-values '(foreign owned))
+(func (eq-values [a i32] [b i32]) #:inline -> i32
+  (bool (if (both-fixnums? a b) (i32.eq a b) (rt:compare 4 a b))))
+(#%fact eq-values '(foreign owned))
+
+;; A closure is a node of kind 9 (runtime.sub's kind-closure): code, a count, the values.
+(func (closure-code* [c i32]) #:inline -> i32
+  (if (v:node-tagged? c 9) (i32.load c 4) (rt:closure-code c)))
+(#%fact closure-code* '(foreign raw))
+(func (closure-cap [c i32] [i i32]) #:inline -> i32 (i32.load (i32.add c (i32.shl i 2)) 12))
+(#%fact closure-cap '(foreign borrowed))
+(func (closure-inline [code i32] [n i32]) #:inline -> i32
+  (let ([c (v:alloc-inline (i32.add 12 (i32.shl n 2)) 9)])
+    (i32.store c code 4)
+    (i32.store c n 8)
+    c))
+(#%fact closure-inline '(foreign owned))
+(func (closure-set-inline! [c i32] [i i32] [v i32]) #:inline (i32.store (i32.add c (i32.shl i 2)) v 12))
+(#%fact closure-set-inline! '(foreign void 2))
+
+;; A struct is a node of kind 14 (runtime.sub's kind-struct): type, hash, count, fields.
+(func (struct-is? [v i32] [t i32]) #:inline -> i32
+  (if (v:node-tagged? v 14) (i32.eq (i32.load v 4) t) 0))
+(#%fact struct-is? '(foreign raw))
+(func (struct-field [v i32] [i i32]) #:inline -> i32
+  (v:dup-inline (i32.load (i32.add v (i32.shl i 2)) 16)))
+(#%fact struct-field '(foreign owned))
+(func (struct-inline [t i32] [n i32]) #:inline -> i32
+  (let ([s (v:alloc-inline (i32.add 16 (i32.shl n 2)) 14)])
+    (i32.store s t 4)
+    (i32.store s (rt:fresh-hash) 8)
+    (i32.store s n 12)
+    s))
+(#%fact struct-inline '(foreign owned 0))
+(func (fix [n i32]) #:inline -> i32 (v:make-integer (i64.extend_i32_s n)))
+(#%fact fix '(foreign owned))
+
+(func (fixnum [n i32]) -> i32 (fix n))
+(#%fact fixnum '(foreign owned))
+(func (fixnum-value [v i32]) -> i32 (rt:fixnum-value-of v))
+(#%fact fixnum-value '(foreign raw))
+
+(scheme-define (live-nodes) (fix (v:live-nodes)))
+
+;; ---- equivalence and predicates ----
+
+(scheme-define (eq? a b) #:free #:inline #:borrow (a b) (bool (i32.eq a b)))
+(scheme-define (eqv? a b) #:free #:borrow (a b) (bool (rt:eqv? a b)))
+(scheme-define (equal? a b) #:free #:borrow (a b) (bool (rt:equal-values? a b)))
+(scheme-define (not x) #:free #:inline #:borrow (x) (bool (i32.eqz x)))
+(scheme-define (boolean? x) #:free #:inline #:borrow (x) (bool (v:boolean-datum? x)))
+(scheme-define (procedure? x) #:free #:borrow (x) (bool (rt:procedure? x)))
+
+;; ---- pairs and lists ----
+
+(func (list-length [l i32] [who i32]) -> i32
+  (let ([n 0] [t l])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (v:pair-cell? t)))
+        (set! n (i32.add n 1))
+        (set! t (v:pair-cdr t))
+        (br next)))
+    (if (i32.eqz (v:null-cell? t)) (drop (rt:wrong-type who '"a list" l)))
+    n))
+(#%fact list-length '(foreign raw))
+
+(func (reverse-list [l i32] [who i32]) -> i32
+  (let ([acc '()] [t l])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (v:pair-cell? t)))
+        (set! acc (v:cons-inline (dup-value (v:pair-car t)) acc))
+        (set! t (v:pair-cdr t))
+        (br next)))
+    (if (i32.eqz (v:null-cell? t)) (drop (rt:wrong-type who '"a list" l)))
+    acc))
+(#%fact reverse-list '(foreign owned))
+
+(func (append-2 [a i32] [b i32]) -> i32
+  (let ([r (reverse-list a '"append")] [t 0])
+    (set! t r)
+    (block done
+      (loop next
+        (br-if done (i32.eqz (v:pair-cell? t)))
+        (set! b (v:cons-inline (dup-value (v:pair-car t)) b))
+        (set! t (v:pair-cdr t))
+        (br next)))
+    (drop-value r)
+    b))
+(#%fact append-2 '(foreign owned 1))
+
+(scheme-define (cons a d) #:inline (v:cons-inline a d))
+(func (car-read [p i32]) #:inline -> i32 (if (v:pair-cell? p) (v:pair-car p) (rt:wrong-type 'car '"a pair" p)))
+(#%fact car-read '(foreign borrowed))
+(func (cdr-read [p i32]) #:inline -> i32 (if (v:pair-cell? p) (v:pair-cdr p) (rt:wrong-type 'cdr '"a pair" p)))
+(#%fact cdr-read '(foreign borrowed))
+(scheme-define (car p) #:inline #:borrow (p) (if (v:pair-cell? p) (v:pair-car p) (rt:wrong-type 'car '"a pair" p)))
+(scheme-define (cdr p) #:inline #:borrow (p) (if (v:pair-cell? p) (v:pair-cdr p) (rt:wrong-type 'cdr '"a pair" p)))
+(func (car-of [p i32] [who i32]) #:inline -> i32 (if (v:pair-cell? p) (v:pair-car p) (rt:wrong-type who '"a pair" p)))
+(#%fact car-of '(foreign borrowed))
+(func (cdr-of [p i32] [who i32]) #:inline -> i32 (if (v:pair-cell? p) (v:pair-cdr p) (rt:wrong-type who '"a pair" p)))
+(#%fact cdr-of '(foreign borrowed))
+(scheme-define (caar p) #:borrow (p) (car-of (car-of p 'caar) 'caar))
+(scheme-define (cadr p) #:borrow (p) (car-of (cdr-of p 'cadr) 'cadr))
+(scheme-define (cdar p) #:borrow (p) (cdr-of (car-of p 'cdar) 'cdar))
+(scheme-define (cddr p) #:borrow (p) (cdr-of (cdr-of p 'cddr) 'cddr))
+(scheme-define (caddr p) #:borrow (p) (car-of (cdr-of (cdr-of p 'caddr) 'caddr) 'caddr))
+(scheme-define (cdddr p) #:borrow (p) (cdr-of (cdr-of (cdr-of p 'cdddr) 'cdddr) 'cdddr))
+(scheme-define (cadddr p) #:borrow (p) (car-of (cdr-of (cdr-of (cdr-of p 'cadddr) 'cadddr) 'cadddr) 'cadddr))
+(scheme-define (pair? x) #:free #:inline #:borrow (x) (bool (v:pair-cell? x)))
+(scheme-define (unshared-pair? x) #:free #:inline #:borrow (x) (bool (if (v:pair-cell? x) (v:unique-cell? x) 0)))
+(scheme-define (null? x) #:free #:inline #:borrow (x) (bool (v:null-cell? x)))
+(scheme-define (list? x) #:free #:borrow (x) (bool (v:list? x)))
+(scheme-define (list-function . xs) xs)
+(scheme-define (length l) #:free #:borrow (l) (fix (list-length l '"length")))
+(scheme-define (reverse l) #:borrow (l) (reverse-list l '"reverse"))
+(func (unsafe-car [p i32]) #:inline -> i32 (v:pair-car p))
+(#%fact unsafe-car '(foreign borrowed))
+(func (unsafe-cdr [p i32]) #:inline -> i32 (v:pair-cdr p))
+(#%fact unsafe-cdr '(foreign borrowed))
+
+(func (append-all [ls i32]) -> i32
+  (let ([l (reverse-list ls '"append")] [acc 0] [t 0])
+    (set! acc (dup-value (v:pair-car l)))
+    (set! t (v:pair-cdr l))
+    (block done
+      (loop next
+        (br-if done (v:null-cell? t))
+        (set! acc (append-2 (v:pair-car t) acc))
+        (set! t (v:pair-cdr t))
+        (br next)))
+    (drop-value l)
+    acc))
+(#%fact append-all '(foreign owned))
+
+(scheme-define append #:borrow (a)
+  (scheme-case-lambda
+    [(a b) (append-2 a b)]
+    [() '()]
+    [(a . rest) (append-all (v:cons-inline a rest))]))
+
+(scheme-define (apply f first . more) (rt:apply-list f (rt:spread (v:cons-inline first more))))
+
+;; ---- numbers ----
+
+(scheme-define (number? x) #:free #:inline #:borrow (x) (bool (i32.or (v:integer-datum? x) (v:node-tagged? x 7))))
+(scheme-define (integer? x) #:free #:inline #:borrow (x) (bool (v:integer-datum? x)))
+(scheme-define (fixnum? x) #:free #:inline #:borrow (x) (bool (i32.and x 1)))
+
+(func (fold-op [op i32] [a i32] [l i32]) -> i32
+  (block done
+    (loop next
+      (br-if done (i32.eqz (v:pair-cell? l)))
+      (let ([r (arith op a (v:pair-car l))])
+        (drop-value a)
+        (set! a r))
+      (set! l (v:pair-cdr l))
+      (br next)))
+  a)
+(#%fact fold-op '(foreign owned 1))
+
+(func (arith [op i32] [a i32] [b i32]) -> i32
+  (if (i32.eq op 0) (return (rt:add a b)))
+  (if (i32.eq op 1) (return (rt:sub a b)))
+  (if (i32.eq op 2) (return (rt:mul a b)))
+  (rt:bitwise op a b))
+(#%fact arith '(foreign owned))
+
+(func (chain [kind i32] [op i32] [a i32] [l i32]) -> i32
+  (let ([ok 1])
+    (block done
+      (loop next
+        (br-if done (i32.eqz (v:pair-cell? l)))
+        (if (i32.eqz (if (i32.eqz kind)
+                         (rt:compare op a (v:pair-car l))
+                         (if (i32.eq kind 1) (rt:char-compare op a (v:pair-car l)) (rt:string-compare op a (v:pair-car l)))))
+            (set! ok 0))
+        (set! a (v:pair-car l))
+        (set! l (v:pair-cdr l))
+        (br next)))
+    (bool ok)))
+(#%fact chain '(foreign owned))
+
+(scheme-define + #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (add-values a b)]
+    [(a b c) (add-values (add-values a b) c)]
+    [() '0]
+    [(a) (rt:add a '0)]
+    [(a b . more) (fold-op 0 (add-values a b) more)]))
+
+(scheme-define - #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (sub-values a b)]
+    [(a b c) (sub-values (sub-values a b) c)]
+    [(a) (sub-values '0 a)]
+    [(a b . more) (fold-op 1 (sub-values a b) more)]))
+
+(scheme-define * #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (mul-values a b)]
+    [(a b c) (mul-values (mul-values a b) c)]
+    [() '1]
+    [(a) (rt:mul a '1)]
+    [(a b . more) (fold-op 2 (mul-values a b) more)]))
+
+(scheme-define (quotient a b) #:inline #:borrow (a b) (quo-values a b))
+(scheme-define (remainder a b) #:inline #:borrow (a b) (rem-values a b))
+(scheme-define (modulo a b) #:inline #:borrow (a b) (mod-values a b))
+
+(scheme-define < #:free #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (lt-values a b)]
+    [(a . more) (chain 0 0 a more)]))
+(scheme-define > #:free #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (gt-values a b)]
+    [(a . more) (chain 0 1 a more)]))
+(scheme-define <= #:free #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (le-values a b)]
+    [(a . more) (chain 0 2 a more)]))
+(scheme-define >= #:free #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (ge-values a b)]
+    [(a . more) (chain 0 3 a more)]))
+(scheme-define = #:free #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (eq-values a b)]
+    [(a . more) (chain 0 4 a more)]))
+
+(scheme-define (zero? a) #:free #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.eq a 1) (i64.eqz (rt:int-value a 'zero?)))))
+(scheme-define (positive? a) #:free #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.gt_s a 1) (i64.gt_s (rt:int-value a 'positive?) (i64.const 0)))))
+(scheme-define (negative? a) #:free #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.lt_s a 0) (i64.lt_s (rt:int-value a 'negative?) (i64.const 0)))))
+(scheme-define (even? a) #:free #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.eqz (i32.and a 2)) (i64.eqz (i64.and (rt:int-value a 'even?) (i64.const 1))))))
+(scheme-define (odd? a) #:free #:inline #:borrow (a)
+  (bool (if (i32.and a 1) (i32.and a 2) (i64.ne (i64.and (rt:int-value a 'odd?) (i64.const 1)) (i64.const 0)))))
+(scheme-define (abs a) #:borrow (a) (if (i64.lt_s (rt:int-value a '"abs") (i64.const 0)) (rt:sub '0 a) a))
+
+(func (extreme [a i32] [l i32] [op i32]) -> i32
+  (drop (rt:int-value a (if (i32.eq op 0) '"min" '"max")))
+  (block done
+    (loop next
+      (br-if done (i32.eqz (v:pair-cell? l)))
+      (if (rt:compare (if (i32.eq op 0) 1 0) a (v:pair-car l)) (set! a (v:pair-car l)))
+      (set! l (v:pair-cdr l))
+      (br next)))
+  (dup-value a))
+(#%fact extreme '(foreign owned))
+
+(scheme-define (min a . more) (extreme a more 0))
+(scheme-define (max a . more) (extreme a more 1))
+
+(scheme-define bitwise-and #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (if (both-fixnums? a b) (fixnum-word (i32.and a b)) (rt:bitwise 3 a b))]
+    [() '-1]
+    [(a . more) (fold-op 3 (rt:bitwise 3 a '-1) more)]))
+(scheme-define bitwise-ior #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (if (both-fixnums? a b) (fixnum-word (i32.or a b)) (rt:bitwise 4 a b))]
+    [() '0]
+    [(a . more) (fold-op 4 (rt:bitwise 4 a '0) more)]))
+(scheme-define bitwise-xor #:inline #:borrow (a b)
+  (scheme-case-lambda
+    [(a b) (if (both-fixnums? a b) (fixnum-word (i32.or (i32.xor a b) 1)) (rt:bitwise 5 a b))]
+    [() '0]
+    [(a . more) (fold-op 5 (rt:bitwise 5 a '0) more)]))
+(scheme-define (bitwise-not a) #:borrow (a) (v:make-integer (i64.xor (rt:int-value a '"bitwise-not") (i64.const -1))))
+(scheme-define (arithmetic-shift a k) #:borrow (a k) (rt:shift a k))
+
+(scheme-define number->string #:borrow (n)
+  (scheme-case-lambda
+    [(n) (rt:number-string-of n '10)]
+    [(n radix) (rt:number-string-of n radix)]))
+
+(scheme-define string->number #:borrow (s)
+  (scheme-case-lambda
+    [(s) (rt:parse-number (rt:string-arg s '"string->number") (i64.const 10))]
+    [(s radix) (rt:parse-number (rt:string-arg s '"string->number") (rt:radix-value radix '"string->number"))]))
+
+;; ---- characters ----
+
+(scheme-define (char? x) #:free #:inline #:borrow (x) (bool (v:char-datum? x)))
+(scheme-define (char->integer c) #:free #:borrow (c) (fix (rt:char-arg c '"char->integer")))
+(scheme-define (integer->char n) #:borrow (n)
+  (let ([x (rt:int-value n '"integer->char")])
+    (if (i32.or (i64.gt_u x (i64.const 1114111)) (i32.and (i64.ge_u x (i64.const 55296)) (i64.le_u x (i64.const 57343))))
+        (return (rt:wrong-type '"integer->char" '"a Unicode scalar value" n)))
+    (v:integer->char (i32.wrap_i64 x))))
+(scheme-define char=? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:char-compare 4 a b))] [(a . more) (chain 1 4 a more)]))
+(scheme-define char<? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:char-compare 0 a b))] [(a . more) (chain 1 0 a more)]))
+(scheme-define char>? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:char-compare 1 a b))] [(a . more) (chain 1 1 a more)]))
+(scheme-define char<=? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:char-compare 2 a b))] [(a . more) (chain 1 2 a more)]))
+(scheme-define char>=? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:char-compare 3 a b))] [(a . more) (chain 1 3 a more)]))
+
+(func (ascii-letter? [c i32]) -> i32
+  (i32.or (i32.and (i32.ge_u c 65) (i32.le_u c 90)) (i32.and (i32.ge_u c 97) (i32.le_u c 122))))
+(#%fact ascii-letter? '(foreign raw))
+
+(scheme-define (char-alphabetic? c) #:free #:borrow (c) (bool (ascii-letter? (rt:char-arg c '"char-alphabetic?"))))
+(scheme-define (char-numeric? c) #:free #:borrow (c)
+  (let ([x (rt:char-arg c '"char-numeric?")]) (bool (i32.and (i32.ge_u x 48) (i32.le_u x 57)))))
+(scheme-define (char-whitespace? c) #:free #:borrow (c)
+  (let ([x (rt:char-arg c '"char-whitespace?")])
+    (bool (i32.or (i32.eq x 32) (i32.and (i32.ge_u x 9) (i32.le_u x 13))))))
+(scheme-define (char-upcase c) #:borrow (c)
+  (let ([x (rt:char-arg c '"char-upcase")])
+    (if (i32.and (i32.ge_u x 97) (i32.le_u x 122)) (v:integer->char (i32.sub x 32)) c)))
+(scheme-define (char-downcase c) #:borrow (c)
+  (let ([x (rt:char-arg c '"char-downcase")])
+    (if (i32.and (i32.ge_u x 65) (i32.le_u x 90)) (v:integer->char (i32.add x 32)) c)))
+(scheme-define (char-utf-8-length c) #:free #:borrow (c) (fix (rt:utf8-length (rt:char-arg c '"char-utf-8-length"))))
+
+;; ---- strings and symbols ----
+
+(scheme-define (symbol<? a b) #:free #:borrow (a b)
+  (bool (i32.lt_s (rt:string-order (v:symbol->string (rt:symbol-arg a '"symbol<?"))
+                                   (v:symbol->string (rt:symbol-arg b '"symbol<?")))
+                  0)))
+
+(scheme-define (string? x) #:free #:inline #:borrow (x) (bool (v:node-tagged? x 5)))
+(scheme-define (symbol? x) #:free #:inline #:borrow (x) (bool (v:node-tagged? x 3)))
+(scheme-define string=? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:string-compare 4 a b))] [(a . more) (chain 2 4 a more)]))
+(scheme-define string<? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:string-compare 0 a b))] [(a . more) (chain 2 0 a more)]))
+(scheme-define string>? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:string-compare 1 a b))] [(a . more) (chain 2 1 a more)]))
+(scheme-define string<=? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:string-compare 2 a b))] [(a . more) (chain 2 2 a more)]))
+(scheme-define string>=? #:free #:borrow (a b)
+  (scheme-case-lambda [(a b) (bool (rt:string-compare 3 a b))] [(a . more) (chain 2 3 a more)]))
+
+;; A new string, even for one argument or none.
+(scheme-define (string-append . strings) (rt:string-append-list strings '"string-append"))
+
+(scheme-define (symbol->string x) #:borrow (x) (v:symbol->string (rt:symbol-arg x '"symbol->string")))
+(scheme-define (string->symbol x) #:borrow (x) (v:string->symbol (rt:string-arg x '"string->symbol")))
+(scheme-define (keyword? x) #:free #:inline #:borrow (x) (bool (v:node-tagged? x 4)))
+(scheme-define (keyword->string k) #:borrow (k)
+  (if (i32.eqz (v:node-tagged? k 4)) (return (rt:wrong-type '"keyword->string" '"a keyword" k)))
+  (v:keyword->string k))
+(scheme-define (string->keyword x) #:borrow (x) (v:string->keyword (rt:string-arg x '"string->keyword")))
+
+;; err-byte is never used: every string is UTF-8.
+(scheme-define string->bytes/utf-8 #:borrow (s)
+  (scheme-case-lambda
+    [(s) (rt:string->bytes-of s '"string->bytes/utf-8")]
+    [(s err-byte) (rt:string->bytes-of s '"string->bytes/utf-8")]))
+(scheme-define bytes->string/utf-8 #:borrow (v)
+  (scheme-case-lambda
+    [(v) (rt:bytes->string-of v '#f '#f '#f '"bytes->string/utf-8")]
+    [(v err) (rt:bytes->string-of v err '#f '#f '"bytes->string/utf-8")]
+    [(v err start) (rt:bytes->string-of v err start '#f '"bytes->string/utf-8")]
+    [(v err start end) (rt:bytes->string-of v err start end '"bytes->string/utf-8")]))
+(scheme-define (string->list s) #:borrow (s) (rt:string->list-of s '"string->list"))
+(scheme-define (list->string chars) #:borrow (chars) (rt:list->string-of chars '"list->string"))
+(scheme-define (string . chars) (rt:list->string-of chars '"string"))
+
+(scheme-define (string-utf-8-length s) #:free #:inline #:borrow (s)
+  (fix (v:string-length (rt:string-arg s 'string-utf-8-length))))
+(scheme-define (string-utf-8-byte s k) #:free #:inline #:borrow (s k)
+  (rt:string-arg s 'string-utf-8-byte)
+  (fix (v:string-byte s (rt:index-of k (v:string-length s) 'string-utf-8-byte))))
+(scheme-define (string-ref/utf-8 s k) #:borrow (s k) (rt:string-ref-char s k))
+(scheme-define substring/utf-8 #:borrow (s start end)
+  (scheme-case-lambda
+    [(s start end) (rt:substring-of s start end '"substring/utf-8")]
+    [(s start) (rt:substring-of s start '#f '"substring/utf-8")]))
+
+;; ---- boxes ----
+
+(scheme-define (box v) (rt:make-box v))
+(scheme-define (box? x) #:free #:borrow (x) (bool (rt:box? x)))
+(scheme-define (unbox b) #:borrow (b) (if (rt:box? b) (rt:unbox b) (rt:wrong-type '"unbox" '"a box" b)))
+(scheme-define (set-box! b v) #:borrow (b)
+  (if (rt:box? b) (rt:set-box! b v) (drop (rt:wrong-type '"set-box!" '"a box" b)))
+  '#f)
+
+;; ---- vectors ----
+
+(scheme-define (vector? x) #:free #:borrow (x) (bool (rt:vector? x)))
+(scheme-define (vector . xs) (rt:list->vector xs '"vector"))
+(scheme-define make-vector #:borrow (n)
+  (scheme-case-lambda
+    [(n fill) (rt:make-vector (rt:count-of n '"make-vector") fill)]
+    [(n) (rt:make-vector (rt:count-of n '"make-vector") '#f)]))
+(scheme-define (vector-length v) #:free #:borrow (v) (fix (rt:vector-length (rt:vector-arg v '"vector-length"))))
+(scheme-define (vector-ref v k) #:borrow (v k)
+  (rt:vector-arg v '"vector-ref")
+  (rt:vector-ref v (rt:index-of k (rt:vector-length v) '"vector-ref")))
+(scheme-define (vector-set! v k x) #:borrow (v k)
+  (rt:vector-arg v '"vector-set!")
+  (rt:vector-set! v (rt:index-of k (rt:vector-length v) '"vector-set!") x)
+  '#f)
+(scheme-define (vector->list v) #:borrow (v) (rt:vector->list (rt:vector-arg v '"vector->list")))
+(scheme-define (list->vector l) #:borrow (l) (rt:list->vector l '"list->vector"))
+(scheme-define (vector-fill! v x) #:borrow (v) (rt:vector-fill! (rt:vector-arg v '"vector-fill!") x) '#f)
+(scheme-define vector-copy #:borrow (v)
+  (scheme-case-lambda
+    [(v) (rt:vector-copy v '#f '#f '"vector-copy")]
+    [(v start) (rt:vector-copy v start '#f '"vector-copy")]
+    [(v start end) (rt:vector-copy v start end '"vector-copy")]))
+
+;; ---- byte strings ----
+
+(scheme-define (bytes? x) #:free #:borrow (x) (bool (rt:bytes? x)))
+(scheme-define (bytes . bs) (rt:bytes-of-list bs '"bytes"))
+(scheme-define make-bytes #:borrow (n)
+  (scheme-case-lambda
+    [(n) (rt:make-bytes (rt:count-of n '"make-bytes") 0)]
+    [(n fill) (rt:make-bytes (rt:count-of n '"make-bytes") (rt:byte-arg fill '"make-bytes"))]))
+(scheme-define (bytes-length v) #:free #:borrow (v) (fix (rt:bytes-length (rt:bytes-arg v '"bytes-length"))))
+(scheme-define (bytes-ref v k) #:free #:borrow (v k)
+  (rt:bytes-arg v '"bytes-ref")
+  (fix (rt:bytes-ref v (rt:index-of k (rt:bytes-length v) '"bytes-ref"))))
+(scheme-define (bytes-set! v k b) #:borrow (v k b)
+  (rt:bytes-arg v '"bytes-set!")
+  (rt:bytes-set! v (rt:index-of k (rt:bytes-length v) '"bytes-set!") (rt:byte-arg b '"bytes-set!"))
+  '#f)
+(scheme-define (bytes-copy v) #:borrow (v) (rt:subbytes v '#f '#f '"bytes-copy"))
+(scheme-define subbytes #:borrow (v start)
+  (scheme-case-lambda
+    [(v start) (rt:subbytes v start '#f '"subbytes")]
+    [(v start end) (rt:subbytes v start end '"subbytes")]))
+(scheme-define (bytes->list v) #:borrow (v) (rt:bytes->list (rt:bytes-arg v '"bytes->list")))
+(scheme-define (list->bytes l) #:borrow (l) (rt:list->bytes l))
+(scheme-define bytes-copy! #:borrow (to at from)
+  (scheme-case-lambda
+    [(to at from) (rt:bytes-copy! to at from '#f '#f)]
+    [(to at from start) (rt:bytes-copy! to at from start '#f)]
+    [(to at from start end) (rt:bytes-copy! to at from start end)]))
+(scheme-define (bytes-append . vs) (rt:bytes-append-list vs))
+
+;; ---- hash tables ----
+
+(scheme-define make-hasheq
+  (scheme-case-lambda [() (rt:make-hash-table 0)] [(assocs) (rt:make-table-from 0 assocs '"make-hasheq")]))
+(scheme-define make-hasheqv
+  (scheme-case-lambda [() (rt:make-hash-table 1)] [(assocs) (rt:make-table-from 1 assocs '"make-hasheqv")]))
+(scheme-define make-hash
+  (scheme-case-lambda [() (rt:make-hash-table 2)] [(assocs) (rt:make-table-from 2 assocs '"make-hash")]))
+(scheme-define (hash? x) #:free #:borrow (x) (bool (rt:table? x)))
+(scheme-define (hash-count t) #:free #:borrow (t) (fix (rt:hash-count t '"hash-count")))
+
+(scheme-define hash-ref #:borrow (t k failure)
+  (scheme-case-lambda
+    [(t k failure) (rt:hash-ref-value t k failure 1 '"hash-ref")]
+    [(t k) (rt:hash-ref-value t k '#f 0 '"hash-ref")]))
+
+(scheme-define (hash-has-key? t k) #:free #:borrow (t k) (bool (rt:hash-has-key? t k '"hash-has-key?")))
+(scheme-define (hash-set! t k v) #:borrow (t) (rt:hash-set-value! t k v '"hash-set!") '#f)
+
+;; updater may change the table.
+(func (hash-update* [t i32] [k i32] [updater i32] [failure i32] [has-failure i32]) -> i32
+  (rt:hash-update-value! t (dup-value k) updater failure has-failure '"hash-update!")
+  '#f)
+(#%fact hash-update* '(foreign owned))
+(#%fact hash-update* '(raises))
+
+(scheme-define hash-update! #:borrow (t k updater)
+  (scheme-case-lambda
+    [(t k updater) (hash-update* t k updater '#f 0)]
+    [(t k updater failure) (hash-update* t k updater failure 1)]))
+
+(scheme-define (hash-remove! t k) #:borrow (t k) (rt:hash-remove! t k '"hash-remove!") '#f)
+(scheme-define (hash-clear! t) #:borrow (t) (rt:hash-clear! t '"hash-clear!") '#f)
+(scheme-define (hash-keys t) #:borrow (t) (rt:table-walk t 0 '"hash-keys"))
+(scheme-define (hash-values t) #:borrow (t) (rt:table-walk t 1 '"hash-values"))
+(scheme-define (hash->list t) #:borrow (t) (rt:table-walk t 2 '"hash->list"))
+
+(func (hash-for-each* [t i32] [f i32]) -> i32
+  (let ([l (rt:table-walk t 2 '"hash-for-each")] [p 0])
+    (set! p l)
+    (try ([catch rt:exn (v) (drop-value l) (throw rt:exn v)])
+      (block done
+        (loop next
+          (br-if done (i32.eqz (v:pair-cell? p)))
+          (drop-value (rt:call-closure f 2 (dup-value (v:pair-car (v:pair-car p))) (dup-value (v:pair-cdr (v:pair-car p))) 0 0))
+          (set! p (v:pair-cdr p))
+          (br next))))
+    (drop-value l)
+    '#f))
+(#%fact hash-for-each* '(foreign owned))
+(#%fact hash-for-each* '(raises))
+
+(scheme-define (hash-for-each t f) #:borrow (t f) (hash-for-each* t f))
+
+;; ---- exceptions ----
+
+(scheme-define (raise v) (rt:raise-value v))
+(scheme-define (call-with-handlers preds procs thunk) #:borrow (preds procs thunk) (rt:call-with-handlers preds procs thunk))
+(scheme-define (dynamic-wind pre thunk post) #:borrow (pre thunk post) (rt:dynamic-wind pre thunk post))
+(scheme-define (exn? v) #:free #:borrow (v) (bool (rt:exn? v)))
+(scheme-define (exn-message v) #:borrow (v) (rt:exn-message v))
+
+;; ---- output and errors ----
+
+(scheme-define write #:borrow (x)
+  (scheme-case-lambda
+    [(x) (rt:write-to-port x (rt:stdout-port) 0) '#f]
+    [(x p) (rt:write-to-port x (rt:port-arg p '"write") 0) '#f]))
+(scheme-define display #:borrow (x)
+  (scheme-case-lambda
+    [(x) (rt:write-to-port x (rt:stdout-port) 1) '#f]
+    [(x p) (rt:write-to-port x (rt:port-arg p '"display") 1) '#f]))
+(scheme-define newline
+  (scheme-case-lambda
+    [() (rt:write-byte-to (rt:stdout-port) 10) (rt:port-flush (rt:stdout-port)) '#f]
+    [(p) (rt:port-arg p '"newline") (rt:write-byte-to p 10) (rt:port-flush p) '#f]))
+
+(scheme-define (interaction-value v) #:borrow (v)
+  (if (i32.eqz (rt:line-start?)) (rt:write-byte-to (rt:stdout-port) 10))
+  (rt:write-value-to (rt:stdout-port) v 0)
+  (rt:write-byte-to (rt:stdout-port) 10)
+  (rt:port-flush (rt:stdout-port))
+  '#f)
+
+(func (write-byte* [b i32] [p i32]) -> i32
+  (rt:write-byte-to p (rt:byte-arg b '"write-byte"))
+  (rt:port-flush p)
+  '#f)
+(#%fact write-byte* '(foreign owned))
+
+(func (write-bytes* [v i32] [p i32]) -> i32
+  (rt:write-to-port (rt:bytes-arg v '"write-bytes") p 1)
+  '#f)
+(#%fact write-bytes* '(foreign owned))
+
+(scheme-define write-byte #:borrow (b p)
+  (scheme-case-lambda
+    [(b p) (write-byte* b (rt:port-arg p '"write-byte"))]
+    [(b) (write-byte* b (rt:stdout-port))]))
+(scheme-define write-bytes #:borrow (v p)
+  (scheme-case-lambda
+    [(v p) (write-bytes* v (rt:port-arg p '"write-bytes"))]
+    [(v) (write-bytes* v (rt:stdout-port))]))
+
+(scheme-define (open-output-bytes) (rt:new-port -1))
+(scheme-define (get-output-bytes p) #:borrow (p) (rt:port-bytes (rt:port-arg p '"get-output-bytes")))
+(scheme-define (file-position p) #:borrow (p) (fix (rt:port-length (rt:port-arg p '"file-position"))))
+
+(func (call-with-output-bytes* [proc i32]) -> i32
+  (let ([p (rt:new-port -1)])
+    (drop-value (try ([catch rt:exn (v) (drop-value p) (throw rt:exn v)])
+                  (rt:call-closure proc 1 (dup-value p) 0 0 0)))
+    (let ([r (rt:port-bytes p)])
+      (drop-value p)
+      r)))
+(#%fact call-with-output-bytes* '(foreign owned))
+(#%fact call-with-output-bytes* '(raises))
+
+(scheme-define (call-with-output-bytes proc) #:borrow (proc) (call-with-output-bytes* proc))
+
+(scheme-define (format form . args) (rt:format-value form args))
+(scheme-define (printf form . args) (rt:write-format-to (rt:stdout-port) '"printf" form args) '#f)
+(scheme-define (eprintf form . args) (rt:write-format-to (rt:stderr-port) '"eprintf" form args) '#f)
+
+(scheme-define (error first . rest) (rt:error-value first rest))
+
+;; ---- the host: files, the command line, instantiating code ----
+
+(scheme-define (file->bytes path) #:borrow (path) (rt:file->bytes path))
+(scheme-define (file-exists? path) #:free #:borrow (path) (bool (rt:file-exists? path)))
+(scheme-define (file->string path) #:borrow (path) (rt:file->string path))
+(scheme-define (display-to-file v path) #:borrow (v path) (rt:display-to-file v path))
+(scheme-define (current-command-line-arguments) (rt:command-line-arguments))
+(scheme-define instantiate #:borrow (name code imports)
+  (scheme-case-lambda
+    [(name code imports) (rt:instantiate-code name code imports)]
+    [(name code) (rt:instantiate-code name code '())]))
+(scheme-define exit
+  (scheme-case-lambda
+    [() (rt:exit-with '0) '#f]
+    [(v) (rt:exit-with v) '#f]))

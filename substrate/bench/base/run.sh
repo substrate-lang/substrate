@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The C-like Lisp against the same programs in C, native and wasm, with and without inlining.
+# Base against the same programs in C, native and wasm, with and without inlining.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"

@@ -6,17 +6,17 @@ compiler is written in that Lisp, builds itself, and runs in a browser.
 ## Layout
 
 - `compiler/`: the compiler. Its reader, expander and back end implement
-  the kernel language: wasm as s-expressions, with modules, phases and
-  macros that run at compile time. `kernel.sub` holds the data macros
-  work on.
-- `compiler/base/`: the C-like Lisp, written as macros over the kernel.
-  The compiler is written in it.
-- `lib/`: languages written in the C-like Lisp: `substrate/`, a Scheme;
+  the kernel, the language's core: wasm as s-expressions, with modules,
+  phases and macros that run at compile time. `kernel.sub` holds the data
+  macros work on.
+- `compiler/base/`: base, the language's C-like layer, written as macros
+  over the kernel. The compiler is written in it.
+- `lib/`: languages written in base: `scheme/`, a Scheme;
   `bend/`, a dependently typed language; and, experimental, `shade/`, GPU
   programs compiled to WGSL, and `web/`, programs in a web page, a game
   library, examples and a REPL. Beside them is what they share:
-  `syntax-match.sub` and `forms.sub` for writing macros in the C-like
-  Lisp, and `nodes.sub` for run-time nodes.
+  `syntax-match.sub` and `forms.sub` for writing macros in base, and
+  `nodes.sub` for run-time nodes.
 - `host/`: what runs compiled programs: `subhost.c` on wasmtime,
   `subhost.mjs` on Node, and `web/` in a browser (experimental).
 - `seed/`: a checked-in build of the compiler, which builds it from source.
