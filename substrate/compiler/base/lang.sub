@@ -12,7 +12,7 @@
 
 (provide [define c-define] [struct c-struct] [union c-union] [variant c-variant] [match c-match] [exception c-exception] [throw c-throw] [try c-try] [lambda c-lambda] inst typedef const [let c-let] [let* c-let*] [set! c-set!]
          [#%datum c-datum] [#%top-interaction c-interaction] [#%module-begin c-module-begin]
-         when unless cond case while for break continue and or not cast sizeof offsetof array-of @ & ->
+         when unless cond case while for break continue rethrow and or not cast sizeof offsetof array-of @ & ->
          + - * / % == != < <= > >= bit-and bit-or bit-xor bit-not << >>
          += -= *= /= %= <<= >>= bit-and= bit-or= bit-xor= sbrk reset-stack!)
 
@@ -68,6 +68,7 @@
                               [(#%c-while) (k:cons 'while ws)]
                               [(#%c-break) '(break)]
                               [(#%c-continue) '(continue)]
+                              [(#%c-rethrow) '(rethrow)]
                               [(#%c-construct) (k:cons (k:caddr data) ws)]
                               [(#%c-lambda) (k:cons 'lambda ws)]
                               [(#%c-array-of) (k:cons 'array-of (k:cons (k:car data) ws))]
@@ -553,12 +554,14 @@
   (global returns (mut i32) 0)
   (global binders (mut i32) 0)
   (global broken (mut i32) 0)
+  (global caught (mut i32) 0)
+  (global rethrown (mut i32) 0)
 
   (global quoter (mut i32) 0)
 
   (func (start-function! [r i32] [result-to i32])
     (set! result r) (set! loops '()) (set! frame 0) (set! frame-size 0) (set! addressed '()) (set! to result-to)
-    (set! returned 0) (set! returns '()) (set! binders '()) (set! lambdas '()) (set! broken '()))
+    (set! returned 0) (set! returns '()) (set! binders '()) (set! lambdas '()) (set! broken '()) (set! caught '()))
 
   ;; Thrown by frame-slot! in a function with no frame; with-frame then checks it again with one.
   (tag needs-frame ())
@@ -715,6 +718,7 @@
       [('#%app ('quote ('#%c-while)) c body step ...) (check-while c body step env)]
       [('#%app ('quote ('#%c-break))) (jump e 1)]
       [('#%app ('quote ('#%c-continue))) (jump e 0)]
+      [('#%app ('quote ('#%c-rethrow))) (rethrow-code e)]
       [('#%app ('quote ('#%c-deref)) . _) (read-place (check-place e env) e)]
       [('#%app ('quote ('#%c-arrow _)) . _) (read-place (check-place e env) e)]
       [('#%app ('quote _) . _) (c-error e '"bad syntax" '())]
@@ -965,12 +969,13 @@
                ;; The lifted begin is located at the generic's definition, s, so that the
                ;; instance's function is located in the generic's file rather than here.
                (let ([s-result result] [s-loops loops] [s-frame frame] [s-frame-size frame-size] [s-addressed addressed]
-                     [s-to to] [s-returned returned] [s-returns returns] [s-binders binders] [s-lambdas lambdas])
+                     [s-to to] [s-returned returned] [s-returns returns] [s-binders binders] [s-lambdas lambdas]
+                     [s-caught caught])
                  (drop (k:syntax-local-lift-definition
                         (at s (function s name x (for/list ([y a]) (replace y sub)) (replace r sub) (for/list ([b body]) (replace b sub)) f 0))))
                  (set! result s-result) (set! loops s-loops) (set! frame s-frame) (set! frame-size s-frame-size)
                  (set! addressed s-addressed) (set! to s-to) (set! returned s-returned) (set! returns s-returns)
-                 (set! binders s-binders) (set! lambdas s-lambdas))
+                 (set! binders s-binders) (set! lambdas s-lambdas) (set! caught s-caught))
                name)))]))
 
   (func (replace [x i32] [sub i32]) -> i32
@@ -1001,11 +1006,12 @@
                           `(,(k:car b) ,(k:cadr b) alias (,(k:cadr b) memory ,base ,(k:caddr b)))
                           `(,(k:car b) ,(k:cadr b) outside)))]
            [s-result result] [s-loops loops] [s-frame frame] [s-frame-size frame-size] [s-to to] [s-returned returned]
+           [s-caught caught]
            [code (begin
-                   (set! result rt) (set! loops '()) (set! to 0) (set! returned 0)
+                   (set! result rt) (set! loops '()) (set! to 0) (set! returned 0) (set! caught '())
                    (with-frame (func-index lambda-walk) `(,e ,body ,xs ,ps ,outside ,rt)))])
       (set! result s-result) (set! loops s-loops) (set! frame s-frame)
-      (set! frame-size s-frame-size) (set! to s-to) (set! returned s-returned)
+      (set! frame-size s-frame-size) (set! to s-to) (set! returned s-returned) (set! caught s-caught)
       (drop (k:syntax-local-lift-definition
              (at e #`(func (#,name [#,base i32] #,@(for/list ([x xs] [p ps]) #`[#,x #,(syn (kernel-type p))]))
                        #,@(if (i32.eq rt 'void) '() `(,#'-> ,(syn (kernel-type rt))))
@@ -1503,22 +1509,39 @@
   (func (check-try [names i32] [body i32] [clauses i32] [env i32] [hint i32]) -> i32
     (let* ([b (check body env hint)]
            [hs (for/list ([n names] [c clauses])
-                 (if (i32.eq (k:syntax-e n) '_)
-                     (syntax-match c [('begin h ...) `(#f () ,(check-sequence c h env hint) ,c)])
-                     (syntax-match c
-                       [('let ((x _) ...) h ...)
-                        (let ([ts (exception-types n)])
-                          (unless (i32.eq (k:length x) (k:length ts))
-                            (c-error c '"~a carries ~a value~a, not ~a"
-                                     `(,(k:syntax-e n) ,(k:fixnum (k:length ts)) ,(plural (k:length ts)) ,(k:fixnum (k:length x)))))
-                          `(,n ,x ,(check-sequence c h (k:append (for/list ([y x] [u ts]) `(,(k:local-binding y) ,u)) env) hint) ,c))])))]
+                 (let ([c0 caught] [checked 0])
+                   (set! caught (k:cons c caught))
+                   (set! checked
+                         (try ([catch needs-frame () (set! caught c0) (throw needs-frame)])
+                           (if (i32.eq (k:syntax-e n) '_)
+                               (syntax-match c [('begin h ...) `(#f () ,(check-sequence c h env hint) ,c)])
+                               (syntax-match c
+                                 [('let ((x _) ...) h ...)
+                                  (let ([ts (exception-types n)])
+                                    (unless (i32.eq (k:length x) (k:length ts))
+                                      (c-error c '"~a carries ~a value~a, not ~a"
+                                               `(,(k:syntax-e n) ,(k:fixnum (k:length ts)) ,(plural (k:length ts)) ,(k:fixnum (k:length x)))))
+                                    `(,n ,x ,(check-sequence c h (k:append (for/list ([y x] [u ts]) `(,(k:local-binding y) ,u)) env) hint) ,c))]))))
+                   (set! caught c0)
+                   checked))]
            [ty (promoted (settled-for (for/fold ([ty (k:car b)]) ([h hs]) (join ty (k:car (k:caddr h)))) hint))]
            [s (fresh 'sp)])
       (k:cons ty #`(let ([#,s sp])
                      (try (#,@(for/list ([h hs])
-                                (let ([code #`(begin (set! sp #,s) #,(as (k:caddr h) ty (k:cadddr h)))])
-                                  (if (k:car h) #`(catch #,(k:car h) (#,@(k:cadr h)) #,code) #`(catch-all #,code)))))
+                                (let ([ref (k:memq (k:cadddr h) rethrown)]
+                                      [code #`(begin (set! sp #,s) #,(as (k:caddr h) ty (k:cadddr h)))])
+                                  (cond [(and (k:car h) ref) #`(catch-ref #,(k:car h) (#,@(k:cadr h) #,(syn 'exn)) #,code)]
+                                        [(k:car h) #`(catch #,(k:car h) (#,@(k:cadr h)) #,code)]
+                                        [ref #`(catch-all-ref (#,(syn 'exn)) #,code)]
+                                        [else #`(catch-all #,code)]))))
                        #,(as b ty body))))))
+
+  ;; A handler binds the exception it caught only if it rethrows it. One name serves every
+  ;; handler: the innermost handler's binding is the one a rethrow in it sees.
+  (func (rethrow-code [e i32]) -> i32
+    (when (k:null? caught) (c-error e '"not in a try's handler" '()))
+    (set! rethrown (k:cons (k:car caught) rethrown))
+    (k:cons 'none #`(throw-ref #,(syn 'exn))))
 
   (func (check-while [c i32] [body i32] [step i32] [env i32]) -> i32
     (let* ([brk (fresh 'break)] [cont (fresh 'continue)] [top (fresh 'loop)]
@@ -1666,6 +1689,7 @@
 (define-syntax & c-addr)
 (define-syntax break (mark-transformer '(#%c-break)))
 (define-syntax continue (mark-transformer '(#%c-continue)))
+(define-syntax rethrow (mark-transformer '(#%c-rethrow)))
 (define-syntax + (mark-transformer '(#%c-op +)))
 (define-syntax - (mark-transformer '(#%c-op -)))
 (define-syntax * (mark-transformer '(#%c-op *)))
