@@ -21,8 +21,15 @@ function systemError(e) {
 
 const host = createHost({
   args: programArgs,
+  // When the reader has gone, as with `| head`, the program stops quietly, as SIGPIPE stops a
+  // process, with its status of 141.
   write(fd, bytes) {
-    fs.writeSync(fd, bytes);
+    try {
+      fs.writeSync(fd, bytes);
+    } catch (e) {
+      if (e.code === 'EPIPE') process.exit(141);
+      throw e;
+    }
   },
   readFile(path) {
     try {
