@@ -304,9 +304,6 @@ export function createHost(platform) {
         memory().set(b, u(bp));
         return b.length;
       },
-      arg_count() {
-        return platform.args.length;
-      },
       arg(i, bp, cap) {
         if (i < 0 || i >= platform.args.length) return -1;
         const b = utf8.encode(platform.args[i]);
