@@ -79,11 +79,11 @@ export function guests() {
     const list = files.get(`${dir}/program`);
     if (!list) throw new Error(`guest.start: no program found in ${spec.program}`);
     const names = text.decode(list).split('\n').filter((n) => n !== '');
-    const linklets = new Map();
+    const wasm = new Map();
     for (const name of names) {
       const bytes = files.get(`${dir}/${name}.wasm`);
       if (!bytes) throw new Error(`guest.start: the program in ${spec.program} is missing ${name}.wasm`);
-      linklets.set(name, bytes);
+      wasm.set(name, bytes);
     }
 
     // postMessage copies the granted files: the guest cannot change ours.
@@ -115,7 +115,7 @@ export function guests() {
     worker.postMessage({
       type: 'start',
       names,
-      linklets,
+      wasm,
       files: granted,
       args: spec.args,
       cwd: app.cwd,

@@ -86,7 +86,7 @@ self.onmessage = (e) => {
         sendOutput();
         self.postMessage({ type: 'ended', reason: `exit ${code}` });
       },
-    }, m.names, m.linklets);
+    }, m.names, m.wasm);
     reportDone(app.started);
   } else if (m.type === 'message' && app && !app.ended) {
     currentMessage = m.bytes;

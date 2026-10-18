@@ -67,18 +67,18 @@ export async function boot(options) {
   for (const [url, dir] of options.packs || []) unpack(await fetchBytes(url), dir, files);
 
   const names = text.decode(await fetchBytes(`${base}program`)).split('\n').filter((n) => n !== '');
-  const linklets = new Map();
+  const wasm = new Map();
   await Promise.all(names.map(async (name) => {
-    linklets.set(name, await fetchBytes(`${base}${encodeURIComponent(name)}.wasm`));
+    wasm.set(name, await fetchBytes(`${base}${encodeURIComponent(name)}.wasm`));
   }));
   if (options.programAt) {
     files.set(resolvePath(options.programAt, 'program'), utf8.encode(names.map((n) => `${n}\n`).join('')));
-    for (const [name, bytes] of linklets) files.set(resolvePath(options.programAt, `${name}.wasm`), bytes);
+    for (const [name, bytes] of wasm) files.set(resolvePath(options.programAt, `${name}.wasm`), bytes);
   }
-  return run({ ...options, files }, names, linklets);
+  return run({ ...options, files }, names, wasm);
 }
 
-export function run(options, names, linklets) {
+export function run(options, names, wasm) {
   const cwd = options.cwd || '/';
   const files = options.files || new Map();
 
@@ -134,7 +134,7 @@ export function run(options, names, linklets) {
   };
 
   running(() => {
-    app.entry = host.load(names, (name) => linklets.get(name));
+    app.entry = host.load(names, (name) => wasm.get(name));
     if (!app.entry) {
       report(host.lastError);
       throw new Exit(2);

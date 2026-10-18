@@ -6,12 +6,12 @@
  *   build/subhost DIR [arg ...]
  *
  * runs the program that `sub build` wrote to DIR. DIR/program lists the
- * program's linklets, one per line, each after the ones it imports from;
+ * program's wasm modules, one per line, each after the ones it imports from;
  * the last is the program's entry. The host instantiates each from
  * DIR/<name>.wasm under its name, then calls the entry's `main`.
  *
  * Exit status: 0 when main returns, or when there is no main; 1 when
- * DIR/program or a linklet's file cannot be read; 2 when a linklet fails
+ * DIR/program or a wasm module's file cannot be read; 2 when a wasm module fails
  * to instantiate, or main traps or lets an exception escape; and
  * whatever the program passes to host.exit. A trap's message and
  * backtrace go to stderr, unless the entry exports `on-trap`, which then
@@ -321,7 +321,7 @@ static wasm_engine_t *engine(void) {
 }
 
 /* Every module compiled so far, by its bytes. The compiler instantiates a
- * linklet in the namespace of each compilation that needs it (spec 3.2),
+ * wasm module in the namespace of each compilation that needs it (spec 3.2),
  * and it is compiled once. */
 typedef struct compiled {
   uint64_t hash;
@@ -728,7 +728,7 @@ static void define(const char *name, int np, int nr, wasmtime_func_callback_t cb
 static void start_host(void) {
   host.store = wasmtime_store_new(engine(), NULL, NULL);
   host.ctx = wasmtime_store_context(host.store);
-  /* A compile keeps every instance it makes, one per compile-time linklet;
+  /* A compile keeps every instance it makes, one per compile-time wasm module;
      a big module makes more than the store's default limit of 10000. */
   wasmtime_store_limiter(host.store, -1, -1, 1000000, -1, -1);
   host.linker = wasmtime_linker_new(engine());
@@ -802,7 +802,7 @@ int main(int argc, char **argv) {
     last = name;
   }
   if (!last) {
-    fprintf(stderr, "subhost: %s names no linklets\n", path);
+    fprintf(stderr, "subhost: %s names no wasm modules\n", path);
     return 1;
   }
   if (call(last, "main")) {
