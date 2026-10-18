@@ -16,10 +16,10 @@ mkdir -p "$site/host/web"
 cp host/subhost-core.mjs "$site/host/"
 cp host/web/subhost-web.mjs "$site/host/web/"
 cp -r build/sub "$site/program"
-host/web/pack.mjs -o "$site/files.pack" compiler/print.sub compiler/memory.sub compiler/numbers.sub compiler/writer.sub compiler/kernel.sub compiler/kernel-forms.sub compiler/syntax-match.sub compiler/patterns.sub compiler/base lib/syntax-match.sub lib/forms.sub lib/nodes.sub lib/scheme lib/bend tests/session
+host/web/pack.mjs -o "$site/files.pack" compiler/print.sub compiler/memory.sub compiler/numbers.sub compiler/writer.sub compiler/kernel.sub compiler/kernel-forms.sub compiler/syntax-match.sub compiler/patterns.sub compiler/substrate lib/syntax-match.sub lib/forms.sub lib/nodes.sub lib/scheme lib/bend tests/session
 cp tests/web/session.html "$site/index.html"
 status=0
-node tests/web/session.mjs "$site" kernel scheme base switch bend || status=1
+node tests/web/session.mjs "$site" kernel scheme substrate switch bend || status=1
 
 lib/web/site.sh lib/web/examples/counter.sub "$sites/counter"
 lib/web/site.sh lib/web/examples/rows.sub "$sites/rows"

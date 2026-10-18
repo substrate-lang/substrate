@@ -124,8 +124,8 @@ const checks = {
     await say('(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))');
     await say('(+ (fib 20) 0.5)');
     await say('(sq 2)');
-    check('repl: a session in base', await shown(), [
-      '(require-unqualified base "compiler/base/base.sub") => ',
+    check('repl: a session in Substrate', await shown(), [
+      '(require-unqualified substrate "compiler/substrate/substrate.sub") => ',
       '(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) => ',
       '(+ (fib 20) 0.5) => 6765.5',
       '! (sq 2) => input-20:1:2: error: unbound identifier sq',

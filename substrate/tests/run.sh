@@ -23,7 +23,7 @@ same_program() {
 pass=0
 fail=0
 
-tests=(tests/*.sub tests/base/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub)
+tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"

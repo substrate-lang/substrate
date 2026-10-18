@@ -1,0 +1,243 @@
+;; Substrate's runtime: allocator, memory functions, arenas, buffers, hash tables.
+
+(require-unqualified lang "lang.sub")
+(require print "../print.sub" write-bytes)
+
+(provide malloc calloc realloc free memcpy memset memcmp strlen print-string arena make-arena arena-alloc arena-free new
+         buffer make-buffer buffer-add! buffer-add-byte! buffer-add-string! buffer-free!
+         hash-table hash-ref hash-set! hash-clear! hash-free!)
+
+(struct header [next (ptr header)] [size u32])
+
+(define base header)
+(define freep (ptr header) 0)
+
+(define small u32 512)
+(define smalls (array (ptr header) 513))
+
+(define (malloc [n u32]) -> (ptr void)
+  (let ([units (+ (/ (+ n (sizeof header) -1) (sizeof header)) 1)] [prev freep])
+    (when (and (<= units small) (!= (@ smalls units) 0))
+      (let ([b (@ smalls units)])
+        (set! (@ smalls units) (-> b next))
+        (return (+ b 1))))
+    (when (== prev 0)
+      (set! (-> base next) (& base))
+      (set! freep (& base))
+      (set! prev freep))
+    (let ([p (-> prev next)])
+      (while 1
+        (when (>= (-> p size) units)
+          (if (== (-> p size) units)
+              (set! (-> prev next) (-> p next))
+              (begin
+                (-= (-> p size) units)
+                (+= p (-> p size))
+                (set! (-> p size) units)))
+          (set! freep prev)
+          (return (+ p 1)))
+        (when (== p freep)
+          (set! p (more-memory units))
+          (when (== p 0) (return 0)))
+        (set! prev p)
+        (set! p (-> p next))))
+    0))
+
+(define (more-memory [units u32]) -> (ptr header)
+  (let* ([n (if (< units 1024) 1024 units)] [p (cast (ptr header) (sbrk (* n (sizeof header))))])
+    (if (== p 0)
+        0
+        (begin (set! (-> p size) n) (free-block p) freep))))
+
+(define (free [block (ptr void)])
+  (when (!= block 0)
+    (let ([b (- (cast (ptr header) block) 1)])
+      (if (<= (-> b size) small)
+          (begin
+            (set! (-> b next) (@ smalls (-> b size)))
+            (set! (@ smalls (-> b size)) b))
+          (free-block b)))))
+
+(define (free-block [b (ptr header)])
+  (let ([p freep])
+    (while (not (and (> b p) (< b (-> p next))))
+      (when (and (>= p (-> p next)) (or (> b p) (< b (-> p next))))
+        (break))
+      (set! p (-> p next)))
+    (if (== (+ b (-> b size)) (-> p next))
+        (begin
+          (+= (-> b size) (-> p next size))
+          (set! (-> b next) (-> p next next)))
+        (set! (-> b next) (-> p next)))
+    (if (== (+ p (-> p size)) b)
+        (begin
+          (+= (-> p size) (-> b size))
+          (set! (-> p next) (-> b next)))
+        (set! (-> p next) b))
+    (set! freep p)))
+
+(define (calloc [count u32] [size u32]) -> (ptr void)
+  (let ([p (malloc (* count size))])
+    (when (!= p 0) (memset p 0 (* count size)))
+    p))
+
+(define (realloc [block (ptr void)] [n u32]) -> (ptr void)
+  (if (== block 0)
+      (malloc n)
+      (let ([old (* (- (-> (- (cast (ptr header) block) 1) size) 1) (sizeof header))] [p (malloc n)])
+        (when (!= p 0)
+          (memcpy p block (if (< n old) n old))
+          (free block))
+        p)))
+
+(define (memcpy [to (ptr void)] [from (ptr void)] [n u32]) -> (ptr void)
+  (memory.copy to from n)
+  to)
+
+(define (memset [to (ptr void)] [byte i32] [n u32]) -> (ptr void)
+  (memory.fill to byte n)
+  to)
+
+(define (memcmp [a (ptr void)] [b (ptr void)] [n u32]) -> i32
+  (let ([x (cast (ptr u8) a)] [y (cast (ptr u8) b)])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (!= (@ x i) (@ y i)) (return (- (@ x i) (@ y i)))))
+    0))
+
+(define (strlen [s (ptr u8)]) -> u32
+  (let ([p s])
+    (while (!= (@ p) 0) (+= p 1))
+    (- p s)))
+
+(define (print-string [s (ptr u8)])
+  (print:write-bytes (cast i32 s) (strlen s)))
+
+(struct chunk [previous (ptr chunk)] [size u32])
+
+(struct arena [last (ptr chunk)] [next (ptr u8)] [end (ptr u8)])
+
+(define (make-arena) -> arena
+  (let ([a arena])
+    (set! (-> a last) 0)
+    (set! (-> a next) 0)
+    (set! (-> a end) 0)
+    a))
+
+(define (arena-alloc [a (ptr arena)] [n u32]) -> (ptr void)
+  (let ([size (bit-and (+ n 7) -8)])
+    (when (> size (- (-> a end) (-> a next)))
+      (arena-grow a size))
+    (let ([p (-> a next)])
+      (+= (-> a next) size)
+      p)))
+
+(define (arena-grow [a (ptr arena)] [n u32])
+  (let* ([size (if (> n 65536) n 65536)]
+         [c (cast (ptr chunk) (malloc (+ size (sizeof chunk))))])
+    (set! (-> c previous) (-> a last))
+    (set! (-> c size) size)
+    (set! (-> a last) c)
+    (set! (-> a next) (cast (ptr u8) (+ c 1)))
+    (set! (-> a end) (+ (-> a next) size))))
+
+(define (arena-free [a (ptr arena)])
+  (let ([c (-> a last)])
+    (while (!= c 0)
+      (let ([previous (-> c previous)])
+        (free c)
+        (set! c previous))))
+  (set! (-> a last) 0)
+  (set! (-> a next) 0)
+  (set! (-> a end) 0))
+
+(struct buffer [bytes (ptr u8)] [length u32] [room u32])
+
+(define (make-buffer) -> buffer
+  (let ([b buffer])
+    (set! (-> b bytes) 0)
+    (set! (-> b length) 0)
+    (set! (-> b room) 0)
+    b))
+
+(define (buffer-reserve [b (ptr buffer)] [n u32])
+  (let ([need (+ (-> b length) n)])
+    (when (> need (-> b room))
+      (set! (-> b room) (if (> need (* 2 (-> b room))) need (* 2 (-> b room))))
+      (set! (-> b bytes) (cast (ptr u8) (realloc (-> b bytes) (-> b room)))))))
+
+(define (buffer-add! [b (ptr buffer)] [p (ptr u8)] [n u32])
+  (buffer-reserve b n)
+  (memcpy (+ (-> b bytes) (-> b length)) p n)
+  (+= (-> b length) n))
+
+(define (buffer-add-byte! [b (ptr buffer)] [byte i32])
+  (buffer-reserve b 1)
+  (set! (@ (-> b bytes) (-> b length)) byte)
+  (+= (-> b length) 1))
+
+(define (buffer-add-string! [b (ptr buffer)] [s (ptr u8)]) (buffer-add! b s (strlen s)))
+
+(define (buffer-free! [b (ptr buffer)])
+  (free (-> b bytes))
+  (set! (-> b bytes) 0)
+  (set! (-> b length) 0)
+  (set! (-> b room) 0))
+
+;; An all-zero table is empty, as a global starts. No key or value may be 0.
+(struct hash-table [keys (ptr u64)] [values (ptr u32)] [count u32] [capacity u32] [shift u32])
+
+(define (hash-slot [t (ptr hash-table)] [key u64]) -> u32
+  (cast u32 (>> (* key 11400714819323198485) (-> t shift))))
+
+(define (hash-ref [t (ptr hash-table)] [key u64]) -> u32
+  (if (== (-> t capacity) 0)
+      0
+      (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)] [i (hash-slot t key)])
+        (while (!= (@ keys i) 0)
+          (when (== (@ keys i) key) (return (@ (-> t values) i)))
+          (set! i (bit-and (+ i 1) mask)))
+        0)))
+
+(define (hash-set! [t (ptr hash-table)] [key u64] [value u32])
+  (when (>= (* 2 (+ (-> t count) 1)) (-> t capacity)) (hash-grow t))
+  (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)] [i (hash-slot t key)])
+    (while (!= (@ keys i) 0)
+      (when (== (@ keys i) key)
+        (set! (@ (-> t values) i) value)
+        (return))
+      (set! i (bit-and (+ i 1) mask)))
+    (set! (@ keys i) key)
+    (set! (@ (-> t values) i) value)
+    (+= (-> t count) 1)))
+
+(define (hash-grow [t (ptr hash-table)])
+  (let ([keys (-> t keys)] [values (-> t values)] [n (-> t capacity)])
+    (set! (-> t capacity) (if (== n 0) 16 (* 2 n)))
+    (set! (-> t shift) (if (== n 0) 60 (- (-> t shift) 1)))
+    (set! (-> t keys) (cast (ptr u64) (calloc (-> t capacity) 8)))
+    (set! (-> t values) (cast (ptr u32) (malloc (* (-> t capacity) 4))))
+    (set! (-> t count) 0)
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (!= (@ keys i) 0) (hash-set! t (@ keys i) (@ values i))))
+    (free keys)
+    (free values)))
+
+(define (hash-clear! [t (ptr hash-table)])
+  (when (!= (-> t capacity) 0) (memset (-> t keys) 0 (* (-> t capacity) 8)))
+  (set! (-> t count) 0))
+
+(define (hash-free! [t (ptr hash-table)])
+  (free (-> t keys))
+  (free (-> t values))
+  (set! (-> t keys) 0)
+  (set! (-> t values) 0)
+  (set! (-> t count) 0)
+  (set! (-> t capacity) 0)
+  (set! (-> t shift) 0))
+
+(begin-for-syntax
+  (require sm "../syntax-match.sub" syntax-match _ ... ?)
+  (func (new-form [s i32]) -> i32
+    (syntax-match s [(_ a t) #`(cast (ptr #,t) (arena-alloc #,a (sizeof #,t)))])))
+
+(define-syntax new new-form)

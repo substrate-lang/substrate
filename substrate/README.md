@@ -1,21 +1,21 @@
 # substrate
 
-A low-level Lisp for writing WebAssembly, and languages built on it. The
-compiler is written in that Lisp, builds itself, and runs in a browser.
+Substrate is a low-level Lisp for writing WebAssembly: C's types, memory
+and control, as s-expressions. Other languages are built on it. Its
+compiler is written in it, builds itself, and runs in a browser.
 
 ## Layout
 
 - `compiler/`: the compiler. Its reader, expander and back end implement
-  the kernel, the language's core: wasm as s-expressions, with modules,
-  phases and macros that run at compile time. `kernel.sub` holds the data
-  macros work on.
-- `compiler/base/`: base, the language's C-like layer, written as macros
-  over the kernel. The compiler is written in it.
-- `lib/`: languages written in base: `scheme/`, a Scheme;
+  the kernel, which Substrate's macros expand into: wasm as s-expressions,
+  with modules, phases and macros that run at compile time. `kernel.sub`
+  holds the data macros work on.
+- `compiler/substrate/`: Substrate, as macros over the kernel.
+- `lib/`: languages written in Substrate: `scheme/`, a Scheme;
   `bend/`, a dependently typed language; and, experimental, `shade/`, GPU
   programs compiled to WGSL, and `web/`, programs in a web page, a game
   library, examples and a REPL. Beside them is what they share:
-  `syntax-match.sub` and `forms.sub` for writing macros in base, and
+  `syntax-match.sub` and `forms.sub` for writing macros in Substrate, and
   `nodes.sub` for run-time nodes.
 - `host/`: what runs compiled programs: `subhost.c` on wasmtime,
   `subhost.mjs` on Node, and `web/` in a browser (experimental).
