@@ -32,6 +32,7 @@
             pkgs.wasm-tools    # validate / print emitted modules
             pkgs.lld           # wasm-ld: links the C benchmarks' C to wasm (bench/base)
             pkgs.gnumake
+            pkgs.time          # GNU time: bench/bend/compile's time and memory
             pkgs.nodejs        # V8, to compare engines (host/subhost.mjs), and the web tests' driver
             (chromium pkgs)    # the headless browser of the web tests (above)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
