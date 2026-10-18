@@ -10,6 +10,7 @@
 (require-unqualified cmp "compile.sub")
 (require-unqualified running "running.sub")
 (require-unqualified ser "serialize.sub")
+(require-unqualified leb "leb128.sub")
 
 (provide set-repository-root! set-package-root! install-kernel! compile-module-file expand-module-file
          content-hash wasm-module program-wasm-modules trap-report set-cache-directory!
@@ -173,15 +174,46 @@
           (set! imports (cdr imports)))))
     out))
 
+;; The group's module that a phase-0 wasm module stands for while compiling: the one of the same
+;; name; or, when the hashes differ, as when the seed builds changed sources, the one from the same
+;; source path, if the two agree on what compiled code relies on.
 (define (group-instance [name datum]) -> datum
-  (let* ([b (string-bytes name)] [n (string-length name)] [i u32 0] [l kernel-group])
+  (let* ([b (string-bytes name)] [n (string-length name)] [i u32 0] [dot u32 0] [l kernel-group] [m datum 0])
     (while (and (< i n) (!= (@ b i) #\@)) (+= i 1))
     (unless (and (< (+ i 2) n) (== (@ b (+ i 1)) #\0) (== (@ b (+ i 2)) #\+)) (return 0))
     (while (pair? l)
       (let ([g (car l)])
         (when (and (== (string-length g) (+ i 4)) (== (memcmp (string-bytes g) b (+ i 1)) 0)) (return g)))
       (set! l (cdr l)))
-    0))
+    (while (and (< dot i) (!= (@ b dot) #\.)) (+= dot 1))
+    (when (>= dot i) (return 0))
+    (set! m (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol (substring name (+ dot 1) i))))))
+    (if (== m 0) 0 (agreeing-instance name m))))
+
+(define agreements hash-table)
+(define group-paths datum 0)
+
+;; The group's module from m's source path. If the two disagree, it fails: code compiled against m
+;; must not run on a module that differs from it.
+(define (agreeing-instance [name datum] [m datum]) -> datum
+  (let* ([key (cast u64 (string->symbol name))] [g (cast datum (hash-ref (& agreements) key))])
+    (when (!= g 0) (return g))
+    (set! g (group-module-at (-> (unit-of m) path)))
+    (when (== g 0) (return 0))
+    (let ([theirs (recorded-description (running-bytes g))])
+      (for-each (lambda ([d datum])
+                  (let ([t (assq (car d) theirs)])
+                    (when (and (!= t 0) (not (string=? (cdr t) (cdr d))))
+                      (fail-at 0 "code run while compiling would use the running compiler's ~a, whose ~a differs from this one's"
+                               `(,(-> (unit-of m) path) ,(car d))))))
+                (recorded-description (-> (wasm-module-of m 0) bytes))))
+    (hash-set! (& agreements) key (cast u32 g))
+    g))
+
+(define (group-module-at [path datum]) -> datum
+  (when (== group-paths 0)
+    (set! group-paths (keep (map (lambda ([g datum]) -> datum (cons (recorded-path (running-bytes g)) g)) kernel-group))))
+  (let ([e (assoc path group-paths)]) (if (!= e 0) (cdr e) 0)))
 
 ;; Binds the kernel's forms and instructions in every phase, gives macros the expander's answers
 ;; to their questions, and finds the kernel module among the running program's modules.
@@ -211,7 +243,22 @@
     (set! (-> (unit-of m) provides) (keep (sort provides (lambda ([a datum] [b datum]) -> i32 (symbol<? (car a) (car b))))))
     (set! (-> (unit-of m) state) (sym done))
     (set! kernel m)
-    (set-kernel-definitions! (kernel-function (sym literal-buffer)) (kernel-function (sym deserialize)))))
+    (use-literals! 0)))
+
+;; Quoted data is built by a kernel module's literal-buffer and deserialize, in its memory. A
+;; program's code uses the kernel.sub this run compiled from the source of the running kernel, if
+;; there is one, so that the program has one kernel module; other code uses the running one.
+(define (use-literals! [program i32])
+  (let* ([path (if program (recorded-path (running-bytes kernel-instance)) 0)]
+         [m (if (!= path 0) (cast datum (hash-ref (& registry) (cast u64 (string->symbol path)))) 0)])
+    (if (and (!= m 0) (== (-> (unit-of m) state) (sym done)))
+        (set-kernel-definitions! (provided-function m (sym literal-buffer)) (provided-function m (sym deserialize)))
+        (set-kernel-definitions! (kernel-function (sym literal-buffer)) (kernel-function (sym deserialize))))))
+
+(define (provided-function [m datum] [name datum]) -> datum
+  (let ([p (assq name (-> (unit-of m) provides))])
+    (unless (and (!= p 0) (== (car (cdr p)) (sym func))) (fail-at 0 "internal: ~a provides no function ~a" `(,(-> (unit-of m) path) ,name)))
+    (cadr (cdr p))))
 
 (define (kernel-wasm-module [names datum]) -> datum
   (while (pair? names)
@@ -682,7 +729,10 @@
       (let* ([p (cast i32 (integer-value (car phases)))] [e (assoc (car phases) (-> current phase-forms))])
         (set! forms (append (storage-forms p) (if (!= e 0) (reverse (cdr e)) nil)))
         (set-current-source! (string->symbol (-> m path)))
-        (add-wasm-module! (-> m self) p (compile-module forms (wasm-module-name (-> m self) p 0)))
+        (use-literals! (== p 0))
+        (add-wasm-module! (-> m self) p (let ([c (compile-module forms (wasm-module-name (-> m self) p 0))])
+                                          (if (== p 0) (recorded (-> m self) c) c)))
+        (use-literals! 0)
         (set! (-> m memories) (keep-cons (cons (make-integer p) (storage-form (sym memory) p)) (-> m memories)))
         (note-definitions! (-> m self) forms))
       (set! phases (cdr phases)))
@@ -691,6 +741,65 @@
     (set! (-> m state) (sym done))
     (set! (-> m code) 0)
     (store-cached! (-> m self))))
+
+;; ---- what compiled code relies on ----
+;; Code compiled against a module relies on more than the types of what it imports, which wasm
+;; checks when it links: on the module's compile-time definitions that are data, such as its types
+;; and constants, and on the bodies of its inline functions. A module's phase-0 wasm module records
+;; its source path and a hash of each of these, by name, in a custom section.
+
+(define (recorded [m datum] [compiled datum]) -> datum
+  (let ([record (data-bytes `(,(-> (unit-of m) path) ,(description m)))])
+    (cons (with-custom-section (car compiled) "substrate" record) (cdr compiled))))
+
+(define (description [m datum]) -> datum
+  (let ([out nil])
+    (for-each (lambda ([p datum])
+                (let* ([meaning (cdr p)] [base (definition-of meaning)]
+                       [d (if (and (!= base 0) (== (definition-module base) m)) (meaning-description meaning) 0)])
+                  (when (!= d 0) (set! out (cons (cons (car p) (content-hash (list1 (format-message "~s" (list1 d))))) out)))))
+              (-> (unit-of m) provides))
+    (reverse out)))
+
+(define (meaning-description [meaning datum]) -> datum
+  (cond [(== (car meaning) (sym compile-time-value))
+         (let ([v (compile-time-value (cadr meaning))]) (if (transformer? v) 0 (plain v)))]
+        [(== (car meaning) (sym func))
+         (let ([b (cast datum (hash-ref (& inlines) (cast u64 (base-info (cadr meaning)))))]) (if (== b 0) 0 (plain b)))]
+        [else 0]))
+
+;; Syntax as its datum, and a definition as its kind and export name, which do not depend on the
+;; hash of its module.
+(define (plain [x datum]) -> datum
+  (cond [(syntax? x) (plain (syntax->datum x))]
+        [(pair? x) (cons (plain (car x)) (plain (cdr x)))]
+        [(func-info? x) `(func ,(func-info-export x))]
+        [(global-info? x) `(global ,(global-info-export x))]
+        [(!= (record-kind x) 0) (sym record)]
+        [else x]))
+
+;; A custom section, which an engine skips: its id, 0, its size, its name and its contents.
+(define (with-custom-section [bytes datum] [name (ptr u8)] [contents datum]) -> datum
+  (let ([out (make-buffer)] [section (make-buffer)] [s datum 0])
+    (write-uleb (& section) (strlen name))
+    (buffer-add! (& section) name (strlen name))
+    (buffer-add! (& section) (string-bytes contents) (string-length contents))
+    (buffer-add! (& out) (string-bytes bytes) (string-length bytes))
+    (buffer-add-byte! (& out) 0)
+    (write-uleb (& out) (-> section length))
+    (buffer-add! (& out) (-> section bytes) (-> section length))
+    (set! s (bytes->string (-> out bytes) (-> out length)))
+    (buffer-free! (& section))
+    (buffer-free! (& out))
+    s))
+
+;; A wasm module's source path and description, or 0 if it records none.
+(define (record-of [bytes datum]) -> datum
+  (let ([s (wasm-module-custom (string-bytes bytes) (string-length bytes) `"substrate")])
+    (if (== s 0) 0 (data-of s))))
+
+(define (recorded-path [bytes datum]) -> datum (let ([r (record-of bytes)]) (if (== r 0) 0 (car r))))
+(define (recorded-description [bytes datum]) -> datum (let ([r (record-of bytes)]) (if (== r 0) nil (cadr r))))
 
 ;; A wasm module compiled in this run is taken over the running build's of the same name,
 ;; so that when the compiler builds itself, its program is the bytes it compiled.
@@ -747,17 +856,19 @@
     (serialize! s d)
     (serializer-bytes s)))
 
-(define (read-data [path datum]) -> datum
-  (let ([s (file-string path)])
-    (if (or (== s 0) (== (string-length s) 0))
-        0
-        (let ([p (string-bytes s)] [count u64 0] [shift u64 0] [i u32 0] [b u32 128])
-          (while (and (!= (bit-and b 128) 0) (< i (string-length s)))
-            (set! b (@ p i))
-            (+= i 1)
-            (set! count (bit-or count (<< (cast u64 (bit-and b 127)) shift)))
-            (+= shift 7))
-          (if (== count 0) 0 (@ (deserialize p (string-length s)) (cast u32 (- count 1))))))))
+(define (read-data [path datum]) -> datum (data-of (file-string path)))
+
+;; The datum whose data-bytes s is.
+(define (data-of [s datum]) -> datum
+  (if (or (== s 0) (== (string-length s) 0))
+      0
+      (let ([p (string-bytes s)] [count u64 0] [shift u64 0] [i u32 0] [b u32 128])
+        (while (and (!= (bit-and b 128) 0) (< i (string-length s)))
+          (set! b (@ p i))
+          (+= i 1)
+          (set! count (bit-or count (<< (cast u64 (bit-and b 127)) shift)))
+          (+= shift 7))
+        (if (== count 0) 0 (@ (deserialize p (string-length s)) (cast u32 (- count 1)))))))
 
 (define (write-data [path datum] [d datum]) -> i32
   (let ([name (make-buffer)] [bytes (data-bytes d)] [ok i32 0])

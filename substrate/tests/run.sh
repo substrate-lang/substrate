@@ -107,5 +107,33 @@ else
   fail=$((fail + 1))
   echo "FAIL the stale cache entry: got $first, then $second"
 fi
+# Code run while compiling uses the running compiler's own modules, also when the sources differ
+# from those it was built from, as when the seed builds changed ones: a test with Substrate macros
+# builds from such sources and runs as it does here, unless a struct it relies on has changed.
+changed="$builds/changed"
+rm -rf "${changed:?}"
+mkdir -p "$changed/lib" "$changed/tests/substrate"
+cp -r compiler "$changed/"
+cp lib/forms.sub "$changed/lib/"
+cp tests/substrate/forms.sub "$changed/tests/substrate/"
+from_changed() {
+  "$host" "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
+    -p "$root/$changed" -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
+}
+echo ';; changed' >> "$changed/compiler/substrate/lang.sub"
+sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' "$changed/compiler/kernel.sub"
+if [ "$(from_changed)" = "$(cat tests/substrate/forms.out)" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL changed sources: tests/substrate/forms.sub does not build and run as it does here"
+fi
+sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/compiler/kernel.sub"
+if grep -qF "whose srcloc differs" <<< "$(from_changed)"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL changed sources: a changed srcloc is not refused"
+fi
 echo "$pass passed, $fail failed; $again built again from the cache"
 [ $fail -eq 0 ]
