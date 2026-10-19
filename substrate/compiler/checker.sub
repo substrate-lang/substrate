@@ -4,6 +4,7 @@
 (require-unqualified k "kernel.sub")
 (require-unqualified sm "substrate/syntax-match.sub")
 (require-unqualified forms "substrate/forms.sub")
+(require-unqualified ops "ops.sub")
 
 (provide substrate-expansion)
 
@@ -12,7 +13,7 @@
 ;; Checking a module at a phase keeps the names made fresh and the definitions lifted from form
 ;; to form; each module compilation has its own, one for each phase.
 (struct checking [phase i32] [counter i32] [instances (ptr arena-table)] [throwers (ptr arena-table)]
-        [strings (ptr arena-table)] [layouts (ptr arena-table)] [rethrown datum] [next (ptr checking)])
+        [strings (ptr arena-table)] [layouts (ptr arena-table)] [types (ptr arena-table)] [rethrown datum] [next (ptr checking)])
 
 (define state (ptr checking) 0)
 
@@ -41,6 +42,7 @@
       (set! (-> s throwers) (make-table))
       (set! (-> s strings) (make-table))
       (set! (-> s layouts) (make-table))
+      (set! (-> s types) (make-table))
       (set! (-> s rethrown) nil)
       (set! (-> s next) (cast (ptr checking) (@ states)))
       (set! (@ states) (cast (ptr void) s)))
@@ -76,6 +78,9 @@
     [('lambda) (substrate-lambda s)]
     [('inst) (substrate-inst s)]
     [('typedef) (substrate-typedef s)]
+    [('func) (substrate-func s)]
+    [('global) (substrate-global s)]
+    [('substrate-value) (substrate-value s)]
     [('const) (substrate-const s)]
     [('array-of) (substrate-array-of s)]
     [('sizeof) (substrate-sizeof s)]
@@ -130,7 +135,8 @@
     [(x ...) (syntax-rewrap e (for/list ([y x]) (written y)))]
     [_ e]))
 
-(define (syn [d datum]) -> datum (datum->syntax here d 0))
+;; The code a form makes: its core forms are named by core identifiers, its other names are here's.
+(define (syn [d datum]) -> datum (core-syntax here d 0))
 
 (define (at [where datum] [form datum]) -> datum (datum->syntax form (syntax-e form) where))
 
@@ -231,9 +237,22 @@
 
 (define (parameters-of [v datum]) -> datum (if (> (length v) 4) (list-ref v 4) nil))
 
+;; A type's compile-time value is syntax, (substrate-struct name (field ...) kind (parameter ...)) or
+;; (substrate-typedef type), read once in a module compilation.
 (define (type-binding [x datum]) -> datum
-  (let ([v (if (== (identifier-binding-kind x) 'compile-time-value) (syntax-local-value x) 0)])
-    (if (and (pair? v) (memq (car v) '(substrate-struct substrate-typedef))) v 0)))
+  (if (== (identifier-binding-kind x) 'compile-time-value) (type-value (syntax-local-value x)) 0))
+
+(define (type-value [v datum]) -> datum
+  (let ([known (cast datum (table-ref (-> state types) (cast u64 v)))])
+    (if (or (!= known 0) (not (syntax? v)))
+        known
+        (let* ([l (syntax->list v)]
+               [t datum (syntax-match (if (!= l 0) l nil)
+                    [('substrate-struct n fs k (p ...)) `(substrate-struct ,(syntax-e n) ,fs ,(syntax-e k) ,(for/list ([q p]) (syntax-e q)))]
+                    [('substrate-typedef t) `(substrate-typedef ,(syntax->datum t))]
+                    [_ 0])])
+          (when (!= t 0) (table-set! (-> state types) (cast u64 v) (cast u32 t)))
+          t))))
 
 (define (named-type [x datum]) -> datum
   (let ([v (type-binding x)])
@@ -294,7 +313,7 @@
 (define (layout [t datum]) -> datum
   (let ([known (datum-get (-> state layouts) (cdr t))])
     (when (!= known 0) (return known))
-    (let* ([v (syntax-local-value (name-identifier (cadr t)))] [items (syntax->list (caddr v))]
+    (let* ([v (type-value (syntax-local-value (name-identifier (cadr t))))] [items (syntax->list (caddr v))]
            [saved type-arguments] [l datum 0])
       (datum-put! (-> state layouts) (cdr t) 'laying-out)
       (set! type-arguments (for/list ([p (parameters-of v)] [a (if (pair? (cdddr t)) (cadddr t) nil)]) (cons p a)))
@@ -372,7 +391,7 @@
 (define (generic [s datum] [ps datum] [f datum] [xs datum] [ts datum] [r datum] [body datum]) -> datum
   (parse-types-with (type-variables (for/list ([p ps]) (syntax-e p))) (cons r ts))
   (syn `(define-syntax ,f
-          (mark-transformer (quote-syntax (#%substrate-generic (,f (,@ps) (,@(for/list ([x xs] [t ts]) `(,x ,t))) ,r (,@body) ,s)))))))
+          (quote-syntax (#%form mark (#%substrate-generic (,f (,@ps) (,@(for/list ([x xs] [t ts]) `(,x ,t))) ,r (,@body) ,s)))))))
 
 (define (global-definition [s datum] [x datum] [t datum] [init datum]) -> datum
   (let ([ty (kept! (complete! (parse-type t) t) t)])
@@ -383,7 +402,7 @@
 ;; A constant is (cast type literal) wherever its name is used.
 (define (substrate-const [s datum]) -> datum
   (syntax-match s
-    [(_ (? identifier? x) t (? literal? c)) (syn `(define-syntax ,x (const-transformer (quote-syntax (cast ,t ,c)))))]
+    [(_ (? identifier? x) t (? literal? c)) (syn `(define-syntax ,x (quote-syntax (#%form constant (cast ,t ,c)))))]
     [_ (substrate-error s "expected (const name type literal)" nil)]))
 
 (define (literal? [c datum]) -> i32
@@ -411,12 +430,10 @@
     [(_ #:forall ((? identifier? p) ...) (? identifier? name) field ...) (aggregate name field kind p)]
     [(_ (? identifier? name) field ...) (aggregate name field kind nil)]))
 
-;; The type's compile-time value is (substrate-struct name fields kind parameters), made by a
-;; quasiquote the code runs while compiling.
+;; The type's compile-time value is (substrate-struct name (field ...) kind (parameter ...)).
 (define (aggregate [name datum] [fields datum] [kind datum] [ps datum]) -> datum
   (distinct! (for/list ([f fields]) (syntax-match f [((? identifier? g) _) g] [_ (substrate-error f "expected [field type]" nil)])) '"field")
-  (syn `(begin (define-syntax ,name (quasiquote (substrate-struct ,name (,'unquote (quote-syntax (,@fields))) ,kind
-                                                                  ,(for/list ([p ps]) (syntax-e p)))))
+  (syn `(begin (define-syntax ,name (quote-syntax (substrate-struct ,name (,@fields) ,kind (,@ps))))
                ,(second-pass (syn `(substrate-struct-check ,name))))))
 
 (define (distinct! [ids datum] [what datum])
@@ -440,10 +457,9 @@
                    [(? identifier? n) `(,n)]
                    [_ (substrate-error c "expected [case [field type] ...]" nil)]))])
     (distinct! (for/list ([c cases]) (car c)) '"case")
-    (syn `(begin (define-syntax ,name (quasiquote (substrate-struct ,name (,'unquote (quote-syntax (,@(for/list ([c cases]) `(,@c)))))
-                                                                    variant ,(for/list ([p ps]) (syntax-e p)))))
+    (syn `(begin (define-syntax ,name (quote-syntax (substrate-struct ,name (,@(for/list ([c cases]) `(,@c))) variant (,@ps))))
                  ,@(for/list ([c cases] [i (numbers-below (length cases))])
-                     `(define-syntax ,(car c) (mark-transformer (quote-syntax (#%substrate-construct ,name ,i ,(car c))))))
+                     `(define-syntax ,(car c) (quote-syntax (#%form mark (#%substrate-construct ,name ,i ,(car c))))))
                  ,(second-pass (syn `(substrate-struct-check ,name)))))))
 
 (define (substrate-struct-check [s datum]) -> datum
@@ -461,7 +477,44 @@
 
 (define (substrate-typedef [s datum]) -> datum
   (syntax-match s
-    [(_ (? identifier? n) t) (syn `(define-syntax ,n (quasiquote (substrate-typedef ,(parse-type t)))))]))
+    [(_ (? identifier? n) t) (syn `(define-syntax ,n (quote-syntax (substrate-typedef ,(parse-type t)))))]))
+
+;; func and global, the core forms, with Substrate code for the body and the value.
+(define (substrate-func [s datum]) -> datum
+  (syntax-match s
+    [(_ ((? identifier? f) ((? identifier? x) t) ...) rest ...)
+     (let* ([inline (syntax-match rest [('#:inline . _) 1] [_ 0])]
+            [rest (if inline (cdr rest) rest)]
+            [ws (for/list ([u t]) (wasm-type! u))]
+            [rs (syntax-match rest [('-> (r ...) . _) (for/list ([u r]) (wasm-type! u))] [('-> r . _) `(,(wasm-type! r))] [_ nil])])
+       (at s (syn `(func (,f ,@(for/list ([y x] [w ws]) `(,y ,w))) ,@(if inline '(#:inline) nil)
+                         ,@(cond [(null? rs) nil] [(null? (cdr rs)) `(-> ,(car rs))] [else `(-> ,rs)])
+                         (substrate-body ,f (,@x) #f (quote (,(results-type rs) ,@ws)) ,@(if (null? rs) rest (cddr rest)))))))]
+    [_ (substrate-error s "expected (func (f [x type] ...) -> type body ...)" nil)]))
+
+(define (substrate-global [s datum]) -> datum
+  (syntax-match s
+    [(_ (? identifier? x) ('mut t) init) (wasm-global s x `(mut ,(wasm-type! t)) init)]
+    [(_ (? identifier? x) t init) (wasm-global s x (wasm-type! t) init)]
+    [_ (substrate-error s "expected (global x type value) or (global x (mut type) value)" nil)]))
+
+(define (wasm-global [s datum] [x datum] [t datum] [init datum]) -> datum
+  (let ([w (if (pair? t) (cadr t) t)])
+    (syn `(begin ,(at s (syn `(global ,x ,t (substrate-value ,x (quote ,w) ,init))))
+                 (#%fact ,x (quote (substrate-wasm-global ,w)))))))
+
+(define (wasm-type! [t datum]) -> datum
+  (let ([w (syntax-e t)])
+    (unless (memq w '(i32 i64 f32 f64)) (substrate-error t "expected a wasm type: i32, i64, f32 or f64" nil))
+    w))
+
+(define (substrate-value [s datum]) -> datum
+  (syntax-match s
+    [(_ x ('quote t) init)
+     (let ([e (begin (set! quoter x) (start-function! 'void 0) (local-expand init))])
+       (with-frame value-walk `(,e ,(syntax->datum t))))]))
+
+(define (value-walk [a datum]) -> datum (framed nil (cons (cadr a) (expect (car a) (cadr a) nil 0))))
 
 ;; ---- forms ----
 
@@ -479,7 +532,10 @@
                             [((? identifier? x) (? type-syntax? t))
                              `(,(syntax-property-set x 'substrate-type (parse-type t)) (quote (#%substrate-zero)))]
                             [((? identifier? x) init) `(,x ,init)]
-                            [_ (substrate-error c "expected [x type value], [x type] or [x value]" nil)])))
+                            [(((? identifier? x) ...) (t ...) init)
+                             `(,(for/list ([y x] [u t]) (syntax-property-set y 'substrate-type (parse-type u))) ,init)]
+                            [(((? identifier? x) ...) init) `(,x ,init)]
+                            [_ (substrate-error c "expected [x type value], [x type], [x value] or [(x ...) value]" nil)])))
                    ,@body)))]))
 
 (define (substrate-let* [s datum]) -> datum
@@ -610,12 +666,14 @@
 (define broken datum nil)
 (define caught datum nil)
 (define lambdas datum nil)
+(define left datum nil)
 
 (define quoter datum 0)
 
 (define (start-function! [r datum] [result-to datum])
   (set! result r) (set! loops nil) (set! frame 0) (set! frame-size 0) (set! addressed nil) (set! to result-to)
-  (set! returned 0) (set! returns nil) (set! binders nil) (set! lambdas nil) (set! broken nil) (set! caught nil))
+  (set! returned 0) (set! returns nil) (set! binders nil) (set! lambdas nil) (set! broken nil) (set! caught nil)
+  (set! left nil))
 
 ;; Thrown by frame-slot! in a function with no frame; with-frame then checks it again with one.
 (exception needs-frame)
@@ -767,13 +825,76 @@
            (unless (memq (car r) '(void none)) (substrate-error e "this function returns no value" nil))
            (cons 'none (syn `(begin ,(cdr r) ,(void-return e)))))
          (cons 'none (syn `(return ,(leave (if (struct-type? result) (result-value v env) (cons result (expect v result env 0))))))))]
-    [('memory.size) (cons 'i32 e)]
-    [('memory.grow n) (cons 'i32 (syn `(memory.grow ,(expect n 'i32 env 0))))]
-    [('memory.copy d s n)
-     (cons 'void (syn `(memory.copy ,(address-value d env) ,(address-value s env) ,(expect n 'i32 env 0))))]
-    [('memory.fill d v n)
-     (cons 'void (syn `(memory.fill ,(address-value d env) ,(expect v 'i32 env 0) ,(expect n 'i32 env 0))))]
+    [('block (? identifier? l) body ...) (check-block e l body env hint)]
+    [('loop (? identifier? l) body ...) (check-block e l body env hint)]
+    [('br l) (left! l) (cons 'none e)]
+    [('br l v) (left! l) (cons 'none (syn `(br ,l ,(cdr (settle (check v env 0) 0 v)))))]
+    [('br-if l c) (left! l) (cons 'void (syn `(br-if ,l ,(operand c 'i32 env))))]
+    [('br-table (l ...) d i) (for/each ([x (cons d l)]) (left! x)) (cons 'none (syn `(br-table (,@l) ,d ,(operand i 'i32 env))))]
+    [('select a b c) (check-select a b c env)]
+    [('drop v) (cons 'void (as-void (check v env 0)))]
+    [('nop) (cons 'void e)]
+    [('unreachable) (cons 'none e)]
+    [('func-index _) (cons 'i32 e)]
+    [('call-indirect sig i arg ...) (check-indirect e sig i arg env)]
+    [('values arg ...)
+     (let ([rs (for/list ([a arg]) (check a env 0))])
+       (cons `(values ,@(for/list ([r rs]) (wasm-type-of r)))
+             (syn `(values ,@(for/list ([r rs] [a arg]) (operand-of r (wasm-type-of r) a))))))]
+    [('i32.const _) (cons 'i32 e)]
+    [('i64.const _) (cons 'i64 e)]
+    [('f32.const _) (cons 'f32 e)]
+    [('f64.const _) (cons 'f64 e)]
+    [((? identifier? o) . _) (check-prim e o env)]
     [_ (substrate-error e "this is not Substrate code" nil)]))
+
+;; ---- core forms ----
+
+;; A core form in Substrate code means what it means in wasm: an operand is any value whose type
+;; is in wasm the operand's, a constant takes the operand's type, and the result's type is the
+;; instruction's.
+
+(define (check-prim [e datum] [o datum] [env datum]) -> datum
+  (let ([p (lookup-prim (syntax-e o))])
+    (when (== p 0) (substrate-error e "this is not Substrate code" nil))
+    (let* ([ps (-> p params)] [args (cdr (syntax->list e))]
+           [offset (if (> (length args) (length ps)) (last args) 0)])
+      (cons (results-type (-> p results))
+            (syn `(,o ,@(for/list ([a args] [t ps]) (operand a t env)) ,@(if (!= offset 0) `(,offset) nil)))))))
+
+(define (results-type [ts datum]) -> datum
+  (cond [(null? ts) 'void] [(null? (cdr ts)) (car ts)] [else `(values ,@ts)]))
+
+(define (values-type? [t datum]) -> i32 (and (pair? t) (== (car t) 'values)))
+
+(define (operand [e datum] [w datum] [env datum]) -> datum (operand-of (check e env 0) w e))
+
+(define (operand-of [r datum] [w datum] [where datum]) -> datum
+  (let ([t (car r)])
+    (cond [(== t 'none) (cdr r)]
+          [(or (== t 'lit) (and (== t 'flit) (float-type? w))) (convert r w where 0)]
+          [(and (or (arithmetic? t) (address-type? t) (closure-type? t)) (== (kernel-type t) w)) (cdr r)]
+          [else (substrate-error where "expected a ~a, got ~s" `(,w ,(shown t)))])))
+
+(define (wasm-type-of [r datum]) -> datum (kernel-type (settled-type (car r))))
+
+(define (check-select [a datum] [b datum] [c datum] [env datum]) -> datum
+  (let* ([ra (check a env 0)] [rb (check b env 0)] [w (wasm-type-of (if (memq (car ra) '(lit flit)) rb ra))])
+    (cons w (syn `(select ,(operand-of ra w a) ,(operand-of rb w b) ,(operand c 'i32 env))))))
+
+(define (check-indirect [e datum] [sig datum] [i datum] [args datum] [env datum]) -> datum
+  (let* ([l (syntax->datum sig)] [rs (cdr (memq '-> l))] [ps (take l (- (length l) (+ (length rs) 1)))])
+    (unless (== (length ps) (length args))
+      (substrate-error e "the signature takes ~a argument~a, not ~a" `(,(fixnum (length ps)) ,(plural (length ps)) ,(fixnum (length args)))))
+    (cons (results-type rs) (syn `(call-indirect ,sig ,(operand i 'i32 env) ,@(for/list ([a args] [p ps]) (operand a p env)))))))
+
+;; A block that a branch leaves completes even if its body does not.
+(define (check-block [e datum] [l datum] [body datum] [env datum] [hint datum]) -> datum
+  (let* ([r (check-sequence e body env hint)] [block (== (syntax-e (car (syntax->list e))) 'block)])
+    (cons (if (and block (== (car r) 'none) (ormap (lambda ([x datum]) -> i32 (free-identifier=? x l)) left)) 'void (car r))
+          (syn `(,(car (syntax->list e)) ,l ,(cdr r))))))
+
+(define (left! [l datum]) (set! left (cons l left)))
 
 ;; e is (#%app 'mark arg ...): a use of a form of Substrate's that its macro marked for checking.
 (define (check-mark [e datum] [mark datum] [args datum] [env datum] [hint datum]) -> datum
@@ -843,8 +964,9 @@
         [else (substrate-error e "~s is not a Substrate literal" `(,d))]))
 
 (define (check-let [e datum] [bindings datum] [body datum] [env datum] [hint datum]) -> datum
-  (let* ([vs (for/list ([b bindings]) (syntax-match b [(x init) (let-variable x init env)]))]
-         [r (settle (check-sequence e body (append (for/list ([v vs]) (car v)) env) hint) hint e)]
+  (let* ([vs (for/list ([b bindings])
+               (syntax-match b [((? identifier? x) init) (let-variable x init env)] [(xs init) (let-variables xs init env)]))]
+         [r (settle (check-sequence e body (append (append-all (for/list ([v vs]) (car v))) env) hint) hint e)]
          [code (syn `(let (,@(for/list ([v vs] #:when (caddr v)) (caddr v))) ,(cdr r)))]
          [stores (for/list ([v vs] #:when (cadr v)) (cadr v))])
     (cons (car r) (if (null? stores) code (syn `(begin ,@stores ,code))))))
@@ -861,15 +983,27 @@
     (cond [(equal? key returned)
            (unless (equal? t result)
              (substrate-error x "~a is returned, so it is a ~s, not a ~s" `(,(syntax-e x) ,(shown result) ,(shown t))))
-           `((,key ,t result) ,(if zero 0 (let-put r to t init env)) #f)]
+           `(((,key ,t result)) ,(if zero 0 (let-put r to t init env)) #f)]
           [(or (aggregate? t) (member key addressed))
            (let* ([o (frame-slot! (kept! t x))] [p (frame-place t o)])
-             `((,key ,t ,(fixnum o))
+             `(((,key ,t ,(fixnum o)))
                ,(cond [(not (aggregate? t)) (store t (car frame) o (let-value zero r t x init 1))]
                       [zero 0]
                       [else (let-put r (address p x) t init env)])
                #f))]
-          [else `((,key ,t) #f ,(syn `(,x ,(kernel-type t) ,(let-value zero r t x init 0))))])))
+          [else `(((,key ,t)) #f ,(syn `(,x ,(kernel-type t) ,(let-value zero r t x init 0))))])))
+
+;; [(x ...) e], e a call of a function with several results, or (values e ...): each x is a local
+;; variable.
+(define (let-variables [xs datum] [init datum] [env datum]) -> datum
+  (let* ([ids (syntax->list xs)] [r (check init env 0)] [ts (if (values-type? (car r)) (cdr (car r)) nil)])
+    (unless (== (length ts) (length ids))
+      (substrate-error init "expected ~a values, got ~s" `(,(fixnum (length ids)) ,(shown (car r)))))
+    (for/each ([x ids] [t ts])
+      (let ([declared (syntax-property x 'substrate-type)])
+        (when (and declared (not (equal? declared t))) (substrate-error x "~a is a ~s, not a ~s" `(,(syntax-e x) ,t ,(shown declared))))
+        (when (member (local-binding x) addressed) (substrate-error x "~a is one of several values, which have no address" `(,(syntax-e x))))))
+    `(,(for/list ([x ids] [t ts]) `(,(local-binding x) ,t)) #f ,(syn `(,xs ,(cdr r))))))
 
 (define (let-value [zero i32] [r datum] [t datum] [x datum] [init datum] [stored i32]) -> datum
   (if zero (constant (fixnum 0) t x) (convert r t init stored)))
@@ -929,8 +1063,7 @@
       (for/each ([t sig])
         (unless (memq t '(i32 i64 f32 f64 ->))
           (substrate-error f "~a takes or returns ~s, which Substrate has not" `(,(syntax-e f) ,t))))
-      (when (and (pair? rs) (pair? (cdr rs))) (substrate-error f "~a returns more than one value" `(,(syntax-e f))))
-      `(,(take sig (- (- (length sig) (length rs)) 1)) ,(if (null? rs) 'void (car rs))))))
+      `(,(take sig (- (- (length sig) (length rs)) 1)) ,(results-type rs)))))
 
 (define (struct-call? [f datum]) -> i32
   (and (identifier? f) (== (identifier-binding-kind f) 'function)
@@ -1284,8 +1417,10 @@
           [else (global-place x)])))
 
 (define (global-place [x datum]) -> datum
-  (let* ([kind (identifier-binding-kind x)] [g (if (== kind 'variable) (fact x 'substrate-global) 0)])
+  (let* ([kind (identifier-binding-kind x)] [g (if (== kind 'variable) (fact x 'substrate-global) 0)]
+         [w (if (and (== kind 'variable) (== g 0)) (fact x 'substrate-wasm-global) 0)])
     (cond [(!= g 0) `(,(car g) memory ,x 0)]
+          [(!= w 0) `(,(car w) local ,x)]
           [(== kind 'function) (substrate-error x "~a is a function, not a value" `(,(syntax-e x)))]
           [else (substrate-error x "~a is not a Substrate variable" `(,(syntax-e x)))])))
 
@@ -1371,9 +1506,6 @@
                [else (string->symbol (format-message "~a.store" `(,(kernel-type t))))])
              a o `(,v)))
 
-(define (address-value [e datum] [env datum]) -> datum
-  (let ([r (check e env 0)]) (if (pointer? (car r)) (cdr r) (convert r 'i32 e 0))))
-
 ;; ---- values ----
 
 (define (const-code [t datum] [n datum]) -> datum (syn `(,(string->symbol (format-message "~a.const" `(,t))) ,n)))
@@ -1390,6 +1522,7 @@
 (define (as-void [r datum]) -> datum
   (cond [(memq (car r) '(void none)) (cdr r)]
         [(memq (car r) '(lit flit)) (syn '(nop))]
+        [(values-type? (car r)) (substrate-error (cdr r) "these ~a values are not used: bind them with let" `(,(fixnum (length (cdr (car r))))))]
         [else (syn `(drop ,(cdr r)))]))
 
 (define (as [r datum] [ty datum] [where datum]) -> datum (if (== ty 'void) (as-void r) (convert r ty where 0)))
@@ -1430,7 +1563,7 @@
           [(== from 'void) (substrate-error where "this has no value, but ~s is expected" `(,(shown t)))]
           [(== from 'lit) (constant c t where)]
           [(== from 'flit) (if (float-type? t) (const-code t c) (convert (cons 'f64 (const-code 'f64 c)) t where stored))]
-          [(or (struct-type? t) (struct-type? from) (closure-type? t) (closure-type? from))
+          [(or (struct-type? t) (struct-type? from) (closure-type? t) (closure-type? from) (values-type? t) (values-type? from))
            (unless (equal? from t) (substrate-error where "expected ~s, got ~s" `(,(shown t) ,(shown from))))
            c]
           [(address-type? t)
