@@ -4,7 +4,7 @@
 (require-unqualified ops "ops.sub")
 (require-unqualified core "core.sub")
 
-(provide substrate-expansion substrate-code boxed-code set-running-names! checker-recover!)
+(provide substrate-expansion substrate-code boxed-code set-expander! checker-recover!)
 
 ;; ---- uses ----
 
@@ -17,6 +17,18 @@
 
 ;; The code a form makes names what it means as here does: the form's value, where it is bound.
 (define here datum 0)
+
+(define running-name (fn (datum) -> datum) 0)
+(define meaning-of (fn (datum) -> datum) 0)
+(define function-value-of (fn (datum) -> datum) 0)
+(define inline-call-of (fn (datum datum) -> datum) 0)
+
+(define (set-expander! [name (fn (datum) -> datum)] [meaning (fn (datum) -> datum)] [function-value (fn (datum) -> datum)]
+                       [inline-call (fn (datum datum) -> datum)])
+  (set! running-name name)
+  (set! meaning-of meaning)
+  (set! function-value-of function-value)
+  (set! inline-call-of inline-call))
 
 ;; The expansion of s, a use of the form kind, whose transformer has env. states is the module
 ;; compilation's. A macro may catch a failure and go on, so here and state are put back either way.
@@ -197,7 +209,7 @@
 (define (prim-code [name datum] [args datum]) -> datum `(prim ,name #f ,args))
 
 (define (info-of [id datum] [kind datum] [what (ptr u8)]) -> datum
-  (let ([m (identifier-meaning id)])
+  (let ([m (meaning-of id)])
     (unless (and (!= m 0) (== (car m) kind))
       (substrate-error id "~s is not ~a" `(,(syntax->datum id) ,(bytes->string what (strlen what)))))
     (cadr m)))
@@ -902,7 +914,7 @@
            (unless (memq (car r) '(void none)) (substrate-error e "this function returns no value" nil))
            (cons 'none (seq `(,(cdr r) ,(void-return)))))
          (cons 'none `(return ,(leave (if (struct-type? result) (result-value v env) (cons result (result-code (check v env result) result v)))))))]
-    [('set! (? identifier? x) v) (check-set x v env hint)]
+    [('set! (? identifier? x) v) (check-set e x v env hint)]
     [('throw (? identifier? t) arg ...) (check-core-throw e t arg env)]
     [('throw-ref v) (cons 'none `(throw-ref ,(operand v 'exnref env)))]
     [('try (c ...) body ...) (check-core-try e c body env hint)]
@@ -935,7 +947,7 @@
   (let ([v (syntax-e n)]) `(as (,t) ,(if (integer? v) `(int ,v) `(float ,v)))))
 
 (define (function-value-ref [f datum]) -> datum
-  (let ([g (identifier-function-value f)])
+  (let ([g (function-value-of f)])
     (when (== g 0) (substrate-error f "~a is a function: call it, or use (func-index ~a)" `(,(syntax-e f) ,(syntax-e f))))
     `(gref ,g)))
 
@@ -1009,7 +1021,7 @@
 (define (check-mark [e datum] [mark datum] [args datum] [env datum] [hint datum]) -> datum
   (syntax-match (cons mark args)
     [(('#%substrate-op o) arg ...) (check-op e (syntax-e o) arg env)]
-    [(('#%substrate-set!) place v) (check-set place v env hint)]
+    [(('#%substrate-set!) place v) (check-set e place v env hint)]
     [(('#%substrate-deref) . _) (read-place (check-place e env) e)]
     [(('#%substrate-arrow _) . _) (read-place (check-place e env) e)]
     [(('#%substrate-cast t) x) (check-cast t x env)]
@@ -1163,7 +1175,7 @@
                                   ,(cons (prim-code 'i32.wrap_i64 `(,(lref kk))) as))))]))))
 
 (define (call-code [f datum] [as datum]) -> datum
-  (let* ([info (info-of f 'func "a function")] [inlined (inline-call-code info as)])
+  (let* ([info (info-of f 'func "a function")] [inlined (inline-call-of info as)])
     (if (!= inlined 0) inlined `(call ,info ,as))))
 
 ;; A function type's wasm signature: its parameter types, and its result types.
@@ -1546,7 +1558,7 @@
 
 (define (global-place [x datum]) -> datum
   (let* ([kind (identifier-binding-kind x)] [g (if (== kind 'variable) (fact x 'substrate-global) 0)]
-         [m (if (== kind 'variable) (identifier-meaning x) 0)] [w (if (and (!= m 0) (== (car m) 'global)) (cadr m) 0)])
+         [m (if (== kind 'variable) (meaning-of x) 0)] [w (if (and (!= m 0) (== (car m) 'global)) (cadr m) 0)])
     (cond [(and (!= g 0) (!= w 0)) `(,(car g) memory (gref ,w) 0)]
           [(!= w 0) `(,(global-info-type w) local (gref ,w))]
           [(== kind 'function) (substrate-error x "~a is a function, not a value" `(,(syntax-e x)))]
@@ -1595,8 +1607,8 @@
     (substrate-error where "~a is a local variable, not in memory: it has no address" `(,(syntax->datum (written where)))))
   (if (== (fixnum-value (cadddr p)) 0) (caddr p) (prim-code 'i32.add `(,(caddr p) ,(const-code 'i32 (cadddr p))))))
 
-(define (check-set [place datum] [v datum] [env datum] [hint datum]) -> datum
-  (let* ([p (check-place place env)] [t (car p)] [c (if (struct-type? t) (scalar-construction v t) 0)])
+(define (check-set [e datum] [place datum] [v datum] [env datum] [hint datum]) -> datum
+  (let* ([p (settable! (check-place place env) e)] [t (car p)] [c (if (struct-type? t) (scalar-construction v t) 0)])
     ;; A place may be read while a call runs, so a call's struct goes first where the call
     ;; puts it, and is copied; so does a construction with a struct or array field.
     (cond [(!= c 0) (cons 'void (construct-in-place v c t (address p place) env))]
@@ -1605,10 +1617,17 @@
           [else (assign p (check v env t) v hint)])))
 
 (define (check-update [e datum] [o datum] [place datum] [v datum] [env datum] [hint datum]) -> datum
-  (let* ([p (check-place place env)] [a (fresh-key!)]
+  (let* ([p (settable! (check-place place env) e)] [a (fresh-key!)]
          [q (if (== (cadr p) 'local) p `(,(car p) memory ,(lref a) ,(cadddr p)))]
          [r (assign q (binary e o (read-place q place) (check v env 0)) e hint)])
     (cons (car r) (if (== (cadr p) 'local) (cdr r) `(let ((,a i32 ,(caddr p) a)) ,(cdr r))))))
+
+(define (settable! [p datum] [where datum]) -> datum
+  (let ([x (caddr p)])
+    (when (and (== (cadr p) 'local) (pair? x) (== (car x) 'gref) (== (global-info-mutable? (cadr x)) 0))
+      (substrate-error where "~a is immutable: declare it (global ~a (mut type) init) to set it"
+                       `(,(global-info-name (cadr x)) ,(global-info-name (cadr x)))))
+    p))
 
 (define (assign [p datum] [r datum] [where datum] [hint datum]) -> datum
   (let ([t (car p)] [x (caddr p)])
@@ -2001,8 +2020,6 @@
 ;; ---- sessions ----
 
 ;; The running compiler's functions, which a session's code calls: the expander names them.
-(define running-name (fn (datum) -> datum) 0)
-(define (set-running-names! [f (fn (datum) -> datum)]) (set! running-name f))
 
 (define (running-info [name datum]) -> datum (info-of (running-name name) 'func "a function"))
 
