@@ -134,7 +134,7 @@ const checks = {
       await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
 
     // This input overwrites memory from byte 8 to the break; 8 is still printed, since
-    // print.sub formats a number in bytes 32..63 and keeps nothing in memory.
+    // substrate.sub formats a number in the bytes below 96 and keeps nothing in memory.
     await page.type('(memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8)))');
     await page.press('Enter');
     await idle();
