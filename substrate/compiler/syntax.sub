@@ -5,11 +5,11 @@
 (require-unqualified writer "writer.sub")
 
 (provide datum srcloc scope-set
-         run-arena current-arena use-arena begin-module-arena end-module-arena module-arena-mark end-module-arenas-to! alloc-in keep
+         run-arena current-arena use-arena begin-module-arena end-module-arena module-arena-mark end-module-arenas-to! keep
          nil boolean boolean? null? pair? cons car cdr cadr cddr caddr cdddr cadddr set-cdr! list? length reverse append quasiquote quasisyntax
          syntax-match _ ... ? for/each for/list for/fold fmt define-macro
          list-ref list-tail last take memq member assq assoc map for-each filter andmap ormap sort
-         equal? datum-hash datum-get datum-put! arena-table make-table table-ref table-set! table-count
+         equal? datum-hash datum-get datum-put! make-table
          make-record make-record-in record? record-kind record-pointer
          symbol? bytes->symbol symbol-named string->symbol symbol->string symbol-append symbol-bytes symbol-length
          keyword? bytes->keyword keyword->string
@@ -122,24 +122,20 @@
 (define (end-module-arenas-to! [mark (ptr void)])
   (while (and (!= innermost 0) (!= (cast (ptr void) innermost) mark)) (end-module-arena)))
 
-(define (alloc-in [a (ptr arena)] [n u32]) -> (ptr void)
-  (let ([p (-> a next)])
-    (set! n (bit-and (+ n 7) -8))
-    (if (> n (- (-> a end) p))
-        (arena-alloc a n)
-        (begin (set! (-> a next) (+ p n)) p))))
+;; For the seed, whose make-cell-in calls it.
+(define (alloc-in [a (ptr arena)] [n u32]) -> (ptr void) (arena-alloc a n))
 
 ;; ---- cells' bytes ----
 
 (define (cell-bytes [n u32]) -> datum
   (let* ([size (bit-and (+ n 7) -8)] [p (-> current next)])
     (if (> size (- (-> current end) p))
-        (cast datum (alloc-in current n))
+        (cast datum (arena-alloc current n))
         (begin
           (set! (-> current next) (+ p size))
           (cast datum p)))))
 
-(define (held-bytes [n u32]) -> (ptr u8) (cast (ptr u8) (alloc-in current n)))
+(define (held-bytes [n u32]) -> (ptr u8) (cast (ptr u8) (arena-alloc current n)))
 
 ;; ---- lists ----
 
@@ -303,77 +299,34 @@
     [_ (mix h (cast u64 d))]))
 
 ;; ---- tables in an arena ----
-;; Hash tables that never need freeing. No key or value may be 0.
-(struct arena-table [arena (ptr arena)] [keys (ptr u64)] [values (ptr u32)] [count u32] [capacity u32] [shift u32])
-
-(define (make-table) -> (ptr arena-table)
-  (let ([t (cast (ptr arena-table) (alloc-in current (sizeof arena-table)))])
+;; A hash table whose storage is in the current arena, so that it never needs freeing.
+(define (make-table) -> (ptr hash-table)
+  (let ([t (cast (ptr hash-table) (memset (arena-alloc current (sizeof hash-table)) 0 (sizeof hash-table)))])
     (set! (-> t arena) current)
-    (set! (-> t keys) 0)
-    (set! (-> t values) 0)
-    (set! (-> t count) 0)
-    (set! (-> t capacity) 0)
-    (set! (-> t shift) 0)
     t))
-
-(define (table-count [t (ptr arena-table)]) -> u32 (-> t count))
-
-(define (table-ref [t (ptr arena-table)] [key u64]) -> u32
-  (if (== (-> t capacity) 0)
-      0
-      (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)]
-             [i (cast u32 (>> (* key 11400714819323198485) (-> t shift)))])
-        (while (!= (@ keys i) 0)
-          (when (== (@ keys i) key) (return (@ (-> t values) i)))
-          (set! i (bit-and (+ i 1) mask)))
-        0)))
-
-(define (table-set! [t (ptr arena-table)] [key u64] [value u32])
-  (when (>= (* 2 (+ (-> t count) 1)) (-> t capacity)) (table-grow t))
-  (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)]
-         [i (cast u32 (>> (* key 11400714819323198485) (-> t shift)))])
-    (while (!= (@ keys i) 0)
-      (when (== (@ keys i) key)
-        (set! (@ (-> t values) i) value)
-        (return))
-      (set! i (bit-and (+ i 1) mask)))
-    (set! (@ keys i) key)
-    (set! (@ (-> t values) i) value)
-    (+= (-> t count) 1)))
-
-(define (table-grow [t (ptr arena-table)])
-  (let ([keys (-> t keys)] [values (-> t values)] [n (-> t capacity)])
-    (set! (-> t capacity) (if (== n 0) 16 (* 2 n)))
-    (set! (-> t shift) (if (== n 0) 60 (- (-> t shift) 1)))
-    (set! (-> t keys) (cast (ptr u64) (alloc-in (-> t arena) (* (-> t capacity) 8))))
-    (memset (-> t keys) 0 (* (-> t capacity) 8))
-    (set! (-> t values) (cast (ptr u32) (alloc-in (-> t arena) (* (-> t capacity) 4))))
-    (set! (-> t count) 0)
-    (for ([i u32 0]) (< i n) (+= i 1)
-      (when (!= (@ keys i) 0) (table-set! t (@ keys i) (@ values i))))))
 
 ;; A datum table: an arena table from datum-hash to entries, which are in the arena too.
 (struct entry [key datum] [value datum] [next (ptr entry)])
 
-(define (datum-get [t (ptr arena-table)] [key datum]) -> datum
-  (let ([e (cast (ptr entry) (table-ref t (datum-hash key)))])
+(define (datum-get [t (ptr hash-table)] [key datum]) -> datum
+  (let ([e (cast (ptr entry) (hash-ref t (datum-hash key)))])
     (while (!= e 0)
       (when (equal? (-> e key) key) (return (-> e value)))
       (set! e (-> e next)))
     0))
 
-(define (datum-put! [t (ptr arena-table)] [key datum] [value datum])
-  (let* ([h (datum-hash key)] [first (cast (ptr entry) (table-ref t h))] [e first])
+(define (datum-put! [t (ptr hash-table)] [key datum] [value datum])
+  (let* ([h (datum-hash key)] [first (cast (ptr entry) (hash-ref t h))] [e first])
     (while (!= e 0)
       (when (equal? (-> e key) key)
         (set! (-> e value) value)
         (return))
       (set! e (-> e next)))
-    (set! e (cast (ptr entry) (alloc-in (-> t arena) (sizeof entry))))
+    (set! e (cast (ptr entry) (arena-alloc (-> t arena) (sizeof entry))))
     (set! (-> e key) key)
     (set! (-> e value) value)
     (set! (-> e next) first)
-    (table-set! t h (cast u32 e))))
+    (hash-set! t h (cast u32 e))))
 
 ;; ---- records ----
 ;; A struct has one record, so == on records compares structs. A record from make-record-in
@@ -406,7 +359,7 @@
         [(symbol name length next) (when (and (== length n) (bytes=? name p n)) (return s)) (set! s next)]
         [(keyword name length next) (when (and (== length n) (bytes=? name p n)) (return s)) (set! s next)]
         [_ (set! s 0)]))
-    (let ([name (cast (ptr u8) (alloc-in (& run-arena) (+ n 1)))] [made datum 0])
+    (let ([name (cast (ptr u8) (arena-alloc (& run-arena) (+ n 1)))] [made datum 0])
       (memcpy name p n)
       (set! (@ name n) 0)
       (set! made (if kw (make-cell-in (& run-arena) (keyword name n latest)) (make-cell-in (& run-arena) (symbol name n latest))))
@@ -530,7 +483,7 @@
             (set! same (== (@ (-> s ids) i) (@ ids i))))
           (when same (return s))))
       (set! s (-> s next)))
-    (let ([made (cast (ptr scope-set) (alloc-in (& run-arena) (+ (sizeof scope-set) (* 4 n))))])
+    (let ([made (cast (ptr scope-set) (arena-alloc (& run-arena) (+ (sizeof scope-set) (* 4 n))))])
       (set! (-> made count) n)
       (set! (-> made next) latest)
       (memcpy (-> made ids) ids (* 4 n))
@@ -584,7 +537,7 @@
 ;; ---- changes to scopes ----
 
 (define (new-change [sc u32] [kind u32] [next (ptr change)]) -> (ptr change)
-  (let ([c (cast (ptr change) (alloc-in current (sizeof change)))])
+  (let ([c (cast (ptr change) (arena-alloc current (sizeof change)))])
     (set! (-> c scope) sc)
     (set! (-> c kind) kind)
     (set! (-> c next) next)
@@ -667,7 +620,7 @@
   (make-cell (syntax e scopes loc props 0)))
 
 (define (make-srcloc [source datum] [line u32] [col u32] [pos u32] [span u32]) -> (ptr srcloc)
-  (let ([l (cast (ptr srcloc) (alloc-in current (sizeof srcloc)))])
+  (let ([l (cast (ptr srcloc) (arena-alloc current (sizeof srcloc)))])
     (set! (-> l source) source)
     (set! (-> l line) line)
     (set! (-> l col) col)
@@ -734,13 +687,13 @@
 ;; with only the core scope, which names the core form in any module, as do the lists; any other
 ;; name is ctx's.
 (define core-scopes (ptr scope-set) (scopes-change no-scopes 0 0))
-(define core-names (ptr arena-table) (make-table))
+(define core-names (ptr hash-table) (make-table))
 
 (define (core-name? [name datum]) -> i32
-  (let ([known (table-ref core-names (cast u64 name))])
+  (let ([known (hash-ref core-names (cast u64 name))])
     (when (== known 0)
       (set! known (if (== (identifier-binding-kind (make-syntax name core-scopes 0 nil)) core-symbol) 1 2))
-      (table-set! core-names (cast u64 name) known))
+      (hash-set! core-names (cast u64 name) known))
     (== known 1)))
 
 (define (core-syntax [ctx datum] [d datum] [loc datum]) -> datum
@@ -790,7 +743,7 @@
   (match (cell-of d)
     [(pair a b) (let ([x (keep a)] [y (keep b)]) (make-cell-in (& run-arena) (pair x y)))]
     [(string bytes length)
-     (let ([kept (cast (ptr u8) (alloc-in (& run-arena) length))])
+     (let ([kept (cast (ptr u8) (arena-alloc (& run-arena) length))])
        (memcpy kept bytes length)
        (make-cell-in (& run-arena) (string kept length)))]
     [(integer low high negative) (make-cell-in (& run-arena) (integer low high negative))]
@@ -805,7 +758,7 @@
 (define (keep-srcloc [l (ptr srcloc)]) -> (ptr srcloc)
   (if (== l 0)
       0
-      (let ([kept (cast (ptr srcloc) (alloc-in (& run-arena) (sizeof srcloc)))])
+      (let ([kept (cast (ptr srcloc) (arena-alloc (& run-arena) (sizeof srcloc)))])
         (set! (@ kept) (@ l))
         kept)))
 
@@ -1100,7 +1053,7 @@
   (set! scope-map map)
   (set! scope-map-count n))
 
-(define (literal-buffer [n u32]) -> (ptr u8) (cast (ptr u8) (alloc-in current n)))
+(define (literal-buffer [n u32]) -> (ptr u8) (cast (ptr u8) (arena-alloc current n)))
 
 (define in-bytes (ptr u8) 0)
 (define in-at u32 0)
@@ -1135,7 +1088,7 @@
 (define (deserialize [bytes (ptr u8)] [n u32]) -> (ptr datum)
   (set! in-bytes bytes)
   (set! in-at 0)
-  (let* ([count (cast u32 (in-uleb))] [objs (cast (ptr u32) (alloc-in current (* 4 (+ count 1))))])
+  (let* ([count (cast u32 (in-uleb))] [objs (cast (ptr u32) (arena-alloc current (* 4 (+ count 1))))])
     (for ([i u32 0]) (< i count) (+= i 1) (set! (@ objs i) (in-entry objs)))
     (cast (ptr datum) objs)))
 
