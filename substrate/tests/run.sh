@@ -119,14 +119,14 @@ from_changed() {
     -p "$root/$changed" -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
 }
 echo ';; changed' >> "$changed/compiler/substrate.sub"
-sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' "$changed/compiler/kernel.sub"
+sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' "$changed/compiler/syntax.sub"
 if [ "$(from_changed)" = "$(cat tests/substrate/forms.out)" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
   echo "FAIL changed sources: tests/substrate/forms.sub does not build and run as it does here"
 fi
-sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/compiler/kernel.sub"
+sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/compiler/syntax.sub"
 if grep -qF "whose srcloc differs" <<< "$(from_changed)"; then
   pass=$((pass + 1))
 else

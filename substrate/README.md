@@ -6,14 +6,15 @@ compiler is written in it, builds itself, and runs in a browser.
 
 ## Layout
 
-- `compiler/`: the compiler. Its reader, expander and back end implement
-  the kernel, which Substrate expands into: wasm as s-expressions, with
-  modules, phases and macros that run at compile time. `checker.sub`
-  implements Substrate's forms: it checks their types and turns them into
-  the kernel's. `kernel.sub` holds the data macros work on.
-- `compiler/substrate/`: Substrate's modules: `lang.sub` binds its forms
-  and holds its run-time parts, beside `runtime.sub` and `math.sub`; and
-  `syntax-match.sub` and `forms.sub` for writing macros in Substrate.
+- `compiler/`: the compiler, written in Substrate. Its reader, expander and
+  back end implement the core forms: wasm as s-expressions, with modules,
+  phases and macros that run at compile time. `checker.sub` implements
+  Substrate's other forms: it checks their types and turns them into core
+  forms. `substrate.sub` is the language every module is in unless it
+  requires another: it binds the forms, and holds the memory, the stack and
+  Substrate's library. `syntax.sub` holds the data and syntax objects that
+  macros work on, and binds the forms on them, `quasiquote` and
+  `syntax-match` among them; `patterns.sub` parses their patterns.
 - `lib/`: languages written in Substrate: `scheme/`, a Scheme;
   `bend/`, a dependently typed language; and, experimental, `shade/`, GPU
   programs compiled to WGSL, and `web/`, programs in a web page, a game
