@@ -50,7 +50,7 @@ const checks = {
     };
     const fieldText = () => page.evaluate('document.querySelector("textarea").value');
 
-    const scheme = '(require-unqualified scheme "lib/scheme/scheme.sub") => ';
+    const scheme = '(language scheme "lib/scheme/scheme.sub") => ';
     await idle();
     check('repl: the page starts a Scheme session', await shown(), scheme);
     check('repl: the text box has the focus', await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
@@ -125,7 +125,7 @@ const checks = {
     await say('(+ (fib 20) 0.5)');
     await say('(sq 2)');
     check('repl: a session in Substrate', await shown(), [
-      '(require-unqualified substrate "compiler/substrate.sub") => ',
+      '(language substrate "compiler/substrate.sub") => ',
       '(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) => ',
       '(+ (fib 20) 0.5) => 6765.5',
       '! (sq 2) => input-20:1:2: error: unbound identifier sq',
