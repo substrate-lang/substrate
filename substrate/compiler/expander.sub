@@ -627,8 +627,16 @@
              (set! compiling (keep-cons (string->symbol path) compiling))
              (begin-module-arena)
              (set! current (new-comp m))
-             (set! (-> (unit-of m) code) (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0))
-             (finish-module! text)
+             ;; If it fails, a later require compiles it again. The failure's message and syntax are
+             ;; in its arena, so the arena is kept until recovery frees it.
+             (try (set! (-> (unit-of m) code) (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0))
+                  (finish-module! text)
+                  [catch-all
+                   (hash-set! (& registry) key 0)
+                   (set! current saved)
+                   (abandon-module-arena)
+                   (set! compiling (cdr compiling))
+                   (rethrow)])
              (set! current saved)
              (end-module-arena)
              (set! compiling (cdr compiling))
@@ -653,7 +661,8 @@
     (set! (-> (the-module) scope) msc)
     (hash-set! (& module-scope-origins) (scope-key msc) (cast u32 (keep (cons (-> (the-module) self) (make-integer 0)))))
     (set! to-syntax syntax)
-    (set! out (expand-body (language-body (map (lambda ([f datum]) -> datum (add-scope (add-scope f core-scope) msc)) forms)) 0))
+    (set! out (try (expand-body (language-body (map (lambda ([f datum]) -> datum (add-scope (add-scope f core-scope) msc)) forms)) 0)
+                   [catch-all (set! to-syntax saved) (rethrow)]))
     (set! to-syntax saved)
     out))
 
@@ -925,7 +934,7 @@
       0
       (begin
         (begin-module-arena)
-        (let ([m (load-cached-in path)])
+        (let ([m (try (load-cached-in path) [catch-all (abandon-module-arena) (rethrow)])])
           (end-module-arena)
           m))))
 
@@ -1330,8 +1339,9 @@
     (set! (-> b pass2) 0)
     (set! (-> b lifted) nil)
     (set! current-body b)
-    (for-each (lambda ([f datum]) (declare-form! f b 0)) forms)
-    (set! out (finish-body! b))
+    (try (for-each (lambda ([f datum]) (declare-form! f b 0)) forms)
+         (set! out (finish-body! b))
+         [catch-all (set! current-body saved) (rethrow)])
     (set! current-body saved)
     out))
 
@@ -1393,9 +1403,10 @@
         (set! l (cdr l)))
       (set! (-> b items) before)
       (set! to-syntax (-> b syntax))
-      (while (pair? new)
-        (set! (-> b lifted) (cons (expand-item (car new) phase) (-> b lifted)))
-        (set! new (cdr new)))
+      (try (while (pair? new)
+             (set! (-> b lifted) (cons (expand-item (car new) phase) (-> b lifted)))
+             (set! new (cdr new)))
+           [catch-all (set! to-syntax saved) (rethrow)])
       (set! to-syntax saved))))
 
 (define (form-list [f datum] [patterns (ptr u8)]) -> datum
@@ -1841,7 +1852,7 @@
           (set! init `(call ,(running-function 'make-function-transformer) ((func-index ,function))))
           (begin
             (set! to-syntax 0)
-            (set! init (expand-expr rhs (+ phase 1)))
+            (set! init (try (expand-expr rhs (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
             (set! to-syntax saved)))
       (set! global (global-info name 'i32 (boolean 1) 0 0))
       (set! getter (func-info name nil '(i32) 0 0))
@@ -1885,7 +1896,7 @@
         [else
          (let ([args (map (lambda ([a datum]) -> datum (plain-value a where)) (caddr e))] [saved api-where] [v datum 0])
            (set! api-where where)
-           (set! v (call-function (function-index (cadr e)) args))
+           (set! v (try (call-function (function-index (cadr e)) args) [catch-all (set! api-where saved) (rethrow)]))
            (set! api-where saved)
            v)]))
 
@@ -1921,7 +1932,7 @@
   (let ([forms (cdr (form-list f "(begin-for-syntax form ...)"))] [saved to-syntax] [code datum 0])
     (use-language! (+ phase 1))
     (set! to-syntax 0)
-    (set! code (expand-body forms (+ phase 1)))
+    (set! code (try (expand-body forms (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
     (set! to-syntax saved)
     (run-compile-time-wasm-module! code (+ phase 1) f)))
 
@@ -2136,7 +2147,8 @@
   (set! api-intro 0)
   (set! session-running 0)
   (set! interacting 0)
-  (set-scope-map! 0 0))
+  (set-scope-map! 0 0)
+  (checker-recover!))
 
 (define (session-failure [said datum]) -> datum
   (let* ([p (string-bytes said)] [n (string-length said)] [from u32 0] [to n] [at (find-bytes p n "instantiate-bytes")])
@@ -2202,7 +2214,12 @@
           (set! api-where saved-where)
           (set! api-intro saved-intro)
           (throw compile-error message blamed
-                 (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0)))) (syntax-srcloc s) loc))])
+                 (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0)))) (syntax-srcloc s) loc))]
+         [catch-all
+          (set! api-phase saved-phase)
+          (set! api-where saved-where)
+          (set! api-intro saved-intro)
+          (rethrow)])
     (set! api-phase saved-phase)
     (set! api-where saved-where)
     (set! api-intro saved-intro)
@@ -2244,16 +2261,14 @@
         (append (func-info-params (cadr m)) (cons '-> (func-info-results (cadr m))))
         0)))
 
-;; A compile error leaving the expansion leaves the expander as it was: the macro may
-;; handle it and go on.
+;; Whatever leaves the expansion leaves the expander as it was: the macro may handle it and
+;; go on.
 (define (query-local-expand [s datum]) -> datum
   (unless (syntax? s) (fail-at api-where "local-expand: expected syntax" nil))
   (let ([saved-output to-syntax] [out datum 0])
     (set! to-syntax 1)
-    (try (set! out (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro))
-         [catch compile-error (message blamed loc)
-          (set! to-syntax saved-output)
-          (throw compile-error message blamed loc)])
+    (set! out (try (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro)
+                   [catch-all (set! to-syntax saved-output) (rethrow)]))
     (set! to-syntax saved-output)
     out))
 
