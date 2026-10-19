@@ -863,7 +863,17 @@
 
 (define (check [e datum] [env datum] [hint datum]) -> datum
   (let ([r (check-expression e env hint)])
-    (if (pair? (cdr r)) (cons (car r) `(at ,e ,(cdr r))) r)))
+    (if (pair? (cdr r)) (cons (car r) `(at ,e ,(typed (car r) (cdr r)))) r)))
+
+(define (typed [t datum] [c datum]) -> datum
+  (if (or (== t 'none) (memq t '(lit flit))) c `(as ,(wasm-types t) ,c)))
+
+(define (wasm-types [t datum]) -> datum
+  (cond [(== t 'void) nil] [(values-type? t) (cdr t)] [else `(,(wasm-type t))]))
+
+(define (wasm-shown [t datum]) -> datum
+  (let ([ws (wasm-types t)])
+    (cond [(null? ws) '"no value"] [(null? (cdr ws)) (car ws)] [else (cons 'values ws)])))
 
 (define (expect [e datum] [t datum] [env datum] [stored i32]) -> datum (convert (check e env t) t e stored))
 
@@ -898,11 +908,11 @@
     [('try (c ...) body ...) (check-core-try e c body env hint)]
     [('block (? identifier? l) body ...) (check-block e l body env hint)]
     [('loop (? identifier? l) body ...) (check-block e l body env hint)]
-    [('br l) (left! l 'void) (cons 'none `(br ,(label-key l) #f))]
-    [('br l v) (let ([r (settle (check v env 0) 0 v)]) (left! l (car r)) (cons 'none `(br ,(label-key l) ,(cdr r))))]
-    [('br-if l c) (left! l 'void) (cons 'void `(br-if ,(label-key l) ,(operand c 'i32 env)))]
+    [('br l) (left! l 'void 'br) (cons 'none `(br ,(label-key l) #f))]
+    [('br l v) (let ([r (settle (check v env 0) 0 v)]) (left! l (car r) 'br) (cons 'none `(br ,(label-key l) ,(cdr r))))]
+    [('br-if l c) (left! l 'void 'br-if) (cons 'void `(br-if ,(label-key l) ,(operand c 'i32 env)))]
     [('br-table (l ...) d i)
-     (for/each ([x (cons d l)]) (left! x 'void))
+     (for/each ([x (cons d l)]) (left! x 'void 'br-table))
      (cons 'none `(br-table ,(for/list ([x l]) (label-key x)) ,(label-key d) ,(operand i 'i32 env)))]
     [('select a b c) (check-select a b c env)]
     [('drop v) (cons 'void (as-void (check v env 0)))]
@@ -950,11 +960,11 @@
 
 (define (operand [e datum] [w datum] [env datum]) -> datum (operand-of (check e env 0) w e))
 
-;; A value of another type in wasm is the back end's to report; one with no value in wasm, Substrate's.
 (define (operand-of [r datum] [w datum] [where datum]) -> datum
   (let ([t (car r)])
     (cond [(or (== t 'lit) (and (== t 'flit) (float-type? w))) (convert r w where 0)]
-          [(or (== t 'none) (arithmetic? t) (address-type? t) (closure-type? t) (== t 'exnref)) (cdr r)]
+          [(== t 'none) (cdr r)]
+          [(and (or (arithmetic? t) (address-type? t) (closure-type? t) (== t 'exnref)) (== (wasm-type (settled-type t)) w)) (cdr r)]
           [else (substrate-error where "expected ~a, got ~s" `(,w ,(shown t)))])))
 
 (define (wasm-type-of [r datum]) -> datum (wasm-type (settled-type (car r))))
@@ -969,19 +979,31 @@
       (substrate-error e "the signature takes ~a argument~a, not ~a" `(,(fixnum (length ps)) ,(plural (length ps)) ,(fixnum (length args)))))
     (cons (results-type rs) `(call-indirect ,ps ,rs ,(operand i 'i32 env) ,(for/list ([a args] [p ps]) (operand a p env))))))
 
-;; A block's value is its body's, or the one a branch to it leaves it with; that they agree is the
-;; back end's to check.
+;; A block's value is its body's, or the one a branch to it leaves it with.
 (define (check-block [e datum] [l datum] [body datum] [env datum] [hint datum]) -> datum
   (let* ([key (label-key l)] [r (check-sequence e body env hint)] [head (syntax-e (car (syntax->list e)))]
+         [lefts (for/list ([x left] #:when (equal? (car x) key)) (cdr x))]
          [ty (if (== head 'block)
-                 (for/fold ([t (car r)]) ([x left])
-                   (cond [(not (equal? (car x) key)) t]
-                         [(memq t '(none void)) (if (== t 'none) (cdr x) (if (== (cdr x) 'none) t (cdr x)))]
+                 (for/fold ([t (car r)]) ([u lefts])
+                   (cond [(memq t '(none void)) (if (== t 'none) (car u) (if (== (car u) 'none) t (car u)))]
                          [else t]))
                  (car r))])
+    (if (== head 'block)
+        (begin
+          (unless (or (== (car r) 'none) (equal? (wasm-types (car r)) (wasm-types ty)))
+            (substrate-error e "block result is ~a but a br carries ~a" `(,(wasm-shown (car r)) ,(wasm-shown ty))))
+          (for/each ([u lefts])
+            (cond [(== (car u) 'none) (begin)]
+                  [(!= (cdr u) 'br)
+                   (unless (null? (wasm-types ty))
+                     (substrate-error e "~a cannot exit a block that produces ~a" `(,(cdr u) ,(wasm-shown ty))))]
+                  [(not (equal? (wasm-types (car u)) (wasm-types ty)))
+                   (substrate-error e "br carries ~a but the block produces ~a" `(,(wasm-shown (car u)) ,(wasm-shown ty)))])))
+        (for/each ([u lefts])
+          (unless (memq (car u) '(none void)) (substrate-error e "br to a loop label cannot carry a value" nil))))
     (cons ty `(,head ,key ,(cdr r)))))
 
-(define (left! [l datum] [t datum]) (set! left (cons (cons (label-key l) t) left)))
+(define (left! [l datum] [t datum] [kind datum]) (set! left (cons (cons (label-key l) (cons t kind)) left)))
 
 ;; e is (#%app 'mark arg ...): a use of a form of Substrate's that its macro marked for checking.
 (define (check-mark [e datum] [mark datum] [args datum] [env datum] [hint datum]) -> datum
