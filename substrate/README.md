@@ -10,11 +10,11 @@ compiler is written in it, builds itself, and runs in a browser.
   back end implement the core forms: wasm as s-expressions, with modules,
   phases and macros that run at compile time. `checker.sub` implements
   Substrate's other forms: it checks their types and turns them into core
-  forms. `substrate.sub` is the language every module is in unless it
-  requires another: it binds the forms, and holds the memory, the stack and
-  Substrate's library. `syntax.sub` holds the data and syntax objects that
-  macros work on, and binds the forms on them, `quasiquote` and
-  `syntax-match` among them; `patterns.sub` parses their patterns.
+  forms. `substrate.sub` is the language every module is in unless its
+  first form names another: it binds the forms, and holds the memory, the
+  stack and Substrate's library. `syntax.sub` holds the data and syntax
+  objects that macros work on, and binds the forms on them, `quasiquote` and
+  `syntax-match` among them, whose code is `macros.sub`'s.
 - `lib/`: languages written in Substrate: `scheme/`, a Scheme;
   `bend/`, a dependently typed language; and, experimental, `shade/`, GPU
   programs compiled to WGSL, and `web/`, programs in a web page, a game

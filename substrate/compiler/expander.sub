@@ -144,8 +144,8 @@
 (define core-scopes (ptr scope-set) (scopes-change no-scopes 0 0))
 
 ;; ==== the syntax module ====
-;; Compile-time code links to the running compiler's instances of the syntax module
-;; and the modules it rests on, so the compiler and every macro share its data.
+;; Compile-time code links to the running compiler's instances of the syntax module, of the
+;; macro tools, and of the modules they rest on, so the compiler and every macro share its data.
 
 (define repository-root datum 0)
 (define (set-repository-root! [root datum]) (set! repository-root (keep root)))
@@ -160,6 +160,46 @@
 (define running-infos hash-table)
 
 (define (syntax-instance? [name datum]) -> i32 (string=? name syntax-instance))
+
+;; A module's compile-time code that requires the module itself gets the running compiler's copy,
+;; as the macro tools' does to bind them: a module cannot be compiled while it is being compiled.
+(define running-copies datum nil)
+
+(define (running-copy [path datum]) -> datum
+  (let ([known (assoc path running-copies)] [g datum 0] [m datum 0])
+    (when (!= known 0) (return (cdr known)))
+    (set! g (group-module-at path))
+    (when (== g 0) (fail-at 0 "~a requires itself while compiling, which only a module the running compiler shares can" (list1 path)))
+    (set! m (running-unit g path))
+    (hash-set! (& units-by-hash) (cast u64 (string->symbol g)) (cast u32 m))
+    (set! running-copies (keep-cons (cons (keep path) m) running-copies))
+    m))
+
+(define (running-copy-of [name datum]) -> datum
+  (let ([l running-copies])
+    (while (pair? l)
+      (when (string=? (-> (unit-of (cdr (car l))) hash) name) (return (cdr (car l))))
+      (set! l (cdr l)))
+    0))
+
+(define (running-instance? [name datum]) -> i32 (or (syntax-instance? name) (!= (running-copy-of name) 0)))
+
+;; The running compiler's module of wasm name, as a unit that provides its functions and tags.
+(define (running-unit [name datum] [path datum]) -> datum
+  (let* ([bytes (running-bytes name)] [exports (wasm-module-exports (string-bytes bytes) (string-length bytes))]
+         [provides nil] [m (new-unit path path)])
+    (while (pair? exports)
+      (let* ([e (car exports)] [named (string->symbol (cadr e))]
+             [info (if (== (car e) 'func)
+                       (func-info named (caddr e) (cadddr e) name (cadr e))
+                       (tag-info named (caddr e) name (cadr e)))])
+        (hash-set! (& running-infos) (cast u64 info) 1)
+        (set! provides (cons (cons named `(,(if (== (car e) 'func) 'func 'tag) ,info)) provides)))
+      (set! exports (cdr exports)))
+    (set! (-> (unit-of m) provides) (keep (sort provides (lambda ([a datum] [b datum]) -> i32 (symbol<? (car a) (car b))))))
+    (set! (-> (unit-of m) hash) (keep name))
+    (set! (-> (unit-of m) state) 'done)
+    m))
 
 (define running-group datum 0)
 
@@ -225,27 +265,14 @@
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
                 query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier)
   (set-running-names! running-id)
-  (let* ([names (running-module-names)] [name (syntax-wasm-module names)]
-         [bytes datum 0] [exports datum 0] [provides nil] [m datum 0])
+  (let* ([names (running-module-names)] [name (running-module-named names "syntax.")] [tools (running-module-named names "macros.")])
     (when (== name 0) (fail-at 0 "the running program has no syntax module" nil))
     (set! running-names (keep names))
     (set! compiler-hash (keep (content-hash running-names)))
     (set! syntax-instance (keep name))
-    (set! running-group (keep (group-of name)))
-    (set! bytes (running-bytes name))
-    (set! exports (wasm-module-exports (string-bytes bytes) (string-length bytes)))
-    (while (pair? exports)
-      (let* ([e (car exports)] [named (string->symbol (cadr e))]
-             [info (if (== (car e) 'func)
-                       (func-info named (caddr e) (cadddr e) syntax-instance (cadr e))
-                       (tag-info named (caddr e) syntax-instance (cadr e)))])
-        (hash-set! (& running-infos) (cast u64 info) 1)
-        (set! provides (cons (cons named `(,(if (== (car e) 'func) 'func 'tag) ,info)) provides)))
-      (set! exports (cdr exports)))
-    (set! m (new-unit '"syntax" '"syntax"))
-    (set! (-> (unit-of m) provides) (keep (sort provides (lambda ([a datum] [b datum]) -> i32 (symbol<? (car a) (car b))))))
-    (set! (-> (unit-of m) state) 'done)
-    (set! running-syntax m)
+    ;; The macro tools rest on the syntax module, so their group holds its group.
+    (set! running-group (keep (group-of (if (!= tools 0) tools name))))
+    (set! running-syntax (running-unit name '"syntax"))
     (use-literals! 0)))
 
 ;; Quoted data is built by a syntax module's literal-buffer and deserialize, in its memory. A
@@ -263,12 +290,13 @@
     (unless (and (!= p 0) (== (car (cdr p)) 'func)) (fail-at 0 "internal: ~a provides no function ~a" `(,(-> (unit-of m) path) ,name)))
     (cadr (cdr p))))
 
-(define (syntax-wasm-module [names datum]) -> datum
-  (while (pair? names)
-    (let ([n (car names)])
-      (when (and (> (string-length n) 7) (== (memcmp (string-bytes n) "syntax." 7) 0)) (return n)))
-    (set! names (cdr names)))
-  0)
+(define (running-module-named [names datum] [prefix (ptr u8)]) -> datum
+  (let ([k (strlen prefix)])
+    (while (pair? names)
+      (let ([n (car names)])
+        (when (and (> (string-length n) k) (== (memcmp (string-bytes n) prefix k) 0)) (return n)))
+      (set! names (cdr names)))
+    0))
 
 (define (running-bytes [name datum]) -> datum
   (let ([bytes (running-module-bytes name)])
@@ -952,9 +980,11 @@
       (return 0))
     (hash-set! (& registry) key (cast u32 (new-unit path path)))
     (while (pair? requires)
-      (unless (string=? (-> (unit-of (compile-module-file (car (car requires)))) hash) (cadr (car requires)))
-        (hash-set! (& registry) key 0)
-        (return 0))
+      (let* ([r (car requires)]
+             [u (if (and (string=? (car r) path) (> (integer-value (caddr r)) 0)) (running-copy path) (compile-module-file (car r)))])
+        (unless (string=? (-> (unit-of u) hash) (cadr r))
+          (hash-set! (& registry) key 0)
+          (return 0)))
       (set! requires (cdr requires)))
     (set! known (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol hash)))))
     (set! m (if (!= known 0) known (load-compiled-module d path)))
@@ -1033,11 +1063,18 @@
       (hash-set! (& definition-indexes) (cast u64 m) (cast u32 index)))
     (cast datum (hash-ref index (definition-key instance kind export)))))
 
-(define (running-definition [kind datum] [export datum]) -> datum
-  (let ([p (assq (string->symbol export) (-> (unit-of running-syntax) provides))])
+;; A running definition is the syntax module's, or a running copy's, which its path names.
+(define (running-definition [kind datum] [export datum] [path datum]) -> datum
+  (let* ([m (if (== path 0) running-syntax (running-copy path))] [p (assq (string->symbol export) (-> (unit-of m) provides))])
     (unless (and (!= p 0) (== (car (cdr p)) kind))
-      (fail-at 0 "the cache is inconsistent: the syntax module has no ~a ~a" `(,kind ,export)))
+      (fail-at 0 "the cache is inconsistent: the running ~a has no ~a ~a" `(,(-> (unit-of m) path) ,kind ,export)))
     (cadr (cdr p))))
+
+(define (running-ref [info datum]) -> datum
+  (let ([m (running-copy-of (info-instance info))])
+    (if (== m 0)
+        `(running ,(info-kind info) ,(info-export info))
+        `(running ,(info-kind info) ,(info-export info) ,(-> (unit-of m) path)))))
 
 ;; ---- writing an interface ----
 
@@ -1137,7 +1174,7 @@
 (define (info-ref [info datum]) -> datum
   (let ([origin (cast datum (hash-ref (& shift-origins) (cast u64 info)))] [instance (info-instance info)] [owner datum 0])
     (cond [(!= origin 0) `(shifted ,(encode (car origin)) ,(cdr origin))]
-          [(running-definition? info) `(running ,(info-kind info) ,(info-export info))]
+          [(running-definition? info) (running-ref info)]
           [else
            (set! owner (if (string? instance) (instance-unit instance) 0))
            (if (and (!= owner 0) (!= owner writing))
@@ -1289,7 +1326,7 @@
   (case (car r)
     [('own) (@ loaded-infos (cast u32 (integer-value (cadr r))))]
     [('shifted) (shift-info (decode (cadr r)) (cast u32 (integer-value (caddr r))))]
-    [('running) (running-definition (cadr r) (caddr r))]
+    [('running) (running-definition (cadr r) (caddr r) (if (pair? (cdddr r)) (cadddr r) 0))]
     [else
      (let ([info (find-info (cadr r) (caddr r) (cadddr r))])
        (when (== info 0)
@@ -1609,7 +1646,12 @@
     (if (absolute-path? given) given (string-append dir given))))
 
 (define (require-module! [f datum] [name datum] [spec datum] [phase i32]) -> datum
-  (require-unit! name (compile-module-file (module-path-of f spec)) phase))
+  (let ([path (canonical-path (module-path-of f spec))])
+    (require-unit! name
+                   (if (and (> phase 0) (not (in-session?)) (string=? path (-> (the-module) path)))
+                       (running-copy path)
+                       (compile-module-file path))
+                   phase)))
 
 (define (require-unit! [name datum] [m datum] [phase i32]) -> datum
   (let* ([me (the-module)] [key (cons (syntax-e name) (make-integer phase))]
@@ -1699,7 +1741,7 @@
   (let ([r (wasm-module-ref name)])
     (cond [(!= r 0) (car r)]
           [(syntax-instance? name) running-syntax]
-          [else 0])))
+          [else (running-copy-of name)])))
 
 ;; ==== compile-time evaluation ====
 
@@ -2951,7 +2993,7 @@
           (cdr (car memory-owners))))))
 
 (define (shifted-instance [name datum] [t i32]) -> datum
-  (if (or (== t 0) (syntax-instance? name))
+  (if (or (== t 0) (running-instance? name))
       name
       (let ([r (wasm-module-ref name)])
         (if (== r 0) 0 (wasm-module-name (car r) (cast i32 (integer-value (cadr r))) (+ (cast i32 (integer-value (caddr r))) t))))))
