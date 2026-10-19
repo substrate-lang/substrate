@@ -5,6 +5,7 @@
 (require-unqualified sm "substrate/syntax-match.sub")
 (require-unqualified forms "substrate/forms.sub")
 (require-unqualified ops "ops.sub")
+(require-unqualified patterns "patterns.sub")
 
 (provide substrate-expansion)
 
@@ -87,6 +88,7 @@
     [('offsetof) (substrate-offsetof s)]
     [('#%module-begin) (substrate-module-begin s)]
     [('#%top-interaction) (substrate-interaction s)]
+    [('quasiquote 'quasisyntax 'make-cell 'syntax-match 'pattern-word 'for/each 'for/list 'for/fold 'fmt 'new) (data-form kind s)]
     [else (raise-syntax-error 'substrate (format-message "internal: no form ~a" `(,kind)) s)]))
 
 (define (substrate-error [where datum] [template (ptr u8)] [args datum]) -> datum
@@ -1859,3 +1861,234 @@
                      ,(as-void r)
                      (print:write-bytes ,(cdr (string-literal text)) ,(i32-const (string-length text)))
                      (print:newline))))])))
+
+;; ---- forms on data ----
+
+;; The code they make is Substrate code on kernel.sub's data, which means what it would where the
+;; form is bound.
+(define (src [d datum]) -> datum (datum->syntax here d 0))
+
+(define (data-form [kind datum] [s datum]) -> datum
+  (case kind
+    [('quasiquote) (quasi-form s 0)]
+    [('quasisyntax) (quasi-form s 1)]
+    [('make-cell)
+     (syntax-match s
+       [(_ c) (at s (src `(let ([p (cell-bytes ,(cell-size c))]) (set! (@ p) ,c) p)))]
+       [(_ a c) (at s (src `(let ([p (cast datum (alloc-in ,a ,(cell-size c)))]) (set! (@ p) ,c) p)))])]
+    [('syntax-match) (syntax-match-form s)]
+    [('pattern-word) (raise-syntax-error 0 '"allowed only in a pattern" s)]
+    [('for/each 'for/list 'for/fold) (for-form kind s)]
+    [('fmt) (syntax-match s [(_ t a ...) (at s (src `(format-message ,t ,(for/fold ([l 'nil]) ([x (reverse a)]) `(cons ,x ,l)))))])]
+    [else (syntax-match s [(_ a t) (at s (src `(cast (ptr ,t) (arena-alloc ,a (sizeof ,t)))))])]))
+
+;; A cell is its tag and its fields, 4 bytes each, which every case's are.
+(define (cell-size [c datum]) -> datum (fixnum (+ 4 (* 4 (if (identifier? c) 0 (- (length (syntax->list c)) 1))))))
+
+;; ---- quasiquote, quasisyntax ----
+
+;; A part of the template with no unquote in it is quoted.
+(define unquoting datum 0)
+(define splicing datum 0)
+(define syntaxes i32 0)
+
+(define (quasi-form [s datum] [syntax i32]) -> datum
+  (syntax-match s
+    [(_ t)
+     (set! syntaxes syntax)
+     (set! unquoting (if syntax 'unsyntax 'unquote))
+     (set! splicing (if syntax 'unsyntax-splicing 'unquote-splicing))
+     (at s (template t))]))
+
+(define (named? [x datum] [name datum]) -> i32 (and (identifier? x) (== (syntax-e x) name)))
+
+(define (fixed? [t datum]) -> i32
+  (let ([e (if (syntax? t) (syntax-e t) t)])
+    (or (not (pair? e))
+        (and (not (named? (car e) unquoting)) (not (named? (car e) splicing)) (fixed? (car e)) (fixed? (cdr e))))))
+
+(define (template [t datum]) -> datum
+  (cond [(fixed? t) (quasi-constant t)]
+        [(named? (car (syntax-e t)) unquoting) (cadr (syntax-e t))]
+        [syntaxes (src `(syntax-rewrap (quote-syntax ,(syntax-rewrap t nil)) ,(template-list (syntax-e t))))]
+        [else (template-list (syntax-e t))]))
+
+(define (template-list [l datum]) -> datum
+  (cond [(and (not syntaxes) (fixed? l)) (quasi-constant l)]
+        [(null? l) (src 'nil)]
+        [(syntax? l) (template l)]
+        [(named? (car l) unquoting) (cadr l)]
+        [(let ([e (if (syntax? (car l)) (syntax-e (car l)) 0)]) (and (pair? e) (named? (car e) splicing)))
+         (let ([v (cadr (syntax-e (car l)))]) (src `(append ,(if syntaxes `(splice-list ,v) v) ,(template-list (cdr l)))))]
+        [else (src `(cons ,(template (car l)) ,(template-list (cdr l))))]))
+
+;; The empty list is nil, so that kernel.sub, which defines quoted data, can make lists.
+(define (quasi-constant [t datum]) -> datum
+  (cond [syntaxes (src `(quote-syntax ,t))]
+        [(null? (syntax->datum t)) (src 'nil)]
+        [else (src `(quote ,t))]))
+
+;; ---- syntax-match ----
+
+(define (syntax-match-form [s datum]) -> datum
+  (let* ([parts (syntax->list s)]
+         [clauses (if (and (!= parts 0) (>= (length parts) 3))
+                      (match-clauses (cddr parts) 'syntax-match)
+                      (raise-syntax-error 'syntax-match '"expected (syntax-match subject [pattern body ...] ...)" s))]
+         [parsed (parse-patterns (for/list ([c clauses]) (car c)) 'syntax-match
+                                 (for/list ([w '(_ ... ? quote quote-syntax)]) (datum->syntax here w 0)))]
+         [x (fresh 's)])
+    (at s (src `(let ([,x ,(cadr parts)])
+                  ,(compile-clauses clauses (car parsed) (cadr parsed) x
+                                    `(throw compile-error (match-failure (quote ,(pattern-texts (car parsed))) ,x) ,x 0)
+                                    (caddr parsed)))))))
+
+(define (nth [l datum] [i datum]) -> datum (list-ref l (fixnum-value i)))
+
+;; A test is code, or (always code ...): code that always matches.
+(define (always? [t datum]) -> i32 (and (pair? t) (== (car t) 'always)))
+
+(define (test-code [t datum]) -> datum (if (always? t) `(begin ,@(cdr t) 1) t))
+
+(define (both [a datum] [b datum]) -> datum
+  (cond [(and (always? a) (always? b)) (cons 'always (append (cdr a) (cdr b)))]
+        [(always? a) `(begin ,@(cdr a) ,(test-code b))]
+        [else `(if ,a ,(test-code b) 0)]))
+
+(define (compile-clauses [cs datum] [ds datum] [varss datum] [x datum] [last datum] [values datum]) -> datum
+  (if (null? cs)
+      last
+      (let* ([vars (for/list ([v (car varss)]) (fresh 'v))]
+             [test (compile-test (car ds) x vars values)]
+             [body `(let (,@(for/list ([v (car varss)] [t vars]) `[,v ,t])) ,@(cdr (car cs)))])
+        (if (always? test)
+            `(let (,@(for/list ([t vars]) `[,t datum 0])) ,@(cdr test) ,body)
+            `(let (,@(for/list ([t vars]) `[,t datum 0]))
+               (if ,test ,body ,(compile-clauses (cdr cs) (cdr ds) (cdr varss) x last values)))))))
+
+(define (compile-test [d datum] [x datum] [vars datum] [values datum]) -> datum
+  (case (car d)
+    [('var) `(always (set! ,(nth vars (cadr d)) ,x))]
+    [('any) '(always)]
+    [('datum) `(match-datum? ,x (quote ,(cadr d)))]
+    [('bound) `(match-bound? ,x ,(nth values (cadr d)))]
+    [('check) (both `(,(nth values (cadr d)) ,x) (compile-tests (cddr d) x vars values))]
+    [else (compile-elements (cadr d) (caddr d) x vars values)]))
+
+(define (compile-tests [ds datum] [x datum] [vars datum] [values datum]) -> datum
+  (cond [(null? ds) '(always)]
+        [(null? (cdr ds)) (compile-test (car ds) x vars values)]
+        [else (both (compile-test (car ds) x vars values) (compile-tests (cdr ds) x vars values))]))
+
+(define (compile-elements [es datum] [tail datum] [r datum] [vars datum] [values datum]) -> datum
+  (cond [(null? es) (if (== (car tail) 'null) `(null? (splice-list ,r)) (compile-test tail r vars values))]
+        [(== (car (car es)) 'repeat)
+         (if (and (null? (cdr es)) (== (car tail) 'null))
+             (compile-repeat (car es) r vars values)
+             (compile-backtrack (car es) (cdr es) tail r vars values))]
+        [else
+         (let ([m (fresh 'm)] [a (fresh 'a)] [d (fresh 'd)])
+           `(let ([,m (match-pair ,r)])
+              (if ,m
+                  ,(if (== (car (car es)) 'any)
+                       `(let ([,d (cdr ,m)]) ,(test-code (compile-elements (cdr es) tail d vars values)))
+                       `(let ([,a (car ,m)] [,d (cdr ,m)])
+                          ,(test-code (both (compile-test (car es) a vars values) (compile-elements (cdr es) tail d vars values)))))
+                  0)))]))
+
+(define (acc-sets [is datum] [accs datum] [vars datum] [last i32]) -> datum
+  (for/list ([i is] [acc accs])
+    (if last `(set! ,(nth vars i) (reverse ,acc)) `(set! ,acc (cons ,(nth vars i) ,acc)))))
+
+(define (compile-repeat [e datum] [r datum] [vars datum] [values datum]) -> datum
+  (let ([p (cadr e)] [is (caddr e)])
+    (cond [(== (car p) 'var)
+           (let ([xs (fresh 'xs)]) `(let ([,xs (match-elements ,r)]) (if ,xs (begin (set! ,(nth vars (cadr p)) ,xs) 1) 0)))]
+          [(== (car p) 'any) `(if (match-elements ,r) 1 0)]
+          [else
+           (let ([ok (fresh 'ok)] [rest (fresh 'r)] [m (fresh 'm)] [a (fresh 'a)] [accs (for/list ([i is]) (fresh 'acc))])
+             `(let ([,ok i32 0] [,rest ,r] ,@(for/list ([acc accs]) `[,acc datum nil]))
+                (while 1
+                  (let ([,m (splice-list ,rest)])
+                    (if (null? ,m) (begin ,@(acc-sets is accs vars 1) (set! ,ok 1) (break)))
+                    (if (not (pair? ,m)) (break))
+                    (let ([,a (car ,m)])
+                      (if (not ,(test-code (compile-test p a vars values))) (break))
+                      ,@(acc-sets is accs vars 0)
+                      (set! ,rest (cdr ,m)))))
+                ,ok))])))
+
+(define (compile-backtrack [e datum] [es datum] [tail datum] [r datum] [vars datum] [values datum]) -> datum
+  (let ([p (cadr e)] [is (caddr e)] [ok (fresh 'ok)] [n (fresh 'n)] [rest (fresh 'r)] [m (fresh 'm)] [a (fresh 'a)]
+        [after (fresh 'after)] [i (fresh 'i)] [accs (for/list ([j (caddr e)]) (fresh 'acc))])
+    `(let ([,ok i32 0] [,n i32 0] [,rest ,r])
+       (while 1
+         (let ([,m (splice-list ,rest)])
+           (if (not (pair? ,m)) (break))
+           (let ([,a (car ,m)])
+             (if (not ,(test-code (compile-test p a vars values))) (break))
+             (+= ,n 1)
+             (set! ,rest (cdr ,m)))))
+       (while 1
+         (let ([,after (match-after ,r ,n)])
+           (if ,(test-code (compile-elements es tail after vars values))
+               (let ([,i i32 0] [,rest ,r] ,@(for/list ([acc accs]) `[,acc datum nil]))
+                 (while (< ,i ,n)
+                   (let* ([,m (splice-list ,rest)] [,a (car ,m)])
+                     ,(test-code (compile-test p a vars values))
+                     ,@(acc-sets is accs vars 0)
+                     (set! ,rest (cdr ,m))
+                     (+= ,i 1)))
+                 ,@(acc-sets is accs vars 1)
+                 (set! ,ok 1)
+                 (break))))
+         (if (== ,n 0) (break))
+         (-= ,n 1))
+       ,ok)))
+
+;; ---- for/each, for/list, for/fold ----
+
+(define (for-form [kind datum] [s datum]) -> datum
+  (let* ([parts (syntax->list s)] [n (if (!= parts 0) (length parts) 0)])
+    (case kind
+      [('for/each)
+       (unless (and (>= n 3) (!= (syntax->list (cadr parts)) 0)) (raise-syntax-error 0 '"expected (for/each (clause ...) body ...)" s))
+       (at s (src (for-loop s (syntax->list (cadr parts)) `(begin ,@(cddr parts)))))]
+      [('for/list)
+       (unless (and (>= n 3) (!= (syntax->list (cadr parts)) 0)) (raise-syntax-error 0 '"expected (for/list (clause ...) body ...)" s))
+       (let ([acc (fresh 'acc)])
+         (at s (src `(let ([,acc nil])
+                       ,(for-loop s (syntax->list (cadr parts)) `(set! ,acc (cons (begin ,@(cddr parts)) ,acc)))
+                       (reverse ,acc)))))]
+      [else
+       (let* ([accs (if (>= n 4) (syntax->list (cadr parts)) 0)]
+              [acc (if (and (!= accs 0) (pair? accs) (null? (cdr accs))) (syntax->list (car accs)) 0)])
+         (unless (and (!= acc 0) (pair? acc) (identifier? (car acc)) (pair? (cdr acc)) (null? (cddr acc))
+                      (!= (syntax->list (caddr parts)) 0))
+           (raise-syntax-error 0 '"expected (for/fold ([acc init]) (clause ...) body ...)" s))
+         (at s (src `(let ([,(car acc) ,(cadr acc)])
+                       ,(for-loop s (syntax->list (caddr parts)) `(set! ,(car acc) (begin ,@(cdddr parts))))
+                       ,(car acc)))))])))
+
+;; The lists step before the body, so that continue takes the next elements.
+(define (for-loop [s datum] [cs datum] [each datum]) -> datum
+  (let ([xs nil] [ls nil] [guard datum 0])
+    (while (pair? cs)
+      (let ([c (car cs)] [b (syntax->list (car cs))])
+        (cond [(and (== (syntax-e c) '#:when) (pair? (cdr cs)) (null? (cddr cs)))
+               (set! guard (cadr cs))
+               (set! cs nil)]
+              [(and (!= b 0) (pair? b) (pair? (cdr b)) (null? (cddr b)) (identifier? (car b)))
+               (set! xs (cons (car b) xs))
+               (set! ls (cons (cadr b) ls))
+               (set! cs (cdr cs))]
+              [else (raise-syntax-error 0 '"expected ([x list] ... [#:when test])" s)])))
+    (when (null? xs) (raise-syntax-error 0 '"expected ([x list] ... [#:when test])" s))
+    (let ([ts (for/list ([x xs]) (fresh 'l))])
+      `(let (,@(for/list ([t ts] [l (reverse ls)]) `[,t ,l]))
+         (while ,(all-pairs ts)
+           (let (,@(for/list ([x (reverse xs)] [t ts]) `[,x (car ,t)]))
+             ,@(for/list ([t ts]) `(set! ,t (cdr ,t)))
+             ,(if (!= guard 0) `(when ,guard ,each) each)))))))
+
+(define (all-pairs [ts datum]) -> datum (if (null? (cdr ts)) `(pair? ,(car ts)) `(and (pair? ,(car ts)) ,(all-pairs (cdr ts)))))
