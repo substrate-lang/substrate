@@ -7,7 +7,8 @@
 
 (provide datum srcloc scope-set
          run-arena current-arena use-arena begin-module-arena end-module-arena module-arena-mark end-module-arenas-to! alloc-in keep
-         nil boolean boolean? null? pair? cons car cdr cadr cddr caddr cdddr cadddr set-cdr! list? length reverse append sym quasiquote quoted quasisyntax
+         nil boolean boolean? null? pair? cons car cdr cadr cddr caddr cdddr cadddr set-cdr! list? length reverse append quasiquote quasisyntax
+         syntax-match _ ... ? for/each for/list for/fold fmt define-macro
          list-ref list-tail last take memq member assq assoc map for-each filter andmap ormap sort
          equal? datum-hash datum-ref datum-set! datum-get datum-put! arena-table make-table table-ref table-set! table-count
          make-record make-record-in record? record-kind record-pointer
@@ -21,7 +22,7 @@
          write-datum write-scoped write-to format-message format buffer-add-utf-8!
          compile-error raise-compile-error write-compile-error
          make-transformer make-function-transformer transformer? transformer-env call-transformer
-         raise-syntax-error match-pair match-datum? match-bound? match-elements match-after match-failure local-binding set-queries! syntax-local-value free-identifier=? identifier-binding-kind
+         raise-syntax-error local-binding set-queries! syntax-local-value free-identifier=? identifier-binding-kind
          identifier-function-signature local-expand syntax-local-lift-definition syntax-local-introduce
          syntax-local-facts identifier-name name-identifier substrate-form
          set-scope-map! literal-buffer deserialize
@@ -49,10 +50,29 @@
 
 ;; ---- fixnums ----
 
-(func (fixnum-bit [d i32]) #:inline -> i32 (i32.and d 1))
-(func (fixnum-shift [d i32]) #:inline -> i32 (i32.shr_s d 1))
-(func (fixnum-tag [n i32]) #:inline -> i32 (i32.or (i32.shl n 1) 1))
-(func (cell-datum [d i32]) #:inline -> i32 (select 0 d (i32.and d 1)))
+;; A datum is a pointer to its cell, or a fixnum, the integer n as 2n + 1, which has no cell.
+(define (fixnum-datum? [d datum]) #:inline -> i32 (bit-and (cast i32 d) 1))
+(define (fixnum-of [d datum]) #:inline -> i32 (>> (cast i32 d) 1))
+(define (make-fixnum [n i32]) #:inline -> datum (cast datum (bit-or (<< n 1) 1)))
+(define (cell-of [d datum]) #:inline -> datum (cast datum (select 0 d (fixnum-datum? d))))
+
+;; ---- forms on data ----
+
+;; The compiler's: the code they make means what it would here. A cell is made the size of its
+;; case, (make-cell (pair a d)) or (make-cell-in arena c).
+(define-syntax make-cell (quote-syntax (#%form make-cell)))
+(define-syntax make-cell-in (quote-syntax (#%form make-cell)))
+(define-syntax quasiquote (quote-syntax (#%form quasiquote)))
+(define-syntax quasisyntax (quote-syntax (#%form quasisyntax)))
+(define-syntax syntax-match (quote-syntax (#%form syntax-match)))
+(define-syntax _ (quote-syntax (#%form pattern-word)))
+(define-syntax ... (quote-syntax (#%form pattern-word)))
+(define-syntax ? (quote-syntax (#%form pattern-word)))
+(define-syntax for/each (quote-syntax (#%form for/each)))
+(define-syntax for/list (quote-syntax (#%form for/list)))
+(define-syntax for/fold (quote-syntax (#%form for/fold)))
+(define-syntax fmt (quote-syntax (#%form fmt)))
+(define-syntax define-macro (quote-syntax (#%form define-macro)))
 
 (define (fail [message (ptr u8)]) -> datum
   (print:host-trap (cast i32 message) (strlen message))
@@ -110,29 +130,6 @@
         (arena-alloc a n)
         (begin (set! (-> a next) (+ p n)) p))))
 
-(begin-for-syntax
-  (require k kernel)
-  (require sm "syntax-match.sub" syntax-match _ ... ?)
-  (require-unqualified kf "kernel-forms.sub")
-  ;; A cell is its tag and its fields, 4 bytes each, which every case's are.
-  (func (cell-size [c i32]) -> i32
-    (k:datum->syntax #'here (k:fixnum (i32.add 4 (i32.mul 4 (if (k:identifier? c) 0 (i32.sub (k:length (k:syntax->list c)) 1))))) '#f))
-  (func (make-cell-form [s i32]) -> i32
-    (syntax-match s [(_ c) #`(let ([p (cell-bytes #,(cell-size c))]) (set! (@ p) #,c) p)]))
-  (func (fixnum-datum?-form [s i32]) -> i32 (syntax-match s [(_ d) #`(fixnum-bit (cast i32 #,d))]))
-  (func (fixnum-of-form [s i32]) -> i32 (syntax-match s [(_ d) #`(fixnum-shift (cast i32 #,d))]))
-  (func (make-fixnum-form [s i32]) -> i32 (syntax-match s [(_ n) #`(cast datum (fixnum-tag #,n))]))
-  (func (cell-of-form [s i32]) -> i32 (syntax-match s [(_ d) #`(cast datum (cell-datum (cast i32 #,d)))]))
-  (func (make-cell-in-form [s i32]) -> i32
-    (syntax-match s [(_ a c) #`(let ([p (cast datum (alloc-in #,a #,(cell-size c)))]) (set! (@ p) #,c) p)])))
-
-(define-syntax make-cell make-cell-form)
-(define-syntax make-cell-in make-cell-in-form)
-(define-syntax fixnum-datum? fixnum-datum?-form)
-(define-syntax fixnum-of fixnum-of-form)
-(define-syntax make-fixnum make-fixnum-form)
-(define-syntax cell-of cell-of-form)
-
 ;; ---- cells' bytes ----
 
 (define (cell-bytes [n u32]) -> datum
@@ -144,101 +141,6 @@
           (cast datum p)))))
 
 (define (held-bytes [n u32]) -> (ptr u8) (cast (ptr u8) (alloc-in current n)))
-
-;; ---- constants and templates ----
-
-(begin-for-syntax
-  (global constant-table (mut i32) 0)
-  (global counter (mut i32) 0)
-
-  (func (constants) -> i32
-    (when (i32.eqz constant-table) (set! constant-table (k:make-table)))
-    constant-table)
-
-  (func (constant-global [d i32] [code i32]) -> i32
-    (let ([known (k:datum-get (constants) d)])
-      (if known
-          (k:syntax-local-introduce known)
-          (let ([g (begin (set! counter (i32.add counter 1))
-                          (syn (k:string->symbol (k:format '"constant~a" `(,(k:fixnum counter))))))])
-            (drop (k:syntax-local-lift-definition #`(define #,g datum #,code)))
-            (k:datum-put! (constants) d (k:syntax-local-introduce g))
-            g))))
-
-  (func (syn [d i32]) -> i32 (k:datum->syntax #'here d 0))
-
-  (func (true? [d i32]) -> i32 (and (k:boolean? d) (i32.ne d 0)))
-
-  (func (datum-code [d i32]) -> i32
-    (cond [(k:symbol? d) #`(symbol-named #,(syn (k:symbol->string d)))]
-          [(k:keyword? d) (let ([n (k:keyword->string d)]) #`(bytes->keyword #,(syn n) #,(syn (k:fixnum (k:string-length n)))))]
-          [(k:string? d) #`(bytes->string #,(syn d) #,(syn (k:fixnum (k:string-length d))))]
-          [(k:null? d) #'nil]
-          [(k:pair? d) #`(cons #,(datum-code (k:car d)) #,(datum-code (k:cdr d)))]
-          [(true? d) #'(boolean 1)]
-          [(i32.eqz d) #'0]
-          [(k:integer? d) #`(make-integer #,(syn d))]
-          [(k:flonum? d) #`(make-flonum #,(syn d))]
-          [(k:char? d) #`(integer->char #,(syn (k:fixnum (k:char->integer d))))]
-          [else (k:raise-syntax-error 'quasiquote '"this datum cannot be in a template" (syn d))]))
-
-  (func (constant [t i32]) -> i32
-    (let ([d (k:syntax->datum t)])
-      (cond [(k:null? d) #'nil]
-            [(i32.eqz d) #'0]
-            [(true? d) #'(boolean 1)]
-            [else (constant-global d (datum-code d))])))
-
-  (func (named? [x i32] [name i32]) -> i32 (and (k:identifier? x) (i32.eq (k:syntax-e x) name)))
-  (func (splice? [x i32]) -> i32 (let ([e (and (k:syntax? x) (k:syntax-e x))]) (and (k:pair? e) (named? (k:car e) 'unquote-splicing))))
-
-  (func (constant? [t i32]) -> i32
-    (let ([e (if (k:syntax? t) (k:syntax-e t) t)])
-      (or (i32.eqz (k:pair? e))
-          (and (i32.eqz (named? (k:car e) 'unquote)) (i32.eqz (named? (k:car e) 'unquote-splicing))
-               (constant? (k:car e)) (constant? (k:cdr e))))))
-
-  (func (template [t i32]) -> i32
-    (cond [(constant? t) (constant t)]
-          [(named? (k:car (k:syntax-e t)) 'unquote) (k:cadr (k:syntax-e t))]
-          [else (template-list (k:syntax-e t))]))
-
-  (func (template-list [l i32]) -> i32
-    (cond [(constant? l) (constant l)]
-          [(k:syntax? l) (template l)]
-          [(named? (k:car l) 'unquote) (k:cadr l)]
-          [(splice? (k:car l)) #`(append #,(k:cadr (k:syntax-e (k:car l))) #,(template-list (k:cdr l)))]
-          [else #`(cons #,(template (k:car l)) #,(template-list (k:cdr l)))]))
-
-  (func (sym-form [s i32]) -> i32 (syntax-match s [(_ (? k:identifier? x)) (constant-global (k:syntax-e x) (datum-code (k:syntax-e x)))]))
-  (func (quasiquote-form [s i32]) -> i32 (syntax-match s [(_ t) (template t)]))
-  (func (quoted-form [s i32]) -> i32 (syntax-match s [(_ d) (constant d)]))
-
-  (func (syntax-constant? [t i32]) -> i32
-    (let ([e (if (k:syntax? t) (k:syntax-e t) t)])
-      (or (i32.eqz (k:pair? e))
-          (and (i32.eqz (named? (k:car e) 'unsyntax)) (i32.eqz (named? (k:car e) 'unsyntax-splicing))
-               (syntax-constant? (k:car e)) (syntax-constant? (k:cdr e))))))
-
-  (func (syntax-template [t i32]) -> i32
-    (cond [(syntax-constant? t) #`(quote-syntax #,t)]
-          [(named? (k:car (k:syntax-e t)) 'unsyntax) (k:cadr (k:syntax-e t))]
-          [else #`(syntax-rewrap (quote-syntax #,(k:syntax-rewrap t '())) #,(syntax-template-list (k:syntax-e t)))]))
-
-  (func (syntax-template-list [l i32]) -> i32
-    (cond [(k:null? l) #'nil]
-          [(k:syntax? l) (syntax-template l)]
-          [(named? (k:car l) 'unsyntax) (k:cadr l)]
-          [(and (k:syntax? (k:car l)) (k:pair? (k:syntax-e (k:car l))) (named? (k:car (k:syntax-e (k:car l))) 'unsyntax-splicing))
-           #`(append #,(k:cadr (k:syntax-e (k:car l))) #,(syntax-template-list (k:cdr l)))]
-          [else #`(cons #,(syntax-template (k:car l)) #,(syntax-template-list (k:cdr l)))]))
-
-  (func (quasisyntax-form [s i32]) -> i32 (syntax-match s [(_ t) (syntax-template t)])))
-
-(define-syntax sym sym-form)
-(define-syntax quasiquote quasiquote-form)
-(define-syntax quoted quoted-form)
-(define-syntax quasisyntax quasisyntax-form)
 
 ;; ---- lists ----
 
@@ -535,6 +437,19 @@
 (define (symbol? [d datum]) -> i32 (match (cell-of d) [(symbol a b c) 1] [_ 0]))
 (define (bytes->symbol [p (ptr u8)] [n u32]) -> datum (intern p n 0))
 (define (symbol-named [s (ptr u8)]) -> datum (intern s (strlen s) 0))
+
+;; Symbols this module's code compares with, made as it starts: it cannot quote them, as it defines
+;; quoted data.
+(define core-symbol datum (symbol-named "core"))
+(define local-binding-symbol datum (symbol-named "%local-binding"))
+(define quote-symbol datum (symbol-named "quote"))
+(define quasiquote-symbol datum (symbol-named "quasiquote"))
+(define unquote-symbol datum (symbol-named "unquote"))
+(define unquote-splicing-symbol datum (symbol-named "unquote-splicing"))
+(define quote-syntax-symbol datum (symbol-named "quote-syntax"))
+(define quasisyntax-symbol datum (symbol-named "quasisyntax"))
+(define unsyntax-symbol datum (symbol-named "unsyntax"))
+(define unsyntax-splicing-symbol datum (symbol-named "unsyntax-splicing"))
 (define (string->symbol [s datum]) -> datum (intern (string-bytes s) (string-length s) 0))
 
 (define (symbol-bytes [s datum]) -> (ptr u8)
@@ -845,7 +760,7 @@
 (define (core-name? [name datum]) -> i32
   (let ([known (table-ref core-names (cast u64 name))])
     (when (== known 0)
-      (set! known (if (== (identifier-binding-kind (make-syntax name core-scopes 0 nil)) (sym core)) 1 2))
+      (set! known (if (== (identifier-binding-kind (make-syntax name core-scopes 0 nil)) core-symbol) 1 2))
       (table-set! core-names (cast u64 name) known))
     (== known 1)))
 
@@ -977,14 +892,14 @@
 (define (abbreviation [d datum]) -> (ptr u8)
   (let ([head (car d)] [rest (cdr d)])
     (cond [(or (not (pair? rest)) (not (null? (cdr rest)))) 0]
-          [(== head (sym quote)) "'"]
-          [(== head (sym quasiquote)) "`"]
-          [(== head (sym unquote)) ","]
-          [(== head (sym unquote-splicing)) ",@"]
-          [(== head (sym quote-syntax)) "#'"]
-          [(== head (sym quasisyntax)) "#`"]
-          [(== head (sym unsyntax)) "#,"]
-          [(== head (sym unsyntax-splicing)) "#,@"]
+          [(== head quote-symbol) "'"]
+          [(== head quasiquote-symbol) "`"]
+          [(== head unquote-symbol) ","]
+          [(== head unquote-splicing-symbol) ",@"]
+          [(== head quote-syntax-symbol) "#'"]
+          [(== head quasisyntax-symbol) "#`"]
+          [(== head unsyntax-symbol) "#,"]
+          [(== head unsyntax-splicing-symbol) "#,@"]
           [else 0])))
 
 (define (write-scopes [b (ptr buffer)] [s (ptr scope-set)])
@@ -1140,7 +1055,7 @@
         [(null? (cddr ts)) (format-message "~a or ~a" ts)]
         [else (format-message "~a, ~a" `(,(car ts) ,(alternatives (cdr ts))))]))
 
-(define (local-binding [id datum]) -> datum (syntax-property id (sym %local-binding)))
+(define (local-binding [id datum]) -> datum (syntax-property id local-binding-symbol))
 
 ;; ---- expander queries ----
 
