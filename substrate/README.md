@@ -13,8 +13,9 @@ compiler is written in it, builds itself, and runs in a browser.
   forms. `substrate.sub` is the language every module is in unless its
   first form names another: it binds the forms, and holds the memory, the
   stack and Substrate's library. `syntax.sub` holds the data and syntax
-  objects that macros work on, and binds the forms on them, `quasiquote` and
-  `syntax-match` among them, whose code is `macros.sub`'s.
+  objects that macros work on. `macros.sub` defines the macro tools on them,
+  `syntax-match` and `quasiquote` among them, as ordinary macros, and passes
+  on `syntax.sub`: a module that writes macros requires it.
 - `lib/`: languages written in Substrate: `scheme/`, a Scheme;
   `bend/`, a dependently typed language; and, experimental, `shade/`, GPU
   programs compiled to WGSL, and `web/`, programs in a web page, a game

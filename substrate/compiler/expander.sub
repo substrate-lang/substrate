@@ -1,7 +1,7 @@
 ;; The expander: syntax to lowered code, with modules, the cache and sessions.
 ;; What lasts the whole run is in the run's arena (keep); what a module's expansion
 ;; makes is in its module arena, freed when the module is done.
-(require-unqualified syntax "syntax.sub")
+(require-unqualified macros "macros.sub")
 (require-unqualified core "core.sub")
 (require-unqualified ops "ops.sub")
 (require-unqualified rd "reader.sub")
@@ -171,23 +171,24 @@
     (set! g (group-module-at path))
     (when (== g 0) (fail-at 0 "~a requires itself while compiling, which only a module the running compiler shares can" (list1 path)))
     (set! m (running-unit g path))
-    (hash-set! (& units-by-hash) (cast u64 (string->symbol g)) (cast u32 m))
+    (hash-set! (& units-by-hash) (cast u64 (string->symbol path)) (cast u32 m))
     (set! running-copies (keep-cons (cons (keep path) m) running-copies))
     m))
 
 (define (running-copy-of [name datum]) -> datum
   (let ([l running-copies])
     (while (pair? l)
-      (when (string=? (-> (unit-of (cdr (car l))) hash) name) (return (cdr (car l))))
+      (when (string=? (-> (unit-of (cdr (car l))) name) name) (return (cdr (car l))))
       (set! l (cdr l)))
     0))
 
 (define (running-instance? [name datum]) -> i32 (or (syntax-instance? name) (!= (running-copy-of name) 0)))
 
-;; The running compiler's module of wasm name, as a unit that provides its functions and tags.
+;; The running compiler's module of wasm name, as a unit that provides its functions and tags. Its
+;; hash is its path: what requires it must not change with each build of the compiler.
 (define (running-unit [name datum] [path datum]) -> datum
   (let* ([bytes (running-bytes name)] [exports (wasm-module-exports (string-bytes bytes) (string-length bytes))]
-         [provides nil] [m (new-unit path path)])
+         [provides nil] [m (new-unit path name)])
     (while (pair? exports)
       (let* ([e (car exports)] [named (string->symbol (cadr e))]
              [info (if (== (car e) 'func)
@@ -197,7 +198,7 @@
         (set! provides (cons (cons named `(,(if (== (car e) 'func) 'func 'tag) ,info)) provides)))
       (set! exports (cdr exports)))
     (set! (-> (unit-of m) provides) (keep (sort provides (lambda ([a datum] [b datum]) -> i32 (symbol<? (car a) (car b))))))
-    (set! (-> (unit-of m) hash) (keep name))
+    (set! (-> (unit-of m) hash) (keep path))
     (set! (-> (unit-of m) state) 'done)
     m))
 
@@ -256,6 +257,10 @@
   (when (== group-paths 0)
     (set! group-paths (keep (map (lambda ([g datum]) -> datum (cons (recorded-path (running-bytes g)) g)) running-group))))
   (let ([e (assoc path group-paths)]) (if (!= e 0) (cdr e) 0)))
+
+;; Every use of a macro tool runs the running compiler's macros.sub, which none of the compiler's
+;; code calls: this reference keeps it in the compiler's program.
+(define macro-tools (fn (datum datum) -> datum) syntax-match-expansion)
 
 ;; Binds the core forms and instructions in every phase, gives macros the expander's answers to
 ;; their questions, and finds the syntax module among the running program's modules.
@@ -2334,13 +2339,22 @@
 (define dependencies-of datum 0)
 (define dependencies-requires datum 0)
 (define dependencies-list datum 0)
+;; Each dependency's place in the list, from 1, by its shift-key.
+(define dependency-places (ptr hash-table) 0)
 
 (define (dependencies) -> datum
   (let ([m (-> current module)])
     (unless (and (== m dependencies-of) (== (-> (unit-of m) requires) dependencies-requires))
       (set! dependencies-of m)
       (set! dependencies-requires (-> (unit-of m) requires))
-      (set! dependencies-list (keep (reverse (visit-dependencies m 0 (make-table) nil)))))
+      (set! dependencies-list (keep (reverse (visit-dependencies m 0 (make-table) nil))))
+      (let ([saved (use-arena (& run-arena))] [l dependencies-list] [i u32 1])
+        (set! dependency-places (make-table))
+        (while (pair? l)
+          (hash-set! dependency-places (shift-key (car (car l)) (cast u32 (integer-value (cdr (car l))))) i)
+          (+= i 1)
+          (set! l (cdr l)))
+        (use-arena saved)))
     dependencies-list))
 
 (define (visit-dependencies [m datum] [shift u32] [seen (ptr hash-table)] [out datum]) -> datum
@@ -2352,19 +2366,27 @@
       (set! rs (cdr rs))))
   (cons (cons m (make-integer shift)) out))
 
+;; The facts about id's binding that the module's dependencies hold, in the dependencies' order:
+;; each fact's module is looked up at the shift that brings the fact to this phase.
 (define (query-local-facts [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "syntax-local-facts: expected an identifier" nil))
-  (let* ([facts (reverse (cast datum (hash-ref (& facts-by-key) (cast u64 (fact-key id api-phase)))))]
-         [deps (if (null? facts) nil (dependencies))] [out nil])
-    (while (pair? deps)
-      (let ([m (car (car deps))] [shift (cast u32 (integer-value (cdr (car deps))))] [fs facts])
-        (while (pair? fs)
-          (let ([f (car fs)])
-            (when (and (== (car f) m) (== (+ (cast i32 (integer-value (cadr f))) (cast i32 shift)) api-phase))
-              (set! out (cons `(,(string->symbol (-> (unit-of m) path)) ,(cadr f) ,(shift-fact (caddr f) shift)) out))))
-          (set! fs (cdr fs))))
-      (set! deps (cdr deps)))
-    (reverse out)))
+  (let ([facts (reverse (cast datum (hash-ref (& facts-by-key) (cast u64 (fact-key id api-phase)))))] [found nil])
+    (when (pair? facts) (dependencies))
+    (while (pair? facts)
+      (let* ([f (car facts)] [shift (- api-phase (cast i32 (integer-value (cadr f))))]
+             [place (if (>= shift 0) (hash-ref dependency-places (shift-key (car f) (cast u32 shift))) 0)])
+        (when (!= place 0)
+          (set! found (by-place (cons (make-integer place)
+                                      `(,(string->symbol (-> (unit-of (car f)) path)) ,(cadr f) ,(shift-fact (caddr f) (cast u32 shift))))
+                                found))))
+      (set! facts (cdr facts)))
+    (map (lambda ([p datum]) -> datum (cdr p)) found)))
+
+;; x put into l, which is in order of place, after those of its place.
+(define (by-place [x datum] [l datum]) -> datum
+  (if (and (pair? l) (<= (integer-value (car (car l))) (integer-value (car x))))
+      (cons (car l) (by-place x (cdr l)))
+      (cons x l)))
 
 (define fact-shift u32 0)
 (define (shift-by-fact-shift [s (ptr scope-set)]) -> (ptr scope-set) (shift-scopes s fact-shift))
