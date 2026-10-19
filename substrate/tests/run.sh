@@ -94,12 +94,11 @@ done
 stale="$builds/stale"
 rm -rf "${stale:?}"
 mkdir -p "$stale"
-print="(require print \"$root/compiler/print.sub\" write-int newline)"
 printf '(provide x)\n(func (x) -> i32 1)\n' > "$stale/b.sub"
-printf '%s\n(require b "b.sub" x)\n(func (main) (write-int (x)) (newline))\n' "$print" > "$stale/a.sub"
+printf '(require b "b.sub" x)\n(func (main) (write-int (x)) (newline))\n' > "$stale/a.sub"
 first="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
 rm "$stale/b.sub"
-printf '%s\n(func (main) (write-int 2) (newline))\n' "$print" > "$stale/a.sub"
+printf '(func (main) (write-int 2) (newline))\n' > "$stale/a.sub"
 second="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
 if [ "$first" = 1 ] && [ "$second" = 2 ]; then
   pass=$((pass + 1))
@@ -119,7 +118,7 @@ from_changed() {
   "$host" "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
     -p "$root/$changed" -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
 }
-echo ';; changed' >> "$changed/compiler/substrate/lang.sub"
+echo ';; changed' >> "$changed/compiler/substrate.sub"
 sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' "$changed/compiler/kernel.sub"
 if [ "$(from_changed)" = "$(cat tests/substrate/forms.out)" ]; then
   pass=$((pass + 1))

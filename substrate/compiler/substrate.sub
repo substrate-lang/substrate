@@ -1,0 +1,419 @@
+;; Substrate: C's types, memory and control as s-expressions, compiled to wasm. Every module is in
+;; it unless it requires another language. The compiler implements its forms; this module binds
+;; them, and holds what the code they make relies on, with Substrate's library: the memory and the
+;; stack, output, math, an allocator, arenas, buffers and hash tables.
+
+(provide define struct union variant match exception throw try lambda inst typedef const let let* set! func global
+         #%datum #%top-interaction #%module-begin
+         when unless cond case while for break continue rethrow and or not cast sizeof offsetof array-of @ & ->
+         + - * / % == != < <= > >= bit-and bit-or bit-xor bit-not << >>
+         += -= *= /= %= <<= >>= bit-and= bit-or= bit-xor=
+         heap-start sbrk reset-stack!
+         host-write host-trap write-bytes write-byte newline write-int write-i64 write-u64
+         sqrt fabs floor ceil trunc nearbyint copysign sqrtf fabsf floorf ceilf truncf nearbyintf copysignf
+         malloc calloc realloc free memcpy memset memcmp strlen print-string arena make-arena arena-alloc arena-free new
+         buffer make-buffer buffer-add! buffer-add-byte! buffer-add-string! buffer-free!
+         hash-table hash-ref hash-set! hash-clear! hash-free!)
+
+;; ---- the forms ----
+
+(define-syntax #%module-begin (quote-syntax (#%form #%module-begin)))
+(define-syntax #%top-interaction (quote-syntax (#%form #%top-interaction)))
+(define-syntax define (quote-syntax (#%form define)))
+(define-syntax substrate-body (quote-syntax (#%form substrate-body)))
+(define-syntax substrate-static (quote-syntax (#%form substrate-static)))
+(define-syntax struct (quote-syntax (#%form struct)))
+(define-syntax union (quote-syntax (#%form union)))
+(define-syntax variant (quote-syntax (#%form variant)))
+(define-syntax match (quote-syntax (#%form match)))
+(define-syntax exception (quote-syntax (#%form exception)))
+(define-syntax throw (quote-syntax (#%form throw)))
+(define-syntax try (quote-syntax (#%form try)))
+(define-syntax lambda (quote-syntax (#%form lambda)))
+(define-syntax inst (quote-syntax (#%form inst)))
+(define-syntax substrate-struct-check (quote-syntax (#%form substrate-struct-check)))
+(define-syntax typedef (quote-syntax (#%form typedef)))
+(define-syntax const (quote-syntax (#%form const)))
+(define-syntax let (quote-syntax (#%form let)))
+(define-syntax let* (quote-syntax (#%form let*)))
+;; The seed's checker names let and let* so in the code it makes.
+(define-syntax substrate-let (quote-syntax (#%form let)))
+(define-syntax substrate-let* (quote-syntax (#%form let*)))
+(define-syntax #%datum (quote-syntax (#%form #%datum)))
+(define-syntax when (quote-syntax (#%form when)))
+(define-syntax unless (quote-syntax (#%form unless)))
+(define-syntax cond (quote-syntax (#%form cond)))
+(define-syntax case (quote-syntax (#%form case)))
+(define-syntax array-of (quote-syntax (#%form array-of)))
+(define-syntax while (quote-syntax (#%form while)))
+(define-syntax for (quote-syntax (#%form for)))
+(define-syntax cast (quote-syntax (#%form cast)))
+(define-syntax sizeof (quote-syntax (#%form sizeof)))
+(define-syntax offsetof (quote-syntax (#%form offsetof)))
+(define-syntax -> (quote-syntax (#%form ->)))
+(define-syntax & (quote-syntax (#%form &)))
+(define-syntax set! (quote-syntax (#%form mark (#%substrate-set!))))
+(define-syntax @ (quote-syntax (#%form mark (#%substrate-deref))))
+(define-syntax break (quote-syntax (#%form mark (#%substrate-break))))
+(define-syntax continue (quote-syntax (#%form mark (#%substrate-continue))))
+(define-syntax rethrow (quote-syntax (#%form mark (#%substrate-rethrow))))
+(define-syntax + (quote-syntax (#%form mark (#%substrate-op +))))
+(define-syntax - (quote-syntax (#%form mark (#%substrate-op -))))
+(define-syntax * (quote-syntax (#%form mark (#%substrate-op *))))
+(define-syntax / (quote-syntax (#%form mark (#%substrate-op /))))
+(define-syntax % (quote-syntax (#%form mark (#%substrate-op %))))
+(define-syntax == (quote-syntax (#%form mark (#%substrate-op ==))))
+(define-syntax != (quote-syntax (#%form mark (#%substrate-op !=))))
+(define-syntax < (quote-syntax (#%form mark (#%substrate-op <))))
+(define-syntax <= (quote-syntax (#%form mark (#%substrate-op <=))))
+(define-syntax > (quote-syntax (#%form mark (#%substrate-op >))))
+(define-syntax >= (quote-syntax (#%form mark (#%substrate-op >=))))
+(define-syntax and (quote-syntax (#%form mark (#%substrate-op and))))
+(define-syntax or (quote-syntax (#%form mark (#%substrate-op or))))
+(define-syntax not (quote-syntax (#%form mark (#%substrate-op not))))
+(define-syntax bit-and (quote-syntax (#%form mark (#%substrate-op bit-and))))
+(define-syntax bit-or (quote-syntax (#%form mark (#%substrate-op bit-or))))
+(define-syntax bit-xor (quote-syntax (#%form mark (#%substrate-op bit-xor))))
+(define-syntax bit-not (quote-syntax (#%form mark (#%substrate-op bit-not))))
+(define-syntax << (quote-syntax (#%form mark (#%substrate-op <<))))
+(define-syntax >> (quote-syntax (#%form mark (#%substrate-op >>))))
+(define-syntax += (quote-syntax (#%form mark (#%substrate-update +))))
+(define-syntax -= (quote-syntax (#%form mark (#%substrate-update -))))
+(define-syntax *= (quote-syntax (#%form mark (#%substrate-update *))))
+(define-syntax /= (quote-syntax (#%form mark (#%substrate-update /))))
+(define-syntax %= (quote-syntax (#%form mark (#%substrate-update %))))
+(define-syntax <<= (quote-syntax (#%form mark (#%substrate-update <<))))
+(define-syntax >>= (quote-syntax (#%form mark (#%substrate-update >>))))
+(define-syntax bit-and= (quote-syntax (#%form mark (#%substrate-update bit-and))))
+(define-syntax bit-or= (quote-syntax (#%form mark (#%substrate-update bit-or))))
+(define-syntax bit-xor= (quote-syntax (#%form mark (#%substrate-update bit-xor))))
+(define-syntax func (quote-syntax (#%form func)))
+(define-syntax global (quote-syntax (#%form global)))
+(define-syntax substrate-value (quote-syntax (#%form substrate-value)))
+;; (new arena type): a new type in arena.
+(define-syntax new (quote-syntax (#%form new)))
+
+;; ---- memory and the stack ----
+
+(memory 1)
+
+;; Table index 0 holds no function: it is the null function pointer.
+(table 1)
+
+;; The bytes below heap-start are output's scratch space.
+(global heap-start i32 1024)
+
+;; Memory past the heap's end has not been given out, so it is zero.
+(global brk (mut i32) heap-start)
+
+;; Memory grows by at least as much as it has: an engine may pay for each growth, as V8 does.
+(func (sbrk [n i32]) -> i32
+  (let* ([p brk] [end (i32.and (i32.add (i32.add brk n) 7) -8)] [size (i32.shl (memory.size) 16)]
+         [need (i32.shr_u (i32.add (i32.sub end size) 65535) 16)])
+    (if (i32.gt_u end size)
+        (if (i32.lt_s (memory.grow (if (i32.gt_u (memory.size) need) (memory.size) need)) 0)
+            (if (i32.lt_s (memory.grow need) 0) (return 0))))
+    (set! brk end)
+    p))
+
+;; 4 MiB, as deep as the engine's own call stack.
+(global stack-base (mut i32) (sbrk 4194304))
+(global sp (mut i32) (i32.add stack-base 4194304))
+
+;; Call it first thing after a trap, which abandons the running functions' frames without
+;; popping them.
+(func (reset-stack!) (set! sp (i32.add stack-base 4194304)))
+
+;; ---- output ----
+
+;; The host's write and trap, which any code may call. Their pointers are typed, so a caller passes
+;; them without casts.
+(import write "host" "write" (i32 i32 i32 -> i32))
+(import trap "host" "trap" (i32 i32 ->))
+(define (host-write [fd i32] [p (ptr u8)] [n i32]) #:inline -> i32 (write fd (cast i32 p) n))
+(define (host-trap [p (ptr u8)] [n i32]) #:inline (trap (cast i32 p) n))
+
+(func (write-bytes [p i32] [n i32]) (drop (write 1 p n)))
+(func (write-byte [b i32]) (i32.store8 0 b) (write-bytes 0 1))
+(func (newline) (write-byte 10))
+
+(func (write-int [n i32])
+  (let ([p 64] [u n] [neg (i32.lt_s n 0)])
+    (if neg (set! u (i32.sub 0 n)))
+    (block done
+      (loop next
+        (set! p (i32.sub p 1))
+        (i32.store8 p (i32.add 48 (i32.rem_u u 10)))
+        (set! u (i32.div_u u 10))
+        (br-if done (i32.eqz u))
+        (br next)))
+    (if neg
+        (begin (set! p (i32.sub p 1)) (i32.store8 p 45)))
+    (write-bytes p (i32.sub 64 p))))
+
+(func (write-u64 [n i64])
+  (let ([p 96] [u n])
+    (block done
+      (loop next
+        (set! p (i32.sub p 1))
+        (i32.store8 p (i32.add 48 (i32.wrap_i64 (i64.rem_u u 10))))
+        (set! u (i64.div_u u 10))
+        (br-if done (i64.eqz u))
+        (br next)))
+    (write-bytes p (i32.sub 96 p))))
+
+(func (write-i64 [n i64])
+  (if (i64.lt_s n 0)
+      (begin (write-byte 45) (write-u64 (i64.sub 0 n)))
+      (write-u64 n)))
+
+;; ---- math ----
+
+;; C's math functions that a wasm instruction computes exactly as C does.
+;; No fmin or fmax: wasm's min and max give NaN for a NaN argument, C's give the other.
+
+(func (sqrt [x f64]) #:inline -> f64 (f64.sqrt x))
+(func (fabs [x f64]) #:inline -> f64 (f64.abs x))
+(func (floor [x f64]) #:inline -> f64 (f64.floor x))
+(func (ceil [x f64]) #:inline -> f64 (f64.ceil x))
+(func (trunc [x f64]) #:inline -> f64 (f64.trunc x))
+(func (nearbyint [x f64]) #:inline -> f64 (f64.nearest x))
+(func (copysign [x f64] [y f64]) #:inline -> f64 (f64.copysign x y))
+
+(func (sqrtf [x f32]) #:inline -> f32 (f32.sqrt x))
+(func (fabsf [x f32]) #:inline -> f32 (f32.abs x))
+(func (floorf [x f32]) #:inline -> f32 (f32.floor x))
+(func (ceilf [x f32]) #:inline -> f32 (f32.ceil x))
+(func (truncf [x f32]) #:inline -> f32 (f32.trunc x))
+(func (nearbyintf [x f32]) #:inline -> f32 (f32.nearest x))
+(func (copysignf [x f32] [y f32]) #:inline -> f32 (f32.copysign x y))
+
+;; ---- the allocator, memory functions, arenas, buffers, hash tables ----
+
+(struct header [next (ptr header)] [size u32])
+
+(define base header)
+(define freep (ptr header) 0)
+
+(define small u32 512)
+(define smalls (array (ptr header) 513))
+
+(define (malloc [n u32]) -> (ptr void)
+  (let ([units (+ (/ (+ n (sizeof header) -1) (sizeof header)) 1)] [prev freep])
+    (when (and (<= units small) (!= (@ smalls units) 0))
+      (let ([b (@ smalls units)])
+        (set! (@ smalls units) (-> b next))
+        (return (+ b 1))))
+    (when (== prev 0)
+      (set! (-> base next) (& base))
+      (set! freep (& base))
+      (set! prev freep))
+    (let ([p (-> prev next)])
+      (while 1
+        (when (>= (-> p size) units)
+          (if (== (-> p size) units)
+              (set! (-> prev next) (-> p next))
+              (begin
+                (-= (-> p size) units)
+                (+= p (-> p size))
+                (set! (-> p size) units)))
+          (set! freep prev)
+          (return (+ p 1)))
+        (when (== p freep)
+          (set! p (more-memory units))
+          (when (== p 0) (return 0)))
+        (set! prev p)
+        (set! p (-> p next))))
+    0))
+
+(define (more-memory [units u32]) -> (ptr header)
+  (let* ([n (if (< units 1024) 1024 units)] [p (cast (ptr header) (sbrk (* n (sizeof header))))])
+    (if (== p 0)
+        0
+        (begin (set! (-> p size) n) (free-block p) freep))))
+
+(define (free [block (ptr void)])
+  (when (!= block 0)
+    (let ([b (- (cast (ptr header) block) 1)])
+      (if (<= (-> b size) small)
+          (begin
+            (set! (-> b next) (@ smalls (-> b size)))
+            (set! (@ smalls (-> b size)) b))
+          (free-block b)))))
+
+(define (free-block [b (ptr header)])
+  (let ([p freep])
+    (while (not (and (> b p) (< b (-> p next))))
+      (when (and (>= p (-> p next)) (or (> b p) (< b (-> p next))))
+        (break))
+      (set! p (-> p next)))
+    (if (== (+ b (-> b size)) (-> p next))
+        (begin
+          (+= (-> b size) (-> p next size))
+          (set! (-> b next) (-> p next next)))
+        (set! (-> b next) (-> p next)))
+    (if (== (+ p (-> p size)) b)
+        (begin
+          (+= (-> p size) (-> b size))
+          (set! (-> p next) (-> b next)))
+        (set! (-> p next) b))
+    (set! freep p)))
+
+(define (calloc [count u32] [size u32]) -> (ptr void)
+  (let ([p (malloc (* count size))])
+    (when (!= p 0) (memset p 0 (* count size)))
+    p))
+
+(define (realloc [block (ptr void)] [n u32]) -> (ptr void)
+  (if (== block 0)
+      (malloc n)
+      (let ([old (* (- (-> (- (cast (ptr header) block) 1) size) 1) (sizeof header))] [p (malloc n)])
+        (when (!= p 0)
+          (memcpy p block (if (< n old) n old))
+          (free block))
+        p)))
+
+(define (memcpy [to (ptr void)] [from (ptr void)] [n u32]) -> (ptr void)
+  (memory.copy to from n)
+  to)
+
+(define (memset [to (ptr void)] [byte i32] [n u32]) -> (ptr void)
+  (memory.fill to byte n)
+  to)
+
+(define (memcmp [a (ptr void)] [b (ptr void)] [n u32]) -> i32
+  (let ([x (cast (ptr u8) a)] [y (cast (ptr u8) b)])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (!= (@ x i) (@ y i)) (return (- (@ x i) (@ y i)))))
+    0))
+
+(define (strlen [s (ptr u8)]) -> u32
+  (let ([p s])
+    (while (!= (@ p) 0) (+= p 1))
+    (- p s)))
+
+(define (print-string [s (ptr u8)])
+  (write-bytes (cast i32 s) (strlen s)))
+
+(struct chunk [previous (ptr chunk)] [size u32])
+
+(struct arena [last (ptr chunk)] [next (ptr u8)] [end (ptr u8)])
+
+(define (make-arena) -> arena
+  (let ([a arena])
+    (set! (-> a last) 0)
+    (set! (-> a next) 0)
+    (set! (-> a end) 0)
+    a))
+
+(define (arena-alloc [a (ptr arena)] [n u32]) -> (ptr void)
+  (let ([size (bit-and (+ n 7) -8)])
+    (when (> size (- (-> a end) (-> a next)))
+      (arena-grow a size))
+    (let ([p (-> a next)])
+      (+= (-> a next) size)
+      p)))
+
+(define (arena-grow [a (ptr arena)] [n u32])
+  (let* ([size (if (> n 65536) n 65536)]
+         [c (cast (ptr chunk) (malloc (+ size (sizeof chunk))))])
+    (set! (-> c previous) (-> a last))
+    (set! (-> c size) size)
+    (set! (-> a last) c)
+    (set! (-> a next) (cast (ptr u8) (+ c 1)))
+    (set! (-> a end) (+ (-> a next) size))))
+
+(define (arena-free [a (ptr arena)])
+  (let ([c (-> a last)])
+    (while (!= c 0)
+      (let ([previous (-> c previous)])
+        (free c)
+        (set! c previous))))
+  (set! (-> a last) 0)
+  (set! (-> a next) 0)
+  (set! (-> a end) 0))
+
+(struct buffer [bytes (ptr u8)] [length u32] [room u32])
+
+(define (make-buffer) -> buffer
+  (let ([b buffer])
+    (set! (-> b bytes) 0)
+    (set! (-> b length) 0)
+    (set! (-> b room) 0)
+    b))
+
+(define (buffer-reserve [b (ptr buffer)] [n u32])
+  (let ([need (+ (-> b length) n)])
+    (when (> need (-> b room))
+      (set! (-> b room) (if (> need (* 2 (-> b room))) need (* 2 (-> b room))))
+      (set! (-> b bytes) (cast (ptr u8) (realloc (-> b bytes) (-> b room)))))))
+
+(define (buffer-add! [b (ptr buffer)] [p (ptr u8)] [n u32])
+  (buffer-reserve b n)
+  (memcpy (+ (-> b bytes) (-> b length)) p n)
+  (+= (-> b length) n))
+
+(define (buffer-add-byte! [b (ptr buffer)] [byte i32])
+  (buffer-reserve b 1)
+  (set! (@ (-> b bytes) (-> b length)) byte)
+  (+= (-> b length) 1))
+
+(define (buffer-add-string! [b (ptr buffer)] [s (ptr u8)]) (buffer-add! b s (strlen s)))
+
+(define (buffer-free! [b (ptr buffer)])
+  (free (-> b bytes))
+  (set! (-> b bytes) 0)
+  (set! (-> b length) 0)
+  (set! (-> b room) 0))
+
+;; An all-zero table is empty, as a global starts. No key or value may be 0.
+(struct hash-table [keys (ptr u64)] [values (ptr u32)] [count u32] [capacity u32] [shift u32])
+
+(define (hash-slot [t (ptr hash-table)] [key u64]) -> u32
+  (cast u32 (>> (* key 11400714819323198485) (-> t shift))))
+
+(define (hash-ref [t (ptr hash-table)] [key u64]) -> u32
+  (if (== (-> t capacity) 0)
+      0
+      (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)] [i (hash-slot t key)])
+        (while (!= (@ keys i) 0)
+          (when (== (@ keys i) key) (return (@ (-> t values) i)))
+          (set! i (bit-and (+ i 1) mask)))
+        0)))
+
+(define (hash-set! [t (ptr hash-table)] [key u64] [value u32])
+  (when (>= (* 2 (+ (-> t count) 1)) (-> t capacity)) (hash-grow t))
+  (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)] [i (hash-slot t key)])
+    (while (!= (@ keys i) 0)
+      (when (== (@ keys i) key)
+        (set! (@ (-> t values) i) value)
+        (return))
+      (set! i (bit-and (+ i 1) mask)))
+    (set! (@ keys i) key)
+    (set! (@ (-> t values) i) value)
+    (+= (-> t count) 1)))
+
+(define (hash-grow [t (ptr hash-table)])
+  (let ([keys (-> t keys)] [values (-> t values)] [n (-> t capacity)])
+    (set! (-> t capacity) (if (== n 0) 16 (* 2 n)))
+    (set! (-> t shift) (if (== n 0) 60 (- (-> t shift) 1)))
+    (set! (-> t keys) (cast (ptr u64) (calloc (-> t capacity) 8)))
+    (set! (-> t values) (cast (ptr u32) (malloc (* (-> t capacity) 4))))
+    (set! (-> t count) 0)
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (!= (@ keys i) 0) (hash-set! t (@ keys i) (@ values i))))
+    (free keys)
+    (free values)))
+
+(define (hash-clear! [t (ptr hash-table)])
+  (when (!= (-> t capacity) 0) (memset (-> t keys) 0 (* (-> t capacity) 8)))
+  (set! (-> t count) 0))
+
+(define (hash-free! [t (ptr hash-table)])
+  (free (-> t keys))
+  (free (-> t values))
+  (set! (-> t keys) 0)
+  (set! (-> t values) 0)
+  (set! (-> t count) 0)
+  (set! (-> t capacity) 0)
+  (set! (-> t shift) 0))

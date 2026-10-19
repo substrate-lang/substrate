@@ -125,7 +125,7 @@ const checks = {
     await say('(+ (fib 20) 0.5)');
     await say('(sq 2)');
     check('repl: a session in Substrate', await shown(), [
-      '(require-unqualified substrate "compiler/substrate/substrate.sub") => ',
+      '(require-unqualified substrate "compiler/substrate.sub") => ',
       '(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) => ',
       '(+ (fib 20) 0.5) => 6765.5',
       '! (sq 2) => input-20:1:2: error: unbound identifier sq',
@@ -150,14 +150,6 @@ const checks = {
     await say('(fib 11)');
     check('repl: Clear keeps the session', await shown(), '(fib 11) => 89');
 
-    await page.click('nav button:nth-of-type(4)');
-    check('repl: a kernel session starts empty', await shown(), '');
-    await say('(require print "compiler/print.sub")');
-    await say('(print:write-int (i32.add 40 2))');
-    check('repl: a session in kernel code', await shown(), [
-      '(require print "compiler/print.sub") => ',
-      '(print:write-int (i32.add 40 2)) => 42',
-    ].join('\n'));
   },
 
   async rows(page) {
@@ -607,7 +599,7 @@ const checks = {
     check('stopped: the report starts with the message of the trap',
       report.split('\n')[0], 'trap: vector-at: there is no item 5: the vector holds 1');
     check('stopped: the report lists the game function that was running, and where it is',
-      /step! .*tests\/web\/stopped\.sub:14:/.test(report), true);
+      /step! .*tests\/web\/stopped\.sub:13:/.test(report), true);
     check('stopped: the screen keeps what was drawn before the trap', await page.evaluate(
       '[...document.querySelector("canvas").getContext("2d").getImageData(10, 10, 1, 1).data].join(",")'), '46,125,50,255');
     await new Promise((resolve) => setTimeout(resolve, 300));
