@@ -24,7 +24,7 @@
            throw throw-ref try
            i32.const i64.const f32.const f64.const
            quote quote-syntax
-           #%app #%datum #%fact))
+           #%app #%datum #%fact #%checked))
 
 ;; The core forms every module has, whatever its language: those that make it a module, with
 ;; application and quotation. Its language gives it any others: Substrate's gives if, return, values
@@ -291,7 +291,7 @@
   (for-each (lambda ([name datum]) (bind-raw! name wasm-scopes all-phases `(prim ,name))) (prim-names))
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
                 query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier
-                query-global-type query-tag-params)
+                query-meaning query-function-value query-inline-call)
   (set-running-names! running-id)
   (let* ([names (running-module-names)] [name (running-module-named names "syntax.")] [tools (running-module-named names "macros.")])
     (when (== name 0) (fail-at 0 "the running program has no syntax module" nil))
@@ -1437,10 +1437,8 @@
     (case kind
       ;; A form a macro's begin splices is its output too.
       [('begin)
-       (let ([forms (cdr (form-list f "(begin form ...)"))] [checked (!= (syntax-property f 'substrate-checked) 0)])
-         (for-each (lambda ([g datum])
-                     (declare-form! (at-use f (if (and checked (syntax? g)) (syntax-property-set g 'substrate-checked (fixnum 1)) g)) b only))
-                   forms))]
+       (let ([forms (cdr (form-list f "(begin form ...)"))])
+         (for-each (lambda ([g datum]) (declare-form! (at-use f g) b only)) forms))]
       [('require) (require! f phase 0)]
       [('require-unqualified) (require! f phase 1)]
       [('language) (if (in-session?) (require! f phase 2) (fail-at f "the language must be the module's first form" nil))]
@@ -1490,9 +1488,7 @@
     [('plain 'done) (if to-syntax (list1 (cadr item)) (caddr item))]
     [else
      (let* ([e (cadr item)]
-            [r (if (and (syntax? e) (!= (syntax-property e 'substrate-checked) 0))
-                   (expand-expr e phase)
-                   (core-expression e phase))])
+            [r (if (or to-syntax (== (core-head e phase) '#%checked)) (expand-expr e phase) (core-expression e phase))])
        (if to-syntax (list1 r) (list1 `(expr ,r))))]))
 
 ;; ==== types ====
@@ -1566,12 +1562,14 @@
          [f (list-ref p 5)] [inline (list-ref p 6)] [value (list-ref p 7)] [info (list-ref p 8)]
          [sc (new-local-scope!)]
          [xs (map (lambda ([pp datum]) -> datum (add-scope (car pp) sc)) params)]
-         [keys (map (lambda ([x datum]) -> datum (bind-local! x phase)) xs)]
          [scoped (map (lambda ([b datum]) -> datum (add-scope b sc)) body)]
-         [r (if (or (!= (syntax-property f 'substrate-checked) 0)
-                    (and (pair? scoped) (null? (cdr scoped)) (checked-form? (car scoped) 'substrate-body phase)))
-                (map (lambda ([b datum]) -> datum (expand-expr b phase)) scoped)
-                (list1 (core-body f name xs scoped info phase)))])
+         [checked (if (and (pair? scoped) (null? (cdr scoped)) (== (core-head (car scoped) phase) '#%checked)) (car scoped) 0)]
+         [box (if (and (!= checked 0) (== (syntax-e (cadr (syntax->list checked))) 'code)) (boxed-code (caddr (syntax->list checked))) 0)]
+         [keys (if (and (!= box 0) (not to-syntax)) (car box) (map (lambda ([x datum]) -> datum (bind-local! x phase)) xs))]
+         [r (cond [to-syntax (map (lambda ([b datum]) -> datum (expand-expr b phase)) scoped)]
+                  [(!= box 0) (list1 (cdr box))]
+                  [(!= checked 0) (list1 (expand-expr checked phase))]
+                  [else (list1 (core-body f name xs scoped info phase))])])
     (if to-syntax
         (let ([ps nil] [x xs] [k keys] [pp params])
           (while (pair? x)
@@ -1602,7 +1600,7 @@
 
 (define (expand-global [p datum] [phase i32]) -> datum
   (let* ([l (syntax->list (cadr p))] [init (cadddr l)]
-         [r (if (or (checked-form? init 'substrate-value phase) (checked-form? init 'substrate-static phase))
+         [r (if (or to-syntax (== (core-head init phase) '#%checked))
                 (expand-expr init phase)
                 (core-value (cadr l) (global-info-type (cadddr p)) init (cadr p) phase))])
     (if to-syntax
@@ -1935,10 +1933,13 @@
 
 ;; ---- checked code ----
 
-(define (checker-form [kind datum] [phase i32]) -> datum
+(define (substrate-context [phase i32]) -> datum
   (let* ([id (make-syntax '%substrate:#%module-begin (module-base-scopes) 0 nil)]
          [t (transformer-of (meaning-of id phase))])
-    (datum->syntax (if (and (!= t 0) (form-value? t)) t (substrate-form-value)) `(#%form ,kind) 0)))
+    (cond [(and (!= t 0) (form-value? t)) t]
+          [(string=? (canonical-path (language-path)) (-> (the-module) path))
+           (make-syntax 'here (scopes-change (module-base-scopes) wasm-scope 0) 0 nil)]
+          [else (substrate-form-value)])))
 
 (define substrate-form-value-cache datum 0)
 (define (substrate-form-value) -> datum
@@ -1949,25 +1950,38 @@
       (when (and (!= t 0) (form-value? t)) (set! substrate-form-value-cache (keep t)))))
   substrate-form-value-cache)
 
-(define (checked [s datum] [kind datum] [phase i32]) -> datum
-  (expand-expr (apply-macro (car (syntax-e s)) (checker-form kind phase) s phase 0) phase))
-
-(define (checked-form? [s datum] [kind datum] [phase i32]) -> i32
-  (and (syntax? s) (pair? (syntax-e s)) (identifier? (car (syntax-e s)))
-       (let ([t (transformer-of (meaning-of (car (syntax-e s)) phase))])
-         (and (!= t 0) (form-value? t) (== (syntax-e (cadr (syntax->list t))) kind)))))
+(define (checked-code [kind datum] [s datum] [phase i32]) -> datum
+  (let ([saved-phase api-phase] [saved-where api-where] [saved-intro api-intro] [intro (new-scope!)] [result datum 0])
+    (set! api-phase phase)
+    (set! api-where s)
+    (set! api-intro intro)
+    (try (set! result (substrate-code kind (flip-scope s intro) (substrate-context phase) (& (-> current checking)) phase))
+         [catch compile-error (message blamed loc)
+          (set! api-phase saved-phase)
+          (set! api-where saved-where)
+          (set! api-intro saved-intro)
+          (throw compile-error message blamed
+                 (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0)))) (syntax-srcloc s) loc))]
+         [catch-all
+          (set! api-phase saved-phase)
+          (set! api-where saved-where)
+          (set! api-intro saved-intro)
+          (rethrow)])
+    (set! api-phase saved-phase)
+    (set! api-where saved-where)
+    (set! api-intro saved-intro)
+    result))
 
 (define (core-body [f datum] [name datum] [xs datum] [body datum] [info datum] [phase i32]) -> datum
   (let* ([rs (func-info-results info)]
          [result (cond [(null? rs) 'void] [(null? (cdr rs)) (car rs)] [else (cons 'values rs)])])
-    (checked (core-syntax f `(substrate-body ,name (,@xs) #:wasm (quote (,result ,@(func-info-params info))) ,@body) f)
-             'substrate-body phase)))
+    (expand-expr (core-syntax f `(#%checked body ,name (,@xs) #:wasm (quote (,result ,@(func-info-params info))) ,@body) f) phase)))
 
 (define (core-expression [s datum] [phase i32]) -> datum
-  (checked (core-syntax s `(substrate-body ,s () #:wasm (quote (void)) ,s) s) 'substrate-body phase))
+  (expand-expr (core-syntax s `(#%checked body ,s () #:wasm (quote (void)) ,s) s) phase))
 
 (define (core-value [x datum] [type datum] [init datum] [where datum] [phase i32]) -> datum
-  (checked (core-syntax where `(substrate-value ,x (quote ,type) ,init) where) 'substrate-value phase))
+  (expand-expr (core-syntax where `(#%checked value ,x (quote ,type) ,init) where) phase))
 
 ;; (define-syntax id rhs); or (define-syntax id function env), a macro whose function also takes env,
 ;; the context that the code it makes names what it means as.
@@ -2406,15 +2420,16 @@
         (append (func-info-params (cadr m)) (cons '-> (func-info-results (cadr m))))
         0)))
 
-(define (query-global-type [id datum]) -> datum
-  (unless (identifier? id) (fail-at api-where "identifier-global-type: expected an identifier" nil))
-  (let ([m (meaning-of id api-phase)])
-    (if (and (!= m 0) (== (car m) 'global)) (global-info-type (cadr m)) 0)))
+(define (query-meaning [id datum]) -> datum
+  (unless (identifier? id) (fail-at api-where "identifier-meaning: expected an identifier" nil))
+  (meaning-of id api-phase))
 
-(define (query-tag-params [id datum]) -> datum
-  (unless (identifier? id) (fail-at api-where "identifier-tag-params: expected an identifier" nil))
+(define (query-function-value [id datum]) -> datum
+  (unless (identifier? id) (fail-at api-where "identifier-function-value: expected an identifier" nil))
   (let ([m (meaning-of id api-phase)])
-    (if (and (!= m 0) (== (car m) 'tag)) (tag-info-params (cadr m)) 0)))
+    (if (and (!= m 0) (== (car m) 'func) (has-value? (cadr m))) (function-value (cadr m)) 0)))
+
+(define (query-inline-call [info datum] [args datum]) -> datum (inline-call info args api-phase))
 
 ;; Whatever leaves the expansion leaves the expander as it was: the macro may handle it and
 ;; go on.
@@ -2826,6 +2841,12 @@
        (unless (and (>= n 2) (syntax? (cadr l)) (!= (syntax->list (cadr l)) 0)) (no-match s "(try (clause ...) body ...)"))
        (let* ([cs (map (lambda ([c datum]) -> datum (expand-catch c phase)) (syntax->list (cadr l)))] [b (map ex (cddr l))])
          (if to-syntax (out s name (cons (out-list (cadr l) cs) b)) (at s `(try ,cs ,(seq-at s b)))))]
+      [('#%checked)
+       (unless (>= n 2) (no-match s "(#%checked kind ...)"))
+       (let ([kind (syntax-e (cadr l))])
+         (cond [to-syntax (out s name (if (== kind 'code) (list1 (cadr l)) (cdr l)))]
+               [(== kind 'code) (cdr (boxed-code (caddr l)))]
+               [else (checked-code kind s phase)]))]
       [else (fail-at s "~a is only allowed at module level" (list1 name))])))
 
 (define (const-literal [name datum] [s datum]) -> datum
