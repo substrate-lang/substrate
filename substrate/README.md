@@ -9,8 +9,10 @@ compiler is written in it, builds itself, and runs in a browser.
 - `compiler/`: the compiler, written in Substrate. Its reader, expander and
   back end implement the core forms: wasm as s-expressions, with modules,
   phases and macros that run at compile time. `checker.sub` implements
-  Substrate's other forms: it checks their types and turns them into core
-  forms. `substrate.sub` is the language every module is in unless its
+  Substrate's other forms, and checks every function body, global value and
+  module-level expression, whichever language wrote it: Substrate's forms
+  turn into core forms, and core forms in Substrate code have wasm's types.
+  `substrate.sub` is the language every module is in unless its
   first form names another: it binds the forms, and holds the memory, the
   stack and Substrate's library. `wasm.sub` binds wasm's own forms and
   instructions, which a module in any language writes as `wasm:name` after

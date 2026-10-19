@@ -290,7 +290,8 @@
             core-forms)
   (for-each (lambda ([name datum]) (bind-raw! name wasm-scopes all-phases `(prim ,name))) (prim-names))
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
-                query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier)
+                query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier
+                query-global-type query-tag-params)
   (set-running-names! running-id)
   (let* ([names (running-module-names)] [name (running-module-named names "syntax.")] [tools (running-module-named names "macros.")])
     (when (== name 0) (fail-at 0 "the running program has no syntax module" nil))
@@ -1434,10 +1435,12 @@
       (fail-at f "~a (~a ...), but only func, global, import, tag, data and #%fact forms and expressions are allowed there"
                `(,(bytes->string only (strlen only)) ,kind)))
     (case kind
-      ;; A form a macro's begin splices is its output too.
+      ;; A form a macro's begin splices is its output too, and checked code's parts are checked code.
       [('begin)
-       (let ([forms (cdr (form-list f "(begin form ...)"))])
-         (for-each (lambda ([g datum]) (declare-form! (at-use f g) b only)) forms))]
+       (let ([forms (cdr (form-list f "(begin form ...)"))] [checked (!= (syntax-property f 'substrate-checked) 0)])
+         (for-each (lambda ([g datum])
+                     (declare-form! (at-use f (if (and checked (syntax? g)) (syntax-property-set g 'substrate-checked (fixnum 1)) g)) b only))
+                   forms))]
       [('require) (require! f phase 0)]
       [('require-unqualified) (require! f phase 1)]
       [('language) (if (in-session?) (require! f phase 2) (fail-at f "the language must be the module's first form" nil))]
@@ -1486,7 +1489,10 @@
     [('global) (expand-global item phase)]
     [('plain 'done) (if to-syntax (list1 (cadr item)) (caddr item))]
     [else
-     (let ([r (expand-expr (cadr item) phase)])
+     (let* ([e (cadr item)]
+            [r (if (and (syntax? e) (!= (syntax-property e 'substrate-checked) 0))
+                   (expand-expr e phase)
+                   (core-expression e phase))])
        (if to-syntax (list1 r) (list1 `(expr ,r))))]))
 
 ;; ==== types ====
@@ -1561,7 +1567,12 @@
          [sc (new-local-scope!)]
          [xs (map (lambda ([pp datum]) -> datum (add-scope (car pp) sc)) params)]
          [keys (map (lambda ([x datum]) -> datum (bind-local! x phase)) xs)]
-         [r (map (lambda ([b datum]) -> datum (expand-expr (add-scope b sc) phase)) body)])
+         [scoped (map (lambda ([b datum]) -> datum (add-scope b sc)) body)]
+         ;; Checked unless the checker made the body, or the body is Substrate's own.
+         [r (if (or (!= (syntax-property f 'substrate-checked) 0)
+                    (and (pair? scoped) (null? (cdr scoped)) (checked-form? (car scoped) 'substrate-body phase)))
+                (map (lambda ([b datum]) -> datum (expand-expr b phase)) scoped)
+                (list1 (core-body f name xs scoped info phase)))])
     (if to-syntax
         (let ([ps nil] [x xs] [k keys] [pp params])
           (while (pair? x)
@@ -1591,7 +1602,10 @@
       `(global ,f ,xt ,info))))
 
 (define (expand-global [p datum] [phase i32]) -> datum
-  (let* ([l (syntax->list (cadr p))] [r (expand-expr (cadddr l) phase)])
+  (let* ([l (syntax->list (cadr p))] [init (cadddr l)]
+         [r (if (or (checked-form? init 'substrate-value phase) (checked-form? init 'substrate-static phase))
+                (expand-expr init phase)
+                (core-value (cadr l) (global-info-type (cadddr p)) init (cadr p) phase))])
     (if to-syntax
         (list1 (out (cadr p) 'global `(,(cadr l) ,(caddr p) ,r)))
         (list1 `(global ,(cadddr p) ,r)))))
@@ -1920,6 +1934,50 @@
   (let ([l (syntax->list v)])
     (substrate-expansion (syntax-e (cadr l)) (if (pair? (cddr l)) (caddr l) 0) s v (& (-> current checking)) phase)))
 
+;; ---- checked code ----
+;; Every function body, global value and module-level expression goes through the checker, as
+;; Substrate's own forms do, whichever language wrote it: core forms in it have wasm's types. The
+;; checker's forms are used by their kinds, with Substrate's context at the phase, so that the code
+;; they make can name Substrate's stack; code at a phase with no Substrate, such as a Scheme module's
+;; own, uses no form of Substrate's and needs no context.
+(define (checker-form [kind datum] [phase i32]) -> datum
+  (let* ([id (make-syntax '%substrate:#%module-begin (module-base-scopes) 0 nil)]
+         [t (transformer-of (meaning-of id phase))])
+    (datum->syntax (if (and (!= t 0) (form-value? t)) t (substrate-form-value)) `(#%form ,kind) 0)))
+
+;; Substrate's phase-0 context, from its module's own #%module-begin, once it is compiled or loaded.
+(define substrate-form-value-cache datum 0)
+(define (substrate-form-value) -> datum
+  (when (== substrate-form-value-cache 0)
+    (let* ([m (cast datum (hash-ref (& registry) (cast u64 (string->symbol (canonical-path (language-path))))))]
+           [p (if (and (!= m 0) (== (-> (unit-of m) state) 'done)) (assq '#%module-begin (-> (unit-of m) provides)) 0)]
+           [t (if (!= p 0) (transformer-of (cdr p)) 0)])
+      (when (and (!= t 0) (form-value? t)) (set! substrate-form-value-cache (keep t)))))
+  substrate-form-value-cache)
+
+(define (checked [s datum] [kind datum] [phase i32]) -> datum
+  (expand-expr (apply-macro (car (syntax-e s)) (checker-form kind phase) s phase 0) phase))
+
+;; Whether s is a use of the checker's form kind.
+(define (checked-form? [s datum] [kind datum] [phase i32]) -> i32
+  (and (syntax? s) (pair? (syntax-e s)) (identifier? (car (syntax-e s)))
+       (let ([t (transformer-of (meaning-of (car (syntax-e s)) phase))])
+         (and (!= t 0) (form-value? t) (== (syntax-e (cadr (syntax->list t))) kind)))))
+
+;; A function's body that is not Substrate's own, checked as core code: its result need only be its
+;; wasm type.
+(define (core-body [f datum] [name datum] [xs datum] [body datum] [info datum] [phase i32]) -> datum
+  (let* ([rs (func-info-results info)]
+         [result (cond [(null? rs) 'void] [(null? (cdr rs)) (car rs)] [else (cons 'values rs)])])
+    (checked (core-syntax f `(substrate-body ,name (,@xs) #:wasm (quote (,result ,@(func-info-params info))) ,@body) f)
+             'substrate-body phase)))
+
+(define (core-expression [s datum] [phase i32]) -> datum
+  (checked (core-syntax s `(substrate-body ,s () #:wasm (quote (void)) ,s) s) 'substrate-body phase))
+
+(define (core-value [x datum] [type datum] [init datum] [where datum] [phase i32]) -> datum
+  (checked (core-syntax where `(substrate-value ,x (quote ,type) ,init) where) 'substrate-value phase))
+
 ;; (define-syntax id rhs); or (define-syntax id function env), a macro whose function also takes env,
 ;; the context that the code it makes names what it means as.
 (define (define-syntax! [f datum] [phase i32])
@@ -1936,14 +1994,14 @@
           (begin
             (when (!= env 0)
               (set! to-syntax 0)
-              (set! env-code (try (expand-expr env (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
+              (set! env-code (try (core-value id 'i32 env env (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
               (set! to-syntax saved))
             (set! init (if (!= env 0)
                            `(call ,(running-function 'make-transformer) ((func-index ,function) ,env-code))
                            `(call ,(running-function 'make-function-transformer) ((func-index ,function))))))
           (begin
             (set! to-syntax 0)
-            (set! init (try (expand-expr rhs (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
+            (set! init (try (core-value id 'i32 rhs rhs (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
             (set! to-syntax saved)))
       (set! global (global-info name 'i32 (boolean 1) 0 0))
       (set! getter (func-info name nil '(i32) 0 0))
@@ -2356,6 +2414,16 @@
     (if (and (!= m 0) (== (car m) 'func))
         (append (func-info-params (cadr m)) (cons '-> (func-info-results (cadr m))))
         0)))
+
+(define (query-global-type [id datum]) -> datum
+  (unless (identifier? id) (fail-at api-where "identifier-global-type: expected an identifier" nil))
+  (let ([m (meaning-of id api-phase)])
+    (if (and (!= m 0) (== (car m) 'global)) (global-info-type (cadr m)) 0)))
+
+(define (query-tag-params [id datum]) -> datum
+  (unless (identifier? id) (fail-at api-where "identifier-tag-params: expected an identifier" nil))
+  (let ([m (meaning-of id api-phase)])
+    (if (and (!= m 0) (== (car m) 'tag)) (tag-info-params (cadr m)) 0)))
 
 ;; Whatever leaves the expansion leaves the expander as it was: the macro may handle it and
 ;; go on.

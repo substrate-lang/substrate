@@ -57,7 +57,7 @@
     [('#%datum) (substrate-datum s)]
     [('let) (substrate-let s)]
     [('define) (substrate-define s)]
-    [('substrate-body) (substrate-body s)]
+    [('substrate-body) (nested-body substrate-body s)]
     [('cast) (substrate-cast s)]
     [('when) (substrate-when s)]
     [('unless) (substrate-unless s)]
@@ -74,16 +74,15 @@
     [('union) (aggregate-type s 'union)]
     [('variant) (substrate-variant s)]
     [('substrate-struct-check) (substrate-struct-check s)]
-    [('substrate-static) (substrate-static s)]
+    [('substrate-static) (nested-body substrate-static s)]
     [('exception) (substrate-exception s)]
     [('throw) (substrate-throw s)]
     [('try) (substrate-try s)]
     [('lambda) (substrate-lambda s)]
     [('inst) (substrate-inst s)]
     [('typedef) (substrate-typedef s)]
-    [('func) (substrate-func s)]
-    [('global) (substrate-global s)]
-    [('substrate-value) (substrate-value s)]
+    [('func 'global) (core-form kind s)]
+    [('substrate-value) (nested-body substrate-value s)]
     [('const) (substrate-const s)]
     [('array-of) (substrate-array-of s)]
     [('sizeof) (substrate-sizeof s)]
@@ -99,7 +98,7 @@
      (mark-use (syn `(#%substrate-op ,kind)) s)]
     [('+= '-= '*= '/= '%= '<<= '>>= 'bit-and= 'bit-or= 'bit-xor=)
      (mark-use (syn `(#%substrate-update ,(bytes->symbol (symbol-bytes kind) (- (symbol-length kind) 1)))) s)]
-    [('#%top-interaction) (substrate-interaction s)]
+    [('#%top-interaction) (nested-body substrate-interaction s)]
     [('make-cell 'new) (data-form kind s)]
     [else (substrate-error s "internal: no form ~a" `(,kind))]))
 
@@ -197,7 +196,7 @@
 
 (define (wasm-type [t datum]) -> datum
   (cond [(or (memq t '(i64 u64)) (closure-type? t)) 'i64]
-        [(memq t '(f32 f64)) t]
+        [(memq t '(f32 f64 exnref)) t]
         [(== t 'flit) 'f64]
         [else 'i32]))
 
@@ -228,7 +227,7 @@
     [(? identifier? x)
      (let ([bound (assq (syntax-e x) type-arguments)])
        (cond [bound (cdr bound)]
-             [(memq (syntax-e x) '(void i8 u8 i16 u16 i32 u32 i64 u64 f32 f64)) (syntax-e x)]
+             [(memq (syntax-e x) '(void i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 exnref)) (syntax-e x)]
              [else (named-type x)]))]
     [('ptr t) `(ptr ,(parse-type t))]
     [('array t n)
@@ -286,8 +285,9 @@
          (let ([v (type-binding h)]) (if (and v (== (car v) 'substrate-struct) (pair? (parameters-of v))) 1 0)))]
     [_ 0]))
 
+;; exnref, a caught exception, is a value in wasm code: it can be held, thrown again and nothing else.
 (define (scalar! [t datum] [where datum]) -> datum
-  (unless (or (arithmetic? t) (address-type? t))
+  (unless (or (arithmetic? t) (address-type? t) (== t 'exnref))
     (substrate-error where "expected a number or pointer type, not ~s" `(,(shown t))))
   t)
 
@@ -432,7 +432,7 @@
   (syntax-match s
     [(_ _ ('quote t)) (syn `(sbrk ,(fixnum (size-of (syntax->datum t)))))]
     [(_ x ('quote t) init)
-     (let* ([ty (syntax->datum t)] [p (fresh 'p)] [e (begin (set! quoter x) (start-function! 'void 0) (local-expand init))])
+     (let* ([ty (syntax->datum t)] [p (fresh 'p)] [e (begin (set! quoter x) (start-function! 'void 0) (body-source! s) (local-expand init))])
        (syn `(let ([,p (sbrk ,(fixnum (size-of ty)))])
                ,(with-frame static-walk `(,p ,e ,ty))
                ,p)))]))
@@ -496,39 +496,15 @@
   (syntax-match s
     [(_ (? identifier? n) t) (syn `(define-syntax ,n (quote-syntax (substrate-typedef ,(parse-type t)))))]))
 
-;; func and global, which wasm.sub binds: the core forms, with Substrate code for the body and the value.
-(define (substrate-func [s datum]) -> datum
-  (syntax-match s
-    [(_ ((? identifier? f) ((? identifier? x) t) ...) rest ...)
-     (let* ([inline (syntax-match rest [('#:inline . _) 1] [_ 0])]
-            [rest (if inline (cdr rest) rest)]
-            [ws (for/list ([u t]) (wasm-type! u))]
-            [rs (syntax-match rest [('-> (r ...) . _) (for/list ([u r]) (wasm-type! u))] [('-> r . _) `(,(wasm-type! r))] [_ nil])])
-       (at s (syn `(func (,f ,@(for/list ([y x] [w ws]) `(,y ,w))) ,@(if inline '(#:inline) nil)
-                         ,@(cond [(null? rs) nil] [(null? (cdr rs)) `(-> ,(car rs))] [else `(-> ,rs)])
-                         ,(at s (syn `(substrate-body ,f (,@x) #:wasm (quote (,(results-type rs) ,@ws)) ,@(if (null? rs) rest (cddr rest)))))))))]
-    [_ (substrate-error s "expected (func (f [x type] ...) -> type body ...)" nil)]))
-
-(define (substrate-global [s datum]) -> datum
-  (syntax-match s
-    [(_ (? identifier? x) ('mut t) init) (wasm-global s x `(mut ,(wasm-type! t)) init)]
-    [(_ (? identifier? x) t init) (wasm-global s x (wasm-type! t) init)]
-    [_ (substrate-error s "expected (global x type value) or (global x (mut type) value)" nil)]))
-
-(define (wasm-global [s datum] [x datum] [t datum] [init datum]) -> datum
-  (let ([w (if (pair? t) (cadr t) t)])
-    (syn `(begin ,(at s (syn `(global ,x ,t (substrate-value ,x (quote ,w) ,init))))
-                 (#%fact ,x (quote (substrate-wasm-global ,w)))))))
-
-(define (wasm-type! [t datum]) -> datum
-  (let ([w (syntax-e t)])
-    (unless (memq w '(i32 i64 f32 f64)) (substrate-error t "expected a wasm type: i32, i64, f32 or f64" nil))
-    w))
+;; func and global, which wasm.sub binds until the seed provides them as core forms: the core forms,
+;; whose bodies and values the expander checks.
+(define (core-form [name datum] [s datum]) -> datum (at s (syn (cons name (cdr (syntax->list s))))))
 
 (define (substrate-value [s datum]) -> datum
   (syntax-match s
     [(_ x ('quote t) init)
-     (let ([e (begin (set! quoter x) (start-function! 'void 0) (local-expand init))])
+     ;; A wasm global's value is core code.
+     (let ([e (begin (set! quoter x) (start-function! 'void 0) (set! wasm-result 1) (body-source! s) (local-expand init))])
        (with-frame value-walk `(,e ,(syntax->datum t))))]))
 
 (define (value-walk [a datum]) -> datum (framed nil (cons (cadr a) (operand-of (check (car a) nil (cadr a)) (cadr a) (car a)))))
@@ -688,7 +664,8 @@
 (define broken datum nil)
 (define caught datum nil)
 (define lambdas datum nil)
-;; A func's, whose value need only be its result's type in wasm.
+;; A core body's: its value need only be its result's type in wasm, and quoted data it has no type
+;; for is an i32.
 (define wasm-result i32 0)
 (define left datum nil)
 
@@ -698,6 +675,25 @@
   (set! result r) (set! loops nil) (set! frame 0) (set! frame-size 0) (set! addressed nil) (set! to result-to)
   (set! returned 0) (set! returns nil) (set! binders nil) (set! lambdas nil) (set! broken nil) (set! caught nil)
   (set! left nil) (set! wasm-result 0))
+
+;; A body may be checked within another's checking: a definition the outer body lifts, such as a
+;; string literal's global, has its value checked at once. The outer body's state is put back.
+(define (nested-body [walk (fn (datum) -> datum)] [s datum]) -> datum
+  (let ([saved (body-state)] [out datum 0])
+    (set! out (try (walk s) [catch-all (restore-body! saved) (rethrow)]))
+    (restore-body! saved)
+    out))
+
+(define (body-state) -> datum
+  `(,result ,loops ,frame ,(fixnum frame-size) ,addressed ,to ,returned ,returns ,binders ,broken ,caught ,lambdas
+    ,(fixnum wasm-result) ,left ,quoter ,body-source))
+
+(define (restore-body! [s datum])
+  (set! result (list-ref s 0)) (set! loops (list-ref s 1)) (set! frame (list-ref s 2)) (set! frame-size (fixnum-value (list-ref s 3)))
+  (set! addressed (list-ref s 4)) (set! to (list-ref s 5)) (set! returned (list-ref s 6)) (set! returns (list-ref s 7))
+  (set! binders (list-ref s 8)) (set! broken (list-ref s 9)) (set! caught (list-ref s 10)) (set! lambdas (list-ref s 11))
+  (set! wasm-result (fixnum-value (list-ref s 12))) (set! left (list-ref s 13)) (set! quoter (list-ref s 14))
+  (set! body-source (list-ref s 15)))
 
 ;; Thrown by frame-slot! in a function with no frame; with-frame then checks it again with one.
 (exception needs-frame)
@@ -771,6 +767,7 @@
      (let* ([ts (syntax->datum types)] [xs (for/list ([y x]) (local-expand y))] [forms (for/list ([b body]) (local-expand b))])
        (set! quoter f)
        (start-function! (car ts) (if (identifier? result-to) result-to 0))
+       (body-source! s)
        (set! wasm-result (keyword? (syntax-e result-to)))
        (for/each ([f forms]) (scan f))
        (when (and (!= to 0) (pair? forms)) (set! returned (returned-variable forms)))
@@ -822,15 +819,23 @@
         [(== (car r) 'void) (syn `(begin ,(cdr r) (set! sp ,(cdr frame))))]
         [else (let ([v (fresh 'v)]) (syn `(let ([,v ,(cdr r)]) (set! sp ,(cdr frame)) ,v)))]))
 
+;; The code is located where e is, unless it is located in the body's file already: a form that
+;; comes to its one inner form's code keeps that form's location, as the back end would.
 (define (check [e datum] [env datum] [hint datum]) -> datum
   (let ([r (check-expression e env hint)])
-    (if (and (syntax? (cdr r)) (pair? (syntax-e (cdr r)))) (cons (car r) (syntax-rewrap e (syntax-e (cdr r)))) r)))
+    (if (and (syntax? (cdr r)) (pair? (syntax-e (cdr r))))
+        (cons (car r) (syntax-rewrap (if (in-body-file? (cdr r)) (cdr r) e) (syntax-e (cdr r))))
+        r)))
+
+(define (in-body-file? [s datum]) -> i32
+  (let ([l (syntax-srcloc s)]) (and (!= l 0) (== (-> l source) body-source))))
 
 (define (expect [e datum] [t datum] [env datum] [stored i32]) -> datum (convert (check e env t) t e stored))
 
 (define (check-expression [e datum] [env datum] [hint datum]) -> datum
   (syntax-match e
-    [(? function-name? f) (function-pointer f)]
+    ;; In a core body a function's name is its value in wasm's terms, the global its #:value names.
+    [(? function-name? f) (if wasm-result (cons 'i32 f) (function-pointer f))]
     [(? identifier? x) (read-place (variable-place x env) e)]
     [('#%datum d) (literal e (syntax-e d))]
     [('#%app ('quote mark) arg ...) (check-mark e mark arg env hint)]
@@ -853,6 +858,10 @@
            (unless (memq (car r) '(void none)) (substrate-error e "this function returns no value" nil))
            (cons 'none (syn `(begin ,(cdr r) ,(void-return e)))))
          (cons 'none (syn `(return ,(leave (if (struct-type? result) (result-value v env) (cons result (result-code (check v env result) result v))))))))]
+    [('set! (? identifier? x) v) (check-set x v env hint)]
+    [('throw (? identifier? t) arg ...) (check-core-throw e t arg env)]
+    [('throw-ref v) (cons 'none (syn `(throw-ref ,(operand v 'exnref env))))]
+    [('try (c ...) body ...) (check-core-try e c body env hint)]
     [('block (? identifier? l) body ...) (check-block e l body env hint)]
     [('loop (? identifier? l) body ...) (check-block e l body env hint)]
     [('br l) (left! l 'void) (cons 'none e)]
@@ -901,7 +910,7 @@
 (define (operand-of [r datum] [w datum] [where datum]) -> datum
   (let ([t (car r)])
     (cond [(or (== t 'lit) (and (== t 'flit) (float-type? w))) (convert r w where 0)]
-          [(or (== t 'none) (arithmetic? t) (address-type? t) (closure-type? t)) (cdr r)]
+          [(or (== t 'none) (arithmetic? t) (address-type? t) (closure-type? t) (== t 'exnref)) (cdr r)]
           [else (substrate-error where "expected ~a, got ~s" `(,w ,(shown t)))])))
 
 (define (wasm-type-of [r datum]) -> datum (wasm-type (settled-type (car r))))
@@ -977,18 +986,33 @@
 
 (define (check-sequence [where datum] [forms datum] [env datum] [hint datum]) -> datum
   (cond [(null? forms) (cons 'void (syn '(nop)))]
-        [(null? (cdr forms)) (check (car forms) env hint)]
+        [(null? (cdr forms)) (located where (check (car forms) env hint))]
         [else (let* ([codes (for/list ([f (but-last forms)]) (as-void (check f env 'void)))]
                      [r (settle (check (last forms) env hint) hint (last forms))])
                 (cons (car r) (at where (syn `(begin ,@codes ,(cdr r))))))]))
+
+;; A sequence's one form takes the sequence's location when that is in the body's file and its own
+;; is not, as code a macro from another module made has none in it: a trap in it is then located
+;; at the sequence, as the back end locates one in a longer sequence.
+(define (located [where datum] [r datum]) -> datum
+  (let* ([c (cdr r)] [w (if (syntax? where) (syntax-srcloc where) 0)] [l (if (syntax? c) (syntax-srcloc c) 0)])
+    (if (and (!= w 0) (syntax? c) (== (-> w source) body-source)
+             (or (== l 0) (!= (-> l source) body-source)))
+        (cons (car r) (at where c))
+        r)))
+
+;; The file of the body being checked: where its form was written.
+(define body-source datum 0)
+(define (body-source! [s datum])
+  (let ([l (if (syntax? s) (syntax-srcloc s) 0)]) (set! body-source (if (!= l 0) (-> l source) 0))))
 
 ;; A macro that defines a function that quotes its input names the datum type where it
 ;; defines the function, not where its input was written.
 (define (datum-type [e datum]) -> datum
   (let ([t (type-binding (datum->syntax quoter 'datum 0))])
-    (if (and t (== (car t) 'substrate-typedef))
-        (cadr t)
-        (substrate-error e "quoted data is the syntax module's, of its type datum: require macros.sub, which names it" nil))))
+    (cond [(and t (== (car t) 'substrate-typedef)) (cadr t)]
+          [wasm-result 'i32]
+          [else (substrate-error e "quoted data is the syntax module's, of its type datum: require macros.sub, which names it" nil)])))
 
 (define (literal [e datum] [d datum]) -> datum
   (cond [(integer? d) (cons 'lit d)]
@@ -999,7 +1023,14 @@
 
 (define (check-let [e datum] [bindings datum] [body datum] [env datum] [hint datum]) -> datum
   (let* ([vs (for/list ([b bindings])
-               (syntax-match b [((? identifier? x) init) (let-variable x init env)] [(xs init) (let-variables xs init env)]))]
+               (syntax-match b
+                 [((? identifier? x) init) (let-variable x init env)]
+                 ;; Core code's typed bindings: (x type init) and ((x ...) (type ...) init).
+                 [((? identifier? x) t init) (let-variable (syntax-property-set x 'substrate-type (parse-type t)) init env)]
+                 [(xs (t ...) init)
+                  (let-variables (syntax-rewrap xs (for/list ([y (syntax->list xs)] [u t]) (syntax-property-set y 'substrate-type (parse-type u))))
+                                 init env)]
+                 [(xs init) (let-variables xs init env)]))]
          [r (settle (check-sequence e body (append (append-all (for/list ([v vs]) (car v))) env) hint) hint e)]
          [code (syn `(let (,@(for/list ([v vs] #:when (caddr v)) (caddr v))) ,(cdr r)))]
          [stores (for/list ([v vs] #:when (cadr v)) (cadr v))])
@@ -1053,9 +1084,10 @@
         (cons r (call e f c args env (temp r)))
         (cons (promoted r) (call e f c args env 0)))))
 
+;; In a core body a call is wasm's, whatever the function: its arguments and result have wasm's types.
 (define (callee [f datum] [env datum]) -> datum
   (if (function-name? f)
-      `(,(function-type f) #f ,(if (!= (fact f 'substrate-function) 0) 'direct 'wasm))
+      `(,(function-type f) #f ,(if (and (not wasm-result) (!= (fact f 'substrate-function) 0)) 'direct 'wasm))
       (let ([r (check f env 0)])
         (cond [(fn-type? (car r)) `(,(cdr (car r)) ,(cdr r) pointer)]
               [(closure-type? (car r)) `(,(cdr (car r)) ,(cdr r) closure)]
@@ -1091,7 +1123,7 @@
 
 (define (function-type [f datum]) -> datum
   (unless (== (identifier-binding-kind f) 'function) (substrate-error f "~a is not a function" `(,(syntax-e f))))
-  (let ([known (fact f 'substrate-function)])
+  (let ([known (if wasm-result 0 (fact f 'substrate-function))])
     (when (!= known 0) (return known))
     (let* ([sig (identifier-function-signature f)] [rs (cdr (memq '-> sig))])
       (for/each ([t sig])
@@ -1254,10 +1286,12 @@
                  (with-frame lambda-walk `(,e ,body ,xs ,ps ,outside ,rt)))])
     (set! result s-result) (set! loops s-loops) (set! frame s-frame)
     (set! frame-size s-frame-size) (set! to s-to) (set! returned s-returned) (set! caught s-caught) (set! wasm-result s-wasm)
+    ;; Its body is checked code, which the expander need not check again.
     (syntax-local-lift-definition
-     (at e (syn `(func (,name (,base i32) ,@(for/list ([x xs] [p ps]) `(,x ,(wasm-type p))))
-                       ,@(if (== rt 'void) nil `(-> ,(wasm-type rt)))
-                       ,code))))
+     (syntax-property-set (at e (syn `(func (,name (,base i32) ,@(for/list ([x xs] [p ps]) `(,x ,(wasm-type p))))
+                                           ,@(if (== rt 'void) nil `(-> ,(wasm-type rt)))
+                                           ,code)))
+                          'substrate-checked (fixnum 1)))
     name))
 
 (define (lambda-walk [a datum]) -> datum
@@ -1452,9 +1486,9 @@
 
 (define (global-place [x datum]) -> datum
   (let* ([kind (identifier-binding-kind x)] [g (if (== kind 'variable) (fact x 'substrate-global) 0)]
-         [w (if (and (== kind 'variable) (== g 0)) (fact x 'substrate-wasm-global) 0)])
+         [w (if (and (== kind 'variable) (== g 0)) (identifier-global-type x) 0)])
     (cond [(!= g 0) `(,(car g) memory ,x 0)]
-          [(!= w 0) `(,(car w) local ,x)]
+          [(!= w 0) `(,w local ,x)]
           [(== kind 'function) (substrate-error x "~a is a function, not a value" `(,(syntax-e x)))]
           [else (substrate-error x "~a is not a Substrate variable" `(,(syntax-e x)))])))
 
@@ -1728,10 +1762,12 @@
 
 ;; ---- control ----
 
+;; A Substrate exception's types, or a wasm tag's.
 (define (exception-types [t datum]) -> datum
-  (let ([ts (if (== (identifier-binding-kind t) 'tag) (fact t 'substrate-exception) 0)])
-    (when (== ts 0) (substrate-error t "~a is not an exception" `(,(syntax-e t))))
-    (car ts)))
+  (let* ([tag (== (identifier-binding-kind t) 'tag)] [ts (if tag (fact t 'substrate-exception) 0)])
+    (cond [(!= ts 0) (car ts)]
+          [tag (identifier-tag-params t)]
+          [else (substrate-error t "~a is not an exception" `(,(syntax-e t)))])))
 
 ;; A throw is a call of a function that throws, one per exception: a function with a throw in
 ;; it is slower to call, in wasmtime by some ten times a short function's cost.
@@ -1746,7 +1782,9 @@
     (if (!= known 0)
         (syntax-local-introduce known)
         (let ([f (fresh (format-message "throw-~a" `(,(syntax-e t))))] [xs (for/list ([u ts]) (fresh 'x))])
-          (syntax-local-lift-definition (syn `(func (,f ,@(for/list ([x xs] [u ts]) `(,x ,(wasm-type u)))) (throw ,t ,@xs))))
+          (syntax-local-lift-definition
+           (syntax-property-set (syn `(func (,f ,@(for/list ([x xs] [u ts]) `(,x ,(wasm-type u)))) (throw ,t ,@xs)))
+                                'substrate-checked (fixnum 1)))
           (datum-put! (-> state throwers) (identifier-name t) (syntax-local-introduce f))
           f))))
 
@@ -1781,6 +1819,38 @@
                                        [ref `(catch-all-ref (exn) ,code)]
                                        [else `(catch-all ,code)]))))
                           ,(as b ty body)))))))
+
+;; wasm's own throw and try in Substrate code: a throw carries operands of the tag's types; a try's
+;; handlers bind the values a tag carries, and a catch-ref's or catch-all-ref's last variable the
+;; exception itself, an exnref. Neither gives the stack back, as Substrate's try does.
+(define (check-core-throw [e datum] [t datum] [args datum] [env datum]) -> datum
+  (let ([ts (exception-types t)])
+    (unless (== (length ts) (length args))
+      (substrate-error e "~a carries ~a value~a, not ~a" `(,(syntax-e t) ,(fixnum (length ts)) ,(plural (length ts)) ,(fixnum (length args)))))
+    (cons 'none (syn `(throw ,t ,@(for/list ([a args] [u ts]) (operand a (wasm-type u) env)))))))
+
+(define (check-core-try [e datum] [clauses datum] [body datum] [env datum] [hint datum]) -> datum
+  (let* ([b (check-sequence e body env hint)]
+         [hs (for/list ([c clauses]) (check-catch c env hint))]
+         [ty (promoted (settled-for (for/fold ([ty (car b)]) ([h hs]) (join ty (car h))) hint))])
+    (cons ty (syn `(try (,@(for/list ([h hs] [c clauses]) `(,@(cadr h) ,(as (cons (car h) (caddr h)) ty c))))
+                        ,(as b ty e))))))
+
+;; A clause's handler's type, the clause's head, and the handler's code.
+(define (check-catch [c datum] [env datum] [hint datum]) -> datum
+  (syntax-match c
+    [('catch (? identifier? t) (x ...) h ...) (catch-handler c `(catch ,t (,@x)) x (exception-types t) h env hint)]
+    [('catch-ref (? identifier? t) (x ... r) h ...)
+     (catch-handler c `(catch-ref ,t (,@x ,r)) (append x `(,r)) (append (exception-types t) '(exnref)) h env hint)]
+    [('catch-all h ...) (catch-handler c '(catch-all) nil nil h env hint)]
+    [('catch-all-ref (r) h ...) (catch-handler c `(catch-all-ref (,r)) `(,r) '(exnref) h env hint)]
+    [_ (substrate-error c "expected (catch tag (x ...) body ...), (catch-ref tag (x ... e) body ...), (catch-all body ...) or (catch-all-ref (e) body ...)" nil)]))
+
+(define (catch-handler [c datum] [head datum] [xs datum] [ts datum] [h datum] [env datum] [hint datum]) -> datum
+  (unless (== (length xs) (length ts))
+    (substrate-error c "this clause binds ~a variable~a, not ~a" `(,(fixnum (length ts)) ,(plural (length ts)) ,(fixnum (length xs)))))
+  (let ([r (check-sequence c h (append (for/list ([x xs] [t ts]) `(,(local-binding x) ,t)) env) hint)])
+    `(,(car r) ,head ,(cdr r))))
 
 ;; A handler binds the exception it caught only if it rethrows it. One name serves every
 ;; handler: the innermost handler's binding is the one a rethrow in it sees.
@@ -1879,9 +1949,11 @@
 (define (substrate-interaction [s datum]) -> datum
   (syntax-match s
     [(_ e)
-     (let ([x (begin (set! quoter s) (start-function! 'void 0) (local-expand e))])
+     (let ([x (begin (set! quoter s) (start-function! 'void 0) (body-source! s) (local-expand e))] [out datum 0])
        (scan x)
-       (with-frame interaction-walk x))]))
+       ;; Checked code, which the expander need not check again as a module-level expression.
+       (set! out (with-frame interaction-walk x))
+       (if (syntax? out) (syntax-property-set out 'substrate-checked (fixnum 1)) out))]))
 
 (define (interaction-walk [e datum]) -> datum
   (framed nil (cons 'void (written-value (settle (check e nil 0) 0 e) e))))
