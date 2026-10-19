@@ -26,7 +26,14 @@
            quote quote-syntax
            #%app #%datum #%fact))
 
-;; The core forms that are wasm's own, with its instructions: what (all-wasm-forms) provides.
+;; The core forms every module has, whatever its language: those that make it a module, with
+;; application and quotation. Its language gives it any others: Substrate's gives if, return, values
+;; and import, which Substrate uses as its own. func, global, set!, let and let* are for code a form
+;; makes; the rest, with the instructions, are wasm's, which (all-wasm-forms) names.
+(define visible-core-forms datum
+  '(define-syntax begin-for-syntax begin require require-unqualified language provide
+           quote quote-syntax #%app #%datum #%fact))
+
 (define wasm-forms datum
   '(memory table tag block loop br br-if br-table call-indirect func-index select drop unreachable nop
            throw throw-ref try i32.const i64.const f32.const f64.const))
@@ -63,7 +70,8 @@
 (const none-slot u32 4294967295)
 
 (define unqualified-imports hash-table)
-(define scope-counter u32 0)
+;; Past wasm-scope, the last of the scopes the expander keeps for itself.
+(define scope-counter u32 2)
 (define registry hash-table)
 (define units-by-hash hash-table)
 
@@ -146,7 +154,14 @@
 (define (prune-local-scopes [x datum]) -> datum (map-scopes x even-scopes))
 
 (const core-scope u32 0)
-(define core-scopes (ptr scope-set) (scopes-change no-scopes 0 0))
+;; The other core forms and the instructions are bound in this scope, which no module's code has but
+;; the language module's: other code reaches them through what its language and wasm.sub provide, or
+;; as code a form makes.
+(const wasm-scope u32 2)
+(define visible-scopes (ptr scope-set) (scopes-change no-scopes core-scope 0))
+(define wasm-scopes (ptr scope-set) (scopes-change no-scopes wasm-scope 0))
+;; Every core form's: the code a form makes names core forms with these.
+(define core-scopes (ptr scope-set) (scopes-change visible-scopes wasm-scope 0))
 
 ;; ==== the syntax module ====
 ;; Compile-time code links to the running compiler's instances of the syntax module, of the
@@ -270,8 +285,10 @@
 ;; Binds the core forms and instructions in every phase, gives macros the expander's answers to
 ;; their questions, and finds the syntax module among the running program's modules.
 (define (install-core!)
-  (for-each (lambda ([name datum]) (bind-raw! name core-scopes all-phases `(core ,name))) core-forms)
-  (for-each (lambda ([name datum]) (bind-raw! name core-scopes all-phases `(prim ,name))) (prim-names))
+  (for-each (lambda ([name datum])
+              (bind-raw! name (if (memq name visible-core-forms) visible-scopes wasm-scopes) all-phases `(core ,name)))
+            core-forms)
+  (for-each (lambda ([name datum]) (bind-raw! name wasm-scopes all-phases `(prim ,name))) (prim-names))
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
                 query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier)
   (set-running-names! running-id)
@@ -727,14 +744,15 @@
         (if (!= (transformer-of (meaning-of id 0)) 0)
             (list1 (make-syntax (cons id forms) core-scopes (if (pair? forms) (syntax-srcloc (car forms)) 0) nil))
             forms))
-      forms))
+      ;; The language module is written in wasm's forms as well as its own.
+      (map (lambda ([f datum]) -> datum (add-scope f wasm-scope)) forms)))
 
 ;; Relative to the package's directory, which is the repository's unless a package is named.
 (define (language-path) -> datum
   (if (== package-root 0) '"compiler/substrate.sub" (string-append repository-root '"/compiler/substrate.sub")))
 
 
-(define (module-base-scopes) -> (ptr scope-set) (scopes-change core-scopes (-> (the-module) scope) 0))
+(define (module-base-scopes) -> (ptr scope-set) (scopes-change visible-scopes (-> (the-module) scope) 0))
 
 ;; Substrate's bindings at phase, if the module is in Substrate's language and has not them yet.
 (define (use-language! [phase i32])
@@ -1218,6 +1236,7 @@
 (define (scope-ref [sc u32]) -> datum
   (let ([origin (scope-origin sc)] [owner (cast datum (hash-ref (& scope-owners) (scope-key sc)))])
     (cond [(== sc core-scope) 'core]
+          [(== sc wasm-scope) 'wasm]
           [(and (!= running-id-scopes 0) (== sc (@ (-> running-id-scopes ids) 0))) 'running-ids]
           [(!= origin 0) `(m ,(-> (unit-of (car origin)) hash) ,(cdr origin))]
           [(!= owner 0) `(s ,(-> (unit-of owner) hash) ,(make-integer (hash-ref (& scope-numbers) (scope-key sc))))]
@@ -1238,7 +1257,7 @@
              (or (< c 0) (and (== c 0) (< (integer-value (caddr a)) (integer-value (caddr b))))))])))
 
 (define (scope-ref-rank [r datum]) -> i32
-  (cond [(== r 'core) 2] [(== r 'running-ids) 3] [(== (car r) 'm) 0] [else 1]))
+  (cond [(== r 'core) 2] [(== r 'running-ids) 3] [(== r 'wasm) 4] [(== (car r) 'm) 0] [else 1]))
 
 (define (string-compare [a datum] [b datum]) -> i32
   (let* ([n (string-length a)] [k (string-length b)] [c (memcmp (string-bytes a) (string-bytes b) (if (< n k) n k))])
@@ -1345,6 +1364,7 @@
 
 (define (scope-at [r datum]) -> u32
   (cond [(== r 'core) core-scope]
+        [(== r 'wasm) wasm-scope]
         [(== r 'running-ids) (running-id-scope)]
         [(== (car r) 'm) (module-scope-at (unit-with-hash (cadr r)) (cast u32 (integer-value (caddr r))))]
         [else (unit-scope-at (unit-with-hash (cadr r)) (cast u32 (integer-value (caddr r))))]))
@@ -1425,7 +1445,7 @@
       [('func) (item! b (declare-func f phase))]
       [('global) (item! b (declare-global f phase))]
       [('import) (item! b (declare-import f phase))]
-      [('memory 'table) (declare-storage! f phase)]
+      [('memory 'table) (declare-storage! f kind phase)]
       [('tag) (item! b (declare-tag f phase))]
       [('define-syntax) (define-syntax! f phase)]
       [('begin-for-syntax) (begin-for-syntax! f phase)]
@@ -1722,8 +1742,9 @@
     (map (lambda ([sym datum]) -> datum (cons (datum->syntax name sym name) (qualified name sym)))
          (filter (lambda ([sym datum]) -> i32 (== (memq sym out) 0)) (reverse syms)))))
 
-(define (declare-storage! [f datum] [phase i32])
-  (let* ([l (syntax->list f)] [kind (syntax-e (car l))] [memory (== kind 'memory)]
+;; kind is the form's, memory or table, however its name is written.
+(define (declare-storage! [f datum] [kind datum] [phase i32])
+  (let* ([l (syntax->list f)] [memory (== kind 'memory)]
          [table (if memory (-> current memories) (-> current tables))] [form datum 0])
     (when (!= (assoc (make-integer phase) table) 0) (fail-at f "a second ~a declaration at this phase" (list1 kind)))
     (set! form (cond [(and (== (length l) 2) (count-literal? (cadr l))) `(,kind ,(syntax-e (cadr l)))]
@@ -2109,7 +2130,7 @@
     (let ([msc (new-scope!)])
       (set! (-> (the-module) scope) msc)
       (hash-set! (& module-scope-origins) (scope-key msc) (cast u32 (keep (cons (-> (the-module) self) (make-integer 0)))))
-      (set! session-set (scopes-change core-scopes msc 0)))
+      (set! session-set (scopes-change visible-scopes msc 0)))
     (set! to-syntax 0)
     (set! (-> current language) nil)
     (use-language! 0)))
@@ -2537,6 +2558,8 @@
 (define (seq-at [s datum] [es datum]) -> datum (at s (cons 'seq es)))
 
 (define (unbound [s datum] [sym datum] [phase i32]) -> datum
+  (when (or (!= (memq sym wasm-forms) 0) (!= (memq sym '(func global)) 0) (!= (memq sym (prim-names)) 0))
+    (fail-at s "~a is a wasm form: require the compiler's wasm.sub, as wasm, and write wasm:~a" `(,sym ,sym)))
   (fail-at s "unbound identifier ~a~a" `(,sym ,(if (> phase 0) (format-message " at phase ~a" (list1 (make-integer phase))) '""))))
 
 (define (expand-expr [s datum] [phase i32]) -> datum

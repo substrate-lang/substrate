@@ -84,11 +84,11 @@ const checks = {
     await idle();
     check('repl: a recalled input can be evaluated again', await last(), '(sq 3) => 27');
 
-    await say('(begin-for-syntax (func (trapping [s i32]) -> i32 (unreachable)))');
+    await say('(begin-for-syntax (define (trapping [s i32]) -> i32 (/ s 0)))');
     await say('(define-syntax trap! trapping)');
     await say('(trap! 1)');
     check('repl: a trap in a macro is reported as the input\'s error', (await last()).split(' at ')[0],
-      '! (trap! 1) => input-12:1:1: error: trap: unreachable');
+      '! (trap! 1) => input-12:1:1: error: trap: divide by zero');
     await say('(sq 2)');
     check('repl: the session still works after the trap', await last(), '(sq 2) => 8');
 

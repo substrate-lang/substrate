@@ -12,7 +12,9 @@ compiler is written in it, builds itself, and runs in a browser.
   Substrate's other forms: it checks their types and turns them into core
   forms. `substrate.sub` is the language every module is in unless its
   first form names another: it binds the forms, and holds the memory, the
-  stack and Substrate's library. `syntax.sub` holds the data and syntax
+  stack and Substrate's library. `wasm.sub` binds wasm's own forms and
+  instructions, which a module in any language writes as `wasm:name` after
+  requiring it as `wasm`. `syntax.sub` holds the data and syntax
   objects that macros work on. `macros.sub` defines the macro tools on them,
   `syntax-match` and `quasiquote` among them, as ordinary macros, and passes
   on `syntax.sub`: a module that writes macros requires it.
