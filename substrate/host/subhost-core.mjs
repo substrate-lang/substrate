@@ -173,22 +173,8 @@ export function createHost(platform) {
   let trapMessage = null;
 
   // Code run while compiling gets only these, since a build's bytes must depend on its sources alone.
-  const COMPILE_TIME_HOST = new Set(['write', 'trap', 'error_message', 'function_slot']);
+  const COMPILE_TIME_HOST = new Set(['write', 'trap', 'error_message']);
   const refused = (what) => () => hostTrap(`${what} is not available while compiling`);
-
-  // A table holds each function in one slot, whichever module puts it there, so that two
-  // pointers to a function are the same number.
-  const slots = new WeakMap();
-  function slotOf(table, f) {
-    let known = slots.get(table);
-    if (!known) slots.set(table, (known = new Map()));
-    let i = known.get(f);
-    if (i === undefined) {
-      i = table.grow(1, f);
-      known.set(f, i);
-    }
-    return i;
-  }
 
   function hostTrap(message) {
     trapMessage = message;
@@ -319,13 +305,7 @@ export function createHost(platform) {
         if (!table) hostTrap('host.export_index: the caller exports no table');
         const exports = registry.get(string(ip, il));
         const f = exports && exports[string(fp, fl)];
-        return typeof f === 'function' ? slotOf(table, f) : -1;
-      },
-      // The slot of the function f in the caller's table.
-      function_slot(f) {
-        const table = self.exports.table;
-        if (!table) hostTrap('host.function_slot: the caller exports no table');
-        return slotOf(table, f);
+        return typeof f === 'function' ? table.grow(1, f) : -1;
       },
       error_message(bp, cap) {
         const b = utf8.encode(lastError).subarray(0, cap);

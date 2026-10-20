@@ -19,7 +19,7 @@
 (struct mstate [self datum] [func-imports datum] [global-imports datum] [tag-imports datum] [synths datum] [fidx datum]
         [uses-memory i32] [memory-loc (ptr srcloc)] [uses-table i32] [table-loc (ptr srcloc)]
         [literals (ptr serializer)] [literals-table datum] [exported (ptr hash-table)]
-        [fname datum] [imported (ptr hash-table)])
+        [fname datum] [imported (ptr hash-table)] [slots datum] [slot-imports datum] [extra-places datum])
 
 (struct compiled [info datum] [sig datum] [locals datum] [asm (ptr asm)] [next (ptr compiled)])
 
@@ -32,14 +32,6 @@
 (define (set-literal-functions! [buffer datum] [deserialize datum])
   (set! literal-buffer-info buffer)
   (set! deserialize-info deserialize))
-
-;; The host's function_slot, which gives a function its slot in the caller's table: one slot,
-;; whichever module asks, so that a function's index is the same number everywhere.
-(define function-slot-info datum 0)
-(define (function-slot) -> datum
-  (when (== function-slot-info 0)
-    (set! function-slot-info (func-info 'function_slot '(funcref) '(i32) '"host" '"function_slot")))
-  function-slot-info)
 
 ;; ---- error locations ----
 
@@ -203,6 +195,9 @@
     (set! (-> ms exported) (make-table))
     (set! (-> ms fname) 0)
     (set! (-> ms imported) (make-table))
+    (set! (-> ms slots) 0)
+    (set! (-> ms slot-imports) nil)
+    (set! (-> ms extra-places) nil)
     ms))
 
 (define (external? [ms (ptr mstate)] [instance datum]) -> i32 (not (equal? instance (-> ms self))))
@@ -681,11 +676,19 @@
          [last (ptr compiled) 0]
          [start-fc (ptr fctx) 0]
          [setup (ptr asm) 0]
-         [literal-segment datum 0])
+         [literal-segment datum 0]
+         [place i32 0])
+    (export-name! ms '%slots)
     (for-each (lambda ([f datum])
                 (set-func-info-instance! (cadr f) self)
                 (set-func-info-export! (cadr f) (export-name! ms (func-info-name (cadr f)))))
               func-forms)
+    ;; A module with a table keeps a slot there for each of its functions.
+    (let ([fs func-forms])
+      (while (pair? fs)
+        (set-func-info-place! (cadr (car fs)) (if (!= table-form 0) place -1))
+        (+= place 1)
+        (set! fs (cdr fs))))
     (for-each (lambda ([f datum])
                 (set-global-info-instance! (cadr f) self)
                 (set-global-info-export! (cadr f) (export-name! ms (global-info-name (cadr f)))))
@@ -711,8 +714,12 @@
     (for-each (lambda ([f datum]) (start-code! ms start-fc f constants)) forms)
     ;; The quoted data is complete only once all code is compiled.
     (when (!= (-> ms literals) 0) (set! literal-segment (serializer-bytes (-> ms literals))))
-    ;; Table registration is the start function's first code, in the order the code met it.
+    (when (and (-> ms uses-table) (== table-form 0))
+      (raise-compile-error (-> ms table-loc) '"this code uses a table, but the module defines none: add (table size)"))
+    ;; The module's slots and the functions it takes the index of are the start function's first
+    ;; code, in the order the code met them.
     (set! setup (new-asm))
+    (when (!= table-form 0) (slots-code! ms setup (cast u32 place)))
     (for-each (lambda ([s datum])
                 (setup-code! ms setup start-fc s literal-segment))
               (reverse (-> ms synths)))
@@ -725,8 +732,6 @@
             [(== (car memory-form) 'memory)
              (fail "quoted data is the syntax module's, in its memory, which this module's own memory is not: take it with (memory from s), s the syntax module"
                    nil)]))
-    (when (and (-> ms uses-table) (== table-form 0))
-      (raise-compile-error (-> ms table-loc) '"this code uses a table, but the module defines none: add (table size)"))
     (link-module ms (-> first next) start-fc setup literal-segment global-forms tag-forms memory-form table-form
                  constants)))
 
@@ -741,28 +746,69 @@
          (set! (-> ms fname) '__start)
          (cx ms fc 0 (cadr f) nil 0)]))
 
+;; Reserves the module's slots in the table: one for each of its n functions, then one for each
+;; function it takes the index of whose own module keeps none. The first slot's global is
+;; exported as %slots.
+(define (slots-code! [ms (ptr mstate)] [setup (ptr asm)] [n u32])
+  (let ([fs (reverse (-> ms fidx))])
+    (while (pair? fs)
+      (when (< (func-info-place (car (car fs))) 0)
+        (set! (-> ms extra-places) (cons (cons (car (car fs)) (small n)) (-> ms extra-places)))
+        (+= n 1))
+      (set! fs (cdr fs)))
+    (when (> n 0)
+      (set! (-> ms slots) (new-synth! ms 'slots 0))
+      (instr! setup '(ref.null func))
+      (instr! setup `(i32.const ,(small n)))
+      (instr! setup '(table.grow 0))
+      (instr! setup `(global.set ,(-> ms slots))))))
+
+;; The global holding the first slot of another module instance.
+(define (slots-of! [ms (ptr mstate)] [instance datum]) -> datum
+  (let ([known (assoc instance (-> ms slot-imports))])
+    (if (!= known 0)
+        (cdr known)
+        (let ([g (global-info '%slots 'i32 (boolean 1) instance '"%slots")])
+          (note-global! ms g)
+          (set! (-> ms slot-imports) (cons (cons instance g) (-> ms slot-imports)))
+          g))))
+
 (define (setup-code! [ms (ptr mstate)] [setup (ptr asm)] [fc (ptr fctx)] [s datum] [segment datum])
   (let ([sy (synth-of s)])
-    (if (== (-> sy kind) 'fidx)
-        (begin
-          (note-func! ms (function-slot))
-          (instr! setup `(ref.func ,(-> sy info)))
-          (instr! setup `(call ,(function-slot)))
-          (instr! setup `(global.set ,s)))
-        (let ([n (small (string-length segment))] [at (small (temp-local! fc 'i32))])
-          (note-func! ms literal-buffer-info)
-          (note-func! ms deserialize-info)
-          (instr! setup `(i32.const ,n))
-          (instr! setup `(call ,literal-buffer-info))
-          (instr! setup `(local.tee ,at))
-          (instr! setup '(i32.const 0))
-          (instr! setup `(i32.const ,n))
-          (instr! setup '(memory.init 0 0))
-          (instr! setup '(data.drop 0))
-          (instr! setup `(local.get ,at))
-          (instr! setup `(i32.const ,n))
-          (instr! setup `(call ,deserialize-info))
-          (instr! setup `(global.set ,s))))))
+    (cond
+      [(== (-> sy kind) 'slots) (begin)]
+      ;; A function's index is its slot, which the first module to take the index fills.
+      [(== (-> sy kind) 'fidx)
+       (let* ([f (-> sy info)] [extra (assq f (-> ms extra-places))] [t (small (temp-local! fc 'i32))]
+              [first (if (and (== extra 0) (external? ms (func-info-instance f))) (slots-of! ms (func-info-instance f)) (-> ms slots))])
+         (instr! setup `(global.get ,first))
+         (instr! setup `(i32.const ,(if (!= extra 0) (cdr extra) (small (func-info-place f)))))
+         (instr! setup '(i32.add))
+         (instr! setup `(local.tee ,t))
+         (instr! setup '(table.get 0))
+         (instr! setup '(ref.is_null))
+         (instr! setup '(if ()))
+         (instr! setup `(local.get ,t))
+         (instr! setup `(ref.func ,f))
+         (instr! setup '(table.set 0))
+         (instr! setup '(end))
+         (instr! setup `(local.get ,t))
+         (instr! setup `(global.set ,s)))]
+      [else
+       (let ([n (small (string-length segment))] [at (small (temp-local! fc 'i32))])
+         (note-func! ms literal-buffer-info)
+         (note-func! ms deserialize-info)
+         (instr! setup `(i32.const ,n))
+         (instr! setup `(call ,literal-buffer-info))
+         (instr! setup `(local.tee ,at))
+         (instr! setup '(i32.const 0))
+         (instr! setup `(i32.const ,n))
+         (instr! setup '(memory.init 0 0))
+         (instr! setup '(data.drop 0))
+         (instr! setup `(local.get ,at))
+         (instr! setup `(i32.const ,n))
+         (instr! setup `(call ,deserialize-info))
+         (instr! setup `(global.set ,s)))])))
 
 ;; ---- linking ----
 
@@ -879,6 +925,7 @@
     (set! wglobals (reverse wglobals))
     ;; ---- exports ----
     ;; Memory and table are exported as "memory" and "table": the host finds the caller's that way.
+    ;; The module's first slot is %slots, where a module that takes its functions' indexes finds it.
     (set! cf compiled)
     (while (!= cf 0)
       (set! exports (cons `(,(func-info-export (-> cf info)) func ,(index-of (-> lk funcs) (-> cf info) "a function")) exports))
@@ -891,6 +938,7 @@
               tag-forms)
     (when (!= memory-form 0) (set! exports (cons '("memory" memory 0) exports)))
     (when (!= table-form 0) (set! exports (cons '("table" table 0) exports)))
+    (when (!= (-> ms slots) 0) (set! exports (cons `("%slots" global ,(index-of (-> lk globals) (-> ms slots) "a global")) exports)))
     (set! exports (reverse exports))
     ;; ---- names ----
     (for-each (lambda ([info datum])
