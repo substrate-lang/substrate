@@ -293,8 +293,8 @@
   (for-each (lambda ([name datum]) (bind-raw! name wasm-scopes all-phases `(prim ,name))) (prim-names))
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
                 query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier)
-  (set-expander! running-id query-meaning query-function-value query-inline-call query-expand-head query-scope-locals query-scope-label
-                 query-apply-form prune-local-scopes query-facts-of)
+  (set-expander! running-id query-meaning query-function-value query-inline-call query-expand-head query-scope-locals query-scope-shape
+                 query-scope-label query-apply-form prune-local-scopes query-facts-of)
   (let* ([names (running-module-names)] [name (running-module-named names "syntax.")] [tools (running-module-named names "macros.")])
     (when (== name 0) (fail-at 0 "the running program has no syntax module" nil))
     (set! running-names (keep names))
@@ -1391,7 +1391,7 @@
                      [(and (syntax? s) (pair? (syntax-e s)) (identifier? (car (syntax-e s)))) (car (syntax-e s))]
                      [else 0])]
          [t (if (!= head 0) (transformer-of (meaning-of head phase)) 0)])
-    (if (!= t 0)
+    (if (and (!= t 0) (not (and (form-value? t) (!= (form-shape-of t s phase) 0))))
         (head-expand (apply-macro head t s phase 1) phase)
         s)))
 
@@ -1931,6 +1931,71 @@
 (define (form-expansion [v datum] [s datum] [phase i32]) -> datum
   (let ([l (syntax->list v)])
     (substrate-expansion (syntax-e (cadr l)) (if (pair? (cddr l)) (caddr l) 0) s v (& (-> current checking)) phase)))
+
+;; ---- the shapes of the forms the compiler implements ----
+
+;; The shape of s, a use of the form whose value is v (checker.sub says what a shape is), or 0 if
+;; the form expands to others. A form with a shape is kept in its expansion, as a core form is.
+(define (form-shape-of [v datum] [s datum] [phase i32]) -> datum
+  (let ([saved api-phase] [out datum 0])
+    (set! api-phase phase)
+    (set! out (try (substrate-shape (syntax-e (cadr (syntax->list v))) s v (& (-> current checking)) phase)
+                   [catch-all (set! api-phase saved) (rethrow)]))
+    (set! api-phase saved)
+    out))
+
+;; m with each piece replaced by what f gives for it.
+(define (shape-map [m datum] [f (closure (datum) -> datum)]) -> datum
+  (if (== (car m) 'group)
+      (let ([out nil] [ps (cddr m)])
+        (while (pair? ps)
+          (set! out (cons (shape-map (car ps) f) out))
+          (set! ps (cdr ps)))
+        `(group ,(cadr m) ,@(reverse out)))
+      (f m)))
+
+(define (shape-syntax [m datum]) -> datum
+  (if (== (car m) 'group) (syntax-rewrap (cadr m) (map (lambda ([p datum]) -> datum (shape-syntax p)) (cddr m))) (caddr m)))
+
+;; A new scope for each region of m's but 0, by region.
+(define (region-scopes [m datum] [acc datum]) -> datum
+  (if (== (car m) 'group)
+      (let ([ps (cddr m)])
+        (while (pair? ps)
+          (set! acc (region-scopes (car ps) acc))
+          (set! ps (cdr ps)))
+        acc)
+      (if (or (== (fixnum-value (cadr m)) 0) (!= (assoc (cadr m) acc) 0)) acc (cons (cons (cadr m) (make-integer (new-local-scope!))) acc))))
+
+(define (in-region [p datum] [scopes datum]) -> datum
+  (if (== (fixnum-value (cadr p)) 0) (caddr p) (add-scope (caddr p) (cast u32 (integer-value (cdr (assoc (cadr p) scopes)))))))
+
+;; m with its variables bound and its expressions in their regions: a binder piece gets its
+;; variable's key last.
+(define (scope-shape [m datum] [phase i32]) -> datum
+  (let ([scopes (region-scopes m nil)])
+    (shape-map m (lambda ([p datum]) -> datum
+                   (case (car p)
+                     [('binder) (let ([x (in-region p scopes)]) `(binder ,(cadr p) ,x ,(bind-local! x phase)))]
+                     [('expr) `(expr ,(cadr p) ,(in-region p scopes))]
+                     [else p])))))
+
+;; The expansion of a use of a form with the shape m: the same form, its expressions expanded.
+(define (expand-shape [m datum] [phase i32]) -> datum
+  (shape-syntax (shape-map (scope-shape m phase)
+                           (lambda ([p datum]) -> datum
+                             (case (car p)
+                               [('binder) `(binder 0 ,(with-local-binding (caddr p) (cadddr p)))]
+                               [('expr) `(expr 0 ,(expand-expr (caddr p) phase))]
+                               [else p])))))
+
+(define (query-scope-shape [m datum] [remember i32]) -> datum
+  (let ([known (if remember (cast datum (hash-ref (-> current scopes) (cast u64 (cadr m)))) 0)])
+    (if (!= known 0)
+        known
+        (let ([r (scope-shape m api-phase)])
+          (when remember (hash-set! (-> current scopes) (cast u64 (cadr m)) (cast u32 r)))
+          r))))
 
 ;; ---- checked code ----
 
@@ -2733,7 +2798,9 @@
        (unless (has-value? (cadr h)) (fail-at s "~a is a function: call it, or use (func-index ~a)" `(,(syntax-e s) ,(syntax-e s))))
        (with-local-binding s 0)]
       [('macro) (expand-expr (cadr h) phase)]
-      [('form) (expand-expr (apply-form (list-ref h 4) (cadddr h) phase) phase)]
+      [('form)
+       (let ([m (form-shape-of (list-ref h 4) (cadddr h) phase)])
+         (if (!= m 0) (expand-shape m phase) (expand-expr (apply-form (list-ref h 4) (cadddr h) phase) phase)))]
       [('core) (expand-core (cadr h) (caddr h) phase)]
       [else (expand-prim (cadr h) (caddr h) phase)])))
 
