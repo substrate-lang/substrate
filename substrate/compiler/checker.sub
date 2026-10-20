@@ -270,6 +270,7 @@
         [(array-type? t) `(array ,(shown (cadr t)) ,(caddr t))]
         [(struct-type? t) (if (pair? (cdddr t)) (cons (caddr t) (for/list ([u (cadddr t)]) (shown u))) (caddr t))]
         [(and (pair? t) (== (car t) 'tvar)) (cadr t)]
+        [(values-type? t) (cons 'values (for/list ([u (cdr t)]) (shown u)))]
         [(== t 'none) 'void]
         [else (settled-type t)]))
 
@@ -301,6 +302,9 @@
     [('fn (t ...)) `(fn ,(for/list ([u t]) (value-type! (parse-type u) u)) void)]
     [('closure (t ...) '-> r) `(closure ,(for/list ([u t]) (value-type! (parse-type u) u)) ,(scalar! (parse-type r) r))]
     [('closure (t ...)) `(closure ,(for/list ([u t]) (value-type! (parse-type u) u)) void)]
+    [('values t ...)
+     (when (null? t) (substrate-error s "expected a type" nil))
+     `(values ,@(for/list ([u t]) (scalar! (parse-type u) u)))]
     [((? identifier? h) a ...) (applied-type s h a)]
     [_ (substrate-error s "expected a type" nil)]))
 
@@ -359,6 +363,7 @@
 (define (result-type! [r datum]) -> datum
   (let ([t (parse-type r)])
     (cond [(== t 'void) t]
+          [(values-type? t) t]
           [(closure-type? t) (substrate-error r "a closure cannot be a result: it lasts only as long as the call that made it" nil)]
           [else (value-type! t r)])))
 
@@ -462,7 +467,7 @@
             ,(at s (syn `(func (,f ,@(if (!= to 0) `((,to i32)) nil) ,@(for/list ([x xs] [p ps]) `(,x ,(wasm-type p))))
                                ,@(if inline '(#:inline) nil)
                                #:value ,value
-                               ,@(if (== rt 'void) nil `(-> ,(wasm-type rt)))
+                               ,@(if (== rt 'void) nil `(-> ,(if (values-type? rt) (wasm-types rt) (wasm-type rt))))
                                ,(at s (syn `(#%checked body ,definer (,@xs) ,(if (!= to 0) to #f) (quote ,(cons rt ps)) ,@body))))))
             (global ,value (mut i32) (func-index ,f))
             (#%fact ,f (quote (substrate-function ,ps ,rt)))))))
@@ -870,7 +875,14 @@
                 (cons (if (== (car b) 'none) 'none r) (result-code b r (if (null? forms) s (last forms)))))]))
 
 (define (result-code [b datum] [r datum] [where datum]) -> datum
-  (if (and wasm-result (not (values-type? r))) (operand-of b r where) (convert b r where 0)))
+  (cond [(and wasm-result (values-type? r)) (values-fit b r where)]
+        [wasm-result (operand-of b r where)]
+        [else (convert b r where 0)]))
+
+(define (values-fit [b datum] [t datum] [where datum]) -> datum
+  (cond [(== (car b) 'none) (cdr b)]
+        [(equal? (wasm-types (car b)) (wasm-types t)) (cdr b)]
+        [else (substrate-error where "expected ~s, got ~s" `(,(shown t) ,(shown (car b))))]))
 
 (define (result-value [e datum] [env datum]) -> datum
   (if (!= returned 0)
@@ -903,14 +915,18 @@
            (let ([p form])
              (while (pair? (cddr p)) (set! p (cdr p)))
              (set-cdr! p (cons restore (cdr p))))]
-          [else (let ([v (fresh-key!)])
-                  (set-cdr! form `((let ((,v ,(wasm-type (car r)) ,(cadr form) v)) ,(seq `(,restore ,(lref v)))))))])))
+          [else (set-cdr! form `(,(leaving (cons (car r) (cadr form)) saved)))])))
 
 (define (leave [r datum]) -> datum
   (cond [(or (== frame-used 0) (== (car r) 'none)) (cdr r)]
         [(== (car r) 'void) (seq `(,(cdr r) ,(set-ref (gref-of 'sp) (lref (cdr frame)))))]
-        [else (let ([v (fresh-key!)])
-                `(let ((,v ,(wasm-type (car r)) ,(cdr r) v)) ,(seq `(,(set-ref (gref-of 'sp) (lref (cdr frame))) ,(lref v)))))]))
+        [else (leaving r (cdr frame))]))
+
+(define (leaving [r datum] [saved datum]) -> datum
+  (let* ([ws (wasm-types (car r))] [ks (for/list ([w ws]) (fresh-key!))] [restore (set-ref (gref-of 'sp) (lref saved))])
+    (if (null? (cdr ks))
+        `(let ((,(car ks) ,(car ws) ,(cdr r) v)) ,(seq `(,restore ,(lref (car ks)))))
+        `(let ((,ks ,ws ,(cdr r) ,(for/list ([w ws]) 'v))) ,(seq `(,restore (values ,@(for/list ([k ks]) (lref k)))))))))
 
 (define (check [e datum] [env datum] [hint datum]) -> datum
   (let ([r (check-expression e env hint)])
@@ -920,7 +936,7 @@
   (if (or (== t 'none) (memq t '(lit flit))) c `(as ,(wasm-types t) ,c)))
 
 (define (wasm-types [t datum]) -> datum
-  (cond [(== t 'void) nil] [(values-type? t) (cdr t)] [else `(,(wasm-type t))]))
+  (cond [(== t 'void) nil] [(values-type? t) (for/list ([u (cdr t)]) (wasm-type u))] [else `(,(wasm-type t))]))
 
 (define (wasm-shown [t datum]) -> datum
   (let ([ws (wasm-types t)])
@@ -972,9 +988,10 @@
     [('func-index f) (cons 'i32 `(func-index ,(info-of f 'func "a function")))]
     [('call-indirect sig i arg ...) (check-indirect e sig i arg env)]
     [('values arg ...)
-     (let ([rs (for/list ([a arg]) (check a env 0))])
-       (cons `(values ,@(for/list ([r rs]) (wasm-type-of r)))
-             `(values ,@(for/list ([r rs] [a arg]) (operand-of r (wasm-type-of r) a)))))]
+     (let* ([hints (if (and (values-type? hint) (== (length (cdr hint)) (length arg))) (cdr hint) (for/list ([a arg]) 0))]
+            [rs (for/list ([a arg] [h hints]) (if (!= h 0) (fit-value (check a env h) h a) (settle (check a env 0) 0 a)))])
+       (for/each ([r rs] [a arg]) (scalar! (car r) a))
+       (cons `(values ,@(for/list ([r rs]) (car r))) `(values ,@(for/list ([r rs]) (cdr r)))))]
     [('i32.const n) (cons 'i32 (const-of 'i32 n))]
     [('i64.const n) (cons 'i64 (const-of 'i64 n))]
     [('f32.const n) (cons 'f32 (const-of 'f32 n))]
@@ -1161,15 +1178,23 @@
 ;; [(x ...) e], e a call of a function with several results, or (values e ...): each x is a local
 ;; variable.
 (define (let-variables [xs datum] [init datum] [env datum]) -> datum
-  (let* ([ids (syntax->list xs)] [r (check init env 0)] [ts (if (values-type? (car r)) (cdr (car r)) nil)])
+  (let* ([ids (syntax->list xs)]
+         [declared (for/list ([x ids]) (syntax-property x 'substrate-type))]
+         [hint (if (ormap (lambda ([d datum]) -> i32 (== d 0)) declared) 0 (cons 'values declared))]
+         [r (check init env hint)]
+         [ts (if (values-type? (car r)) (cdr (car r)) nil)])
     (unless (== (length ts) (length ids))
       (substrate-error init "expected ~a values, got ~s" `(,(fixnum (length ids)) ,(shown (car r)))))
-    (for/each ([x ids] [t ts])
-      (let ([declared (syntax-property x 'substrate-type)])
-        (when (and declared (not (equal? declared t))) (substrate-error x "~a is a ~s, not a ~s" `(,(syntax-e x) ,t ,(shown declared))))
-        (when (member (local-binding x) addressed) (substrate-error x "~a is one of several values, which have no address" `(,(syntax-e x))))))
-    `(,(for/list ([x ids] [t ts]) `(,(local-binding x) ,t)) #f
-      (,(for/list ([x ids]) (local-binding x)) ,ts ,(cdr r) ,(for/list ([x ids]) (syntax-e x))))))
+    (for/each ([x ids] [d declared] [t ts])
+      (when (and d (not (equal? d t)) (not (and wasm-result (== (wasm-type d) (wasm-type t)))))
+        (substrate-error x "~a is a ~s, not a ~s" `(,(syntax-e x) ,(shown t) ,(shown d))))
+      (when (member (local-binding x) addressed) (substrate-error x "~a is one of several values, which have no address" `(,(syntax-e x)))))
+    (let ([vs (for/list ([d declared] [t ts]) (if d d t))])
+      `(,(for/list ([x ids] [v vs]) `(,(local-binding x) ,v)) #f
+        (,(for/list ([x ids]) (local-binding x)) ,(for/list ([v vs]) (wasm-type v)) ,(cdr r) ,(for/list ([x ids]) (syntax-e x)))))))
+
+(define (fit-value [r datum] [t datum] [where datum]) -> datum
+  (cons t (if (and wasm-result (memq t '(i32 i64 f32 f64 exnref))) (operand-of r t where) (convert r t where 0))))
 
 (define (let-value [zero i32] [r datum] [t datum] [x datum] [init datum] [stored i32]) -> datum
   (if zero (constant (fixnum 0) t x) (convert r t init stored)))
@@ -1220,7 +1245,7 @@
 (define (signature [sig datum]) -> datum
   (let ([r (cadr sig)])
     (cons (for/list ([t (if (struct-type? r) (cons 'i32 (car sig)) (car sig))]) (wasm-type t))
-          (if (== r 'void) nil `(,(wasm-type r))))))
+          (wasm-types r))))
 
 (define (function-name? [f datum]) -> i32 (and (identifier? f) (== (identifier-binding-kind f) 'function)))
 
@@ -1401,7 +1426,7 @@
     (set! frame-used s-frame-used) (set! frame-returns s-frame-returns)
     (syntax-local-lift-definition
      (at e (syn `(func (,name (,base i32) ,@(for/list ([x xs] [p ps]) `(,x ,(wasm-type p))))
-                       ,@(if (== rt 'void) nil `(-> ,(wasm-type rt)))
+                       ,@(if (== rt 'void) nil `(-> ,(if (values-type? rt) (wasm-types rt) (wasm-type rt))))
                        (#%checked code ,(code-box (cons (cons base-key (for/list ([x xs]) (local-binding x))) code)))))))
     (syntax-local-introduce name)))
 
