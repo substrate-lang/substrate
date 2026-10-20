@@ -109,7 +109,7 @@
 (struct comp [module datum] [use-site-scopes datum] [phase-forms datum] [memories datum]
         [tables datum] [provide-ids datum] [require-names datum]
         [ns datum] [instances (ptr hash-table)] [values (ptr hash-table)] [wasm-module-counter u32] [storage-wasm-modules datum]
-        [checking (ptr void)] [language datum])
+        [checking (ptr void)] [language datum] [heads (ptr hash-table)] [scopes (ptr hash-table)])
 
 (define current (ptr comp) 0)
 
@@ -134,6 +134,8 @@
     (set! (-> c storage-wasm-modules) nil)
     (set! (-> c checking) 0)
     (set! (-> c language) 0)
+    (set! (-> c heads) (make-table))
+    (set! (-> c scopes) (make-table))
     c))
 
 ;; Scopes are even; a local binding form's is odd, so that quote-syntax can prune the
@@ -291,7 +293,8 @@
   (for-each (lambda ([name datum]) (bind-raw! name wasm-scopes all-phases `(prim ,name))) (prim-names))
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
                 query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier)
-  (set-expander! running-id query-meaning query-function-value query-inline-call)
+  (set-expander! running-id query-meaning query-function-value query-inline-call query-expand-head query-scope-locals query-scope-label
+                 query-apply-form prune-local-scopes)
   (let* ([names (running-module-names)] [name (running-module-named names "syntax.")] [tools (running-module-named names "macros.")])
     (when (== name 0) (fail-at 0 "the running program has no syntax module" nil))
     (set! running-names (keep names))
@@ -750,7 +753,6 @@
 ;; Relative to the package's directory, which is the repository's unless a package is named.
 (define (language-path) -> datum
   (if (== package-root 0) '"compiler/substrate.sub" (string-append repository-root '"/compiler/substrate.sub")))
-
 
 (define (module-base-scopes) -> (ptr scope-set) (scopes-change visible-scopes (-> (the-module) scope) 0))
 
@@ -2430,6 +2432,82 @@
 
 (define (query-inline-call [info datum] [args datum]) -> datum (inline-call info args api-phase))
 
+(define (query-expand-head [s datum]) -> datum
+  (let ([known (cast datum (hash-ref (-> current heads) (cast u64 s)))])
+    (if (!= known 0)
+        known
+        (let ([h (expand-head s api-phase)])
+          (hash-set! (-> current heads) (cast u64 s) (cast u32 h))
+          h))))
+
+(define (expand-head [s datum] [phase i32]) -> datum
+  (let ([e (syntax-e s)])
+    (cond
+      [(symbol? e)
+       (let ([m (meaning-of s phase)])
+         (case (if (== m 0) 0 (car m))
+           [('local) `(local ,(cadr m))]
+           [('global) `(global ,(cadr m))]
+           [('compile-time-value)
+            (let ([t (transformer-of m)])
+              (when (== t 0) (fail-at s "~a is bound to a compile-time value: read it with syntax-local-value" (list1 e)))
+              (head-transformer s t s phase))]
+           [('func) `(func ,(cadr m))]
+           [('tag) (fail-at s "~a is a tag: throw it with (throw ~a arg ...)" `(,e ,e))]
+           [('core 'prim) (fail-at s "bad use of ~a" (list1 e))]
+           [('label) (fail-at s "~a is a label" (list1 e))]
+           [else (unbound s e phase)]))]
+      [(pair? e)
+       (let* ([head (car e)] [m (if (identifier? head) (meaning-of head phase) 0)] [t (transformer-of m)])
+         (cond [(!= t 0) (head-transformer head t s phase)]
+               [(and (!= m 0) (== (car m) 'core)) `(core ,(cadr m) ,s)]
+               [(and (!= m 0) (== (car m) 'prim)) `(prim ,(cadr m) ,s)]
+               [else
+                (when (and (identifier? head) (== (syntax-e head) '#%app))
+                  (if (!= m 0)
+                      (fail-at s "#%app is bound here, but not to a macro or the core form" nil)
+                      (unbound head '#%app phase)))
+                (expand-head (syntax-rewrap s (cons (implicit-id s '#%app) e)) phase)]))]
+      [(null? e) (fail-at s "empty form ()" nil)]
+      [(literal? e)
+       (let* ([id (implicit-id s '#%datum)] [m (meaning-of id phase)] [t (transformer-of m)] [form (syntax-rewrap s `(,id ,s))])
+         (cond [(!= t 0) (head-transformer id t form phase)]
+               [(and (!= m 0) (== (car m) 'core)) `(core #%datum ,form)]
+               [else (fail-at s "the literal ~s needs #%datum, which is ~a here"
+                              `(,(syntax->datum s) ,(if (!= m 0) '"not a macro or the core form" '"unbound")))]))]
+      [(keyword? e) (fail-at s "~s: keyword misused as an expression" (list1 e))]
+      [else (fail-at s "~s is not an expression" (list1 (syntax->datum s)))])))
+
+(define (query-apply-form [t datum] [s datum]) -> datum (apply-form t s api-phase))
+
+(define (apply-form [t datum] [s datum] [phase i32]) -> datum
+  (apply-macro (if (pair? (syntax-e s)) (car (syntax-e s)) s) t s phase 0))
+
+(define (head-transformer [head datum] [t datum] [s datum] [phase i32]) -> datum
+  (if (form-value? t)
+      (let ([l (syntax->list t)]) `(form ,(syntax-e (cadr l)) ,(if (pair? (cddr l)) (caddr l) 0) ,s ,t))
+      `(macro ,(apply-macro head t s phase 0))))
+
+(define (query-scope-locals [key datum] [xs datum] [forms datum]) -> datum
+  (let ([known (cast datum (hash-ref (-> current scopes) (cast u64 key)))])
+    (if (!= known 0)
+        known
+        (let* ([sc (new-local-scope!)]
+               [ys (map (lambda ([x datum]) -> datum (add-scope x sc)) xs)]
+               [keys (map (lambda ([y datum]) -> datum (bind-local! y api-phase)) ys)]
+               [r `(,keys ,ys ,(map (lambda ([f datum]) -> datum (add-scope f sc)) forms))])
+          (hash-set! (-> current scopes) (cast u64 key) (cast u32 r))
+          r))))
+
+(define (query-scope-label [key datum] [l datum] [forms datum]) -> datum
+  (let ([known (cast datum (hash-ref (-> current scopes) (cast u64 key)))])
+    (if (!= known 0)
+        known
+        (let* ([sc (new-local-scope!)] [label (add-scope l sc)]
+               [r `(,(fresh-label! label api-phase) ,(map (lambda ([f datum]) -> datum (add-scope f sc)) forms))])
+          (hash-set! (-> current scopes) (cast u64 key) (cast u32 r))
+          r))))
+
 ;; Whatever leaves the expansion leaves the expander as it was: the macro may handle it and
 ;; go on.
 (define (query-local-expand [s datum]) -> datum
@@ -2636,46 +2714,17 @@
   (fail-at s "unbound identifier ~a~a" `(,sym ,(if (> phase 0) (format-message " at phase ~a" (list1 (make-integer phase))) '""))))
 
 (define (expand-expr [s datum] [phase i32]) -> datum
-  (let ([e (syntax-e s)])
-    (cond
-      [(symbol? e)
-       (let ([m (meaning-of s phase)])
-         (case (if (== m 0) 0 (car m))
-           [('local) (with-local-binding s (cadr m))]
-           [('global) (with-local-binding s 0)]
-           [('compile-time-value)
-            (let ([t (transformer-of m)])
-              (when (== t 0) (fail-at s "~a is bound to a compile-time value: read it with syntax-local-value" (list1 e)))
-              (expand-expr (apply-macro s t s phase 0) phase))]
-           [('func)
-            (unless (has-value? (cadr m)) (fail-at s "~a is a function: call it, or use (func-index ~a)" `(,e ,e)))
-            (with-local-binding s 0)]
-           [('tag) (fail-at s "~a is a tag: throw it with (throw ~a arg ...)" `(,e ,e))]
-           [('core 'prim) (fail-at s "bad use of ~a" (list1 e))]
-           [('label) (fail-at s "~a is a label" (list1 e))]
-           [else (unbound s e phase)]))]
-      [(pair? e)
-       (let* ([head (car e)] [m (if (identifier? head) (meaning-of head phase) 0)] [t (transformer-of m)])
-         (if (!= t 0)
-             (expand-expr (apply-macro head t s phase 0) phase)
-             (case (if (== m 0) 0 (car m))
-               [('core) (expand-core (cadr m) s phase)]
-               [('prim) (expand-prim (cadr m) s phase)]
-               [else
-                (when (and (identifier? head) (== (syntax-e head) '#%app))
-                  (if (!= m 0)
-                      (fail-at s "#%app is bound here, but not to a macro or the core form" nil)
-                      (unbound head '#%app phase)))
-                (expand-expr (syntax-rewrap s (cons (implicit-id s '#%app) e)) phase)])))]
-      [(null? e) (fail-at s "empty form ()" nil)]
-      [(literal? e)
-       (let* ([id (implicit-id s '#%datum)] [m (meaning-of id phase)] [t (transformer-of m)])
-         (cond [(!= t 0) (expand-expr (apply-macro id t (syntax-rewrap s `(,id ,s)) phase 0) phase)]
-               [(and (!= m 0) (== (car m) 'core)) (datum-out s s)]
-               [else (fail-at s "the literal ~s needs #%datum, which is ~a here"
-                              `(,(syntax->datum s) ,(if (!= m 0) '"not a macro or the core form" '"unbound")))]))]
-      [(keyword? e) (fail-at s "~s: keyword misused as an expression" (list1 e))]
-      [else (fail-at s "~s is not an expression" (list1 (syntax->datum s)))])))
+  (let ([h (expand-head s phase)])
+    (case (car h)
+      [('local) (with-local-binding s (cadr h))]
+      [('global) (with-local-binding s 0)]
+      [('func)
+       (unless (has-value? (cadr h)) (fail-at s "~a is a function: call it, or use (func-index ~a)" `(,(syntax-e s) ,(syntax-e s))))
+       (with-local-binding s 0)]
+      [('macro) (expand-expr (cadr h) phase)]
+      [('form) (expand-expr (apply-form (list-ref h 4) (cadddr h) phase) phase)]
+      [('core) (expand-core (cadr h) (caddr h) phase)]
+      [else (expand-prim (cadr h) (caddr h) phase)])))
 
 (define (literal? [e datum]) -> i32 (or (integer? e) (flonum? e) (char? e) (boolean? e) (string? e)))
 

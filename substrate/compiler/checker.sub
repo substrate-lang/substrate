@@ -11,7 +11,8 @@
 ;; Checking a module at a phase keeps the names made fresh and the definitions lifted from form
 ;; to form; each module compilation has its own, one for each phase.
 (struct checking [phase i32] [counter i32] [instances (ptr hash-table)] [throwers (ptr hash-table)]
-        [strings (ptr hash-table)] [layouts (ptr hash-table)] [types (ptr hash-table)] [rethrown datum] [next (ptr checking)])
+        [strings (ptr hash-table)] [layouts (ptr hash-table)] [types (ptr hash-table)] [forms (ptr hash-table)]
+        [lifted (ptr hash-table)] [rethrown datum] [next (ptr checking)])
 
 (define state (ptr checking) 0)
 
@@ -22,13 +23,25 @@
 (define meaning-of (fn (datum) -> datum) 0)
 (define function-value-of (fn (datum) -> datum) 0)
 (define inline-call-of (fn (datum datum) -> datum) 0)
+(define expand-head (fn (datum) -> datum) 0)
+(define scope-locals! (fn (datum datum datum) -> datum) 0)
+(define scope-label! (fn (datum datum datum) -> datum) 0)
+(define apply-form! (fn (datum datum) -> datum) 0)
+(define prune-local-scopes (fn (datum) -> datum) 0)
 
 (define (set-expander! [name (fn (datum) -> datum)] [meaning (fn (datum) -> datum)] [function-value (fn (datum) -> datum)]
-                       [inline-call (fn (datum datum) -> datum)])
+                       [inline-call (fn (datum datum) -> datum)] [head (fn (datum) -> datum)]
+                       [locals (fn (datum datum datum) -> datum)] [label (fn (datum datum datum) -> datum)]
+                       [apply (fn (datum datum) -> datum)] [prune (fn (datum) -> datum)])
   (set! running-name name)
   (set! meaning-of meaning)
   (set! function-value-of function-value)
-  (set! inline-call-of inline-call))
+  (set! inline-call-of inline-call)
+  (set! expand-head head)
+  (set! scope-locals! locals)
+  (set! scope-label! label)
+  (set! apply-form! apply)
+  (set! prune-local-scopes prune))
 
 ;; The expansion of s, a use of the form kind, whose transformer has env. states is the module
 ;; compilation's. A macro may catch a failure and go on, so here and state are put back either way.
@@ -64,6 +77,7 @@
 (define (checker-recover!)
   (set! here 0)
   (set! state 0)
+  (set! lifts nil)
   (set! type-arguments nil))
 
 (define (state-at [states (ptr (ptr void))] [phase i32]) -> (ptr checking)
@@ -78,6 +92,8 @@
       (set! (-> s strings) (make-table))
       (set! (-> s layouts) (make-table))
       (set! (-> s types) (make-table))
+      (set! (-> s forms) (make-table))
+      (set! (-> s lifted) (make-table))
       (set! (-> s rethrown) nil)
       (set! (-> s next) (cast (ptr checking) (@ states)))
       (set! (@ states) (cast (ptr void) s)))
@@ -457,7 +473,6 @@
     [('-> r body ...) (cons r body)]
     [(body ...) (cons (syn 'void) body)]))
 
-
 (define (function [s datum] [f datum] [xs datum] [ts datum] [r datum] [body datum] [definer datum] [inline i32]) -> datum
   (let* ([ps (for/list ([t ts]) (value-type! (parse-type t) t))]
          [rt (result-type! r)]
@@ -499,7 +514,7 @@
   (syntax-match s
     [(_ _ _ ('quote t)) (call-of 'sbrk `(,(i32-const (size-of (syntax->datum t)))))]
     [(_ _ x ('quote t) init)
-     (let* ([ty (syntax->datum t)] [p (fresh-key!)] [e (begin (set! quoter x) (start-function! 'void 0) (local-expand init))])
+     (let* ([ty (syntax->datum t)] [p (fresh-key!)] [e (begin (set! quoter x) (start-function! 'void 0) init)])
        `(let ((,p i32 ,(call-of 'sbrk `(,(i32-const (size-of ty)))) p))
           ,(seq `(,(with-frame static-walk `(,(lref p) ,e ,ty)) ,(lref p)))))]))
 
@@ -565,7 +580,7 @@
 (define (substrate-value [s datum]) -> datum
   (syntax-match s
     [(_ _ x ('quote t) init)
-     (let ([e (begin (set! quoter x) (start-function! 'void 0) (set! wasm-result 1) (local-expand init))])
+     (let ([e (begin (set! quoter x) (start-function! 'void 0) (set! wasm-result 1) init)])
        (with-frame value-walk `(,e ,(syntax->datum t))))]))
 
 (define (value-walk [a datum]) -> datum (framed nil (cons (cadr a) (operand-of (check (car a) nil (cadr a)) (cadr a) (car a)))))
@@ -723,7 +738,12 @@
 (define to datum 0)
 (define returned datum 0)
 (define returns datum nil)
-(define binders datum nil)
+(define needed datum nil)
+(define captured datum nil)
+(define misreturned i32 0)
+(define returned-blocked i32 0)
+(define tail datum 0)
+(define lifts datum nil)
 (define broken datum nil)
 (define caught datum nil)
 (define lambdas datum nil)
@@ -735,25 +755,31 @@
 
 (define (start-function! [r datum] [result-to datum])
   (set! result r) (set! loops nil) (set! frame 0) (set! frame-size 0) (set! addressed nil) (set! to result-to)
-  (set! returned 0) (set! returns nil) (set! binders nil) (set! lambdas nil) (set! broken nil) (set! caught nil)
-  (set! left nil) (set! wasm-result 0))
+  (set! returned 0) (set! returns nil) (set! lambdas nil) (set! broken nil) (set! caught nil)
+  (set! left nil) (set! wasm-result 0)
+  (set! needed nil) (set! captured nil) (set! misreturned 0) (set! returned-blocked 0) (set! tail 0))
 
 (define (nested-body [walk (fn (datum) -> datum)] [s datum]) -> datum
-  (let ([saved (body-state)] [out datum 0])
-    (set! out (try (walk s) [catch-all (restore-body! saved) (rethrow)]))
+  (let ([saved (body-state)] [saved-lifts lifts] [out datum 0])
+    (set! lifts nil)
+    (set! out (try (walk s) [catch-all (restore-body! saved) (set! lifts saved-lifts) (rethrow)]))
     (restore-body! saved)
+    (set! lifts saved-lifts)
     out))
 
 (define (body-state) -> datum
-  `(,result ,loops ,frame ,(fixnum frame-size) ,addressed ,to ,returned ,returns ,binders ,broken ,caught ,lambdas
-    ,(fixnum wasm-result) ,left ,quoter ,(fixnum frame-used) ,frame-returns))
+  `(,result ,loops ,frame ,(fixnum frame-size) ,addressed ,to ,returned ,returns ,broken ,caught ,lambdas
+    ,(fixnum wasm-result) ,left ,quoter ,(fixnum frame-used) ,frame-returns
+    ,needed ,captured ,(fixnum misreturned) ,(fixnum returned-blocked) ,tail))
 
 (define (restore-body! [s datum])
   (set! result (list-ref s 0)) (set! loops (list-ref s 1)) (set! frame (list-ref s 2)) (set! frame-size (fixnum-value (list-ref s 3)))
   (set! addressed (list-ref s 4)) (set! to (list-ref s 5)) (set! returned (list-ref s 6)) (set! returns (list-ref s 7))
-  (set! binders (list-ref s 8)) (set! broken (list-ref s 9)) (set! caught (list-ref s 10)) (set! lambdas (list-ref s 11))
-  (set! wasm-result (fixnum-value (list-ref s 12))) (set! left (list-ref s 13)) (set! quoter (list-ref s 14))
-  (set! frame-used (fixnum-value (list-ref s 15))) (set! frame-returns (list-ref s 16)))
+  (set! broken (list-ref s 8)) (set! caught (list-ref s 9)) (set! lambdas (list-ref s 10))
+  (set! wasm-result (fixnum-value (list-ref s 11))) (set! left (list-ref s 12)) (set! quoter (list-ref s 13))
+  (set! frame-used (fixnum-value (list-ref s 14))) (set! frame-returns (list-ref s 15))
+  (set! needed (list-ref s 16)) (set! captured (list-ref s 17)) (set! misreturned (fixnum-value (list-ref s 18)))
+  (set! returned-blocked (fixnum-value (list-ref s 19))) (set! tail (list-ref s 20)))
 
 (define (frame-slot! [t datum]) -> i32
   (set! frame-used 1)
@@ -766,99 +792,47 @@
 (define (frame-place [t datum] [offset i32]) -> datum `(,t memory ,(fp) ,(fixnum offset)))
 
 (define (with-frame [walk (fn (datum) -> datum)] [arg datum]) -> datum
-  (set! frame (cons (fresh-key!) (fresh-key!)))
-  (set! frame-size 0)
-  (set! frame-used 0)
-  (set! frame-returns nil)
-  (walk arg))
+  (let ([outermost (== frame 0)] [saved (body-state)] [saved-lifts lifts] [r datum 0])
+    (set! frame (cons (fresh-key!) (fresh-key!)))
+    (set! frame-size 0)
+    (set! frame-used 0)
+    (set! frame-returns nil)
+    (set! needed nil)
+    (set! misreturned 0)
+    (set! r (walk arg))
+    (cond [(and (null? needed) (not misreturned))
+           (when outermost
+             (for/each ([l lifts]) (set-cdr! (car l) (cons (cdr l) nil)))
+             (set! lifts nil))
+           r]
+          [else
+           (let ([more needed] [bad misreturned] [known addressed] [blocked returned-blocked])
+             (restore-body! saved)
+             (set! lifts saved-lifts)
+             (set! addressed (append more known))
+             (set! returned-blocked (or blocked bad))
+             (with-frame walk arg))])))
 
-(define (scan [e datum])
-  (let ([l (syntax-unwrapped e)])
-    (when (pair? l)
-      (let ([h (head-symbol l)] [args (cdr l)])
-        (cond [(== h 'quote) (begin)]
-              [(and (== h 'let) (pair? args) (plain-bindings? (syntax-unwrapped (car args))))
-               (for/each ([b (syntax-unwrapped (car args))])
-                 (let ([bl (syntax-unwrapped b)])
-                   (unless (== (quoted-mark (cadr bl)) '#%substrate-field) (set! binders (cons (local-binding (car bl)) binders)))
-                   (scan (cadr bl))))
-               (for/each ([b (cdr args)]) (scan b))]
-              [(and (== h 'return) (pair? args) (null? (cdr args))) (set! returns (cons (car args) returns)) (scan (car args))]
-              [(and (== h '#%app) (pair? args) (pair? (cdr args)) (null? (cddr args)))
-               (let ([m (quoted-mark (car args))] [a (cadr args)])
-                 (cond [(and (== m '#%substrate-addr) (identifier? a))
-                        (let ([b (local-binding a)]) (when b (set! addressed (cons b addressed))))]
-                       [(== m '#%substrate-lambda) (set! addressed (append (free-locals a) addressed)) (scan a)]
-                       [else (for/each ([y l]) (scan y))]))]
-              [else (for/each ([y l]) (scan y))])))))
-
-(define (syntax-unwrapped [x datum]) -> datum (if (syntax? x) (syntax-e x) x))
-
-(define (head-symbol [l datum]) -> datum (let ([h (syntax-unwrapped (car l))]) (if (symbol? h) h 0)))
-
-(define (quoted-mark [s datum]) -> datum
-  (let ([q (syntax-unwrapped s)])
-    (if (and (pair? q) (== (head-symbol q) 'quote) (pair? (cdr q)) (null? (cddr q)))
-        (let ([d (syntax-unwrapped (cadr q))]) (if (pair? d) (head-symbol d) 0))
-        0)))
-
-(define (plain-bindings? [bs datum]) -> i32
-  (while (pair? bs)
-    (let ([bl (syntax-unwrapped (car bs))])
-      (unless (and (pair? bl) (pair? (cdr bl)) (null? (cddr bl))) (return 0)))
-    (set! bs (cdr bs)))
-  (null? bs))
-
-(define free-bound datum nil)
-(define free-used datum nil)
-
-(define (free-locals [e datum]) -> datum
-  (set! free-bound nil)
-  (set! free-used nil)
-  (free-walk e)
-  (for/list ([b free-used] #:when (not (member b free-bound))) b))
-
-(define (free-walk [e datum])
-  (syntax-match e
-    [('quote . _) (begin)]
-    [(? identifier? x) (let ([b (local-binding x)]) (when b (set! free-used (cons b free-used))))]
-    [('let ((x init) ...) body ...)
-     (set! free-bound (append (for/list ([y x]) (local-binding y)) free-bound))
-     (for/each ([i init]) (free-walk i))
-     (for/each ([b body]) (free-walk b))]
-    [(x ...) (for/each ([y x]) (free-walk y))]
-    [_ (begin)]))
-
-(define (returned-variable [forms datum]) -> datum
-  (let ([v (value-variable (last forms))])
-    (if (and v (member v binders) (andmap (lambda ([e datum]) -> i32 (equal? (value-variable e) v)) returns)) v 0)))
-
-(define (value-variable [e datum]) -> datum
-  (syntax-match e
-    [(? identifier? x) (local-binding x)]
-    [('return v) (value-variable v)]
-    [('let _ body ... v) (value-variable v)]
-    [('begin body ... v) (value-variable v)]
-    [_ 0]))
+(define (local-key [x datum]) -> datum
+  (let ([m (meaning-of x)])
+    (if (and (!= m 0) (== (car m) 'local)) (cadr m) (substrate-error x "internal: ~a is not a local variable" `(,(syntax-e x))))))
 
 (define (substrate-body [s datum]) -> datum
   (syntax-match s
     [(_ _ f (x ...) result-to ('quote types) body ...)
-     (let* ([ts (syntax->datum types)] [xs (for/list ([y x]) (local-expand y))] [forms (for/list ([b body]) (local-expand b))])
+     (let ([ts (syntax->datum types)])
        (set! quoter f)
-       (start-function! (car ts) (if (identifier? result-to) (lref (local-binding (local-expand result-to))) 0))
+       (start-function! (car ts) (if (identifier? result-to) (lref (local-key result-to)) 0))
        (set! wasm-result (keyword? (syntax-e result-to)))
-       (for/each ([f forms]) (scan f))
-       (when (and (!= to 0) (pair? forms)) (set! returned (returned-variable forms)))
-       (with-frame body-walk `(,s ,forms ,xs ,(cdr ts) ,(car ts))))]))
+       (with-frame body-walk `(,s ,body ,x ,(cdr ts) ,(car ts) ,(for/list ([y x]) (local-key y)))))]))
 
 (define (body-walk [a datum]) -> datum
-  (let* ([s (car a)] [forms (cadr a)] [params (for/list ([x (caddr a)] [t (cadddr a)]) (parameter x t))])
+  (let* ([s (car a)] [forms (cadr a)] [params (for/list ([k (list-ref a 5)] [x (caddr a)] [t (cadddr a)]) (parameter k x t))])
     (framed (append-all (for/list ([p params]) (cdr p)))
             (function-body s forms (for/list ([p params]) (car p)) (list-ref a 4)))))
 
-(define (parameter [x datum] [t datum]) -> datum
-  (let ([key (local-binding x)])
+(define (parameter [key datum] [x datum] [t datum]) -> datum
+  (begin
     (cond [(struct-type? t) `((,key ,t at))]
           [(member key addressed)
            (let ([o (frame-slot! (kept! t x))]) `((,key ,t ,(fixnum o)) ,(store t (fp) o (lref key))))]
@@ -885,9 +859,24 @@
         [else (substrate-error where "expected ~s, got ~s" `(,(shown t) ,(shown (car b))))]))
 
 (define (result-value [e datum] [env datum]) -> datum
-  (if (!= returned 0)
-      (let ([r (check e env result)]) (if (== (car r) 'none) r (cons 'i32 (convert r result e 0))))
-      (copy-into to e result env)))
+  (set! tail e)
+  (if (!= (producer e) 0)
+      (copy-into to e result env)
+      (let ([r (check e env result)])
+        (cond [(== (car r) 'none) r]
+              [(!= returned 0) (cons 'i32 (convert r result e 0))]
+              [else (copied-into to r result e)]))))
+
+(define (returned-value [e datum] [env datum]) -> datum
+  (let ([k (value-key e)])
+    (when (and (!= returned 0) (not (equal? k returned))) (set! misreturned 1))
+    (set! returns (cons k returns))
+    (if (!= returned 0)
+        (let ([r (check e env result)]) (if (== (car r) 'none) r (cons 'i32 (convert r result e 0))))
+        (copy-into to e result env))))
+
+(define (value-key [e datum]) -> datum
+  (let ([h (expand-head e)]) (if (== (car h) 'local) (cadr h) 0)))
 
 (define (framed [entry datum] [b datum]) -> datum
   (if frame-used
@@ -945,15 +934,107 @@
 (define (expect [e datum] [t datum] [env datum] [stored i32]) -> datum (convert (check e env t) t e stored))
 
 (define (check-expression [e datum] [env datum] [hint datum]) -> datum
-  (syntax-match e
-    [(? function-name? f) (if (!= (fact f 'substrate-function) 0) (function-pointer f) (cons 'i32 (function-value-ref f)))]
-    [(? identifier? x) (read-place (variable-place x env) e)]
+  (let ([h (expand-head e)])
+    (case (car h)
+      [('macro) (check-expression (in-tail e (cadr h)) env hint)]
+      [('form) (check-form (cadr h) (caddr h) (cadddr h) (list-ref h 4) env hint)]
+      [('local) (read-place (local-place (cadr h) e env) e)]
+      [('global) (read-place (global-place e) e)]
+      [('func) (if (!= (fact e 'substrate-function) 0) (function-pointer e) (cons 'i32 (function-value-ref e)))]
+      [('prim) (check-prim (caddr h) (cadr h) env)]
+      [('core) (check-core (cadr h) (caddr h) env hint)]
+      [else (substrate-error e "internal: no expansion of kind ~a" `(,(car h)))])))
+
+(define (check-form [kind datum] [fenv datum] [s datum] [ctx datum] [env datum] [hint datum]) -> datum
+  (unless (or (pair? (syntax-e s)) (memq kind '(mark constant))) (substrate-error s "~a is a form, not a value" `(,kind)))
+  (case kind
+    [('+ '- '* '/ '% '== '!= '< '<= '> '>= 'and 'or 'not 'bit-and 'bit-or 'bit-xor 'bit-not '<< '>>)
+     (check-op s kind (cdr (syntax->list s)) env)]
+    [('+= '-= '*= '/= '%= '<<= '>>= 'bit-and= 'bit-or= 'bit-xor=)
+     (syntax-match s
+       [(_ place v) (check-update s (bytes->symbol (symbol-bytes kind) (- (symbol-length kind) 1)) place v env hint)]
+       [_ (substrate-error s "expected (~a place value)" `(,kind))])]
+    [('set!) (syntax-match s [(_ place v) (check-set s place v env hint)] [_ (substrate-error s "expected (set! place value)" nil)])]
+    [('@ '->) (read-place (check-place s env) s)]
+    [('&)
+     (syntax-match s
+       [(_ (? function-name? f)) (function-pointer f)]
+       [(_ x) (let ([p (check-place x env)]) (cons `(ptr ,(car p)) (address p x)))]
+       [_ (substrate-error s "expected (& place) or (& function)" nil)])]
+    [('cast) (syntax-match s [(_ t x) (check-cast t x env)] [_ (substrate-error s "expected (cast type value)" nil)])]
+    [('while) (syntax-match s [(_ c body ...) (check-while c body nil env)] [_ (substrate-error s "expected (while test body ...)" nil)])]
+    [('for)
+     (syntax-match s
+       [(_ (b ...) c step body ...) (check-let s b (cons c (cons step body)) env 'void 1)]
+       [_ (substrate-error s "expected (for (binding ...) test step body ...)" nil)])]
+    [('match) (syntax-match s [(_ v clause ...) (check-match s v clause env hint)] [_ (substrate-error s "expected (match value clause ...)" nil)])]
+    [('array-of)
+     (syntax-match s
+       [(_ t e ...) (let ([ty (array-of-type t e)]) (cons `(ptr ,(cadr ty)) (construct-array s ty e env (temp ty))))]
+       [_ (substrate-error s "expected (array-of type value ...)" nil)])]
+    [('throw) (syntax-match s [(_ (? identifier? t) arg ...) (check-throw s t arg env)] [_ (substrate-error s "expected (throw exception value ...)" nil)])]
+    [('lambda) (check-lambda-form s env)]
+    [('try) (check-try-form s env hint)]
+    [('break) (jump s 1)]
+    [('continue) (jump s 0)]
+    [('rethrow) (rethrow-code s)]
+    [('sizeof) (syntax-match s [(_ t) (cons 'lit (fixnum (size-of (complete! (parse-type t) t))))] [_ (substrate-error s "expected (sizeof type)" nil)])]
+    [('offsetof)
+     (syntax-match s
+       [(_ t (? identifier? f))
+        (let ([ty (parse-type t)])
+          (unless (struct-type? ty) (substrate-error t "~s is not a struct" `(,(shown ty))))
+          (cons 'lit (caddr (field-of ty f))))]
+       [_ (substrate-error s "expected (offsetof type field)" nil)])]
+    [('inst) (check-inst s env)]
+    [('#%datum) (syntax-match s [(_ d) (if (string? (syntax-e d)) (string-literal (syntax-e d)) (literal s (syntax-e d)))])]
+    [('mark) (check-marked s fenv env hint)]
+    [else (check-expression (in-tail s (expanded-form s ctx)) env hint)]))
+
+(define (in-tail [e datum] [x datum]) -> datum
+  (when (== e tail) (set! tail x))
+  x)
+
+(define (expanded-form [s datum] [ctx datum]) -> datum
+  (let ([known (cast datum (hash-ref (-> state forms) (cast u64 s)))])
+    (if (!= known 0)
+        known
+        (let ([x (apply-form! ctx s)])
+          (hash-set! (-> state forms) (cast u64 s) (cast u32 x))
+          x))))
+
+(define (check-marked [s datum] [fenv datum] [env datum] [hint datum]) -> datum
+  (let ([args (if (pair? (syntax-e s)) (cdr (syntax->list s)) nil)])
+    (syntax-match fenv
+      [('#%substrate-generic g)
+       (if (pair? (syntax-e s))
+           (check-generic-call s g args env hint)
+           (syntax-match g [(f . _) (substrate-error s "~a is generic: give its types, (inst ~a type ...)" `(,(syntax-e f) ,(syntax-e f)))]))]
+      [('#%substrate-construct v i n)
+       (let ([t (construct-type s v i args env hint)]) (cons t (construct s t i n args env (temp t))))])))
+
+(define (check-inst [s datum] [env datum]) -> datum
+  (syntax-match s
+    [(_ f t ...)
+     (let ([h (expand-head f)])
+       (syntax-match (if (== (car h) 'form) (caddr h) 0)
+         [('#%substrate-generic g)
+          (let ([i (instance g (for/list ([u t]) (parse-type u)) s)]) (cons (cons 'fn (function-type i)) (function-ref i)))]
+         [_ (substrate-error f "~a is not a generic function" `(,(syntax->datum f)))]))]
+    [_ (substrate-error s "expected (inst generic type ...)" nil)]))
+
+(define (check-core [name datum] [e datum] [env datum] [hint datum]) -> datum
+  (syntax-match (cons name (cdr (syntax->list e)))
     [('#%datum d) (literal e (syntax-e d))]
     [('#%app ('quote mark) arg ...) (check-mark e mark arg env hint)]
     [('#%app f arg ...) (check-call e f (callee f env) arg env)]
     [('quote d) (check-quoted e d env hint)]
-    [('quote-syntax d) (cons (datum-type e) `(quote ,(syntax-local-introduce d)))]
-    [('let (b ...) body ...) (check-let e b body env hint)]
+    [('quote-syntax d) (cons (datum-type e) `(quote ,(syntax-local-introduce (prune-local-scopes d))))]
+    [('let (b ...) body ...) (check-let e b body env hint 0)]
+    [('let* () body ...) (check-sequence e body env hint)]
+    [('let* (b rest ...) body ...)
+     (let ([l (syntax->list e)])
+       (check-let e `(,b) `(,(syntax-rewrap e `(,(car l) ,(syntax-rewrap (cadr l) rest) ,@body))) env hint 0))]
     [('if c a) (cons 'void `(if ,(truth (check c env 0) c) ,(as-void (check a env 'void)) #f))]
     [('if c a b)
      (let* ([t (truth (check c env 0) c)] [ra (check a env hint)] [rb (check b env hint)]
@@ -968,13 +1049,15 @@
          (let ([r (check v env 'void)])
            (unless (memq (car r) '(void none)) (substrate-error e "this function returns no value" nil))
            (cons 'none (seq `(,(cdr r) ,(void-return)))))
-         (cons 'none (returning (if (struct-type? result) (result-value v env) (cons result (result-code (check v env result) result v))))))]
+         (cons 'none (returning (if (struct-type? result) (returned-value v env) (cons result (result-code (check v env result) result v))))))]
     [('set! (? identifier? x) v) (check-set e x v env hint)]
     [('throw (? identifier? t) arg ...) (check-core-throw e t arg env)]
     [('throw-ref v) (cons 'none `(throw-ref ,(operand v 'exnref env)))]
-    [('try (c ...) body ...) (check-core-try e c body env hint)]
-    [('block (? identifier? l) body ...) (check-block e l body env hint)]
-    [('loop (? identifier? l) body ...) (check-block e l body env hint)]
+    [('try (c ...) body ...)
+     (for/each ([x c]) (when (== (syntax->list x) 0) (no-match e '"(try (clause ...) body ...)")))
+     (check-core-try e c body env hint)]
+    [('block (? identifier? l) body ...) (check-block e 'block l body env hint)]
+    [('loop (? identifier? l) body ...) (check-block e 'loop l body env hint)]
     [('br l) (left! l 'void 'br) (cons 'none `(br ,(label-key l) #f))]
     [('br l v) (let ([r (settle (check v env 0) 0 v)]) (left! l (car r) 'br) (cons 'none `(br ,(label-key l) ,(cdr r))))]
     [('br-if l c) (left! l 'void 'br-if) (cons 'void `(br-if ,(label-key l) ,(operand c 'i32 env)))]
@@ -992,15 +1075,49 @@
             [rs (for/list ([a arg] [h hints]) (if (!= h 0) (fit-value (check a env h) h a) (settle (check a env 0) 0 a)))])
        (for/each ([r rs] [a arg]) (scalar! (car r) a))
        (cons `(values ,@(for/list ([r rs]) (car r))) `(values ,@(for/list ([r rs]) (cdr r)))))]
-    [('i32.const n) (cons 'i32 (const-of 'i32 n))]
-    [('i64.const n) (cons 'i64 (const-of 'i64 n))]
-    [('f32.const n) (cons 'f32 (const-of 'f32 n))]
-    [('f64.const n) (cons 'f64 (const-of 'f64 n))]
-    [((? identifier? o) . _) (check-prim e o env)]
-    [_ (substrate-error e "this is not Substrate code" nil)]))
+    [('i32.const n) (cons 'i32 (const-of 'i32 (const-literal 'i32.const n)))]
+    [('i64.const n) (cons 'i64 (const-of 'i64 (const-literal 'i64.const n)))]
+    [('f32.const n) (cons 'f32 (const-of 'f32 (const-literal 'f32.const n)))]
+    [('f64.const n) (cons 'f64 (const-of 'f64 (const-literal 'f64.const n)))]
+    [_ (core-shape e name)]))
+
+(define (const-literal [name datum] [n datum]) -> datum
+  (let ([v (syntax-e n)] [integer (or (== name 'i32.const) (== name 'i64.const))])
+    (unless (if integer (integer? v) (or (integer? v) (flonum? v)))
+      (substrate-error n "~a takes a literal ~a" `(,name ,(if integer '"integer" '"number"))))
+    n))
 
 (define (const-of [t datum] [n datum]) -> datum
   (let ([v (syntax-e n)]) `(as (,t) ,(if (integer? v) `(int ,v) `(float ,v)))))
+
+(define (core-shape [e datum] [name datum]) -> datum
+  (let ([shape (case name
+                 [('#%app) '"(#%app f arg ...)"]
+                 [('#%datum) '"(#%datum literal)"]
+                 [('quote) '"(quote datum)"]
+                 [('quote-syntax) '"(quote-syntax datum)"]
+                 [('i32.const 'i64.const 'f32.const 'f64.const) (format-message "(~a literal)" `(,name))]
+                 [('set!) '"(set! x value)"]
+                 [('let 'let*) (format-message "(~a (binding ...) body ...)" `(,name))]
+                 [('if) '"(if test then) or (if test then otherwise)"]
+                 [('block 'loop) (format-message "(~a label body ...)" `(,name))]
+                 [('br) '"(br label) or (br label value)"]
+                 [('br-if) '"(br-if label test)"]
+                 [('br-table) '"(br-table (label ...) default index)"]
+                 [('return) '"(return) or (return value)"]
+                 [('call-indirect) '"(call-indirect signature index arg ...)"]
+                 [('func-index) '"(func-index f)"]
+                 [('select) '"(select a b test)"]
+                 [('drop) '"(drop value)"]
+                 [('unreachable 'nop) (format-message "(~a)" `(,name))]
+                 [('throw) '"(throw tag arg ...)"]
+                 [('throw-ref) '"(throw-ref exn)"]
+                 [('try) '"(try (clause ...) body ...)"]
+                 [else 0])])
+    (if (== shape 0) (substrate-error e "~a is only allowed at module level" `(,name)) (no-match e shape))))
+
+(define (no-match [e datum] [shape datum]) -> datum
+  (substrate-error e "~a: expected ~a" `(,(syntax-e (car (syntax->list e))) ,shape)))
 
 (define (function-value-ref [f datum]) -> datum
   (let ([g (function-value-of f)])
@@ -1013,13 +1130,13 @@
 ;; is in wasm the operand's, a constant takes the operand's type, and the result's type is the
 ;; instruction's.
 
-(define (check-prim [e datum] [o datum] [env datum]) -> datum
-  (let ([p (lookup-prim (syntax-e o))])
+(define (check-prim [e datum] [name datum] [env datum]) -> datum
+  (let ([p (lookup-prim name)])
     (when (== p 0) (substrate-error e "this is not Substrate code" nil))
     (let* ([ps (-> p params)] [args (cdr (syntax->list e))]
            [offset (if (> (length args) (length ps)) (last args) 0)])
       (cons (results-type (-> p results))
-            `(prim ,(syntax-e o) ,(if (!= offset 0) (syntax-e offset) 0) ,(for/list ([a args] [t ps]) (operand a t env)))))))
+            `(prim ,name ,(if (!= offset 0) (syntax-e offset) 0) ,(for/list ([a args] [t ps]) (operand a t env)))))))
 
 (define (results-type [ts datum]) -> datum
   (cond [(null? ts) 'void] [(null? (cdr ts)) (car ts)] [else `(values ,@ts)]))
@@ -1048,8 +1165,8 @@
     (cons (results-type rs) `(call-indirect ,ps ,rs ,(operand i 'i32 env) ,(for/list ([a args] [p ps]) (operand a p env))))))
 
 ;; A block's value is its body's, or the one a branch to it leaves it with.
-(define (check-block [e datum] [l datum] [body datum] [env datum] [hint datum]) -> datum
-  (let* ([key (label-key l)] [r (check-sequence e body env hint)] [head (syntax-e (car (syntax->list e)))]
+(define (check-block [e datum] [head datum] [l datum] [body datum] [env datum] [hint datum]) -> datum
+  (let* ([sc (scope-label! e l body)] [key (car sc)] [r (check-sequence e (cadr sc) env hint)]
          [lefts (for/list ([x left] #:when (equal? (car x) key)) (cdr x))]
          [ty (if (== head 'block)
                  (for/fold ([t (car r)]) ([u lefts])
@@ -1082,21 +1199,32 @@
     [(('#%substrate-arrow _) . _) (read-place (check-place e env) e)]
     [(('#%substrate-cast t) x) (check-cast t x env)]
     [(('#%substrate-update o) place v) (check-update e (syntax-e o) place v env hint)]
-    [(('#%substrate-while) c body step ...) (check-while c body step env)]
+    [(('#%substrate-while) c body step ...) (check-while c `(,body) step env)]
     [(('#%substrate-construct v i n) arg ...)
      (let ([t (construct-type e v i arg env hint)]) (cons t (construct e t i n arg env (temp t))))]
     [(('#%substrate-generic g) arg ...) (check-generic-call e g arg env hint)]
-    [(('#%substrate-match n ...) v clause ...) (check-match e n v clause env hint)]
+    [(('#%substrate-match n ...) v clause ...) (check-match e v (for/list ([m n] [c clause]) (unmarked-clause m c)) env hint)]
     [(('#%substrate-array-of t) arg ...)
      (let ([ty (array-of-type t arg)]) (cons `(ptr ,(cadr ty)) (construct-array e ty arg env (temp ty))))]
     [(('#%substrate-throw t) arg ...) (check-throw e t arg env)]
-    [(('#%substrate-lambda r) ('let ((x _) ...) body ...)) (check-lambda e r x body env)]
-    [(('#%substrate-try n ...) body clause ...) (check-try n body clause env hint)]
+    [(('#%substrate-lambda r) ('let ((x _) ...) body ...))
+     (check-lambda e r x (for/list ([y x]) (value-type! (syntax-property y 'substrate-type) y)) body env)]
+    [(('#%substrate-try n ...) body clause ...) (check-try e `(,body) (for/list ([m n] [c clause]) (unmarked-handler m c)) env hint)]
     [(('#%substrate-addr) place) (let ([p (check-place place env)]) (cons `(ptr ,(car p)) (address p place)))]
     [(('#%substrate-break)) (jump e 1)]
     [(('#%substrate-continue)) (jump e 0)]
     [(('#%substrate-rethrow)) (rethrow-code e)]
     [_ (substrate-error e "bad syntax" nil)]))
+
+(define (unmarked-clause [n datum] [c datum]) -> datum
+  (syntax-match c
+    [('let ((x _) ...) body ...) (syntax-rewrap c `((,n ,@x) ,@body))]
+    [(_ body ...) (syntax-rewrap c `(,n ,@body))]))
+
+(define (unmarked-handler [n datum] [c datum]) -> datum
+  (syntax-match c
+    [('let ((x _) ...) h ...) `(,n ,x ,h ,c)]
+    [(_ h ...) `(#f () ,h ,c)]))
 
 ;; e is 'd: a use of a form of Substrate's that its macro marked, or quoted data.
 (define (check-quoted [e datum] [d datum] [env datum] [hint datum]) -> datum
@@ -1114,10 +1242,10 @@
      (let ([f (instance g (for/list ([u t]) (parse-type u)) e)]) (cons (cons 'fn (function-type f)) (function-ref f)))]
     [_ (cons (datum-type e) `(quote ,(syntax->datum d)))]))
 
-
 (define (void-return) -> datum (returning (cons 'void #f)))
 
 (define (check-sequence [where datum] [forms datum] [env datum] [hint datum]) -> datum
+  (when (and (== where tail) (pair? forms)) (set! tail (last forms)))
   (cond [(null? forms) (cons 'void '(nop))]
         [(null? (cdr forms)) (check (car forms) env hint)]
         [else (let* ([codes (for/list ([f (but-last forms)]) (as-void (check f env 'void)))]
@@ -1139,29 +1267,51 @@
         [(boolean? d) (cons 'lit (fixnum (if d 1 0)))]
         [else (substrate-error e "~s is not a Substrate literal" `(,d))]))
 
-(define (check-let [e datum] [bindings datum] [body datum] [env datum] [hint datum]) -> datum
-  (let* ([vs (for/list ([b bindings])
-               (syntax-match b
-                 [((? identifier? x) init) (let-variable x init env)]
-                 [((? identifier? x) t init) (let-variable (syntax-property-set x 'substrate-type (parse-type t)) init env)]
-                 [(xs (t ...) init)
-                  (let-variables (syntax-rewrap xs (for/list ([y (syntax->list xs)] [u t]) (syntax-property-set y 'substrate-type (parse-type u))))
-                                 init env)]
-                 [(xs init) (let-variables xs init env)]))]
-         [r (settle (check-sequence e body (append (append-all (for/list ([v vs]) (car v))) env) hint) hint e)]
+(define (check-let [e datum] [bindings datum] [body datum] [env datum] [hint datum] [looping i32]) -> datum
+  (let* ([bs (for/list ([b bindings]) (let-binding b))]
+         [sc (scope-locals! e (append-all (for/list ([b bs]) (car b))) body)]
+         [forms (caddr sc)]
+         [final (if (and (== e tail) (not looping) (pair? forms)) (value-key (last forms)) 0)]
+         [vs (bound-values bs (car sc) (cadr sc) final env)]
+         [inner (append (append-all (for/list ([v vs]) (car v))) env)]
+         [r (if looping
+                (check-while (car forms) (cddr forms) `(,(cadr forms)) inner)
+                (settle (check-sequence e forms inner hint) hint e))]
          [code `(let ,(for/list ([v vs] #:when (caddr v)) (caddr v)) ,(cdr r))]
          [stores (for/list ([v vs] #:when (cadr v)) (cadr v))])
     (cons (car r) (if (null? stores) code (seq `(,@stores ,code))))))
 
-(define (let-variable [x datum] [init datum] [env datum]) -> datum
-  (let* ([declared (syntax-property x 'substrate-type)] [key (local-binding x)]
-         [zero (syntax-match init [('quote ('#%substrate-zero)) 1] [_ 0])]
+(define (let-binding [b datum]) -> datum
+  (syntax-match b
+    [((? identifier? x) t init) `((,(typed-variable x t)) ,init #f)]
+    [((? identifier? x) (? type-syntax? t)) `((,(typed-variable x t)) #f #f)]
+    [((? identifier? x) init) `((,x) ,init #f)]
+    [(((? identifier? x) ...) (t ...) init) `(,(for/list ([y x] [u t]) (typed-variable y u)) ,init #t)]
+    [(((? identifier? x) ...) init) `(,x ,init #t)]
+    [_ (substrate-error b "expected [x type value], [x type], [x value] or [(x ...) value]" nil)]))
+
+(define (typed-variable [x datum] [t datum]) -> datum (syntax-property-set x 'substrate-type (parse-type t)))
+
+(define (bound-values [bs datum] [keys datum] [ys datum] [final datum] [env datum]) -> datum
+  (if (null? bs)
+      nil
+      (let* ([b (car bs)] [n (length (car b))]
+             [v (if (caddr b)
+                    (let-variables (take ys n) (take keys n) (cadr b) env)
+                    (let-variable (car ys) (car keys) (cadr b) env (equal? (car keys) final)))])
+        (cons v (bound-values (cdr bs) (list-tail keys n) (list-tail ys n) final env)))))
+
+(define (let-variable [x datum] [key datum] [init datum] [env datum] [final i32]) -> datum
+  (let* ([declared (syntax-property x 'substrate-type)]
+         [zero (if (== init 0) 1 (syntax-match init [('quote ('#%substrate-zero)) 1] [_ 0]))]
          [call (if (== declared 0) (produced-type init) 0)]
          [r (if (or zero (aggregate? declared) call) 0 (check init env declared))]
          [t (cond [declared (complete! declared x)]
                   [call call]
                   [(or (struct-type? (car r)) (closure-type? (car r))) (car r)]
                   [else (scalar! (settled-type (car r)) x)])])
+    (when (and final (== returned 0) (not returned-blocked) (null? returns) (!= to 0) (equal? t result))
+      (set! returned key))
     (cond [(equal? key returned)
            (unless (equal? t result)
              (substrate-error x "~a is returned, so it is a ~s, not a ~s" `(,(syntax-e x) ,(shown result) ,(shown t))))
@@ -1177,21 +1327,20 @@
 
 ;; [(x ...) e], e a call of a function with several results, or (values e ...): each x is a local
 ;; variable.
-(define (let-variables [xs datum] [init datum] [env datum]) -> datum
-  (let* ([ids (syntax->list xs)]
-         [declared (for/list ([x ids]) (syntax-property x 'substrate-type))]
+(define (let-variables [ids datum] [keys datum] [init datum] [env datum]) -> datum
+  (let* ([declared (for/list ([x ids]) (syntax-property x 'substrate-type))]
          [hint (if (ormap (lambda ([d datum]) -> i32 (== d 0)) declared) 0 (cons 'values declared))]
          [r (check init env hint)]
          [ts (if (values-type? (car r)) (cdr (car r)) nil)])
     (unless (== (length ts) (length ids))
       (substrate-error init "expected ~a values, got ~s" `(,(fixnum (length ids)) ,(shown (car r)))))
-    (for/each ([x ids] [d declared] [t ts])
+    (for/each ([x ids] [k keys] [d declared] [t ts])
       (when (and d (not (equal? d t)) (not (and wasm-result (== (wasm-type d) (wasm-type t)))))
         (substrate-error x "~a is a ~s, not a ~s" `(,(syntax-e x) ,(shown t) ,(shown d))))
-      (when (member (local-binding x) addressed) (substrate-error x "~a is one of several values, which have no address" `(,(syntax-e x)))))
+      (when (member k addressed) (substrate-error x "~a is one of several values, which have no address" `(,(syntax-e x)))))
     (let ([vs (for/list ([d declared] [t ts]) (if d d t))])
-      `(,(for/list ([x ids] [v vs]) `(,(local-binding x) ,v)) #f
-        (,(for/list ([x ids]) (local-binding x)) ,(for/list ([v vs]) (wasm-type v)) ,(cdr r) ,(for/list ([x ids]) (syntax-e x)))))))
+      `(,(for/list ([k keys] [v vs]) `(,k ,v)) #f
+        (,keys ,(for/list ([v vs]) (wasm-type v)) ,(cdr r) ,(for/list ([x ids]) (syntax-e x)))))))
 
 (define (fit-value [r datum] [t datum] [where datum]) -> datum
   (cons t (if (and wasm-result (memq t '(i32 i64 f32 f64 exnref))) (operand-of r t where) (convert r t where 0))))
@@ -1281,28 +1430,51 @@
 ;; dst must be fresh, bytes no one reads until this is done: a new variable's, a copy's, or
 ;; the function's own result's.
 (define (copy-into [dst datum] [e datum] [t datum] [env datum]) -> datum
-  (let ([produced (produced-type e)])
+  (let* ([p (producer e)] [produced (production-type p)])
     (if (!= produced 0)
         (begin
           (unless (equal? produced t) (substrate-error e "expected ~s, got ~s" `(,(shown t) ,(shown produced))))
-          (cons 'i32 (syntax-match e
-                            [('#%app ('quote ('#%substrate-construct _ i n)) arg ...) (construct e t i n arg env dst)]
-                            [('#%app ('quote ('#%substrate-array-of _)) arg ...) (construct-array e t arg env dst)]
-                            [('quote ('#%substrate-construct _ i n)) (construct e t i n nil env dst)]
-                            [('#%app f arg ...) (call e f (callee f env) arg env dst)])))
-        (let ([r (check e env t)] [d (fresh-key!)])
-          (if (== (car r) 'none)
-              r
-              (cons 'i32 `(let ((,d i32 ,dst to)) ,(seq `(,(copy-bytes (lref d) (convert r t e 0) (size-of t)) ,(lref d))))))))))
+          (cons 'i32 (case (car p)
+                       [('construct) (construct e t (caddr p) (cadddr p) (list-ref p 4) env dst)]
+                       [('array) (construct-array e t (caddr p) env dst)]
+                       [else (call e (cadr p) (callee (cadr p) env) (caddr p) env dst)])))
+        (let ([r (check e env t)]) (if (== (car r) 'none) r (copied-into dst r t e))))))
+
+(define (copied-into [dst datum] [r datum] [t datum] [e datum]) -> datum
+  (let ([d (fresh-key!)])
+    (cons 'i32 `(let ((,d i32 ,dst to)) ,(seq `(,(copy-bytes (lref d) (convert r t e 0) (size-of t)) ,(lref d)))))))
 
 ;; A generic variant's construction is not one: its type may be the one its place expects.
-(define (produced-type [e datum]) -> datum
-  (syntax-match e
-    [('#%app (? struct-call? f) . _) (cadr (function-type f))]
-    [('#%app ('quote ('#%substrate-array-of t)) arg ...) (array-of-type t arg)]
-    [('#%app ('quote ('#%substrate-construct v . _)) . _) (if (null? (parameters-of (type-binding v))) (named-type v) 0)]
-    [('quote ('#%substrate-construct v . _)) (if (null? (parameters-of (type-binding v))) (named-type v) 0)]
-    [_ 0]))
+(define (producer [e datum]) -> datum
+  (let ([h (expand-head e)])
+    (case (car h)
+      [('macro) (producer (cadr h))]
+      [('form)
+       (case (cadr h)
+         [('array-of) (syntax-match e [(_ t arg ...) `(array ,t ,arg)] [_ 0])]
+         [('mark)
+          (syntax-match (caddr h)
+            [('#%substrate-construct v i n) `(construct ,v ,i ,n ,(if (pair? (syntax-e e)) (cdr (syntax->list e)) nil))]
+            [_ 0])]
+         [else 0])]
+      [('core)
+       (syntax-match (caddr h)
+         [('#%app ('quote ('#%substrate-construct v i n)) arg ...) `(construct ,v ,i ,n ,arg)]
+         [('#%app ('quote ('#%substrate-array-of t)) arg ...) `(array ,t ,arg)]
+         [('quote ('#%substrate-construct v i n)) `(construct ,v ,i ,n ())]
+         [('#%app (? struct-call? f) arg ...) `(call ,f ,arg)]
+         [_ 0])]
+      [else 0])))
+
+(define (produced-type [e datum]) -> datum (production-type (producer e)))
+
+(define (production-type [p datum]) -> datum
+  (if (== p 0)
+      0
+      (case (car p)
+        [('call) (cadr (function-type (cadr p)))]
+        [('array) (array-of-type (cadr p) (caddr p))]
+        [else (if (null? (parameters-of (type-binding (cadr p)))) (named-type (cadr p)) 0)])))
 
 (define (temp [t datum]) -> datum (address (frame-place t (frame-slot! t)) 0))
 
@@ -1377,15 +1549,10 @@
              (datum-put! (-> state instances) key (syntax-local-introduce name))
              ;; The lifted begin is located at the generic's definition, s, so that the
              ;; instance's function is located in the generic's file rather than here.
-             (let ([s-result result] [s-loops loops] [s-frame frame] [s-frame-size frame-size] [s-addressed addressed]
-                   [s-to to] [s-returned returned] [s-returns returns] [s-binders binders] [s-lambdas lambdas]
-                   [s-caught caught] [s-wasm wasm-result] [s-frame-used frame-used] [s-frame-returns frame-returns])
+             (let ([saved (body-state)])
                (syntax-local-lift-definition
                 (at s (function s name x (for/list ([y a]) (replace y sub)) (replace r sub) (for/list ([b body]) (replace b sub)) f 0)))
-               (set! result s-result) (set! loops s-loops) (set! frame s-frame) (set! frame-size s-frame-size)
-               (set! frame-used s-frame-used) (set! frame-returns s-frame-returns)
-               (set! addressed s-addressed) (set! to s-to) (set! returned s-returned) (set! returns s-returns)
-               (set! binders s-binders) (set! lambdas s-lambdas) (set! caught s-caught) (set! wasm-result s-wasm))
+               (restore-body! saved))
              (syntax-local-introduce name))))]))
 
 (define (replace [x datum] [sub datum]) -> datum
@@ -1396,42 +1563,61 @@
 
 ;; ---- closures ----
 
-(define (check-lambda [e datum] [r datum] [xs datum] [body datum] [env datum]) -> datum
-  (let* ([ps (for/list ([x xs]) (value-type! (syntax-property x 'substrate-type) x))]
-         [rt (let ([t (parse-type r)]) (if (== t 'void) t (scalar! t r)))]
+(define (check-lambda-form [s datum] [env datum]) -> datum
+  (syntax-match s
+    [(_ (((? identifier? x) t) ...) '-> r body0 body ...) (check-lambda s r x (lambda-types t) (cons body0 body) env)]
+    [(_ (((? identifier? x) t) ...) body0 body ...) (check-lambda s (syn 'void) x (lambda-types t) (cons body0 body) env)]
+    [_ (substrate-error s "expected (lambda ([x type] ...) -> type body ...) or (lambda ([x type] ...) body ...)" nil)]))
+
+(define (lambda-types [ts datum]) -> datum (for/list ([t ts]) (value-type! (parse-type t) t)))
+
+(define (check-lambda [e datum] [r datum] [xs datum] [ps datum] [body datum] [env datum]) -> datum
+  (let* ([rt (let ([t (parse-type r)]) (if (== t 'void) t (scalar! t r)))]
          [name (let ([known (assq e lambdas)])
                  (if (!= known 0)
                      (cdr known)
-                     (let ([n (lift-lambda e xs ps rt body env)]) (set! lambdas (cons (cons e n) lambdas)) n)))])
+                     (let ([n (lift-lambda e xs ps rt body env)]) (when (!= n 0) (set! lambdas (cons (cons e n) lambdas))) n)))])
     (cons `(closure ,ps ,rt)
-          (prim-code 'i64.or
-                     `(,(prim-code 'i64.shl `(,(prim-code 'i64.extend_i32_u `((func-index ,(info-of name 'func "a function"))))
-                                              ,(const-code 'i64 (fixnum 32))))
-                       ,(prim-code 'i64.extend_i32_u `(,(if frame-used (fp) (i32-const 0)))))))))
+          (if (== name 0)
+              '(unreachable)
+              (prim-code 'i64.or
+                         `(,(prim-code 'i64.shl `(,(prim-code 'i64.extend_i32_u `((func-index ,(info-of name 'func "a function"))))
+                                                  ,(const-code 'i64 (fixnum 32))))
+                           ,(prim-code 'i64.extend_i32_u `(,(if frame-used (fp) (i32-const 0))))))))))
 
-;; The lifted function's body is checked code, with the parameters' keys.
 (define (lift-lambda [e datum] [xs datum] [ps datum] [rt datum] [body datum] [env datum]) -> datum
-  (let* ([name (fresh 'lambda)] [base (fresh 'frame)] [base-key (fresh-key!)]
+  (let* ([sc (scope-locals! e xs body)] [keys (car sc)] [ys (cadr sc)]
+         [made (lambda-definition e ys ps rt keys)] [name (car made)] [base-key (cadr made)]
          [outside (for/list ([b env])
-                    (if (and (pair? (cddr b)) (integer? (caddr b)))
-                        `(,(car b) ,(cadr b) alias (,(cadr b) memory ,(lref base-key) ,(caddr b)))
-                        `(,(car b) ,(cadr b) outside)))]
-         [s-result result] [s-loops loops] [s-frame frame] [s-frame-size frame-size] [s-to to] [s-returned returned]
-         [s-caught caught] [s-wasm wasm-result] [s-frame-used frame-used] [s-frame-returns frame-returns]
+                    (cond [(and (pair? (cddr b)) (integer? (caddr b))) `(,(car b) ,(cadr b) alias (,(cadr b) memory ,(lref base-key) ,(caddr b)))]
+                          [(and (null? (cddr b)) (not (member (car b) addressed))) `(,(car b) ,(cadr b) capture)]
+                          [else `(,(car b) ,(cadr b) outside)]))]
+         [saved (body-state)]
          [code (begin
-                 (set! result rt) (set! loops nil) (set! to 0) (set! returned 0) (set! caught nil) (set! wasm-result 0)
-                 (with-frame lambda-walk `(,e ,body ,xs ,ps ,outside ,rt)))])
-    (set! result s-result) (set! loops s-loops) (set! frame s-frame)
-    (set! frame-size s-frame-size) (set! to s-to) (set! returned s-returned) (set! caught s-caught) (set! wasm-result s-wasm)
-    (set! frame-used s-frame-used) (set! frame-returns s-frame-returns)
-    (syntax-local-lift-definition
-     (at e (syn `(func (,name (,base i32) ,@(for/list ([x xs] [p ps]) `(,x ,(wasm-type p))))
-                       ,@(if (== rt 'void) nil `(-> ,(if (values-type? rt) (wasm-types rt) (wasm-type rt))))
-                       (#%checked code ,(code-box (cons (cons base-key (for/list ([x xs]) (local-binding x))) code)))))))
-    (syntax-local-introduce name)))
+                 (set! result rt) (set! loops nil) (set! to 0) (set! returned 0) (set! returns nil) (set! caught nil)
+                 (set! wasm-result 0) (set! addressed nil) (set! captured nil) (set! returned-blocked 0) (set! tail 0)
+                 (with-frame lambda-walk `(,e ,(caddr sc) ,ys ,ps ,outside ,rt ,keys)))]
+         [taken captured])
+    (restore-body! saved)
+    (if (pair? taken)
+        (begin (set! needed (append taken needed)) 0)
+        (begin (set! lifts (cons (cons (caddr made) code) lifts)) name))))
+
+(define (lambda-definition [e datum] [ys datum] [ps datum] [rt datum] [keys datum]) -> datum
+  (let ([known (cast datum (hash-ref (-> state lifted) (cast u64 e)))])
+    (if (!= known 0)
+        known
+        (let* ([name (fresh 'lambda)] [base (fresh 'frame)] [base-key (fresh-key!)] [cell (cons 'seq nil)]
+               [made `(,(syntax-local-introduce name) ,base-key ,cell)])
+          (syntax-local-lift-definition
+           (at e (syn `(func (,name (,base i32) ,@(for/list ([x ys] [p ps]) `(,x ,(wasm-type p))))
+                             ,@(if (== rt 'void) nil `(-> ,(if (values-type? rt) (wasm-types rt) (wasm-type rt))))
+                             (#%checked code ,(code-box (cons (cons base-key keys) cell)))))))
+          (hash-set! (-> state lifted) (cast u64 e) (cast u32 made))
+          made))))
 
 (define (lambda-walk [a datum]) -> datum
-  (let* ([e (car a)] [body (cadr a)] [params (for/list ([x (caddr a)] [p (cadddr a)]) (parameter x p))])
+  (let* ([e (car a)] [body (cadr a)] [params (for/list ([k (list-ref a 6)] [x (caddr a)] [p (cadddr a)]) (parameter k x p))])
     (framed (append-all (for/list ([q params]) (cdr q)))
             (function-body e body (append (for/list ([q params]) (car q)) (list-ref a 4)) (list-ref a 5)))))
 
@@ -1468,10 +1654,7 @@
     fields))
 
 (define (scalar-construction [v datum] [t datum]) -> datum
-  (let ([c datum (syntax-match v
-             [('#%app ('quote ('#%substrate-construct w i n)) arg ...) `(,w ,i ,n ,arg)]
-             [('quote ('#%substrate-construct w i n)) `(,w ,i ,n ())]
-             [_ 0])])
+  (let ([c (let ([p (producer v)]) (if (and (!= p 0) (== (car p) 'construct)) (cdr p) 0))])
     (if (and (!= c 0) (variant-type? t) (== (identifier-name (car c)) (cadr t))
              (andmap (lambda ([f datum]) -> i32 (not (aggregate? (cadr f))))
                      (cdr (list-ref (cases-of t) (fixnum-value (syntax-e (cadr c)))))))
@@ -1485,9 +1668,16 @@
        ,(seq `(,(prim-code 'i32.store `(,(lref d) ,(const-code 'i32 i)))
                ,@(for/list ([x xs] [f fields]) (store (cadr f) (lref d) (fixnum-value (caddr f)) (lref x))))))))
 
-(define (check-match [e datum] [names datum] [v datum] [clauses datum] [env datum] [hint datum]) -> datum
-  (let* ([p (struct-base v env)] [t (car p)] [a (fresh-key!)] [tag (fresh-key!)] [nullable (pointer-base? p)]
-         [pairs (for/list ([n names] [c clauses]) (cons n c))]
+(define (check-match [e datum] [v datum] [clauses datum] [env datum] [hint datum]) -> datum
+  (let* ([cs (for/list ([c clauses])
+               (syntax-match c
+                 [((? false-literal? n) body0 body ...) `(,n (#f ,(cons body0 body) ,c))]
+                 [(((? identifier? n) (? identifier? x) ...) body0 body ...)
+                  `(,n (,(for/list ([y x]) (if (== (syntax-e y) '_) (fresh '_) y)) ,(cons body0 body) ,c))]
+                 [((? identifier? n) body0 body ...) `(,n (#f ,(cons body0 body) ,c))]
+                 [_ (substrate-error c "expected [(case x ...) body ...], [case body ...], [#f body ...] or [_ body ...]" nil)]))]
+         [p (struct-base v env)] [t (car p)] [a (fresh-key!)] [tag (fresh-key!)] [nullable (pointer-base? p)]
+         [pairs (for/list ([x cs]) (cons (car x) (cadr x)))]
          [nulls (for/list ([nc pairs] #:when (== (syntax-e (car nc)) 0)) nc)]
          [cases (for/list ([nc pairs] #:when (!= (syntax-e (car nc)) 0)) nc)])
     (unless (variant-type? t) (substrate-error v "match takes a variant, or a pointer to one, not ~s" `(,(shown t))))
@@ -1521,7 +1711,7 @@
       (let* ([n (car names)] [c (car clauses)]
              [i (if (== (syntax-e n) '_) 0 (case-index n t))])
         (when (and (!= i 0) (not (member i left))) (substrate-error n "~a is matched twice" `(,(syntax-e n))))
-        (when (null? left) (substrate-error c "this clause can never match" nil))
+        (when (null? left) (substrate-error (caddr c) "this clause can never match" nil))
         (match-arms e p t a tag nullable nulls (cdr names) (cdr clauses)
                     (cons `(,i ,(arm c i t a (cadddr p) env hint) ,c) arms)
                     (if (!= i 0) (for/list ([j left] #:when (not (equal? j i))) j) nil)
@@ -1537,21 +1727,21 @@
 
 (define (arm-code [x datum] [ty datum]) -> datum (as (cadr x) ty (caddr x)))
 
-(define (arm [c datum] [i datum] [t datum] [a datum] [o datum] [env datum] [hint datum]) -> datum
-  (syntax-match c
-    [('let ((x _) ...) body ...)
-     (let ([fields (cdr (list-ref (cases-of t) (fixnum-value i)))])
-       (unless (== (length x) (length fields))
-         (substrate-error c "~a has ~a field~a, not ~a"
-                          `(,(car (list-ref (cases-of t) (fixnum-value i))) ,(fixnum (length fields)) ,(plural (length fields)) ,(fixnum (length x)))))
-       (settle (check-sequence c body
-                               (append (for/list ([y x] [f fields])
-                                         `(,(local-binding y) ,(cadr f) alias
-                                           (,(cadr f) memory ,(lref a) ,(fixnum (+ (fixnum-value o) (fixnum-value (caddr f)))))))
-                                       env)
-                               hint)
-               hint c))]
-    [('begin body ...) (check-sequence c body env hint)]))
+(define (arm [cl datum] [i datum] [t datum] [a datum] [o datum] [env datum] [hint datum]) -> datum
+  (let ([x (car cl)] [body (cadr cl)] [c (caddr cl)])
+    (if (== x 0)
+        (check-sequence c body env hint)
+        (let ([fields (cdr (list-ref (cases-of t) (fixnum-value i)))])
+          (unless (== (length x) (length fields))
+            (substrate-error c "~a has ~a field~a, not ~a"
+                             `(,(car (list-ref (cases-of t) (fixnum-value i))) ,(fixnum (length fields)) ,(plural (length fields)) ,(fixnum (length x)))))
+          (let ([sc (scope-locals! c x body)])
+            (settle (check-sequence c (caddr sc)
+                                    (append (for/list ([k (car sc)] [f fields])
+                                              `(,k ,(cadr f) alias (,(cadr f) memory ,(lref a) ,(fixnum (+ (fixnum-value o) (fixnum-value (caddr f)))))))
+                                            env)
+                                    hint)
+                    hint c))))))
 
 (define (construct-type [e datum] [v datum] [i datum] [args datum] [env datum] [hint datum]) -> datum
   (let ([b (type-binding v)])
@@ -1566,8 +1756,8 @@
              `(struct ,(identifier-name v) ,(cadr b) ,(for/list ([p ps]) (bound-type e s p (syntax-e v)))))])))
 
 (define (case-index [n datum] [t datum]) -> datum
-  (syntax-match (if (== (identifier-binding-kind n) 'macro) (local-expand n) 0)
-    [('quote ('#%substrate-construct v i _))
+  (syntax-match (let ([h (expand-head n)]) (if (== (car h) 'form) (caddr h) 0))
+    [('#%substrate-construct v i _)
      (if (== (identifier-name v) (cadr t)) (syntax-e i) (substrate-error n "~a is not a case of ~a" `(,(syntax-e n) ,(shown t))))]
     [_ (substrate-error n "~a is not a case of ~a" `(,(syntax-e n) ,(shown t)))]))
 
@@ -1596,30 +1786,63 @@
 ;; ---- places ----
 
 (define (check-place [e datum] [env datum]) -> datum
+  (let ([h (expand-head e)])
+    (case (car h)
+      [('macro) (check-place (cadr h) env)]
+      [('local) (local-place (cadr h) e env)]
+      [('global) (global-place e)]
+      [('form)
+       (case (cadr h)
+         [('@)
+          (syntax-match e
+            [(_ p) (deref-place p env)]
+            [(_ p i) (index-place p i env)]
+            [_ (substrate-error e "expected (@ p) or (@ p i)" nil)])]
+         [('->) (arrow-place e env)]
+         [else (not-a-place e)])]
+      [('core)
+       (syntax-match (caddr h)
+         [('#%app ('quote ('#%substrate-deref)) p) (deref-place p env)]
+         [('#%app ('quote ('#%substrate-deref)) p i) (index-place p i env)]
+         [('#%app ('quote ('#%substrate-arrow f)) s) (field-place s f env)]
+         [_ (not-a-place e)])]
+      [else (not-a-place e)])))
+
+(define (deref-place [p datum] [env datum]) -> datum
+  (let ([r (check p env 0)]) `(,(pointee r p) memory ,(cdr r) 0)))
+
+(define (not-a-place [e datum]) -> datum
+  (substrate-error e "expected a place: a variable, (@ p), (@ p i) or (-> p field)" nil))
+
+(define (arrow-place [e datum] [env datum]) -> datum
   (syntax-match e
-    [(? identifier? x) (variable-place x env)]
-    [('#%app ('quote ('#%substrate-deref)) p) (let ([r (check p env 0)]) `(,(pointee r p) memory ,(cdr r) 0))]
-    [('#%app ('quote ('#%substrate-deref)) p i) (index-place p i env)]
-    [('#%app ('quote ('#%substrate-arrow f)) s) (field-place s f env)]
-    [_ (substrate-error e "expected a place: a variable, (@ p), (@ p i) or (-> p field)" nil)]))
+    [(_ s (? identifier? f) (? identifier? g) ...) (for/fold ([p (struct-base s env)]) ([h (cons f g)]) (field-in p h s))]
+    [_ (substrate-error e "expected (-> p field ...)" nil)]))
 
 (define (place-form? [e datum]) -> i32
-  (syntax-match e
-    [(? identifier? _) 1]
-    [('#%app ('quote ((? identifier? m) . _)) . _) (if (memq (syntax-e m) '(#%substrate-deref #%substrate-arrow)) 1 0)]
-    [_ 0]))
+  (let ([h (expand-head e)])
+    (case (car h)
+      [('macro) (place-form? (cadr h))]
+      [('local 'global) 1]
+      [('form) (if (memq (cadr h) '(@ ->)) 1 0)]
+      [('core)
+       (syntax-match (caddr h)
+         [('#%app ('quote ((? identifier? m) . _)) . _) (if (memq (syntax-e m) '(#%substrate-deref #%substrate-arrow)) 1 0)]
+         [_ 0])]
+      [else 0])))
 
-(define (variable-place [x datum] [env datum]) -> datum
-  (let ([b (assoc (local-binding x) env)])
-    (cond [(and b (null? (cddr b))) `(,(cadr b) local ,(lref (car b)))]
-          [(and b (== (caddr b) 'at)) `(,(cadr b) memory ,(lref (car b)) 0)]
-          [(and b (== (caddr b) 'result)) `(,(cadr b) memory ,to 0)]
-          [(and b (== (caddr b) 'alias)) (cadddr b)]
-          [(and b (== (caddr b) 'outside))
+(define (local-place [key datum] [x datum] [env datum]) -> datum
+  (let ([b (assoc key env)])
+    (cond [(== b 0) (substrate-error x "internal: ~a is not in scope" `(,(syntax-e x)))]
+          [(null? (cddr b)) `(,(cadr b) local ,(lref (car b)))]
+          [(== (caddr b) 'at) `(,(cadr b) memory ,(lref (car b)) 0)]
+          [(== (caddr b) 'result) `(,(cadr b) memory ,to 0)]
+          [(== (caddr b) 'alias) (cadddr b)]
+          [(== (caddr b) 'capture) (set! captured (cons key captured)) `(,(cadr b) local ,(lref (car b)))]
+          [(== (caddr b) 'outside)
            (substrate-error x "~a cannot be used in this lambda: a lambda uses the variables of the function it is in, not those of a match, a struct parameter or another lambda"
                             `(,(syntax-e x)))]
-          [b (frame-place (cadr b) (fixnum-value (caddr b)))]
-          [else (global-place x)])))
+          [else (frame-place (cadr b) (fixnum-value (caddr b)))])))
 
 (define (global-place [x datum]) -> datum
   (let* ([kind (identifier-binding-kind x)] [g (if (== kind 'variable) (fact x 'substrate-global) 0)]
@@ -1641,18 +1864,22 @@
         `(,t memory ,(cdr r) ,(make-integer (* (integer-value (cdr n)) (cast u32 size))))
         `(,t memory ,(prim-code 'i32.add `(,(cdr r) ,(scaled n size i))) 0))))
 
-(define (field-place [s datum] [f datum] [env datum]) -> datum
-  (let* ([base (struct-base s env)] [field (field-of (car base) f)])
+(define (field-place [s datum] [f datum] [env datum]) -> datum (field-in (struct-base s env) f s))
+
+(define (field-in [p datum] [f datum] [s datum]) -> datum
+  (let* ([base (if (struct-type? (car p)) p (based (read-place p s) s))] [field (field-of (car base) f)])
     `(,(cadr field) memory ,(caddr base) ,(fixnum (+ (fixnum-value (cadddr base)) (fixnum-value (caddr field)))))))
 
 (define (struct-base [s datum] [env datum]) -> datum
   (let ([p (if (place-form? s) (check-place s env) 0)])
     (if (and (!= p 0) (struct-type? (car p)))
         p
-        (let ([r (if (!= p 0) (read-place p s) (check s env 0))])
-          (cond [(struct-type? (car r)) `(,(car r) memory ,(cdr r) 0)]
-                [(and (pointer? (car r)) (struct-type? (cadr (car r)))) `(,(cadr (car r)) memory ,(cdr r) 0 pointer)]
-                [else (substrate-error s "expected a struct, or a pointer to one, not ~s" `(,(shown (car r))))])))))
+        (based (if (!= p 0) (read-place p s) (check s env 0)) s))))
+
+(define (based [r datum] [s datum]) -> datum
+  (cond [(struct-type? (car r)) `(,(car r) memory ,(cdr r) 0)]
+        [(and (pointer? (car r)) (struct-type? (cadr (car r)))) `(,(cadr (car r)) memory ,(cdr r) 0 pointer)]
+        [else (substrate-error s "expected a struct, or a pointer to one, not ~s" `(,(shown (car r))))]))
 
 (define (pointer-base? [p datum]) -> i32 (and (== (length p) 5) (== (list-ref p 4) 'pointer)))
 
@@ -1668,9 +1895,13 @@
           [else (cons (promoted t) (load t (caddr p) (fixnum-value (cadddr p))))])))
 
 (define (address [p datum] [where datum]) -> datum
-  (when (== (cadr p) 'local)
-    (substrate-error where "~a is a local variable, not in memory: it has no address" `(,(syntax->datum (written where)))))
-  (if (== (fixnum-value (cadddr p)) 0) (caddr p) (prim-code 'i32.add `(,(caddr p) ,(const-code 'i32 (cadddr p))))))
+  (cond [(== (cadr p) 'local)
+         (let ([x (caddr p)])
+           (if (and (pair? x) (== (car x) 'lref) (not (member (cadr x) addressed)))
+               (begin (set! needed (cons (cadr x) needed)) x)
+               (substrate-error where "~a is a local variable, not in memory: it has no address" `(,(syntax->datum (written where))))))]
+        [(== (fixnum-value (cadddr p)) 0) (caddr p)]
+        [else (prim-code 'i32.add `(,(caddr p) ,(const-code 'i32 (cadddr p))))]))
 
 (define (check-set [e datum] [place datum] [v datum] [env datum] [hint datum]) -> datum
   (let* ([p (settable! (check-place place env) e)] [t (car p)] [c (if (struct-type? t) (scalar-construction v t) 0)])
@@ -1934,22 +2165,34 @@
 
 ;; Each handler first gives the stack back to where it was when the try began: the frames of
 ;; the calls the exception left were not given back.
-(define (check-try [names datum] [body datum] [clauses datum] [env datum] [hint datum]) -> datum
-  (let* ([b (check body env hint)]
-         [hs (for/list ([n names] [c clauses])
-               (let ([c0 caught] [exn (fresh-key!)] [checked datum 0])
+(define (check-try-form [s datum] [env datum] [hint datum]) -> datum
+  (syntax-match s [(_ form ...) (try-parts s (reverse form) nil env hint)]))
+
+(define (try-parts [s datum] [forms datum] [clauses datum] [env datum] [hint datum]) -> datum
+  (let ([clause datum (if (pair? forms)
+                    (syntax-match (car forms)
+                      [('catch (? identifier? t) ((? identifier? x) ...) h0 h ...) `(,t ,x ,(cons h0 h) ,(car forms))]
+                      [('catch-all h0 h ...) `(#f () ,(cons h0 h) ,(car forms))]
+                      [_ 0])
+                    0)])
+    (cond [(!= clause 0) (try-parts s (cdr forms) (cons clause clauses) env hint)]
+          [(or (null? forms) (null? clauses))
+           (substrate-error s "expected (try body ... [catch E (x ...) h ...] ... [catch-all h ...])" nil)]
+          [else (check-try s (reverse forms) clauses env hint)])))
+
+(define (check-try [s datum] [body datum] [clauses datum] [env datum] [hint datum]) -> datum
+  (let* ([b (check-sequence s body env hint)]
+         [hs (for/list ([cl clauses])
+               (let ([n (car cl)] [x (cadr cl)] [h (caddr cl)] [c (cadddr cl)] [c0 caught] [exn (fresh-key!)] [checked datum 0])
                  (set! caught (cons (cons c exn) caught))
                  (set! checked
-                       (if (== (syntax-e n) '_)
-                                (syntax-match c [('begin h ...) `(#f () ,(check-sequence c h env hint) ,c ,exn)])
-                                (syntax-match c
-                                  [('let ((x _) ...) h ...)
-                                   (let ([ts (exception-types n)])
-                                     (unless (== (length x) (length ts))
-                                       (substrate-error c "~a carries ~a value~a, not ~a"
-                                                        `(,(syntax-e n) ,(fixnum (length ts)) ,(plural (length ts)) ,(fixnum (length x)))))
-                                     `(,n ,(for/list ([y x]) (local-binding y))
-                                       ,(check-sequence c h (append (for/list ([y x] [u ts]) `(,(local-binding y) ,u)) env) hint) ,c ,exn))])))
+                       (if (== n 0)
+                           `(#f () ,(check-sequence c h env hint) ,c ,exn)
+                           (let ([ts (exception-types n)] [sc (scope-locals! c x h)])
+                             (unless (== (length x) (length ts))
+                               (substrate-error c "~a carries ~a value~a, not ~a"
+                                                `(,(syntax-e n) ,(fixnum (length ts)) ,(plural (length ts)) ,(fixnum (length x)))))
+                             `(,n ,(car sc) ,(check-sequence c (caddr sc) (append (for/list ([k (car sc)] [u ts]) `(,k ,u)) env) hint) ,c ,exn))))
                  (set! caught c0)
                  checked))]
          [ty (promoted (settled-for (for/fold ([ty (car b)]) ([h hs]) (join ty (car (caddr h)))) hint))]
@@ -1963,7 +2206,7 @@
                                 [(car h) `(catch ,(info-of (car h) 'tag "a tag") ,keys ,code)]
                                 [ref `(catch-all-ref #f (,exn) ,code)]
                                 [else `(catch-all #f () ,code)])))
-                     ,(as b ty body))))))
+                     ,(as b ty s))))))
 
 (define (check-core-throw [e datum] [t datum] [args datum] [env datum]) -> datum
   (let ([ts (exception-types t)])
@@ -1980,20 +2223,19 @@
 
 (define (check-catch [c datum] [env datum] [hint datum]) -> datum
   (syntax-match c
-    [('catch (? identifier? t) (x ...) h ...)
-     (catch-handler c `(catch ,(info-of t 'tag "a tag") ,(for/list ([y x]) (local-binding y))) x (exception-types t) h env hint)]
+    [('catch (? identifier? t) (x ...) h ...) (catch-handler c `(catch ,(info-of t 'tag "a tag")) x (exception-types t) h env hint)]
     [('catch-ref (? identifier? t) (x ... r) h ...)
-     (catch-handler c `(catch-ref ,(info-of t 'tag "a tag") ,(for/list ([y (append x `(,r))]) (local-binding y)))
-                    (append x `(,r)) (append (exception-types t) '(exnref)) h env hint)]
-    [('catch-all h ...) (catch-handler c '(catch-all #f ()) nil nil h env hint)]
-    [('catch-all-ref (r) h ...) (catch-handler c `(catch-all-ref #f (,(local-binding r))) `(,r) '(exnref) h env hint)]
+     (catch-handler c `(catch-ref ,(info-of t 'tag "a tag")) (append x `(,r)) (append (exception-types t) '(exnref)) h env hint)]
+    [('catch-all h ...) (catch-handler c '(catch-all #f) nil nil h env hint)]
+    [('catch-all-ref (r) h ...) (catch-handler c '(catch-all-ref #f) `(,r) '(exnref) h env hint)]
     [_ (substrate-error c "expected (catch tag (x ...) body ...), (catch-ref tag (x ... e) body ...), (catch-all body ...) or (catch-all-ref (e) body ...)" nil)]))
 
 (define (catch-handler [c datum] [head datum] [xs datum] [ts datum] [h datum] [env datum] [hint datum]) -> datum
   (unless (== (length xs) (length ts))
     (substrate-error c "this clause binds ~a variable~a, not ~a" `(,(fixnum (length ts)) ,(plural (length ts)) ,(fixnum (length xs)))))
-  (let ([r (check-sequence c h (append (for/list ([x xs] [t ts]) `(,(local-binding x) ,t)) env) hint)])
-    `(,(car r) ,head ,(cdr r))))
+  (let* ([sc (scope-locals! c xs h)]
+         [r (check-sequence c (caddr sc) (append (for/list ([k (car sc)] [t ts]) `(,k ,t)) env) hint)])
+    `(,(car r) (,@head ,(car sc)) ,(cdr r))))
 
 ;; A handler binds the exception it caught only if it rethrows it.
 (define (rethrow-code [e datum]) -> datum
@@ -2008,7 +2250,7 @@
          [t (truth r c)]
          [b (let ([l0 loops] [v datum 0])
               (set! loops (cons (cons brk cont) loops))
-              (set! v (as-void (check body env 'void)))
+              (set! v (as-void (check-sequence c body env 'void)))
               (set! loops l0)
               v)]
          [s (for/list ([x step]) (as-void (check x env 'void)))])
@@ -2090,9 +2332,10 @@
 (define (substrate-interaction [s datum]) -> datum
   (syntax-match s
     [(_ _ e)
-     (let ([x (begin (set! quoter s) (start-function! 'void 0) (local-expand e))])
-       (scan x)
-       (with-frame interaction-walk x))]))
+     (begin
+       (set! quoter s)
+       (start-function! 'void 0)
+       (with-frame interaction-walk e))]))
 
 (define (interaction-walk [e datum]) -> datum
   (framed nil (cons 'void (written-value (settle (check e nil 0) 0 e) e))))
