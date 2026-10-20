@@ -2,7 +2,7 @@
 
 (require-unqualified macros "../../compiler/macros.sub")
 
-(provide convert-body convert-lambda infer-module! in-pass?)
+(provide convert-body convert-lambda infer-module! in-pass? closure-of)
 
 (define passing i32 0)
 (define (in-pass?) -> i32 passing)
@@ -97,7 +97,24 @@
 (define (list4 [a datum] [b datum] [c datum] [d datum]) -> datum (cons a (cons b (cons c (cons d nil)))))
 
 (define (data-form? [s datum]) -> i32
-  (or (form? s 'quote) (form? s 'quote-syntax) (form? s '#%datum)))
+  (or (form? s 'quote) (form? s 'quote-syntax) (form? s '#%datum) (and (cast-form? s) (data-form? (cast-arg s)))))
+
+;; Substrate's cast, (#%app (quote (#%substrate-cast type)) e): the pass sees through it.
+(define (cast-form? [s datum]) -> i32
+  (and (form? s '#%app) (== (length (parts s)) 3) (form? (cadr (parts s)) 'quote)
+       (let ([q (syntax->list (cadr (parts (cadr (parts s)))))])
+         (and (!= q 0) (pair? q) (identifier? (car q)) (== (syntax-e (car q)) '#%substrate-cast)))))
+
+(define (cast-arg [s datum]) -> datum (caddr (parts s)))
+
+;; A Scheme function's closure, the global its definition named in a fact.
+(define (closure-of [f datum]) -> datum
+  (let ([fs (syntax-local-facts f)])
+    (while (pair? fs)
+      (let ([v (syntax->datum (caddr (car fs)))])
+        (when (and (pair? v) (== (car v) 'scheme-closure)) (return (name-identifier (cadr v)))))
+      (set! fs (cdr fs)))
+    (fail-datum '"a function that is not Scheme's is used as a value" f)))
 
 (define (code-form? [s datum]) -> i32
   (and (syntax? s) (pair? (syntax-e s)) (not (data-form? s))))
@@ -132,10 +149,14 @@
 
 ;; Its parameters, as a func's, its result and its body.
 (define (lambda-parts [s datum]) -> datum
-  (let ([l (parts (caddr (parts s)))])
-    (list3 (map (lambda ([b datum]) -> datum (list2 (binding-name b) (cadr (parts b)))) (parts (cadr l)))
-           (list2 (named '-> s) (named 'i32 s))
-           (cddr l))))
+  (let ([l (parts (caddr (parts s)))] [ps nil] [i 0] [bs datum 0])
+    (set! bs (parts (cadr l)))
+    (while (pair? bs)
+      (let ([b (car bs)])
+        (set! ps (cons (list2 (binding-name b) (if (== i 0) (cadr (parts b)) (named 'v:datum b))) ps)))
+      (+= i 1)
+      (set! bs (cdr bs)))
+    (list3 (reverse ps) (list2 (named '-> s) (named 'v:datum s)) (cddr l))))
 
 (define (param-name [p datum]) -> datum (car (parts p)))
 
@@ -424,6 +445,7 @@
 
 (define (owned-use? [s datum] [id i32] [owned i32]) -> i32
   (cond [(data-form? s) 0]
+        [(cast-form? s) (owned-use? (cast-arg s) id owned)]
         [(identifier? s) (and (== (id-of s) id) owned)]
         [(lambda-form? s) (uses? s id)]
         [(form? s 'set!) (owned-use? (caddr (parts s)) id 1)]
@@ -672,6 +694,7 @@
 
 (define (tail-calls [s datum] [acc datum]) -> datum
   (cond [(data-form? s) acc]
+        [(cast-form? s) (tail-calls (cast-arg s) acc)]
         [(form? s 'if)
          (let ([l (cdr (parts s))])
            (set! acc (tail-calls (cadr l) acc))
@@ -970,6 +993,7 @@
 
 (define (kind-of [s datum] [env datum] [live datum]) -> i32
   (cond [(data-form? s) e-lit]
+        [(cast-form? s) (kind-of (cast-arg s) env live)]
         [(identifier? s)
          (let ([e (lookup env (id-of s))])
            (cond [(!= e 0)
@@ -1060,10 +1084,13 @@
 (define (let-code [bindings datum] [body datum] [loc datum]) -> datum
   (cond [(and (null? bindings) (== (length body) 1)) (car body)]
         [(null? bindings) (datum->syntax ctx (cons (named 'begin loc) body) loc)]
-        [else (datum->syntax ctx (cons (named 'let loc) (cons (datum->syntax ctx bindings loc) body)) loc)]))
+        [else (datum->syntax ctx (cons (datum->syntax ctx 'let loc) (cons (datum->syntax ctx bindings loc) body)) loc)]))
 
 (define (binding-code [x datum] [init datum] [loc datum]) -> datum
-  (datum->syntax ctx (list3 x (named 'i32 loc) init) loc))
+  (datum->syntax ctx (list3 x (named 'v:datum loc) init) loc))
+
+(define (kinded-binding-code [x datum] [e datum] [kind i32] [init datum] [loc datum]) -> datum
+  (if (== kind e-raw) (typed-binding-code x e init loc) (binding-code x init loc)))
 
 (define (typed-binding-code [x datum] [e datum] [init datum] [loc datum]) -> datum
   (datum->syntax ctx (list3 x (named (expression-type e) loc) init) loc))
@@ -1111,11 +1138,17 @@
 
 (define (rw [s datum] [env datum] [live datum] [mode i32]) -> datum
   (cond [(data-form? s) (if (== mode m-stmt) 0 s)]
+        [(cast-form? s)
+         (let ([inner (rw (cast-arg s) env live mode)])
+           (if (== mode m-stmt) inner (syntax-rewrap s (list3 (car (parts s)) (cadr (parts s)) inner))))]
         [(identifier? s)
          (let ([e (lookup env (id-of s))])
            (cond [(!= e 0) (use-of e (id-of s) s live mode)]
                  [(== mode m-stmt) 0]
-                 [(and (== mode m-owned) (or (!= (id-of s) -1) (global? s))) (dup-code s s)]
+                 [(and (== (id-of s) -1) (global? s))
+                  (let ([g (as-value (if (== (identifier-binding-kind s) 'function) (closure-of s) s) s)])
+                    (if (== mode m-owned) (dup-code g s) g))]
+                 [(and (== mode m-owned) (!= (id-of s) -1)) (dup-code s s)]
                  [else s]))]
         [(form? s 'set!) (rw-set s env live)]
         [(form? s 'begin) (rw-sequence (cdr (parts s)) env live mode s)]
@@ -1184,7 +1217,7 @@
            ;; A global: the old value is dropped once the new one is made, which may use it.
            (let ([t (fresh "value" s)])
              (let-code (list1 (binding-code t (value v env live) s))
-                       (list2 (drop-code x s) (syntax-rewrap s (list3 (car l) x t)))
+                       (list2 (drop-code (as-value x s) s) (syntax-rewrap s (list3 (car l) x (as-word t s))))
                        s))])))
 
 (define (remove-id [l datum] [id i32]) -> datum
@@ -1459,6 +1492,7 @@
     (if (!= k 0)
         (== k 2)
         (let ([r (cond [(or (data-form? s) (identifier? s) (lambda-form? s)) 0]
+                       [(cast-form? s) (raises? (cast-arg s))]
                        [(or (form? s 'throw) (form? s 'throw-ref)) 1]
                        [(!= (call-head-id s) -1) (or (not (marked? safe-locals (call-head-id s))) (raises-each? (parts s)))]
                        [(form? s 'call-indirect) 1]
@@ -1615,7 +1649,7 @@
            (set! (-> acc out) (cons t (-> acc out))))]
         [(-> acc any-temp)
          (let ([t (fresh "arg" o)])
-           (set! (-> acc temps) (cons (typed-binding-code t o (rw o env after m-any) o) (-> acc temps)))
+           (set! (-> acc temps) (cons (kinded-binding-code t o (kind-of o env after) (rw o env after m-any) o) (-> acc temps)))
            (set! (-> acc out) (cons t (-> acc out))))]
         [else (set! (-> acc out) (cons (rw o env after m-any) (-> acc out)))]))
 
@@ -1698,8 +1732,19 @@
       (set! ops (cdr ops)))
     (set! unwind saved)
     (set! (-> acc drops) (append (held-drops held env s) (-> acc drops)))
-    (call-code s (syntax-rewrap s (reverse (-> acc out))) acc result mode
+    (call-code s (value-code (syntax-rewrap s (reverse (-> acc out))) kind s) acc result mode
                (if (-> acc padded) (pad-drops env live (reverse (-> acc drops)) s) nil))))
+
+;; A closure's code gives an i32, a value.
+(define (value-code [call datum] [kind i32] [loc datum]) -> datum
+  (if (== kind 0) (as-value call loc) call))
+
+;; Scheme's globals are wasm globals, i32s: a value read from one is cast, and cast back when written.
+(define (as-value [e datum] [loc datum]) -> datum
+  (datum->syntax ctx (list3 (named 'cast loc) (named 'v:datum loc) e) loc))
+
+(define (as-word [e datum] [loc datum]) -> datum
+  (datum->syntax ctx (list3 (named 'cast loc) (named 'i32 loc) e) loc))
 
 (define (call-code [s datum] [call datum] [acc (ptr operands)] [result i32] [mode i32] [pad datum]) -> datum
   (let ([drops (reverse (-> acc drops))] [temps (reverse (-> acc temps))])
@@ -1729,7 +1774,7 @@
           [else
            (let ([r (fresh "result" s)])
              (nested-let-code temps
-                              (list1 (let-code (list1 (typed-binding-code r s (if (== result e-borrowed) (dup-code call s) call) s))
+                              (list1 (let-code (list1 (kinded-binding-code r s result (if (== result e-borrowed) (dup-code call s) call) s))
                                                (append drops (list1 r)) s))
                               s))])))
 
@@ -1823,10 +1868,10 @@
     (while (pair? caps)
       (let* ([v (cast i32 (integer-value (car caps)))] [cv (fresh "captured" m)])
         (set! inner (bind inner v (boxed? v) k-owned cv))
-        (set! cparams (cons (datum->syntax ctx (list2 cv (named 'i32 m)) m) cparams)))
+        (set! cparams (cons (datum->syntax ctx (list2 cv (named 'v:datum m)) m) cparams)))
       (set! caps (cdr caps)))
     (set! inner (bind-mark-params inner (parts params)))
-    (let ([func (datum->syntax ctx (cons (named 'func m)
+    (let ([func (datum->syntax ctx (cons (named 'define m)
                                          (cons (cons name (append (reverse cparams) (parts params)))
                                                (append result (list1 (body-code body inner m)))))
                                m)])
@@ -1867,8 +1912,8 @@
     (when (>= self-id 0) (set! inner (bind inner self-id 0 k-borrowed self)))
     (set! inner (bind-mark-params inner (parts params)))
     (let* ([read (let-code (reverse reads) (list1 (body-code body inner s)) s)]
-           [func (datum->syntax ctx (cons (named 'func s)
-                                          (cons (cons name (cons (datum->syntax ctx (list2 self (named 'i32 s)) s) (parts params)))
+           [func (datum->syntax ctx (cons (named 'define s)
+                                          (cons (cons name (cons (datum->syntax ctx (list2 self (named 'v:datum s)) s) (parts params)))
                                                 (append result (list1 read))))
                                 s)]
            [c (fresh "closure" s)] [k u32 0] [sets nil] [vs capture-ids]

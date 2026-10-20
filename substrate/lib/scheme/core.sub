@@ -41,7 +41,7 @@
 
 (begin-for-syntax
   (require-unqualified macros "../../compiler/macros.sub")
-  (require lower "lower.sub" convert-body convert-lambda infer-module! in-pass?)
+  (require lower "lower.sub" convert-body convert-lambda infer-module! in-pass? closure-of)
 
   ;; A core form that Substrate's form of the same name hides here: the code made here is lowered.
   (define (core [name datum]) -> datum (core-syntax 0 name 0))
@@ -122,7 +122,7 @@
   (define (argument [i u32]) -> datum (if (< i 4) (nth slots i) #`(rt:extra-arg #,(number (- i 4)))))
 
   (define (param-inits [ps datum] [i u32]) -> datum
-    (if (null? ps) nil (cons #`[#,(car ps) i32 #,(argument i)] (param-inits (cdr ps) (+ i 1)))))
+    (if (null? ps) nil (cons #`[#,(car ps) v:datum #,(argument i)] (param-inits (cdr ps) (+ i 1)))))
 
   (define (slots-from [n u32]) -> datum
     (for/list ([s slots] [i (numbers-below 4)]) (if (< (cast u32 (fixnum-value i)) n) #'0 s)))
@@ -131,9 +131,9 @@
     (when (null? cs) (return #`(rt:no-clause-error '#,name nargs)))
     (let* ([c (car cs)] [p (parse-params (car c))] [rest (cdr p)] [n (length (car p))]
            [inits (append (param-inits (car p) 0)
-                          (if rest `(,#`[#,rest i32 (rt:rest-arguments #,(number n) nargs #,@(slots-from n))]) nil))])
+                          (if rest `(,#`[#,rest v:datum (rt:rest-arguments #,(number n) nargs #,@(slots-from n))]) nil))])
       #`(if #,(if rest #`(wasm:i32.ge_u nargs #,(number n)) #`(wasm:i32.eq nargs #,(number n)))
-            (#,(core 'let) (#,@inits) #,@(cdr c))
+            (let (#,@inits) #,@(cdr c))
             #,(if single
                   #`(rt:arity-error '#,name #,(number n) #,(number (if rest 1 0)) nargs)
                   (dispatch (cdr cs) name 0)))))
@@ -235,16 +235,22 @@
         (unless (borrowed? b params) (raise-syntax-error 'define '"#:borrow names a parameter the function does not have" b)))
       (record-function! name params body bs)
       #`(begin
-          (#,(core 'func) (#,name #,@(for/list ([p params]) #`[#,p i32])) #,@(if inline (syntax->list #'(#:inline)) nil)
-            #:value #,value -> i32 (scheme-body #,name (#,@params) (#,@bs) #,@body))
+          (define (#,name #,@(for/list ([p params]) #`[#,p v:datum])) #,@(if inline (syntax->list #'(#:inline)) nil)
+            -> v:datum (scheme-body #,name (#,@params) (#,@bs) #,@body))
           #,@(if defined-free `(,#`(#%fact #,name '(result free))) nil)
           #,@(if closure
                  nil
-                 `(,#`(#,(core 'func) (#,code [self i32] [nargs i32] [a0 i32] [a1 i32] [a2 i32] [a3 i32]) -> i32
+                 `(,#`(define (#,code [self v:datum] [nargs i32] [a0 v:datum] [a1 v:datum] [a2 v:datum] [a3 v:datum]) -> v:datum
                         (if (wasm:i32.eq nargs #,(number n))
                             (scheme-wrapper #,name (#,@params) (#,@bs) #,@(for/list ([i (numbers-below n)]) (argument (cast u32 (fixnum-value i)))))
                             (rt:arity-error '#,name #,(number n) 0 nargs)))))
-          (#,(core 'global) #,value (mut i32) #,(if closure #`(scheme-expr #,closure) #`(rt:make-closure (wasm:func-index #,code) 0))))))
+          (#,(core 'global) #,value (mut i32) #,(if closure #`(scheme-expr #,closure) #`(rt:make-closure (wasm:func-index #,code) 0)))
+          (closure-fact #,name #,value))))
+
+  ;; The closure of a function, a wasm global of this macro's, named in a fact for a use of the function as a value.
+  (define (closure-fact [stx datum]) -> datum
+    (syntax-match stx
+      [(_ name value) #`(#%fact #,name '(scheme-closure #,(datum->syntax stx (identifier-name value) stx)))]))
 
   (define (numbers-below [n u32]) -> datum
     (let ([l nil])
@@ -260,7 +266,7 @@
            [call #`(#,name #,@args)])
       (if (null? bs)
           call
-          #`(#,(core 'let) ([r i32 #,call])
+          #`(let ([r v:datum #,call])
               #,@(for/list ([p params] [a args] #:when (borrowed? p bs)) #`(drop-value #,a))
               r))))
 
@@ -281,9 +287,9 @@
       ;; its own (scheme-expr), so that it owns its values as a body does.
       (when (and (not (in-pass?)) (or (not (function-name? f)) (recorded-function? f) (scheme-function? f)))
         (return #`(scheme-expr #,stx)))
-      (cond [(function-name? f) (if (takes? f (length args)) #`(#%app #,f #,@args) (call-value #`(begin #,f) args))]
-            [(identifier? f) (call-value f args)]
-            [else #`(#,(core 'let) ([fv i32 #,f]) #,(call-value #'fv args))])))
+      (cond [(function-name? f) (if (takes? f (length args)) #`(#%app #,f #,@args) (call-value #`(cast v:datum #,(closure-of f)) args))]
+            [(identifier? f) (call-value (if (local-binding (local-expand f)) f #`(cast v:datum #,f)) args)]
+            [else #`(let ([fv v:datum #,f]) #,(call-value #'fv args))])))
 
   (define (call-value [head datum] [args datum]) -> datum
     (let ([n (length args)])
@@ -291,7 +297,7 @@
           #`(wasm:call-indirect (i32 i32 i32 i32 i32 i32 -> i32) (closure-code* #,head) #,head #,(number n)
                                 #,@(append args (list-tail (syntax->list #'(0 0 0 0)) n)))
           (let ([ts (for/list ([a args]) (fresh-name 't))])
-            #`(#,(core 'let) (#,@(for/list ([t ts] [a args]) #`[#,t i32 #,a]))
+            #`(let (#,@(for/list ([t ts] [a args]) #`[#,t v:datum #,a]))
                 #,@(for/list ([t (list-tail ts 4)] [i (numbers-below (- n 4))]) #`(rt:set-extra-arg! #,(number (fixnum-value i)) #,t))
                 (wasm:call-indirect (i32 i32 i32 i32 i32 i32 -> i32) (closure-code* #,head) #,head #,(number n) #,@(take ts 4)))))))
 
@@ -322,8 +328,8 @@
 
   (define (binding-names [bs datum]) -> datum (for/list ([b bs]) (car (syntax->list b))))
 
-  (define (i32-bindings [bs datum]) -> datum
-    (for/list ([b bs]) (let ([l (syntax->list b)]) (if (== (length l) 2) #`[#,(car l) i32 #,(cadr l)] b))))
+  (define (datum-bindings [bs datum]) -> datum
+    (for/list ([b bs]) (let ([l (syntax->list b)]) (if (== (length l) 2) #`[#,(car l) v:datum #,(cadr l)] b))))
 
   (define (scheme-let [stx datum]) -> datum
     (let ([parts (syntax->list stx)])
@@ -331,17 +337,17 @@
           (let* ([bs (syntax->list (caddr parts))]
                  [f (datum->syntax 0 (syntax-e #`(scheme-lambda (#,@(binding-names bs)) #,@(cdddr parts))) stx)])
             #`(letrec ([#,(cadr parts) #,f]) (app #,(cadr parts) #,@(for/list ([b bs]) (cadr (syntax->list b))))))
-          #`(#,(core 'let) (#,@(i32-bindings (syntax->list (cadr parts)))) #,@(cddr parts)))))
+          #`(let (#,@(datum-bindings (syntax->list (cadr parts)))) #,@(cddr parts)))))
 
   (define (scheme-let* [stx datum]) -> datum
     (let ([parts (syntax->list stx)])
-      #`(#,(core 'let*) (#,@(i32-bindings (syntax->list (cadr parts)))) #,@(cddr parts))))
+      #`(let* (#,@(datum-bindings (syntax->list (cadr parts)))) #,@(cddr parts))))
 
   (define (letrec [stx datum]) -> datum
     (let* ([parts (syntax->list stx)] [bs (syntax->list (cadr parts))])
-      #`(#,(core 'let) (#,@(for/list ([x (binding-names bs)]) #`[#,x i32 '#f]))
+      #`(let (#,@(for/list ([x (binding-names bs)]) #`[#,x v:datum '#f]))
           #,@(for/list ([b bs]) (let ([l (syntax->list b)]) #`(#,(core 'set!) #,(car l) #,(cadr l))))
-          (#,(core 'let) () #,@(cddr parts)))))
+          (let () #,@(cddr parts)))))
 
   (define (scheme-struct [stx datum]) -> datum
     (let* ([parts (syntax->list stx)]
@@ -357,13 +363,13 @@
       #`(begin
           (#,(core 'global) D (mut i32) (rt:make-struct-type '#,name '(#,@fields)))
           (scheme-define (#,make #,@fields)
-            (#,(core 'let) ([s i32 (struct-inline D #,(number (length fields)))])
+            (let ([s v:datum (struct-inline (cast v:datum D) #,(number (length fields)))])
               #,@(for/list ([f fields] [i (numbers-below (length fields))]) #`(rt:struct-init! s #,(number (fixnum-value i)) #,f))
               s))
           (define-syntax #,name
-            (struct-transformer
-             (quote-syntax (struct-info #,name #,make #,pred (#,@(for/list ([s specs]) (accessor-name name s))) (#,@fields)))))
-          (scheme-define (#,pred v) (bool (struct-is? v D)))
+            (struct-transformer (cast datum
+             (quote-syntax (struct-info #,name #,make #,pred (#,@(for/list ([s specs]) (accessor-name name s))) (#,@fields))))))
+          (scheme-define (#,pred v) (bool (struct-is? v (cast v:datum D))))
           #,@(accessors name specs all-mutable 0))))
 
   (define (struct-use [info datum] [stx datum]) -> datum
@@ -397,15 +403,15 @@
            [get (accessor-name name spec)]
            [rest (accessors name (cdr specs) all-mutable (+ i 1))]
            [getter #`(scheme-define (#,get v) #:borrow (v)
-                       (if (struct-is? v D) (struct-field v #,(number i)) (rt:not-a-struct v D '#,get)))])
+                       (if (struct-is? v (cast v:datum D)) (struct-field v #,(number i)) (rt:not-a-struct v (cast v:datum D) '#,get)))])
       (if (not (or all-mutable (not (identifier? spec))))
           (cons getter rest)
           (let ([set (named-after field (string-append '"set-" prefix) '"!")])
             (cons getter
                   (cons #`(scheme-define (#,set v x) #:borrow (v)
-                            (if (struct-is? v D)
+                            (if (struct-is? v (cast v:datum D))
                                 (begin (rt:struct-set! v #,(number i) x) '#f)
-                                (rt:not-a-struct v D '#,set)))
+                                (rt:not-a-struct v (cast v:datum D) '#,set)))
                         rest))))))
 )
 
@@ -425,121 +431,122 @@
 (define-syntax scheme-body scheme-body)
 (define-syntax scheme-expr scheme-expr)
 (define-syntax scheme-wrapper scheme-wrapper)
+(define-syntax closure-fact closure-fact)
 
 ;; ---- functions -------------------------------------------------------------------------
-;; A value is a word, an i32: a literal is a wasm number unless quoted.
+;; A value is a datum, a word; a literal is a wasm number unless quoted.
 
-(wasm:func (dup-value [d i32]) #:inline -> i32 (v:dup-inline d))
+(define (dup-value [d v:datum]) #:inline -> v:datum (v:dup-inline d))
 (#%fact dup-value '(foreign owned))
-(wasm:func (drop-value [d i32]) #:inline (v:drop-inline d))
+(define (drop-value [d v:datum]) #:inline (v:drop-inline d))
 
 ;; ---- fixnums inline ----
 ;; The tagged sum a + b - 1 overflows i32 exactly when the sum leaves the fixnum range;
 ;; tagging preserves order, so comparisons compare the words.
 
 ;; Defined before the comparisons, whose inline bodies hold it.
-(wasm:func (bool [x i32]) #:inline -> i32 (if x (v:true-value) 0))
+(define (bool [x i32]) #:inline -> v:datum (if x (v:true-value) 0))
 (#%fact bool '(foreign free))
 
-(wasm:func (both-fixnums? [a i32] [b i32]) #:inline -> i32 (wasm:i32.and (wasm:i32.and a b) 1))
+(define (both-fixnums? [a v:datum] [b v:datum]) #:inline -> i32 (wasm:i32.and (wasm:i32.and a b) 1))
 
-;; An identity, for the pass, which owns a value it does not know is a fixnum.
-(wasm:func (fixnum-word [w i32]) #:inline -> i32 w)
+;; A fixnum's word as a value, for the pass, which owns a value it does not know is a fixnum.
+(define (fixnum-word [w i32]) #:inline -> v:datum (cast v:datum w))
 (#%fact fixnum-word '(foreign owned))
 
-(wasm:func (add-values [a i32] [b i32]) #:inline -> i32
+(define (add-values [a v:datum] [b v:datum]) #:inline -> v:datum
   (if (both-fixnums? a b)
       (let ([r (wasm:i32.add a (wasm:i32.sub b 1))])
-        (if (wasm:i32.lt_s (wasm:i32.and (wasm:i32.xor a r) (wasm:i32.xor (wasm:i32.sub b 1) r)) 0) (cast i32 (rt:add (cast v:datum a) (cast v:datum b))) r))
-      (cast i32 (rt:add (cast v:datum a) (cast v:datum b)))))
+        (if (wasm:i32.lt_s (wasm:i32.and (wasm:i32.xor a r) (wasm:i32.xor (wasm:i32.sub b 1) r)) 0) (rt:add a b) (cast v:datum r)))
+      (rt:add a b)))
 (#%fact add-values '(foreign owned))
 
-(wasm:func (sub-values [a i32] [b i32]) #:inline -> i32
+(define (sub-values [a v:datum] [b v:datum]) #:inline -> v:datum
   (if (both-fixnums? a b)
       (let ([d (wasm:i32.sub a b)])
-        (if (wasm:i32.lt_s (wasm:i32.and (wasm:i32.xor a b) (wasm:i32.xor a d)) 0) (cast i32 (rt:sub (cast v:datum a) (cast v:datum b))) (wasm:i32.add d 1)))
-      (cast i32 (rt:sub (cast v:datum a) (cast v:datum b)))))
+        (if (wasm:i32.lt_s (wasm:i32.and (wasm:i32.xor a b) (wasm:i32.xor a d)) 0) (rt:sub a b) (cast v:datum (wasm:i32.add d 1))))
+      (rt:sub a b)))
 (#%fact sub-values '(foreign owned))
 
-(wasm:func (mul-values [a i32] [b i32]) #:inline -> i32
+(define (mul-values [a v:datum] [b v:datum]) #:inline -> v:datum
   (if (both-fixnums? a b)
       (let ([m (wasm:i64.mul (wasm:i64.extend_i32_s (wasm:i32.shr_s a 1)) (wasm:i64.extend_i32_s (wasm:i32.sub b 1)))])
-        (if (wasm:i64.eq (wasm:i64.extend_i32_s (wasm:i32.wrap_i64 m)) m) (wasm:i32.add (wasm:i32.wrap_i64 m) 1) (cast i32 (rt:mul (cast v:datum a) (cast v:datum b)))))
-      (cast i32 (rt:mul (cast v:datum a) (cast v:datum b)))))
+        (if (wasm:i64.eq (wasm:i64.extend_i32_s (wasm:i32.wrap_i64 m)) m) (cast v:datum (wasm:i32.add (wasm:i32.wrap_i64 m) 1)) (rt:mul a b)))
+      (rt:mul a b)))
 (#%fact mul-values '(foreign owned))
 
 ;; Division by zero, and the least fixnum by -1, which is not one, go to the runtime.
-(wasm:func (quo-values [a i32] [b i32]) #:inline -> i32
+(define (quo-values [a v:datum] [b v:datum]) #:inline -> v:datum
   (if (wasm:i32.and (both-fixnums? a b) (wasm:i32.ne b 1))
       (let ([q (wasm:i32.div_s (wasm:i32.shr_s a 1) (wasm:i32.shr_s b 1))])
-        (if (wasm:i32.eq q 1073741824) (cast i32 (rt:quo (cast v:datum a) (cast v:datum b))) (wasm:i32.or (wasm:i32.shl q 1) 1)))
-      (cast i32 (rt:quo (cast v:datum a) (cast v:datum b)))))
+        (if (wasm:i32.eq q 1073741824) (rt:quo a b) (cast v:datum (wasm:i32.or (wasm:i32.shl q 1) 1))))
+      (rt:quo a b)))
 (#%fact quo-values '(foreign owned))
 
-(wasm:func (rem-values [a i32] [b i32]) #:inline -> i32
+(define (rem-values [a v:datum] [b v:datum]) #:inline -> v:datum
   (if (wasm:i32.and (both-fixnums? a b) (wasm:i32.ne b 1))
-      (wasm:i32.or (wasm:i32.shl (wasm:i32.rem_s (wasm:i32.shr_s a 1) (wasm:i32.shr_s b 1)) 1) 1)
-      (cast i32 (rt:rem (cast v:datum a) (cast v:datum b)))))
+      (cast v:datum (wasm:i32.or (wasm:i32.shl (wasm:i32.rem_s (wasm:i32.shr_s a 1) (wasm:i32.shr_s b 1)) 1) 1))
+      (rt:rem a b)))
 (#%fact rem-values '(foreign owned))
 
-(wasm:func (mod-values [a i32] [b i32]) #:inline -> i32
+(define (mod-values [a v:datum] [b v:datum]) #:inline -> v:datum
   (if (wasm:i32.and (both-fixnums? a b) (wasm:i32.ne b 1))
       (let ([r (wasm:i32.rem_s (wasm:i32.shr_s a 1) (wasm:i32.shr_s b 1))])
-        (wasm:i32.or (wasm:i32.shl (if (wasm:i32.and (wasm:i32.ne r 0) (wasm:i32.lt_s (wasm:i32.xor r b) 0)) (wasm:i32.add r (wasm:i32.shr_s b 1)) r) 1) 1))
-      (cast i32 (rt:floor-remainder (cast v:datum a) (cast v:datum b)))))
+        (cast v:datum (wasm:i32.or (wasm:i32.shl (if (wasm:i32.and (wasm:i32.ne r 0) (wasm:i32.lt_s (wasm:i32.xor r b) 0)) (wasm:i32.add r (wasm:i32.shr_s b 1)) r) 1) 1)))
+      (rt:floor-remainder a b)))
 (#%fact mod-values '(foreign owned))
 
-(wasm:func (lt-values [a i32] [b i32]) #:inline -> i32
-  (bool (if (both-fixnums? a b) (wasm:i32.lt_s a b) (rt:compare 0 (cast v:datum a) (cast v:datum b)))))
+(define (lt-values [a v:datum] [b v:datum]) #:inline -> v:datum
+  (bool (if (both-fixnums? a b) (wasm:i32.lt_s a b) (rt:compare 0 a b))))
 (#%fact lt-values '(foreign owned))
-(wasm:func (gt-values [a i32] [b i32]) #:inline -> i32
-  (bool (if (both-fixnums? a b) (wasm:i32.gt_s a b) (rt:compare 1 (cast v:datum a) (cast v:datum b)))))
+(define (gt-values [a v:datum] [b v:datum]) #:inline -> v:datum
+  (bool (if (both-fixnums? a b) (wasm:i32.gt_s a b) (rt:compare 1 a b))))
 (#%fact gt-values '(foreign owned))
-(wasm:func (le-values [a i32] [b i32]) #:inline -> i32
-  (bool (if (both-fixnums? a b) (wasm:i32.le_s a b) (rt:compare 2 (cast v:datum a) (cast v:datum b)))))
+(define (le-values [a v:datum] [b v:datum]) #:inline -> v:datum
+  (bool (if (both-fixnums? a b) (wasm:i32.le_s a b) (rt:compare 2 a b))))
 (#%fact le-values '(foreign owned))
-(wasm:func (ge-values [a i32] [b i32]) #:inline -> i32
-  (bool (if (both-fixnums? a b) (wasm:i32.ge_s a b) (rt:compare 3 (cast v:datum a) (cast v:datum b)))))
+(define (ge-values [a v:datum] [b v:datum]) #:inline -> v:datum
+  (bool (if (both-fixnums? a b) (wasm:i32.ge_s a b) (rt:compare 3 a b))))
 (#%fact ge-values '(foreign owned))
-(wasm:func (eq-values [a i32] [b i32]) #:inline -> i32
-  (bool (if (both-fixnums? a b) (wasm:i32.eq a b) (rt:compare 4 (cast v:datum a) (cast v:datum b)))))
+(define (eq-values [a v:datum] [b v:datum]) #:inline -> v:datum
+  (bool (if (both-fixnums? a b) (wasm:i32.eq a b) (rt:compare 4 a b))))
 (#%fact eq-values '(foreign owned))
 
 ;; A closure is a node of kind 9 (runtime.sub's kind-closure): code, a count, the values.
-(wasm:func (closure-code* [c i32]) #:inline -> i32
-  (if (v:node-tagged? c 9) (wasm:i32.load c 4) (rt:closure-code (cast v:datum c))))
+(define (closure-code* [c v:datum]) #:inline -> i32
+  (if (v:node-tagged? c 9) (wasm:i32.load c 4) (cast i32 (rt:closure-code c))))
 (#%fact closure-code* '(foreign raw))
-(wasm:func (closure-cap [c i32] [i i32]) #:inline -> i32 (wasm:i32.load (wasm:i32.add c (wasm:i32.shl i 2)) 12))
+(define (closure-cap [c v:datum] [i i32]) #:inline -> v:datum (cast v:datum (wasm:i32.load (wasm:i32.add c (wasm:i32.shl i 2)) 12)))
 (#%fact closure-cap '(foreign borrowed))
-(wasm:func (closure-inline [code i32] [n i32]) #:inline -> i32
+(define (closure-inline [code i32] [n i32]) #:inline -> v:datum
   (let ([c (v:alloc-inline (wasm:i32.add 12 (wasm:i32.shl n 2)) 9)])
     (wasm:i32.store c code 4)
     (wasm:i32.store c n 8)
     c))
 (#%fact closure-inline '(foreign owned))
-(wasm:func (closure-set-inline! [c i32] [i i32] [v i32]) #:inline (wasm:i32.store (wasm:i32.add c (wasm:i32.shl i 2)) v 12))
+(define (closure-set-inline! [c v:datum] [i i32] [v v:datum]) #:inline (wasm:i32.store (wasm:i32.add c (wasm:i32.shl i 2)) v 12))
 (#%fact closure-set-inline! '(foreign void 2))
 
 ;; A struct is a node of kind 14 (runtime.sub's kind-struct): type, hash, count, fields.
-(wasm:func (struct-is? [v i32] [t i32]) #:inline -> i32
+(define (struct-is? [v v:datum] [t v:datum]) #:inline -> i32
   (if (v:node-tagged? v 14) (wasm:i32.eq (wasm:i32.load v 4) t) 0))
 (#%fact struct-is? '(foreign raw))
-(wasm:func (struct-field [v i32] [i i32]) #:inline -> i32
-  (v:dup-inline (wasm:i32.load (wasm:i32.add v (wasm:i32.shl i 2)) 16)))
+(define (struct-field [v v:datum] [i i32]) #:inline -> v:datum
+  (v:dup-inline (cast v:datum (wasm:i32.load (wasm:i32.add v (wasm:i32.shl i 2)) 16))))
 (#%fact struct-field '(foreign owned))
-(wasm:func (struct-inline [t i32] [n i32]) #:inline -> i32
+(define (struct-inline [t v:datum] [n i32]) #:inline -> v:datum
   (let ([s (v:alloc-inline (wasm:i32.add 16 (wasm:i32.shl n 2)) 14)])
     (wasm:i32.store s t 4)
     (wasm:i32.store s (rt:fresh-hash) 8)
     (wasm:i32.store s n 12)
     s))
 (#%fact struct-inline '(foreign owned 0))
-(wasm:func (fix [n i32]) #:inline -> i32 (cast i32 (v:make-integer (wasm:i64.extend_i32_s n))))
+(define (fix [n i32]) #:inline -> v:datum (v:make-integer (wasm:i64.extend_i32_s n)))
 (#%fact fix '(foreign owned))
 
-(wasm:func (fixnum [n i32]) -> i32 (fix n))
+(define (fixnum [n i32]) -> v:datum (fix n))
 (#%fact fixnum '(foreign owned))
-(wasm:func (fixnum-value [v i32]) -> i32 (rt:fixnum-value-of (cast v:datum v)))
+(define (fixnum-value [v v:datum]) -> i32 (rt:fixnum-value-of v))
 (#%fact fixnum-value '(foreign raw))
 
 (scheme-define (live-nodes) (fix (v:live-nodes)))
@@ -555,7 +562,7 @@
 
 ;; ---- pairs and lists ----
 
-(wasm:func (list-length [l i32] [who i32]) -> i32
+(define (list-length [l v:datum] [who v:datum]) -> i32
   (let ([n 0] [t l])
     (wasm:block done
       (wasm:loop next
@@ -563,11 +570,11 @@
         (set! n (wasm:i32.add n 1))
         (set! t (v:pair-cdr t))
         (wasm:br next)))
-    (if (wasm:i32.eqz (v:null-cell? t)) (rt:wrong-type (cast v:datum who) (cast v:datum '"a list") (cast v:datum l)))
+    (if (wasm:i32.eqz (v:null-cell? t)) (rt:wrong-type who '"a list" l))
     n))
 (#%fact list-length '(foreign raw))
 
-(wasm:func (reverse-list [l i32] [who i32]) -> i32
+(define (reverse-list [l v:datum] [who v:datum]) -> v:datum
   (let ([acc '()] [t l])
     (wasm:block done
       (wasm:loop next
@@ -575,12 +582,12 @@
         (set! acc (v:cons-inline (dup-value (v:pair-car t)) acc))
         (set! t (v:pair-cdr t))
         (wasm:br next)))
-    (if (wasm:i32.eqz (v:null-cell? t)) (rt:wrong-type (cast v:datum who) (cast v:datum '"a list") (cast v:datum l)))
+    (if (wasm:i32.eqz (v:null-cell? t)) (rt:wrong-type who '"a list" l))
     acc))
 (#%fact reverse-list '(foreign owned))
 
-(wasm:func (append-2 [a i32] [b i32]) -> i32
-  (let ([r (reverse-list a '"append")] [t 0])
+(define (append-2 [a v:datum] [b v:datum]) -> v:datum
+  (let ([r (reverse-list a '"append")] [t v:datum 0])
     (set! t r)
     (wasm:block done
       (wasm:loop next
@@ -593,15 +600,15 @@
 (#%fact append-2 '(foreign owned 1))
 
 (scheme-define (cons a d) #:inline (v:cons-inline a d))
-(wasm:func (car-read [p i32]) #:inline -> i32 (if (v:pair-cell? p) (v:pair-car p) (cast i32 (rt:wrong-type (cast v:datum 'car) (cast v:datum '"a pair") (cast v:datum p)))))
+(define (car-read [p v:datum]) #:inline -> v:datum (if (v:pair-cell? p) (v:pair-car p) (rt:wrong-type 'car '"a pair" p)))
 (#%fact car-read '(foreign borrowed))
-(wasm:func (cdr-read [p i32]) #:inline -> i32 (if (v:pair-cell? p) (v:pair-cdr p) (cast i32 (rt:wrong-type (cast v:datum 'cdr) (cast v:datum '"a pair") (cast v:datum p)))))
+(define (cdr-read [p v:datum]) #:inline -> v:datum (if (v:pair-cell? p) (v:pair-cdr p) (rt:wrong-type 'cdr '"a pair" p)))
 (#%fact cdr-read '(foreign borrowed))
 (scheme-define (car p) #:inline #:borrow (p) (if (v:pair-cell? p) (v:pair-car p) (rt:wrong-type 'car '"a pair" p)))
 (scheme-define (cdr p) #:inline #:borrow (p) (if (v:pair-cell? p) (v:pair-cdr p) (rt:wrong-type 'cdr '"a pair" p)))
-(wasm:func (car-of [p i32] [who i32]) #:inline -> i32 (if (v:pair-cell? p) (v:pair-car p) (cast i32 (rt:wrong-type (cast v:datum who) (cast v:datum '"a pair") (cast v:datum p)))))
+(define (car-of [p v:datum] [who v:datum]) #:inline -> v:datum (if (v:pair-cell? p) (v:pair-car p) (rt:wrong-type who '"a pair" p)))
 (#%fact car-of '(foreign borrowed))
-(wasm:func (cdr-of [p i32] [who i32]) #:inline -> i32 (if (v:pair-cell? p) (v:pair-cdr p) (cast i32 (rt:wrong-type (cast v:datum who) (cast v:datum '"a pair") (cast v:datum p)))))
+(define (cdr-of [p v:datum] [who v:datum]) #:inline -> v:datum (if (v:pair-cell? p) (v:pair-cdr p) (rt:wrong-type who '"a pair" p)))
 (#%fact cdr-of '(foreign borrowed))
 (scheme-define (caar p) #:borrow (p) (car-of (car-of p 'caar) 'caar))
 (scheme-define (cadr p) #:borrow (p) (car-of (cdr-of p 'cadr) 'cadr))
@@ -617,13 +624,13 @@
 (scheme-define (list-function . xs) xs)
 (scheme-define (length l) #:free #:borrow (l) (fix (list-length l '"length")))
 (scheme-define (reverse l) #:borrow (l) (reverse-list l '"reverse"))
-(wasm:func (unsafe-car [p i32]) #:inline -> i32 (v:pair-car p))
+(define (unsafe-car [p v:datum]) #:inline -> v:datum (v:pair-car p))
 (#%fact unsafe-car '(foreign borrowed))
-(wasm:func (unsafe-cdr [p i32]) #:inline -> i32 (v:pair-cdr p))
+(define (unsafe-cdr [p v:datum]) #:inline -> v:datum (v:pair-cdr p))
 (#%fact unsafe-cdr '(foreign borrowed))
 
-(wasm:func (append-all [ls i32]) -> i32
-  (let ([l (reverse-list ls '"append")] [acc 0] [t 0])
+(define (append-all [ls v:datum]) -> v:datum
+  (let ([l (reverse-list ls '"append")] [acc v:datum 0] [t v:datum 0])
     (set! acc (dup-value (v:pair-car l)))
     (set! t (v:pair-cdr l))
     (wasm:block done
@@ -650,7 +657,7 @@
 (scheme-define (integer? x) #:free #:inline #:borrow (x) (bool (v:integer-datum? x)))
 (scheme-define (fixnum? x) #:free #:inline #:borrow (x) (bool (wasm:i32.and x 1)))
 
-(wasm:func (fold-op [op i32] [a i32] [l i32]) -> i32
+(define (fold-op [op i32] [a v:datum] [l v:datum]) -> v:datum
   (wasm:block done
     (wasm:loop next
       (wasm:br-if done (wasm:i32.eqz (v:pair-cell? l)))
@@ -662,21 +669,21 @@
   a)
 (#%fact fold-op '(foreign owned 1))
 
-(wasm:func (arith [op i32] [a i32] [b i32]) -> i32
-  (if (wasm:i32.eq op 0) (return (cast i32 (rt:add (cast v:datum a) (cast v:datum b)))))
-  (if (wasm:i32.eq op 1) (return (cast i32 (rt:sub (cast v:datum a) (cast v:datum b)))))
-  (if (wasm:i32.eq op 2) (return (cast i32 (rt:mul (cast v:datum a) (cast v:datum b)))))
-  (cast i32 (rt:bitwise op (cast v:datum a) (cast v:datum b))))
+(define (arith [op i32] [a v:datum] [b v:datum]) -> v:datum
+  (if (wasm:i32.eq op 0) (return (rt:add a b)))
+  (if (wasm:i32.eq op 1) (return (rt:sub a b)))
+  (if (wasm:i32.eq op 2) (return (rt:mul a b)))
+  (rt:bitwise op a b))
 (#%fact arith '(foreign owned))
 
-(wasm:func (chain [kind i32] [op i32] [a i32] [l i32]) -> i32
+(define (chain [kind i32] [op i32] [a v:datum] [l v:datum]) -> v:datum
   (let ([ok 1])
     (wasm:block done
       (wasm:loop next
         (wasm:br-if done (wasm:i32.eqz (v:pair-cell? l)))
         (if (wasm:i32.eqz (if (wasm:i32.eqz kind)
-                              (rt:compare op (cast v:datum a) (cast v:datum (v:pair-car l)))
-                              (if (wasm:i32.eq kind 1) (rt:char-compare op (cast v:datum a) (cast v:datum (v:pair-car l))) (rt:string-compare op (cast v:datum a) (cast v:datum (v:pair-car l))))))
+                              (rt:compare op a (v:pair-car l))
+                              (if (wasm:i32.eq kind 1) (rt:char-compare op a (v:pair-car l)) (rt:string-compare op a (v:pair-car l)))))
             (set! ok 0))
         (set! a (v:pair-car l))
         (set! l (v:pair-cdr l))
@@ -744,12 +751,12 @@
   (bool (if (wasm:i32.and a 1) (wasm:i32.and a 2) (wasm:i64.ne (wasm:i64.and (rt:int-value a 'odd?) (wasm:i64.const 1)) (wasm:i64.const 0)))))
 (scheme-define (abs a) #:borrow (a) (if (wasm:i64.lt_s (rt:int-value a '"abs") (wasm:i64.const 0)) (rt:sub '0 a) a))
 
-(wasm:func (extreme [a i32] [l i32] [op i32]) -> i32
-  (rt:int-value (cast v:datum a) (cast v:datum (if (wasm:i32.eq op 0) '"min" '"max")))
+(define (extreme [a v:datum] [l v:datum] [op i32]) -> v:datum
+  (rt:int-value a (if (wasm:i32.eq op 0) '"min" '"max"))
   (wasm:block done
     (wasm:loop next
       (wasm:br-if done (wasm:i32.eqz (v:pair-cell? l)))
-      (if (rt:compare (if (wasm:i32.eq op 0) 1 0) (cast v:datum a) (cast v:datum (v:pair-car l))) (set! a (v:pair-car l)))
+      (if (rt:compare (if (wasm:i32.eq op 0) 1 0) a (v:pair-car l)) (set! a (v:pair-car l)))
       (set! l (v:pair-cdr l))
       (wasm:br next)))
   (dup-value a))
@@ -807,7 +814,7 @@
 (scheme-define char>=? #:free #:borrow (a b)
   (scheme-case-lambda [(a b) (bool (rt:char-compare 3 a b))] [(a . more) (chain 1 3 a more)]))
 
-(wasm:func (ascii-letter? [c i32]) -> i32
+(define (ascii-letter? [c i32]) -> i32
   (wasm:i32.or (wasm:i32.and (wasm:i32.ge_u c 65) (wasm:i32.le_u c 90)) (wasm:i32.and (wasm:i32.ge_u c 97) (wasm:i32.le_u c 122))))
 (#%fact ascii-letter? '(foreign raw))
 
@@ -966,9 +973,8 @@
 (scheme-define (hash-set! t k v) #:borrow (t) (rt:hash-set-value! t k v '"hash-set!") '#f)
 
 ;; updater may change the table.
-(wasm:func (hash-update* [t i32] [k i32] [updater i32] [failure i32] [has-failure i32]) -> i32
-  (rt:hash-update-value! (cast v:datum t) (cast v:datum (dup-value k)) (cast v:datum updater) (cast v:datum failure) has-failure
-                         (cast v:datum '"hash-update!"))
+(define (hash-update* [t v:datum] [k v:datum] [updater v:datum] [failure v:datum] [has-failure i32]) -> v:datum
+  (rt:hash-update-value! t (dup-value k) updater failure has-failure '"hash-update!")
   '#f)
 (#%fact hash-update* '(foreign owned))
 (#%fact hash-update* '(raises))
@@ -984,14 +990,13 @@
 (scheme-define (hash-values t) #:borrow (t) (rt:table-walk t 1 '"hash-values"))
 (scheme-define (hash->list t) #:borrow (t) (rt:table-walk t 2 '"hash->list"))
 
-(wasm:func (hash-for-each* [t i32] [f i32]) -> i32
-  (let ([l (cast i32 (rt:table-walk (cast v:datum t) 2 (cast v:datum '"hash-for-each")))] [p 0])
+(define (hash-for-each* [t v:datum] [f v:datum]) -> v:datum
+  (let ([l (rt:table-walk t 2 '"hash-for-each")] [p v:datum 0])
     (set! p l)
     (try (wasm:block done
            (wasm:loop next
              (wasm:br-if done (wasm:i32.eqz (v:pair-cell? p)))
-             (drop-value (cast i32 (rt:call-closure (cast v:datum f) 2 (cast v:datum (dup-value (v:pair-car (v:pair-car p))))
-                                                    (cast v:datum (dup-value (v:pair-cdr (v:pair-car p)))) 0 0)))
+             (drop-value (rt:call-closure f 2 (dup-value (v:pair-car (v:pair-car p))) (dup-value (v:pair-cdr (v:pair-car p))) 0 0))
              (set! p (v:pair-cdr p))
              (wasm:br next)))
       [catch rt:exn (v) (drop-value l) (throw rt:exn v)])
@@ -1032,14 +1037,14 @@
   (rt:port-flush (rt:stdout-port))
   '#f)
 
-(wasm:func (write-byte* [b i32] [p i32]) -> i32
-  (rt:write-byte-to (cast v:datum p) (rt:byte-arg (cast v:datum b) (cast v:datum '"write-byte")))
-  (rt:port-flush (cast v:datum p))
+(define (write-byte* [b v:datum] [p v:datum]) -> v:datum
+  (rt:write-byte-to p (rt:byte-arg b '"write-byte"))
+  (rt:port-flush p)
   '#f)
 (#%fact write-byte* '(foreign owned))
 
-(wasm:func (write-bytes* [v i32] [p i32]) -> i32
-  (rt:write-to-port (rt:bytes-arg (cast v:datum v) (cast v:datum '"write-bytes")) (cast v:datum p) 1)
+(define (write-bytes* [v v:datum] [p v:datum]) -> v:datum
+  (rt:write-to-port (rt:bytes-arg v '"write-bytes") p 1)
   '#f)
 (#%fact write-bytes* '(foreign owned))
 
@@ -1056,11 +1061,11 @@
 (scheme-define (get-output-bytes p) #:borrow (p) (rt:port-bytes (rt:port-arg p '"get-output-bytes")))
 (scheme-define (file-position p) #:borrow (p) (fix (rt:port-length (rt:port-arg p '"file-position"))))
 
-(wasm:func (call-with-output-bytes* [proc i32]) -> i32
-  (let ([p (cast i32 (rt:new-port -1))])
-    (drop-value (try (cast i32 (rt:call-closure (cast v:datum proc) 1 (cast v:datum (dup-value p)) 0 0 0))
+(define (call-with-output-bytes* [proc v:datum]) -> v:datum
+  (let ([p (rt:new-port -1)])
+    (drop-value (try (rt:call-closure proc 1 (dup-value p) 0 0 0)
                      [catch rt:exn (v) (drop-value p) (throw rt:exn v)]))
-    (let ([r (cast i32 (rt:port-bytes (cast v:datum p)))])
+    (let ([r (rt:port-bytes p)])
       (drop-value p)
       r)))
 (#%fact call-with-output-bytes* '(foreign owned))
