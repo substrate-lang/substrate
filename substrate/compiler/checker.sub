@@ -11,8 +11,8 @@
 ;; Checking a module at a phase keeps the names made fresh and the definitions lifted from form
 ;; to form; each module compilation has its own, one for each phase.
 (struct checking [phase i32] [counter i32] [instances (ptr hash-table)] [throwers (ptr hash-table)]
-        [strings (ptr hash-table)] [layouts (ptr hash-table)] [types (ptr hash-table)] [rethrown datum] [datum datum]
-        [next (ptr checking)])
+        [strings (ptr hash-table)] [copies (ptr hash-table)] [layouts (ptr hash-table)] [types (ptr hash-table)]
+        [rethrown datum] [datum datum] [next (ptr checking)])
 
 (define state (ptr checking) 0)
 
@@ -22,6 +22,7 @@
 (define running-name (fn (datum) -> datum) 0)
 (define meaning-of (fn (datum) -> datum) 0)
 (define inline-call-of (fn (datum datum) -> datum) 0)
+(define inline-copy-of (fn (datum) -> datum) 0)
 (define expand-head-of (fn (datum i32) -> datum) 0)
 (define scope-shape-of (fn (datum i32) -> datum) 0)
 (define apply-form-of (fn (datum datum i32) -> datum) 0)
@@ -30,12 +31,14 @@
 (define datum-type-of (fn () -> datum) 0)
 
 (define (set-expander! [name (fn (datum) -> datum)] [meaning (fn (datum) -> datum)]
-                       [inline-call (fn (datum datum) -> datum)] [head (fn (datum i32) -> datum)]
-                       [shape (fn (datum i32) -> datum)] [apply (fn (datum datum i32) -> datum)]
-                       [prune (fn (datum) -> datum)] [facts (fn (datum) -> datum)] [quoted (fn () -> datum)])
+                       [inline-call (fn (datum datum) -> datum)] [inline-copy (fn (datum) -> datum)]
+                       [head (fn (datum i32) -> datum)] [shape (fn (datum i32) -> datum)]
+                       [apply (fn (datum datum i32) -> datum)] [prune (fn (datum) -> datum)] [facts (fn (datum) -> datum)]
+                       [quoted (fn () -> datum)])
   (set! running-name name)
   (set! meaning-of meaning)
   (set! inline-call-of inline-call)
+  (set! inline-copy-of inline-copy)
   (set! expand-head-of head)
   (set! scope-shape-of shape)
   (set! apply-form-of apply)
@@ -106,6 +109,7 @@
       (set! (-> s instances) (make-table))
       (set! (-> s throwers) (make-table))
       (set! (-> s strings) (make-table))
+      (set! (-> s copies) (make-table))
       (set! (-> s layouts) (make-table))
       (set! (-> s types) (make-table))
       (set! (-> s rethrown) nil)
@@ -407,13 +411,17 @@
   (syntax-match s
     [(_ #:forall ((? identifier? p) ...) ((? identifier? f) ((? identifier? x) t) ...) rest ...)
      (let ([r (result-and-body rest)]) (generic s p f x t (car r) (cdr r)))]
-    [(_ ((? identifier? f) ((? identifier? x) t) ...) #:inline rest ...)
-     (let ([r (result-and-body rest)]) (function s f x t (car r) (cdr r) f 1))]
+    [(_ ((? identifier? f) ((? identifier? x) t) ...) (? placement? k) rest ...)
+     (let ([r (result-and-body rest)]) (function s f x t (car r) (cdr r) f k))]
     [(_ ((? identifier? f) ((? identifier? x) t) ...) rest ...)
      (let ([r (result-and-body rest)]) (function s f x t (car r) (cdr r) f 0))]
     [(_ (? identifier? x) t) (global-definition s x t nil)]
     [(_ (? identifier? x) t init) (global-definition s x t `(,init))]
     [_ (substrate-error s "expected (define (f [x type] ...) -> type body ...) or (define x type [value])" nil)]))
+
+;; Where a function's body goes besides the function: #:inline, into each call of it; #:copied,
+;; into a copy of the function in each other module that calls it.
+(define (placement? [k datum]) -> i32 (!= (memq (syntax-e k) '(#:inline #:copied)) 0))
 
 ;; A function's result type and body: -> type body ..., or body ... for void.
 (define (result-and-body [rest datum]) -> datum
@@ -421,13 +429,13 @@
     [('-> r body ...) (cons r body)]
     [(body ...) (cons (syn 'void) body)]))
 
-(define (function [s datum] [f datum] [xs datum] [ts datum] [r datum] [body datum] [definer datum] [inline i32]) -> datum
+(define (function [s datum] [f datum] [xs datum] [ts datum] [r datum] [body datum] [definer datum] [placement datum]) -> datum
   (let* ([ps (for/list ([t ts]) (value-type! (parse-type t) t))]
          [rt (result-type! r)]
          [to (if (struct-type? rt) (fresh 'to) 0)])
     (syn `(begin
             ,(at s (syn `(func (,f ,@(if (!= to 0) `((,to i32)) nil) ,@(for/list ([x xs] [p ps]) `(,x ,(wasm-type p))))
-                               ,@(if inline '(#:inline) nil)
+                               ,@(if (!= placement 0) (cons placement nil) nil)
                                ,@(if (== rt 'void) nil `(-> ,(if (values-type? rt) (wasm-types rt) (wasm-type rt))))
                                ,(at s (syn `(#%checked body ,definer (,@xs) ,(if (!= to 0) to #f) (quote ,(cons rt ps)) ,@body))))))
             (#%fact ,f (quote (substrate-function ,ps ,rt)))))))
@@ -1446,7 +1454,25 @@
 
 (define (call-code [info datum] [as datum]) -> datum
   (let ([inlined (inline-call-of info as)])
-    (if (!= inlined 0) inlined `(call ,info ,as))))
+    (cond [(== inlined 0) `(call ,info ,as)]
+          [(== inlined 'copy) `(call ,(copy-of info) ,as)]
+          [else inlined])))
+
+;; This module's own copy of a copied function of another module, made at its first call here.
+;; A session drops what a failed input defined, this copy among them, so it is made again if it
+;; is gone.
+(define (copy-of [info datum]) -> datum
+  (let* ([known (cast datum (hash-ref (-> state copies) (cast u64 info)))]
+         [m (if (!= known 0) (meaning-of known) 0)])
+    (if (and (!= m 0) (== (car m) 'func)) (cadr m) (info-of (lift-copy info) 'func "a function"))))
+
+(define (lift-copy [info datum]) -> datum
+  (let ([f (fresh (func-info-name info))] [rs (func-info-results info)])
+    (syntax-local-lift-definition
+     (syn `(func (,f ,@(for/list ([t (func-info-params info)]) `(,(fresh 'x) ,t))) ,@(if (null? rs) nil `(-> ,rs))
+                 (#%checked code ,(code-box (inline-copy-of info))))))
+    (hash-set! (-> state copies) (cast u64 info) (cast u32 (syntax-local-introduce f)))
+    (syntax-local-introduce f)))
 
 ;; A function type's wasm signature: its parameter types, and its result types.
 (define (signature [sig datum]) -> datum

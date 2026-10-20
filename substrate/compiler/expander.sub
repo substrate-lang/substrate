@@ -295,7 +295,7 @@
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
                 query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier
                 query-shape)
-  (set-expander! running-id query-meaning query-inline-call query-expand-head query-scope-shape
+  (set-expander! running-id query-meaning query-inline-call inline-copy query-expand-head query-scope-shape
                  query-apply-form prune-local-scopes query-facts-of query-datum-type)
   (let* ([names (running-module-names)] [name (running-module-named names "syntax.")] [tools (running-module-named names "macros.")])
     (when (== name 0) (fail-at 0 "the running program has no syntax module" nil))
@@ -873,7 +873,7 @@
     (set! inline-shift shift)
     (hash-free! (& keys))
     (hash-free! (& labels))
-    `(,params ,(cadr b) ,body ,(cadddr b) ,assigned ,(list-ref b 5))))
+    `(,params ,(cadr b) ,body ,(cadddr b) ,assigned ,(list-ref b 5) ,(list-ref b 6))))
 
 ;; Syntax as its datum, and a definition as its kind and export name, which do not depend on the
 ;; hash of its module.
@@ -1137,7 +1137,8 @@
                               (if (== b 0)
                                   0
                                   (encode `(,f ,(car b) ,(cadr b) ,(caddr b) ,(cadddr b)
-                                            ,(map (lambda ([p datum]) -> datum (car p)) (list-ref b 4)) ,(list-ref b 5))))))
+                                            ,(map (lambda ([p datum]) -> datum (car p)) (list-ref b 4)) ,(list-ref b 5)
+                                            ,(list-ref b 6))))))
                           own))]
            [macro-forms (filter-out-false
                     (map (lambda ([f datum]) -> datum
@@ -1325,7 +1326,7 @@
 (define (load-inline! [x datum])
   (let* ([saved (use-arena (& run-arena))] [params (keep (cadr x))]
          [assigned (filter (lambda ([p datum]) -> i32 (!= (member (car p) (list-ref x 5)) 0)) params)]
-         [b `(,params ,(keep (caddr x)) ,(keep (cadddr x)) ,(list-ref x 4) ,assigned ,(list-ref x 6))])
+         [b `(,params ,(keep (caddr x)) ,(keep (cadddr x)) ,(list-ref x 4) ,assigned ,(list-ref x 6) ,(list-ref x 7))])
     (use-arena saved)
     (hash-set! (& inlines) (cast u64 (car x)) (cast u32 b))))
 
@@ -1535,7 +1536,7 @@
            [params (map (lambda ([p datum]) -> datum (param-of p)) (cdr head))]
            [types (map (lambda ([p datum]) -> datum (parse-type (cadr p))) params)]
            [rest (cddr l)]
-           [inline (if (and (pair? rest) (== (syntax-e (car rest)) '#:inline)) (car rest) 0)]
+           [inline (if (and (pair? rest) (!= (memq (syntax-e (car rest)) '(#:inline #:copied)) 0)) (car rest) 0)]
            [rest (if (!= inline 0) (cdr rest) rest)]
            [rb (parse-results rest)]
            [info (func-info (syntax-e name) types (car rb) 0 0)])
@@ -1547,6 +1548,8 @@
     (unless (and (!= l 0) (== (length l) 2) (identifier? (car l))) (no-match p "(name type)"))
     l))
 
+(define in-inline-body i32 0)
+
 (define (expand-func [p datum] [phase i32]) -> datum
   (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
          [f (list-ref p 5)] [inline (list-ref p 6)] [info (list-ref p 7)]
@@ -1556,10 +1559,15 @@
          [checked (if (and (pair? scoped) (null? (cdr scoped)) (== (core-head (car scoped) phase) '#%checked)) (car scoped) 0)]
          [box (if (and (!= checked 0) (== (syntax-e (cadr (syntax->list checked))) 'code)) (boxed-code (caddr (syntax->list checked))) 0)]
          [keys (if (and (!= box 0) (not to-syntax)) (car box) (map (lambda ([x datum]) -> datum (bind-local! x phase)) xs))]
-         [r (cond [to-syntax (map (lambda ([b datum]) -> datum (expand-expr b phase)) scoped)]
-                  [(!= box 0) (list1 (cdr box))]
-                  [(!= checked 0) (list1 (expand-expr checked phase))]
-                  [else (list1 (core-body f name xs scoped info phase))])])
+         [was in-inline-body]
+         [r (begin
+              (set! in-inline-body (!= inline 0))
+              (try (cond [to-syntax (map (lambda ([b datum]) -> datum (expand-expr b phase)) scoped)]
+                         [(!= box 0) (list1 (cdr box))]
+                         [(!= checked 0) (list1 (expand-expr checked phase))]
+                         [else (list1 (core-body f name xs scoped info phase))])
+                   [catch-all (set! in-inline-body was) (rethrow)]))])
+    (set! in-inline-body was)
     (if to-syntax
         (let ([ps nil] [x xs] [k keys] [pp params])
           (while (pair? x)
@@ -1574,7 +1582,7 @@
             (set! ps (cons (cons (car k) (car types)) ps))
             (set! k (cdr k)) (set! types (cdr types)))
           (set! ps (reverse ps))
-          (when (!= inline 0) (note-inline! info ps code name))
+          (when (!= inline 0) (note-inline! info ps code name (== (syntax-e inline) '#:copied)))
           (list1 `(func ,info ,ps ,code))))))
 
 (define (declare-global [f datum] [phase i32]) -> datum
@@ -2821,19 +2829,23 @@
 (define inlines hash-table)
 
 (define inline-memory i32 0)
+(define inline-copied i32 0)
 
 ;; An inline body must not depend on which module it is compiled in; one that uses
-;; memory is inlined only where the code uses the same memory.
-(define (record-inline! [info datum] [params datum] [body datum] [id datum])
+;; memory is inlined only where the code uses the same memory. A copied function's body goes
+;; not into each call but into one copy of the function in each module that calls it.
+(define (record-inline! [info datum] [params datum] [body datum] [id datum] [copied i32])
   (set! inline-memory 0)
+  (set! inline-copied copied)
   (let ([returns (check-inline body id)])
     (hash-set! (& inlines) (cast u64 info)
                (cast u32 (keep `(,params ,(func-info-results info) ,(without-locations body) ,(boolean returns)
                                  ,(filter (lambda ([p datum]) -> i32 (assigns? body (car p))) params)
-                                 ,(boolean inline-memory)))))))
+                                 ,(boolean inline-memory) ,(boolean copied)))))))
 
 (define (inline-fail [id datum] [what (ptr u8)]) -> i32
-  (fail-at id "~a is inline, so it may not ~a" `(,(syntax-e id) ,(bytes->string what (strlen what))))
+  (fail-at id "~a is ~a, so it may not ~a"
+           `(,(syntax-e id) ,(if inline-copied '"copied" '"inline") ,(bytes->string what (strlen what))))
   0)
 
 (define (check-inline [e datum] [id datum]) -> i32
@@ -2892,19 +2904,34 @@
                 (unless (== last 0) (set-cdr! last l))
                 head)]))
 
+;; The code of a call of info with args: the function's body in place of the call; 0, for the
+;; call itself; or copy, for a call of this module's own copy of the function. A copied function
+;; is called in its own module, and its body taken into the inline and copied bodies that call
+;; it, so that a copy calls no other.
 (define (inline-call [info datum] [args datum] [phase i32]) -> datum
   (let ([b (cast datum (hash-ref (& inlines) (cast u64 (base-info info))))])
-    (if (or (== b 0) (!= (length args) (length (car b)))
-            (and (!= (list-ref b 5) 0) (not (same-memory? info phase))))
-        0
-        (let* ([keys (new-table)] [labels (new-table)]
-               [ret (if (!= (cadddr b) 0) (fresh-key!) 0)]
-               [bindings (inline-bindings (car b) args (list-ref b 4) (& keys))]
-               [body (begin (set! inline-shift (info-shift info)) (copy-inline (caddr b) (& keys) (& labels) ret))]
-               [e `(let ,bindings ,body)])
-          (hash-free! (& keys))
-          (hash-free! (& labels))
-          `(as ,(cadr b) ,(if (!= ret 0) `(block ,ret ,e) e))))))
+    (cond [(or (== b 0) (!= (length args) (length (car b)))
+               (and (!= (list-ref b 5) 0) (not (same-memory? info phase))))
+           0]
+          [(and (!= (list-ref b 6) 0) (not in-inline-body))
+           (if (and (== (info-instance (base-info info)) 0) (== (info-shift info) 0)) 0 'copy)]
+          [else (inlined b info args)])))
+
+(define (inlined [b datum] [info datum] [args datum]) -> datum
+  (let* ([keys (new-table)] [labels (new-table)]
+         [ret (if (!= (cadddr b) 0) (fresh-key!) 0)]
+         [bindings (inline-bindings (car b) args (list-ref b 4) (& keys))]
+         [body (begin (set! inline-shift (info-shift info)) (copy-inline (caddr b) (& keys) (& labels) ret))]
+         [e `(let ,bindings ,body)])
+    (hash-free! (& keys))
+    (hash-free! (& labels))
+    `(as ,(cadr b) ,(if (!= ret 0) `(block ,ret ,e) e))))
+
+;; A module's own copy of a copied function: its parameters' keys, then its code.
+(define (inline-copy [info datum]) -> datum
+  (let ([keys (map (lambda ([t datum]) -> datum (fresh-key!)) (func-info-params info))])
+    (cons keys (inlined (cast datum (hash-ref (& inlines) (cast u64 (base-info info)))) info
+                        (map (lambda ([k datum]) -> datum `(lref ,k)) keys)))))
 
 (define (new-table) -> hash-table
   (let ([t hash-table])
@@ -3030,4 +3057,5 @@
 (define (copy-each [l datum] [keys (ptr hash-table)] [labels (ptr hash-table)] [ret datum]) -> datum
   (map (lambda ([x datum]) -> datum (copy-inline x keys labels ret)) l))
 
-(define (note-inline! [info datum] [params datum] [code datum] [name datum]) (record-inline! info params code name))
+(define (note-inline! [info datum] [params datum] [code datum] [name datum] [copied i32])
+  (record-inline! info params code name copied))
