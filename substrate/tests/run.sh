@@ -106,9 +106,7 @@ else
   fail=$((fail + 1))
   echo "FAIL the stale cache entry: got $first, then $second"
 fi
-# Code run while compiling uses the running compiler's own modules, also when the sources differ
-# from those it was built from, as when the seed builds changed ones: a test with Substrate macros
-# builds from such sources and runs as it does here, unless a struct it relies on has changed.
+# A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
 rm -rf "${changed:?}"
 mkdir -p "$changed/tests/substrate"
