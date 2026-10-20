@@ -95,10 +95,10 @@ stale="$builds/stale"
 rm -rf "${stale:?}"
 mkdir -p "$stale"
 printf '(provide x)\n(define (x) -> i32 1)\n' > "$stale/b.sub"
-printf '(require b "b.sub" x)\n(define (main) (write-int (x)) (newline))\n' > "$stale/a.sub"
+printf '(require b "b.sub" x)\n(define (main) (printf "~a~n" (x)))\n' > "$stale/a.sub"
 first="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
 rm "$stale/b.sub"
-printf '(define (main) (write-int 2) (newline))\n' > "$stale/a.sub"
+printf '(define (main) (printf "~a~n" 2))\n' > "$stale/a.sub"
 second="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
 if [ "$first" = 1 ] && [ "$second" = 2 ]; then
   pass=$((pass + 1))
