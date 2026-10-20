@@ -10,4 +10,3 @@ for ((k = 0; k < n; k++)); do
   sed "s/@/$k/g" "$here/${kinds[k % 3]}.sub"
   echo
 done
-echo "(func (main))"

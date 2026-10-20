@@ -50,7 +50,7 @@ const checks = {
     };
     const fieldText = () => page.evaluate('document.querySelector("textarea").value');
 
-    const scheme = '(require-unqualified scheme "lib/scheme/scheme.sub") => ';
+    const scheme = '(language scheme "lib/scheme/scheme.sub") => ';
     await idle();
     check('repl: the page starts a Scheme session', await shown(), scheme);
     check('repl: the text box has the focus', await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
@@ -84,11 +84,11 @@ const checks = {
     await idle();
     check('repl: a recalled input can be evaluated again', await last(), '(sq 3) => 27');
 
-    await say('(begin-for-syntax (func (trapping [s i32]) -> i32 (unreachable)))');
+    await say('(begin-for-syntax (define (trapping [s i32]) -> i32 (/ s 0)))');
     await say('(define-syntax trap! trapping)');
     await say('(trap! 1)');
     check('repl: a trap in a macro is reported as the input\'s error', (await last()).split(' at ')[0],
-      '! (trap! 1) => input-12:1:1: error: trap: unreachable');
+      '! (trap! 1) => input-12:1:1: error: trap: divide by zero');
     await say('(sq 2)');
     check('repl: the session still works after the trap', await last(), '(sq 2) => 8');
 
@@ -125,7 +125,7 @@ const checks = {
     await say('(+ (fib 20) 0.5)');
     await say('(sq 2)');
     check('repl: a session in Substrate', await shown(), [
-      '(require-unqualified substrate "compiler/substrate/substrate.sub") => ',
+      '(language substrate "compiler/substrate.sub") => ',
       '(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) => ',
       '(+ (fib 20) 0.5) => 6765.5',
       '! (sq 2) => input-20:1:2: error: unbound identifier sq',
@@ -134,7 +134,7 @@ const checks = {
       await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
 
     // This input overwrites memory from byte 8 to the break; 8 is still printed, since
-    // print.sub formats a number in bytes 32..63 and keeps nothing in memory.
+    // substrate.sub formats a number in the bytes below 96 and keeps nothing in memory.
     await page.type('(memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8)))');
     await page.press('Enter');
     await idle();
@@ -150,14 +150,6 @@ const checks = {
     await say('(fib 11)');
     check('repl: Clear keeps the session', await shown(), '(fib 11) => 89');
 
-    await page.click('nav button:nth-of-type(4)');
-    check('repl: a kernel session starts empty', await shown(), '');
-    await say('(require print "compiler/print.sub")');
-    await say('(print:write-int (i32.add 40 2))');
-    check('repl: a session in kernel code', await shown(), [
-      '(require print "compiler/print.sub") => ',
-      '(print:write-int (i32.add 40 2)) => 42',
-    ].join('\n'));
   },
 
   async rows(page) {
@@ -607,7 +599,7 @@ const checks = {
     check('stopped: the report starts with the message of the trap',
       report.split('\n')[0], 'trap: vector-at: there is no item 5: the vector holds 1');
     check('stopped: the report lists the game function that was running, and where it is',
-      /step! .*tests\/web\/stopped\.sub:14:/.test(report), true);
+      /step! .*tests\/web\/stopped\.sub:13:/.test(report), true);
     check('stopped: the screen keeps what was drawn before the trap', await page.evaluate(
       '[...document.querySelector("canvas").getContext("2d").getImageData(10, 10, 1, 1).data].join(",")'), '46,125,50,255');
     await new Promise((resolve) => setTimeout(resolve, 300));

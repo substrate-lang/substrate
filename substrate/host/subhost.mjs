@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --stack-size=4000
 // The host for Node: runs the program that `sub build` wrote to DIR, on V8.
-// The #! line's --stack-size gives V8 a 4 MiB call stack; lang.sub's stack is as deep.
+// The #! line's --stack-size gives V8 a 4 MiB call stack; substrate.sub's stack is as deep.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import util from 'node:util';

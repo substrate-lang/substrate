@@ -1,8 +1,7 @@
 ;; The expander: syntax to lowered code, with modules, the cache and sessions.
 ;; What lasts the whole run is in the run's arena (keep); what a module's expansion
 ;; makes is in its module arena, freed when the module is done.
-(require-unqualified substrate "substrate/substrate.sub")
-(require-unqualified k "kernel.sub")
+(require-unqualified macros "macros.sub")
 (require-unqualified core "core.sub")
 (require-unqualified ops "ops.sub")
 (require-unqualified rd "reader.sub")
@@ -10,20 +9,32 @@
 (require-unqualified cmp "compile.sub")
 (require-unqualified running "running.sub")
 (require-unqualified ser "serialize.sub")
+(require-unqualified leb "leb128.sub")
+(require-unqualified checker "checker.sub")
 
-(provide set-repository-root! set-package-root! install-kernel! compile-module-file expand-module-file
+(provide set-repository-root! set-package-root! install-core! compile-module-file expand-module-file
          content-hash wasm-module program-wasm-modules trap-report set-cache-directory!
          session-open! session-eval! session-eval-text! session-eval-file! session-error session-recover!)
 
 (define core-forms datum
-  (quoted (func global import memory table tag define-syntax begin-for-syntax
-           begin require require-unqualified provide set! let let* if block loop br br-if br-table
+  '(func global import memory table tag define-syntax begin-for-syntax
+           begin require require-unqualified language provide set! let let* if block loop br br-if br-table
            return
            call-indirect func-index select drop values unreachable nop
            throw throw-ref try
            i32.const i64.const f32.const f64.const
-           quote quasiquote unquote unquote-splicing quote-syntax quasisyntax unsyntax unsyntax-splicing
-           #%app #%datum #%fact)))
+           quote quote-syntax
+           #%app #%datum #%fact #%checked))
+
+;; The core forms every module sees, whatever its language. The others and the instructions come
+;; from its language or from wasm.sub.
+(define visible-core-forms datum
+  '(define-syntax begin-for-syntax begin require require-unqualified language provide
+           quote quote-syntax #%app #%datum #%fact))
+
+(define wasm-forms datum
+  '(memory table tag block loop br br-if br-table call-indirect func-index select drop unreachable nop
+           throw throw-ref try i32.const i64.const f32.const f64.const))
 
 ;; ==== errors ====
 
@@ -57,7 +68,8 @@
 (const none-slot u32 4294967295)
 
 (define unqualified-imports hash-table)
-(define scope-counter u32 0)
+;; Scopes up to wasm-scope are the expander's own.
+(define scope-counter u32 2)
 (define registry hash-table)
 (define units-by-hash hash-table)
 
@@ -72,12 +84,12 @@
 (const unit-kind u32 20)
 
 (define (new-unit [path datum] [name datum]) -> datum
-  (let ([m (cast (ptr unit) (alloc-in (& run-arena) (sizeof unit)))])
+  (let ([m (cast (ptr unit) (arena-alloc (& run-arena) (sizeof unit)))])
     (set! (-> m self) (make-record unit-kind m))
     (set! (-> m path) (keep path))
     (set! (-> m name) (keep name))
     (set! (-> m hash) 0)
-    (set! (-> m state) (sym compiling))
+    (set! (-> m state) 'compiling)
     (set! (-> m requires) nil)
     (set! (-> m provides) nil)
     (set! (-> m entries) 0)
@@ -94,7 +106,8 @@
 
 (struct comp [module datum] [use-site-scopes datum] [phase-forms datum] [memories datum]
         [tables datum] [provide-ids datum] [require-names datum]
-        [ns datum] [instances (ptr arena-table)] [values (ptr arena-table)] [wasm-module-counter u32] [storage-wasm-modules datum])
+        [ns datum] [instances (ptr hash-table)] [values (ptr hash-table)] [wasm-module-counter u32] [storage-wasm-modules datum]
+        [checking (ptr void)] [language datum] [expansions (ptr hash-table)] [scopes (ptr hash-table)])
 
 (define current (ptr comp) 0)
 
@@ -103,7 +116,7 @@
 (define namespace-counter u32 0)
 
 (define (new-comp [m datum]) -> (ptr comp)
-  (let ([c (cast (ptr comp) (alloc-in (current-arena) (sizeof comp)))])
+  (let ([c (cast (ptr comp) (arena-alloc (current-arena) (sizeof comp)))])
     (set! (-> c module) m)
     (set! (-> c use-site-scopes) nil)
     (set! (-> c phase-forms) nil)
@@ -117,6 +130,10 @@
     (set! (-> c values) (make-table))
     (set! (-> c wasm-module-counter) 0)
     (set! (-> c storage-wasm-modules) nil)
+    (set! (-> c checking) 0)
+    (set! (-> c language) 0)
+    (set! (-> c expansions) (make-table))
+    (set! (-> c scopes) (make-table))
     c))
 
 ;; Scopes are even; a local binding form's is odd, so that quote-syntax can prune the
@@ -137,28 +154,71 @@
 (define (prune-local-scopes [x datum]) -> datum (map-scopes x even-scopes))
 
 (const core-scope u32 0)
-(define core-scopes (ptr scope-set) (scopes-change no-scopes 0 0))
+;; The other core forms and the instructions are bound in this scope. Only the language module's
+;; code has it; other code gets them from wasm.sub, or in the code a form makes.
+(const wasm-scope u32 2)
+(define visible-scopes (ptr scope-set) (scopes-change no-scopes core-scope 0))
+(define wasm-scopes (ptr scope-set) (scopes-change no-scopes wasm-scope 0))
+(define core-scopes (ptr scope-set) (scopes-change visible-scopes wasm-scope 0))
 
-;; ==== the kernel module ====
-;; Compile-time code links to the running compiler's instances of the kernel module
-;; and the modules it rests on, so the compiler and every macro share its data.
+;; ==== the syntax module ====
+;; Compile-time code uses the running compiler's syntax module and macro tools, so that macros and
+;; the compiler share their data.
 
 (define repository-root datum 0)
 (define (set-repository-root! [root datum]) (set! repository-root (keep root)))
 
-
-
-(define kernel datum 0)
-(define kernel-instance datum 0)
+(define running-syntax datum 0)
+(define syntax-instance datum 0)
 (define running-names datum 0)
 
-;; When the compiler builds itself, kernel.sub compiled from source has the running
-;; build's wasm module name, but compile-time code still links to the running build's.
-(define kernel-infos hash-table)
+;; When the compiler builds itself, syntax.sub from source has the running build's module name, but
+;; compile-time code must still use the running build's.
+(define running-infos hash-table)
 
-(define (kernel-name? [name datum]) -> i32 (string=? name kernel-instance))
+(define (syntax-instance? [name datum]) -> i32 (string=? name syntax-instance))
 
-(define kernel-group datum 0)
+;; Compile-time code that requires its own module gets the running compiler's copy of it.
+(define running-copies datum nil)
+
+(define (running-copy [path datum]) -> datum
+  (let ([known (assoc path running-copies)] [g datum 0] [m datum 0])
+    (when (!= known 0) (return (cdr known)))
+    (set! g (group-module-at path))
+    (when (== g 0) (fail-at 0 "~a requires itself while compiling, which only a module the running compiler shares can" (list1 path)))
+    (set! m (running-unit g path))
+    (hash-set! (& units-by-hash) (cast u64 (string->symbol path)) (cast u32 m))
+    (set! running-copies (keep-cons (cons (keep path) m) running-copies))
+    m))
+
+(define (running-copy-of [name datum]) -> datum
+  (let ([l running-copies])
+    (while (pair? l)
+      (when (string=? (-> (unit-of (cdr (car l))) name) name) (return (cdr (car l))))
+      (set! l (cdr l)))
+    0))
+
+(define (running-instance? [name datum]) -> i32 (or (syntax-instance? name) (!= (running-copy-of name) 0)))
+
+;; Its hash is its path, so that what requires it does not change with each build of the compiler.
+(define (running-unit [name datum] [path datum]) -> datum
+  (let* ([bytes (running-bytes name)] [exports (wasm-module-exports (string-bytes bytes) (string-length bytes))]
+         [provides nil] [m (new-unit path name)])
+    (while (pair? exports)
+      (let* ([e (car exports)] [named (string->symbol (cadr e))]
+             [info (if (== (car e) 'func)
+                       (func-info named (caddr e) (cadddr e) name (cadr e))
+                       (tag-info named (caddr e) name (cadr e)))])
+        (when (== (car e) 'func) (set-func-info-place! info (cast i32 (integer-value (list-ref e 4)))))
+        (hash-set! (& running-infos) (cast u64 info) 1)
+        (set! provides (cons (cons named `(,(if (== (car e) 'func) 'func 'tag) ,info)) provides)))
+      (set! exports (cdr exports)))
+    (set! (-> (unit-of m) provides) (keep (sort provides (lambda ([a datum] [b datum]) -> i32 (symbol<? (car a) (car b))))))
+    (set! (-> (unit-of m) hash) (keep path))
+    (set! (-> (unit-of m) state) 'done)
+    m))
+
+(define running-group datum 0)
 
 (define (group-of [name datum]) -> datum
   (let ([out nil] [todo (list1 name)] [n datum 0] [imports datum 0])
@@ -173,52 +233,88 @@
           (set! imports (cdr imports)))))
     out))
 
+;; The running module a phase-0 module stands for: the one with the same name, or, when the seed
+;; builds changed sources, the one with the same source path if the two agree.
 (define (group-instance [name datum]) -> datum
-  (let* ([b (string-bytes name)] [n (string-length name)] [i u32 0] [l kernel-group])
+  (let* ([b (string-bytes name)] [n (string-length name)] [i u32 0] [dot u32 0] [l running-group] [m datum 0])
     (while (and (< i n) (!= (@ b i) #\@)) (+= i 1))
     (unless (and (< (+ i 2) n) (== (@ b (+ i 1)) #\0) (== (@ b (+ i 2)) #\+)) (return 0))
     (while (pair? l)
       (let ([g (car l)])
         (when (and (== (string-length g) (+ i 4)) (== (memcmp (string-bytes g) b (+ i 1)) 0)) (return g)))
       (set! l (cdr l)))
-    0))
+    (while (and (< dot i) (!= (@ b dot) #\.)) (+= dot 1))
+    (when (>= dot i) (return 0))
+    (set! m (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol (substring name (+ dot 1) i))))))
+    (if (== m 0) 0 (agreeing-instance name m))))
 
-;; Binds the kernel's forms and instructions in every phase, gives macros the expander's answers
-;; to their questions, and finds the kernel module among the running program's modules.
-(define (install-kernel!)
-  (for-each (lambda ([name datum]) (bind-raw! name core-scopes all-phases `(core ,name))) core-forms)
-  (for-each (lambda ([name datum]) (bind-raw! name core-scopes all-phases `(prim ,name))) (prim-names))
+(define agreements hash-table)
+(define group-paths datum 0)
+
+;; Fails if the two disagree: code compiled against m must not run on a different module.
+(define (agreeing-instance [name datum] [m datum]) -> datum
+  (let* ([key (cast u64 (string->symbol name))] [g (cast datum (hash-ref (& agreements) key))])
+    (when (!= g 0) (return g))
+    (set! g (group-module-at (-> (unit-of m) path)))
+    (when (== g 0) (return 0))
+    (let ([theirs (recorded-description (running-bytes g))])
+      (for-each (lambda ([d datum])
+                  (let ([t (assq (car d) theirs)])
+                    (when (and (!= t 0) (not (string=? (cdr t) (cdr d))))
+                      (fail-at 0 "code run while compiling would use the running compiler's ~a, whose ~a differs from this one's"
+                               `(,(-> (unit-of m) path) ,(car d))))))
+                (recorded-description (-> (wasm-module-of m 0) bytes))))
+    (hash-set! (& agreements) key (cast u32 g))
+    g))
+
+(define (group-module-at [path datum]) -> datum
+  (when (== group-paths 0)
+    (set! group-paths (keep (map (lambda ([g datum]) -> datum (cons (recorded-path (running-bytes g)) g)) running-group))))
+  (let ([e (assoc path group-paths)]) (if (!= e 0) (cdr e) 0)))
+
+;; Keeps macros.sub in the compiler's program: no compiler code calls it, but every macro tool runs it.
+(define macro-tools (fn (datum datum) -> datum) syntax-match-expansion)
+
+(define (install-core!)
+  (for-each (lambda ([name datum])
+              (bind-raw! name (if (memq name visible-core-forms) visible-scopes wasm-scopes) all-phases `(core ,name)))
+            core-forms)
+  (for-each (lambda ([name datum]) (bind-raw! name wasm-scopes all-phases `(prim ,name))) (prim-names))
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
-                query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier)
-  (let* ([names (running-module-names)] [name (kernel-wasm-module names)]
-         [bytes datum 0] [exports datum 0] [provides nil] [m datum 0])
-    (when (== name 0) (fail-at 0 "the running program has no kernel module" nil))
+                query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier
+                query-shape)
+  (set-expander! running-id query-meaning query-inline-call inline-copy query-expand-head query-scope-shape
+                 query-apply-form prune-local-scopes query-facts-of query-datum-type)
+  (let* ([names (running-module-names)] [name (running-module-named names "syntax.")] [tools (running-module-named names "macros.")])
+    (when (== name 0) (fail-at 0 "the running program has no syntax module" nil))
     (set! running-names (keep names))
     (set! compiler-hash (keep (content-hash running-names)))
-    (set! kernel-instance (keep name))
-    (set! kernel-group (keep (group-of name)))
-    (set! bytes (running-bytes name))
-    (set! exports (wasm-module-exports (string-bytes bytes) (string-length bytes)))
-    (while (pair? exports)
-      (let* ([e (car exports)] [named (string->symbol (cadr e))]
-             [info (if (== (car e) (sym func))
-                       (func-info named (caddr e) (cadddr e) kernel-instance (cadr e))
-                       (tag-info named (caddr e) kernel-instance (cadr e)))])
-        (hash-set! (& kernel-infos) (cast u64 info) 1)
-        (set! provides (cons (cons named `(,(if (== (car e) (sym func)) (sym func) (sym tag)) ,info)) provides)))
-      (set! exports (cdr exports)))
-    (set! m (new-unit `"kernel" `"kernel"))
-    (set! (-> (unit-of m) provides) (keep (sort provides (lambda ([a datum] [b datum]) -> i32 (symbol<? (car a) (car b))))))
-    (set! (-> (unit-of m) state) (sym done))
-    (set! kernel m)
-    (set-kernel-definitions! (kernel-function (sym literal-buffer)) (kernel-function (sym deserialize)))))
+    (set! syntax-instance (keep name))
+    (set! running-group (keep (group-of (if (!= tools 0) tools name))))
+    (set! running-syntax (running-unit name '"syntax"))
+    (use-literals! 0)))
 
-(define (kernel-wasm-module [names datum]) -> datum
-  (while (pair? names)
-    (let ([n (car names)])
-      (when (and (> (string-length n) 7) (== (memcmp (string-bytes n) "kernel." 7) 0)) (return n)))
-    (set! names (cdr names)))
-  0)
+;; A program's quoted data is built by the program's own syntax module, so that it has only one.
+;; Compile-time code's is built by the running one.
+(define (use-literals! [program i32])
+  (let* ([path (if program (recorded-path (running-bytes syntax-instance)) 0)]
+         [m (if (!= path 0) (cast datum (hash-ref (& registry) (cast u64 (string->symbol path)))) 0)])
+    (if (and (!= m 0) (== (-> (unit-of m) state) 'done))
+        (set-literal-functions! (provided-function m 'literal-buffer) (provided-function m 'deserialize))
+        (set-literal-functions! (running-function 'literal-buffer) (running-function 'deserialize)))))
+
+(define (provided-function [m datum] [name datum]) -> datum
+  (let ([p (assq name (-> (unit-of m) provides))])
+    (unless (and (!= p 0) (== (car (cdr p)) 'func)) (fail-at 0 "internal: ~a provides no function ~a" `(,(-> (unit-of m) path) ,name)))
+    (cadr (cdr p))))
+
+(define (running-module-named [names datum] [prefix (ptr u8)]) -> datum
+  (let ([k (strlen prefix)])
+    (while (pair? names)
+      (let ([n (car names)])
+        (when (and (> (string-length n) k) (== (memcmp (string-bytes n) prefix k) 0)) (return n)))
+      (set! names (cdr names)))
+    0))
 
 (define (running-bytes [name datum]) -> datum
   (let ([bytes (running-module-bytes name)])
@@ -228,15 +324,15 @@
 (define (running-wasm-module? [name datum]) -> i32
   (!= (member name running-names) 0))
 
-(define (kernel-function [name datum]) -> datum
-  (let ([p (assq name (-> (unit-of kernel) provides))])
-    (unless (and (!= p 0) (== (car (cdr p)) (sym func))) (fail-at 0 "internal: the kernel module has no function ~a" (list1 name)))
+(define (running-function [name datum]) -> datum
+  (let ([p (assq name (-> (unit-of running-syntax) provides))])
+    (unless (and (!= p 0) (== (car (cdr p)) 'func)) (fail-at 0 "internal: the syntax module has no function ~a" (list1 name)))
     (cadr (cdr p))))
 
 (define (running-storage [kind datum] [phase i32]) -> datum
   (if (and (== phase 0) (not (in-session?)))
       0
-      `(,(if (== kind (sym memory)) (sym memory-import) (sym table-import)) ,kernel-instance)))
+      `(,(if (== kind 'memory) 'memory-import 'table-import) ,syntax-instance)))
 
 ;; ==== bindings ====
 
@@ -249,7 +345,7 @@
   (cast (ptr binding) (hash-ref (& bindings) (slot-key sym slot))))
 
 (define (bind-raw! [sym datum] [scopes (ptr scope-set)] [phase i32] [meaning datum]) -> (ptr binding)
-  (let ([b (cast (ptr binding) (alloc-in (& run-arena) (sizeof binding)))] [k (slot-key sym (binding-slot scopes))])
+  (let ([b (cast (ptr binding) (arena-alloc (& run-arena) (sizeof binding)))] [k (slot-key sym (binding-slot scopes))])
     (set! (-> b scopes) scopes)
     (set! (-> b phase) phase)
     (set! (-> b key) (keep (fresh-key!)))
@@ -261,7 +357,7 @@
 (define (bind-module-level! [sym datum] [scopes (ptr scope-set)] [phase i32] [meaning datum]) -> (ptr binding)
   (let ([b (bind-raw! sym scopes phase meaning)])
     (when (!= current 0)
-      (let ([e (cast (ptr module-entry) (alloc-in (& run-arena) (sizeof module-entry)))] [m (the-module)])
+      (let ([e (cast (ptr module-entry) (arena-alloc (& run-arena) (sizeof module-entry)))] [m (the-module)])
         (set! (-> e symbol) sym)
         (set! (-> e scopes) scopes)
         (set! (-> e phase) phase)
@@ -278,7 +374,7 @@
     (while (!= b 0)
       (when (and (== (-> b phase) phase) (== (-> b scopes) (syntax-scopes id)) (not (equal? (-> b meaning) meaning)))
         (fail-at id "~a is already bound~a"
-                 `(,(syntax-e id) ,(if (> phase 0) (format-message " at phase ~a" (list1 (make-integer phase))) `""))))
+                 `(,(syntax-e id) ,(if (> phase 0) (format-message " at phase ~a" (list1 (make-integer phase))) '""))))
       (set! b (-> b next)))))
 
 ;; Use-site scopes come off the name, so a definition a macro makes from its input
@@ -348,11 +444,6 @@
 (define (meaning-of [id datum] [phase i32]) -> datum
   (let ([b (resolve id phase)]) (if (== b 0) 0 (-> b meaning))))
 
-(define (core-id? [id datum] [name datum] [phase i32]) -> i32
-  (and (identifier? id)
-       (let ([m (meaning-of id phase)])
-         (and (!= m 0) (== (car m) (sym core)) (== (cadr m) name)))))
-
 ;; ---- phase shifting ----
 
 (define (shift-key [d datum] [k u32]) -> u64 (bit-or (<< (cast u64 d) 32) k))
@@ -367,15 +458,17 @@
         inst)))
 
 (define (shift-info [info datum] [k u32]) -> datum
-  (if (or (== k 0) (kernel-definition? info))
+  (if (or (== k 0) (running-definition? info))
       info
       (let ([hit (cast datum (hash-ref (& shifted-infos) (shift-key info k)))] [new datum 0] [o datum 0])
         (if (!= hit 0)
             hit
             (begin
               (set! new (cond [(func-info? info)
-                               (func-info (func-info-name info) (func-info-params info) (func-info-results info)
-                                          (shift-instance (func-info-instance info) k) (func-info-export info))]
+                               (let ([f (func-info (func-info-name info) (func-info-params info) (func-info-results info)
+                                                   (shift-instance (func-info-instance info) k) (func-info-export info))])
+                                 (set-func-info-place! f (func-info-place info))
+                                 f)]
                               [(global-info? info)
                                (global-info (global-info-name info) (global-info-type info) (global-info-mutable? info)
                                             (shift-instance (global-info-instance info) k) (global-info-export info))]
@@ -392,7 +485,7 @@
 (define shift-origins hash-table)
 
 (define (shift-meaning [meaning datum] [k u32]) -> datum
-  (if (and (!= meaning 0) (!= (memq (car meaning) `(func global compile-time-value tag)) 0))
+  (if (and (!= meaning 0) (!= (memq (car meaning) '(func global compile-time-value tag)) 0))
       `(,(car meaning) ,(shift-info (cadr meaning) k))
       meaning))
 
@@ -455,14 +548,6 @@
 (define package-root datum 0)
 (define (set-package-root! [dir datum]) (set! package-root (keep dir)))
 
-(define (string-append-2 [a datum] [b datum]) -> datum
-  (let ([buf (make-buffer)] [s datum 0])
-    (buffer-add! (& buf) (string-bytes a) (string-length a))
-    (buffer-add! (& buf) (string-bytes b) (string-length b))
-    (set! s (bytes->string (-> buf bytes) (-> buf length)))
-    (buffer-free! (& buf))
-    s))
-
 (define (substring [s datum] [from u32] [to u32]) -> datum (bytes->string (+ (string-bytes s) from) (- to from)))
 
 (define (absolute-path? [p datum]) -> i32 (and (> (string-length p) 0) (== (@ (string-bytes p) 0) #\/)))
@@ -472,7 +557,7 @@
 
 (define (canonical-path [p datum]) -> datum
   (let* ([root (resolve-segments (package-directory))]
-         [full (resolve-segments (if (absolute-path? p) p (string-append-2 root (string-append-2 `"/" p))))]
+         [full (resolve-segments (if (absolute-path? p) p (string-append root (string-append '"/" p))))]
          [n (+ (string-length root) 1)])
     (if (and (> (string-length full) n) (== (memcmp (string-bytes full) (string-bytes root) (- n 1)) 0)
              (== (@ (string-bytes full) (- n 1)) #\/))
@@ -487,7 +572,7 @@
         (let ([seg (substring p start i)])
           (cond [(or (== i start) (and (== (- i start) 1) (== (@ bytes start) #\.))) 0]
                 [(and (== (- i start) 2) (== (@ bytes start) #\.) (== (@ bytes (+ start 1)) #\.))
-                 (cond [(and (pair? kept) (not (string=? (car kept) `".."))) (set! kept (cdr kept))]
+                 (cond [(and (pair? kept) (not (string=? (car kept) '".."))) (set! kept (cdr kept))]
                        [(not absolute) (set! kept (cons seg kept))])]
                 [else (set! kept (cons seg kept))]))
         (set! start (+ i 1))))
@@ -509,7 +594,7 @@
 
 (define (directory-of [path datum]) -> datum
   (let ([slash (last-byte-index path #\/)])
-    (if (>= slash 0) (substring path 0 (+ slash 1)) `"")))
+    (if (>= slash 0) (substring path 0 (+ slash 1)) '"")))
 
 (define provisional-names hash-table)
 
@@ -565,7 +650,7 @@
     (content-hash parts)))
 
 (define (package-file [path datum]) -> datum
-  (if (absolute-path? path) path (string-append-2 (package-directory) (string-append-2 `"/" path))))
+  (if (absolute-path? path) path (string-append (package-directory) (string-append '"/" path))))
 
 (define (source-text [file datum] [path datum]) -> datum
   (let* ([name (make-buffer)] [n u32 0] [p (ptr u8) 0] [s datum 0])
@@ -581,7 +666,7 @@
 (define (compile-module-file [source datum]) -> datum
   (let* ([path (canonical-path source)] [key (cast u64 (string->symbol path))]
          [known (cast datum (hash-ref (& registry) key))] [cached datum 0])
-    (cond [(and (!= known 0) (== (-> (unit-of known) state) (sym done))) known]
+    (cond [(and (!= known 0) (== (-> (unit-of known) state) 'done)) known]
           [(!= known 0) (fail-at 0 "cyclic require: ~a requires itself" (list1 path))]
           [(begin (set! cached (load-cached path)) (!= cached 0)) cached]
           [else
@@ -590,8 +675,16 @@
              (set! compiling (keep-cons (string->symbol path) compiling))
              (begin-module-arena)
              (set! current (new-comp m))
-             (set! (-> (unit-of m) code) (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0))
-             (finish-module! text)
+             ;; The failure's message and syntax are in its arena, so the arena is kept until
+             ;; recovery frees it.
+             (try (set! (-> (unit-of m) code) (expand-module-body (read-all (string-bytes text) (string-length text) (string->symbol path)) 0))
+                  (finish-module! text)
+                  [catch-all
+                   (hash-set! (& registry) key 0)
+                   (set! current saved)
+                   (abandon-module-arena)
+                   (set! compiling (cdr compiling))
+                   (rethrow)])
              (set! current saved)
              (end-module-arena)
              (set! compiling (cdr compiling))
@@ -616,28 +709,58 @@
     (set! (-> (the-module) scope) msc)
     (hash-set! (& module-scope-origins) (scope-key msc) (cast u32 (keep (cons (-> (the-module) self) (make-integer 0)))))
     (set! to-syntax syntax)
-    (set! out (expand-body (language-body (map (lambda ([f datum]) -> datum (add-scope (add-scope f core-scope) msc)) forms)) 0))
+    (set! out (try (expand-body (language-body (map (lambda ([f datum]) -> datum (add-scope (add-scope f core-scope) msc)) forms)) 0)
+                   [catch-all (set! to-syntax saved) (rethrow)]))
     (set! to-syntax saved)
     out))
 
-;; A module whose first form requires a module unqualified is in that module's language:
-;; if the language binds #%module-begin, the rest of the module is (#%module-begin form ...).
+;; A module whose first form is (language name path) is in that language. Any other module, and
+;; all compile-time code, is in Substrate.
 (define (language-body [forms datum]) -> datum
-  (if (and (pair? forms) (== (core-head (car forms) 0) (sym require-unqualified)))
-      (let ([id (datum->syntax (car forms) (sym #%module-begin) (car forms))])
-        (require! (car forms) 0 1)
+  (if (and (pair? forms) (== (core-head (car forms) 0) 'language))
+      (let ([id (datum->syntax (car forms) '#%module-begin (car forms))])
+        (require! (car forms) 0 2)
+        (when (== (transformer-of (meaning-of id 0)) 0)
+          (fail-at (car forms) "~a is not a language: it binds no #%module-begin" (list1 (syntax-e (caddr (syntax->list (car forms)))))))
+        (set! (-> current language) (list1 (make-integer 0)))
+        (list1 (datum->syntax (car forms) (cons id (cdr forms)) (car forms))))
+      (default-body forms)))
+
+(define (default-body [forms datum]) -> datum
+  (if (not (string=? (canonical-path (language-path)) (-> (the-module) path)))
+      ;; By the qualified name, so that the module may define its own #%module-begin.
+      (let ([id (make-syntax '%substrate:#%module-begin (module-base-scopes) 0 nil)])
+        (set! (-> current language) nil)
+        (use-language! 0)
         (if (!= (transformer-of (meaning-of id 0)) 0)
-            (list1 (datum->syntax (car forms) (cons id (cdr forms)) (car forms)))
-            (cdr forms)))
-      forms))
+            (list1 (make-syntax (cons id forms) core-scopes (if (pair? forms) (syntax-srcloc (car forms)) 0) nil))
+            forms))
+      ;; The language module also sees wasm's forms.
+      (map (lambda ([f datum]) -> datum (add-scope f wasm-scope)) forms)))
+
+(define (compiler-file [name datum]) -> datum
+  (if (== package-root 0) (string-append '"compiler/" name) (string-append repository-root (string-append '"/compiler/" name))))
+
+(define (language-path) -> datum (compiler-file '"substrate.sub"))
+
+(define (module-base-scopes) -> (ptr scope-set) (scopes-change visible-scopes (-> (the-module) scope) 0))
+
+(define (use-language! [phase i32])
+  (let ([l (-> current language)])
+    (when (and (!= l 0) (== (memq (make-integer phase) l) 0))
+      (set! (-> current language) (cons (make-integer phase) l))
+      (require! (make-syntax `(,(core-id 'language 0) ,(make-syntax '%substrate (module-base-scopes) 0 nil)
+                               ,(make-syntax (language-path) no-scopes 0 nil))
+                             core-scopes 0 nil)
+                phase 2))))
 
 (define (finish-module! [text datum])
   (let ([m (the-module)] [items (reverse (-> current provide-ids))] [provides nil])
     (add-phase-forms! 0 (-> m code))
     (while (pair? items)
       (let* ([item (car items)] [id (cdr item)] [v (meaning-of id 0)])
-        (unless (and (!= v 0) (!= (memq (car v) `(func global compile-time-value data tag)) 0))
-          (fail-at id "cannot provide ~a: it is not a module-level binding" (list1 (syntax-e id))))
+        (unless (and (!= v 0) (!= (memq (car v) '(func global compile-time-value data tag core prim)) 0))
+          (fail-at id "cannot provide ~a: it is not a module-level binding or a core form" (list1 (syntax-e id))))
         (set! provides (cons (cons (syntax-e (car item)) v) provides)))
       (set! items (cdr items)))
     (set! (-> m provides) (keep (reverse provides)))
@@ -652,15 +775,15 @@
 ;; ---- wasm modules ----
 
 (define (storage-forms [phase i32]) -> datum
-  (let ([mem (storage-form (sym memory) phase)] [tbl (storage-form (sym table) phase)])
+  (let ([mem (storage-form 'memory phase)] [tbl (storage-form 'table phase)])
     (append (if (!= mem 0) (list1 mem) nil) (if (!= tbl 0) (list1 tbl) nil))))
 
 (define (storage-form [kind datum] [phase i32]) -> datum
-  (let ([f (assoc (make-integer phase) (if (== kind (sym memory)) (-> current memories) (-> current tables)))])
+  (let ([f (assoc (make-integer phase) (if (== kind 'memory) (-> current memories) (-> current tables)))])
     (if (!= f 0) (cdr f) (running-storage kind phase))))
 
 (define (add-wasm-module! [m datum] [phase i32] [compiled datum])
-  (let ([l (cast (ptr wasm-module) (alloc-in (& run-arena) (sizeof wasm-module)))] [u (unit-of m)])
+  (let ([l (cast (ptr wasm-module) (arena-alloc (& run-arena) (sizeof wasm-module)))] [u (unit-of m)])
     (set! (-> l phase) phase)
     (set! (-> l bytes) (keep (car compiled)))
     (set! (-> l imports) (keep (cadr compiled)))
@@ -682,15 +805,84 @@
       (let* ([p (cast i32 (integer-value (car phases)))] [e (assoc (car phases) (-> current phase-forms))])
         (set! forms (append (storage-forms p) (if (!= e 0) (reverse (cdr e)) nil)))
         (set-current-source! (string->symbol (-> m path)))
-        (add-wasm-module! (-> m self) p (compile-module forms (wasm-module-name (-> m self) p 0)))
-        (set! (-> m memories) (keep-cons (cons (make-integer p) (storage-form (sym memory) p)) (-> m memories)))
+        (use-literals! (== p 0))
+        (add-wasm-module! (-> m self) p (let ([c (compile-module forms (wasm-module-name (-> m self) p 0))])
+                                          (if (== p 0) (recorded (-> m self) c) c)))
+        (use-literals! 0)
+        (set! (-> m memories) (keep-cons (cons (make-integer p) (storage-form 'memory p)) (-> m memories)))
         (note-definitions! (-> m self) forms))
       (set! phases (cdr phases)))
-    (for-each (lambda ([f datum]) (when (and (func-info? f) (has-value? f)) (function-value f))) (-> m infos))
     (hash-set! (& installed) (shift-key (-> m self) 0) 1)
-    (set! (-> m state) (sym done))
+    (set! (-> m state) 'done)
     (set! (-> m code) 0)
     (store-cached! (-> m self))))
+
+;; ---- what compiled code relies on ----
+;; Code compiled against a module also relies on its compile-time data, such as types and constants,
+;; and on its inline and copied bodies, which wasm does not check. A module records a hash of each,
+;; by name, in a custom section.
+
+(define (recorded [m datum] [compiled datum]) -> datum
+  (let ([record (data-bytes `(,(-> (unit-of m) path) ,(description m)))])
+    (cons (with-custom-section (car compiled) "substrate" record) (cdr compiled))))
+
+(define (description [m datum]) -> datum
+  (let ([out nil])
+    (for-each (lambda ([p datum])
+                (let* ([meaning (cdr p)] [base (definition-of meaning)]
+                       [d (if (and (!= base 0) (== (definition-module base) m)) (meaning-description meaning) 0)])
+                  (when (!= d 0) (set! out (cons (cons (car p) (content-hash (list1 (format-message "~s" (list1 d))))) out)))))
+              (-> (unit-of m) provides))
+    (reverse out)))
+
+(define (meaning-description [meaning datum]) -> datum
+  (cond [(== (car meaning) 'compile-time-value)
+         (let ([v (compile-time-value (cadr meaning))]) (if (transformer? v) 0 (plain v)))]
+        [(== (car meaning) 'func)
+         (let ([b (cast datum (hash-ref (& inlines) (cast u64 (base-info (cadr meaning)))))]) (if (== b 0) 0 (plain (numbered b))))]
+        [else 0]))
+
+;; Keys numbered again from 1, since the keys a run makes depend on what it compiled first.
+(define (numbered [b datum]) -> datum
+  (let* ([keys (new-table)] [labels (new-table)] [was (keys-from! 0)] [shift inline-shift]
+         [params (map (lambda ([p datum]) -> datum (cons (copied-key (& keys) (car p)) (cdr p))) (car b))]
+         [body (begin (set! inline-shift 0) (copy-inline (caddr b) (& keys) (& labels) 0))]
+         [assigned (map (lambda ([p datum]) -> datum (copied-key (& keys) (car p))) (list-ref b 4))])
+    (keys-from! was)
+    (set! inline-shift shift)
+    (hash-free! (& keys))
+    (hash-free! (& labels))
+    `(,params ,(cadr b) ,body ,(cadddr b) ,assigned ,(list-ref b 5) ,(list-ref b 6))))
+
+;; Without anything that depends on a module's hash.
+(define (plain [x datum]) -> datum
+  (cond [(syntax? x) (plain (syntax->datum x))]
+        [(pair? x) (cons (plain (car x)) (plain (cdr x)))]
+        [(func-info? x) `(func ,(func-info-export x))]
+        [(global-info? x) `(global ,(global-info-export x))]
+        [(!= (record-kind x) 0) 'record]
+        [else x]))
+
+(define (with-custom-section [bytes datum] [name (ptr u8)] [contents datum]) -> datum
+  (let ([out (make-buffer)] [section (make-buffer)] [s datum 0])
+    (write-uleb (& section) (strlen name))
+    (buffer-add! (& section) name (strlen name))
+    (buffer-add! (& section) (string-bytes contents) (string-length contents))
+    (buffer-add! (& out) (string-bytes bytes) (string-length bytes))
+    (buffer-add-byte! (& out) 0)
+    (write-uleb (& out) (-> section length))
+    (buffer-add! (& out) (-> section bytes) (-> section length))
+    (set! s (bytes->string (-> out bytes) (-> out length)))
+    (buffer-free! (& section))
+    (buffer-free! (& out))
+    s))
+
+(define (record-of [bytes datum]) -> datum
+  (let ([s (wasm-module-custom (string-bytes bytes) (string-length bytes) '"substrate")])
+    (if (== s 0) 0 (data-of s))))
+
+(define (recorded-path [bytes datum]) -> datum (let ([r (record-of bytes)]) (if (== r 0) 0 (car r))))
+(define (recorded-description [bytes datum]) -> datum (let ([r (record-of bytes)]) (if (== r 0) nil (cadr r))))
 
 ;; A wasm module compiled in this run is taken over the running build's of the same name,
 ;; so that when the compiler builds itself, its program is the bytes it compiled.
@@ -699,7 +891,7 @@
     (set! out (visit-wasm-modules m seen out))
     (reverse out)))
 
-(define (visit-wasm-modules [m datum] [seen (ptr arena-table)] [out datum]) -> datum
+(define (visit-wasm-modules [m datum] [seen (ptr hash-table)] [out datum]) -> datum
   (let ([name (wasm-module-name m 0 0)])
     (when (!= (datum-get seen name) 0) (return out))
     (datum-put! seen name (boolean 1))
@@ -709,7 +901,7 @@
         (set! imports (cdr imports)))
       (cons (cons name (-> p bytes)) out))))
 
-(define (visit-import [imp datum] [seen (ptr arena-table)] [out datum]) -> datum
+(define (visit-import [imp datum] [seen (ptr hash-table)] [out datum]) -> datum
   (let ([l (wasm-module-ref imp)])
     (cond [(!= l 0)
            (unless (and (== (integer-value (cadr l)) 0) (== (integer-value (caddr l)) 0))
@@ -718,7 +910,7 @@
           [(running-wasm-module? imp) (visit-running imp seen out)]
           [else out])))
 
-(define (visit-running [name datum] [seen (ptr arena-table)] [out datum]) -> datum
+(define (visit-running [name datum] [seen (ptr hash-table)] [out datum]) -> datum
   (when (!= (datum-get seen name) 0) (return out))
   (datum-put! seen name (boolean 1))
   (let* ([bytes (running-bytes name)] [imports (wasm-module-imports (string-bytes bytes) (string-length bytes))])
@@ -740,24 +932,25 @@
 
 (define (cache-compiler) -> datum (if (== cache-directory 0) 0 compiler-hash))
 
-(define (cache-file [name datum]) -> datum (string-append-2 cache-directory (string-append-2 `"/" name)))
+(define (cache-file [name datum]) -> datum (string-append cache-directory (string-append '"/" name)))
 
 (define (data-bytes [d datum]) -> datum
   (let ([s (make-serializer)])
     (serialize! s d)
     (serializer-bytes s)))
 
-(define (read-data [path datum]) -> datum
-  (let ([s (file-string path)])
-    (if (or (== s 0) (== (string-length s) 0))
-        0
-        (let ([p (string-bytes s)] [count u64 0] [shift u64 0] [i u32 0] [b u32 128])
-          (while (and (!= (bit-and b 128) 0) (< i (string-length s)))
-            (set! b (@ p i))
-            (+= i 1)
-            (set! count (bit-or count (<< (cast u64 (bit-and b 127)) shift)))
-            (+= shift 7))
-          (if (== count 0) 0 (@ (deserialize p (string-length s)) (cast u32 (- count 1))))))))
+(define (read-data [path datum]) -> datum (data-of (file-string path)))
+
+(define (data-of [s datum]) -> datum
+  (if (or (== s 0) (== (string-length s) 0))
+      0
+      (let ([p (string-bytes s)] [count u64 0] [shift u64 0] [i u32 0] [b u32 128])
+        (while (and (!= (bit-and b 128) 0) (< i (string-length s)))
+          (set! b (@ p i))
+          (+= i 1)
+          (set! count (bit-or count (<< (cast u64 (bit-and b 127)) shift)))
+          (+= shift 7))
+        (if (== count 0) 0 (@ (deserialize p (string-length s)) (cast u32 (- count 1)))))))
 
 (define (write-data [path datum] [d datum]) -> i32
   (let ([name (make-buffer)] [bytes (data-bytes d)] [ok i32 0])
@@ -770,16 +963,16 @@
 (define (section [d datum] [key datum]) -> datum (cdr (assq key d)))
 
 (define (current-interface? [d datum]) -> i32
-  (and (pair? d) (!= (assq (sym format) d) 0)
-       (equal? (section d (sym format)) (make-integer interface-format))
-       (equal? (section d (sym compiler)) compiler-hash)))
+  (and (pair? d) (!= (assq 'format d) 0)
+       (equal? (section d 'format) (make-integer interface-format))
+       (equal? (section d 'compiler) compiler-hash)))
 
 (define (load-cached [path datum]) -> datum
   (if (== (cache-compiler) 0)
       0
       (begin
         (begin-module-arena)
-        (let ([m (load-cached-in path)])
+        (let ([m (try (load-cached-in path) [catch-all (abandon-module-arena) (rethrow)])])
           (end-module-arena)
           m))))
 
@@ -789,8 +982,8 @@
          [key (cast u64 (string->symbol path))]
          [hash datum 0] [requires datum 0] [known datum 0] [m datum 0])
     (unless (current-interface? d) (return 0))
-    (set! hash (section d (sym hash)))
-    (set! requires (section d (sym requires)))
+    (set! hash (section d 'hash))
+    (set! requires (section d 'requires))
     (unless (and (string? hash)
                  (string=? (module-hash path (source-text (package-file path) path)
                                         (map (lambda ([r datum]) -> datum (cdr r)) requires))
@@ -798,9 +991,11 @@
       (return 0))
     (hash-set! (& registry) key (cast u32 (new-unit path path)))
     (while (pair? requires)
-      (unless (string=? (-> (unit-of (compile-module-file (car (car requires)))) hash) (cadr (car requires)))
-        (hash-set! (& registry) key 0)
-        (return 0))
+      (let* ([r (car requires)]
+             [u (if (and (string=? (car r) path) (> (integer-value (caddr r)) 0)) (running-copy path) (compile-module-file (car r)))])
+        (unless (string=? (-> (unit-of u) hash) (cadr r))
+          (hash-set! (& registry) key 0)
+          (return 0)))
       (set! requires (cdr requires)))
     (set! known (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol hash)))))
     (set! m (if (!= known 0) known (load-compiled-module d path)))
@@ -813,14 +1008,14 @@
       (write-data (cache-file (cache-name (-> u path))) (list1 (write-interface m))))))
 
 ;; One file per source path, so the cache does not grow as sources change.
-(define (cache-name [path datum]) -> datum (string-append-2 (content-hash (list1 path)) `".subc"))
+(define (cache-name [path datum]) -> datum (string-append (content-hash (list1 path)) '".subc"))
 
 (define (load-compiled-module [d datum] [path datum]) -> datum
-  (let ([m (new-unit path (section d (sym name)))])
+  (let ([m (new-unit path (section d 'name))])
     (set! (-> (unit-of m) requires)
           (keep (map (lambda ([r datum]) -> datum
                        (cons (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol (cadr r))))) (caddr r)))
-                     (section d (sym requires)))))
+                     (section d 'requires))))
     (load-module! m d)
     m))
 
@@ -854,7 +1049,7 @@
     m))
 
 (define (info-kind [info datum]) -> datum
-  (cond [(func-info? info) (sym func)] [(global-info? info) (sym global)] [else (sym tag)]))
+  (cond [(func-info? info) 'func] [(global-info? info) 'global] [else 'tag]))
 
 (define (info-export [info datum]) -> datum
   (cond [(func-info? info) (func-info-export info)] [(global-info? info) (global-info-export info)] [else (tag-info-export info)]))
@@ -865,30 +1060,36 @@
   (cast u64 (string->symbol (format-message "~a ~a ~a" `(,instance ,kind ,export)))))
 
 (define (find-info [instance datum] [kind datum] [export datum]) -> datum
-  (let ([m (instance-unit instance)] [index (ptr arena-table) 0])
+  (let ([m (instance-unit instance)] [index (ptr hash-table) 0])
     (when (== m 0) (return 0))
-    (set! index (cast (ptr arena-table) (hash-ref (& definition-indexes) (cast u64 m))))
+    (set! index (cast (ptr hash-table) (hash-ref (& definition-indexes) (cast u64 m))))
     (when (== index 0)
       (let ([saved (use-arena (& run-arena))] [infos (-> (unit-of m) infos)])
         (set! index (make-table))
         (while (pair? infos)
           (let ([info (car infos)])
-            (table-set! index (definition-key (info-instance info) (info-kind info) (info-export info)) (cast u32 info)))
+            (hash-set! index (definition-key (info-instance info) (info-kind info) (info-export info)) (cast u32 info)))
           (set! infos (cdr infos)))
         (use-arena saved))
       (hash-set! (& definition-indexes) (cast u64 m) (cast u32 index)))
-    (cast datum (table-ref index (definition-key instance kind export)))))
+    (cast datum (hash-ref index (definition-key instance kind export)))))
 
-(define (kernel-definition [kind datum] [export datum]) -> datum
-  (let ([p (assq (string->symbol export) (-> (unit-of kernel) provides))])
+(define (running-definition [kind datum] [export datum] [path datum]) -> datum
+  (let* ([m (if (== path 0) running-syntax (running-copy path))] [p (assq (string->symbol export) (-> (unit-of m) provides))])
     (unless (and (!= p 0) (== (car (cdr p)) kind))
-      (fail-at 0 "the cache is inconsistent: the kernel module has no ~a ~a" `(,kind ,export)))
+      (fail-at 0 "the cache is inconsistent: the running ~a has no ~a ~a" `(,(-> (unit-of m) path) ,kind ,export)))
     (cadr (cdr p))))
+
+(define (running-ref [info datum]) -> datum
+  (let ([m (running-copy-of (info-instance info))])
+    (if (== m 0)
+        `(running ,(info-kind info) ,(info-export info))
+        `(running ,(info-kind info) ,(info-export info) ,(-> (unit-of m) path)))))
 
 ;; ---- writing an interface ----
 
 (define writing datum 0)
-(define own-numbers (ptr arena-table) 0)
+(define own-numbers (ptr hash-table) 0)
 (define own-list datum 0)
 (define own-count u32 0)
 
@@ -904,19 +1105,14 @@
            [provides (map (lambda ([p datum]) -> datum (cons (car p) (encode (cdr p)))) (-> u provides))]
            [entries (entry-forms m)]
            [own (reverse (-> u infos))]
-           [value-forms (filter-out-false
-                    (map (lambda ([f datum]) -> datum
-                           (if (and (func-info? f) (has-value? f))
-                               (let ([g (function-value f)]) (if (!= g 0) (encode `(,f ,g)) 0))
-                               0))
-                         own))]
            [inline-forms (filter-out-false
                      (map (lambda ([f datum]) -> datum
                             (let ([b (cast datum (hash-ref (& inlines) (cast u64 f)))])
                               (if (== b 0)
                                   0
                                   (encode `(,f ,(car b) ,(cadr b) ,(caddr b) ,(cadddr b)
-                                            ,(map (lambda ([p datum]) -> datum (car p)) (list-ref b 4)) ,(list-ref b 5))))))
+                                            ,(map (lambda ([p datum]) -> datum (car p)) (list-ref b 4)) ,(list-ref b 5)
+                                            ,(list-ref b 6))))))
                           own))]
            [macro-forms (filter-out-false
                     (map (lambda ([f datum]) -> datum
@@ -933,7 +1129,7 @@
       `((format . ,(make-integer interface-format)) (compiler . ,compiler-hash) (hash . ,(-> u hash))
         (definitions . ,(make-integer (length (-> u infos)))) (requires . ,require-forms) (name . ,(-> u name))
         (infos . ,infos) (provides . ,provides) (entries . ,entries)
-        (values . ,value-forms) (inlines . ,inline-forms) (macros . ,macro-forms) (facts . ,fact-forms) (wasm-modules . ,wasm-modules)
+        (inlines . ,inline-forms) (macros . ,macro-forms) (facts . ,fact-forms) (wasm-modules . ,wasm-modules)
         (memories . ,(-> u memories))))))
 
 (define (filter-out-false [l datum]) -> datum (filter (lambda ([x datum]) -> i32 (!= x 0)) l))
@@ -955,8 +1151,8 @@
       (set! e (-> e next)))
     out))
 
-(define (tag-symbol? [x datum]) -> i32 (or (object-tag? x) (== x (sym %quote))))
-(define (object-tag? [x datum]) -> i32 (or (== x (sym %info)) (== x (sym %syntax))))
+(define (tag-symbol? [x datum]) -> i32 (or (object-tag? x) (== x '%quote)))
+(define (object-tag? [x datum]) -> i32 (or (== x '%info) (== x '%syntax)))
 
 (define (encode [x datum]) -> datum
   (cond [(pair? x)
@@ -971,7 +1167,7 @@
         [(syntax? x)
          `(%syntax ,(encode (syntax-e x)) ,(scope-refs (syntax-scopes x)) ,(srcloc-form (syntax-srcloc x))
                    ,(encode (syntax-props x)))]
-        [(or (func-info? x) (global-info? x) (tag-info? x)) (cons (sym %info) (info-ref x))]
+        [(or (func-info? x) (global-info? x) (tag-info? x)) (cons '%info (info-ref x))]
         [else x]))
 
 (define (srcloc-form [l (ptr srcloc)]) -> datum
@@ -983,7 +1179,7 @@
 (define (info-ref [info datum]) -> datum
   (let ([origin (cast datum (hash-ref (& shift-origins) (cast u64 info)))] [instance (info-instance info)] [owner datum 0])
     (cond [(!= origin 0) `(shifted ,(encode (car origin)) ,(cdr origin))]
-          [(kernel-definition? info) `(kernel ,(info-kind info) ,(info-export info))]
+          [(running-definition? info) (running-ref info)]
           [else
            (set! owner (if (string? instance) (instance-unit instance) 0))
            (if (and (!= owner 0) (!= owner writing))
@@ -991,18 +1187,18 @@
                (own-ref info))])))
 
 (define (own-ref [info datum]) -> datum
-  (let ([i (table-ref own-numbers (cast u64 info))])
+  (let ([i (hash-ref own-numbers (cast u64 info))])
     (when (== i 0)
       (set! own-list (cons info own-list))
       (+= own-count 1)
       (set! i own-count)
-      (table-set! own-numbers (cast u64 info) i))
+      (hash-set! own-numbers (cast u64 info) i))
     `(own ,(make-integer (- i 1)))))
 
 (define (info->list [info datum]) -> datum
   (cond [(func-info? info)
          `(func ,(func-info-name info) ,(func-info-params info) ,(func-info-results info) ,(func-info-instance info)
-                ,(func-info-export info))]
+                ,(func-info-export info) ,(make-integer (func-info-place info)))]
         [(global-info? info)
          `(global ,(global-info-name info) ,(global-info-type info) ,(global-info-mutable? info) ,(global-info-instance info)
                   ,(global-info-export info))]
@@ -1010,14 +1206,18 @@
 
 (define (list->info [l datum]) -> datum
   (case (car l)
-    [((sym func)) (func-info (list-ref l 1) (list-ref l 2) (list-ref l 3) (list-ref l 4) (list-ref l 5))]
-    [((sym global)) (global-info (list-ref l 1) (list-ref l 2) (list-ref l 3) (list-ref l 4) (list-ref l 5))]
+    [('func)
+     (let ([f (func-info (list-ref l 1) (list-ref l 2) (list-ref l 3) (list-ref l 4) (list-ref l 5))])
+       (set-func-info-place! f (cast i32 (integer-value (list-ref l 6))))
+       f)]
+    [('global) (global-info (list-ref l 1) (list-ref l 2) (list-ref l 3) (list-ref l 4) (list-ref l 5))]
     [else (tag-info (list-ref l 1) (list-ref l 2) (list-ref l 3) (list-ref l 4))]))
 
 (define (scope-ref [sc u32]) -> datum
   (let ([origin (scope-origin sc)] [owner (cast datum (hash-ref (& scope-owners) (scope-key sc)))])
-    (cond [(== sc core-scope) (sym core)]
-          [(and (!= kernel-id-scopes 0) (== sc (@ (-> kernel-id-scopes ids) 0))) (sym kernel-ids)]
+    (cond [(== sc core-scope) 'core]
+          [(== sc wasm-scope) 'wasm]
+          [(and (!= running-id-scopes 0) (== sc (@ (-> running-id-scopes ids) 0))) 'running-ids]
           [(!= origin 0) `(m ,(-> (unit-of (car origin)) hash) ,(cdr origin))]
           [(!= owner 0) `(s ,(-> (unit-of owner) hash) ,(make-integer (hash-ref (& scope-numbers) (scope-key sc))))]
           [else (fail-at 0 "internal: scope ~a belongs to no module" (list1 (make-integer sc))) 0])))
@@ -1037,7 +1237,7 @@
              (or (< c 0) (and (== c 0) (< (integer-value (caddr a)) (integer-value (caddr b))))))])))
 
 (define (scope-ref-rank [r datum]) -> i32
-  (cond [(== r (sym core)) 2] [(== r (sym kernel-ids)) 3] [(== (car r) (sym m)) 0] [else 1]))
+  (cond [(== r 'core) 2] [(== r 'running-ids) 3] [(== r 'wasm) 4] [(== (car r) 'm) 0] [else 1]))
 
 (define (string-compare [a datum] [b datum]) -> i32
   (let* ([n (string-length a)] [k (string-length b)] [c (memcmp (string-bytes a) (string-bytes b) (if (< n k) n k))])
@@ -1049,15 +1249,15 @@
 (define loaded-infos (ptr datum) 0)
 
 (define (zeroed-array [n u32]) -> (ptr datum)
-  (let ([a (cast (ptr datum) (alloc-in (current-arena) (* 4 (+ n 1))))])
+  (let ([a (cast (ptr datum) (arena-alloc (current-arena) (* 4 (+ n 1))))])
     (for ([i u32 0]) (< i n) (+= i 1) (set! (@ a i) 0))
     a))
 
 (define (load-module! [m datum] [d datum])
-  (let* ([u (unit-of m)] [infos (section d (sym infos))] [ni (length infos)]
-         [definitions (cast u32 (integer-value (section d (sym definitions))))])
-    (set! (-> u name) (keep (section d (sym name))))
-    (set! (-> u hash) (keep (section d (sym hash))))
+  (let* ([u (unit-of m)] [infos (section d 'infos)] [ni (length infos)]
+         [definitions (cast u32 (integer-value (section d 'definitions)))])
+    (set! (-> u name) (keep (section d 'name)))
+    (set! (-> u hash) (keep (section d 'hash)))
     (hash-set! (& units-by-hash) (cast u64 (string->symbol (-> u hash))) (cast u32 m))
     (set! (-> u scope) (new-run-scope!))
     (hash-set! (& module-scope-origins) (scope-key (-> u scope)) (cast u32 (keep (cons m (make-integer 0)))))
@@ -1068,7 +1268,7 @@
                   (add-wasm-module! m phase `(,(cadr l) ,(caddr l)
                                           ,(map (lambda ([r datum]) -> datum (make-integer (scope-at r))) (cadddr l))))
                   (wasm-module-name m phase 0)))
-              (section d (sym wasm-modules)))
+              (section d 'wasm-modules))
     (for ([i u32 0]) (< i ni) (+= i 1)
       (let ([info (list->info (decode (car infos)))])
         (set! (@ loaded-infos i) info)
@@ -1077,33 +1277,30 @@
     (for-each (lambda ([e datum])
                 (let* ([scopes (scope-set-of (cadr e))] [phase (cast i32 (integer-value (caddr e)))]
                        [b (bind-raw! (car e) scopes phase (decode (cadddr e)))]
-                       [me (cast (ptr module-entry) (alloc-in (& run-arena) (sizeof module-entry)))])
+                       [me (cast (ptr module-entry) (arena-alloc (& run-arena) (sizeof module-entry)))])
                   (set! (-> me symbol) (car e))
                   (set! (-> me scopes) scopes)
                   (set! (-> me phase) phase)
                   (set! (-> me binding) b)
                   (set! (-> me next) (-> u entries))
                   (set! (-> u entries) me)))
-              (section d (sym entries)))
-    (set! (-> u provides) (keep (map (lambda ([p datum]) -> datum (cons (car p) (decode (cdr p)))) (section d (sym provides)))))
-    (for-each (lambda ([v datum])
-                (let ([x (decode v)]) (hash-set! (& function-values) (cast u64 (car x)) (cast u32 (cadr x)))))
-              (section d (sym values)))
-    (for-each (lambda ([v datum]) (load-inline! (decode v))) (section d (sym inlines)))
-    (set! (-> u memories) (keep (section d (sym memories))))
+              (section d 'entries))
+    (set! (-> u provides) (keep (map (lambda ([p datum]) -> datum (cons (car p) (decode (cdr p)))) (section d 'provides))))
+    (for-each (lambda ([v datum]) (load-inline! (decode v))) (section d 'inlines))
+    (set! (-> u memories) (keep (section d 'memories)))
     (for-each (lambda ([g datum]) (hash-set! (& macro-modules) (cast u64 (decode (car g))) (cast u32 m)))
-              (section d (sym macros)))
-    (let ([facts (map (lambda ([f datum]) -> datum (decode f)) (section d (sym facts)))])
+              (section d 'macros))
+    (let ([facts (map (lambda ([f datum]) -> datum (decode f)) (section d 'facts))])
       (set! (-> u facts) (keep (reverse facts)))
       (for-each (lambda ([f datum]) (index-fact! m f)) (reverse (-> u facts))))
     (set! loading 0)
-    (set! (-> u state) (sym done))
+    (set! (-> u state) 'done)
     (install-module-bindings! m 0)))
 
 (define (load-inline! [x datum])
   (let* ([saved (use-arena (& run-arena))] [params (keep (cadr x))]
          [assigned (filter (lambda ([p datum]) -> i32 (!= (member (car p) (list-ref x 5)) 0)) params)]
-         [b `(,params ,(keep (caddr x)) ,(keep (cadddr x)) ,(list-ref x 4) ,assigned ,(list-ref x 6))])
+         [b `(,params ,(keep (caddr x)) ,(keep (cadddr x)) ,(list-ref x 4) ,assigned ,(list-ref x 6) ,(list-ref x 7))])
     (use-arena saved)
     (hash-set! (& inlines) (cast u64 (car x)) (cast u32 b))))
 
@@ -1111,13 +1308,13 @@
   (if (not (pair? x))
       x
       (case (car x)
-        [((sym %info)) (info-at (cdr x))]
-        [((sym %syntax))
+        [('%info) (info-at (cdr x))]
+        [('%syntax)
          (make-syntax (decode (cadr x)) (scope-set-of (caddr x)) (srcloc-of (cadddr x)) (decode (list-ref x 4)))]
         [else
          (let ([head nil] [last datum 0] [l x] [p datum 0])
            (while (and (pair? l) (not (object-tag? (car l))))
-             (if (== (car l) (sym %quote))
+             (if (== (car l) '%quote)
                  (begin (set! p (list1 (cadr l))) (set! l (cddr l)))
                  (begin (set! p (list1 (decode (car l)))) (set! l (cdr l))))
              (if (== last 0) (set! head p) (set-cdr! last p))
@@ -1133,9 +1330,9 @@
 
 (define (info-at [r datum]) -> datum
   (case (car r)
-    [((sym own)) (@ loaded-infos (cast u32 (integer-value (cadr r))))]
-    [((sym shifted)) (shift-info (decode (cadr r)) (cast u32 (integer-value (caddr r))))]
-    [((sym kernel)) (kernel-definition (cadr r) (caddr r))]
+    [('own) (@ loaded-infos (cast u32 (integer-value (cadr r))))]
+    [('shifted) (shift-info (decode (cadr r)) (cast u32 (integer-value (caddr r))))]
+    [('running) (running-definition (cadr r) (caddr r) (if (pair? (cdddr r)) (cadddr r) 0))]
     [else
      (let ([info (find-info (cadr r) (caddr r) (cadddr r))])
        (when (== info 0)
@@ -1143,9 +1340,10 @@
        info)]))
 
 (define (scope-at [r datum]) -> u32
-  (cond [(== r (sym core)) core-scope]
-        [(== r (sym kernel-ids)) (kernel-id-scope)]
-        [(== (car r) (sym m)) (module-scope-at (unit-with-hash (cadr r)) (cast u32 (integer-value (caddr r))))]
+  (cond [(== r 'core) core-scope]
+        [(== r 'wasm) wasm-scope]
+        [(== r 'running-ids) (running-id-scope)]
+        [(== (car r) 'm) (module-scope-at (unit-with-hash (cadr r)) (cast u32 (integer-value (caddr r))))]
         [else (unit-scope-at (unit-with-hash (cadr r)) (cast u32 (integer-value (caddr r))))]))
 
 (define (scope-set-of [refs datum]) -> (ptr scope-set)
@@ -1160,7 +1358,7 @@
 (define (core-head [s datum] [phase i32]) -> datum
   (if (and (syntax? s) (pair? (syntax-e s)) (identifier? (car (syntax-e s))))
       (let ([m (meaning-of (car (syntax-e s)) phase)])
-        (if (and (!= m 0) (== (car m) (sym core))) (cadr m) 0))
+        (if (and (!= m 0) (== (car m) 'core)) (cadr m) 0))
       0))
 
 (define (head-expand [s datum] [phase i32]) -> datum
@@ -1168,7 +1366,7 @@
                      [(and (syntax? s) (pair? (syntax-e s)) (identifier? (car (syntax-e s)))) (car (syntax-e s))]
                      [else 0])]
          [t (if (!= head 0) (transformer-of (meaning-of head phase)) 0)])
-    (if (!= t 0)
+    (if (and (!= t 0) (not (and (form-value? t) (!= (shape-of t s phase) 0))))
         (head-expand (apply-macro head t s phase 1) phase)
         s)))
 
@@ -1177,15 +1375,16 @@
 (define current-body (ptr body) 0)
 
 (define (expand-body [forms datum] [phase i32]) -> datum
-  (let ([b (cast (ptr body) (alloc-in (current-arena) (sizeof body)))] [saved current-body] [out datum 0])
+  (let ([b (cast (ptr body) (arena-alloc (current-arena) (sizeof body)))] [saved current-body] [out datum 0])
     (set! (-> b phase) phase)
     (set! (-> b syntax) to-syntax)
     (set! (-> b items) nil)
     (set! (-> b pass2) 0)
     (set! (-> b lifted) nil)
     (set! current-body b)
-    (for-each (lambda ([f datum]) (declare-form! f b 0)) forms)
-    (set! out (finish-body! b))
+    (try (for-each (lambda ([f datum]) (declare-form! f b 0)) forms)
+         (set! out (finish-body! b))
+         [catch-all (set! current-body saved) (rethrow)])
     (set! current-body saved)
     out))
 
@@ -1208,25 +1407,26 @@
 (define (declare-form! [f0 datum] [b (ptr body)] [only (ptr u8)])
   (let* ([phase (-> b phase)] [f (head-expand f0 phase)] [kind (core-head f phase)])
     (when (and (!= only 0)
-               (!= (memq kind `(require require-unqualified provide memory table define-syntax begin-for-syntax)) 0))
+               (!= (memq kind '(require require-unqualified language provide memory table define-syntax begin-for-syntax)) 0))
       (fail-at f "~a (~a ...), but only func, global, import, tag, data and #%fact forms and expressions are allowed there"
                `(,(bytes->string only (strlen only)) ,kind)))
     (case kind
       ;; A form a macro's begin splices is its output too.
-      [((sym begin))
+      [('begin)
        (let ([forms (cdr (form-list f "(begin form ...)"))])
          (for-each (lambda ([g datum]) (declare-form! (at-use f g) b only)) forms))]
-      [((sym require)) (require! f phase 0)]
-      [((sym require-unqualified)) (require! f phase 1)]
-      [((sym provide)) (provide! f phase)]
-      [((sym func)) (item! b (declare-func f phase))]
-      [((sym global)) (item! b (declare-global f phase))]
-      [((sym import)) (item! b (declare-import f phase))]
-      [((sym memory) (sym table)) (declare-storage! f phase)]
-      [((sym tag)) (item! b (declare-tag f phase))]
-      [((sym define-syntax)) (define-syntax! f phase)]
-      [((sym begin-for-syntax)) (begin-for-syntax! f phase)]
-      [((sym #%fact)) (item! b `(done ,(fact! f phase) ()))]
+      [('require) (require! f phase 0)]
+      [('require-unqualified) (require! f phase 1)]
+      [('language) (if (in-session?) (require! f phase 2) (fail-at f "the language must be the module's first form" nil))]
+      [('provide) (provide! f phase)]
+      [('func) (item! b (declare-func f phase))]
+      [('global) (item! b (declare-global f phase))]
+      [('import) (item! b (declare-import f phase))]
+      [('memory 'table) (declare-storage! f kind phase)]
+      [('tag) (item! b (declare-tag f phase))]
+      [('define-syntax) (define-syntax! f phase)]
+      [('begin-for-syntax) (begin-for-syntax! f phase)]
+      [('#%fact) (item! b `(done ,(fact! f phase) ()))]
       [else
        (if (and (in-session?) (== phase 0) (== only 0) (not interacting))
            (interact! f0 f b)
@@ -1247,9 +1447,10 @@
         (set! l (cdr l)))
       (set! (-> b items) before)
       (set! to-syntax (-> b syntax))
-      (while (pair? new)
-        (set! (-> b lifted) (cons (expand-item (car new) phase) (-> b lifted)))
-        (set! new (cdr new)))
+      (try (while (pair? new)
+             (set! (-> b lifted) (cons (expand-item (car new) phase) (-> b lifted)))
+             (set! new (cdr new)))
+           [catch-all (set! to-syntax saved) (rethrow)])
       (set! to-syntax saved))))
 
 (define (form-list [f datum] [patterns (ptr u8)]) -> datum
@@ -1258,11 +1459,12 @@
 
 (define (expand-item [item datum] [phase i32]) -> datum
   (case (car item)
-    [((sym func)) (expand-func item phase)]
-    [((sym global)) (expand-global item phase)]
-    [((sym plain) (sym done)) (if to-syntax (list1 (cadr item)) (caddr item))]
+    [('func) (expand-func item phase)]
+    [('global) (expand-global item phase)]
+    [('plain 'done) (if to-syntax (list1 (cadr item)) (caddr item))]
     [else
-     (let ([r (expand-expr (cadr item) phase)])
+     (let* ([e (cadr item)]
+            [r (if (or to-syntax (== (core-head e phase) '#%checked)) (expand-expr e phase) (core-expression e phase))])
        (if to-syntax (list1 r) (list1 `(expr ,r))))]))
 
 ;; ==== types ====
@@ -1271,7 +1473,7 @@
 ;; type syntax are compared by name, like wasm's keywords.
 (define (parse-type [s datum]) -> datum
   (let ([d (syntax-e s)])
-    (when (== (memq d `(i32 i64 f32 f64 exnref)) 0)
+    (when (== (memq d '(i32 i64 f32 f64 exnref)) 0)
       (fail-at s "expected a type (i32, i64, f32, f64 or exnref), got ~s" (list1 (syntax->datum s))))
     d))
 
@@ -1284,33 +1486,22 @@
   (let ([n (syntax-e s)]) (and (integer? n) (>= (integer-value n) 0) (< (integer-value n) 1073741824))))
 
 (define (parse-results [body datum]) -> datum
-  (cond [(and (pair? body) (named? (car body) (sym ->)) (pair? (cdr body)))
+  (cond [(and (pair? body) (named? (car body) '->) (pair? (cdr body)))
          (let ([l (syntax->list (cadr body))])
            (cons (if (!= l 0) (map (lambda ([x datum]) -> datum (parse-type x)) l) (list1 (parse-type (cadr body))))
                  (cddr body)))]
-        [(and (pair? body) (named? (car body) (sym ->))) (fail-at (car body) "expected a type after ->" nil)]
+        [(and (pair? body) (named? (car body) '->)) (fail-at (car body) "expected a type after ->" nil)]
         [else (cons nil body)]))
 
 (define (parse-signature [s datum]) -> datum
   (let ([l (syntax->list s)] [params nil])
-    (when (or (== l 0) (not (ormap (lambda ([t datum]) -> i32 (named? t (sym ->))) l)))
+    (when (or (== l 0) (not (ormap (lambda ([t datum]) -> i32 (named? t '->)) l)))
       (fail-at s "expected a signature (type ... -> type ...)" nil))
-    (while (not (named? (car l) (sym ->)))
+    (while (not (named? (car l) '->))
       (set! params (cons (car l) params))
       (set! l (cdr l)))
     (cons (map (lambda ([t datum]) -> datum (parse-type t)) (reverse params))
           (map (lambda ([t datum]) -> datum (parse-type t)) (cdr l)))))
-
-(define (func-options [rest datum]) -> datum
-  (let* ([inline (if (and (pair? rest) (== (syntax-e (car rest)) `#:inline)) (car rest) 0)]
-         [rest (if (!= inline 0) (cdr rest) rest)]
-         [value (if (and (pair? rest) (== (syntax-e (car rest)) `#:value))
-                    (begin
-                      (unless (and (pair? (cdr rest)) (identifier? (cadr rest)))
-                        (fail-at (car rest) "#:value needs the name of a global" nil))
-                      `(,(car rest) ,(cadr rest)))
-                    0)])
-    `(,inline ,value ,(if (!= value 0) (cddr rest) rest))))
 
 (define (declare-func [f datum] [phase i32]) -> datum
   (let* ([l (syntax->list f)] [head (if (and (!= l 0) (>= (length l) 2)) (syntax->list (cadr l)) 0)])
@@ -1318,58 +1509,73 @@
     (let* ([name (car head)]
            [params (map (lambda ([p datum]) -> datum (param-of p)) (cdr head))]
            [types (map (lambda ([p datum]) -> datum (parse-type (cadr p))) params)]
-           [options (func-options (cddr l))]
-           [inline (car options)] [value (cadr options)] [rest (caddr options)]
+           [rest (cddr l)]
+           [inline (if (and (pair? rest) (!= (memq (syntax-e (car rest)) '(#:inline #:copied)) 0)) (car rest) 0)]
+           [rest (if (!= inline 0) (cdr rest) rest)]
            [rb (parse-results rest)]
            [info (func-info (syntax-e name) types (car rb) 0 0)])
       (bind-definition! name phase `(func ,info))
-      (when (!= value 0) (hash-set! (& function-values) (cast u64 info) (cast u32 (keep (cons (cadr value) (make-integer phase))))))
-      `(func ,name ,params ,(take rest (- (length rest) (length (cdr rb)))) ,(cdr rb) ,f ,inline ,value ,info))))
+      `(func ,name ,params ,(take rest (- (length rest) (length (cdr rb)))) ,(cdr rb) ,f ,inline ,info))))
 
 (define (param-of [p datum]) -> datum
   (let ([l (syntax->list p)])
     (unless (and (!= l 0) (== (length l) 2) (identifier? (car l))) (no-match p "(name type)"))
     l))
 
+(define in-inline-body i32 0)
+
 (define (expand-func [p datum] [phase i32]) -> datum
   (let* ([name (list-ref p 1)] [params (list-ref p 2)] [arrow (list-ref p 3)] [body (list-ref p 4)]
-         [f (list-ref p 5)] [inline (list-ref p 6)] [value (list-ref p 7)] [info (list-ref p 8)]
+         [f (list-ref p 5)] [inline (list-ref p 6)] [info (list-ref p 7)]
          [sc (new-local-scope!)]
          [xs (map (lambda ([pp datum]) -> datum (add-scope (car pp) sc)) params)]
-         [keys (map (lambda ([x datum]) -> datum (bind-local! x phase)) xs)]
-         [r (map (lambda ([b datum]) -> datum (expand-expr (add-scope b sc) phase)) body)])
+         [scoped (map (lambda ([b datum]) -> datum (add-scope b sc)) body)]
+         [checked (if (and (pair? scoped) (null? (cdr scoped)) (== (core-head (car scoped) phase) '#%checked)) (car scoped) 0)]
+         [box (if (and (!= checked 0) (== (syntax-e (cadr (syntax->list checked))) 'code)) (boxed-code (caddr (syntax->list checked))) 0)]
+         [keys (if (and (!= box 0) (not to-syntax)) (car box) (map (lambda ([x datum]) -> datum (bind-local! x phase)) xs))]
+         [was in-inline-body]
+         [r (begin
+              (set! in-inline-body (!= inline 0))
+              (try (cond [to-syntax (map (lambda ([b datum]) -> datum (expand-expr b phase)) scoped)]
+                         [(!= box 0) (list1 (cdr box))]
+                         [(!= checked 0) (list1 (expand-expr checked phase))]
+                         [else (list1 (core-body f name xs scoped info phase))])
+                   [catch-all (set! in-inline-body was) (rethrow)]))])
+    (set! in-inline-body was)
     (if to-syntax
         (let ([ps nil] [x xs] [k keys] [pp params])
           (while (pair? x)
             (set! ps (cons (out-list (car x) `(,(with-local-binding (car x) (car k)) ,(cadr (car pp)))) ps))
             (set! x (cdr x)) (set! k (cdr k)) (set! pp (cdr pp)))
-          (list1 (out f (sym func)
+          (list1 (out f 'func
                       `(,(out-list (cadr (syntax->list f)) (cons name (reverse ps)))
-                        ,@(if (!= inline 0) (list1 inline) nil) ,@(if (!= value 0) value nil) ,@arrow
+                        ,@(if (!= inline 0) (list1 inline) nil) ,@arrow
                         ,@r))))
         (let ([ps nil] [k keys] [types (func-info-params info)] [code (seq-at f r)])
           (while (pair? k)
             (set! ps (cons (cons (car k) (car types)) ps))
             (set! k (cdr k)) (set! types (cdr types)))
           (set! ps (reverse ps))
-          (when (!= inline 0) (note-inline! info ps code name))
-          (when (!= value 0) (function-value info))
+          (when (!= inline 0) (note-inline! info ps code name (== (syntax-e inline) '#:copied)))
           (list1 `(func ,info ,ps ,code))))))
 
 (define (declare-global [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 4) (identifier? (cadr l))) (no-match f "(global name type init)"))
     (let* ([name (cadr l)] [xt (caddr l)] [xl (syntax->list xt)]
-           [info (if (and (!= xl 0) (== (length xl) 2) (named? (car xl) (sym mut)))
+           [info (if (and (!= xl 0) (== (length xl) 2) (named? (car xl) 'mut))
                      (global-info (syntax-e name) (parse-type (cadr xl)) (boolean 1) 0 0)
                      (global-info (syntax-e name) (parse-type xt) 0 0 0))])
       (bind-definition! name phase `(global ,info))
       `(global ,f ,xt ,info))))
 
 (define (expand-global [p datum] [phase i32]) -> datum
-  (let* ([l (syntax->list (cadr p))] [r (expand-expr (cadddr l) phase)])
+  (let* ([l (syntax->list (cadr p))] [init (cadddr l)]
+         [r (if (or to-syntax (== (core-head init phase) '#%checked))
+                (expand-expr init phase)
+                (core-value (cadr l) (global-info-type (cadddr p)) init (cadr p) phase))])
     (if to-syntax
-        (list1 (out (cadr p) (sym global) `(,(cadr l) ,(caddr p) ,r)))
+        (list1 (out (cadr p) 'global `(,(cadr l) ,(caddr p) ,r)))
         (list1 `(global ,(cadddr p) ,r)))))
 
 (define (declare-import [f datum] [phase i32]) -> datum
@@ -1378,7 +1584,7 @@
       (no-match f "(import name module field signature)"))
     (let* ([name (cadr l)] [module (caddr l)] [field (cadddr l)] [sig (list-ref l 4)] [pr (parse-signature sig)])
       (bind-definition! name phase `(func ,(func-info (syntax-e name) (car pr) (cdr pr) (syntax-e module) (syntax-e field))))
-      `(plain ,(out f (sym import) `(,name ,module ,field ,sig)) ()))))
+      `(plain ,(out f 'import `(,name ,module ,field ,sig)) ()))))
 
 (define (declare-tag [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
@@ -1386,25 +1592,24 @@
       (no-match f "(tag name (type ...))"))
     (let ([info (tag-info (syntax-e (cadr l)) (map (lambda ([t datum]) -> datum (parse-type t)) (syntax->list (caddr l))) 0 0)])
       (bind-definition! (cadr l) phase `(tag ,info))
-      `(plain ,(out f (sym tag) `(,(cadr l) ,(caddr l))) ((tag ,info))))))
-
-(define (tag-info-of [id datum] [phase i32]) -> datum
-  (let ([m (if (identifier? id) (meaning-of id phase) 0)])
-    (unless (and (!= m 0) (== (car m) (sym tag))) (fail-at id "~s is not a tag" (list1 (syntax->datum id))))
-    (cadr m)))
+      `(plain ,(out f 'tag `(,(cadr l) ,(caddr l))) ((tag ,info))))))
 
 ;; ---- require, provide, storage ----
 
+;; all is 0 for require, 1 for require-unqualified and 2 for language, which binds the same names.
 (define (require! [f datum] [phase i32] [all i32])
   (let ([l (syntax->list f)])
     (if all
         (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l)) (module-source? (caddr l)))
-          (no-match f "(require-unqualified name source)"))
+          (no-match f (if (== all 2) "(language name source)" "(require-unqualified name source)")))
         (unless (and (!= l 0) (>= (length l) 3) (identifier? (cadr l)) (module-source? (caddr l)))
           (no-match f "(require name source item ...)")))
     (let* ([name (cadr l)] [source (caddr l)]
-           [provided (cond [(string? (syntax-e source)) (require-module! f name source phase)]
-                           [else (require-kernel! name phase)])])
+           [provided (require-module! f name source phase)])
+      ;; Only a session may require a language unqualified.
+      (when (and (== all 1) (not (in-session?)) (!= (assq '#%module-begin provided) 0))
+        (fail-at f "~a is a language: a module is in it when its first form is (language ~a ~s)"
+                 `(,(syntax-e source) ,(syntax-e name) ,(syntax-e source))))
       (for-each (lambda ([p datum]) (bind-import! (qualified name (car p)) phase (cdr p))) provided)
       (when all
         (for-each (lambda ([p datum])
@@ -1424,7 +1629,7 @@
             (for-each (lambda ([p datum]) (bind-import! (car names) phase (cdr p))) ps))
           (set! items (cdr items)))))))
 
-(define (module-source? [s datum]) -> i32 (or (string-literal? s) (named? s (sym kernel))))
+(define (module-source? [s datum]) -> i32 (string-literal? s))
 
 (define (qualified [name datum] [sym datum]) -> datum
   (datum->syntax name (string->symbol (format-message "~a:~a" `(,(syntax-e name) ,sym))) name))
@@ -1439,23 +1644,21 @@
          [c (memcmp x y (if (< n m) n m))])
     (or (< c 0) (and (== c 0) (< n m)))))
 
-(define (require-kernel! [name datum] [phase i32]) -> datum
-  (let* ([key (cons (syntax-e name) (make-integer phase))] [named (assoc key (-> current require-names))])
-    (when (and (!= named 0) (!= (cdr named) kernel))
-      (fail-at name "~a already names another module at this phase" (list1 (syntax-e name))))
-    (when (== named 0) (set! (-> current require-names) (cons (cons key kernel) (-> current require-names))))
-    (-> (unit-of kernel) provides)))
-
 ;; A relative path is from the file the path is written in, so a require a macro makes
 ;; names a file relative to the macro's own file.
 (define (module-path-of [f datum] [spec datum]) -> datum
   (let* ([loc (if (!= (syntax-srcloc spec) 0) (syntax-srcloc spec) (syntax-srcloc f))]
-         [dir (if (!= loc 0) (directory-of (symbol->string (-> loc source))) `"")]
+         [dir (if (!= loc 0) (directory-of (symbol->string (-> loc source))) '"")]
          [given (syntax-e spec)])
-    (if (absolute-path? given) given (string-append-2 dir given))))
+    (if (absolute-path? given) given (string-append dir given))))
 
 (define (require-module! [f datum] [name datum] [spec datum] [phase i32]) -> datum
-  (require-unit! name (compile-module-file (module-path-of f spec)) phase))
+  (let ([path (canonical-path (module-path-of f spec))])
+    (require-unit! name
+                   (if (and (> phase 0) (not (in-session?)) (string=? path (-> (the-module) path)))
+                       (running-copy path)
+                       (compile-module-file path))
+                   phase)))
 
 (define (require-unit! [name datum] [m datum] [phase i32]) -> datum
   (let* ([me (the-module)] [key (cons (syntax-e name) (make-integer phase))]
@@ -1493,13 +1696,16 @@
 (define (provide-items [item datum]) -> datum
   (let ([l (syntax->list item)])
     (cond [(identifier? item) (list1 (cons item item))]
-          [(and (!= l 0) (== (length l) 2) (named? (car l) (sym all-from-out))) (all-from-items (cadr l) nil)]
-          [(and (!= l 0) (>= (length l) 2) (named? (car l) (sym except-out))
-                (let ([inner (syntax->list (cadr l))]) (and (!= inner 0) (== (length inner) 2) (named? (car inner) (sym all-from-out))))
+          [(and (!= l 0) (== (length l) 2) (named? (car l) 'all-from-out)) (all-from-items (cadr l) nil)]
+          [(and (!= l 0) (>= (length l) 2) (named? (car l) 'except-out)
+                (let ([inner (syntax->list (cadr l))]) (and (!= inner 0) (== (length inner) 2) (named? (car inner) 'all-from-out)))
                 (andmap (lambda ([x datum]) -> i32 (identifier? x)) (cddr l)))
            (all-from-items (cadr (syntax->list (cadr l))) (cddr l))]
           [(and (!= l 0) (== (length l) 2) (identifier? (car l)) (identifier? (cadr l))) (list1 (cons (car l) (cadr l)))]
-          [else (no-match item "name, (all-from-out module), (except-out (all-from-out module) name ...) or (new-name name)")])))
+          [(and (!= l 0) (== (length l) 1) (named? (car l) 'all-wasm-forms))
+           (map (lambda ([name datum]) -> datum (cons (datum->syntax item name item) (make-syntax name core-scopes 0 nil)))
+                (append '(func global) (append wasm-forms (prim-names))))]
+          [else (no-match item "name, (all-from-out module), (except-out (all-from-out module) name ...), (new-name name) or (all-wasm-forms)")])))
 
 (define (all-from-items [name datum] [excluded datum]) -> datum
   (let* ([m (unit-of (required-module name 0))] [out (map (lambda ([x datum]) -> datum (syntax-e x)) excluded)]
@@ -1513,15 +1719,15 @@
     (map (lambda ([sym datum]) -> datum (cons (datum->syntax name sym name) (qualified name sym)))
          (filter (lambda ([sym datum]) -> i32 (== (memq sym out) 0)) (reverse syms)))))
 
-(define (declare-storage! [f datum] [phase i32])
-  (let* ([l (syntax->list f)] [kind (syntax-e (car l))] [memory (== kind (sym memory))]
+(define (declare-storage! [f datum] [kind datum] [phase i32])
+  (let* ([l (syntax->list f)] [memory (== kind 'memory)]
          [table (if memory (-> current memories) (-> current tables))] [form datum 0])
     (when (!= (assoc (make-integer phase) table) 0) (fail-at f "a second ~a declaration at this phase" (list1 kind)))
     (set! form (cond [(and (== (length l) 2) (count-literal? (cadr l))) `(,kind ,(syntax-e (cadr l)))]
-                     [(and (== (length l) 3) (named? (cadr l) (sym from)))
+                     [(and (== (length l) 3) (named? (cadr l) 'from))
                       (let ([m (required-module (caddr l) phase)])
-                        `(,(if memory (sym memory-import) (sym table-import))
-                          ,(if (== m kernel) kernel-instance (wasm-module-name m 0 phase))))]
+                        `(,(if memory 'memory-import 'table-import)
+                          ,(wasm-module-name m 0 phase)))]
                      [else (no-match f (if memory "(memory size) or (memory from module)" "(table size) or (table from module)"))]))
     (if memory
         (set! (-> current memories) (cons (cons (make-integer phase) form) (-> current memories)))
@@ -1544,8 +1750,8 @@
 (define (instance-unit [name datum]) -> datum
   (let ([r (wasm-module-ref name)])
     (cond [(!= r 0) (car r)]
-          [(kernel-name? name) kernel]
-          [else 0])))
+          [(syntax-instance? name) running-syntax]
+          [else (running-copy-of name)])))
 
 ;; ==== compile-time evaluation ====
 
@@ -1581,12 +1787,12 @@
 
 (define (ensure-wasm-module! [m datum] [q i32] [t u32])
   (let* ([name (ns-name (wasm-module-name m q (cast i32 t)))] [key (cast u64 (string->symbol name))] [p (ptr wasm-module) 0])
-    (when (== (table-ref (-> current instances) key) 0)
+    (when (== (hash-ref (-> current instances) key) 0)
       (set! p (wasm-module-of m q))
       (when (== p 0) (fail-at 0 "internal: ~a has no phase ~a wasm module" `(,(-> (unit-of m) name) ,(make-integer q))))
       (for-each (lambda ([imp datum]) (ensure-import! imp t)) (-> p imports))
       (instantiate! name (-> p bytes) (-> p imports) (-> p scopes) t 0 (>= (+ q (cast i32 t)) 1))
-      (table-set! (-> current instances) key 1))))
+      (hash-set! (-> current instances) key 1))))
 
 ;; Code that runs at phase 1 or above runs while compiling, so the host gives it less.
 (define (instantiate! [name datum] [bytes datum] [imports datum] [scopes datum] [t u32] [where datum] [compile-time i32])
@@ -1612,7 +1818,7 @@
           (fail-at where "compile-time code failed: ~a" (list1 (host-error)))))))
 
 (define (scope-map-of [scopes datum] [t u32]) -> (ptr u32)
-  (let ([p (cast (ptr u32) (alloc-in (current-arena) (* 4 (+ (length scopes) 1))))] [i u32 0] [sc u32 0] [o datum 0])
+  (let ([p (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ (length scopes) 1))))] [i u32 0] [sc u32 0] [o datum 0])
     (while (pair? scopes)
       (set! sc (cast u32 (integer-value (car scopes))))
       (set! o (scope-origin sc))
@@ -1622,7 +1828,7 @@
     p))
 
 (define (host-error) -> datum
-  (let* ([p (cast (ptr u8) (alloc-in (current-arena) 2048))] [n (cast u32 (host-error-message p 2048))])
+  (let* ([p (cast (ptr u8) (arena-alloc (current-arena) 2048))] [n (cast u32 (host-error-message p 2048))])
     (bytes->string p n)))
 
 (define (instantiate-wasm-module! [name datum] [forms datum] [where datum])
@@ -1630,7 +1836,7 @@
   (let ([compiled (compile-module forms name)])
     (for-each (lambda ([imp datum]) (ensure-import! imp 0)) (cadr compiled))
     (instantiate! (ns-name name) (car compiled) (cadr compiled) (caddr compiled) 0 where 1)
-    (table-set! (-> current instances) (cast u64 (string->symbol (ns-name name))) 1)))
+    (hash-set! (-> current instances) (cast u64 (string->symbol (ns-name name))) 1)))
 
 (define (run-compile-time-wasm-module! [forms datum] [phase i32] [where datum])
   (add-phase-forms! phase forms)
@@ -1645,14 +1851,14 @@
           (set! (-> current phase-forms) (cons (cons (make-integer phase) (reverse forms)) (-> current phase-forms)))))))
 
 (define (wasm-module-storage-forms [phase i32] [name datum]) -> datum
-  (let ([out nil] [kinds `(memory table)] [form datum 0] [owner datum 0])
+  (let ([out nil] [kinds '(memory table)] [form datum 0] [owner datum 0])
     (while (pair? kinds)
       (set! form (storage-form (car kinds) phase))
       (set! owner (assoc (cons (car kinds) (make-integer phase)) (-> current storage-wasm-modules)))
       (cond [(== form 0) 0]
             [(!= (car form) (car kinds)) (set! out (cons form out))]
             [(!= owner 0)
-             (set! out (cons `(,(if (== (car kinds) (sym memory)) (sym memory-import) (sym table-import)) ,(cdr owner)) out))]
+             (set! out (cons `(,(if (== (car kinds) 'memory) 'memory-import 'table-import) ,(cdr owner)) out))]
             [else
              (set! (-> current storage-wasm-modules) (cons (cons (cons (car kinds) (make-integer phase)) name) (-> current storage-wasm-modules)))
              (set! out (cons form out))])
@@ -1668,39 +1874,177 @@
     i))
 
 (define (compile-time-value [getter datum]) -> datum
-  (let ([cached (cast datum (table-ref (-> current values) (cast u64 getter)))] [v datum 0])
+  (let ([cached (cast datum (hash-ref (-> current values) (cast u64 getter)))] [v datum 0])
     (if (!= cached 0)
         (car cached)
         (let ([f (cast (fn () -> datum) (function-index getter))])
           (set! v (f))
-          (table-set! (-> current values) (cast u64 getter) (cast u32 (cons v nil)))
+          (hash-set! (-> current values) (cast u64 getter) (cast u32 (cons v nil)))
           v))))
 
 (define (transformer-of [m datum]) -> datum
-  (if (and (!= m 0) (== (car m) (sym compile-time-value)))
-      (let ([v (compile-time-value (cadr m))]) (if (transformer? v) v 0))
+  (if (and (!= m 0) (== (car m) 'compile-time-value))
+      (let ([v (compile-time-value (cadr m))]) (if (or (transformer? v) (form-value? v)) v 0))
       0))
 
+;; A form the compiler implements has the value (#%form kind [env]).
+(define (form-value? [v datum]) -> i32
+  (and (syntax? v) (pair? (syntax-e v)) (identifier? (car (syntax-e v))) (== (syntax-e (car (syntax-e v))) '#%form)))
+
+(define (form-expansion [v datum] [s datum] [phase i32]) -> datum
+  (let ([l (syntax->list v)])
+    (substrate-expansion (syntax-e (cadr l)) (if (pair? (cddr l)) (caddr l) 0) s v (& (-> current checking)) phase)))
+
+;; ---- shapes ----
+
+;; 0 for a form that expands to others or is allowed only at module level. A form with a shape
+;; stays in its expansion.
+(define (shape-of [v datum] [s datum] [phase i32]) -> datum
+  (let ([saved api-phase] [out datum 0])
+    (set! api-phase phase)
+    (set! out (try (if (symbol? v)
+                       (core-shape v s)
+                       (substrate-shape (syntax-e (cadr (syntax->list v))) s v (& (-> current checking)) phase))
+                   [catch-all (set! api-phase saved) (rethrow)]))
+    (set! api-phase saved)
+    out))
+
+;; Scopes m in place: each region gets a scope, and each binder or label piece gets its key at the end.
+(define (scope-shape [m datum] [phase i32] [scopes datum]) -> datum
+  (let ([ps (pieces-of m)])
+    (while (pair? ps)
+      (let ([p (car ps)])
+        (cond [(== (piece-role p) 'group) (set! scopes (scope-shape p phase scopes))]
+              [(!= (piece-region p) 0)
+               (let ([known (assoc (cadr p) scopes)])
+                 (when (== known 0)
+                   (set! known (cons (cadr p) (make-integer (new-local-scope!))))
+                   (set! scopes (cons known scopes)))
+                 (let ([x (add-scope (piece-syntax p) (cast u32 (integer-value (cdr known))))])
+                   (set-car! (cddr p) x)
+                   (case (car p)
+                     [('binder) (set-cdr! (cddr p) (cons (bind-local! x phase) nil))]
+                     [('label) (set-cdr! (cddr p) (cons (fresh-label! x phase) nil))]
+                     [else (begin)])))]
+              [else (begin)]))
+      (set! ps (cdr ps)))
+    scopes))
+
+(define (expanded-piece [p datum] [phase i32]) -> datum
+  (case (piece-role p)
+    [('expr) (expand-expr (piece-syntax p) phase)]
+    [('binder) (with-local-binding (piece-syntax p) (cadddr p))]
+    [('callee)
+     (let* ([f (piece-syntax p)] [m (if (identifier? f) (meaning-of f phase) 0)])
+       (if (and (!= m 0) (== (car m) 'func)) f (expand-expr f phase)))]
+    [else (piece-syntax p)]))
+
+(define (expand-shape [m datum] [phase i32]) -> datum
+  (when (== (piece-role m) 'group) (scope-shape m phase nil))
+  (shape-syntax m (for/list ([p (shape-pieces m)]) (expanded-piece p phase))))
+
+;; A macro's use is not expanded to find its shape.
+(define (query-shape [s datum]) -> datum
+  (let* ([e (if (syntax? s) (syntax-e s) 0)] [head (if (pair? e) (car e) 0)]
+         [m (if (identifier? head) (meaning-of head api-phase) 0)] [t (transformer-of m)])
+    (cond [(and (!= t 0) (form-value? t)) (shape-of t s api-phase)]
+          [(and (!= m 0) (or (== (car m) 'core) (== (car m) 'prim))) (shape-of (cadr m) s api-phase)]
+          [else 0])))
+
+(define (query-scope-shape [m datum] [remember i32]) -> datum
+  (let ([known (if remember (cast datum (hash-ref (-> current scopes) (cast u64 (cadr m)))) 0)])
+    (if (!= known 0)
+        known
+        (begin
+          (scope-shape m api-phase nil)
+          (when remember (hash-set! (-> current scopes) (cast u64 (cadr m)) (cast u32 m)))
+          m))))
+
+;; ---- checked code ----
+
+(define (substrate-context [phase i32]) -> datum
+  (let* ([id (make-syntax '%substrate:#%module-begin (module-base-scopes) 0 nil)]
+         [t (transformer-of (meaning-of id phase))])
+    (cond [(and (!= t 0) (form-value? t)) t]
+          [(string=? (canonical-path (language-path)) (-> (the-module) path))
+           (make-syntax 'here (scopes-change (module-base-scopes) wasm-scope 0) 0 nil)]
+          [else (substrate-form-value)])))
+
+(define substrate-form-value-cache datum 0)
+(define (substrate-form-value) -> datum
+  (when (== substrate-form-value-cache 0)
+    (let* ([m (cast datum (hash-ref (& registry) (cast u64 (string->symbol (canonical-path (language-path))))))]
+           [p (if (and (!= m 0) (== (-> (unit-of m) state) 'done)) (assq '#%module-begin (-> (unit-of m) provides)) 0)]
+           [t (if (!= p 0) (transformer-of (cdr p)) 0)])
+      (when (and (!= t 0) (form-value? t)) (set! substrate-form-value-cache (keep t)))))
+  substrate-form-value-cache)
+
+(define (checked-code [kind datum] [s datum] [phase i32]) -> datum
+  (let ([saved-phase api-phase] [saved-where api-where] [saved-intro api-intro] [intro (new-scope!)] [result datum 0])
+    (set! api-phase phase)
+    (set! api-where s)
+    (set! api-intro intro)
+    (try (set! result (substrate-code kind (flip-scope s intro) (substrate-context phase) (& (-> current checking)) phase))
+         [catch compile-error (message blamed loc)
+          (set! api-phase saved-phase)
+          (set! api-where saved-where)
+          (set! api-intro saved-intro)
+          (throw compile-error message blamed
+                 (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0)))) (syntax-srcloc s) loc))]
+         [catch-all
+          (set! api-phase saved-phase)
+          (set! api-where saved-where)
+          (set! api-intro saved-intro)
+          (rethrow)])
+    (set! api-phase saved-phase)
+    (set! api-where saved-where)
+    (set! api-intro saved-intro)
+    result))
+
+(define (core-body [f datum] [name datum] [xs datum] [body datum] [info datum] [phase i32]) -> datum
+  (let* ([rs (func-info-results info)]
+         [result (cond [(null? rs) 'void] [(null? (cdr rs)) (car rs)] [else (cons 'values rs)])])
+    (expand-expr (core-syntax f `(#%checked body ,name (,@xs) #:wasm (quote (,result ,@(func-info-params info))) ,@body) f) phase)))
+
+(define (core-expression [s datum] [phase i32]) -> datum
+  (expand-expr (core-syntax s `(#%checked body ,s () #:wasm (quote (void)) ,s) s) phase))
+
+(define (core-value [x datum] [type datum] [init datum] [where datum] [phase i32]) -> datum
+  (expand-expr (core-syntax where `(#%checked value ,x (quote ,type) ,init) where) phase))
+
+;; (define-syntax id rhs), or (define-syntax id function env) for a macro whose function also takes
+;; env, the context of the code it makes.
 (define (define-syntax! [f datum] [phase i32])
   (let ([l (syntax->list f)])
-    (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l))) (no-match f "(define-syntax id rhs)"))
-    (let* ([id (cadr l)] [rhs (caddr l)]
+    (unless (and (!= l 0) (>= (length l) 3) (identifier? (cadr l)) (or (== (length l) 3) (and (== (length l) 4) (identifier? (caddr l)))))
+      (no-match f "(define-syntax id rhs) or (define-syntax id function env)"))
+    (unless (and (identifier? (caddr l)) (== (length l) 3)) (use-language! (+ phase 1)))
+    (let* ([id (cadr l)] [rhs (caddr l)] [env (if (== (length l) 4) (cadddr l) 0)] [arity u32 (if (!= env 0) 2 1)]
            [m (if (identifier? rhs) (meaning-of rhs (+ phase 1)) 0)]
            [name (string->symbol (format-message "__value.~a" (list1 (syntax-e id))))]
-           [function (if (and (!= m 0) (== (car m) (sym func))) (syntax-function-of rhs phase) 0)]
-           [init datum 0] [global datum 0] [getter datum 0] [forms datum 0] [saved to-syntax])
+           [function (if (or (!= env 0) (and (!= m 0) (== (car m) 'func))) (syntax-function-of rhs phase arity) 0)]
+           [env-code datum 0] [init datum 0] [global datum 0] [getter datum 0] [forms datum 0] [saved to-syntax])
       (if (!= function 0)
-          (set! init `(call ,(kernel-function (sym make-function-transformer)) ((func-index ,function))))
+          (begin
+            (when (!= env 0)
+              (set! to-syntax 0)
+              (set! env-code (try (core-value id 'i32 env env (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
+              (set! to-syntax saved))
+            (set! init (if (!= env 0)
+                           `(call ,(running-function 'make-transformer) ((func-index ,function) ,env-code))
+                           `(call ,(running-function 'make-function-transformer) ((func-index ,function))))))
           (begin
             (set! to-syntax 0)
-            (set! init (expand-expr rhs (+ phase 1)))
+            (set! init (try (core-value id 'i32 rhs rhs (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
             (set! to-syntax saved)))
-      (set! global (global-info name (sym i32) (boolean 1) 0 0))
-      (set! getter (func-info name nil `(i32) 0 0))
+      (set! global (global-info name 'i32 (boolean 1) 0 0))
+      (set! getter (func-info name nil '(i32) 0 0))
       (set! forms `((global ,global ,init) (func ,getter () (gref ,global))))
-      (cond [(and (!= function 0) (callable? function 1))
+      (cond [(and (!= function 0) (callable? function arity) (or (== env 0) (plain? env-code)))
              (add-phase-forms! (+ phase 1) forms)
-             (made-value! getter (make-function-transformer (cast u32 (function-index function))))]
+             (made-value! getter (if (!= env 0)
+                                     (make-transformer (cast u32 (function-index function)) (plain-value env-code env))
+                                     (make-function-transformer (cast u32 (function-index function)))))]
             [(and (== function 0) (plain? init))
              (add-phase-forms! (+ phase 1) forms)
              (made-value! getter (plain-value init rhs))]
@@ -1713,31 +2057,31 @@
 ;; ---- values the expander makes ----
 
 (define (made-value! [getter datum] [v datum])
-  (table-set! (-> current values) (cast u64 getter) (cast u32 (cons v nil))))
+  (hash-set! (-> current values) (cast u64 getter) (cast u32 (cons v nil))))
 
 (define (plain? [e datum]) -> i32
-  (cond [(== (car e) (sym at)) (plain? (caddr e))]
-        [(== (car e) (sym quote)) 1]
-        [(== (car e) (sym call))
+  (cond [(or (== (car e) 'at) (== (car e) 'as)) (plain? (caddr e))]
+        [(== (car e) 'quote) 1]
+        [(== (car e) 'call)
          (and (callable? (cadr e) (length (caddr e))) (andmap (lambda ([a datum]) -> i32 (plain? a)) (caddr e)))]
         [else 0]))
 
 (define (callable? [info datum] [n u32]) -> i32
   (let ([ps (func-info-params info)])
-    (unless (and (!= (func-info-instance info) 0) (<= n 6) (== (length ps) n) (equal? (func-info-results info) `(i32)))
+    (unless (and (!= (func-info-instance info) 0) (<= n 6) (== (length ps) n) (equal? (func-info-results info) '(i32)))
       (return 0))
     (while (pair? ps)
-      (unless (== (car ps) (sym i32)) (return 0))
+      (unless (== (car ps) 'i32) (return 0))
       (set! ps (cdr ps)))
     1))
 
 (define (plain-value [e datum] [where datum]) -> datum
-  (cond [(== (car e) (sym at)) (plain-value (caddr e) where)]
-        [(== (car e) (sym quote)) (cadr e)]
+  (cond [(or (== (car e) 'at) (== (car e) 'as)) (plain-value (caddr e) where)]
+        [(== (car e) 'quote) (cadr e)]
         [else
          (let ([args (map (lambda ([a datum]) -> datum (plain-value a where)) (caddr e))] [saved api-where] [v datum 0])
            (set! api-where where)
-           (set! v (call-function (function-index (cadr e)) args))
+           (set! v (try (call-function (function-index (cadr e)) args) [catch-all (set! api-where saved) (rethrow)]))
            (set! api-where saved)
            v)]))
 
@@ -1758,21 +2102,25 @@
       [(5) (let ([f (cast (fn (datum datum datum datum datum) -> datum) index)]) (f a b c d e))]
       [else (let ([f (cast (fn (datum datum datum datum datum datum) -> datum) index)]) (f a b c d e g))])))
 
-(define (syntax-function-of [id datum] [phase i32]) -> datum
+(define (syntax-function-of [id datum] [phase i32] [arity u32]) -> datum
   (let ([m (meaning-of id (+ phase 1))] [info datum 0])
-    (unless (and (!= m 0) (== (car m) (sym func)))
+    (unless (and (!= m 0) (== (car m) 'func))
       (fail-at id "~a is not a function at phase ~a" `(,(syntax-e id) ,(make-integer (+ phase 1)))))
     (set! info (cadr m))
-    (unless (and (equal? (func-info-params info) `(i32)) (equal? (func-info-results info) `(i32)))
-      (fail-at id "a transformer takes one i32 (syntax) and returns one i32" nil))
+    (unless (and (equal? (func-info-params info) (if (== arity 2) '(i32 i32) '(i32))) (equal? (func-info-results info) '(i32)))
+      (fail-at id (if (== arity 2)
+                      "a transformer with an environment takes two i32s (the environment and the syntax) and returns one i32"
+                      "a transformer takes one i32 (syntax) and returns one i32")
+               nil))
     (when (== (func-info-instance info) 0)
       (fail-at id "~a must be defined by an earlier begin-for-syntax" (list1 (syntax-e id))))
     info))
 
 (define (begin-for-syntax! [f datum] [phase i32])
   (let ([forms (cdr (form-list f "(begin-for-syntax form ...)"))] [saved to-syntax] [code datum 0])
+    (use-language! (+ phase 1))
     (set! to-syntax 0)
-    (set! code (expand-body forms (+ phase 1)))
+    (set! code (try (expand-body forms (+ phase 1)) [catch-all (set! to-syntax saved) (rethrow)]))
     (set! to-syntax saved)
     (run-compile-time-wasm-module! code (+ phase 1) f)))
 
@@ -1795,12 +2143,12 @@
            [key (fact-key id phase)]
            [kind (fact-quote written)]
            [d (cadr (syntax->list written))]
-           [value (if (== kind (sym quote)) (syntax->datum d) (prune-local-scopes d))]
+           [value (if (== kind 'quote) (syntax->datum d) (prune-local-scopes d))]
            [fact `(,key ,(make-integer phase) ,value)]
            [m (the-module)])
       (set! (-> m facts) (keep-cons fact (-> m facts)))
       (index-fact! (-> m self) fact)
-      (core-headed f (sym #%fact)))))
+      (core-headed f '#%fact))))
 
 (define facts-by-key hash-table)
 
@@ -1819,15 +2167,15 @@
 (define (fact-quote [written datum]) -> datum
   (let* ([l (syntax->list written)]
          [kind (if (and (!= l 0) (== (length l) 2) (identifier? (car l))) (syntax-e (car l)) 0)])
-    (unless (!= (memq kind `(quote quote-syntax)) 0)
+    (unless (!= (memq kind '(quote quote-syntax)) 0)
       (fail-at written "a fact is a datum or syntax: expected (#%fact id 'datum) or (#%fact id #'syntax)" nil))
     kind))
 
 (define (definition-of [m datum]) -> datum
-  (let ([info (if (and (!= m 0) (!= (memq (car m) `(func global tag compile-time-value)) 0)) (base-info (cadr m)) 0)])
-    (if (and (!= info 0) (not (kernel-definition? info))) info 0)))
+  (let ([info (if (and (!= m 0) (!= (memq (car m) '(func global tag compile-time-value)) 0)) (base-info (cadr m)) 0)])
+    (if (and (!= info 0) (not (running-definition? info))) info 0)))
 
-(define (kernel-definition? [info datum]) -> i32 (!= (hash-ref (& kernel-infos) (cast u64 info)) 0))
+(define (running-definition? [info datum]) -> i32 (!= (hash-ref (& running-infos) (cast u64 info)) 0))
 
 (define (fact-key [id datum] [phase i32]) -> datum
   (let* ([m (meaning-of id phase)] [base (definition-of m)])
@@ -1839,7 +2187,7 @@
   (let ([u (unit-of m)])
     (for-each (lambda ([f datum])
                 (case (car f)
-                  [((sym func) (sym global) (sym tag)) (set! (-> u infos) (keep-cons (cadr f) (-> u infos)))]))
+                  [('func 'global 'tag) (set! (-> u infos) (keep-cons (cadr f) (-> u infos)))]))
               forms)))
 
 ;; ==== sessions ====
@@ -1874,8 +2222,10 @@
     (let ([msc (new-scope!)])
       (set! (-> (the-module) scope) msc)
       (hash-set! (& module-scope-origins) (scope-key msc) (cast u32 (keep (cons (-> (the-module) self) (make-integer 0)))))
-      (set! session-set (scopes-change core-scopes msc 0)))
-    (set! to-syntax 0)))
+      (set! session-set (scopes-change visible-scopes msc 0)))
+    (set! to-syntax 0)
+    (set! (-> current language) nil)
+    (use-language! 0)))
 
 (define (session-binding-id [id datum] [phase i32] [meaning datum]) -> datum
   (if (and (in-session?) (!= session-scope 0) (!= (scopes-change (syntax-scopes id) session-scope 1) (syntax-scopes id)))
@@ -1922,7 +2272,7 @@
       (run-session-wasm-module! (expand-body (map (lambda ([f datum]) -> datum (add-scopes f scopes)) forms) 0))
       (set! ok 1)
       [catch compile-error (message blamed loc) (session-fail! message blamed loc)]
-      [catch-all (session-fail! `"an exception escaped the input's code" 0 0)])
+      [catch-all (session-fail! '"an exception escaped the input's code" 0 0)])
     (if ok
         (when session-scope-kept (set! session-set scopes))
         (let ([n (-> session wasm-module-counter)])
@@ -1957,7 +2307,7 @@
       (set! session-running 1)
       (instantiate! (ns-name name) (car compiled) (cadr compiled) (caddr compiled) 0 0 0)
       (set! session-running 0)
-      (table-set! (-> current instances) (cast u64 (string->symbol (ns-name name))) 1))))
+      (hash-set! (-> current instances) (cast u64 (string->symbol (ns-name name))) 1))))
 
 ;; The message is formatted first: formatting needs data in arenas session-recover! frees.
 (define (session-fail! [message datum] [blamed datum] [loc (ptr srcloc)])
@@ -1985,7 +2335,8 @@
   (set! api-intro 0)
   (set! session-running 0)
   (set! interacting 0)
-  (set-scope-map! 0 0))
+  (set-scope-map! 0 0)
+  (checker-recover!))
 
 (define (session-failure [said datum]) -> datum
   (let* ([p (string-bytes said)] [n (string-length said)] [from u32 0] [to n] [at (find-bytes p n "instantiate-bytes")])
@@ -2005,7 +2356,7 @@
 ;; #%top-interaction is looked up with f0's scopes, as #%app is with its call's: f's
 ;; fail when the expression starts with a macro.
 (define (interact! [f0 datum] [f datum] [b (ptr body)])
-  (let* ([id (implicit-id f0 (sym #%top-interaction))] [t (transformer-of (meaning-of id 0))])
+  (let* ([id (implicit-id f0 '#%top-interaction)] [t (transformer-of (meaning-of id 0))])
     (if (== t 0)
         (item! b `(expr ,f))
         (begin
@@ -2030,7 +2381,7 @@
 
 (define (defined-here? [head datum] [phase i32]) -> i32
   (let ([m (meaning-of head phase)])
-    (and (!= m 0) (== (car m) (sym compile-time-value))
+    (and (!= m 0) (== (car m) 'compile-time-value)
          (== (cast datum (hash-ref (& macro-modules) (cast u64 (cadr m)))) (-> current module)))))
 
 (define (at-use [use datum] [out datum]) -> datum
@@ -2045,13 +2396,18 @@
     (set! api-phase phase)
     (set! api-where s)
     (set! api-intro intro)
-    (try (set! result (call-transformer t s))
+    (try (set! result (if (form-value? t) (form-expansion t s phase) (call-transformer t s)))
          [catch compile-error (message blamed loc)
           (set! api-phase saved-phase)
           (set! api-where saved-where)
           (set! api-intro saved-intro)
           (throw compile-error message blamed
-                 (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0)))) (syntax-srcloc s) loc))])
+                 (if (and (== loc 0) (not (and (syntax? blamed) (!= (syntax-srcloc blamed) 0)))) (syntax-srcloc s) loc))]
+         [catch-all
+          (set! api-phase saved-phase)
+          (set! api-where saved-where)
+          (set! api-intro saved-intro)
+          (rethrow)])
     (set! api-phase saved-phase)
     (set! api-where saved-where)
     (set! api-intro saved-intro)
@@ -2067,7 +2423,7 @@
 
 (define (query-local-value [id datum]) -> datum
   (let ([m (if (identifier? id) (meaning-of id api-phase) 0)])
-    (if (and (!= m 0) (== (car m) (sym compile-time-value))) (compile-time-value (cadr m)) 0)))
+    (if (and (!= m 0) (== (car m) 'compile-time-value)) (compile-time-value (cadr m)) 0)))
 
 (define (query-free-identifier=? [x datum] [y datum]) -> datum
   (unless (and (identifier? x) (identifier? y)) (fail-at api-where "free-identifier=?: expected identifiers" nil))
@@ -2078,31 +2434,95 @@
   (unless (identifier? id) (fail-at api-where "identifier-binding-kind: expected an identifier" nil))
   (let ([m (meaning-of id api-phase)])
     (case (if (== m 0) 0 (car m))
-      [((sym func)) (sym function)]
-      [((sym local) (sym global)) (sym variable)]
-      [((sym compile-time-value)) (if (!= (transformer-of m) 0) (sym macro) (sym compile-time-value))]
-      [((sym tag)) (sym tag)]
-      [((sym label)) (sym label)]
-      [((sym core) (sym prim)) (sym core)]
+      [('func) 'function]
+      [('local 'global) 'variable]
+      [('compile-time-value) (if (!= (transformer-of m) 0) 'macro 'compile-time-value)]
+      [('tag) 'tag]
+      [('label) 'label]
+      [('core 'prim) 'core]
       [else 0])))
 
 (define (query-function-signature [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "identifier-function-signature: expected an identifier" nil))
   (let ([m (meaning-of id api-phase)])
-    (if (and (!= m 0) (== (car m) (sym func)))
-        (append (func-info-params (cadr m)) (cons (sym ->) (func-info-results (cadr m))))
+    (if (and (!= m 0) (== (car m) 'func))
+        (append (func-info-params (cadr m)) (cons '-> (func-info-results (cadr m))))
         0)))
 
-;; A compile error leaving the expansion leaves the expander as it was: the macro may
-;; handle it and go on.
+(define (query-meaning [id datum]) -> datum
+  (unless (identifier? id) (fail-at api-where "internal: not an identifier" nil))
+  (meaning-of id api-phase))
+
+(define (query-inline-call [info datum] [args datum]) -> datum (inline-call info args api-phase))
+
+(define (query-expand-head [s datum] [remember i32]) -> datum (expand-head s api-phase remember))
+
+(define (expand-head [s datum] [phase i32] [remember i32]) -> datum
+  (let ([e (syntax-e s)])
+    (cond
+      [(symbol? e)
+       (let ([m (meaning-of s phase)])
+         (case (if (== m 0) 0 (car m))
+           [('local) `(local ,(cadr m))]
+           [('global) `(global ,(cadr m))]
+           [('compile-time-value)
+            (let ([t (transformer-of m)])
+              (when (== t 0) (fail-at s "~a is bound to a compile-time value: read it with syntax-local-value" (list1 e)))
+              (head-transformer s t s phase remember))]
+           [('func) `(func ,(cadr m))]
+           [('tag) (fail-at s "~a is a tag: throw it with (throw ~a arg ...)" `(,e ,e))]
+           [('core 'prim) (fail-at s "bad use of ~a" (list1 e))]
+           [('label) (fail-at s "~a is a label" (list1 e))]
+           [else (unbound s e phase)]))]
+      [(pair? e)
+       (let* ([head (car e)] [m (if (identifier? head) (meaning-of head phase) 0)] [t (transformer-of m)])
+         (cond [(!= t 0) (head-transformer head t s phase remember)]
+               [(and (!= m 0) (== (car m) 'core)) `(core ,(cadr m) ,s)]
+               [(and (!= m 0) (== (car m) 'prim)) `(prim ,(cadr m) ,s)]
+               [else
+                (when (and (identifier? head) (== (syntax-e head) '#%app))
+                  (if (!= m 0)
+                      (fail-at s "#%app is bound here, but not to a macro or the core form" nil)
+                      (unbound head '#%app phase)))
+                (expand-head (syntax-rewrap s (cons (implicit-id s '#%app) e)) phase remember)]))]
+      [(null? e) (fail-at s "empty form ()" nil)]
+      [(literal? e)
+       (let* ([id (implicit-id s '#%datum)] [m (meaning-of id phase)] [t (transformer-of m)] [form (syntax-rewrap s `(,id ,s))])
+         (cond [(!= t 0) (head-transformer id t form phase remember)]
+               [(and (!= m 0) (== (car m) 'core)) `(core #%datum ,form)]
+               [else (fail-at s "the literal ~s needs #%datum, which is ~a here"
+                              `(,(syntax->datum s) ,(if (!= m 0) '"not a macro or the core form" '"unbound")))]))]
+      [(keyword? e) (fail-at s "~s: keyword misused as an expression" (list1 e))]
+      [else (fail-at s "~s is not an expression" (list1 (syntax->datum s)))])))
+
+(define (head-transformer [head datum] [t datum] [s datum] [phase i32] [remember i32]) -> datum
+  (if (form-value? t)
+      (let ([l (syntax->list t)]) `(form ,(syntax-e (cadr l)) ,(if (pair? (cddr l)) (caddr l) 0) ,s ,t))
+      `(macro ,(if remember (remembered-expansion head t s phase) (apply-macro head t s phase 0)))))
+
+(define (query-apply-form [t datum] [s datum] [remember i32]) -> datum
+  (if remember
+      (remembered-expansion (if (pair? (syntax-e s)) (car (syntax-e s)) s) t s api-phase)
+      (apply-form t s api-phase)))
+
+(define (apply-form [t datum] [s datum] [phase i32]) -> datum
+  (apply-macro (if (pair? (syntax-e s)) (car (syntax-e s)) s) t s phase 0))
+
+(define (remembered-expansion [head datum] [t datum] [s datum] [phase i32]) -> datum
+  (let ([known (cast datum (hash-ref (-> current expansions) (cast u64 s)))])
+    (if (!= known 0)
+        known
+        (let ([x (apply-macro head t s phase 0)])
+          (hash-set! (-> current expansions) (cast u64 s) (cast u32 x))
+          x))))
+
+;; Anything leaving the expansion leaves the expander as it was: the macro may handle it and go on.
 (define (query-local-expand [s datum]) -> datum
   (unless (syntax? s) (fail-at api-where "local-expand: expected syntax" nil))
   (let ([saved-output to-syntax] [out datum 0])
     (set! to-syntax 1)
-    (try (set! out (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro))
-         [catch compile-error (message blamed loc)
-          (set! to-syntax saved-output)
-          (throw compile-error message blamed loc)])
+    (set! out (try (flip-scope (expand-expr (flip-scope s api-intro) api-phase) api-intro)
+                   [catch-all (set! to-syntax saved-output) (rethrow)]))
     (set! to-syntax saved-output)
     out))
 
@@ -2115,12 +2535,31 @@
   (unless (syntax? s) (fail-at api-where "syntax-local-introduce: expected syntax" nil))
   (flip-scope s api-intro))
 
-(define (dependencies) -> datum
-  (reverse (visit-dependencies (-> current module) 0 (make-table) nil)))
+;; Kept until the module's requires change, in the run's arena, since a macro may ask while its own
+;; arena is current.
+(define dependencies-of datum 0)
+(define dependencies-requires datum 0)
+(define dependencies-list datum 0)
+(define dependency-places (ptr hash-table) 0)
 
-(define (visit-dependencies [m datum] [shift u32] [seen (ptr arena-table)] [out datum]) -> datum
-  (when (!= (table-ref seen (shift-key m shift)) 0) (return out))
-  (table-set! seen (shift-key m shift) 1)
+(define (dependencies) -> datum
+  (let ([m (-> current module)])
+    (unless (and (== m dependencies-of) (== (-> (unit-of m) requires) dependencies-requires))
+      (set! dependencies-of m)
+      (set! dependencies-requires (-> (unit-of m) requires))
+      (set! dependencies-list (keep (reverse (visit-dependencies m 0 (make-table) nil))))
+      (let ([saved (use-arena (& run-arena))] [l dependencies-list] [i u32 1])
+        (set! dependency-places (make-table))
+        (while (pair? l)
+          (hash-set! dependency-places (shift-key (car (car l)) (cast u32 (integer-value (cdr (car l))))) i)
+          (+= i 1)
+          (set! l (cdr l)))
+        (use-arena saved)))
+    dependencies-list))
+
+(define (visit-dependencies [m datum] [shift u32] [seen (ptr hash-table)] [out datum]) -> datum
+  (when (!= (hash-ref seen (shift-key m shift)) 0) (return out))
+  (hash-set! seen (shift-key m shift) 1)
   (let ([rs (-> (unit-of m) requires)])
     (while (pair? rs)
       (set! out (visit-dependencies (car (car rs)) (+ shift (cast u32 (integer-value (cdr (car rs))))) seen out))
@@ -2129,17 +2568,28 @@
 
 (define (query-local-facts [id datum]) -> datum
   (unless (identifier? id) (fail-at api-where "syntax-local-facts: expected an identifier" nil))
-  (let* ([facts (reverse (cast datum (hash-ref (& facts-by-key) (cast u64 (fact-key id api-phase)))))]
-         [deps (if (null? facts) nil (dependencies))] [out nil])
-    (while (pair? deps)
-      (let ([m (car (car deps))] [shift (cast u32 (integer-value (cdr (car deps))))] [fs facts])
-        (while (pair? fs)
-          (let ([f (car fs)])
-            (when (and (== (car f) m) (== (+ (cast i32 (integer-value (cadr f))) (cast i32 shift)) api-phase))
-              (set! out (cons `(,(string->symbol (-> (unit-of m) path)) ,(cadr f) ,(shift-fact (caddr f) shift)) out))))
-          (set! fs (cdr fs))))
-      (set! deps (cdr deps)))
-    (reverse out)))
+  (facts-at (fact-key id api-phase)))
+
+(define (query-facts-of [m datum]) -> datum
+  (let ([base (definition-of m)]) (if (== base 0) nil (facts-at base))))
+
+(define (facts-at [base datum]) -> datum
+  (let ([facts (reverse (cast datum (hash-ref (& facts-by-key) (cast u64 base))))] [found nil])
+    (when (pair? facts) (dependencies))
+    (while (pair? facts)
+      (let* ([f (car facts)] [shift (- api-phase (cast i32 (integer-value (cadr f))))]
+             [place (if (>= shift 0) (hash-ref dependency-places (shift-key (car f) (cast u32 shift))) 0)])
+        (when (!= place 0)
+          (set! found (by-place (cons (make-integer place)
+                                      `(,(string->symbol (-> (unit-of (car f)) path)) ,(cadr f) ,(shift-fact (caddr f) (cast u32 shift))))
+                                found))))
+      (set! facts (cdr facts)))
+    (map (lambda ([p datum]) -> datum (cdr p)) found)))
+
+(define (by-place [x datum] [l datum]) -> datum
+  (if (and (pair? l) (<= (integer-value (car (car l))) (integer-value (car x))))
+      (cons (car l) (by-place x (cdr l)))
+      (cons x l)))
 
 (define fact-shift u32 0)
 (define (shift-by-fact-shift [s (ptr scope-set)]) -> (ptr scope-set) (shift-scopes s fact-shift))
@@ -2163,7 +2613,7 @@
         [(tag-info? info) (tag-info-instance info)]
         [else 0]))
 
-(struct names [upto (ptr module-entry)] [by-base (ptr arena-table)] [by-name (ptr arena-table)] [counts (ptr arena-table)])
+(struct names [upto (ptr module-entry)] [by-base (ptr hash-table)] [by-name (ptr hash-table)] [counts (ptr hash-table)])
 (define name-tables hash-table)
 
 (define (module-names [m datum]) -> (ptr names)
@@ -2177,7 +2627,7 @@
           (set! e (-> e next)))
         (when (!= e (-> n upto)) (set! n 0)))
       (when (== n 0)
-        (set! n (cast (ptr names) (alloc-in (& run-arena) (sizeof names))))
+        (set! n (cast (ptr names) (arena-alloc (& run-arena) (sizeof names))))
         (set! (-> n by-base) (make-table))
         (set! (-> n by-name) (make-table))
         (set! (-> n counts) (make-table))
@@ -2195,16 +2645,16 @@
 (define (name-entries! [m datum] [n (ptr names)] [entries datum])
   (while (pair? entries)
     (let* ([e (cast (ptr module-entry) (car entries))] [base (definition-of (-> e binding meaning))])
-      (when (and (!= base 0) (== (table-ref (-> n by-base) (cast u64 base)) 0) (== (definition-module base) m))
+      (when (and (!= base 0) (== (hash-ref (-> n by-base) (cast u64 base)) 0) (== (definition-module base) m))
         (let* ([key (cons (-> e symbol) (make-integer (-> e phase)))] [c (datum-get (-> n counts) key)]
                [k (if (== c 0) 0 (integer-value c))]
                [name (string->symbol (format-message "~a:~a~a~a"
                                                      `(,(-> (unit-of m) path) ,(-> e symbol)
-                                                       ,(if (== (-> e phase) 0) `"" (format-message "@~a" (list1 (make-integer (-> e phase)))))
-                                                       ,(if (== k 0) `"" (format-message "#~a" (list1 (make-integer k)))))))])
+                                                       ,(if (== (-> e phase) 0) '"" (format-message "@~a" (list1 (make-integer (-> e phase)))))
+                                                       ,(if (== k 0) '"" (format-message "#~a" (list1 (make-integer k)))))))])
           (datum-put! (-> n counts) key (make-integer (+ k 1)))
-          (table-set! (-> n by-base) (cast u64 base) (cast u32 name))
-          (table-set! (-> n by-name) (cast u64 name) (cast u32 e)))))
+          (hash-set! (-> n by-base) (cast u64 base) (cast u32 name))
+          (hash-set! (-> n by-name) (cast u64 name) (cast u32 e)))))
     (set! entries (cdr entries))))
 
 (define (query-identifier-name [id datum]) -> datum
@@ -2212,18 +2662,23 @@
   (let ([base (definition-of (meaning-of id api-phase))])
     (if (== base 0)
         0
-        (cast datum (table-ref (-> (module-names (definition-module base)) by-base) (cast u64 base))))))
+        (cast datum (hash-ref (-> (module-names (definition-module base)) by-base) (cast u64 base))))))
 
 (define (query-name-identifier [name datum]) -> datum
   (unless (symbol? name) (fail-at api-where "name-identifier: expected a name, a symbol" nil))
   (let ([deps (dependencies)])
     (while (pair? deps)
       (let* ([m (car (car deps))] [shift (cast u32 (integer-value (cdr (car deps))))]
-             [e (cast (ptr module-entry) (table-ref (-> (module-names m) by-name) (cast u64 name)))])
+             [e (cast (ptr module-entry) (hash-ref (-> (module-names m) by-name) (cast u64 name)))])
         (when (and (!= e 0) (== (+ (-> e phase) (cast i32 shift)) api-phase))
           (return (make-syntax (-> e symbol) (shift-scopes (-> e scopes) shift) 0 nil))))
       (set! deps (cdr deps)))
     (fail-at api-where "name-identifier: ~a names no definition of this module, or of one it requires, at this phase" (list1 name))))
+
+;; Quoted data's type, named by path like the syntax module's functions, since the code being
+;; checked may be something the syntax module itself needs.
+(define (query-datum-type) -> datum
+  `(ptr (struct ,(string->symbol (format-message "~a:cell" (list1 (canonical-path (compiler-file '"syntax.sub"))))) cell)))
 
 ;; ==== fully expanded code ====
 ;; Core forms are named by identifiers with only the core scope, so they mean the core
@@ -2241,21 +2696,21 @@
   (out-list f (cons (core-id name (car (syntax-e f))) (cdr (syntax-e f)))))
 
 ;; Its private scope is on no module's code, so only fully expanded code can refer to it.
-(define kernel-id-scopes (ptr scope-set) 0)
-(define kernel-ids hash-table)
+(define running-id-scopes (ptr scope-set) 0)
+(define running-ids hash-table)
 
-(define (kernel-id-scope) -> u32
-  (when (== kernel-id-scopes 0) (set! kernel-id-scopes (scopes-change no-scopes (new-run-scope!) 0)))
-  (@ (-> kernel-id-scopes ids) 0))
+(define (running-id-scope) -> u32
+  (when (== running-id-scopes 0) (set! running-id-scopes (scopes-change no-scopes (new-run-scope!) 0)))
+  (@ (-> running-id-scopes ids) 0))
 
-(define (kernel-id [name datum]) -> datum
-  (kernel-id-scope)
-  (let ([known (cast datum (hash-ref (& kernel-ids) (cast u64 name)))])
+(define (running-id [name datum]) -> datum
+  (running-id-scope)
+  (let ([known (cast datum (hash-ref (& running-ids) (cast u64 name)))])
     (if (!= known 0)
         known
-        (let ([id (keep (make-syntax name kernel-id-scopes 0 nil))])
-          (bind-raw! name kernel-id-scopes all-phases `(func ,(kernel-function name)))
-          (hash-set! (& kernel-ids) (cast u64 name) (cast u32 id))
+        (let ([id (keep (make-syntax name running-id-scopes 0 nil))])
+          (bind-raw! name running-id-scopes all-phases `(func ,(running-function name)))
+          (hash-set! (& running-ids) (cast u64 name) (cast u32 id))
           id))))
 
 ;; ==== expressions ====
@@ -2264,339 +2719,51 @@
 
 (define (at [s datum] [e datum]) -> datum `(at ,s ,e))
 
-(define (seq-at [s datum] [es datum]) -> datum (at s (cons (sym seq) es)))
+(define (seq-at [s datum] [es datum]) -> datum (at s (cons 'seq es)))
 
 (define (unbound [s datum] [sym datum] [phase i32]) -> datum
-  (fail-at s "unbound identifier ~a~a" `(,sym ,(if (> phase 0) (format-message " at phase ~a" (list1 (make-integer phase))) `""))))
+  (when (or (!= (memq sym wasm-forms) 0) (!= (memq sym '(func global)) 0) (!= (memq sym (prim-names)) 0))
+    (fail-at s "~a is a wasm form: require the compiler's wasm.sub, as wasm, and write wasm:~a" `(,sym ,sym)))
+  (fail-at s "unbound identifier ~a~a" `(,sym ,(if (> phase 0) (format-message " at phase ~a" (list1 (make-integer phase))) '""))))
 
 (define (expand-expr [s datum] [phase i32]) -> datum
-  (let ([e (syntax-e s)])
-    (cond
-      [(symbol? e)
-       (let ([m (meaning-of s phase)])
-         (case (if (== m 0) 0 (car m))
-           [((sym local)) (if to-syntax (with-local-binding s (cadr m)) (at s `(lref ,(cadr m))))]
-           [((sym global)) (if to-syntax (with-local-binding s 0) (at s `(gref ,(cadr m))))]
-           [((sym compile-time-value))
-            (let ([t (transformer-of m)])
-              (when (== t 0) (fail-at s "~a is bound to a compile-time value: read it with syntax-local-value" (list1 e)))
-              (expand-expr (apply-macro s t s phase 0) phase))]
-           [((sym func))
-            (unless (has-value? (cadr m)) (fail-at s "~a is a function: call it, or use (func-index ~a)" `(,e ,e)))
-            (if to-syntax (with-local-binding s 0) (at s `(gref ,(function-value (cadr m)))))]
-           [((sym tag)) (fail-at s "~a is a tag: throw it with (throw ~a arg ...)" `(,e ,e))]
-           [((sym core) (sym prim)) (fail-at s "bad use of ~a" (list1 e))]
-           [((sym label)) (fail-at s "~a is a label" (list1 e))]
-           [else (unbound s e phase)]))]
-      [(pair? e)
-       (let* ([head (car e)] [m (if (identifier? head) (meaning-of head phase) 0)] [t (transformer-of m)])
-         (if (!= t 0)
-             (expand-expr (apply-macro head t s phase 0) phase)
-             (case (if (== m 0) 0 (car m))
-               [((sym core)) (expand-core (cadr m) s phase)]
-               [((sym prim)) (expand-prim (cadr m) s phase)]
-               [else
-                (when (and (identifier? head) (== (syntax-e head) (sym #%app)))
-                  (if (!= m 0)
-                      (fail-at s "#%app is bound here, but not to a macro or the core form" nil)
-                      (unbound head (sym #%app) phase)))
-                (expand-expr (syntax-rewrap s (cons (implicit-id s (sym #%app)) e)) phase)])))]
-      [(null? e) (fail-at s "empty form ()" nil)]
-      [(literal? e)
-       (let* ([id (implicit-id s (sym #%datum))] [m (meaning-of id phase)] [t (transformer-of m)])
-         (cond [(!= t 0) (expand-expr (apply-macro id t (syntax-rewrap s `(,id ,s)) phase 0) phase)]
-               [(and (!= m 0) (== (car m) (sym core))) (datum-out s s)]
-               [else (fail-at s "the literal ~s needs #%datum, which is ~a here"
-                              `(,(syntax->datum s) ,(if (!= m 0) `"not a macro or the core form" `"unbound")))]))]
-      [(keyword? e) (fail-at s "~s: keyword misused as an expression" (list1 e))]
-      [else (fail-at s "~s is not an expression" (list1 (syntax->datum s)))])))
+  (let ([h (expand-head s phase 0)])
+    (case (car h)
+      [('local) (with-local-binding s (cadr h))]
+      [('global 'func) (with-local-binding s 0)]
+      [('macro) (expand-expr (cadr h) phase)]
+      [('form)
+       (let ([m (shape-of (list-ref h 4) (cadddr h) phase)])
+         (if (!= m 0) (expand-shape m phase) (expand-expr (apply-form (list-ref h 4) (cadddr h) phase) phase)))]
+      [else (expand-core (cadr h) (caddr h) phase)])))
 
 (define (literal? [e datum]) -> i32 (or (integer? e) (flonum? e) (char? e) (boolean? e) (string? e)))
 
 (define (implicit-id [s datum] [name datum]) -> datum (datum->syntax s name s))
 
-(define (core-datum [s datum]) -> datum
-  (let ([e (syntax-e s)])
-    (cond [(integer? e) `(int ,e)]
-          [(flonum? e) `(float ,e)]
-          [(char? e) `(int ,(make-integer (char->integer e)))]
-          [(== e (boolean 1)) `(const i32 1)]
-          [(== e 0) `(const i32 0)]
-          [(string? e)
-           (fail-at s "a string is not a wasm value: use (data name offset \"...\") for bytes, or '\"...\" for a kernel string" nil)]
-          [else (fail-at s "~s is not a literal" (list1 (syntax->datum s)))])))
-
-(define (datum-out [where datum] [literal datum]) -> datum
-  (let ([d (core-datum literal)])
-    (if to-syntax (out where (sym #%datum) (list1 literal)) (at where d))))
-
-(define (core-app [s datum] [f datum] [args datum] [phase i32]) -> datum
-  (let* ([m (if (identifier? f) (meaning-of f phase) 0)]
-         [info (if (and (!= m 0) (== (car m) (sym func))) (cadr m) 0)]
-         [h (if (!= info 0) f (expand-expr f phase))]
-         [a (map (lambda ([e datum]) -> datum (expand-expr e phase)) args)])
-    (cond [to-syntax (out s (sym #%app) (cons h a))]
-          [(!= info 0) (at s (let ([inlined (inline-call info a phase)]) (if (!= inlined 0) inlined `(call ,info ,a))))]
-          [else (fail-at s "~s is not a function: a function value is called with call-indirect" (list1 (syntax->datum f)))])))
-
-(define (prim-args [name datum] [s datum]) -> datum
-  (let* ([p (lookup-prim name)]
-         [args (let ([l (syntax->list (cdr (syntax-e s)))]) (if (== l 0) (fail-at s "bad syntax" nil) l))]
-         [n (length (-> p params))])
-    (cond [(== (length args) n) (cons args 0)]
-          [(and (== (-> p kind) (sym mem)) (== (length args) (+ n 1))
-                (let ([off (syntax-e (list-ref args n))]) (and (integer? off) (>= (integer-value off) 0) (< (integer-value off) 1073741824))))
-           (cons (take args n) (list-ref args n))]
-          [else (fail-at s "~a takes ~a argument~a~a, got ~a"
-                         `(,name ,(make-integer n) ,(if (== n 1) `"" `"s")
-                           ,(if (== (-> p kind) (sym mem)) `" and an optional offset" `"")
-                           ,(make-integer (length args))))])))
-
-(define (expand-prim [name datum] [s datum] [phase i32]) -> datum
-  (let* ([ao (prim-args name s)] [args (map (lambda ([a datum]) -> datum (expand-expr a phase)) (car ao))])
-    (if to-syntax
-        (out s name (append args (if (!= (cdr ao) 0) (list1 (cdr ao)) nil)))
-        (at s `(prim ,name ,(if (!= (cdr ao) 0) (syntax-e (cdr ao)) 0) ,args)))))
-
-(define (format-string [template (ptr u8)] [x datum]) -> (ptr u8)
-  (let* ([s (format-message template (list1 x))] [b (make-buffer)])
-    (buffer-add! (& b) (string-bytes s) (string-length s))
-    (buffer-add-byte! (& b) 0)
-    (-> b bytes)))
-
 (define (expand-core [name datum] [s datum] [phase i32]) -> datum
-  (let* ([l (syntax->list s)] [n (if (== l 0) -1 (cast i32 (length l)))]
-         [ex (lambda ([x datum]) -> datum (expand-expr x phase))])
-    (case name
-      [((sym #%app))
-       (when (< n 2) (no-match s "(#%app f arg ...)"))
-       (core-app s (cadr l) (cddr l) phase)]
-      [((sym #%datum))
-       (unless (== n 2) (no-match s "(#%datum literal)"))
-       (datum-out s (cadr l))]
-      [((sym quote))
-       (unless (== n 2) (no-match s "(quote datum)"))
-       (if to-syntax (out s name (list1 (cadr l))) (at s `(quote ,(syntax->datum (cadr l)))))]
-      [((sym quote-syntax))
-       (unless (== n 2) (no-match s "(quote-syntax datum)"))
-       (let ([d (prune-local-scopes (cadr l))]) (if to-syntax (out s name (list1 d)) (at s `(quote ,d))))]
-      [((sym quasiquote))
-       (unless (== n 2) (no-match s "(quasiquote template)"))
-       (ex (quasi s (cadr l) 0 phase (sym quasiquote) (sym unquote) (sym unquote-splicing) 0))]
-      [((sym quasisyntax))
-       (unless (== n 2) (no-match s "(quasisyntax template)"))
-       (ex (quasi s (cadr l) 0 phase (sym quasisyntax) (sym unsyntax) (sym unsyntax-splicing) 1))]
-      [((sym unquote) (sym unquote-splicing) (sym unsyntax) (sym unsyntax-splicing))
-       (fail-at s "~a is not inside a quasi form" (list1 name))]
-      ;; wasm's constants: a literal of that type, whatever #%datum means here.
-      [((sym i32.const) (sym i64.const) (sym f32.const) (sym f64.const))
-       (unless (== n 2) (no-match s (format-string "(~a literal)" name)))
-       (let ([v (const-literal name (cadr l))])
-         (if to-syntax
-             (out s name (list1 (cadr l)))
-             (at s `(as (,(const-type name)) ,(if (integer? v) `(int ,v) `(float ,v))))))]
-      [((sym set!))
-       (unless (and (== n 3) (identifier? (cadr l))) (no-match s "(set! x value)"))
-       (let* ([x (cadr l)] [m (meaning-of x phase)])
-         (unless (and (!= m 0) (!= (memq (car m) `(local global)) 0))
-           (fail-at x "set!: ~a is not a variable" (list1 (syntax-e x))))
-         (let ([v (ex (caddr l))])
-           (cond [to-syntax (out s name `(,(with-local-binding x (if (== (car m) (sym local)) (cadr m) 0)) ,v))]
-                 [(== (car m) (sym local)) (at s `(lset ,(cadr m) ,v))]
-                 [else (at s `(gset ,(cadr m) ,v))])))]
-      [((sym let) (sym let*))
-       (unless (and (>= n 2) (syntax? (cadr l)) (!= (syntax->list (cadr l)) 0)) (no-match s (format-string "(~a (binding ...) body ...)" name)))
-       (let ([bs (map (lambda ([b datum]) -> datum (let-binding b)) (syntax->list (cadr l)))] [body (cddr l)])
-         (if (== name (sym let))
-             (let* ([inits (map (lambda ([bp datum]) -> datum (expand-expr (let-init bp) phase)) bs)]
-                    [sc (new-local-scope!)]
-                    [xs (map (lambda ([bp datum]) -> datum (scoped (car bp) sc)) bs)]
-                    [keys (map (lambda ([x datum]) -> datum (bind-locals! x phase)) xs)])
-               (let-out s (cadr l) bs xs keys inits (map (lambda ([x datum]) -> datum (expand-expr (add-scope x sc) phase)) body)))
-             (expand-let* s bs body phase)))]
-      [((sym begin))
-       (when (< n 1) (no-match s "(begin e ...)"))
-       (let ([es (map ex (cdr l))]) (if to-syntax (out s name es) (at s (cons (sym seq) es))))]
-      [((sym if))
-       (cond [(== n 3)
-              (let* ([c (ex (cadr l))] [t (ex (caddr l))]) (if to-syntax (out s name `(,c ,t)) (at s `(if ,c ,t #f))))]
-             [(== n 4)
-              (let* ([c (ex (cadr l))] [t (ex (caddr l))] [e (ex (cadddr l))])
-                (if to-syntax (out s name `(,c ,t ,e)) (at s `(if ,c ,t ,e))))]
-             [else (no-match s "(if test then) or (if test then otherwise)")])]
-      [((sym block) (sym loop))
-       (unless (and (>= n 2) (identifier? (cadr l))) (no-match s (format-string "(~a label body ...)" name)))
-       (let* ([sc (new-local-scope!)] [label (add-scope (cadr l) sc)] [key (fresh-label! label phase)]
-              [b (map (lambda ([x datum]) -> datum (expand-expr (add-scope x sc) phase)) (cddr l))])
-         (if to-syntax (out s name (cons label b)) (at s `(,name ,key ,(seq-at s b)))))]
-      [((sym br))
-       (cond [(== n 2)
-              (let ([key (label-key-of (cadr l) phase)]) (if to-syntax (out s name (list1 (cadr l))) (at s `(br ,key #f))))]
-             [(== n 3)
-              (let* ([key (label-key-of (cadr l) phase)] [v (ex (caddr l))])
-                (if to-syntax (out s name `(,(cadr l) ,v)) (at s `(br ,key ,v))))]
-             [else (no-match s "(br label) or (br label value)")])]
-      [((sym br-if))
-       (unless (== n 3) (no-match s "(br-if label test)"))
-       (let* ([key (label-key-of (cadr l) phase)] [c (ex (caddr l))])
-         (if to-syntax (out s name `(,(cadr l) ,c)) (at s `(br-if ,key ,c))))]
-      [((sym br-table))
-       (unless (and (== n 4) (names? (cadr l)) (identifier? (caddr l))) (no-match s "(br-table (label ...) default index)"))
-       (let* ([keys (map (lambda ([x datum]) -> datum (label-key-of x phase)) (syntax->list (cadr l)))]
-              [d (label-key-of (caddr l) phase)] [i (ex (cadddr l))])
-         (if to-syntax (out s name `(,(cadr l) ,(caddr l) ,i)) (at s `(br-table ,keys ,d ,i))))]
-      [((sym return))
-       (cond [(== n 1) (if to-syntax (out s name nil) (at s `(return #f)))]
-             [(== n 2) (let ([v (ex (cadr l))]) (if to-syntax (out s name (list1 v)) (at s `(return ,v))))]
-             [else (no-match s "(return) or (return value)")])]
-      [((sym call-indirect))
-       (unless (>= n 3) (no-match s "(call-indirect signature index arg ...)"))
-       (let* ([sig (cadr l)] [pr (parse-signature sig)] [i (ex (caddr l))] [a (map ex (cdddr l))])
-         (if to-syntax (out s name (cons sig (cons i a))) (at s `(call-indirect ,(car pr) ,(cdr pr) ,i ,a))))]
-      [((sym func-index))
-       (unless (and (== n 2) (identifier? (cadr l))) (no-match s "(func-index f)"))
-       (let* ([f (cadr l)] [m (meaning-of f phase)])
-         (unless (and (!= m 0) (== (car m) (sym func))) (fail-at f "func-index: ~a is not a function" (list1 (syntax-e f))))
-         (if to-syntax (out s name (list1 f)) (at s `(func-index ,(cadr m)))))]
-      [((sym select))
-       (unless (== n 4) (no-match s "(select a b test)"))
-       (let* ([x (ex (cadr l))] [y (ex (caddr l))] [c (ex (cadddr l))])
-         (if to-syntax (out s name `(,x ,y ,c)) (at s `(select ,x ,y ,c))))]
-      [((sym values))
-       (let ([vs (map (lambda ([x datum]) -> datum (expand-expr x phase)) (cdr l))])
-         (if to-syntax (out s name vs) (at s `(values ,@vs))))]
-      [((sym drop))
-       (unless (== n 2) (no-match s "(drop value)"))
-       (let ([v (ex (cadr l))]) (if to-syntax (out s name (list1 v)) (at s `(drop ,v))))]
-      [((sym unreachable) (sym nop))
-       (unless (== n 1) (no-match s (format-string "(~a)" name)))
-       (if to-syntax (out s name nil) (at s (list1 name)))]
-      [((sym throw))
-       (unless (>= n 2) (no-match s "(throw tag arg ...)"))
-       (let* ([info (tag-info-of (cadr l) phase)] [a (map ex (cddr l))])
-         (if to-syntax (out s name (cons (cadr l) a)) (at s `(throw ,info ,a))))]
-      [((sym throw-ref))
-       (unless (== n 2) (no-match s "(throw-ref exn)"))
-       (let ([v (ex (cadr l))]) (if to-syntax (out s name (list1 v)) (at s `(throw-ref ,v))))]
-      [((sym try))
-       (unless (and (>= n 2) (syntax? (cadr l)) (!= (syntax->list (cadr l)) 0)) (no-match s "(try (clause ...) body ...)"))
-       (let* ([cs (map (lambda ([c datum]) -> datum (expand-catch c phase)) (syntax->list (cadr l)))] [b (map ex (cddr l))])
-         (if to-syntax (out s name (cons (out-list (cadr l) cs) b)) (at s `(try ,cs ,(seq-at s b)))))]
-      [else (fail-at s "~a is only allowed at module level" (list1 name))])))
-
-(define (const-literal [name datum] [s datum]) -> datum
-  (let ([n (syntax-e s)] [integer (or (== name (sym i32.const)) (== name (sym i64.const)))])
-    (unless (if integer (integer? n) (or (integer? n) (flonum? n)))
-      (fail-at s "~a takes a literal ~a" `(,name ,(if integer `"integer" `"number"))))
-    n))
-
-(define (const-type [name datum]) -> datum
-  (case name [((sym i32.const)) (sym i32)] [((sym i64.const)) (sym i64)] [((sym f32.const)) (sym f32)] [else (sym f64)]))
-
-(define (catch-parts [c datum]) -> datum
-  (let* ([l (syntax->list c)] [n (if (== l 0) 0 (length l))]
-         [ids? (lambda ([v datum] [least u32]) -> i32
-                 (let ([vl (syntax->list v)])
-                   (and (syntax? v) (!= vl 0) (>= (length vl) least) (andmap (lambda ([x datum]) -> i32 (identifier? x)) vl))))])
-    (cond [(and (>= n 3) (named? (car l) (sym catch)) (ids? (caddr l) 0)) `(catch ,(cadr l) ,(caddr l) ,(cdddr l))]
-          [(and (>= n 3) (named? (car l) (sym catch-ref)) (ids? (caddr l) 1)) `(catch-ref ,(cadr l) ,(caddr l) ,(cdddr l))]
-          [(and (>= n 1) (named? (car l) (sym catch-all))) `(catch-all #f #f ,(cdr l))]
-          [(and (>= n 2) (named? (car l) (sym catch-all-ref)) (ids? (cadr l) 1) (== (length (syntax->list (cadr l))) 1))
-           `(catch-all-ref #f ,(cadr l) ,(cddr l))]
-          [else (no-match c "(catch tag (x ...) body ...), (catch-ref tag (x ... e) body ...), (catch-all body ...) or (catch-all-ref (e) body ...)")])))
-
-(define (expand-catch [c datum] [phase i32]) -> datum
-  (let* ([p (catch-parts c)] [kind (car p)] [tag (cadr p)] [vars (caddr p)] [body (cadddr p)]
-         [xs (if (!= vars 0) (syntax->list vars) nil)]
-         [info (if (!= tag 0) (tag-info-of tag phase) 0)]
-         [n (+ (if (!= info 0) (length (tag-info-params info)) 0)
-               (if (!= (memq kind `(catch-ref catch-all-ref)) 0) 1 0))]
-         [sc (new-local-scope!)])
-    (unless (== (length xs) n)
-      (fail-at vars "this clause binds ~a variable~a, not ~a" `(,(make-integer n) ,(if (== n 1) `"" `"s") ,(make-integer (length xs)))))
-    (let* ([scoped (map (lambda ([x datum]) -> datum (add-scope x sc)) xs)]
-           [keys (map (lambda ([x datum]) -> datum (bind-local! x phase)) scoped)]
-           [b (map (lambda ([x datum]) -> datum (expand-expr (add-scope x sc) phase)) body)])
-      (if to-syntax
-          (let ([bound nil] [x scoped] [k keys])
-            (while (pair? x)
-              (set! bound (cons (with-local-binding (car x) (car k)) bound))
-              (set! x (cdr x)) (set! k (cdr k)))
-            (out-list c `(,(core-id kind (car (syntax->list c)))
-                          ,@(if (!= tag 0) (list1 tag) nil)
-                          ,@(if (!= vars 0) (list1 (out-list vars (reverse bound))) nil)
-                          ,@b)))
-          `(,kind ,info ,keys ,(seq-at c b))))))
-
-(define (let-binding [b datum]) -> datum
-  (let ([l (syntax->list b)])
-    (cond [(and (!= l 0) (== (length l) 2) (identifier? (car l))) `(,(car l) #f #f ,(cadr l))]
-          [(and (!= l 0) (== (length l) 3) (identifier? (car l))) `(,(car l) ,(cadr l) ,(parse-type (cadr l)) ,(caddr l))]
-          [(and (!= l 0) (== (length l) 2) (names? (car l))) `(,(syntax->list (car l)) #f #f ,(cadr l))]
-          [(and (!= l 0) (== (length l) 3) (names? (car l)) (!= (syntax->list (cadr l)) 0)
-                (== (length (syntax->list (cadr l))) (length (syntax->list (car l)))))
-           (let ([ts (syntax->list (cadr l))])
-             `(,(syntax->list (car l)) ,ts ,(map (lambda ([t datum]) -> datum (parse-type t)) ts) ,(caddr l)))]
-          [else (no-match b "(name init), (name type init), ((name ...) init) or ((name ...) (type ...) init)")])))
-
-(define (names? [x datum]) -> i32
-  (let ([l (syntax->list x)])
-    (when (or (== l 0) (null? l)) (return 0))
-    (while (pair? l)
-      (unless (identifier? (car l)) (return 0))
-      (set! l (cdr l)))
-    1))
-
-(define (scoped [x datum] [sc u32]) -> datum
-  (if (pair? x) (map (lambda ([y datum]) -> datum (add-scope y sc)) x) (add-scope x sc)))
-
-(define (bind-locals! [x datum] [phase i32]) -> datum
-  (if (pair? x) (map (lambda ([y datum]) -> datum (bind-local! y phase)) x) (bind-local! x phase)))
-
-(define (let-init [bp datum]) -> datum (cadddr bp))
-
-(define (let-out [s datum] [bindings datum] [bs datum] [xs datum] [keys datum] [inits datum] [body datum]) -> datum
-  (let ([outs nil])
-    (while (pair? bs)
-      (let* ([bp (car bs)] [x (car xs)] [key (car keys)] [init (car inits)])
-        (set! outs (cons (cond [(and to-syntax (pair? x))
-                                (let ([ids nil] [y x] [k key])
-                                  (while (pair? y)
-                                    (set! ids (cons (with-local-binding (car y) (car k)) ids))
-                                    (set! y (cdr y))
-                                    (set! k (cdr k)))
-                                  (let ([names (out-list (car x) (reverse ids))])
-                                    (out-list (car x) (if (!= (cadr bp) 0) `(,names ,(out-list (car x) (cadr bp)) ,init) `(,names ,init)))))]
-                               [to-syntax
-                                (let ([x (with-local-binding x key)])
-                                  (out-list (car bp) (if (!= (cadr bp) 0) `(,x ,(cadr bp) ,init) `(,x ,init))))]
-                               [(pair? x) `(,key ,(caddr bp) ,init ,(map (lambda ([y datum]) -> datum (syntax-e y)) (car bp)))]
-                               [else `(,key ,(caddr bp) ,init ,(syntax-e (car bp)))])
-                         outs)))
-      (set! bs (cdr bs)) (set! xs (cdr xs)) (set! keys (cdr keys)) (set! inits (cdr inits)))
-    (if to-syntax
-        (out s (sym let) (cons (out-list bindings (reverse outs)) body))
-        (at s `(let ,(reverse outs) ,(seq-at s body))))))
-
-(define (expand-let* [s datum] [bs datum] [body datum] [phase i32]) -> datum
-  (if (null? bs)
-      (let-out s s nil nil nil nil (map (lambda ([x datum]) -> datum (expand-expr x phase)) body))
-      (let* ([bp (car bs)]
-             [init (expand-expr (let-init bp) phase)]
-             [sc (new-local-scope!)]
-             [x (scoped (car bp) sc)]
-             [key (bind-locals! x phase)]
-             [later (map (lambda ([b datum]) -> datum `(,(scoped (car b) sc) ,(cadr b) ,(caddr b) ,(add-scope (let-init b) sc)))
-                         (cdr bs))]
-             [body (map (lambda ([y datum]) -> datum (add-scope y sc)) body)])
-        (let-out s s (list1 bp) (list1 x) (list1 key) (list1 init)
-                 (if (null? later) (map (lambda ([y datum]) -> datum (expand-expr y phase)) body) (list1 (expand-let* s later body phase)))))))
+  (case name
+    [('#%checked)
+     (let ([l (syntax->list s)])
+       (unless (and (!= l 0) (>= (length l) 2)) (no-match s "(#%checked kind ...)"))
+       (let ([kind (syntax-e (cadr l))])
+         (cond [to-syntax (out s name (if (== kind 'code) (list1 (cadr l)) (cdr l)))]
+               [(== kind 'code) (cdr (boxed-code (caddr l)))]
+               [else (checked-code kind s phase)])))]
+    [('let*) (expand-expr (let*-expansion s) phase)]
+    [else
+     (let ([m (shape-of name s phase)])
+       (when (== m 0) (fail-at s "~a is only allowed at module level" (list1 name)))
+       (core-headed (if (== name 'quote-syntax)
+                        (syntax-rewrap s `(,(car (syntax-e s)) ,(prune-local-scopes (cadr (syntax->list s)))))
+                        (expand-shape m phase))
+                    name))]))
 
 (define (bind-local! [id datum] [phase i32]) -> datum
   (let ([b (bindings-under (syntax-e id) (binding-slot (syntax-scopes id)))])
     (while (!= b 0)
       (when (and (== (-> b phase) phase) (== (-> b scopes) (syntax-scopes id))
-                 (pair? (-> b meaning)) (== (car (-> b meaning)) (sym local)))
+                 (pair? (-> b meaning)) (== (car (-> b meaning)) 'local))
         (fail-at id "~a is bound twice" (list1 (syntax-e id))))
       (set! b (-> b next))))
   (let ([b (bind! id phase 0)])
@@ -2606,8 +2773,8 @@
 ;; In fully expanded code an identifier has the property if and only if it is a
 ;; local variable's, whatever properties a macro copied onto it.
 (define (with-local-binding [id datum] [key datum]) -> datum
-  (if (or (!= key 0) (!= (syntax-property id (sym %local-binding)) 0))
-      (syntax-property-set id (sym %local-binding) key)
+  (if (or (!= key 0) (!= (syntax-property id '%local-binding) 0))
+      (syntax-property-set id '%local-binding key)
       id))
 
 (define (fresh-label! [id datum] [phase i32]) -> datum
@@ -2615,136 +2782,56 @@
     (set! (-> b meaning) (keep `(label ,key)))
     key))
 
-(define (label-key-of [id datum] [phase i32]) -> datum
-  (let ([m (if (identifier? id) (meaning-of id phase) 0)])
-    (unless (and (!= m 0) (== (car m) (sym label))) (fail-at id "~s is not a label" (list1 (syntax->datum id))))
-    (cadr m)))
-
-;; ==== quasiquote / quasisyntax ====
-
-(struct quasi-form [where datum] [phase i32] [qname datum] [uname datum] [sname datum] [syntax i32])
-
-(define (quasi [where datum] [t datum] [depth i32] [phase i32] [qname datum] [uname datum] [sname datum] [syntax i32]) -> datum
-  (let ([q quasi-form])
-    (set! (-> q where) where)
-    (set! (-> q phase) phase)
-    (set! (-> q qname) qname)
-    (set! (-> q uname) uname)
-    (set! (-> q sname) sname)
-    (set! (-> q syntax) syntax)
-    (quasi-walk (& q) t depth)))
-
-(define (tagged? [q (ptr quasi-form)] [x datum] [name datum]) -> i32
-  (let ([l (syntax->list x)])
-    (and (!= l 0) (== (length l) 2) (core-id? (car l) name (-> q phase)))))
-
-(define (changes? [q (ptr quasi-form)] [x datum] [depth i32]) -> i32
-  (cond [(or (tagged? q x (-> q uname)) (tagged? q x (-> q sname)))
-         (or (== depth 0) (changes? q (cadr (syntax->list x)) (- depth 1)))]
-        [(tagged? q x (-> q qname)) (changes? q (cadr (syntax->list x)) (+ depth 1))]
-        [(and (syntax? x) (pair? (syntax-e x)))
-         (let ([e (syntax-e x)])
-           (while (pair? e)
-             (when (changes? q (car e) depth) (return 1))
-             (set! e (cdr e)))
-           (and (syntax? e) (changes? q e depth)))]
-        [else 0]))
-
-(define (quasi-call [q (ptr quasi-form)] [name datum] [args datum]) -> datum
-  (out (-> q where) (sym #%app) (cons (kernel-id name) args)))
-
-(define (quasi-constant [q (ptr quasi-form)] [x datum]) -> datum
-  (if (-> q syntax)
-      (out x (sym quote-syntax) (list1 (prune-local-scopes x)))
-      (out x (sym quote) (list1 x))))
-
-(define (quasi-list [q (ptr quasi-form)] [x datum] [e datum] [depth i32]) -> datum
-  (cond [(null? e) (out x (sym quote) (list1 (make-syntax nil no-scopes 0 nil)))]
-        [(syntax? e) (quasi-walk q e depth)]
-        [(and (== depth 0) (tagged? q (car e) (-> q sname)))
-         (let ([v (cadr (syntax->list (car e)))])
-           (quasi-call q (sym append) `(,(if (-> q syntax) (quasi-call q (sym splice-list) (list1 v)) v) ,(quasi-list q x (cdr e) depth))))]
-        [else (quasi-call q (sym cons) `(,(quasi-walk q (car e) depth) ,(quasi-list q x (cdr e) depth)))]))
-
-(define (quasi-walk [q (ptr quasi-form)] [x datum] [depth i32]) -> datum
-  (cond [(not (changes? q x depth)) (quasi-constant q x)]
-        [(and (tagged? q x (-> q uname)) (== depth 0)) (cadr (syntax->list x))]
-        [(pair? (syntax-e x))
-         (let* ([l (syntax-e x)]
-                [unq (or (tagged? q x (-> q uname)) (tagged? q x (-> q sname)))]
-                [inner-depth (cond [unq (- depth 1)] [(tagged? q x (-> q qname)) (+ depth 1)] [else depth])]
-                [head (if (or unq (tagged? q x (-> q qname)))
-                          (quasi-call q (sym cons) `(,(quasi-constant q (car l)) ,(quasi-list q x (cdr l) inner-depth)))
-                          (quasi-list q x l depth))])
-           (if (-> q syntax) (quasi-call q (sym syntax-rewrap) `(,(quasi-constant q x) ,head)) head))]
-        [else (quasi-constant q x)]))
-
-;; ---- function values ----
-
-;; Resolved in the second pass, so the global may be declared after the function,
-;; or lifted with it.
-(define function-values hash-table)
-
-(define (has-value? [info datum]) -> i32 (!= (hash-ref (& function-values) (cast u64 (base-info info))) 0))
-
-(define (function-value [info datum]) -> datum
-  (let* ([base (base-info info)] [v (cast datum (hash-ref (& function-values) (cast u64 base)))] [g datum 0])
-    (cond [(== v 0) 0]
-          [(pair? v)
-           (let ([m (meaning-of (car v) (cast i32 (integer-value (cdr v))))])
-             (unless (and (!= m 0) (== (car m) (sym global)))
-               (fail-at (car v) "#:value names ~a, which is not a global" (list1 (syntax-e (car v)))))
-             (hash-set! (& function-values) (cast u64 base) (cast u32 (cadr m)))
-             (set! g (cadr m)))]
-          [else (set! g v)])
-    (shift-info g (info-shift info))))
-
 ;; ---- inline functions ----
 
 ;; Kept without source locations: an inlined call is at the call's.
 (define inlines hash-table)
 
 (define inline-memory i32 0)
+(define inline-copied i32 0)
 
 ;; An inline body must not depend on which module it is compiled in; one that uses
-;; memory is inlined only where the code uses the same memory.
-(define (record-inline! [info datum] [params datum] [body datum] [id datum])
+;; memory is inlined only where the code uses the same memory. A copied function's body goes into
+;; one copy of the function in each module that calls it, instead of into each call.
+(define (record-inline! [info datum] [params datum] [body datum] [id datum] [copied i32])
   (set! inline-memory 0)
+  (set! inline-copied copied)
   (let ([returns (check-inline body id)])
     (hash-set! (& inlines) (cast u64 info)
                (cast u32 (keep `(,params ,(func-info-results info) ,(without-locations body) ,(boolean returns)
                                  ,(filter (lambda ([p datum]) -> i32 (assigns? body (car p))) params)
-                                 ,(boolean inline-memory)))))))
+                                 ,(boolean inline-memory) ,(boolean copied)))))))
 
 (define (inline-fail [id datum] [what (ptr u8)]) -> i32
-  (fail-at id "~a is inline, so it may not ~a" `(,(syntax-e id) ,(bytes->string what (strlen what))))
+  (fail-at id "~a is ~a, so it may not ~a"
+           `(,(syntax-e id) ,(if inline-copied '"copied" '"inline") ,(bytes->string what (strlen what))))
   0)
 
 (define (check-inline [e datum] [id datum]) -> i32
   (let ([check (lambda ([x datum]) -> i32 (check-inline x id))]
         [each (lambda ([l datum]) -> i32 (check-each l id))])
     (case (car e)
-      [((sym at) (sym as) (sym lset) (sym gset)) (check (caddr e))]
-      [((sym int) (sym float) (sym const) (sym lref) (sym gref) (sym unreachable) (sym nop) (sym quote)) 0]
-      [((sym let))
+      [('at 'as 'lset 'gset) (check (caddr e))]
+      [('int 'float 'const 'lref 'gref 'unreachable 'nop 'quote) 0]
+      [('let)
        (let ([r (check-each (map (lambda ([b datum]) -> datum (caddr b)) (cadr e)) id)]) (or (check (caddr e)) r))]
-      [((sym seq)) (each (cdr e))]
-      [((sym if)) (let* ([a (check (cadr e))] [b (check (caddr e))] [c (if (!= (cadddr e) 0) (check (cadddr e)) 0)]) (or a b c))]
-      [((sym block) (sym loop) (sym br-if)) (check (caddr e))]
-      [((sym br-table)) (check (cadddr e))]
-      [((sym br)) (if (!= (caddr e) 0) (check (caddr e)) 0)]
-      [((sym return)) (when (!= (cadr e) 0) (check (cadr e))) 1]
-      [((sym call)) (each (caddr e))]
-      [((sym prim))
-       (when (or (== (-> (lookup-prim (cadr e)) kind) (sym mem))
-                 (!= (memq (cadr e) `(memory.size memory.grow memory.copy memory.fill)) 0))
+      [('seq) (each (cdr e))]
+      [('if) (let* ([a (check (cadr e))] [b (check (caddr e))] [c (if (!= (cadddr e) 0) (check (cadddr e)) 0)]) (or a b c))]
+      [('block 'loop 'br-if) (check (caddr e))]
+      [('br-table) (check (cadddr e))]
+      [('br) (if (!= (caddr e) 0) (check (caddr e)) 0)]
+      [('return) (when (!= (cadr e) 0) (check (cadr e))) 1]
+      [('call) (each (caddr e))]
+      [('prim)
+       (when (or (== (-> (lookup-prim (cadr e)) kind) 'mem)
+                 (!= (memq (cadr e) '(memory.size memory.grow memory.copy memory.fill)) 0))
          (set! inline-memory 1))
        (each (cadddr e))]
-      [((sym call-indirect) (sym func-index)) (inline-fail id "use a table")]
-      [((sym select) (sym drop) (sym values)) (each (cdr e))]
-      [((sym throw)) (each (caddr e))]
-      [((sym throw-ref)) (check (cadr e))]
-      [((sym try))
+      [('call-indirect 'func-index) (inline-fail id "use a table")]
+      [('select 'drop 'values) (each (cdr e))]
+      [('throw) (each (caddr e))]
+      [('throw-ref) (check (cadr e))]
+      [('try)
        (let ([r (check-each (map (lambda ([c datum]) -> datum (cadddr c)) (cadr e)) id)]) (or (check (caddr e)) r))]
       [else (fail-at id "internal: lowered form ~a" (list1 (car e))) 0])))
 
@@ -2757,16 +2844,16 @@
 
 (define (assigns? [e datum] [key datum]) -> i32
   (cond [(not (pair? e)) 0]
-        [(== (car e) (sym quote)) 0]
-        [(and (== (car e) (sym lset)) (equal? (cadr e) key)) 1]
+        [(== (car e) 'quote) 0]
+        [(and (== (car e) 'lset) (equal? (cadr e) key)) 1]
         [else (ormap (lambda ([x datum]) -> i32 (assigns? x key)) (cdr e))]))
 
-(define (unlocated [e datum]) -> datum (if (== (car e) (sym at)) (unlocated (caddr e)) e))
+(define (unlocated [e datum]) -> datum (if (== (car e) 'at) (unlocated (caddr e)) e))
 
 (define (without-locations [e datum]) -> datum
   (cond [(not (pair? e)) e]
-        [(== (car e) (sym at)) (without-locations (caddr e))]
-        [(== (car e) (sym quote)) e]
+        [(== (car e) 'at) (without-locations (caddr e))]
+        [(== (car e) 'quote) e]
         [else (let ([head nil] [last datum 0] [l e])
                 (while (pair? l)
                   (let ([p (list1 (without-locations (car l)))])
@@ -2776,19 +2863,31 @@
                 (unless (== last 0) (set-cdr! last l))
                 head)]))
 
+;; The body in place of the call, 0 for the call itself, or copy for a call of this module's copy.
+;; An inline or copied body takes in the copied functions it calls, so that a copy calls no other.
 (define (inline-call [info datum] [args datum] [phase i32]) -> datum
   (let ([b (cast datum (hash-ref (& inlines) (cast u64 (base-info info))))])
-    (if (or (== b 0) (!= (length args) (length (car b)))
-            (and (!= (list-ref b 5) 0) (not (same-memory? info phase))))
-        0
-        (let* ([keys (new-table)] [labels (new-table)]
-               [ret (if (!= (cadddr b) 0) (fresh-key!) 0)]
-               [bindings (inline-bindings (car b) args (list-ref b 4) (& keys))]
-               [body (begin (set! inline-shift (info-shift info)) (copy-inline (caddr b) (& keys) (& labels) ret))]
-               [e `(let ,bindings ,body)])
-          (hash-free! (& keys))
-          (hash-free! (& labels))
-          `(as ,(cadr b) ,(if (!= ret 0) `(block ,ret ,e) e))))))
+    (cond [(or (== b 0) (!= (length args) (length (car b)))
+               (and (!= (list-ref b 5) 0) (not (same-memory? info phase))))
+           0]
+          [(and (!= (list-ref b 6) 0) (not in-inline-body))
+           (if (and (== (info-instance (base-info info)) 0) (== (info-shift info) 0)) 0 'copy)]
+          [else (inlined b info args)])))
+
+(define (inlined [b datum] [info datum] [args datum]) -> datum
+  (let* ([keys (new-table)] [labels (new-table)]
+         [ret (if (!= (cadddr b) 0) (fresh-key!) 0)]
+         [bindings (inline-bindings (car b) args (list-ref b 4) (& keys))]
+         [body (begin (set! inline-shift (info-shift info)) (copy-inline (caddr b) (& keys) (& labels) ret))]
+         [e `(let ,bindings ,body)])
+    (hash-free! (& keys))
+    (hash-free! (& labels))
+    `(as ,(cadr b) ,(if (!= ret 0) `(block ,ret ,e) e))))
+
+(define (inline-copy [info datum]) -> datum
+  (let ([keys (map (lambda ([t datum]) -> datum (fresh-key!)) (func-info-params info))])
+    (cons keys (inlined (cast datum (hash-ref (& inlines) (cast u64 (base-info info)))) info
+                        (map (lambda ([k datum]) -> datum `(lref ,k)) keys)))))
 
 (define (new-table) -> hash-table
   (let ([t hash-table])
@@ -2804,9 +2903,9 @@
     (and (!= def 0) (!= use 0) (string=? def use))))
 
 (define (use-memory-owner [phase i32]) -> datum
-  (let ([form (storage-form (sym memory) phase)])
+  (let ([form (storage-form 'memory phase)])
     (cond [(== form 0) 0]
-          [(== (car form) (sym memory)) (wasm-module-name (-> current module) phase 0)]
+          [(== (car form) 'memory) (wasm-module-name (-> current module) phase 0)]
           [else (memory-owner (cadr form))])))
 
 (define (memory-owner [name datum]) -> datum
@@ -2819,7 +2918,7 @@
                (let* ([m (car r)] [q (cast i32 (integer-value (cadr r)))] [t (cast i32 (integer-value (caddr r)))]
                       [form (module-memory m q)])
                  (cond [(== form 0) 0]
-                       [(== (car form) (sym memory)) name]
+                       [(== (car form) 'memory) name]
                        [else (memory-owner (shifted-instance (cadr form) t))]))))]))
 
 (define memory-owners datum nil)
@@ -2835,14 +2934,14 @@
           (cdr (car memory-owners))))))
 
 (define (shifted-instance [name datum] [t i32]) -> datum
-  (if (or (== t 0) (kernel-name? name))
+  (if (or (== t 0) (running-instance? name))
       name
       (let ([r (wasm-module-ref name)])
         (if (== r 0) 0 (wasm-module-name (car r) (cast i32 (integer-value (cadr r))) (+ (cast i32 (integer-value (caddr r))) t))))))
 
 (define (module-memory [m datum] [q i32]) -> datum
   (if (== m (-> current module))
-      (storage-form (sym memory) q)
+      (storage-form 'memory q)
       (let ([p (assoc (make-integer q) (-> (unit-of m) memories))])
         (if (== p 0) 0 (cdr p)))))
 
@@ -2852,7 +2951,7 @@
   (if (null? params)
       nil
       (let* ([p (car params)] [a (unlocated (car args))])
-        (if (and (== (car a) (sym lref)) (== (assoc (car p) assigned) 0)
+        (if (and (== (car a) 'lref) (== (assoc (car p) assigned) 0)
                  (not (ormap (lambda ([later datum]) -> i32 (assigns? later (cadr a))) (cdr args))))
             (begin
               (hash-set! keys (cast u64 (integer-value (car p))) (cast u32 `(as (,(cdr p)) ,a)))
@@ -2879,31 +2978,31 @@
         [copies (lambda ([l datum]) -> datum (copy-each l keys labels ret))]
         [copy? (lambda ([x datum]) -> datum (if (== x 0) 0 (copy-inline x keys labels ret)))])
     (case (car e)
-      [((sym as)) `(as ,(cadr e) ,(copy (caddr e)))]
-      [((sym int) (sym float) (sym const) (sym quote) (sym unreachable) (sym nop)) e]
-      [((sym lref)) (let ([m (copied-key keys (cadr e))]) (if (pair? m) m `(lref ,m)))]
-      [((sym lset)) `(lset ,(copied-key keys (cadr e)) ,(copy (caddr e)))]
-      [((sym gref)) `(gref ,(shift-info (cadr e) inline-shift))]
-      [((sym gset)) `(gset ,(shift-info (cadr e) inline-shift) ,(copy (caddr e)))]
-      [((sym let))
+      [('as) `(as ,(cadr e) ,(copy (caddr e)))]
+      [('int 'float 'const 'quote 'unreachable 'nop) e]
+      [('lref) (let ([m (copied-key keys (cadr e))]) (if (pair? m) m `(lref ,m)))]
+      [('lset) `(lset ,(copied-key keys (cadr e)) ,(copy (caddr e)))]
+      [('gref) `(gref ,(shift-info (cadr e) inline-shift))]
+      [('gset) `(gset ,(shift-info (cadr e) inline-shift) ,(copy (caddr e)))]
+      [('let)
        `(let ,(map (lambda ([b datum]) -> datum
                      (cons (if (pair? (car b)) (copied-keys (car b) keys) (copied-key keys (car b)))
                            (cons (cadr b) (cons (copy-inline (caddr b) keys labels ret) (cdddr b)))))
                    (cadr e))
              ,(copy (caddr e)))]
-      [((sym seq) (sym select) (sym drop) (sym values)) (cons (car e) (copies (cdr e)))]
-      [((sym if)) `(if ,(copy (cadr e)) ,(copy (caddr e)) ,(copy? (cadddr e)))]
-      [((sym block) (sym loop)) `(,(car e) ,(copied-key labels (cadr e)) ,(copy (caddr e)))]
-      [((sym br)) `(br ,(copied-key labels (cadr e)) ,(copy? (caddr e)))]
-      [((sym br-if)) `(br-if ,(copied-key labels (cadr e)) ,(copy (caddr e)))]
-      [((sym br-table))
+      [('seq 'select 'drop 'values) (cons (car e) (copies (cdr e)))]
+      [('if) `(if ,(copy (cadr e)) ,(copy (caddr e)) ,(copy? (cadddr e)))]
+      [('block 'loop) `(,(car e) ,(copied-key labels (cadr e)) ,(copy (caddr e)))]
+      [('br) `(br ,(copied-key labels (cadr e)) ,(copy? (caddr e)))]
+      [('br-if) `(br-if ,(copied-key labels (cadr e)) ,(copy (caddr e)))]
+      [('br-table)
        `(br-table ,(map (lambda ([k datum]) -> datum (copied-key labels k)) (cadr e)) ,(copied-key labels (caddr e)) ,(copy (cadddr e)))]
-      [((sym return)) `(br ,ret ,(copy? (cadr e)))]
-      [((sym call)) `(call ,(shift-info (cadr e) inline-shift) ,(copies (caddr e)))]
-      [((sym prim)) `(prim ,(cadr e) ,(caddr e) ,(copies (cadddr e)))]
-      [((sym throw)) `(throw ,(shift-info (cadr e) inline-shift) ,(copies (caddr e)))]
-      [((sym throw-ref)) `(throw-ref ,(copy (cadr e)))]
-      [((sym try))
+      [('return) `(br ,ret ,(copy? (cadr e)))]
+      [('call) `(call ,(shift-info (cadr e) inline-shift) ,(copies (caddr e)))]
+      [('prim) `(prim ,(cadr e) ,(caddr e) ,(copies (cadddr e)))]
+      [('throw) `(throw ,(shift-info (cadr e) inline-shift) ,(copies (caddr e)))]
+      [('throw-ref) `(throw-ref ,(copy (cadr e)))]
+      [('try)
        `(try ,(map (lambda ([c datum]) -> datum
                      `(,(car c) ,(if (!= (cadr c) 0) (shift-info (cadr c) inline-shift) 0) ,(copied-keys (caddr c) keys)
                        ,(copy-inline (cadddr c) keys labels ret)))
@@ -2914,4 +3013,5 @@
 (define (copy-each [l datum] [keys (ptr hash-table)] [labels (ptr hash-table)] [ret datum]) -> datum
   (map (lambda ([x datum]) -> datum (copy-inline x keys labels ret)) l))
 
-(define (note-inline! [info datum] [params datum] [code datum] [name datum]) (record-inline! info params code name))
+(define (note-inline! [info datum] [params datum] [code datum] [name datum] [copied i32])
+  (record-inline! info params code name copied))

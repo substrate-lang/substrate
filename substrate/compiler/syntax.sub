@@ -1,0 +1,1185 @@
+;; The syntax module: the data every language shares, and the macro contract.
+
+(require-unqualified numbers "numbers.sub")
+(require-unqualified writer "writer.sub")
+(require wasm "wasm.sub")
+
+(provide datum srcloc scope-set
+         run-arena current-arena use-arena begin-module-arena end-module-arena abandon-module-arena module-arena-mark end-module-arenas-to! keep
+         nil boolean boolean? null? pair? cons car cdr cadr cddr caddr cdddr cadddr set-car! set-cdr! list? length reverse append
+         list-ref list-tail last take memq member assq assoc map for-each filter andmap ormap sort
+         equal? datum-hash datum-get datum-put! make-table
+         make-record make-record-in record? record-kind record-pointer
+         symbol? bytes->symbol symbol-named string->symbol symbol->string symbol-append symbol-bytes symbol-length
+         keyword? bytes->keyword keyword->string
+         string? bytes->string string-bytes string-length string=?
+         integer? make-integer make-unsigned-integer integer-value integer-negative? fixnum? flonum? make-flonum flonum-value char? integer->char char->integer
+         syntax? identifier? make-syntax syntax-e syntax->list splice-list syntax->datum datum->syntax core-syntax syntax-rewrap
+         syntax-scopes syntax-srcloc syntax-props make-srcloc syntax-property syntax-property-set
+         no-scopes scopes-change scopes-subset? scopes-filter map-scopes add-scope add-scopes remove-scope flip-scope
+         write-datum write-scoped write-to format-message format buffer-add-utf-8!
+         compile-error raise-compile-error write-compile-error
+         make-transformer make-function-transformer transformer? transformer-env call-transformer
+         raise-syntax-error local-binding set-queries! match-pair match-datum? match-bound? match-elements match-after match-failure syntax-local-value free-identifier=? identifier-binding-kind
+         identifier-function-signature local-expand syntax-local-lift-definition syntax-local-introduce
+         syntax-local-facts syntax-local-shape identifier-name name-identifier
+         piece-role piece-syntax piece-region pieces-of shape-pieces shape-syntax
+         set-scope-map! literal-buffer deserialize
+         fixnum fixnum-value unsafe-car unsafe-cdr string-byte string-append symbol-hash string->keyword
+         syntax-source syntax-line syntax-column)
+
+;; ---- cells ----
+
+(variant cell
+  [pair [car (ptr cell)] [cdr (ptr cell)]]
+  [empty]
+  [true]
+  [symbol [name (ptr u8)] [length u32] [next (ptr cell)]]
+  [keyword [name (ptr u8)] [length u32] [next (ptr cell)]]
+  [string [bytes (ptr u8)] [length u32]]
+  ;; An integer's 64 bits, low then high, so that a cell needs no 8-byte alignment.
+  [integer [low u32] [high u32] [negative u32]]
+  [flonum [low u32] [high u32]]
+  [character [code u32]]
+  [syntax [e (ptr cell)] [scopes (ptr scope-set)] [srcloc (ptr srcloc)] [props (ptr cell)] [pending (ptr change)]]
+  [record [kind u32] [pointer (ptr void)]]
+  [transformer [code u32] [env (ptr cell)] [arity u32]])
+
+;; The type of quoted data, which the expander names as this file's cell.
+(typedef datum (ptr cell))
+
+;; ---- fixnums ----
+
+;; A datum is a pointer to a cell, or a fixnum: the integer n as 2n + 1, with no cell.
+(define (fixnum-datum? [d datum]) #:inline -> i32 (bit-and (cast i32 d) 1))
+(define (fixnum-of [d datum]) #:inline -> i32 (>> (cast i32 d) 1))
+(define (make-fixnum [n i32]) #:inline -> datum (cast datum (bit-or (<< n 1) 1)))
+(define (cell-of [d datum]) #:inline -> datum (cast datum (wasm:select 0 d (fixnum-datum? d))))
+
+;; ---- forms on data ----
+
+;; A cell is made the size of its case: (make-cell (pair a d)) or (make-cell-in arena c).
+(define-syntax make-cell (quote-syntax (#%form make-cell)))
+(define-syntax make-cell-in (quote-syntax (#%form make-cell)))
+
+(define (fail [message (ptr u8)]) -> datum
+  (host-trap message (strlen message))
+  0)
+
+(struct srcloc [source datum] [line u32] [col u32] [pos u32] [span u32])
+
+(struct scope-set [count u32] [next (ptr scope-set)] [ids (array u32 0)])
+
+(struct change [scope u32] [kind u32] [next (ptr change)])
+
+;; ---- arenas ----
+
+(define run-arena arena)
+
+(struct module-arena [arena arena] [outer (ptr module-arena)])
+
+(define innermost (ptr module-arena) 0)
+(define current (ptr arena) (& run-arena))
+
+(define (current-arena) #:inline -> (ptr arena) current)
+
+(define (use-arena [a (ptr arena)]) -> (ptr arena)
+  (let ([was current])
+    (set! current a)
+    was))
+
+(define (in-run-arena?) -> i32 (== current (& run-arena)))
+
+(define (begin-module-arena)
+  (let ([m (cast (ptr module-arena) (malloc (sizeof module-arena)))])
+    (set! (-> m arena) (make-arena))
+    (set! (-> m outer) innermost)
+    (set! innermost m)
+    (set! current (& (-> m arena)))))
+
+(define (end-module-arena)
+  (let ([m innermost])
+    (set! innermost (-> m outer))
+    (set! current (if (== innermost 0) (& run-arena) (& (-> innermost arena))))
+    (free-module-arena! m)))
+
+;; A module whose compilation failed leaves the stack, but its arena holds the failure's message
+;; and syntax, so only end-module-arenas-to! frees it.
+(define abandoned (ptr module-arena) 0)
+
+(define (abandon-module-arena)
+  (let ([m innermost])
+    (set! innermost (-> m outer))
+    (set! current (if (== innermost 0) (& run-arena) (& (-> innermost arena))))
+    (set! (-> m outer) abandoned)
+    (set! abandoned m)))
+
+(define (free-module-arena! [m (ptr module-arena)])
+  (arena-free (& (-> m arena)))
+  (free m)
+  ;; Its changes, remembered, are of sets that are gone from its syntax.
+  (hash-clear! (& changes-made)))
+
+(define (module-arena-mark) -> (ptr void) innermost)
+
+(define (end-module-arenas-to! [mark (ptr void)])
+  (while (and (!= innermost 0) (!= (cast (ptr void) innermost) mark)) (end-module-arena))
+  (while (!= abandoned 0)
+    (let ([m abandoned])
+      (set! abandoned (-> m outer))
+      (free-module-arena! m))))
+
+;; ---- cells' bytes ----
+
+(define (cell-bytes [n u32]) #:copied -> datum
+  (let* ([size (bit-and (+ n 7) -8)] [p (-> current next)])
+    (if (> size (- (-> current end) p))
+        (cast datum (arena-alloc current n))
+        (begin
+          (set! (-> current next) (+ p size))
+          (cast datum p)))))
+
+(define (held-bytes [n u32]) -> (ptr u8) (cast (ptr u8) (arena-alloc current n)))
+
+;; ---- lists ----
+
+(define nil datum (make-cell-in (& run-arena) empty))
+(define true-cell datum (make-cell-in (& run-arena) true))
+
+(define (boolean [b i32]) -> datum (if b true-cell 0))
+(define (boolean? [d datum]) -> i32 (or (== d 0) (== d true-cell)))
+(define (null? [d datum]) #:inline -> i32 (== d nil))
+
+(define (pair? [d datum]) #:inline -> i32 (match (cell-of d) [(pair a b) 1] [_ 0]))
+
+(define (cons [a datum] [d datum]) #:copied -> datum (make-cell (pair a d)))
+
+(define (car [p datum]) #:copied -> datum (match (cell-of p) [(pair a d) a] [_ (fail "expected a pair")]))
+(define (cdr [p datum]) #:copied -> datum (match (cell-of p) [(pair a d) d] [_ (fail "expected a pair")]))
+
+(define (cadr [p datum]) #:copied -> datum (car (cdr p)))
+(define (cddr [p datum]) #:copied -> datum (cdr (cdr p)))
+(define (caddr [p datum]) #:copied -> datum (car (cddr p)))
+(define (cdddr [p datum]) #:copied -> datum (cdr (cddr p)))
+(define (cadddr [p datum]) #:copied -> datum (car (cdddr p)))
+
+;; Only for building a list from its start, before anything else has it.
+(define (set-car! [p datum] [d datum]) (match (cell-of p) [(pair a b) (set! a d)] [_ 0]))
+
+(define (set-cdr! [p datum] [d datum]) (match (cell-of p) [(pair a b) (set! b d)] [_ 0]))
+
+(define (list? [l datum]) -> i32
+  (while (pair? l) (set! l (cdr l)))
+  (== l nil))
+
+(define (length [l datum]) -> u32
+  (let ([n u32 0])
+    (while (pair? l) (+= n 1) (set! l (cdr l)))
+    n))
+
+(define (reverse [l datum]) -> datum
+  (let ([r nil])
+    (while (pair? l) (set! r (cons (car l) r)) (set! l (cdr l)))
+    r))
+
+(define (append [a datum] [b datum]) -> datum
+  (let ([r (reverse a)])
+    (while (pair? r) (set! b (cons (car r) b)) (set! r (cdr r)))
+    b))
+
+(define (list-ref [l datum] [n u32]) -> datum (car (list-tail l n)))
+
+(define (list-tail [l datum] [n u32]) -> datum
+  (for ([i u32 0]) (< i n) (+= i 1) (set! l (cdr l)))
+  l)
+
+(define (last [l datum]) -> datum
+  (while (pair? (cdr l)) (set! l (cdr l)))
+  (car l))
+
+(define (memq [x datum] [l datum]) -> datum
+  (while (pair? l)
+    (when (== (car l) x) (return l))
+    (set! l (cdr l)))
+  0)
+
+(define (member [x datum] [l datum]) -> datum
+  (while (pair? l)
+    (when (equal? (car l) x) (return l))
+    (set! l (cdr l)))
+  0)
+
+(define (assq [x datum] [l datum]) -> datum
+  (while (pair? l)
+    (when (== (car (car l)) x) (return (car l)))
+    (set! l (cdr l)))
+  0)
+
+(define (assoc [x datum] [l datum]) -> datum
+  (while (pair? l)
+    (when (equal? (car (car l)) x) (return (car l)))
+    (set! l (cdr l)))
+  0)
+
+(define (map [f (closure (datum) -> datum)] [l datum]) -> datum
+  (let ([head nil] [last datum 0])
+    (while (pair? l)
+      (let ([p (cons (f (car l)) nil)])
+        (if (== last 0) (set! head p) (set-cdr! last p))
+        (set! last p))
+      (set! l (cdr l)))
+    head))
+
+(define (for-each [f (closure (datum))] [l datum])
+  (while (pair? l)
+    (f (car l))
+    (set! l (cdr l))))
+
+(define (filter [keep (closure (datum) -> i32)] [l datum]) -> datum
+  (let ([head nil] [last datum 0])
+    (while (pair? l)
+      (when (keep (car l))
+        (let ([p (cons (car l) nil)])
+          (if (== last 0) (set! head p) (set-cdr! last p))
+          (set! last p)))
+      (set! l (cdr l)))
+    head))
+
+(define (andmap [f (closure (datum) -> i32)] [l datum]) -> i32
+  (while (pair? l)
+    (unless (f (car l)) (return 0))
+    (set! l (cdr l)))
+  1)
+
+(define (ormap [f (closure (datum) -> i32)] [l datum]) -> i32
+  (while (pair? l)
+    (when (f (car l)) (return 1))
+    (set! l (cdr l)))
+  0)
+
+(define (sort [l datum] [before? (closure (datum datum) -> i32)]) -> datum
+  (let ([n (length l)])
+    (if (< n 2)
+        l
+        (let* ([half (/ n 2)] [a (sort (take l half) before?)] [b (sort (list-tail l half) before?)]
+               [head nil] [last datum 0] [next datum 0])
+          (while (or (pair? a) (pair? b))
+            (if (and (pair? a) (or (not (pair? b)) (not (before? (car b) (car a)))))
+                (begin (set! next (car a)) (set! a (cdr a)))
+                (begin (set! next (car b)) (set! b (cdr b))))
+            (let ([p (cons next nil)])
+              (if (== last 0) (set! head p) (set-cdr! last p))
+              (set! last p)))
+          head))))
+
+(define (take [l datum] [n u32]) -> datum
+  (if (== n 0) nil (cons (car l) (take (cdr l) (- n 1)))))
+
+;; ---- equality and hashing ----
+
+(define (equal? [a datum] [b datum]) -> i32
+  (when (== a b) (return 1))
+  (match (cell-of a)
+    [(pair x y) (and (pair? b) (equal? x (car b)) (equal? y (cdr b)))]
+    [(string bytes length) (and (string? b) (string=? a b))]
+    [(integer low high negative)
+     (and (integer? b) (== (integer-value a) (integer-value b)) (== negative (integer-negative? b)))]
+    [(flonum low high) (and (flonum? b) (== (f64-bits (flonum-value a)) (f64-bits (flonum-value b))))]
+    [(character c) (and (char? b) (== c (char->integer b)))]
+    [_ 0]))
+
+;; Never 0, so a hash table's key.
+(define (datum-hash [d datum]) -> u64 (bit-or (hash-into 14695981039346656037 d) 1))
+
+(define (mix [h u64] [x u64]) -> u64 (* (bit-xor h x) 1099511628211))
+
+(define (hash-into [h u64] [d datum]) -> u64
+  (when (fixnum-datum? d) (return (mix h (cast u64 (integer-value d)))))
+  (match d
+    [#f (mix h 1)]
+    [(pair x y) (hash-into (hash-into (mix h 2) x) y)]
+    [(string bytes length) (mix h (hash-bytes bytes length))]
+    [(integer low high negative) (mix h (cast u64 (integer-value d)))]
+    [(flonum low high) (mix h (cast u64 (f64-bits (flonum-value d))))]
+    [(character c) (mix h c)]
+    [_ (mix h (cast u64 d))]))
+
+;; ---- tables in an arena ----
+(define (make-table) -> (ptr hash-table)
+  (let ([t (cast (ptr hash-table) (memset (arena-alloc current (sizeof hash-table)) 0 (sizeof hash-table)))])
+    (set! (-> t arena) current)
+    t))
+
+(struct entry [key datum] [value datum] [next (ptr entry)])
+
+(define (datum-get [t (ptr hash-table)] [key datum]) -> datum
+  (let ([e (cast (ptr entry) (hash-ref t (datum-hash key)))])
+    (while (!= e 0)
+      (when (equal? (-> e key) key) (return (-> e value)))
+      (set! e (-> e next)))
+    0))
+
+(define (datum-put! [t (ptr hash-table)] [key datum] [value datum])
+  (let* ([h (datum-hash key)] [first (cast (ptr entry) (hash-ref t h))] [e first])
+    (while (!= e 0)
+      (when (equal? (-> e key) key)
+        (set! (-> e value) value)
+        (return))
+      (set! e (-> e next)))
+    (set! e (cast (ptr entry) (arena-alloc (-> t arena) (sizeof entry))))
+    (set! (-> e key) key)
+    (set! (-> e value) value)
+    (set! (-> e next) first)
+    (hash-set! t h (cast u32 e))))
+
+;; ---- records ----
+;; A struct has one record, so == on records compares structs. A record from make-record-in
+;; must not be given to keep.
+
+(define (make-record [kind u32] [p (ptr void)]) -> datum (make-cell-in (& run-arena) (record kind p)))
+(define (make-record-in [a (ptr arena)] [kind u32] [p (ptr void)]) -> datum (make-cell-in a (record kind p)))
+(define (record? [d datum] [kind u32]) -> i32 (match (cell-of d) [(record k p) (== k kind)] [_ 0]))
+(define (record-kind [d datum]) -> u32 (match (cell-of d) [(record k p) k] [_ 0]))
+(define (record-pointer [d datum]) -> (ptr void) (match (cell-of d) [(record k p) p] [_ (fail "expected a record") 0]))
+
+;; ---- symbols, keywords and strings ----
+
+;; FNV-1a, never 0, so a hash table's key.
+(define (hash-bytes [p (ptr u8)] [n u32]) -> u64
+  (let ([h u64 14695981039346656037])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! h (* (bit-xor h (@ p i)) 1099511628211)))
+    (bit-or h 1)))
+
+(define (bytes=? [a (ptr u8)] [b (ptr u8)] [n u32]) -> i32 (== (memcmp a b n) 0))
+
+(define symbols hash-table)
+(define keywords hash-table)
+
+(define (intern [p (ptr u8)] [n u32] [kw i32]) -> datum
+  (let* ([t (if kw (& keywords) (& symbols))] [key (hash-bytes p n)] [latest (cast datum (hash-ref t key))] [s latest])
+    (while (!= s 0)
+      (match s
+        [(symbol name length next) (when (and (== length n) (bytes=? name p n)) (return s)) (set! s next)]
+        [(keyword name length next) (when (and (== length n) (bytes=? name p n)) (return s)) (set! s next)]
+        [_ (set! s 0)]))
+    (let ([name (cast (ptr u8) (arena-alloc (& run-arena) (+ n 1)))] [made datum 0])
+      (memcpy name p n)
+      (set! (@ name n) 0)
+      (set! made (if kw (make-cell-in (& run-arena) (keyword name n latest)) (make-cell-in (& run-arena) (symbol name n latest))))
+      (hash-set! t key (cast u32 made))
+      made)))
+
+(define (symbol? [d datum]) -> i32 (match (cell-of d) [(symbol a b c) 1] [_ 0]))
+(define (bytes->symbol [p (ptr u8)] [n u32]) -> datum (intern p n 0))
+(define (symbol-named [s (ptr u8)]) -> datum (intern s (strlen s) 0))
+
+;; This module cannot quote symbols, since it defines quoted data, so it makes them as it starts.
+(define core-symbol datum (symbol-named "core"))
+(define local-binding-symbol datum (symbol-named "%local-binding"))
+(define quote-symbol datum (symbol-named "quote"))
+(define quasiquote-symbol datum (symbol-named "quasiquote"))
+(define unquote-symbol datum (symbol-named "unquote"))
+(define unquote-splicing-symbol datum (symbol-named "unquote-splicing"))
+(define quote-syntax-symbol datum (symbol-named "quote-syntax"))
+(define quasisyntax-symbol datum (symbol-named "quasisyntax"))
+(define unsyntax-symbol datum (symbol-named "unsyntax"))
+(define unsyntax-splicing-symbol datum (symbol-named "unsyntax-splicing"))
+(define datum-symbol datum (symbol-named "#%datum"))
+(define app-symbol datum (symbol-named "#%app"))
+(define (string->symbol [s datum]) -> datum (intern (string-bytes s) (string-length s) 0))
+
+(define (symbol-bytes [s datum]) -> (ptr u8)
+  (match (cell-of s) [(symbol name length next) name] [_ (fail "expected a symbol") 0]))
+
+(define (symbol-length [s datum]) -> u32
+  (match (cell-of s) [(symbol name length next) length] [_ (fail "expected a symbol") 0]))
+
+(define (symbol->string [s datum]) -> datum (make-cell (string (symbol-bytes s) (symbol-length s))))
+
+(define (symbol-append [a datum] [b datum]) -> datum
+  (let ([buf (make-buffer)] [s datum 0])
+    (buffer-add! (& buf) (symbol-bytes a) (symbol-length a))
+    (buffer-add! (& buf) (symbol-bytes b) (symbol-length b))
+    (set! s (intern (-> buf bytes) (-> buf length) 0))
+    (buffer-free! (& buf))
+    s))
+
+(define (keyword? [d datum]) -> i32 (match (cell-of d) [(keyword a b c) 1] [_ 0]))
+(define (bytes->keyword [p (ptr u8)] [n u32]) -> datum (intern p n 1))
+
+(define (keyword->string [k datum]) -> datum
+  (match (cell-of k)
+    [(keyword name length next) (make-cell (string name length))]
+    [_ (fail "expected a keyword")]))
+
+(define (string? [d datum]) -> i32 (match (cell-of d) [(string a b) 1] [_ 0]))
+
+(define (bytes->string [p (ptr u8)] [n u32]) -> datum
+  (let ([bytes (held-bytes n)])
+    (memcpy bytes p n)
+    (make-cell (string bytes n))))
+
+(define (string-bytes [s datum]) -> (ptr u8)
+  (match (cell-of s) [(string bytes length) bytes] [_ (fail "expected a string") 0]))
+
+(define (string-length [s datum]) -> u32
+  (match (cell-of s) [(string bytes length) length] [_ (fail "expected a string") 0]))
+
+(define (string=? [a datum] [b datum]) -> i32
+  (and (== (string-length a) (string-length b)) (bytes=? (string-bytes a) (string-bytes b) (string-length a))))
+
+;; ---- numbers and characters ----
+
+(define (integer? [d datum]) -> i32 (or (fixnum-datum? d) (match d [(integer a b c) 1] [_ 0])))
+(define (make-integer [n i64]) -> datum
+  (if (and (>= n -1073741824) (<= n 1073741823))
+      (make-fixnum (cast i32 n))
+      (make-cell (integer (cast u32 n) (cast u32 (>> n 32)) (< n 0)))))
+(define (make-unsigned-integer [n u64]) -> datum
+  (if (<= n 1073741823)
+      (make-fixnum (cast i32 n))
+      (make-cell (integer (cast u32 n) (cast u32 (>> n 32)) 0))))
+
+;; Its 64-bit two's complement: with integer-negative? its exact value.
+(define (integer-value [d datum]) -> i64
+  (if (fixnum-datum? d)
+      (cast i64 (fixnum-of d))
+      (match d [(integer low high negative) (bit-or (cast i64 low) (<< (cast i64 high) 32))] [_ (fail "expected an integer") 0])))
+
+(define (integer-negative? [d datum]) -> i32
+  (if (fixnum-datum? d)
+      (< (fixnum-of d) 0)
+      (match d [(integer low high negative) negative] [_ (fail "expected an integer") 0])))
+
+(define (fixnum? [d datum]) -> i32 (fixnum-datum? d))
+
+(define (flonum? [d datum]) -> i32 (match (cell-of d) [(flonum a b) 1] [_ 0]))
+
+(define (make-flonum [x f64]) -> datum
+  (let ([bits (f64-bits x)]) (make-cell (flonum (cast u32 bits) (cast u32 (>> bits 32))))))
+
+(define (flonum-value [d datum]) -> f64
+  (match (cell-of d) [(flonum low high) (bits-f64 (bit-or (cast i64 low) (<< (cast i64 high) 32)))] [_ (fail "expected a flonum") 0]))
+
+(define (char? [d datum]) -> i32 (match (cell-of d) [(character c) 1] [_ 0]))
+(define (integer->char [n u32]) -> datum (make-cell (character n)))
+
+(define (char->integer [d datum]) -> u32
+  (match (cell-of d) [(character c) c] [_ (fail "expected a character") 0]))
+
+;; ---- scope sets ----
+
+(define scope-sets hash-table)
+(define changes-made hash-table)
+
+(define (hash-words [p (ptr u32)] [n u32]) -> u64
+  (let ([h u64 14695981039346656037])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! h (* (bit-xor h (@ p i)) 1099511628211)))
+    (bit-or h 1)))
+
+(define (intern-scopes [ids (ptr u32)] [n u32]) -> (ptr scope-set)
+  (let* ([key (hash-words ids n)] [latest (cast (ptr scope-set) (hash-ref (& scope-sets) key))] [s latest])
+    (while (!= s 0)
+      (when (== (-> s count) n)
+        (let ([same 1])
+          (for ([i u32 0]) (and same (< i n)) (+= i 1)
+            (set! same (== (@ (-> s ids) i) (@ ids i))))
+          (when same (return s))))
+      (set! s (-> s next)))
+    (let ([made (cast (ptr scope-set) (arena-alloc (& run-arena) (+ (sizeof scope-set) (* 4 n))))])
+      (set! (-> made count) n)
+      (set! (-> made next) latest)
+      (memcpy (-> made ids) ids (* 4 n))
+      (hash-set! (& scope-sets) key (cast u32 made))
+      made)))
+
+(define no-scopes (ptr scope-set) (intern-scopes 0 0))
+
+(define scratch (ptr u32) 0)
+(define scratch-room u32 0)
+
+(define (scratch-for [n u32]) -> (ptr u32)
+  (when (> n scratch-room)
+    (set! scratch-room (* 2 n))
+    (set! scratch (cast (ptr u32) (realloc scratch (* 4 scratch-room)))))
+  scratch)
+
+(define (scopes-change [s (ptr scope-set)] [sc u32] [kind u32]) -> (ptr scope-set)
+  (let* ([key (bit-or (<< (cast u64 s) 32) (bit-or (<< sc 2) kind))]
+         [known (cast (ptr scope-set) (hash-ref (& changes-made) key))])
+    (if (!= known 0)
+        known
+        (let ([made (scopes-changed s sc kind)])
+          (hash-set! (& changes-made) key (cast u32 made))
+          made))))
+
+(define (scopes-changed [s (ptr scope-set)] [sc u32] [kind u32]) -> (ptr scope-set)
+  (let* ([n (-> s count)] [ids (-> s ids)] [i u32 0])
+    (while (and (< i n) (> (@ ids i) sc)) (+= i 1))
+    (let ([has (and (< i n) (== (@ ids i) sc))])
+      (cond [(if has (== kind 0) (== kind 1)) s]
+            [has (let ([out (scratch-for n)])
+                   (memcpy out ids (* 4 i))
+                   (memcpy (+ out i) (+ ids i 1) (* 4 (- n i 1)))
+                   (intern-scopes out (- n 1)))]
+            [else (let ([out (scratch-for (+ n 1))])
+                    (memcpy out ids (* 4 i))
+                    (set! (@ out i) sc)
+                    (memcpy (+ out i 1) (+ ids i) (* 4 (- n i)))
+                    (intern-scopes out (+ n 1)))]))))
+
+;; Both are greatest first, so a scope of b less than a's next is past where that one would be.
+(define (scopes-subset? [a (ptr scope-set)] [b (ptr scope-set)]) -> i32
+  (let ([i u32 0] [j u32 0] [n (-> a count)] [m (-> b count)] [x (-> a ids)] [y (-> b ids)])
+    (while (< i n)
+      (when (or (>= j m) (> (@ x i) (@ y j))) (return 0))
+      (when (== (@ x i) (@ y j)) (+= i 1))
+      (+= j 1))
+    1))
+
+;; ---- changes to scopes ----
+
+(define (new-change [sc u32] [kind u32] [next (ptr change)]) -> (ptr change)
+  (let ([c (cast (ptr change) (arena-alloc current (sizeof change)))])
+    (set! (-> c scope) sc)
+    (set! (-> c kind) kind)
+    (set! (-> c next) next)
+    c))
+
+(define (changes-add [cs (ptr change)] [sc u32] [kind u32]) -> (ptr change)
+  (cond [(== cs 0) (new-change sc kind 0)]
+        [(!= (-> cs scope) sc) (new-change (-> cs scope) (-> cs kind) (changes-add (-> cs next) sc kind))]
+        [(!= kind 2) (new-change sc kind (-> cs next))]
+        [(== (-> cs kind) 2) (-> cs next)]
+        [else (new-change sc (- 1 (-> cs kind)) (-> cs next))]))
+
+(define (changes-compose [cs (ptr change)] [later (ptr change)]) -> (ptr change)
+  (when (== cs 0) (return later))
+  (while (!= later 0)
+    (set! cs (changes-add cs (-> later scope) (-> later kind)))
+    (set! later (-> later next)))
+  cs)
+
+(define (scopes-apply [s (ptr scope-set)] [cs (ptr change)]) -> (ptr scope-set)
+  (while (!= cs 0)
+    (set! s (scopes-change s (-> cs scope) (-> cs kind)))
+    (set! cs (-> cs next)))
+  s)
+
+;; No syntax object in the run's arena has changes pending: made later, they would be cells
+;; that die sooner. So there, changes are made at once.
+(define (change-all [s datum] [cs (ptr change)]) -> datum
+  (match s
+    [(syntax e scopes loc props pending)
+     (if (in-run-arena?)
+         (make-cell (syntax (push (push e pending) cs) (scopes-apply scopes cs) loc props 0))
+         (make-cell (syntax e (scopes-apply scopes cs) loc props (if (or (pair? e) (syntax? e)) (changes-compose pending cs) 0))))]
+    [_ s]))
+
+(define (push [d datum] [cs (ptr change)]) -> datum
+  (when (== cs 0) (return d))
+  (match (cell-of d)
+    [(syntax e scopes loc props pending) (change-all d cs)]
+    [(pair a b)
+     (let* ([head (cons (push a cs) nil)] [last head] [rest b])
+       (while (pair? rest)
+         (let ([p (cons (push (car rest) cs) nil)])
+           (set-cdr! last p)
+           (set! last p))
+         (set! rest (cdr rest)))
+       (set-cdr! last (if (syntax? rest) (change-all rest cs) rest))
+       head)]
+    [_ d]))
+
+(define (scopes-filter [s (ptr scope-set)] [keep? (fn (u32) -> i32)]) -> (ptr scope-set)
+  (let ([out (scratch-for (-> s count))] [n u32 0])
+    (for ([i u32 0]) (< i (-> s count)) (+= i 1)
+      (when (keep? (@ (-> s ids) i))
+        (set! (@ out n) (@ (-> s ids) i))
+        (+= n 1)))
+    (if (== n (-> s count)) s (intern-scopes out n))))
+
+(define (map-scopes [x datum] [op (fn ((ptr scope-set)) -> (ptr scope-set))]) -> datum
+  (match (cell-of x)
+    [(syntax e scopes loc props pending) (make-cell (syntax (map-scopes (syntax-e x) op) (op scopes) loc props 0))]
+    [(pair a b) (cons (map-scopes a op) (map-scopes b op))]
+    [_ x]))
+
+(define (add-scope [d datum] [sc u32]) -> datum (push d (new-change sc 0 0)))
+(define (remove-scope [d datum] [sc u32]) -> datum (push d (new-change sc 1 0)))
+(define (flip-scope [d datum] [sc u32]) -> datum (push d (new-change sc 2 0)))
+
+(define (add-scopes [d datum] [s (ptr scope-set)]) -> datum
+  (let ([cs (ptr change) 0])
+    (for ([i u32 0]) (< i (-> s count)) (+= i 1)
+      (set! cs (new-change (@ (-> s ids) i) 0 cs)))
+    (push d cs)))
+
+;; ---- syntax objects ----
+
+(define (syntax? [d datum]) #:inline -> i32 (match (cell-of d) [(syntax a b c e f) 1] [_ 0]))
+
+(define (make-syntax [e datum] [scopes (ptr scope-set)] [loc (ptr srcloc)] [props datum]) -> datum
+  (make-cell (syntax e scopes loc props 0)))
+
+(define (make-srcloc [source datum] [line u32] [col u32] [pos u32] [span u32]) -> (ptr srcloc)
+  (let ([l (cast (ptr srcloc) (arena-alloc current (sizeof srcloc)))])
+    (set! (-> l source) source)
+    (set! (-> l line) line)
+    (set! (-> l col) col)
+    (set! (-> l pos) pos)
+    (set! (-> l span) span)
+    l))
+
+(define (syntax-e [s datum]) #:copied -> datum
+  (match (cell-of s)
+    [(syntax e scopes loc props pending)
+     (when (!= pending 0)
+       (set! e (push e pending))
+       (set! pending 0))
+     e]
+    [_ (fail "expected a syntax object")]))
+
+;; Its datum as it is: pending changes do not change its shape.
+(define (datum-of [s datum]) -> datum (match (cell-of s) [(syntax e scopes loc props pending) e] [_ 0]))
+
+(define (identifier? [d datum]) -> i32 (and (syntax? d) (symbol? (datum-of d))))
+
+(define (syntax-scopes [s datum]) -> (ptr scope-set)
+  (match (cell-of s) [(syntax e scopes loc props pending) scopes] [_ (fail "expected a syntax object") 0]))
+
+(define (syntax-srcloc [s datum]) -> (ptr srcloc)
+  (match (cell-of s) [(syntax e scopes loc props pending) loc] [_ (fail "expected a syntax object") 0]))
+
+(define (syntax-props [s datum]) -> datum
+  (match (cell-of s) [(syntax e scopes loc props pending) props] [_ (fail "expected a syntax object")]))
+
+(define (splice-list [d datum]) -> datum (if (syntax? d) (syntax-e d) d))
+
+(define (syntax->list [d datum]) -> datum
+  (let ([e (splice-list d)])
+    (if (list? e) e 0)))
+
+(define (syntax->datum [d datum]) -> datum
+  (match (cell-of d)
+    [(syntax e scopes loc props pending) (syntax->datum e)]
+    [(pair a b) (cons (syntax->datum a) (syntax->datum b))]
+    [_ d]))
+
+(define (datum->syntax [ctx datum] [d datum] [loc datum]) -> datum
+  (wrap d (if (syntax? ctx) (syntax-scopes ctx) no-scopes) (if (syntax? loc) (syntax-srcloc loc) 0)))
+
+(define (wrap [d datum] [scopes (ptr scope-set)] [loc (ptr srcloc)]) -> datum
+  (match (cell-of d)
+    [(syntax e s l props pending) d]
+    [(pair a b)
+     (let* ([head (cons (wrap a scopes loc) nil)] [last head] [rest b])
+       (while (pair? rest)
+         (let ([p (cons (wrap (car rest) scopes loc) nil)])
+           (set-cdr! last p)
+           (set! last p))
+         (set! rest (cdr rest)))
+       (set-cdr! last (if (null? rest) nil (wrap rest scopes loc)))
+       (make-syntax head scopes loc nil))]
+    [_ (make-syntax d scopes loc nil)]))
+
+(define (syntax-rewrap [s datum] [e datum]) -> datum
+  (match (cell-of s) [(syntax x scopes loc props pending) (make-syntax e scopes loc props)] [_ (fail "expected a syntax object")]))
+
+;; A core form's name gets only the core scopes, 0 and 2, which name it in any module. Any other
+;; name gets ctx's scopes.
+(define core-scopes (ptr scope-set) (scopes-change (scopes-change no-scopes 0 0) 2 0))
+(define core-names (ptr hash-table) (make-table))
+
+(define (core-name? [name datum]) -> i32
+  (let ([known (hash-ref core-names (cast u64 name))])
+    (when (== known 0)
+      (set! known (if (== (identifier-binding-kind (make-syntax name core-scopes 0 nil)) core-symbol) 1 2))
+      (hash-set! core-names (cast u64 name) known))
+    (== known 1)))
+
+(define (core-syntax [ctx datum] [d datum] [loc datum]) -> datum
+  (core-wrap d (if (syntax? ctx) (syntax-scopes ctx) no-scopes) (if (syntax? loc) (syntax-srcloc loc) 0)))
+
+(define (core-wrap [d datum] [scopes (ptr scope-set)] [loc (ptr srcloc)]) -> datum
+  (match (cell-of d)
+    [(syntax e s l props pending) d]
+    [(symbol name length next) (make-syntax d (if (core-name? d) core-scopes scopes) loc nil)]
+    [(pair a b)
+     (let* ([head (cons (core-wrap a scopes loc) nil)] [last head] [rest b])
+       (while (pair? rest)
+         (let ([p (cons (core-wrap (car rest) scopes loc) nil)])
+           (set-cdr! last p)
+           (set! last p))
+         (set! rest (cdr rest)))
+       (set-cdr! last (if (null? rest) nil (core-wrap rest scopes loc)))
+       (make-syntax head core-scopes loc nil))]
+    [_ (make-syntax d core-scopes loc nil)]))
+
+;; ---- properties ----
+
+(define (syntax-property [s datum] [key datum]) -> datum
+  (let ([ps (match (cell-of s) [(syntax e scopes loc props pending) props] [_ (fail "expected a syntax object")])])
+    (while (pair? ps)
+      (when (== (car (car ps)) key) (return (cdr (car ps))))
+      (set! ps (cdr ps)))
+    0))
+
+(define (syntax-property-set [s datum] [key datum] [value datum]) -> datum
+  ;; A copy in the run's arena may have no changes pending.
+  (when (in-run-arena?) (syntax-e s))
+  (match (cell-of s)
+    [(syntax e scopes loc props pending)
+     (make-cell (syntax e scopes loc (cons (cons key value) (without key props)) pending))]
+    [_ (fail "expected a syntax object")]))
+
+(define (without [key datum] [ps datum]) -> datum
+  (cond [(not (pair? ps)) ps]
+        [(== (car (car ps)) key) (without key (cdr ps))]
+        [else (cons (car ps) (without key (cdr ps)))]))
+
+;; ---- keeping ----
+
+;; Pending changes are made before d is copied into the run's arena, which may hold none.
+(define (keep [d datum]) -> datum
+  (match (cell-of d)
+    [(pair a b) (let ([x (keep a)] [y (keep b)]) (make-cell-in (& run-arena) (pair x y)))]
+    [(string bytes length)
+     (let ([kept (cast (ptr u8) (arena-alloc (& run-arena) length))])
+       (memcpy kept bytes length)
+       (make-cell-in (& run-arena) (string kept length)))]
+    [(integer low high negative) (make-cell-in (& run-arena) (integer low high negative))]
+    [(flonum low high) (make-cell-in (& run-arena) (flonum low high))]
+    [(character c) (make-cell-in (& run-arena) (character c))]
+    [(syntax e scopes loc props pending)
+     (let ([x (keep (syntax-e d))] [l (keep-srcloc loc)] [ps (keep props)])
+       (make-cell-in (& run-arena) (syntax x scopes l ps 0)))]
+    [(transformer code env arity) (let ([e (keep env)]) (make-cell-in (& run-arena) (transformer code e arity)))]
+    [_ d]))
+
+(define (keep-srcloc [l (ptr srcloc)]) -> (ptr srcloc)
+  (if (== l 0)
+      0
+      (let ([kept (cast (ptr srcloc) (arena-alloc (& run-arena) (sizeof srcloc)))])
+        (set! (@ kept) (@ l))
+        kept)))
+
+;; ---- writing ----
+
+(const as-write i32 0)
+(const as-display i32 1)
+(const with-scopes i32 2)
+
+(define (write-datum [d datum]) (write-out d as-write))
+(define (write-scoped [d datum]) (write-out d with-scopes))
+
+(define (write-out [d datum] [how i32])
+  (let ([b (make-buffer)])
+    (write-to (& b) d how)
+    (write-bytes (cast i32 (-> b bytes)) (-> b length))
+    (buffer-free! (& b))))
+
+(define (write-to [b (ptr buffer)] [d datum] [how i32]) (write-in b d how 0))
+
+(define (write-in [b (ptr buffer)] [d datum] [how i32] [in i32])
+  (when (fixnum-datum? d)
+    (let ([n (fixnum-of d)])
+      (when (< n 0) (buffer-add-byte! b 45))
+      (write-decimal b (cast u64 (if (< n 0) (- 0 n) n)))
+      (return)))
+  (match d
+    [#f (buffer-add-string! b "#f")]
+    [(pair x y) (write-pair b d how in)]
+    [empty (buffer-add-string! b "()")]
+    [true (buffer-add-string! b "#t")]
+    [(symbol name length next) (buffer-add! b name length)]
+    [(keyword name length next) (buffer-add-string! b "#:") (buffer-add! b name length)]
+    [(string bytes length) (if (== how as-display) (buffer-add! b bytes length) (write-string b bytes length))]
+    [(integer low high negative)
+     (when negative (buffer-add-byte! b 45))
+     (write-decimal b (if negative (- 0 (integer-value d)) (integer-value d)))]
+    [(flonum low high) (write-flonum b (flonum-value d))]
+    [(character c) (if (== how as-display) (buffer-add-utf-8! b c) (write-char b c))]
+    [(record kind p) (buffer-add-string! b "#<record ") (write-decimal b kind) (buffer-add-byte! b 62)]
+    [(transformer code env arity) (buffer-add-string! b "#<transformer>")]
+    [(syntax e scopes loc props pending)
+     (cond [(== how with-scopes) (write-in b (syntax-e d) how 1) (write-scopes b scopes)]
+           [in (write-in b e how 1)]
+           [else (buffer-add-string! b "#<syntax ") (write-in b e how 1) (buffer-add-byte! b 62)])]))
+
+(define (write-pair [b (ptr buffer)] [d datum] [how i32] [in i32])
+  (let ([prefix (abbreviation d)] [rest (cdr d)])
+    (when (!= prefix 0)
+      (buffer-add-string! b prefix)
+      (return (write-in b (cadr d) how in)))
+    (buffer-add-byte! b 40)
+    (write-in b (car d) how in)
+    (while (pair? rest)
+      (buffer-add-byte! b 32)
+      (write-in b (car rest) how in)
+      (set! rest (cdr rest)))
+    (unless (null? rest)
+      (buffer-add-string! b " . ")
+      (write-in b rest how in))
+    (buffer-add-byte! b 41)))
+
+(define (abbreviation [d datum]) -> (ptr u8)
+  (let ([head (car d)] [rest (cdr d)])
+    (cond [(or (not (pair? rest)) (not (null? (cdr rest)))) 0]
+          [(== head quote-symbol) "'"]
+          [(== head quasiquote-symbol) "`"]
+          [(== head unquote-symbol) ","]
+          [(== head unquote-splicing-symbol) ",@"]
+          [(== head quote-syntax-symbol) "#'"]
+          [(== head quasisyntax-symbol) "#`"]
+          [(== head unsyntax-symbol) "#,"]
+          [(== head unsyntax-splicing-symbol) "#,@"]
+          [else 0])))
+
+(define (write-scopes [b (ptr buffer)] [s (ptr scope-set)])
+  (buffer-add-byte! b 123)
+  (for ([i u32 0]) (< i (-> s count)) (+= i 1)
+    (when (> i 0) (buffer-add-byte! b 32))
+    (write-decimal b (@ (-> s ids) i)))
+  (buffer-add-byte! b 125))
+
+;; ---- errors ----
+
+(exception compile-error datum datum (ptr srcloc))
+
+(define (raise-compile-error [loc (ptr srcloc)] [message datum])
+  (throw compile-error message 0 loc))
+
+(define (format-message [template (ptr u8)] [args datum]) -> datum
+  (format-bytes template (strlen template) args))
+
+(define (format [template datum] [args datum]) -> datum
+  (format-bytes (string-bytes template) (string-length template) args))
+
+(define (format-bytes [template (ptr u8)] [n u32] [args datum]) -> datum
+  (let ([b (make-buffer)] [i u32 0] [s datum 0])
+    (while (< i n)
+      (if (and (== (@ template i) 126) (< (+ i 1) n) (pair? args))
+          (begin
+            (write-to (& b) (car args) (if (== (@ template (+ i 1)) 115) as-write as-display))
+            (set! args (cdr args))
+            (+= i 2))
+          (begin
+            (buffer-add-byte! (& b) (@ template i))
+            (+= i 1))))
+    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (buffer-free! (& b))
+    s))
+
+(define (write-compile-error [b (ptr buffer)] [message datum] [blamed datum] [loc (ptr srcloc)])
+  (let ([at (if (and (== loc 0) (syntax? blamed)) (syntax-srcloc blamed) loc)])
+    (if (== at 0)
+        (buffer-add-string! b "<unknown>")
+        (begin
+          (write-to b (-> at source) as-display)
+          (buffer-add-byte! b 58)
+          (write-decimal b (-> at line))
+          (buffer-add-byte! b 58)
+          (write-decimal b (+ (-> at col) 1))))
+    (buffer-add-string! b ": error: ")
+    (write-to b message as-display)
+    (when (syntax? blamed)
+      (buffer-add-string! b "\n  in: ")
+      (write-to b (as-written (syntax->datum blamed)) as-write))
+    (buffer-add-byte! b 10)))
+
+;; d without the forms the expander adds: (#%app f x) is (f x), (#%datum x) is x.
+(define (as-written [d datum]) -> datum
+  (cond [(not (pair? d)) d]
+        [(and (== (car d) datum-symbol) (pair? (cdr d)) (null? (cddr d))) (cadr d)]
+        [else (written-list (if (== (car d) app-symbol) (cdr d) d))]))
+
+(define (written-list [l datum]) -> datum
+  (if (pair? l) (cons (as-written (car l)) (written-list (cdr l))) l))
+
+;; ==== the macro contract ====
+;; Compile-time code links to the running compiler's instance of this module, so the compiler
+;; and every macro share its data and state.
+
+;; ---- the contract's other names ----
+
+(define (fixnum [n i32]) -> datum (make-integer n))
+(define (fixnum-value [d datum]) -> i32 (cast i32 (integer-value d)))
+
+(define (unsafe-car [p datum]) -> datum (match (cell-of p) [(pair a d) a] [_ 0]))
+(define (unsafe-cdr [p datum]) -> datum (match (cell-of p) [(pair a d) d] [_ 0]))
+
+(define (string-byte [s datum] [i u32]) -> u32
+  (when (>= i (string-length s)) (fail "string-byte: index out of range"))
+  (@ (string-bytes s) i))
+
+(define (string-append [a datum] [b datum]) -> datum
+  (let ([buf (make-buffer)] [s datum 0])
+    (buffer-add! (& buf) (string-bytes a) (string-length a))
+    (buffer-add! (& buf) (string-bytes b) (string-length b))
+    (set! s (bytes->string (-> buf bytes) (-> buf length)))
+    (buffer-free! (& buf))
+    s))
+
+(define (symbol-hash [s datum]) -> u32 (cast u32 (hash-bytes (symbol-bytes s) (symbol-length s))))
+(define (string->keyword [s datum]) -> datum (bytes->keyword (string-bytes s) (string-length s)))
+
+(define (syntax-source [s datum]) -> datum (let ([l (syntax-srcloc s)]) (if (== l 0) 0 (-> l source))))
+(define (syntax-line [s datum]) -> datum (let ([l (syntax-srcloc s)]) (if (== l 0) 0 (make-integer (-> l line)))))
+(define (syntax-column [s datum]) -> datum (let ([l (syntax-srcloc s)]) (if (== l 0) 0 (make-integer (-> l col)))))
+
+;; ---- transformers ----
+
+(define (make-transformer [code u32] [env datum]) -> datum (make-cell (transformer code env 2)))
+(define (make-function-transformer [code u32]) -> datum (make-cell (transformer code 0 1)))
+
+(define (transformer? [d datum]) -> i32 (match (cell-of d) [(transformer code env arity) 1] [_ 0]))
+
+(define (transformer-env [t datum]) -> datum
+  (match (cell-of t) [(transformer code env arity) env] [_ (fail "expected a transformer")]))
+
+(define (call-transformer [t datum] [s datum]) -> datum
+  (match (cell-of t)
+    [(transformer code env arity)
+     (if (== arity 1)
+         (let ([f (cast (fn (datum) -> datum) code)]) (f s))
+         (let ([f (cast (fn (datum datum) -> datum) code)]) (f env s)))]
+    [_ (fail "expected a transformer")]))
+
+;; ---- syntax errors ----
+
+(define (raise-syntax-error [name datum] [message datum] [stx datum]) -> datum
+  (let ([who (if (symbol? name) name (named-by stx))])
+    (throw compile-error (if (== who 0) message (format-message "~a: ~a" (cons who (cons message nil)))) stx 0)
+    0))
+
+(define (named-by [stx datum]) -> datum
+  (cond [(identifier? stx) (syntax-e stx)]
+        [(and (syntax? stx) (pair? (syntax-e stx)) (identifier? (car (syntax-e stx)))) (syntax-e (car (syntax-e stx)))]
+        [else 0]))
+
+;; ---- what syntax-match's code calls ----
+;; Here rather than in macros.sub, so that their calls to the functions above stay in this module.
+
+(define (match-pair [x datum]) -> datum (let ([m (splice-list x)]) (if (pair? m) m 0)))
+
+(define (match-datum? [x datum] [v datum]) -> i32 (equal? (if (pair? v) (syntax->datum x) (splice-list x)) v))
+
+(define (match-bound? [x datum] [id datum]) -> i32 (and (identifier? x) (free-identifier=? x id)))
+
+(define (match-elements [l datum]) -> datum
+  (let ([m (splice-list l)])
+    (cond [(null? m) nil]
+          [(list? m) m]
+          [(pair? m) (let ([r (match-elements (cdr m))]) (if r (cons (car m) r) 0))]
+          [else 0])))
+
+(define (match-after [l datum] [n i32]) -> datum
+  (while (> n 0)
+    (set! l (cdr (splice-list l)))
+    (-= n 1))
+  l)
+
+;; A pattern that starts with _ is given as (text) and shown with the head of x.
+(define (match-failure [texts datum] [x datum]) -> datum
+  (let ([shown nil] [l (splice-list x)] [name (named-by x)])
+    (for ([ts texts]) (pair? ts) (set! ts (cdr ts))
+      (let ([t (car ts)])
+        (set! shown (cons (if (pair? t)
+                              (format-message "(~a~a" (cons (if (and (pair? l) (identifier? (car l))) (syntax-e (car l)) (symbol-named "_"))
+                                                       (cons (car t) nil)))
+                              t)
+                          shown))))
+    (let ([message (format-message "expected ~a" (cons (alternatives (reverse shown)) nil))])
+      (if (!= name 0) (format-message "~a: ~a" (cons name (cons message nil))) message))))
+
+(define (alternatives [ts datum]) -> datum
+  (cond [(null? (cdr ts)) (car ts)]
+        [(null? (cddr ts)) (format-message "~a or ~a" ts)]
+        [else (format-message "~a, ~a" (cons (car ts) (cons (alternatives (cdr ts)) nil)))]))
+
+(define (local-binding [id datum]) -> datum (syntax-property id local-binding-symbol))
+
+;; ---- expander queries ----
+
+(define (no-expander [a datum]) -> datum (fail "an expander query was used outside the expander"))
+(define (no-expander-2 [a datum] [b datum]) -> datum (fail "an expander query was used outside the expander"))
+
+(define q-local-value (fn (datum) -> datum) no-expander)
+(define q-free-identifier=? (fn (datum datum) -> datum) no-expander-2)
+(define q-binding-kind (fn (datum) -> datum) no-expander)
+(define q-local-expand (fn (datum) -> datum) no-expander)
+(define q-lift (fn (datum) -> datum) no-expander)
+(define q-signature (fn (datum) -> datum) no-expander)
+(define q-introduce (fn (datum) -> datum) no-expander)
+(define q-local-facts (fn (datum) -> datum) no-expander)
+(define q-identifier-name (fn (datum) -> datum) no-expander)
+(define q-name-identifier (fn (datum) -> datum) no-expander)
+(define q-shape (fn (datum) -> datum) no-expander)
+
+(define (set-queries! [local-value (fn (datum) -> datum)] [free-identifier (fn (datum datum) -> datum)]
+                      [binding-kind (fn (datum) -> datum)] [local-exp (fn (datum) -> datum)] [lift (fn (datum) -> datum)]
+                      [signature (fn (datum) -> datum)] [introduce (fn (datum) -> datum)] [local-facts (fn (datum) -> datum)]
+                      [id-name (fn (datum) -> datum)] [name-id (fn (datum) -> datum)] [shape (fn (datum) -> datum)])
+  (set! q-local-value local-value)
+  (set! q-free-identifier=? free-identifier)
+  (set! q-binding-kind binding-kind)
+  (set! q-local-expand local-exp)
+  (set! q-lift lift)
+  (set! q-signature signature)
+  (set! q-introduce introduce)
+  (set! q-local-facts local-facts)
+  (set! q-identifier-name id-name)
+  (set! q-name-identifier name-id)
+  (set! q-shape shape))
+
+(define (syntax-local-value [id datum]) -> datum (q-local-value id))
+
+(define (free-identifier=? [a datum] [b datum]) -> i32 (!= (q-free-identifier=? a b) 0))
+
+(define (identifier-binding-kind [id datum]) -> datum (q-binding-kind id))
+
+(define (identifier-function-signature [id datum]) -> datum (q-signature id))
+
+(define (local-expand [stx datum]) -> datum (q-local-expand stx))
+
+(define (syntax-local-lift-definition [form datum]) -> datum (q-lift form))
+
+(define (syntax-local-introduce [stx datum]) -> datum (q-introduce stx))
+
+(define (syntax-local-facts [id datum]) -> datum (q-local-facts id))
+
+(define (identifier-name [id datum]) -> datum (q-identifier-name id))
+(define (name-identifier [name datum]) -> datum (q-name-identifier name))
+
+;; The shape of s, a use of a form that fully expanded code keeps, or #f.
+(define (syntax-local-shape [s datum]) -> datum (q-shape s))
+
+;; ---- shapes ----
+
+;; A shape lists a form's parts, so that code can go through the form without knowing it. A piece
+;; is bare syntax, an expression, or (role r x) with role expr, binder, label, type, name or callee.
+;; A part in parentheses is (group x piece ...). A binder or label names a variable or a block in
+;; the expressions of its region r; region 0 is outside the form.
+
+(define expr-symbol datum (symbol-named "expr"))
+(define group-symbol datum (symbol-named "group"))
+
+(define (piece-role [p datum]) -> datum (if (syntax? p) expr-symbol (car p)))
+(define (piece-syntax [p datum]) -> datum (if (syntax? p) p (caddr p)))
+(define (piece-region [p datum]) -> i32 (if (or (syntax? p) (== (car p) group-symbol)) 0 (fixnum-value (cadr p))))
+(define (pieces-of [g datum]) -> datum (cddr g))
+
+;; The pieces of the shape m that are not groups, in order.
+(define (shape-pieces [m datum]) -> datum (reverse (pieces-onto m nil)))
+
+(define (pieces-onto [m datum] [acc datum]) -> datum
+  (if (== (piece-role m) group-symbol)
+      (let ([ps (cddr m)])
+        (while (pair? ps)
+          (set! acc (pieces-onto (car ps) acc))
+          (set! ps (cdr ps)))
+        acc)
+      (cons m acc)))
+
+;; The form m stands for, made again from xs, one for each piece shape-pieces gives.
+(define (shape-syntax [m datum] [xs datum]) -> datum (car (syntax-from m xs)))
+
+(define (syntax-from [m datum] [xs datum]) -> datum
+  (if (== (piece-role m) group-symbol)
+      (let ([out nil] [ps (cddr m)])
+        (while (pair? ps)
+          (let ([r (syntax-from (car ps) xs)])
+            (set! out (cons (car r) out))
+            (set! xs (cdr r)))
+          (set! ps (cdr ps)))
+        (cons (syntax-rewrap (cadr m) (reverse out)) xs))
+      xs))
+
+;; ---- quoted data ----
+;; Before instantiating a wasm module, the compiler maps its scope indexes to the run's scopes
+;; (set-scope-map!); a wasm module in a running program gets no map and keeps the indexes.
+
+(define scope-map (ptr u32) 0)
+(define scope-map-count u32 0)
+
+(define (set-scope-map! [map (ptr u32)] [n u32])
+  (set! scope-map map)
+  (set! scope-map-count n))
+
+(define (literal-buffer [n u32]) -> (ptr u8) (cast (ptr u8) (arena-alloc current n)))
+
+(define in-bytes (ptr u8) 0)
+(define in-at u32 0)
+
+(define (in-byte) -> u32
+  (let ([b (@ in-bytes in-at)])
+    (+= in-at 1)
+    b))
+
+(define (in-uleb) -> u64
+  (let ([n u64 0] [shift u64 0] [b u32 128])
+    (while (!= (bit-and b 128) 0)
+      (set! b (in-byte))
+      (set! n (bit-or n (<< (cast u64 (bit-and b 127)) shift)))
+      (+= shift 7))
+    n))
+
+(define (in-sleb) -> i64
+  (let ([n u64 0] [shift u64 0] [b u32 128] [ones u64 18446744073709551615])
+    (while (!= (bit-and b 128) 0)
+      (set! b (in-byte))
+      (set! n (bit-or n (<< (cast u64 (bit-and b 127)) shift)))
+      (+= shift 7))
+    (when (and (< shift 64) (!= (bit-and b 64) 0)) (set! n (bit-or n (<< ones shift))))
+    (cast i64 n)))
+
+(define (in-u64) -> u64
+  (let ([n u64 0])
+    (for ([i u64 0]) (< i 8) (+= i 1) (set! n (bit-or n (<< (cast u64 (in-byte)) (* i 8)))))
+    n))
+
+(define (deserialize [bytes (ptr u8)] [n u32]) -> (ptr datum)
+  (set! in-bytes bytes)
+  (set! in-at 0)
+  (let* ([count (cast u32 (in-uleb))] [objs (cast (ptr u32) (arena-alloc current (* 4 (+ count 1))))])
+    (for ([i u32 0]) (< i count) (+= i 1) (set! (@ objs i) (in-entry objs)))
+    (cast (ptr datum) objs)))
+
+(define (in-object [objs (ptr u32)]) -> u32 (@ objs (cast u32 (in-uleb))))
+
+(define (in-entry [objs (ptr u32)]) -> u32
+  (let ([kind (in-byte)] [n u32 0] [p (ptr u8) 0])
+    (case kind
+      [(0) 0]
+      [(1) (cast u32 (make-integer (in-sleb)))]
+      [(2) (cast u32 (boolean 1))]
+      [(3) (cast u32 nil)]
+      [(4) (cast u32 (integer->char (cast u32 (in-uleb))))]
+      [(5) (let* ([a (in-object objs)] [d (in-object objs)]) (cast u32 (cons (cast datum a) (cast datum d))))]
+      [(6 7 13)
+       (set! n (cast u32 (in-uleb)))
+       (set! p (+ in-bytes in-at))
+       (+= in-at n)
+       (cast u32 (case kind [(6) (bytes->symbol p n)] [(7) (bytes->string p n)] [else (bytes->keyword p n)]))]
+      [(8)
+       (let* ([e (in-object objs)] [scopes (in-object objs)] [loc (in-object objs)] [props (in-object objs)])
+         (cast u32 (make-syntax (cast datum e) (scopes-of (cast datum scopes)) (cast (ptr srcloc) loc) (cast datum props))))]
+      [(9)
+       (let* ([source (in-object objs)] [line (in-sleb)] [col (in-sleb)] [pos (in-sleb)] [span (in-sleb)])
+         (cast u32 (make-srcloc (cast datum source) (cast u32 line) (cast u32 col) (cast u32 pos) (cast u32 span))))]
+      [(10)
+       (let* ([negative (in-byte)] [m (in-u64)])
+         (cast u32 (if negative (make-integer (- 0 (cast i64 m))) (make-unsigned-integer m))))]
+      [(11) (cast u32 (make-flonum (bits-f64 (cast i64 (in-u64)))))]
+      [else (fail "deserialize: an unknown kind of object") 0])))
+
+(define (scopes-of [l datum]) -> (ptr scope-set)
+  (let ([s no-scopes] [i u32 0])
+    (while (pair? l)
+      (set! i (cast u32 (integer-value (car l))))
+      (set! s (scopes-change s (if (and (!= scope-map 0) (< i scope-map-count)) (@ scope-map i) i) 0))
+      (set! l (cdr l)))
+    s))

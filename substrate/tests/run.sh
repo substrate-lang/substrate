@@ -94,18 +94,42 @@ done
 stale="$builds/stale"
 rm -rf "${stale:?}"
 mkdir -p "$stale"
-print="(require print \"$root/compiler/print.sub\" write-int newline)"
-printf '(provide x)\n(func (x) -> i32 1)\n' > "$stale/b.sub"
-printf '%s\n(require b "b.sub" x)\n(func (main) (write-int (x)) (newline))\n' "$print" > "$stale/a.sub"
+printf '(provide x)\n(define (x) -> i32 1)\n' > "$stale/b.sub"
+printf '(require b "b.sub" x)\n(define (main) (write-int (x)) (newline))\n' > "$stale/a.sub"
 first="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
 rm "$stale/b.sub"
-printf '%s\n(func (main) (write-int 2) (newline))\n' "$print" > "$stale/a.sub"
+printf '(define (main) (write-int 2) (newline))\n' > "$stale/a.sub"
 second="$(bin/sub build "$stale/a.sub" -o "$stale/a" -c "$cache" 2>&1 && "$host" "$root/$stale/a" 2>&1)"
 if [ "$first" = 1 ] && [ "$second" = 2 ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
   echo "FAIL the stale cache entry: got $first, then $second"
+fi
+# A test with macros builds against changed compiler sources and runs as it does here.
+changed="$builds/changed"
+rm -rf "${changed:?}"
+mkdir -p "$changed/tests/substrate"
+cp -r compiler "$changed/"
+cp tests/substrate/forms.sub "$changed/tests/substrate/"
+from_changed() {
+  "$host" "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
+    -p "$root/$changed" -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
+}
+echo ';; changed' >> "$changed/compiler/substrate.sub"
+sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' "$changed/compiler/syntax.sub"
+if [ "$(from_changed)" = "$(cat tests/substrate/forms.out)" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL changed sources: tests/substrate/forms.sub does not build and run as it does here"
+fi
+sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/compiler/syntax.sub"
+if grep -qF "whose srcloc differs" <<< "$(from_changed)"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL changed sources: a changed srcloc is not refused"
 fi
 echo "$pass passed, $fail failed; $again built again from the cache"
 [ $fail -eq 0 ]
