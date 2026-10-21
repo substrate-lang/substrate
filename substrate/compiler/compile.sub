@@ -17,7 +17,8 @@
 (const synth-kind u32 40)
 
 (struct mstate [self datum] [func-imports datum] [global-imports datum] [tag-imports datum] [synths datum] [fidx datum]
-        [uses-memory i32] [memory-loc (ptr srcloc)] [uses-table i32] [table-loc (ptr srcloc)]
+        [uses-memory i32] [memory-loc (ptr srcloc)] [substrate-memory datum] [uses-table i32] [table-loc (ptr srcloc)]
+        [substrate-table datum] [own-fidx datum] [own-slots datum]
         [literals (ptr serializer)] [literals-table datum] [exported (ptr hash-table)]
         [fname datum] [imported (ptr hash-table)] [slots datum] [slot-imports datum] [extra-places datum])
 
@@ -186,8 +187,12 @@
     (set! (-> ms fidx) nil)
     (set! (-> ms uses-memory) 0)
     (set! (-> ms memory-loc) 0)
+    (set! (-> ms substrate-memory) 0)
     (set! (-> ms uses-table) 0)
     (set! (-> ms table-loc) 0)
+    (set! (-> ms substrate-table) 0)
+    (set! (-> ms own-fidx) nil)
+    (set! (-> ms own-slots) 0)
     (set! (-> ms literals) 0)
     (set! (-> ms literals-table) 0)
     (set! (-> ms exported) (make-table))
@@ -235,14 +240,17 @@
     (set! (-> ms synths) (cons (-> s self) (-> ms synths)))
     (-> s self)))
 
-(define (fidx-synth! [ms (ptr mstate)] [info datum]) -> datum
+;; own is for an index in the module's own table.
+(define (fidx-synth! [ms (ptr mstate)] [info datum] [own i32]) -> datum
   (note-table! ms)
-  (let ([found (assq info (-> ms fidx))])
+  (let ([found (assq info (if own (-> ms own-fidx) (-> ms fidx)))])
     (if (!= found 0)
         (cdr found)
-        (let ([s (new-synth! ms 'fidx info)])
+        (let ([s (new-synth! ms (if own 'own-fidx 'fidx) info)])
           (note-func! ms info)
-          (set! (-> ms fidx) (cons (cons info s) (-> ms fidx)))
+          (if own
+              (set! (-> ms own-fidx) (cons (cons info s) (-> ms own-fidx)))
+              (set! (-> ms fidx) (cons (cons info s) (-> ms fidx))))
           s))))
 
 (define (export-name! [ms (ptr mstate)] [name datum]) -> datum
@@ -448,22 +456,24 @@
          (args-code ms fc labels (cadr args) (func-info-params info))
          (call! fc `(call ,info) (func-info-results info) expected tail))]
       [(== kind 'prim)
-       (let* ([name (car args)] [offset (cadr args)] [p (lookup-prim name)])
-         (when (or (== (-> p kind) 'mem) (!= (memq name '(memory.size memory.grow memory.copy memory.fill)) 0))
-           (note-memory! ms))
+       (let* ([name (car args)] [offset (cadr args)] [p (lookup-prim name)]
+              [memory (small (if (and (!= (-> ms substrate-memory) 0) (pair? (cdddr args))) 1 0))])
+         (unless (== (-> p kind) 'plain) (note-memory! ms))
          (args-code ms fc labels (caddr args) (-> p params))
-         (emit! fc (if (== (-> p kind) 'mem)
-                       `(,name ,(-> p align) ,(if (!= offset 0) offset (small 0)))
-                       (cons name nil)))
+         (emit! fc (case (-> p kind)
+                     [('mem) `(,name (,(-> p align) ,(if (!= offset 0) offset (small 0)) ,memory))]
+                     [('memory) (if (== name 'memory.copy) `(,name ,memory ,memory) `(,name ,memory))]
+                     [else (cons name nil)]))
          (fit fc (-> p results) expected))]
       [(== kind 'call-indirect)
        (note-table! ms)
-       (let ([params (car args)] [results (cadr args)])
+       (let ([params (car args)] [results (cadr args)]
+             [table (small (if (and (!= (-> ms substrate-table) 0) (pair? (cdr (cdddr args)))) 1 0))])
          (args-code ms fc labels (cadddr args) params)
          (code-of ms fc labels (caddr args) 'i32)
-         (call! fc `(call_indirect (func ,params ,results) 0) results expected tail))]
+         (call! fc `(call_indirect (func ,params ,results) ,table) results expected tail))]
       [(== kind 'func-index)
-       (emit! fc `(global.get ,(fidx-synth! ms (car args))))
+       (emit! fc `(global.get ,(fidx-synth! ms (car args) (and (!= (-> ms substrate-table) 0) (pair? (cdr args))))))
        (fit fc '(i32) expected)]
       [(== kind 'select)
        (unless (single? expected) (fail "internal: select without a single type" nil))
@@ -506,7 +516,7 @@
              (emit! fc '(i32.const 0))
              (let ([i (serialize! (module-literals ms) d)])
                (emit! fc `(global.get ,(-> ms literals-table)))
-               (emit! fc `(i32.load 2 ,(small (* 4 i))))))
+               (emit! fc `(i32.load (2 ,(small (* 4 i)) 0)))))
          (fit fc '(i32) expected))]
       [else (fail "internal: unknown lowered form ~s" (cons kind nil))])))
 
@@ -677,6 +687,10 @@
          [literal-segment datum 0]
          [place i32 0])
     (export-name! ms '%slots)
+    ;; A module with a memory or table of its own has Substrate's as well, as memory or table 0, for
+    ;; the code Substrate compiles. The wasm instructions written in it use its own, memory or table 1.
+    (set! (-> ms substrate-memory) (form-of forms 'substrate-memory 'substrate-memory))
+    (set! (-> ms substrate-table) (form-of forms 'substrate-table 'substrate-table))
     (for-each (lambda ([f datum])
                 (set-func-info-instance! (cadr f) self)
                 (set-func-info-export! (cadr f) (export-name! ms (func-info-name (cadr f)))))
@@ -721,11 +735,11 @@
               (reverse (-> ms synths)))
     (when (and (-> ms uses-memory) (== memory-form 0))
       (raise-compile-error (-> ms memory-loc) '"this code uses memory, but the module defines none: add (memory pages)"))
-    ;; Quoted data is in the syntax module's memory, so a module that quotes data cannot
-    ;; have a memory of its own.
+    ;; Quoted data is in the syntax module's memory, which a module with only a memory of its own
+    ;; does not have.
     (when (!= (-> ms literals) 0)
       (cond [(== memory-form 0) (set! memory-form `(memory-import ,(func-info-instance literal-buffer-info)))]
-            [(== (car memory-form) 'memory)
+            [(and (== (car memory-form) 'memory) (== (-> ms substrate-memory) 0))
              (fail "quoted data is the syntax module's, in its memory, which this module's own memory is not: take it with (memory from s), s the syntax module"
                    nil)]))
     (link-module ms (-> first next) start-fc setup literal-segment global-forms tag-forms memory-form table-form
@@ -743,25 +757,39 @@
          (cx ms fc 0 (cadr f) nil 0)]))
 
 ;; Fills the module's slots from its passive segment: its n functions, then the functions it takes
-;; the index of whose modules keep no slots.
+;; the index of whose modules keep no slots, and the other modules' functions it takes the index of
+;; in its own table. Its own table gets the same slots.
 (define (slots-code! [ms (ptr mstate)] [setup (ptr asm)] [n u32])
-  (let ([fs (reverse (-> ms fidx))])
+  (let ([fs (reverse (-> ms fidx))] [os (reverse (-> ms own-fidx))])
     (while (pair? fs)
-      (when (< (func-info-place (car (car fs))) 0)
-        (set! (-> ms extra-places) (cons (cons (car (car fs)) (small n)) (-> ms extra-places)))
-        (+= n 1))
+      (when (< (func-info-place (car (car fs))) 0) (set! n (extra-place! ms (car (car fs)) n)))
       (set! fs (cdr fs)))
+    (while (pair? os)
+      (when (external? ms (func-info-instance (car (car os)))) (set! n (extra-place! ms (car (car os)) n)))
+      (set! os (cdr os)))
     (when (> n 0)
-      (set! (-> ms slots) (new-synth! ms 'slots 0))
-      (instr! setup '(ref.null func))
-      (instr! setup `(i32.const ,(small n)))
-      (instr! setup '(table.grow 0))
-      (instr! setup `(global.set ,(-> ms slots)))
-      (instr! setup `(global.get ,(-> ms slots)))
-      (instr! setup '(i32.const 0))
-      (instr! setup `(i32.const ,(small n)))
-      (instr! setup '(table.init 0 0))
+      (set! (-> ms slots) (fill-slots! ms setup 0 n))
+      (unless (null? (-> ms own-fidx)) (set! (-> ms own-slots) (fill-slots! ms setup 1 n)))
       (instr! setup '(elem.drop 0)))))
+
+;; The slot after the n before it, for f if it has none: returns how many there are.
+(define (extra-place! [ms (ptr mstate)] [f datum] [n u32]) -> u32
+  (if (!= (assq f (-> ms extra-places)) 0)
+      n
+      (begin (set! (-> ms extra-places) (cons (cons f (small n)) (-> ms extra-places))) (+ n 1))))
+
+;; Grows table t by n slots and fills them from the passive segment: returns the global of the first.
+(define (fill-slots! [ms (ptr mstate)] [setup (ptr asm)] [t i32] [n u32]) -> datum
+  (let ([s (new-synth! ms 'slots 0)])
+    (instr! setup '(ref.null func))
+    (instr! setup `(i32.const ,(small n)))
+    (instr! setup `(table.grow ,(small t)))
+    (instr! setup `(global.set ,s))
+    (instr! setup `(global.get ,s))
+    (instr! setup '(i32.const 0))
+    (instr! setup `(i32.const ,(small n)))
+    (instr! setup `(table.init 0 ,(small t)))
+    s))
 
 (define (slots-of! [ms (ptr mstate)] [instance datum]) -> datum
   (let ([known (assoc instance (-> ms slot-imports))])
@@ -777,9 +805,11 @@
     (cond
       [(== (-> sy kind) 'slots) (begin)]
       ;; A function's index is its module's first slot plus its place.
-      [(== (-> sy kind) 'fidx)
+      [(or (== (-> sy kind) 'fidx) (== (-> sy kind) 'own-fidx))
        (let* ([f (-> sy info)] [extra (assq f (-> ms extra-places))]
-              [first (if (and (== extra 0) (external? ms (func-info-instance f))) (slots-of! ms (func-info-instance f)) (-> ms slots))])
+              [first (cond [(== (-> sy kind) 'own-fidx) (-> ms own-slots)]
+                           [(and (== extra 0) (external? ms (func-info-instance f))) (slots-of! ms (func-info-instance f))]
+                           [else (-> ms slots)])])
          (instr! setup `(global.get ,first))
          (instr! setup `(i32.const ,(if (!= extra 0) (cdr extra) (small (func-info-place f)))))
          (instr! setup '(i32.add))
@@ -880,7 +910,11 @@
     (for-each (lambda ([t datum])
                 (set! imports (cons `(,(tag-info-instance t) ,(tag-info-export t) tag ,(tag-type-index lk t)) imports)))
               tag-imports)
+    (let ([s (-> ms substrate-memory)])
+      (when (!= s 0) (set! imports (cons `(,(cadr s) "memory" memory (0 #f)) imports))))
     (when (imported-storage? memory-form) (set! imports (cons `(,(cadr memory-form) "memory" memory (0 #f)) imports)))
+    (let ([s (-> ms substrate-table)])
+      (when (!= s 0) (set! imports (cons `(,(cadr s) "table" table (0 #f)) imports))))
     (when (imported-storage? table-form) (set! imports (cons `(,(cadr table-form) "table" table (0 #f)) imports)))
     (set! imports (reverse imports))
     ;; ---- functions ----
@@ -917,8 +951,10 @@
     (for-each (lambda ([f datum])
                 (set! exports (cons `(,(tag-info-export (cadr f)) tag ,(index-of (-> lk tags) (cadr f) "a tag")) exports)))
               tag-forms)
-    (when (!= memory-form 0) (set! exports (cons '("memory" memory 0) exports)))
-    (when (!= table-form 0) (set! exports (cons '("table" table 0) exports)))
+    (when (!= memory-form 0)
+      (set! exports (cons `("memory" memory ,(small (if (!= (-> ms substrate-memory) 0) 1 0))) exports)))
+    (when (!= table-form 0)
+      (set! exports (cons `("table" table ,(small (if (!= (-> ms substrate-table) 0) 1 0))) exports)))
     (when (!= (-> ms slots) 0) (set! exports (cons `("%slots" global ,(index-of (-> lk globals) (-> ms slots) "a global")) exports)))
     (set! exports (reverse exports))
     ;; ---- names ----
