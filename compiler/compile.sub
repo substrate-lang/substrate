@@ -20,7 +20,8 @@
         [uses-memory i32] [memory-loc (ptr srcloc)] [substrate-memory datum] [uses-table i32] [table-loc (ptr srcloc)]
         [substrate-table datum] [own-fidx datum] [own-slots datum]
         [literals (ptr serializer)] [literals-table datum] [exported (ptr hash-table)]
-        [fname datum] [imported (ptr hash-table)] [slots datum] [slot-imports datum] [extra-places datum])
+        [fname datum] [imported (ptr hash-table)] [slots datum] [slot-imports datum] [extra-places datum]
+        [segment datum])
 
 (struct compiled [info datum] [sig datum] [locals datum] [asm (ptr asm)] [next (ptr compiled)])
 
@@ -198,6 +199,7 @@
     (set! (-> ms slots) 0)
     (set! (-> ms slot-imports) nil)
     (set! (-> ms extra-places) nil)
+    (set! (-> ms segment) nil)
     ms))
 
 (define (external? [ms (ptr mstate)] [instance datum]) -> i32 (not (equal? instance (-> ms self))))
@@ -676,8 +678,7 @@
          [last (ptr compiled) 0]
          [start-fc (ptr fctx) 0]
          [setup (ptr asm) 0]
-         [literal-segment datum 0]
-         [place i32 0])
+         [literal-segment datum 0])
     (export-name! ms '%slots)
     ;; If a module declares its own memory, it still imports Substrate's memory too, and the same
     ;; goes for tables. Substrate's memory and table are index 0, and all compiled code uses them.
@@ -689,11 +690,7 @@
                 (set-func-info-instance! (cadr f) self)
                 (set-func-info-export! (cadr f) (export-name! ms (func-info-name (cadr f)))))
               func-forms)
-    (let ([fs func-forms])
-      (while (pair? fs)
-        (set-func-info-place! (cadr (car fs)) (if (!= table-form 0) place -1))
-        (+= place 1)
-        (set! fs (cdr fs))))
+    (for-each (lambda ([f datum]) (set-func-info-place! (cadr f) -1)) func-forms)
     (for-each (lambda ([f datum])
                 (set-global-info-instance! (cadr f) self)
                 (set-global-info-export! (cadr f) (export-name! ms (global-info-name (cadr f)))))
@@ -719,7 +716,7 @@
     (when (and (-> ms uses-table) (== table-form 0))
       (raise-compile-error (-> ms table-loc) '"this code uses a table, but the module defines none: add (table size)"))
     (set! setup (new-asm))
-    (when (!= table-form 0) (slots-code! ms setup (cast u32 place)))
+    (when (!= table-form 0) (slots-code! ms setup first (length func-forms)))
     (for-each (lambda ([s datum])
                 (setup-code! ms setup start-fc s literal-segment))
               (reverse (-> ms synths)))
@@ -744,35 +741,85 @@
          (set! (-> ms fname) '__start)
          (cx ms fc 0 (cadr f) nil 0)]))
 
-(define (slots-code! [ms (ptr mstate)] [setup (ptr asm)] [n u32])
-  (let ([fs (reverse (-> ms fidx))] [os (reverse (-> ms own-fidx))])
+(define (slots-code! [ms (ptr mstate)] [setup (ptr asm)] [head (ptr compiled)] [n u32])
+  (let ([k (place-functions! ms head)] [end n] [others nil] [fs (reverse (-> ms fidx))] [os (reverse (-> ms own-fidx))])
     (while (pair? fs)
-      (when (< (func-info-place (car (car fs))) 0) (set! n (extra-place! ms (car (car fs)) n)))
+      (let ([f (car (car fs))])
+        (cond [(< (func-info-place f) 0) (set! end (extra-place! ms f end))]
+              [(external? ms (func-info-instance f)) (set! others (cons f others))]))
       (set! fs (cdr fs)))
     (while (pair? os)
-      (when (external? ms (func-info-instance (car (car os)))) (set! n (extra-place! ms (car (car os)) n)))
+      (when (external? ms (func-info-instance (car (car os)))) (set! end (extra-place! ms (car (car os)) end)))
       (set! os (cdr os)))
-    (when (> n 0)
-      (set! (-> ms slots) (fill-slots! ms setup 0 n))
-      (unless (null? (-> ms own-fidx)) (set! (-> ms own-slots) (fill-slots! ms setup 1 n)))
-      (instr! setup '(elem.drop 0)))))
+    (set! others (reverse others))
+    (set! (-> ms segment)
+          (append (-> ms segment) (append (reverse (map (lambda ([e datum]) -> datum (car e)) (-> ms extra-places))) others)))
+    (when (> end 0)
+      (set! (-> ms slots) (grow-slots! ms setup 0 end))
+      (fill-slots! setup 0 (-> ms slots) 0 0 k)
+      (fill-slots! setup 0 (-> ms slots) n k (- end n))
+      (let ([i (+ k (- end n))])
+        (while (pair? others)
+          (let ([f (car others)])
+            (fill-slots! setup 0 (slots-of! ms (func-info-instance f)) (cast u32 (func-info-place f)) i 1))
+          (+= i 1)
+          (set! others (cdr others))))
+      (unless (null? (-> ms own-fidx))
+        (set! (-> ms own-slots) (grow-slots! ms setup 1 end))
+        (fill-slots! setup 1 (-> ms own-slots) 0 0 k)
+        (fill-slots! setup 1 (-> ms own-slots) n k (- end n)))
+      (unless (null? (-> ms segment)) (instr! setup '(elem.drop 0))))))
+
+(define (taken? [ms (ptr mstate)] [info datum]) -> i32
+  (or (!= (assq info (-> ms fidx)) 0) (!= (assq info (-> ms own-fidx)) 0)))
+
+(define (place-functions! [ms (ptr mstate)] [head (ptr compiled)]) -> u32
+  (let ([rest compiled] [a head] [b (ptr compiled) 0] [cf (-> head next)] [next (ptr compiled) 0] [k u32 0] [i i32 0])
+    (set! b (& rest))
+    (while (!= cf 0)
+      (set! next (-> cf next))
+      (if (taken? ms (-> cf info))
+          (begin
+            (set! (-> a next) cf)
+            (set! a cf)
+            (set! (-> ms segment) (cons (-> cf info) (-> ms segment)))
+            (+= k 1))
+          (begin
+            (set! (-> b next) cf)
+            (set! b cf)))
+      (set! cf next))
+    (set! (-> b next) 0)
+    (set! (-> a next) (-> rest next))
+    (set! (-> ms segment) (reverse (-> ms segment)))
+    (set! cf (-> head next))
+    (while (!= cf 0)
+      (set-func-info-place! (-> cf info) i)
+      (+= i 1)
+      (set! cf (-> cf next)))
+    k))
 
 (define (extra-place! [ms (ptr mstate)] [f datum] [n u32]) -> u32
   (if (!= (assq f (-> ms extra-places)) 0)
       n
       (begin (set! (-> ms extra-places) (cons (cons f (small n)) (-> ms extra-places))) (+ n 1))))
 
-(define (fill-slots! [ms (ptr mstate)] [setup (ptr asm)] [t i32] [n u32]) -> datum
+(define (grow-slots! [ms (ptr mstate)] [setup (ptr asm)] [t i32] [n u32]) -> datum
   (let ([s (new-synth! ms 'slots 0)])
     (instr! setup '(ref.null func))
     (instr! setup `(i32.const ,(small n)))
     (instr! setup `(table.grow ,(small t)))
     (instr! setup `(global.set ,s))
-    (instr! setup `(global.get ,s))
-    (instr! setup '(i32.const 0))
-    (instr! setup `(i32.const ,(small n)))
-    (instr! setup `(table.init 0 ,(small t)))
     s))
+
+(define (fill-slots! [setup (ptr asm)] [t i32] [base datum] [at u32] [from u32] [n u32])
+  (when (> n 0)
+    (instr! setup `(global.get ,base))
+    (unless (== at 0)
+      (instr! setup `(i32.const ,(small at)))
+      (instr! setup '(i32.add)))
+    (instr! setup `(i32.const ,(small from)))
+    (instr! setup `(i32.const ,(small n)))
+    (instr! setup `(table.init 0 ,(small t)))))
 
 (define (slots-of! [ms (ptr mstate)] [instance datum]) -> datum
   (let ([known (assoc instance (-> ms slot-imports))])
@@ -959,11 +1006,7 @@
     (set! (-> m globals) wglobals)
     (set! (-> m exports) exports)
     (set! (-> m start) (if has-start (small start-index) 0))
-    (set! (-> m slots)
-          (if (== (-> ms slots) 0)
-              nil
-              (map (lambda ([info datum]) -> datum (index-of (-> lk funcs) info "a function"))
-                   (append (reverse infos) (reverse (map (lambda ([e datum]) -> datum (car e)) (-> ms extra-places)))))))
+    (set! (-> m slots) (map (lambda ([info datum]) -> datum (index-of (-> lk funcs) info "a function")) (-> ms segment)))
     (set! (-> m datas) (if (!= literal-segment 0) (cons literal-segment nil) nil))
     (set! (-> m names) (cons (-> ms self) names))
     (encode-module (& m) (& out))
