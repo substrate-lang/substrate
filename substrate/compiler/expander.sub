@@ -779,12 +779,32 @@
 ;; ---- wasm modules ----
 
 (define (storage-forms [phase i32]) -> datum
-  (let ([mem (storage-form 'memory phase)] [tbl (storage-form 'table phase)])
-    (append (if (!= mem 0) (list1 mem) nil) (if (!= tbl 0) (list1 tbl) nil))))
+  (let ([mem (storage-form 'memory phase)] [sub (substrate-memory phase)] [tbl (storage-form 'table phase)])
+    (append (if (!= mem 0) (list1 mem) nil) (append (if (!= sub 0) (list1 sub) nil) (if (!= tbl 0) (list1 tbl) nil)))))
 
+;; A module's memory is its own if it declares one.
 (define (storage-form [kind datum] [phase i32]) -> datum
-  (let ([f (assoc (make-integer phase) (if (== kind 'memory) (-> current memories) (-> current tables)))])
-    (if (!= f 0) (cdr f) (running-storage kind phase))))
+  (let ([f (if (== kind 'memory)
+               (let ([own (declared-memory phase 'memory)]) (if (!= own 0) own (declared-memory phase 'memory-import)))
+               (let ([t (assoc (make-integer phase) (-> current tables))]) (if (!= t 0) (cdr t) 0)))])
+    (if (!= f 0) f (running-storage kind phase))))
+
+;; A module with a memory of its own has Substrate's as well, for the code Substrate compiles: the
+;; one it takes with (memory from m), or else the running compiler's.
+(define (substrate-memory [phase i32]) -> datum
+  (if (== (declared-memory phase 'memory) 0)
+      0
+      (let ([f (declared-memory phase 'memory-import)])
+        (when (== f 0) (set! f (running-storage 'memory phase)))
+        (if (== f 0) 0 `(substrate-memory ,(cadr f))))))
+
+;; The phase's (memory size) for memory, or its (memory from m) for memory-import.
+(define (declared-memory [phase i32] [head datum]) -> datum
+  (let ([l (-> current memories)])
+    (while (pair? l)
+      (when (and (== (cast i32 (integer-value (car (car l)))) phase) (== (car (cdr (car l))) head)) (return (cdr (car l))))
+      (set! l (cdr l)))
+    0))
 
 (define (add-wasm-module! [m datum] [phase i32] [compiled datum])
   (let ([l (cast (ptr wasm-module) (arena-alloc (& run-arena) (sizeof wasm-module)))] [u (unit-of m)])
@@ -1723,14 +1743,15 @@
 
 (define (declare-storage! [f datum] [kind datum] [phase i32])
   (let* ([l (syntax->list f)] [memory (== kind 'memory)]
-         [table (if memory (-> current memories) (-> current tables))] [form datum 0])
-    (when (!= (assoc (make-integer phase) table) 0) (fail-at f "a second ~a declaration at this phase" (list1 kind)))
-    (set! form (cond [(and (== (length l) 2) (count-literal? (cadr l))) `(,kind ,(syntax-e (cadr l)))]
+         [form (cond [(and (== (length l) 2) (count-literal? (cadr l))) `(,kind ,(syntax-e (cadr l)))]
                      [(and (== (length l) 3) (named? (cadr l) 'from))
                       (let ([m (required-module (caddr l) phase)])
                         `(,(if memory 'memory-import 'table-import)
                           ,(wasm-module-name m 0 phase)))]
-                     [else (no-match f (if memory "(memory size) or (memory from module)" "(table size) or (table from module)"))]))
+                     [else (no-match f (if memory "(memory size) or (memory from module)" "(table size) or (table from module)"))])])
+    ;; A memory of the module's own may go with one from another module.
+    (when (!= (if memory (declared-memory phase (car form)) (assoc (make-integer phase) (-> current tables))) 0)
+      (fail-at f "a second ~a declaration at this phase" (list1 kind)))
     (if memory
         (set! (-> current memories) (cons (cons (make-integer phase) form) (-> current memories)))
         (set! (-> current tables) (cons (cons (make-integer phase) form) (-> current tables))))))
@@ -1865,7 +1886,7 @@
              (set! (-> current storage-wasm-modules) (cons (cons (cons (car kinds) (make-integer phase)) name) (-> current storage-wasm-modules)))
              (set! out (cons form out))])
       (set! kinds (cdr kinds)))
-    (reverse out)))
+    (let ([sub (substrate-memory phase)]) (if (!= sub 0) (cons sub (reverse out)) (reverse out)))))
 
 (define (function-index [info datum]) -> i32
   (let* ([instance (func-info-instance info)] [export (func-info-export info)] [target datum 0] [i i32 -1])
@@ -2805,11 +2826,12 @@
       [('br-table) (check (cadddr e))]
       [('br) (if (!= (caddr e) 0) (check (caddr e)) 0)]
       [('return) (when (!= (cadr e) 0) (check (cadr e))) 1]
-      [('call) (each (caddr e))]
+      ;; A function of no module is the host's, which reads the caller's memory.
+      [('call)
+       (let ([i (info-instance (base-info (cadr e)))]) (when (and (string? i) (== (instance-unit i) 0)) (set! inline-memory 1)))
+       (each (caddr e))]
       [('prim)
-       (when (or (== (-> (lookup-prim (cadr e)) kind) 'mem)
-                 (!= (memq (cadr e) '(memory.size memory.grow memory.copy memory.fill)) 0))
-         (set! inline-memory 1))
+       (unless (== (-> (lookup-prim (cadr e)) kind) 'plain) (set! inline-memory 1))
        (each (cadddr e))]
       [('call-indirect 'func-index) (inline-fail id "use a table")]
       [('select 'drop 'values) (each (cdr e))]
@@ -2983,7 +3005,7 @@
        `(br-table ,(map (lambda ([k datum]) -> datum (copied-key labels k)) (cadr e)) ,(copied-key labels (caddr e)) ,(copy (cadddr e)))]
       [('return) `(br ,ret ,(copy? (cadr e)))]
       [('call) `(call ,(shift-info (cadr e) inline-shift) ,(copies (caddr e)))]
-      [('prim) `(prim ,(cadr e) ,(caddr e) ,(copies (cadddr e)))]
+      [('prim) `(prim ,(cadr e) ,(caddr e) ,(copies (cadddr e)) ,@(cdr (cdddr e)))]
       [('throw) `(throw ,(shift-info (cadr e) inline-shift) ,(copies (caddr e)))]
       [('throw-ref) `(throw-ref ,(copy (cadr e)))]
       [('try)
