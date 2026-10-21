@@ -16,7 +16,6 @@
 ;; The context of the form being expanded: names in the code it makes are resolved there.
 (define here datum 0)
 
-(define running-name (fn (datum) -> datum) 0)
 (define meaning-of (fn (datum) -> datum) 0)
 (define inline-call-of (fn (datum datum) -> datum) 0)
 (define inline-copy-of (fn (datum) -> datum) 0)
@@ -26,13 +25,13 @@
 (define prune-local-scopes (fn (datum) -> datum) 0)
 (define facts-of (fn (datum) -> datum) 0)
 (define datum-type-of (fn () -> datum) 0)
+(define syntax-function-of (fn (datum i32) -> datum) 0)
 
-(define (set-expander! [name (fn (datum) -> datum)] [meaning (fn (datum) -> datum)]
+(define (set-expander! [meaning (fn (datum) -> datum)]
                        [inline-call (fn (datum datum) -> datum)] [inline-copy (fn (datum) -> datum)]
                        [head (fn (datum i32) -> datum)] [shape (fn (datum i32) -> datum)]
                        [apply (fn (datum datum i32) -> datum)] [prune (fn (datum) -> datum)] [facts (fn (datum) -> datum)]
-                       [quoted (fn () -> datum)])
-  (set! running-name name)
+                       [quoted (fn () -> datum)] [syntax-function (fn (datum i32) -> datum)])
   (set! meaning-of meaning)
   (set! inline-call-of inline-call)
   (set! inline-copy-of inline-copy)
@@ -41,7 +40,8 @@
   (set! apply-form-of apply)
   (set! prune-local-scopes prune)
   (set! facts-of facts)
-  (set! datum-type-of quoted))
+  (set! datum-type-of quoted)
+  (set! syntax-function-of syntax-function))
 
 (define twice i32 0)
 
@@ -598,6 +598,9 @@
       [('sizeof)
        (unless (== n 2) (substrate-error s "expected (sizeof type)" nil))
        (use `(,(piece 'type 0 (cadr l))))]
+      [('printf)
+       (unless (and (>= n 2) (string? (syntax-e (cadr l)))) (substrate-error s "expected (printf \"template\" value ...)" nil))
+       (use (cons (piece 'name 0 (cadr l)) (exprs-in 0 (cddr l))))]
       [('offsetof)
        (unless (and (== n 3) (identifier? (caddr l))) (substrate-error s "expected (offsetof type field)" nil))
        (use `(,(piece 'type 0 (cadr l)) ,(piece 'name 0 (caddr l))))]
@@ -1132,6 +1135,7 @@
           [('continue) (jump s 0)]
           [('rethrow) (rethrow-code s)]
           [('sizeof) (let ([t (piece-at m 1)]) (cons 'lit (fixnum (size-of (complete! (parse-type t) t)))))]
+          [('printf) (check-printf (piece-at m 1) (pieces-from m 2) env)]
           [('offsetof)
            (let* ([t (piece-at m 1)] [ty (parse-type t)])
              (unless (struct-type? ty) (substrate-error t "~s is not a struct" `(,(shown ty))))
@@ -2295,6 +2299,53 @@
       (-= j 1))
     w))
 
+;; ---- printing ----
+
+;; ~a displays the next value, ~s writes it as the reader reads it, ~n is a newline and ~~ a
+;; tilde. The pieces are printed in turn, so each value is worked out just before it is printed.
+(define (check-printf [t datum] [args datum] [env datum]) -> datum
+  (let* ([s (syntax-e t)] [p (string-bytes s)] [n (string-length s)] [i u32 0] [text (make-buffer)] [out nil])
+    (while (< i n)
+      (let ([c (@ p i)] [d (if (< (+ i 1) n) (@ p (+ i 1)) 0)])
+        (cond [(!= c #\~) (buffer-add-byte! (& text) c) (+= i 1)]
+              [(== d #\n) (buffer-add-byte! (& text) 10) (+= i 2)]
+              [(== d #\~) (buffer-add-byte! (& text) c) (+= i 2)]
+              [(and (!= d #\a) (!= d #\s)) (substrate-error t "expected ~a, ~s, ~n or ~~ in the template" nil)]
+              [(null? args) (substrate-error t "the template has more ~a and ~s than there are values" nil)]
+              [else
+               (set! out (cons (printed (check (car args) env 0) (car args) (== d #\a)) (text-code (& text) out)))
+               (set! args (cdr args))
+               (+= i 2)])))
+    (set! out (text-code (& text) out))
+    (buffer-free! (& text))
+    (unless (null? args) (substrate-error (car args) "the template has no ~a or ~s for this value" nil))
+    (cons 'void (if (null? out) '(nop) (seq (reverse out))))))
+
+(define (text-code [b (ptr buffer)] [out datum]) -> datum
+  (let ([n (-> b length)])
+    (set! (-> b length) 0)
+    (if (== n 0) out (cons (text-printed (bytes->string (-> b bytes) n)) out))))
+
+;; A byte is printed without a string literal, so that a module with its own memory can print it.
+(define (text-printed [s datum]) -> datum
+  (if (== (string-length s) 1)
+      (call-of 'print-byte `(,(i32-const (@ (string-bytes s)))))
+      (call-of 'print-bytes `(,(cdr (string-literal s)) ,(i32-const (string-length s))))))
+
+;; Data print through the syntax module, as quoted data are built. A value of no printed form
+;; prints as its type.
+(define (printed [r datum] [a datum] [display i32]) -> datum
+  (let ([t (car r)])
+    (cond [(memq t '(u32 u64)) (call-of 'print-integer `(,(convert r 'u64 a 0) ,(i32-const 0)))]
+          [(memq t '(lit i64)) (call-of 'print-integer `(,(convert r 'i64 a 0) ,(i32-const 1)))]
+          [(integer-type? t) (call-of 'print-integer `(,(prim-code 'i64.extend_i32_s `(,(convert r 'i32 a 0))) ,(i32-const 1)))]
+          [(memq t '(flit f64)) (call-of 'print-float `(,(convert r 'f64 a 0) ,(i32-const 0)))]
+          [(== t 'f32) (call-of 'print-float `(,(prim-code 'f64.promote_f32 `(,(cdr r))) ,(i32-const 1)))]
+          [(equal? t '(ptr u8)) (call-of 'print-string `(,(cdr r) ,(i32-const (not display))))]
+          [(equal? t (datum-type)) `(call ,(syntax-function-of 'print-datum (-> state phase)) (,(cdr r) ,(i32-const display)))]
+          [(address-type? t) (call-of 'print-integer `(,(prim-code 'i64.extend_i32_u `(,(cdr r))) ,(i32-const 0)))]
+          [else (seq `(,(as-void r) ,(text-printed (format-message "#<~s>" `(,(shown t))))))])))
+
 ;; ---- modules ----
 
 (define (names? [id datum] [name datum]) -> i32
@@ -2320,42 +2371,18 @@
 
 ;; ---- sessions ----
 
-(define (running-info [name datum]) -> datum (info-of (running-name name) 'func "a function"))
-
 (define (substrate-interaction [s datum]) -> datum
   (syntax-match s
     [(_ _ e)
      (start-function! 'void 0)
      (with-frame interaction-walk e)]))
 
+;; Each result prints as (printf "~s~n" result) prints it.
 (define (interaction-walk [e datum]) -> datum
-  (framed nil (cons 'void (written-value (settle (check e nil 0) 0 e) e))))
-
-(define (written-value [r datum] [e datum]) -> datum
-  (let ([t (car r)] [c (cdr r)] [line (call-of 'newline nil)])
-    (cond [(memq t '(void none)) c]
-          [(== t 'i32) (seq `(,(call-of 'write-int `(,c)) ,line))]
-          [(== t 'u32) (seq `(,(call-of 'write-u64 `(,(prim-code 'i64.extend_i32_u `(,c)))) ,line))]
-          [(== t 'i64) (seq `(,(call-of 'write-i64 `(,c)) ,line))]
-          [(== t 'u64) (seq `(,(call-of 'write-u64 `(,c)) ,line))]
-          [(== t 'f64) (seq `((call ,(running-info 'write-datum) ((call ,(running-info 'make-flonum) (,c)))) ,line))]
-          [(== t 'f32)
-           (seq `((call ,(running-info 'write-datum) ((call ,(running-info 'make-flonum) (,(prim-code 'f64.promote_f32 `(,c)))))) ,line))]
-          [(equal? t '(ptr u8))
-           (let ([p (fresh-key!)])
-             `(let ((,p i32 ,c p))
-                ,(seq `((if ,(lref p)
-                            ,(seq `(,(call-of 'write-byte `(,(i32-const 34)))
-                                    ,(call-of 'write-bytes `(,(lref p) ,(call-of 'strlen `(,(lref p)))))
-                                    ,(call-of 'write-byte `(,(i32-const 34)))))
-                            ,(call-of 'write-int `(,(i32-const 0))))
-                        ,line))))]
-          [(address-type? t) (seq `(,(call-of 'write-u64 `(,(prim-code 'i64.extend_i32_u `(,c)))) ,line))]
-          [else
-           (let ([text (format-message "#<~s>" `(,(shown t)))])
-             (seq `(,(as-void r)
-                    ,(call-of 'write-bytes `(,(cdr (string-literal text)) ,(i32-const (string-length text))))
-                    ,line)))])))
+  (let ([r (settle (check e nil 0) 0 e)])
+    (framed nil (cons 'void (if (memq (car r) '(void none))
+                                (cdr r)
+                                (seq `(,(printed r e 0) ,(text-printed '"\n"))))))))
 
 ;; ---- forms on data ----
 
