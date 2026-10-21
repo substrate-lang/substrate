@@ -11,8 +11,10 @@ const trapperBytes = Uint8Array.from([
   0x74, 0x2d, 0x74, 0x72, 0x61, 0x70,
 ]);
 
-// Host imports read their caller's memory through its exports, which exist only after
-// instantiation. So the start function is exported instead, and called after instantiation.
+// Host imports get the calling module's memory from the instance's exports, and the exports
+// don't exist until instantiation finishes. A wasm start function runs during instantiation, so
+// it couldn't call the host. Instead we export the start function and call it ourselves after
+// instantiating.
 const START_EXPORT = '__subhost_start';
 
 function readU32(bytes, pos) {
