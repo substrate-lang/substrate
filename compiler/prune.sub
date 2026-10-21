@@ -1,0 +1,371 @@
+;; Leaves out of a program's wasm modules the functions it can never call.
+(require-unqualified macros "macros.sub")
+(require-unqualified leb "leb128.sub")
+(require-unqualified binary "binary.sub")
+
+(provide pruned)
+
+(struct wasm [name datum] [p (ptr u8)] [size u32] [sections datum] [imports datum] [funcs datum] [nimports u32]
+        [exports datum] [start i32] [elems datum] [count u32] [starts (ptr u32)] [ends (ptr u32)] [live (ptr u8)]
+        [kept datum])
+
+(struct reader [p (ptr u8)] [at u32])
+
+;; ---- reading ----
+
+(define (unreadable) (raise-compile-error 0 '"internal: a program's wasm module cannot be read"))
+
+(define (next-byte [r (ptr reader)]) -> u32
+  (let ([b (cast u32 (@ (-> r p) (-> r at)))])
+    (+= (-> r at) 1)
+    b))
+
+(define (next-uleb [r (ptr reader)]) -> u32
+  (let ([n u32 0] [shift u32 0] [b u32 128])
+    (while (!= (bit-and b 128) 0)
+      (set! b (next-byte r))
+      (set! n (bit-or n (<< (bit-and b 127) shift)))
+      (+= shift 7))
+    n))
+
+(define (skip-sleb [r (ptr reader)])
+  (let ([b u32 128])
+    (while (!= (bit-and b 128) 0) (set! b (next-byte r)))))
+
+(define (next-name [r (ptr reader)]) -> datum
+  (let* ([n (next-uleb r)] [s (bytes->string (+ (-> r p) (-> r at)) n)])
+    (+= (-> r at) n)
+    s))
+
+(define (skip-limits [r (ptr reader)])
+  (let ([flag (next-byte r)])
+    (next-uleb r)
+    (when (== (bit-and flag 1) 1) (next-uleb r))))
+
+(define (new-wasm [name datum] [bytes datum]) -> (ptr wasm)
+  (let ([w (cast (ptr wasm) (arena-alloc (current-arena) (sizeof wasm)))] [r reader] [id u32 0] [head u32 0] [next u32 0])
+    (set! (-> w name) name)
+    (set! (-> w p) (string-bytes bytes))
+    (set! (-> w size) (string-length bytes))
+    (set! (-> w sections) nil)
+    (set! (-> w imports) nil)
+    (set! (-> w funcs) nil)
+    (set! (-> w nimports) 0)
+    (set! (-> w exports) nil)
+    (set! (-> w start) -1)
+    (set! (-> w elems) nil)
+    (set! (-> w count) 0)
+    (set! (-> w kept) nil)
+    (set! (-> r p) (-> w p))
+    (set! (-> r at) 8)
+    (while (< (-> r at) (-> w size))
+      (set! head (-> r at))
+      (set! id (next-byte (& r)))
+      (set! next (next-uleb (& r)))
+      (+= next (-> r at))
+      (set! (-> w sections)
+            (cons `(,(make-integer id) ,(make-integer head) ,(make-integer (-> r at)) ,(make-integer next)) (-> w sections)))
+      (when (== id 2) (read-imports! w (& r)))
+      (set! (-> r at) next))
+    (set! (-> w sections) (reverse (-> w sections)))
+    (set! (-> w funcs) (reverse (-> w funcs)))
+    w))
+
+(define (read-rest! [w (ptr wasm)])
+  (let ([r reader] [ss (-> w sections)] [id i64 0])
+    (set! (-> r p) (-> w p))
+    (while (pair? ss)
+      (set! id (integer-value (car (car ss))))
+      (set! (-> r at) (cast u32 (integer-value (caddr (car ss)))))
+      (cond [(== id 7) (read-exports! w (& r))]
+            [(== id 8) (set! (-> w start) (cast i32 (next-uleb (& r))))]
+            [(== id 9) (read-elems! w (& r))]
+            [(== id 10) (read-bodies! w (& r))])
+      (set! ss (cdr ss)))
+    (set! (-> w live) (cast (ptr u8) (arena-alloc (current-arena) (+ (-> w nimports) (-> w count) 1))))
+    (memset (-> w live) 0 (+ (-> w nimports) (-> w count) 1))))
+
+(define (read-imports! [w (ptr wasm)] [r (ptr reader)])
+  (let ([module datum 0] [field datum 0] [kind u32 0])
+    (for ([i u32 (next-uleb r)]) (> i 0) (-= i 1)
+      (set! module (next-name r))
+      (set! field (next-name r))
+      (set! kind (next-byte r))
+      (set! (-> w imports) (cons (cons module field) (-> w imports)))
+      (cond [(== kind 0)
+             (next-uleb r)
+             (set! (-> w funcs) (cons (cons module field) (-> w funcs)))
+             (+= (-> w nimports) 1)]
+            [(== kind 1) (next-byte r) (skip-limits r)]
+            [(== kind 2) (skip-limits r)]
+            [(== kind 3) (next-byte r) (next-byte r)]
+            [else (next-byte r) (next-uleb r)]))))
+
+(define (read-exports! [w (ptr wasm)] [r (ptr reader)])
+  (let ([name datum 0] [kind u32 0])
+    (for ([i u32 (next-uleb r)]) (> i 0) (-= i 1)
+      (set! name (next-name r))
+      (set! kind (next-byte r))
+      (set! (-> w exports) (cons `(,name ,(make-integer kind) ,(make-integer (next-uleb r))) (-> w exports))))
+    (set! (-> w exports) (reverse (-> w exports)))))
+
+(define (read-elems! [w (ptr wasm)] [r (ptr reader)])
+  (for ([i u32 (next-uleb r)]) (> i 0) (-= i 1)
+    (unless (and (== (next-uleb r) 1) (== (next-byte r) 0)) (unreadable))
+    (for ([j u32 (next-uleb r)]) (> j 0) (-= j 1)
+      (set! (-> w elems) (cons (make-integer (next-uleb r)) (-> w elems))))))
+
+(define (read-bodies! [w (ptr wasm)] [r (ptr reader)])
+  (let ([n (next-uleb r)] [size u32 0])
+    (set! (-> w count) n)
+    (set! (-> w starts) (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ n 1)))))
+    (set! (-> w ends) (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ n 1)))))
+    (for ([k u32 0]) (< k n) (+= k 1)
+      (set! size (next-uleb r))
+      (set! (@ (-> w starts) k) (-> r at))
+      (+= (-> r at) size)
+      (set! (@ (-> w ends) k) (-> r at)))))
+
+;; ---- what a body calls ----
+
+(define (calls-in [p (ptr u8)] [start u32] [end u32]) -> datum
+  (let ([r reader] [out nil] [b u32 0] [d datum 0] [ks datum 0])
+    (set! (-> r p) p)
+    (set! (-> r at) start)
+    (for ([i u32 (next-uleb (& r))]) (> i 0) (-= i 1)
+      (next-uleb (& r))
+      (next-byte (& r)))
+    (while (< (-> r at) end)
+      (set! b (next-byte (& r)))
+      (unless (or (== b #x05) (== b #x0B))
+        (set! d (decoding-of b (if (or (== b #xFC) (== b #x1C)) (next-uleb (& r)) 0)))
+        (when (== d 0) (unreadable))
+        (set! ks (cdr d))
+        (while (pair? ks)
+          (if (== (car ks) 'func)
+              (set! out (cons (make-integer (next-uleb (& r))) out))
+              (skip-immediate (& r) (car ks)))
+          (set! ks (cdr ks)))))
+    (unless (== (-> r at) end) (unreadable))
+    out))
+
+(define (skip-immediate [r (ptr reader)] [k datum]) -> u32
+  (cond [(or (== k 'u) (== k 'global) (== k 'type) (== k 'tag)) (next-uleb r)]
+        [(== k 's) (skip-sleb r)]
+        [(== k 'memarg)
+         (when (!= (bit-and (next-uleb r) 64) 0) (next-uleb r))
+         (next-uleb r)]
+        [(== k 'labels) (for ([i u32 (next-uleb r)]) (> i 0) (-= i 1) (next-uleb r))]
+        [(== k 'f32) (+= (-> r at) 4)]
+        [(== k 'f64) (+= (-> r at) 8)]
+        [(or (== k 'heap) (== k 'valtype)) (next-byte r)]
+        [(== k 'blocktype)
+         (let ([b (@ (-> r p) (-> r at))])
+           (if (and (>= b #x40) (< b #x80)) (+= (-> r at) 1) (skip-sleb r)))]
+        [(== k 'catches)
+         (for ([i u32 (next-uleb r)]) (> i 0) (-= i 1)
+           (when (< (next-byte r) 2) (next-uleb r))
+           (next-uleb r))]
+        [else (unreadable)])
+  (-> r at))
+
+;; ---- what the program can call ----
+
+(define work datum nil)
+
+(define (mark! [w (ptr wasm)] [i u32])
+  (when (and (< i (+ (-> w nimports) (-> w count))) (== (@ (-> w live) i) 0))
+    (set! (@ (-> w live) i) 1)
+    (set! work (cons (cons (cast datum w) (make-integer i)) work))))
+
+(define (wasm-named [ws datum] [name datum]) -> (ptr wasm)
+  (while (pair? ws)
+    (when (string=? (-> (cast (ptr wasm) (car ws)) name) name) (return (cast (ptr wasm) (car ws))))
+    (set! ws (cdr ws)))
+  0)
+
+(define (exported [w (ptr wasm)] [name datum]) -> i64
+  (let ([es (-> w exports)])
+    (while (pair? es)
+      (when (and (== (integer-value (cadr (car es))) 0) (string=? (car (car es)) name)) (return (integer-value (caddr (car es)))))
+      (set! es (cdr es)))
+    -1))
+
+(define (reach! [ws datum])
+  (while (pair? work)
+    (let* ([item (car work)] [w (cast (ptr wasm) (car item))] [i (cast u32 (integer-value (cdr item)))])
+      (set! work (cdr work))
+      (if (< i (-> w nimports))
+          (let* ([f (list-ref (-> w funcs) i)] [owner (wasm-named ws (car f))])
+            (unless (== owner 0)
+              (let ([j (exported owner (cdr f))]) (when (>= j 0) (mark! owner (cast u32 j))))))
+          (let ([k (- i (-> w nimports))])
+            (for-each (lambda ([t datum]) (mark! w (cast u32 (integer-value t))))
+                      (calls-in (-> w p) (@ (-> w starts) k) (@ (-> w ends) k))))))))
+
+(define (loads-code? [w (ptr wasm)]) -> i32
+  (ormap (lambda ([imp datum]) -> i32
+           (and (string=? (car imp) '"host") (or (string=? (cdr imp) '"instantiate") (string=? (cdr imp) '"export_index"))))
+         (-> w imports)))
+
+;; strip is 1 to leave out the function names and source locations too.
+(define (pruned [modules datum] [strip i32]) -> datum
+  (let ([ws (map (lambda ([m datum]) -> datum (cast datum (new-wasm (car m) (cdr m)))) modules)] [entry (ptr wasm) 0])
+    (when (ormap (lambda ([x datum]) -> i32 (loads-code? (cast (ptr wasm) x))) ws) (return modules))
+    (for-each (lambda ([x datum]) (read-rest! (cast (ptr wasm) x))) ws)
+    (set! entry (cast (ptr wasm) (last ws)))
+    (set! work nil)
+    (let ([l ws] [w (ptr wasm) 0] [fs datum 0] [is datum 0] [owner (ptr wasm) 0])
+      (while (pair? l)
+        (set! w (cast (ptr wasm) (car l)))
+        (when (>= (-> w start) 0) (mark! w (cast u32 (-> w start))))
+        (set! fs (-> w elems))
+        (while (pair? fs)
+          (mark! w (cast u32 (integer-value (car fs))))
+          (set! fs (cdr fs)))
+        (set! is (-> w imports))
+        (while (pair? is)
+          (set! owner (wasm-named ws (car (car is))))
+          (unless (== owner 0) (set! (-> owner kept) (cons (cdr (car is)) (-> owner kept))))
+          (set! is (cdr is)))
+        (set! l (cdr l))))
+    (let ([es (-> entry exports)])
+      (while (pair? es)
+        (when (== (integer-value (cadr (car es))) 0) (mark! entry (cast u32 (integer-value (caddr (car es))))))
+        (set! es (cdr es))))
+    (reach! ws)
+    (map (lambda ([x datum]) -> datum
+           (let ([w (cast (ptr wasm) x)]) (cons (-> w name) (rewritten w (== w entry) strip))))
+         ws)))
+
+;; ---- writing ----
+
+(define (write-name [q (ptr buffer)] [s datum])
+  (write-uleb q (string-length s))
+  (buffer-add! q (string-bytes s) (string-length s)))
+
+(define (section-out [out (ptr buffer)] [id i32] [q (ptr buffer)])
+  (buffer-add-byte! out id)
+  (write-uleb out (-> q length))
+  (buffer-add! out (-> q bytes) (-> q length))
+  (buffer-free! q))
+
+(define (custom-name [w (ptr wasm)] [start u32]) -> datum
+  (let ([r reader])
+    (set! (-> r p) (-> w p))
+    (set! (-> r at) start)
+    (next-name (& r))))
+
+(define (rewritten [w (ptr wasm)] [entry i32] [strip i32]) -> datum
+  (let ([out (make-buffer)] [ss (-> w sections)] [news (ptr u32) 0] [s datum 0])
+    (set! news (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ (-> w count) 1)))))
+    (buffer-add! (& out) (-> w p) 8)
+    (while (pair? ss)
+      (let* ([sec (car ss)] [id (integer-value (car sec))] [head (cast u32 (integer-value (cadr sec)))]
+             [start (cast u32 (integer-value (caddr sec)))] [end (cast u32 (integer-value (cadddr sec)))]
+             [custom (if (== id 0) (custom-name w start) '"")])
+        (cond [(== id 7) (exports! (& out) w entry)]
+              [(== id 10) (code! (& out) w news)]
+              [(or (string=? custom '"substrate")
+                   (and strip (or (string=? custom '"name") (string=? custom '"source-locations"))))
+               (begin)]
+              [(string=? custom '"name") (names! (& out) w start end)]
+              [(string=? custom '"source-locations") (locations! (& out) w start end news)]
+              [else (buffer-add! (& out) (+ (-> w p) head) (- end head))]))
+      (set! ss (cdr ss)))
+    (set! s (bytes->string (-> out bytes) (-> out length)))
+    (buffer-free! (& out))
+    s))
+
+(define (exports! [out (ptr buffer)] [w (ptr wasm)] [entry i32])
+  (let ([q (make-buffer)] [kept nil] [es (-> w exports)] [kind i64 0])
+    (while (pair? es)
+      (set! kind (integer-value (cadr (car es))))
+      (when (or entry (== kind 1) (== kind 2) (!= (member (car (car es)) (-> w kept)) 0))
+        (set! kept (cons (car es) kept)))
+      (set! es (cdr es)))
+    (set! kept (reverse kept))
+    (write-uleb (& q) (length kept))
+    (while (pair? kept)
+      (write-name (& q) (car (car kept)))
+      (buffer-add-byte! (& q) (cast i32 (integer-value (cadr (car kept)))))
+      (write-uleb (& q) (cast u64 (integer-value (caddr (car kept)))))
+      (set! kept (cdr kept)))
+    (section-out out 7 (& q))))
+
+(define (code! [out (ptr buffer)] [w (ptr wasm)] [news (ptr u32)])
+  (let ([q (make-buffer)] [n (-> w count)] [size u32 0] [base u32 0])
+    (write-uleb (& q) n)
+    (for ([k u32 0]) (< k n) (+= k 1)
+      (if (!= (@ (-> w live) (+ (-> w nimports) k)) 0)
+          (begin
+            (set! size (- (@ (-> w ends) k) (@ (-> w starts) k)))
+            (write-uleb (& q) size)
+            (set! (@ news k) (-> q length))
+            (buffer-add! (& q) (+ (-> w p) (@ (-> w starts) k)) size))
+          (begin
+            (buffer-add-byte! (& q) 3)
+            (set! (@ news k) (-> q length))
+            (buffer-add-byte! (& q) 0)
+            (buffer-add-byte! (& q) 0)
+            (buffer-add-byte! (& q) #x0B))))
+    (set! base (+ (-> out length) 1 (uleb-length (-> q length))))
+    (for ([k u32 0]) (< k n) (+= k 1) (+= (@ news k) base))
+    (section-out out 10 (& q))))
+
+(define (names! [out (ptr buffer)] [w (ptr wasm)] [start u32] [end u32])
+  (let ([q (make-buffer)] [sub (make-buffer)] [r reader] [id u32 0] [size u32 0] [next u32 0] [i u32 0] [name datum 0] [kept nil])
+    (set! (-> r p) (-> w p))
+    (set! (-> r at) start)
+    (write-name (& q) (next-name (& r)))
+    (while (< (-> r at) end)
+      (set! id (next-byte (& r)))
+      (set! size (next-uleb (& r)))
+      (set! next (+ (-> r at) size))
+      (if (== id 1)
+          (begin
+            (for ([n u32 (next-uleb (& r))]) (> n 0) (-= n 1)
+              (set! i (next-uleb (& r)))
+              (set! name (next-name (& r)))
+              (when (!= (@ (-> w live) i) 0) (set! kept (cons (cons (make-integer i) name) kept))))
+            (set! kept (reverse kept))
+            (write-uleb (& sub) (length kept))
+            (while (pair? kept)
+              (write-uleb (& sub) (cast u64 (integer-value (car (car kept)))))
+              (write-name (& sub) (cdr (car kept)))
+              (set! kept (cdr kept)))
+            (section-out (& q) 1 (& sub)))
+          (begin
+            (buffer-add-byte! (& q) (cast i32 id))
+            (write-uleb (& q) size)
+            (buffer-add! (& q) (+ (-> w p) (-> r at)) size)))
+      (set! (-> r at) next))
+    (section-out out 0 (& q))))
+
+(define (locations! [out (ptr buffer)] [w (ptr wasm)] [start u32] [end u32] [news (ptr u32)])
+  (let ([q (make-buffer)] [r reader] [files u32 0] [at u32 0] [k u32 0] [entries nil] [prev u32 0] [o u32 0])
+    (set! (-> r p) (-> w p))
+    (set! (-> r at) start)
+    (write-name (& q) (next-name (& r)))
+    (set! files (-> r at))
+    (for ([i u32 (next-uleb (& r))]) (> i 0) (-= i 1) (next-name (& r)))
+    (buffer-add! (& q) (+ (-> w p) files) (- (-> r at) files))
+    (for ([i u32 (next-uleb (& r))]) (> i 0) (-= i 1)
+      (+= at (next-uleb (& r)))
+      (let* ([file (next-uleb (& r))] [line (next-uleb (& r))] [col (next-uleb (& r))])
+        (while (and (< k (-> w count)) (>= at (@ (-> w ends) k))) (+= k 1))
+        (when (and (< k (-> w count)) (>= at (@ (-> w starts) k)) (!= (@ (-> w live) (+ (-> w nimports) k)) 0))
+          (set! entries (cons `(,(make-integer (+ (@ news k) (- at (@ (-> w starts) k)))) ,(make-integer file)
+                                ,(make-integer line) ,(make-integer col))
+                              entries)))))
+    (set! entries (reverse entries))
+    (write-uleb (& q) (length entries))
+    (while (pair? entries)
+      (set! o (cast u32 (integer-value (car (car entries)))))
+      (write-uleb (& q) (- o prev))
+      (set! prev o)
+      (write-uleb (& q) (cast u64 (integer-value (cadr (car entries)))))
+      (write-uleb (& q) (cast u64 (integer-value (caddr (car entries)))))
+      (write-uleb (& q) (cast u64 (integer-value (cadddr (car entries)))))
+      (set! entries (cdr entries)))
+    (section-out out 0 (& q))))
