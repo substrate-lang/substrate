@@ -11,3 +11,8 @@ These rules keep an agent's context and actions under the user's control.
 - Stay inside this repository. Do not read, list or search files outside it
   unless the user asks.
 - Do not write agent memory files. Project rules belong in this file.
+- Non-trivial English entering the repository must be approved by the user.
+- Avoid comments in most code. A comment is a short, concrete label: what a
+  file, section or value is, or where related code lives. No explanations in
+  comments unless the user asks.
+- Commit messages are one short line.
