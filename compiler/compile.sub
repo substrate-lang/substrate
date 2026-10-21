@@ -21,7 +21,7 @@
         [substrate-table datum] [own-fidx datum] [own-slots datum]
         [literals (ptr serializer)] [literals-table datum] [exported (ptr hash-table)]
         [fname datum] [imported (ptr hash-table)] [slots datum] [slot-imports datum] [extra-places datum]
-        [segment datum])
+        [segment datum] [sbrk datum] [statics datum] [data-size u32] [zero-size u32] [data-block datum] [zero-block datum])
 
 (struct compiled [info datum] [sig datum] [locals datum] [asm (ptr asm)] [next (ptr compiled)])
 
@@ -200,6 +200,12 @@
     (set! (-> ms slot-imports) nil)
     (set! (-> ms extra-places) nil)
     (set! (-> ms segment) nil)
+    (set! (-> ms sbrk) 0)
+    (set! (-> ms statics) nil)
+    (set! (-> ms data-size) 0)
+    (set! (-> ms zero-size) 0)
+    (set! (-> ms data-block) 0)
+    (set! (-> ms zero-block) 0)
     ms))
 
 (define (external? [ms (ptr mstate)] [instance datum]) -> i32 (not (equal? instance (-> ms self))))
@@ -472,6 +478,27 @@
       [(== kind 'func-index)
        (emit! fc `(global.get ,(fidx-synth! ms (car args) (and (!= (-> ms substrate-table) 0) (pair? (cdr args))))))
        (fit fc '(i32) expected)]
+      [(== kind 'static)
+       (let ([size (cast u32 (integer-value (cadr args)))] [align (cast u32 (integer-value (caddr args)))] [bytes (cadddr args)]
+             [at u32 0])
+         (note-memory! ms)
+         (set! (-> ms sbrk) (car args))
+         (if (!= bytes 0)
+             (begin
+               (set! at (aligned (-> ms data-size) align))
+               (set! (-> ms statics) (cons (cons (small at) bytes) (-> ms statics)))
+               (set! (-> ms data-size) (+ at size))
+               (when (== (-> ms data-block) 0) (set! (-> ms data-block) (new-synth! ms 'block 0)))
+               (emit! fc `(global.get ,(-> ms data-block))))
+             (begin
+               (set! at (aligned (-> ms zero-size) align))
+               (set! (-> ms zero-size) (+ at size))
+               (when (== (-> ms zero-block) 0) (set! (-> ms zero-block) (new-synth! ms 'block 0)))
+               (emit! fc `(global.get ,(-> ms zero-block)))))
+         (unless (== at 0)
+           (emit! fc `(i32.const ,(small at)))
+           (emit! fc '(i32.add)))
+         (fit fc '(i32) expected))]
       [(== kind 'select)
        (unless (single? expected) (fail "internal: select without a single type" nil))
        (cx ms fc labels (car args) expected 0)
@@ -631,9 +658,9 @@
     (reverse acc)))
 
 (define (constant-inits [ms (ptr mstate)] [global-forms datum]) -> (ptr hash-table)
-  (let ([constants (make-table)])
+  (let ([constants (make-table)] [known nil])
     (while (pair? global-forms)
-      (let* ([f (car global-forms)] [info (cadr f)] [init (caddr f)] [t (global-info-type info)])
+      (let* ([f (car global-forms)] [info (cadr f)] [init (known-init (caddr f) known)] [t (global-info-type info)])
         (set! current-loc (carrier-loc (loc-of init)))
         (set! current-form (if (!= current-loc 0) (loc-of init) 0))
         (cond
@@ -641,12 +668,19 @@
            (let ([fc (new-fctx nil nil)])
              (set! (-> ms fname) (global-info-name info))
              (cx ms fc 0 init (cons t nil) 0)
-             (hash-set! constants (cast u64 info) (cast u32 (-> fc asm))))]
+             (hash-set! constants (cast u64 info) (cast u32 (-> fc asm))))
+           (when (== (global-info-mutable? info) 0) (set! known (cons (cons info init) known)))]
           [(== (global-info-mutable? info) 0)
            (fail "global ~a is immutable, so its initializer must be a constant expression; declare it (mut ~a) to compute it when the module starts"
                  `(,(global-info-name info) ,t))]))
       (set! global-forms (cdr global-forms)))
     constants))
+
+(define (known-init [e datum] [known datum]) -> datum
+  (let ([u e] [k datum 0])
+    (while (and (pair? u) (or (== (car u) 'at) (== (car u) 'as))) (set! u (caddr u)))
+    (set! k (if (and (pair? u) (== (car u) 'gref)) (assq (cadr u) known) 0))
+    (if (!= k 0) (cdr k) e)))
 
 (define (forms-of [forms datum] [kind datum]) -> datum
   (let ([out nil])
@@ -717,6 +751,7 @@
       (raise-compile-error (-> ms table-loc) '"this code uses a table, but the module defines none: add (table size)"))
     (set! setup (new-asm))
     (when (!= table-form 0) (slots-code! ms setup first (length func-forms)))
+    (block-code! ms setup)
     (for-each (lambda ([s datum])
                 (setup-code! ms setup start-fc s literal-segment))
               (reverse (-> ms synths)))
@@ -821,6 +856,39 @@
     (instr! setup `(i32.const ,(small n)))
     (instr! setup `(table.init 0 ,(small t)))))
 
+(define (aligned [n u32] [a u32]) -> u32 (* (/ (+ n (- a 1)) a) a))
+
+(define (block-code! [ms (ptr mstate)] [setup (ptr asm)])
+  (let ([d (aligned (-> ms data-size) 8)] [base (if (!= (-> ms data-block) 0) (-> ms data-block) (-> ms zero-block))])
+    (unless (== base 0)
+      (note-func! ms (-> ms sbrk))
+      (instr! setup `(i32.const ,(small (+ d (-> ms zero-size)))))
+      (instr! setup `(call ,(-> ms sbrk)))
+      (instr! setup `(global.set ,base))
+      (when (> (-> ms data-size) 0)
+        (instr! setup `(global.get ,base))
+        (instr! setup '(i32.const 0))
+        (instr! setup `(i32.const ,(small (-> ms data-size))))
+        (instr! setup '(memory.init 0 0))
+        (instr! setup '(data.drop 0)))
+      (when (and (!= (-> ms data-block) 0) (!= (-> ms zero-block) 0))
+        (instr! setup `(global.get ,base))
+        (instr! setup `(i32.const ,(small d)))
+        (instr! setup '(i32.add))
+        (instr! setup `(global.set ,(-> ms zero-block)))))))
+
+(define (block-bytes [ms (ptr mstate)]) -> datum
+  (let ([b (make-buffer)] [es (reverse (-> ms statics))] [s datum 0])
+    (while (pair? es)
+      (let ([at (cast u32 (integer-value (car (car es))))] [x (cdr (car es))])
+        (while (< (-> b length) at) (buffer-add-byte! (& b) 0))
+        (buffer-add! (& b) (string-bytes x) (string-length x)))
+      (set! es (cdr es)))
+    (while (< (-> b length) (-> ms data-size)) (buffer-add-byte! (& b) 0))
+    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (buffer-free! (& b))
+    s))
+
 (define (slots-of! [ms (ptr mstate)] [instance datum]) -> datum
   (let ([known (assoc instance (-> ms slot-imports))])
     (if (!= known 0)
@@ -833,7 +901,7 @@
 (define (setup-code! [ms (ptr mstate)] [setup (ptr asm)] [fc (ptr fctx)] [s datum] [segment datum])
   (let ([sy (synth-of s)])
     (cond
-      [(== (-> sy kind) 'slots) (begin)]
+      [(or (== (-> sy kind) 'slots) (== (-> sy kind) 'block)) (begin)]
       [(or (== (-> sy kind) 'fidx) (== (-> sy kind) 'own-fidx))
        (let* ([f (-> sy info)] [extra (assq f (-> ms extra-places))]
               [first (cond [(== (-> sy kind) 'own-fidx) (-> ms own-slots)]
@@ -844,7 +912,7 @@
          (instr! setup '(i32.add))
          (instr! setup `(global.set ,s)))]
       [else
-       (let ([n (small (string-length segment))] [at (small (temp-local! fc 'i32))])
+       (let ([n (small (string-length segment))] [at (small (temp-local! fc 'i32))] [d (small (if (> (-> ms data-size) 0) 1 0))])
          (note-func! ms literal-buffer-info)
          (note-func! ms deserialize-info)
          (instr! setup `(i32.const ,n))
@@ -852,8 +920,8 @@
          (instr! setup `(local.tee ,at))
          (instr! setup '(i32.const 0))
          (instr! setup `(i32.const ,n))
-         (instr! setup '(memory.init 0 0))
-         (instr! setup '(data.drop 0))
+         (instr! setup `(memory.init ,d 0))
+         (instr! setup `(data.drop ,d))
          (instr! setup `(local.get ,at))
          (instr! setup `(i32.const ,n))
          (instr! setup `(call ,deserialize-info))
@@ -1007,7 +1075,8 @@
     (set! (-> m exports) exports)
     (set! (-> m start) (if has-start (small start-index) 0))
     (set! (-> m slots) (map (lambda ([info datum]) -> datum (index-of (-> lk funcs) info "a function")) (-> ms segment)))
-    (set! (-> m datas) (if (!= literal-segment 0) (cons literal-segment nil) nil))
+    (set! (-> m datas) (append (if (> (-> ms data-size) 0) (cons (block-bytes ms) nil) nil)
+                               (if (!= literal-segment 0) (cons literal-segment nil) nil)))
     (set! (-> m names) (cons (-> ms self) names))
     (encode-module (& m) (& out))
     (set! bytes (bytes->string (-> out bytes) (-> out length)))
