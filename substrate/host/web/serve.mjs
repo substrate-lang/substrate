@@ -40,7 +40,6 @@ const server = http.createServer((request, response) => {
     return;
   }
   let file = path.join(root, name);
-  // Only files inside the directory: reject a path that resolves outside it, as with "..".
   if (file !== root && !file.startsWith(root + path.sep)) {
     response.writeHead(403).end();
     return;

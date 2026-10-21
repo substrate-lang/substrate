@@ -4,7 +4,6 @@ import { createHost } from '../subhost-core.mjs';
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
 
-// host.exit must stop the program at once: from a host function, only a throw can.
 class Exit {
   constructor(code) {
     this.code = code;
@@ -43,7 +42,6 @@ async function fetchListed(url, dir, files) {
   const list = new URL(url, globalThis.document ? document.baseURI : globalThis.location.href);
   const paths = text.decode(await fetchBytes(list)).split('\n').filter((p) => p !== '');
   await Promise.all(paths.map(async (path) => {
-    // Escaped part by part, so that a name may contain characters such as # or ?.
     const from = new URL(path.split('/').map(encodeURIComponent).join('/'), list);
     files.set(resolvePath(dir, path), await fetchBytes(from));
   }));
@@ -81,7 +79,6 @@ export function run(options, names, wasm) {
   const out = lines((l) => console.log(l));
   const err = lines((l) => console.error(l));
   const write = options.write || ((fd, piece) => (fd === 2 ? err : out)(piece));
-  // A decoder per stream: { stream: true } carries a split character over to the next write.
   const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 

@@ -115,8 +115,6 @@ export async function gpu(options = {}) {
     const encoder = device.createCommandEncoder();
     let pass = null;
     let computing = false;
-    // Read-backs copy into a buffer during the frame; the buffer can only
-    // be mapped once the frame has been submitted, so they finish after.
     const reads = [];
     const drawn = new Map();
     const inPass = (what, compute) => {
@@ -132,7 +130,6 @@ export async function gpu(options = {}) {
           const node = theDom && theDom.nodeOf ? theDom.nodeOf(w[i + 2]) : null;
           if (!node) caller.trap(`gpu: surface ${id}: the page gave this module no dom, or node ${w[i + 2]} is not on the page`);
           if (!(node instanceof HTMLCanvasElement)) caller.trap(`gpu: surface ${id}: node ${w[i + 2]} is not a canvas`);
-          // Offscreen, for measuring on a real GPU: a headless browser there cannot show a WebGPU canvas.
           if (options.offscreen) {
             const texture = device.createTexture({
               label: `surface ${id}`, size: [node.width, node.height, 1], format: canvasFormat,
@@ -151,8 +148,6 @@ export async function gpu(options = {}) {
         }
         case 2: {
           const id = w[i + 1];
-          // A shader that does not compile is reported for the shader, with its lines, rather than
-          // as a general error of the device.
           device.pushErrorScope('validation');
           const module = device.createShaderModule({ label: `shader ${id}`, code: string(i + 2) });
           shaders.set(id, module);
@@ -515,8 +510,6 @@ export async function gpu(options = {}) {
     for (const read of reads) read();
   }
 
-  // Validation errors are caught per resource: a mistake is reported naming the pipeline,
-  // layout or bind group, rather than as the "previous error" that fails the frame later.
   function checked(what, id, make) {
     device.pushErrorScope('validation');
     const resource = make();
@@ -524,8 +517,6 @@ export async function gpu(options = {}) {
     return resource;
   }
 
-  // readSurface: a WebGPU canvas cannot be read through a 2D context without a GPU, so a test
-  // reads the next frame drawn on the surface this way.
   const surfaceReads = [];
   const timing = { measure: false, frames: 0, ms: 0 };
 
@@ -549,7 +540,6 @@ export async function gpu(options = {}) {
     });
   }
 
-  // Through a 2D context: copyExternalImageToTexture fails without a GPU.
   async function loadTexture(id, name) {
     loading++;
     try {
@@ -573,7 +563,6 @@ export async function gpu(options = {}) {
           pixels[k + 2] = (pixels[k + 2] * a + 127) / 255;
         }
       }
-      // The texture may have been destroyed while the file was on its way.
       const t = textures.get(id);
       if (!t) return;
       const texture = device.createTexture({
@@ -582,7 +571,6 @@ export async function gpu(options = {}) {
       });
       device.queue.writeTexture({ texture }, pixels, { bytesPerRow: bitmap.width * 4 }, [bitmap.width, bitmap.height]);
       textures.set(id, { texture, format: 'rgba8unorm', width: bitmap.width, height: bitmap.height, layers: 1 });
-      // Remake the bind groups that name the texture before destroying the placeholder.
       for (const description of bindGroups.values()) {
         if (description.entries.some((e) => e.kind === 3 && e.id === id)) description.group = makeBindGroup(description);
       }
@@ -620,7 +608,6 @@ export async function gpu(options = {}) {
     const t = get(5, id);
     const bpp = pixelBytes[t.format];
     if (!bpp) caller.trap(`gpu: a ${t.format} texture cannot be read`);
-    // A row of the copy must be a multiple of 256 bytes long.
     const bytesPerRow = (width * bpp + 255) & ~255;
     const staging = device.createBuffer({ size: bytesPerRow * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     encoder.copyTextureToBuffer(
@@ -649,7 +636,6 @@ export async function gpu(options = {}) {
     return {
       apply(ptr, len) {
         const memory = caller.memory();
-        // A Uint32Array must start at a multiple of 4: a batch at any other address is copied first.
         const w = ptr % 4 === 0
           ? new Uint32Array(memory.buffer, memory.byteOffset + ptr, len >>> 2)
           : new Uint32Array(memory.slice(ptr, ptr + len).buffer);

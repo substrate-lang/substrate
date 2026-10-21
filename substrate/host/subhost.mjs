@@ -1,6 +1,5 @@
 #!/usr/bin/env -S node --stack-size=4000
 // The host for Node: runs the program that `sub build` wrote to DIR, on V8.
-// The #! line's --stack-size gives V8 a 4 MiB call stack; substrate.sub's stack is as deep.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import util from 'node:util';
@@ -12,7 +11,6 @@ if (!dir) {
   process.exit(64);
 }
 
-// Worded as C's strerror words it, as the tests' expected errors are.
 function systemError(e) {
   if (typeof e.errno !== 'number') return e;
   const m = util.getSystemErrorMessage(e.errno);
@@ -21,8 +19,6 @@ function systemError(e) {
 
 const host = createHost({
   args: programArgs,
-  // When the reader has gone, as with `| head`, the program stops quietly, as SIGPIPE stops a
-  // process, with its status of 141.
   write(fd, bytes) {
     try {
       fs.writeSync(fd, bytes);

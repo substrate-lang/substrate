@@ -9,8 +9,6 @@ builds="${OUT:-build}/tests"
 rm -rf "${builds:?}"
 mkdir -p "$builds"
 
-# A cache of the suite's own, emptied, so that each test compiles its module: an
-# expected output includes what a module prints while compiling, which a cached one does not.
 cache="$root/$builds/cache"
 rm -rf "${cache:?}"
 mkdir -p "$cache"
@@ -53,7 +51,7 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
-# The session tests. Backtrace lines are removed: they depend on the host.
+# The session tests.
 for t in tests/session/*.sub; do
   name="$(basename "$t" .sub)"
   actual="$(cd tests/session && "$root/bin/sub" eval "$name.sub" -c "$cache" 2>&1 | grep -v '^    ')"
@@ -90,7 +88,7 @@ for t in "${tests[@]}"; do
     again=$((again + 1))
   fi
 done
-# A stale cache entry is not used: a required b, now does not, and b is gone.
+# A stale cache entry is not used.
 stale="$builds/stale"
 rm -rf "${stale:?}"
 mkdir -p "$stale"

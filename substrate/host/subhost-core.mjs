@@ -3,8 +3,7 @@
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
 
-// Wasm can catch a JavaScript exception but not a trap, so the host traps by calling
-// this module: (module (func (export "trap") unreachable)).
+// (module (func (export "trap") unreachable))
 const trapperBytes = Uint8Array.from([
   0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01,
   0x00, 0x07, 0x08, 0x01, 0x04, 0x74, 0x72, 0x61, 0x70, 0x00, 0x00, 0x0a, 0x05, 0x01, 0x03, 0x00, 0x00,
@@ -61,8 +60,6 @@ function deferStart(bytes) {
   const [func] = readU32(bytes, start.body);
   const name = utf8.encode(START_EXPORT);
   const entry = [...u32(name.length), ...name, 0, ...u32(func)];
-  // The export section comes just before the start section; without one,
-  // the new one takes the start section's place.
   const old = sections.find((s) => s.id === 7);
   let body = [...u32(1), ...entry];
   if (old) {
@@ -106,7 +103,6 @@ function limitMemory(bytes, pages) {
     bytes.subarray(section.end)]);
 }
 
-// Different modules may get the same key: compile also compares their bytes.
 function keyOf(bytes) {
   let a = 0x811c9dc5;
   let b = 0x811c9dc5;
@@ -172,7 +168,6 @@ export function createHost(platform) {
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
 
-  // Code run while compiling gets only these, since a build's bytes must depend on its sources alone.
   const COMPILE_TIME_HOST = new Set(['write', 'trap', 'error_message']);
   const refused = (what) => () => hostTrap(`${what} is not available while compiling`);
 
@@ -197,8 +192,6 @@ export function createHost(platform) {
     const kept = { bytes: platform.keyOf ? null : bytes, module };
     if (known) known.push(kept);
     else modules.set(key, [kept]);
-    // deferStart and limitMemory resize sections before the code, so the source-location
-    // offsets move by the difference in length.
     noteLocations(module, deferred.length - bytes.length);
     return module;
   }
@@ -282,7 +275,6 @@ export function createHost(platform) {
     };
   }
 
-  // A pointer arrives as a signed i32 and is taken unsigned (u): a memory can exceed 2 GB.
   function hostImports(self) {
     const { memory, string, u } = callerOf(self, 'host');
     return {
@@ -293,7 +285,7 @@ export function createHost(platform) {
       trap(ptr, len) {
         hostTrap(string(ptr, len));
       },
-      // compileTime is 1 for code the compiler runs while compiling, which gets less of the host.
+      // compileTime is 1 for code the compiler runs while compiling.
       instantiate(np, nl, bp, bl, mp, ml, compileTime) {
         const name = string(np, nl);
         const bytes = memory().slice(u(bp), u(bp) + bl);
@@ -340,7 +332,6 @@ export function createHost(platform) {
         }
         return 0;
       },
-      // A directory and those it is in. Where files are only names, as in a page, there is none.
       make_dir(pp, pl) {
         const path = string(pp, pl);
         try {
@@ -354,13 +345,11 @@ export function createHost(platform) {
       exit(code) {
         platform.exit(code);
       },
-      // The names of the modules the running program is made of, each followed by a newline.
       program_modules(bp, cap) {
         const b = utf8.encode(programNames.map((n) => `${n}\n`).join(''));
         memory().set(b.subarray(0, cap), u(bp));
         return b.length;
       },
-      // One of those modules' bytes, or -1 if it is not one of them.
       module_bytes(np, nl, bp, cap) {
         const name = string(np, nl);
         if (!programNames.includes(name)) {
@@ -414,7 +403,6 @@ export function createHost(platform) {
       const start = self.exports[START_EXPORT];
       if (start) start();
     } catch (e) {
-      // A wasm exception from the start function goes on to the caller; traps and link errors fail.
       if (!(e instanceof WebAssembly.RuntimeError || e instanceof RangeError ||
             e instanceof WebAssembly.LinkError)) throw e;
       const where = backtrace(e);
@@ -460,8 +448,6 @@ export function createHost(platform) {
           onTrap();
           return false;
         } catch (e2) {
-          // on-trap trapped too: report the original trap. Anything else, such as a platform's
-          // exit, is passed on.
           if (!(e2 instanceof WebAssembly.RuntimeError || e2 instanceof RangeError ||
                 e2 instanceof WebAssembly.Exception)) throw e2;
         }

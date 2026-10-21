@@ -83,9 +83,7 @@ header.writeUInt32BE(width, 0);
 header.writeUInt32BE(height, 4);
 header[8] = 8; // 8 bits per channel
 header[9] = 6; // colour type 6: red, green, blue and alpha
-// Bytes 10 to 12 stay 0: the standard compression, no filter, not interlaced.
 
-// Each row of pixels is preceded by a byte that names its filter; 0 is none.
 const rows = Buffer.alloc(height * (1 + width * 4));
 for (let y = 0; y < height; y++) {
   rows.set(pixels.subarray(y * width * 4, (y + 1) * width * 4), y * (1 + width * 4) + 1);

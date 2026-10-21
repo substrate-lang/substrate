@@ -4,8 +4,6 @@ import { run } from './subhost-web.mjs';
 let app = null;
 let currentMessage = null;
 
-// Output is sent every 30 ms, before a message and when a piece of work ends, and at most
-// maxPending bytes between sends, so that a program printing in a loop cannot flood the page.
 const pieces = [];
 let pendingBytes = 0;
 let droppedBytes = 0;
@@ -37,7 +35,6 @@ function sendOutput() {
 function output(fd, bytes) {
   if (pendingBytes + bytes.length > maxPending) droppedBytes += bytes.length;
   else {
-    // bytes points into the program's memory, which will change: keep a copy.
     pieces.push([fd, bytes.slice()]);
     pendingBytes += bytes.length;
   }
@@ -79,7 +76,6 @@ self.onmessage = (e) => {
       cwd: m.cwd,
       output,
       mayWrite: (path) => m.writable.some((dir) => isUnder(dir, path)),
-      // A wasm page is 64 KiB, so there are 16 pages in a mebibyte.
       memoryPages: m.memory * 16,
       modules: { guest },
       onExit(code) {

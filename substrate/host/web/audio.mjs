@@ -1,5 +1,4 @@
 // The host module "audio": sound files and synthesized tones.
-// No sound before the user's first key or click: until then tones are dropped and loops wait.
 import { resolvePath } from './subhost-web.mjs';
 
 export function audio() {
@@ -9,8 +8,6 @@ export function audio() {
 
   const sounds = new Map();
   let loading = 0;
-  // Decoding needs an audio context; the output one cannot exist before the first key or click,
-  // but one that renders to memory can, and what it decodes plays in any context.
   let decoder = null;
 
   const voices = new Map();
@@ -60,7 +57,6 @@ export function audio() {
       const bytes = app.files.get(resolvePath(app.cwd, name));
       if (!decoder) decoder = new OfflineAudioContext(1, 1, 44100);
       loading++;
-      // Decoding takes the bytes away from whoever passes them: a file of the program's is copied.
       const data = bytes
         ? Promise.resolve(bytes.slice().buffer)
         : fetch(name).then((response) => {
@@ -108,7 +104,6 @@ export function audio() {
       oscillator.type = shapes[wave] || 'square';
       oscillator.frequency.setValueAtTime(from, start);
       oscillator.frequency.linearRampToValueAtTime(to, end);
-      // Fading to silence avoids the click that an abrupt stop makes.
       gain.gain.setValueAtTime(volume, start);
       gain.gain.linearRampToValueAtTime(0, end);
       oscillator.connect(gain).connect(context.destination);

@@ -4,7 +4,6 @@ import { resolvePath } from './subhost-web.mjs';
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
 
-// The browser needs the media type to decode an image given as bytes.
 const imageTypes = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
   avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml',
@@ -12,15 +11,11 @@ const imageTypes = {
 
 export function dom(root) {
   const templates = new Map();
-  // A copy's nodes are consecutive siblings, so its { start, end } covers all of them,
-  // nested copies included.
   const nodes = new Map([[0, root]]);
   const images = new Map();
   let loading = 0;
   let event = null;
   let app = null;
-  // An event that fires while a batch is applied is queued: the program would answer by
-  // writing patches into the buffer being read.
   let applying = false;
   const waiting = [];
 
@@ -34,10 +29,7 @@ export function dom(root) {
     }
   };
 
-  // A listener's number is an address in the program's memory, freed with its node's number:
-  // never deliver for a freed node (unlisten clears the table, heard checks it).
   const listener = (e) => {
-    // currentTarget is set only during dispatch: read it now.
     const node = e.currentTarget;
     if (applying) waiting.push(() => heard(e, node));
     else heard(e, node);
@@ -55,7 +47,6 @@ export function dom(root) {
 
   function frame(time) {
     frameRequest = 0;
-    // A listener can be removed during the frame (its element unmounted): check before each call.
     for (const [id, message] of [...frames]) {
       if (frames.get(id) === message) give({ type: 'frame', timeStamp: time }, message);
     }
@@ -69,7 +60,6 @@ export function dom(root) {
       return;
     }
     const entry = { type, handler: null };
-    // The listener may be removed before a held-back event is delivered: check it is still there.
     const deliver = (e) => {
       const list = windowListeners.get(id);
       if (list && list.includes(entry)) give(e, message);
@@ -83,7 +73,6 @@ export function dom(root) {
     windowListeners.get(id).push(entry);
   }
 
-  // The pointer lock's events fire on the document and do not bubble: listen for them there.
   const windowTarget = (type) => (type === 'pointerlockchange' || type === 'pointerlockerror' ? document : window);
 
   const unlisten = (id) => {
@@ -112,8 +101,6 @@ export function dom(root) {
         n.replaceWith(marked[i]);
       }
     }
-    // An empty text node first keeps a copy's first node first, though nodes are inserted before
-    // an anchor the template begins with; an empty template gets one too.
     const first = content.firstChild;
     if (!first || (first.nodeType === Node.COMMENT_NODE && first.data === 'a')) {
       content.insertBefore(document.createTextNode(''), first);
@@ -151,8 +138,6 @@ export function dom(root) {
     return fragment;
   }
 
-  // A form control shows its value and checked properties, not the attributes: value sets the
-  // property instead, checked sets both.
   function setAttribute(node, name, value) {
     if (name === 'value') {
       if (node.value !== value) node.value = value;
@@ -223,10 +208,7 @@ export function dom(root) {
     }
   }
 
-  // Focus (10) and scrolling to the end (11) wait for the whole batch: focusing fires events,
-  // and scrolling needs the final content.
   function patches(memory, ptr, length, after) {
-    // A Uint32Array must start at a multiple of 4: a batch at any other address is copied first.
     const w = ptr % 4 === 0
       ? new Uint32Array(memory.buffer, memory.byteOffset + ptr, length >>> 2)
       : new Uint32Array(memory.slice(ptr, ptr + length).buffer);
@@ -253,8 +235,7 @@ export function dom(root) {
         }
         case 3:
           taken(nodes.get(w[i + 1]));
-          // No break here: removing a copy also frees its numbers, which is
-          // what patch 4 does.
+          // No break here.
         case 4:
           for (let id = w[i + 1]; id <= w[i + 1] + w[i + 2]; id++) {
             unlisten(id);
@@ -305,7 +286,6 @@ export function dom(root) {
         case 15: {
           const node = nodes.get(w[i + 1]);
           if (w[i + 2] !== 0) {
-            // pointerlockerror reports a failure; the promise newer browsers return must not reject unhandled.
             after.push(() => { const p = node.requestPointerLock(); if (p && p.catch) p.catch(() => {}); });
           } else {
             after.push(() => document.exitPointerLock());
@@ -348,8 +328,6 @@ export function dom(root) {
     }
   }
 
-  // Events from the deferred effects are delivered at once: safe, since the program emptied its
-  // patch buffer before calling apply.
   function apply(memory, ptr, length) {
     const after = [];
     applying = true;

@@ -86,7 +86,6 @@ export function guests() {
       wasm.set(name, bytes);
     }
 
-    // postMessage copies the granted files: the guest cannot change ours.
     const readable = spec.read.map((d) => resolvePath(app.cwd, d));
     const granted = new Map();
     for (const [path, bytes] of files) if (readable.some((d) => isUnder(d, path))) granted.set(path, bytes);
@@ -97,7 +96,6 @@ export function guests() {
     alive.set(g, guest);
 
     worker.onmessage = (e) => {
-      // Ignore anything that arrives after the guest was ended.
       if (alive.get(g) !== guest) return;
       const m = e.data;
       if (m.type === 'output') deliver(g, m.fd === 2 ? STDERR : STDOUT, m.bytes);
@@ -140,10 +138,8 @@ export function guests() {
       send(g, ptr, length) {
         const guest = alive.get(g);
         if (!guest) return -1;
-        // slice() copies out of the program's memory; the copy is transferred, not copied again.
         const bytes = caller.memory().slice(caller.u(ptr), caller.u(ptr) + length);
         guest.worker.postMessage({ type: 'message', bytes }, [bytes.buffer]);
-        // An idle guest starts this message now, so its time limit starts now too.
         if (guest.unfinished++ === 0) restartTimer(g, guest);
         return 0;
       },

@@ -8,7 +8,7 @@ import { withBrowser } from '../../host/web/browser.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [site, ...names] = process.argv.slice(2);
 
-// Port 0: any free port; serve.mjs prints the address it chose.
+// Port 0: any free port.
 const server = spawn(path.join(here, '../../host/web/serve.mjs'), [site, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 
@@ -18,7 +18,6 @@ try {
     for (const name of names) {
       const page = await open(`${url}index.html?session=${name}`);
       await page.waitFor('window.done', 60000);
-      // Backtrace lines (four spaces) are removed: they depend on the host.
       const actual = (await page.evaluate('document.getElementById("out").textContent'))
         .split('\n').filter((l) => !l.startsWith('    ')).join('\n');
       const expected = fs.readFileSync(path.join(here, `../session/${name}.out`), 'utf8');

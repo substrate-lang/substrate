@@ -7,15 +7,12 @@ import { withBrowser, webgpuFlags, hardwareGpuFlags } from '../../../host/web/br
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites, hardware] = process.argv.slice(2);
 const counts = [1000, 5000, 20000];
-// For the hardware only: drawn in software, a frame would take seconds.
 const bigCounts = [100000, 200000];
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const column = (text, width) => String(text).padStart(width);
 
 const server = spawn(path.join(here, '../../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
-// WebGPU needs the GPU process and flags, which change how the 2D context draws,
-// so each renderer gets a browser of its own.
 try {
   console.log('renderer                     sprites   frame ms   drawing ms   gpu ms   frames a second');
   const runs = [

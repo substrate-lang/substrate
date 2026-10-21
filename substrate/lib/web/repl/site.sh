@@ -14,6 +14,4 @@ out="$1"
 "$root/host/web/pack.mjs" -o "$out/session.pack" -C "$out/session" .
 rm -r "${out:?}/session"
 
-# files.pack must hold the sources session.sub was built from: the compiler reuses the
-# modules it runs only for sources with the same hash.
 "$root/host/web/pack.mjs" -o "$out/files.pack" -C "$root" compiler/substrate.sub compiler/wasm.sub compiler/writer.sub compiler/syntax.sub compiler/host.sub compiler/macros.sub lib/nodes.sub lib/scheme lib/bend

@@ -1,4 +1,3 @@
-# bin/sub builds build/sub when the compiler's sources or the seed are newer.
 build/sub:
 	@mkdir -p build && : > build/empty.sub
 	bin/sub expand build/empty.sub > /dev/null

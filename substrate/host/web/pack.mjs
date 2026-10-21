@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Writes a file pack, many files in one, sorted so that the same files give the same bytes.
+// Writes a file pack, many files in one.
 import fs from 'node:fs';
 import path from 'node:path';
 

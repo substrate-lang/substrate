@@ -4,18 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-// Without a GPU, Chromium runs WebGPU on SwiftShader only with these flags and its GPU process
-// on. On macOS (Metal) they only turn WebGPU on: SwiftShader's device is lost there.
 export const webgpuFlags = process.platform === 'darwin' ? ['--enable-unsafe-webgpu'] : [
   '--enable-unsafe-webgpu', '--enable-unsafe-swiftshader', '--enable-features=Vulkan', '--use-vulkan=swiftshader',
   '--use-angle=vulkan',
 ];
 
-// With these, headless Chromium uses a Vulkan GPU, but only off screen: drawing on a canvas
-// loses the device (vkAllocateMemory fails).
 export const hardwareGpuFlags = ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-angle=vulkan'];
 
-// DevTools needs each key's code and Windows virtual key number, not only its name.
 const keys = {
   Enter: { code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
   Tab: { code: 'Tab', windowsVirtualKeyCode: 9 },
@@ -27,11 +22,8 @@ const keys = {
   ArrowRight: { code: 'ArrowRight', windowsVirtualKeyCode: 39 },
 };
 
-// --no-sandbox: Chromium's sandbox needs kernel features that build machines often lack;
-// the only pages opened are this repository's own, served from this machine.
 export async function withBrowser(use, options = {}) {
   const profile = fs.mkdtempSync(path.join(options.dir || os.tmpdir(), 'chromium-'));
-  // No GPU unless options.gpu: a build machine has none, and looking for one costs time.
   const browser = spawn(options.chromium || process.env.CHROMIUM || 'chromium', [
     '--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
     '--no-first-run', '--no-default-browser-check', ...(options.gpu ? [] : ['--disable-gpu']), '--no-sandbox',
@@ -91,7 +83,6 @@ export async function withBrowser(use, options = {}) {
       const command = (method, params) => send(method, params, sessionId);
       await command('Runtime.enable');
       await command('Page.enable');
-      // In front: the browser runs animation frames at full speed only for the page in front.
       await send('Target.activateTarget', { targetId });
       const evaluate = async (js) => {
         const r = await command('Runtime.evaluate', { expression: js, awaitPromise: true, returnByValue: true });
@@ -104,7 +95,6 @@ export async function withBrowser(use, options = {}) {
       const page = {
         log,
         evaluate,
-        // An evaluation that never answers (a promise for a frame never drawn) ends at the deadline too.
         async waitFor(js, ms = 10000) {
           const until = Date.now() + ms;
           const late = {};
@@ -167,8 +157,6 @@ export async function withBrowser(use, options = {}) {
     if (socket) socket.close();
     browser.kill();
     await new Promise((resolve) => browser.on('exit', resolve));
-    // The GPU process may still write its caches after the browser exits,
-    // so removing the profile may need a retry.
     fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   }
 }

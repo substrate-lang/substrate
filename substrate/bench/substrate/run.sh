@@ -13,8 +13,6 @@ mkdir -p "$out"
 
 for name in "${names[@]}"; do
   (cd "$here" && "$root/bin/sub" build "$name.sub" -o "$out/$name" -c "$root/build/bench/cache" > /dev/null)
-  # nix's clang wrapper adds hardening flags that slow C down, warns of the wasm target, and
-  # passes native link flags, so wasm-ld links the wasm itself.
   NIX_HARDENING_ENABLE= clang -O2 -o "$out/$name.native" "$here/$name.c"
   for v in wasm noinline; do
     NIX_HARDENING_ENABLE= clang --target=wasm32 -O2 $([ $v = noinline ] && echo -fno-inline) -ffreestanding -nostdlib \
@@ -26,7 +24,6 @@ done
 
 variants=(ours native wasm noinline)
 node=(node --stack-size=4000 --experimental-wasm-exnref --no-liftoff)
-# The C wasm exports run, whose result it prints.
 c_wasm='const fs = require("fs");
 console.log(String(new WebAssembly.Instance(new WebAssembly.Module(fs.readFileSync(process.argv[1]))).exports.run()))'
 

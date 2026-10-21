@@ -14,7 +14,6 @@ mkdir -p "$out/host/web"
 "$root/bin/sub" build "$file" -o "$out/program"
 assets="$(dirname "$file")/assets"
 if [ -d "$assets" ]; then
-  # -L copies the file a symbolic link points to, not the link.
   cp -RL "$assets" "$out/assets"
   (cd "$out" && find assets -type f | LC_ALL=C sort) > "$out/assets.list"
 else

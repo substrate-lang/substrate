@@ -5,7 +5,6 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 sites="${OUT:-build}/web"
 
-# Expanding an empty file is the cheapest way to have bin/sub bring build/sub up to date.
 mkdir -p build
 : > build/empty.sub
 bin/sub expand build/empty.sub > /dev/null
@@ -32,8 +31,6 @@ lib/web/site.sh lib/web/examples/snake/snake.sub "$sites/snake" lib/web/examples
 lib/web/site.sh lib/web/examples/platformer/platformer.sub "$sites/platformer" lib/web/examples/platformer/page.html
 lib/web/site.sh lib/web/examples/blocks/blocks.sub "$sites/blocks" lib/web/examples/blocks/page.html
 lib/web/site.sh lib/web/examples/valley/valley.sub "$sites/valley" lib/web/examples/valley/page.html
-# The sounds page uses the platformer's page, which keeps the audio module
-# where the test can ask it what was played.
 lib/web/site.sh tests/web/sounds.sub "$sites/sounds" lib/web/examples/platformer/page.html
 lib/web/site.sh tests/web/stopped.sub "$sites/stopped"
 lib/web/site.sh tests/web/stopped-at-start.sub "$sites/stopped-at-start"

@@ -1,4 +1,4 @@
-/* The C benchmarks' allocator, Substrate's K&R malloc, and their entry point. */
+/* The C benchmarks' allocator and their entry point. */
 #include <stddef.h>
 #include <stdint.h>
 

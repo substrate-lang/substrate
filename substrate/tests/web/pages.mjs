@@ -32,7 +32,6 @@ const checks = {
       '<div class="counter"><button>-</button><span class="count">0</span><button>+</button><!--a--></div>');
   },
 
-  // Backtrace lines (four spaces) are removed: they depend on the host.
   async repl(page) {
     const entries = () => page.evaluate(`[...document.querySelectorAll('section.entry')].map((s) => {
       const output = s.querySelector('.output');
@@ -133,8 +132,6 @@ const checks = {
     check('repl: the text box has the focus after a language button',
       await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
 
-    // This input overwrites memory from byte 8 to the break; 8 is still printed, since
-    // substrate.sub formats a number in the bytes below 96 and keeps nothing in memory.
     await page.type('(memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8)))');
     await page.press('Enter');
     await idle();
@@ -173,7 +170,6 @@ const checks = {
     await page.click('#append');
     same('rows: append 1,000 rows', await ids(), [...swapped, ...upTo(1000, 1001)]);
 
-    // A click on a removed row's link must not reach the program, whose data for it is freed.
     await page.evaluate(`(() => {
       window.kept = document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a");
       window.given = 0;
@@ -229,7 +225,6 @@ const checks = {
   },
 
   async guests(page) {
-    // Backtrace lines (four spaces) are removed: they depend on the host.
     const log = async () => (await page.evaluate('document.getElementById("log").textContent'))
       .split('\n').filter((l) => !l.startsWith('    ')).join('\n');
     await page.waitFor('document.getElementById("log").textContent.includes("guest 3 is now looping")', 30000);
@@ -372,8 +367,6 @@ const checks = {
     check('snake: the A key turns left and starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
   },
 
-  // The level is 12 pixels taller than the screen and the camera at its bottom, so the
-  // player, at (35, 146) in the level, is drawn from y = 134.
   async platformer(page) {
     const pixel = (x, y) => page.evaluate(
       `window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
@@ -467,7 +460,6 @@ const checks = {
       return [lit, shaded];
     })`);
     check('blocks: the sun lights some grass and leaves some in shade', greens[0] > 5000 && greens[1] > 5000, true);
-    // The sun is up and to the left (light-init! in meshes.sub): left and up bring its disc in.
     await page.keyDown('ArrowLeft');
     await new Promise((resolve) => setTimeout(resolve, 430));
     await page.keyUp('ArrowLeft');
@@ -508,8 +500,6 @@ const checks = {
     await page.click('canvas');
     await page.waitFor('document.pointerLockElement !== null', 5000);
     check('blocks: a click locks the pointer to the screen', await page.evaluate('document.pointerLockElement && document.pointerLockElement.tagName'), 'CANVAS');
-    // The program hears of the lock a moment after the browser, and ignores movement until
-    // then: so the mouse moves a little on each look until the view has turned.
     await page.waitFor(`(window.dispatchEvent(new MouseEvent('mousemove', { movementX: 30, movementY: 0 })),
       window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${dug}; }))`, 5000);
     check('blocks: moving the mouse turns the view', (await picture()) !== dug, true);
@@ -517,7 +507,6 @@ const checks = {
     await page.evaluate(`document.querySelector('canvas').dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true })); window.dispatchEvent(new MouseEvent('mouseup', { button: 0 }))`);
     await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${turned}; })`, 5000);
     check('blocks: the left button digs', (await picture()) !== turned, true);
-    // Escape frees the pointer in a real browser; here the page does it.
     await page.evaluate('document.exitPointerLock()');
     await page.waitFor('document.pointerLockElement === null', 5000);
     check('blocks: the game has not stopped', await page.evaluate('document.querySelector(".game-stopped") === null'), true);
@@ -548,7 +537,6 @@ const checks = {
     await page.keyDown('v');
     await page.keyUp('v');
     const before = await picture();
-    // W is held until the view has changed: a frame on SwiftShader takes a while.
     await page.keyDown('w');
     await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 30000);
     await page.keyUp('w');
@@ -569,9 +557,7 @@ const checks = {
     check('sounds: one sound file was loaded and decoded', await count('loaded'), 1);
     check('sounds: the file that is missing is reported',
       page.log.some((line) => line.includes('audio: cannot load the sound assets/nothing.wav')), true);
-    // A browser allows sound only after a key press or a click.
     check('sounds: nothing plays before a key is pressed', await count('started'), 0);
-    // Any key will do: this one means nothing to the game.
     await page.press('x');
     await page.waitFor('window.audio.running()', 5000);
     await page.waitFor('window.audio.started() === 1', 5000);
@@ -642,17 +628,15 @@ const checks = {
     check('focus: the program receives the focus event', await counts(), '1 1 0');
     check('focus: the field has the focus', await page.evaluate('document.activeElement.id'), 'field');
     check('focus: the update was applied once', await marks(), 1);
-    // Clicking the button first takes the focus from the field (a blur event).
     await page.click('#turn');
     check('focus: second click', await counts(), '2 2 1');
     check('focus: still one mark', await marks(), 1);
   },
 };
 
-// The pages that need WebGPU run in a browser of their own, with the flags for it.
 const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 
-// Port 0: any free port; serve.mjs prints its address.
+// Port 0: any free port.
 const server = spawn(path.join(here, '../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 async function run(group) {

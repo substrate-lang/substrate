@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Writes a Bend module: header.sub, then N blocks of nat.sub, list.sub and tree.sub, @ = k.
+# Writes a Bend module: header.sub, then N blocks of nat.sub, list.sub and tree.sub.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 n="${1:-3200}"

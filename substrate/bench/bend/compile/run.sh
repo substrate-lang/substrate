@@ -6,7 +6,6 @@ root="$(cd "$here/../../.." && pwd)"
 n="${1:-3200}"
 out="$root/build/bench/bend"
 mkdir -p "$out"
-# In build/, at this directory's depth, so the requires copied from header.sub resolve.
 "$here/proofs.sh" "$n" > "$out/proofs-$n.sub"
 cache="$out/cache"
 mkdir -p "$cache"

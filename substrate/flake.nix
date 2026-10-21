@@ -7,8 +7,6 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      # nixpkgs builds no Chromium for macOS: there, Playwright's Chrome for
-      # Testing, run by a `chromium` script.
       chromium = pkgs:
         if pkgs.stdenv.isLinux then pkgs.chromium
         else pkgs.runCommand "chromium" {
@@ -33,7 +31,7 @@
             pkgs.nodejs        # V8: the host (host/subhost.mjs), and the web tests' driver
             (chromium pkgs)    # the headless browser of the web tests (above)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-            pkgs.clang     # the C benchmarks' compiler (bench/substrate); on macOS, the shell's own
+            pkgs.clang     # the C benchmarks' compiler (bench/substrate)
           ];
         };
       });

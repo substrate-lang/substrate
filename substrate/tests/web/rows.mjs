@@ -13,7 +13,6 @@ try {
   await withBrowser(async (open) => {
     const page = await open(`${url}rows/index.html`);
     await page.waitFor('window.ready', 60000);
-    // Reading offsetHeight makes the browser lay the page out, so layout is in the time.
     const click = (selector) => page.evaluate(`(() => {
       const e = document.querySelector(${JSON.stringify(selector)});
       const t = performance.now();
