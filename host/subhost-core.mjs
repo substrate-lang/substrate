@@ -159,6 +159,12 @@ function importMap(bytes) {
   return map;
 }
 
+export class Exit {
+  constructor(code) {
+    this.code = code;
+  }
+}
+
 export function createHost(platform) {
   const registry = new Map();
   const modules = new Map();
@@ -166,6 +172,12 @@ export function createHost(platform) {
   // The running program: its modules' names in load order, and how to get one's bytes.
   let programNames = [];
   let programBytes = null;
+  let entry = null;
+  let ended = false;
+  let running = false;
+  let draining = false;
+  const queue = [];
+  let current = null;
 
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
@@ -256,7 +268,7 @@ export function createHost(platform) {
     return `${named[1]}${f} ${found.where}`;
   }
 
-  function callerOf(self, who) {
+  function callerOf(self, who, made) {
     const memory = () => {
       const m = self.exports && self.exports.memory;
       if (!m) hostTrap(`${who}: the caller exports no memory, or is still starting`);
@@ -273,6 +285,21 @@ export function createHost(platform) {
       trap: hostTrap,
       error(message) {
         lastError = message;
+      },
+      event(kind, id, value, bytes, data) {
+        event(made.source, kind, id, value, bytes, data);
+      },
+      current: () => current,
+    };
+  }
+
+  function eventImports(self) {
+    const { memory, u } = callerOf(self, 'events');
+    return {
+      take(buf, cap) {
+        if (!current || !current.bytes) return 0;
+        memory().set(current.bytes.subarray(0, cap), u(buf));
+        return current.bytes.length;
       },
     };
   }
@@ -383,11 +410,19 @@ export function createHost(platform) {
         if (!made.has('host')) made.set('host', hostImports(self));
         value = made.get('host')[imp.name];
         if (compileTime && value && !COMPILE_TIME_HOST.has(imp.name)) value = refused(`host.${imp.name}`);
+      } else if (imp.module === 'events') {
+        if (!made.has('events')) made.set('events', eventImports(self));
+        value = made.get('events')[imp.name];
+        if (compileTime && value) value = refused(`events.${imp.name}`);
       } else if (platform.modules && platform.modules.has(from)) {
         if (compileTime) {
           value = refused(`${from}.${imp.name}`);
         } else {
-          if (!made.has(from)) made.set(from, platform.modules.get(from)(callerOf(self, from)));
+          if (!made.has(from)) {
+            const functions = {};
+            Object.assign(functions, platform.modules.get(from)(callerOf(self, from, functions)));
+            made.set(from, functions);
+          }
           value = made.get(from)[imp.name];
         }
       } else {
@@ -419,43 +454,107 @@ export function createHost(platform) {
   function load(names, bytesOf) {
     programNames = names;
     programBytes = bytesOf;
-    for (const name of names) {
-      let loaded;
-      try {
-        loaded = instantiate(name, bytesOf(name), new Map());
-      } catch (e) {
-        if (!(e instanceof WebAssembly.Exception)) throw e;
-        lastError = 'uncaught exception';
+    running = true;
+    try {
+      for (const name of names) {
+        let loaded;
+        try {
+          loaded = instantiate(name, bytesOf(name), new Map());
+        } catch (e) {
+          if (e instanceof Exit) {
+            end(`exit ${e.code}`);
+            return {};
+          }
+          if (!(e instanceof WebAssembly.Exception)) throw e;
+          lastError = 'uncaught exception';
+        }
+        if (!loaded) return null;
       }
-      if (!loaded) return null;
+    } finally {
+      running = false;
     }
-    return names.length > 0 ? registry.get(names[names.length - 1]) : {};
+    entry = names.length > 0 ? registry.get(names[names.length - 1]) : {};
+    return entry;
   }
 
-  function call(entry, f, args, report) {
+  function end(reason) {
+    ended = true;
+    queue.length = 0;
+    if (platform.ended) platform.ended(reason);
+  }
+
+  function trapped(e) {
+    if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
+      lastError = `trap: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}\n${backtrace(e)}`;
+    } else if (e instanceof WebAssembly.Exception) {
+      lastError = 'uncaught exception';
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  function call(f, args) {
+    if (ended) return false;
+    const outer = running;
+    running = true;
     try {
       f(...args);
       return true;
     } catch (e) {
-      if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
-        lastError = `trap: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}\n${backtrace(e)}`;
-      } else if (e instanceof WebAssembly.Exception) {
-        lastError = 'uncaught exception';
-      } else {
-        throw e;
+      if (e instanceof Exit) {
+        end(`exit ${e.code}`);
+        return false;
       }
-      const onTrap = entry['on-trap'];
+      if (!trapped(e)) throw e;
+      const onTrap = entry && entry['on-trap'];
       if (typeof onTrap === 'function') {
         try {
           onTrap();
           return false;
         } catch (e2) {
-          if (!(e2 instanceof WebAssembly.RuntimeError || e2 instanceof RangeError ||
-                e2 instanceof WebAssembly.Exception)) throw e2;
+          if (e2 instanceof Exit) {
+            end(`exit ${e2.code}`);
+            return false;
+          }
+          if (!trapped(e2)) throw e2;
         }
       }
-      report(lastError);
+      platform.report(lastError);
+      end(lastError);
       return false;
+    } finally {
+      running = outer;
+      if (!outer) drain();
+    }
+  }
+
+  function event(source, kind, id, value, bytes, data) {
+    if (ended) return;
+    queue.push({ source, kind, id, value, bytes: bytes || null, data: data === undefined ? null : data });
+    if (!running) drain();
+  }
+
+  function drain() {
+    if (draining || running) return;
+    draining = true;
+    try {
+      while (queue.length > 0 && !ended) {
+        const e = queue.shift();
+        const onEvent = entry && entry['on-event'];
+        let ok;
+        if (typeof onEvent === 'function') {
+          current = e;
+          try {
+            ok = call(onEvent, [e.source, e.kind, e.id, e.value, e.bytes ? e.bytes.length : 0]);
+          } finally {
+            current = null;
+          }
+        }
+        if (platform.delivered) platform.delivered(e, ok);
+      }
+    } finally {
+      draining = false;
     }
   }
 
@@ -464,6 +563,10 @@ export function createHost(platform) {
     instantiate,
     load,
     call,
+    event,
+    get ended() {
+      return ended;
+    },
     get lastError() {
       return lastError;
     },

@@ -51,6 +51,12 @@ const host = createHost({
   exit(code) {
     process.exit(code);
   },
+  report(message) {
+    process.stderr.write(`error: ${message}\n`);
+  },
+  ended() {
+    process.exit(2);
+  },
   keyOf: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 });
 
@@ -73,7 +79,6 @@ if (!entry) {
   process.stderr.write(`error: ${host.lastError}\n`);
   process.exit(2);
 }
-if (typeof entry.main === 'function' &&
-    !host.call(entry, entry.main, [], (message) => process.stderr.write(`error: ${message}\n`))) {
+if (typeof entry.main === 'function' && !host.call(entry.main, []) && typeof entry['on-event'] !== 'function') {
   process.exit(2);
 }

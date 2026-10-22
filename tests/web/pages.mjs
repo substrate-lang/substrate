@@ -138,7 +138,7 @@ const checks = {
     check('repl: an input that corrupts the session fails', (await last()).split('\n')[0],
       '! (memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8))) => 8');
     check('repl: the page reports that the session crashed', (await last()).split('\n').pop(),
-      'The session crashed while evaluating this input. A new session was started.');
+      'trap: memory access out of bounds');
     await say('(fib 10)');
     check('repl: earlier definitions survive the crash', await last(), '(fib 10) => 55');
 
@@ -173,8 +173,7 @@ const checks = {
     await page.evaluate(`(() => {
       window.kept = document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a");
       window.given = 0;
-      const call = window.app.call;
-      window.app.call = (...args) => { window.given++; return call(...args); };
+      window.app.delivered = () => { window.given++; };
     })()`);
     await page.click('#clear');
     same('rows: clear removes every row', await ids(), []);

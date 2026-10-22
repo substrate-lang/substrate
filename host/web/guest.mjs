@@ -1,58 +1,26 @@
 // The host module "guest": runs another program in a Web Worker, sharing nothing but messages.
 import { resolvePath } from './subhost-web.mjs';
+import { isUnder, parseSpec } from '../guest-common.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
 
+const SOURCE = 3;
 const MESSAGE = 1;
 const STDOUT = 2;
 const STDERR = 3;
 const DONE = 4;
 const ENDED = 5;
 
-function parseSpec(spec) {
-  const result = { program: null, args: [], read: [], write: [], time: 0, memory: 0 };
-  const positiveInteger = (word, value) => {
-    if (!/^[0-9]+$/.test(value) || Number(value) === 0) {
-      throw new Error(`guest.start: "${word}" needs a positive whole number, not "${value}"`);
-    }
-    return Number(value);
-  };
-  for (const line of spec.split('\n')) {
-    if (line.trim() === '') continue;
-    const space = line.indexOf(' ');
-    const word = space < 0 ? line : line.slice(0, space);
-    const value = space < 0 ? '' : line.slice(space + 1);
-    if (word === 'program') result.program = value;
-    else if (word === 'arg') result.args.push(value);
-    else if (word === 'read') result.read.push(value);
-    else if (word === 'write') result.write.push(value);
-    else if (word === 'time') result.time = positiveInteger(word, value);
-    else if (word === 'memory') result.memory = positiveInteger(word, value);
-    else throw new Error(`guest.start: unknown setting "${word}" in the spec`);
-  }
-  if (result.program === null) throw new Error('guest.start: the spec has no "program" line');
-  return result;
-}
-
-const isUnder = (dir, path) => path === dir || path.startsWith(dir === '/' ? dir : `${dir}/`);
-
 export function guests() {
   let app = null;
+  let caller = null;
 
   const alive = new Map();
   let nextNumber = 1;
 
-  let eventData = null;
-
   const deliver = (g, kind, bytes) => {
-    const outer = eventData;
-    eventData = bytes;
-    try {
-      app.call('on-guest', g, kind);
-    } finally {
-      eventData = outer;
-    }
+    if (caller) caller.event(kind, g, 0, bytes);
   };
 
   const end = (g, reason) => {
@@ -124,9 +92,11 @@ export function guests() {
     return g;
   }
 
-  return (caller, theApp) => {
+  return (theCaller, theApp) => {
+    caller = theCaller;
     app = theApp;
     return {
+      source: SOURCE,
       start(ptr, length) {
         try {
           return start(caller.string(ptr, length));
@@ -142,11 +112,6 @@ export function guests() {
         guest.worker.postMessage({ type: 'message', bytes }, [bytes.buffer]);
         if (guest.unfinished++ === 0) restartTimer(g, guest);
         return 0;
-      },
-      take(buf, cap) {
-        if (!eventData) return 0;
-        caller.memory().set(eventData.subarray(0, cap), caller.u(buf));
-        return eventData.length;
       },
       stop(g) {
         end(g, null);

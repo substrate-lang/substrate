@@ -1,14 +1,8 @@
 // The host for a web page: runs a program in a browser, its files kept in memory.
-import { createHost } from '../subhost-core.mjs';
+import { createHost, Exit } from '../subhost-core.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
-
-class Exit {
-  constructor(code) {
-    this.code = code;
-  }
-}
 
 export function resolvePath(cwd, path) {
   const out = [];
@@ -82,9 +76,14 @@ export function run(options, names, wasm) {
   const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 
-  const app = { files, cwd, entry: null, ended: false };
+  const app = { files, cwd, entry: null, ended: false, delivered: options.delivered || null };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
+  const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
+  const ended = (reason) => {
+    app.ended = true;
+    if (options.onEnd) options.onEnd(reason);
+  };
 
   const host = createHost({
     args: options.args || [],
@@ -102,38 +101,27 @@ export function run(options, names, wasm) {
     exit(code) {
       throw new Exit(code);
     },
+    report,
+    ended,
+    delivered(event, ok) {
+      if (app.delivered) app.delivered(event, ok);
+    },
     modules,
     memoryPages: options.memoryPages || 0,
   });
   app.host = host;
 
-  const running = (f) => {
-    if (app.ended) return false;
-    try {
-      return f();
-    } catch (e) {
-      if (!(e instanceof Exit)) throw e;
-      app.ended = true;
-      if (options.onExit) options.onExit(e.code);
-      return false;
-    }
-  };
-  const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
-
   app.call = (name, ...args) => {
     const f = app.entry && app.entry[name];
     if (typeof f !== 'function') return undefined;
-    return running(() => host.call(app.entry, f, args, report));
+    return host.call(f, args);
   };
 
-  running(() => {
-    app.entry = host.load(names, (name) => wasm.get(name));
-    if (!app.entry) {
-      report(host.lastError);
-      throw new Exit(2);
-    }
-    return true;
-  });
+  app.entry = host.load(names, (name) => wasm.get(name));
+  if (!app.entry) {
+    report(host.lastError);
+    ended('exit 2');
+  }
   app.started = app.call('main');
   return app;
 }

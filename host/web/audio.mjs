@@ -1,6 +1,12 @@
 // The host module "audio": sound files and synthesized tones.
 import { resolvePath } from './subhost-web.mjs';
 
+const utf8 = new TextEncoder();
+
+const SOURCE = 4;
+const LOADED = 1;
+const FAILED = 2;
+
 export function audio() {
   let context = null;
   let played = 0;
@@ -52,6 +58,7 @@ export function audio() {
   const shapes = ['square', 'sawtooth', 'triangle', 'sine'];
 
   const module = (caller, app) => ({
+    source: SOURCE,
     load(id, ptr, length) {
       const name = caller.string(ptr, length);
       const bytes = app.files.get(resolvePath(app.cwd, name));
@@ -64,12 +71,19 @@ export function audio() {
           return response.arrayBuffer();
         });
       data.then((buffer) => decoder.decodeAudioData(buffer)).then(
-        (decoded) => sounds.set(id, decoded),
-        (e) => console.error(`audio: cannot load the sound ${name}: ${e.message}`),
-      ).finally(() => {
-        loading--;
-        startWaiting();
-      });
+        (decoded) => {
+          sounds.set(id, decoded);
+          loading--;
+          startWaiting();
+          caller.event(LOADED, id, 0);
+        },
+        (e) => {
+          console.error(`audio: cannot load the sound ${name}: ${e.message}`);
+          loading--;
+          startWaiting();
+          caller.event(FAILED, id, 0, utf8.encode(`cannot load the sound ${name}: ${e.message}`));
+        },
+      );
     },
     loading() {
       return loading;

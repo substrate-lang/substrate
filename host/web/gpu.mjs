@@ -27,6 +27,7 @@ const comparisons = { 1: 'less', 2: 'less-equal', 3: 'greater', 4: 'greater-equa
 const addressModes = { 0: 'clamp-to-edge', 1: 'repeat', 2: 'mirror-repeat' };
 const kindNames = { 1: 'surface', 2: 'shader', 3: 'pipeline', 4: 'buffer', 5: 'texture', 6: 'sampler', 7: 'layout', 8: 'bind group' };
 
+const SOURCE = 2;
 const ERROR = 1;
 const LOADED = 2;
 const PIXELS = 3;
@@ -34,8 +35,8 @@ const BYTES = 4;
 
 function unavailable(reason) {
   const module = (caller) => ({
+    source: SOURCE,
     apply() { caller.trap(`gpu: WebGPU is not available: ${reason}`); },
-    take() { return 0; },
     loading() { return 0; },
   });
   module.available = false;
@@ -73,21 +74,8 @@ export async function gpu(options = {}) {
 
   let app = null;
   let caller = null;
-  let eventData = null;
-  const pending = [];
   function event(kind, id, data) {
-    pending.push({ kind, id, data });
-    if (pending.length > 1) return;
-    while (pending.length > 0) {
-      const e = pending[0];
-      eventData = e.data;
-      try {
-        if (app) app.call('on-gpu', e.kind, e.id);
-      } finally {
-        eventData = null;
-        pending.shift();
-      }
-    }
+    if (caller) caller.event(kind, id, 0, data);
   }
   const error = (id, message) => event(ERROR, id, utf8.encode(message));
 
@@ -634,6 +622,7 @@ export async function gpu(options = {}) {
     caller = theCaller;
     app = theApp;
     return {
+      source: SOURCE,
       apply(ptr, len) {
         const memory = caller.memory();
         const w = ptr % 4 === 0
@@ -642,11 +631,6 @@ export async function gpu(options = {}) {
         const f = new Float32Array(w.buffer, w.byteOffset, w.length);
         const string = (at) => text.decode(memory.subarray(w[at], w[at] + w[at + 1]));
         run(memory, w, f, string);
-      },
-      take(buf, cap) {
-        if (!eventData) return 0;
-        caller.memory().set(eventData.subarray(0, cap), caller.u(buf));
-        return eventData.length;
       },
       loading() {
         return loading;
