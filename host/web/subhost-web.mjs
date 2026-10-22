@@ -87,6 +87,7 @@ export function run(options, names, wasm) {
     report,
     ended,
     delivered: options.delivered,
+    active: options.active,
     modules,
     memoryPages: options.memoryPages || 0,
   });
