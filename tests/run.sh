@@ -26,7 +26,7 @@ mkdir -p "$builds/tls"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
 
-tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub)
+tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
@@ -73,7 +73,7 @@ for t in tests/events/*.sub; do
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
-  actual="$(cd tests/events && "$host" -g clock,random,timer,fetch,websocket,net "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
+  actual="$(cd tests/events && "$host" -g clock,random,timer,fetch,websocket,net,fs "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
   code=$?
   if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then
     pass=$((pass + 1))

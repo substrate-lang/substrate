@@ -1,0 +1,300 @@
+;; HTTP/1.1 as bytes. A parser is fed bytes and calls on-head once a head is complete, on-body with each piece of
+;; the body, and on-end after the message, then starts on the next; header names are lowercased. Heads are
+;; written into a buffer line by line.
+(provide http-head http-header http-parser http-parser-init! http-feed! http-parser-closed!
+         http-write-request! http-write-status! http-write-header! http-write-number! http-write-end! http-write-chunk!
+         http-reason http-decimal http-has? http-add-decimal!)
+
+(const max-headers u32 32)
+
+(struct http-head [line buffer] [names (array (ptr u8) 32)] [values (array (ptr u8) 32)] [count u32]
+  [method (ptr u8)] [target (ptr u8)] [version (ptr u8)] [status i32] [reason (ptr u8)])
+
+(const state-head i32 0)
+(const state-length i32 1)
+(const state-chunk-size i32 2)
+(const state-chunk-data i32 3)
+(const state-chunk-end i32 4)
+(const state-trailers i32 5)
+(const state-until-close i32 6)
+
+(struct http-parser [head http-head] [line buffer] [state i32] [remaining i64] [user (ptr void)]
+  [on-head (fn ((ptr http-parser)))] [on-body (fn ((ptr http-parser) (ptr u8) u32))] [on-end (fn ((ptr http-parser)))])
+
+;; ---- text ----
+
+(define (lower! [s (ptr u8)])
+  (let ([i u32 0])
+    (while (!= (@ s i) 0)
+      (when (and (>= (@ s i) 65) (<= (@ s i) 90)) (set! (@ s i) (+ (@ s i) 32)))
+      (+= i 1))))
+
+(define (same? [a (ptr u8)] [b (ptr u8)]) -> i32
+  (let ([i u32 0])
+    (while (and (== (@ a i) (@ b i)) (!= (@ a i) 0)) (+= i 1))
+    (== (@ a i) (@ b i))))
+
+(define (http-has? [s (ptr u8)] [part (ptr u8)]) -> i32
+  (let ([n (strlen part)] [i u32 0])
+    (while (>= (strlen (+ s i)) n)
+      (when (== (memcmp (+ s i) part n) 0) (return 1))
+      (+= i 1))
+    0))
+
+(define (http-decimal [s (ptr u8)]) -> i64
+  (let ([n i64 0] [i u32 0])
+    (while (and (>= (@ s i) 48) (<= (@ s i) 57))
+      (set! n (+ (* n 10) (- (@ s i) 48)))
+      (+= i 1))
+    (if (or (== i 0) (!= (@ s i) 0)) -1 n)))
+
+(define (hex-digit [c u8]) -> i32
+  (cond [(and (>= c 48) (<= c 57)) (- c 48)]
+        [(and (>= c 97) (<= c 102)) (+ (- c 97) 10)]
+        [(and (>= c 65) (<= c 70)) (+ (- c 65) 10)]
+        [else -1]))
+
+(define (split-space! [s (ptr u8)]) -> (ptr u8)
+  (let ([i u32 0])
+    (while (and (!= (@ s i) 0) (!= (@ s i) 32)) (+= i 1))
+    (if (== (@ s i) 0)
+        0
+        (begin
+          (set! (@ s i) 0)
+          (+= i 1)
+          (while (== (@ s i) 32) (+= i 1))
+          (+ s i)))))
+
+(define (http-add-decimal! [b (ptr buffer)] [n i64])
+  (when (< n 0) (buffer-add-byte! b 45) (set! n (- 0 n)))
+  (when (>= n 10) (http-add-decimal! b (/ n 10)))
+  (buffer-add-byte! b (cast i32 (+ 48 (% n 10)))))
+
+(define (add-hex! [b (ptr buffer)] [n u32])
+  (when (>= n 16) (add-hex! b (/ n 16)))
+  (let ([d (% n 16)]) (buffer-add-byte! b (cast i32 (if (< d 10) (+ 48 d) (+ 87 d))))))
+
+;; ---- the head ----
+
+(define (http-header [h (ptr http-head)] [name (ptr u8)]) -> (ptr u8)
+  (for ([i u32 0]) (< i (-> h count)) (+= i 1)
+    (when (same? (@ (-> h names) i) name) (return (@ (-> h values) i))))
+  0)
+
+(define (parse-first-line! [h (ptr http-head)] [line (ptr u8)]) -> i32
+  (let ([second (split-space! line)])
+    (when (== second 0) (return 0))
+    (let ([third (split-space! second)])
+      (if (== (memcmp line "HTTP/" 5) 0)
+          (begin
+            (set! (-> h version) line)
+            (set! (-> h status) (cast i32 (http-decimal second)))
+            (set! (-> h reason) (if (== third 0) "" third))
+            (set! (-> h method) 0)
+            (set! (-> h target) 0)
+            (and (>= (-> h status) 100) (<= (-> h status) 999)))
+          (begin
+            (when (== third 0) (return 0))
+            (set! (-> h method) line)
+            (set! (-> h target) second)
+            (set! (-> h version) third)
+            (set! (-> h status) 0)
+            (set! (-> h reason) 0)
+            1)))))
+
+(define (parse-header-line! [h (ptr http-head)] [line (ptr u8)]) -> i32
+  (let ([i u32 0])
+    (while (and (!= (@ line i) 0) (!= (@ line i) 58)) (+= i 1))
+    (when (or (== (@ line i) 0) (== i 0) (>= (-> h count) max-headers)) (return 0))
+    (set! (@ line i) 0)
+    (+= i 1)
+    (while (or (== (@ line i) 32) (== (@ line i) 9)) (+= i 1))
+    (let ([end (+ i (strlen (+ line i)))])
+      (while (and (> end i) (or (== (@ line (- end 1)) 32) (== (@ line (- end 1)) 9))) (-= end 1))
+      (set! (@ line end) 0))
+    (lower! line)
+    (set! (@ (-> h names) (-> h count)) line)
+    (set! (@ (-> h values) (-> h count)) (+ line i))
+    (+= (-> h count) 1)
+    1))
+
+(define (parse-head! [h (ptr http-head)]) -> i32
+  (let* ([b (& (-> h line))] [n (-> b length)] [i u32 0] [line-start u32 0] [first 1])
+    (buffer-add-byte! b 0)
+    (set! (-> h count) 0)
+    (let ([s (-> b bytes)])
+      (while (< i n)
+        (when (== (@ s i) 10)
+          (let ([end i])
+            (when (and (> end line-start) (== (@ s (- end 1)) 13)) (-= end 1))
+            (set! (@ s end) 0)
+            (cond [(== end line-start) (begin)]
+                  [first
+                   (set! first 0)
+                   (unless (parse-first-line! h (+ s line-start)) (return 0))]
+                  [else (unless (parse-header-line! h (+ s line-start)) (return 0))])
+            (set! line-start (+ i 1))))
+        (+= i 1)))
+    (not first)))
+
+(define (head-complete? [b (ptr buffer)]) -> i32
+  (let ([n (-> b length)] [s (-> b bytes)])
+    (or (and (>= n 2) (== (@ s (- n 1)) 10) (== (@ s (- n 2)) 10))
+        (and (>= n 4) (== (@ s (- n 1)) 10) (== (@ s (- n 2)) 13) (== (@ s (- n 3)) 10) (== (@ s (- n 4)) 13)))))
+
+;; ---- the parser ----
+
+(define (http-parser-init! [p (ptr http-parser)] [user (ptr void)] [on-head (fn ((ptr http-parser)))]
+                           [on-body (fn ((ptr http-parser) (ptr u8) u32))] [on-end (fn ((ptr http-parser)))])
+  (set! (-> p head line) (make-buffer))
+  (set! (-> p head count) 0)
+  (set! (-> p line) (make-buffer))
+  (set! (-> p state) state-head)
+  (set! (-> p remaining) 0)
+  (set! (-> p user) user)
+  (set! (-> p on-head) on-head)
+  (set! (-> p on-body) on-body)
+  (set! (-> p on-end) on-end))
+
+(define (end! [p (ptr http-parser)])
+  ((-> p on-end) p)
+  (set! (-> p head line length) 0)
+  (set! (-> p head count) 0)
+  (set! (-> p line length) 0)
+  (set! (-> p state) state-head)
+  (set! (-> p remaining) 0))
+
+(define (body-expected? [status i32]) -> i32
+  (not (or (< status 200) (== status 204) (== status 304))))
+
+(define (framing! [p (ptr http-parser)]) -> i32
+  (let* ([h (& (-> p head))] [encoding (http-header h "transfer-encoding")] [length (http-header h "content-length")])
+    ((-> p on-head) p)
+    (cond [(and (!= encoding 0) (http-has? encoding "chunked")) (set! (-> p state) state-chunk-size)]
+          [(!= length 0)
+           (let ([n (http-decimal length)])
+             (when (< n 0) (return 0))
+             (if (== n 0)
+                 (end! p)
+                 (begin
+                   (set! (-> p remaining) n)
+                   (set! (-> p state) state-length))))]
+          [(and (== (-> h method) 0) (body-expected? (-> h status))) (set! (-> p state) state-until-close)]
+          [else (end! p)])
+    1))
+
+(define (chunk-size [b (ptr buffer)]) -> i64
+  (let ([n i64 0] [i u32 0] [s (-> b bytes)] [some 0])
+    (while (and (< i (-> b length)) (>= (hex-digit (@ s i)) 0))
+      (set! n (+ (* n 16) (hex-digit (@ s i))))
+      (set! some 1)
+      (+= i 1))
+    (if some n -1)))
+
+(define (take-body! [p (ptr http-parser)] [bytes (ptr u8)] [i u32] [n u32]) -> u32
+  (let ([take (if (< (cast i64 (- n i)) (-> p remaining)) (- n i) (cast u32 (-> p remaining)))])
+    ((-> p on-body) p (+ bytes i) take)
+    (-= (-> p remaining) (cast i64 take))
+    take))
+
+(define (http-feed! [p (ptr http-parser)] [bytes (ptr u8)] [n u32]) -> i32
+  (let ([i u32 0])
+    (while (< i n)
+      (let ([c (@ bytes i)] [state (-> p state)])
+        (cond
+          [(== state state-head)
+           (buffer-add-byte! (& (-> p head line)) c)
+           (+= i 1)
+           (when (head-complete? (& (-> p head line)))
+             (unless (parse-head! (& (-> p head))) (return -1))
+             (unless (framing! p) (return -1)))]
+          [(== state state-length)
+           (+= i (take-body! p bytes i n))
+           (when (== (-> p remaining) 0) (end! p))]
+          [(== state state-chunk-size)
+           (buffer-add-byte! (& (-> p line)) c)
+           (+= i 1)
+           (when (== c 10)
+             (let ([size (chunk-size (& (-> p line)))])
+               (when (< size 0) (return -1))
+               (set! (-> p line length) 0)
+               (if (== size 0)
+                   (set! (-> p state) state-trailers)
+                   (begin
+                     (set! (-> p remaining) size)
+                     (set! (-> p state) state-chunk-data)))))]
+          [(== state state-chunk-data)
+           (+= i (take-body! p bytes i n))
+           (when (== (-> p remaining) 0) (set! (-> p state) state-chunk-end))]
+          [(== state state-chunk-end)
+           (+= i 1)
+           (when (== c 10) (set! (-> p state) state-chunk-size))]
+          [(== state state-trailers)
+           (buffer-add-byte! (& (-> p line)) c)
+           (+= i 1)
+           (when (== c 10)
+             (if (or (== (-> p line length) 1) (and (== (-> p line length) 2) (== (@ (-> p line bytes) 0) 13)))
+                 (end! p)
+                 (set! (-> p line length) 0)))]
+          [(== state state-until-close)
+           ((-> p on-body) p (+ bytes i) (- n i))
+           (set! i n)]
+          [else (return -1)])))
+    0))
+
+(define (http-parser-closed! [p (ptr http-parser)])
+  (when (== (-> p state) state-until-close) (end! p)))
+
+;; ---- writing heads ----
+
+(define (http-reason [status i32]) -> (ptr u8)
+  (case status
+    [(200) "OK"]
+    [(201) "Created"]
+    [(204) "No Content"]
+    [(206) "Partial Content"]
+    [(301) "Moved Permanently"]
+    [(302) "Found"]
+    [(304) "Not Modified"]
+    [(400) "Bad Request"]
+    [(403) "Forbidden"]
+    [(404) "Not Found"]
+    [(405) "Method Not Allowed"]
+    [(413) "Content Too Large"]
+    [(500) "Internal Server Error"]
+    [(501) "Not Implemented"]
+    [else "Unknown"]))
+
+(define (http-write-request! [b (ptr buffer)] [method (ptr u8)] [target (ptr u8)])
+  (buffer-add-string! b method)
+  (buffer-add-byte! b 32)
+  (buffer-add-string! b target)
+  (buffer-add-string! b " HTTP/1.1\r\n"))
+
+(define (http-write-status! [b (ptr buffer)] [status i32])
+  (buffer-add-string! b "HTTP/1.1 ")
+  (http-add-decimal! b status)
+  (buffer-add-byte! b 32)
+  (buffer-add-string! b (http-reason status))
+  (buffer-add-string! b "\r\n"))
+
+(define (http-write-header! [b (ptr buffer)] [name (ptr u8)] [value (ptr u8)])
+  (buffer-add-string! b name)
+  (buffer-add-string! b ": ")
+  (buffer-add-string! b value)
+  (buffer-add-string! b "\r\n"))
+
+(define (http-write-number! [b (ptr buffer)] [name (ptr u8)] [n i64])
+  (buffer-add-string! b name)
+  (buffer-add-string! b ": ")
+  (http-add-decimal! b n)
+  (buffer-add-string! b "\r\n"))
+
+(define (http-write-end! [b (ptr buffer)]) (buffer-add-string! b "\r\n"))
+
+(define (http-write-chunk! [b (ptr buffer)] [p (ptr u8)] [n u32])
+  (add-hex! b n)
+  (buffer-add-string! b "\r\n")
+  (buffer-add! b p n)
+  (buffer-add-string! b "\r\n")
+  (when (== n 0) (buffer-add-string! b "\r\n")))
