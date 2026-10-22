@@ -145,7 +145,7 @@ rm -rf "${changed:?}"
 mkdir -p "$changed/tests/substrate"
 cp -r compiler "$changed/"
 mkdir -p "$changed/host"
-cp host/host.sub host/fs.sub "$changed/host/"
+cp host/fs.sub "$changed/host/"
 cp tests/substrate/forms.sub "$changed/tests/substrate/"
 from_changed() {
   "$host" "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
