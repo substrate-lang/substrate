@@ -1,10 +1,12 @@
 ;; An HTTP server over net: a listener whose connections are parsed, each request handed to a handler, which
 ;; answers with a head and then bytes, a stream, or nothing, or takes the connection's stream for itself. One
 ;; request at a time on a connection: the next is read once the answer is complete, and one arriving before that
-;; closes the connection after the answer. The listener takes net's options, set before serving.
+;; closes the connection after the answer. Set before serving: net's options, how many milliseconds a connection
+;; may wait for bytes, and how many connections there may be, the last two unlimited when 0.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
+(require-unqualified timer "../../host/modules/timer.sub")
 (require-unqualified http "http.sub")
 
 (provide http-server http-request http-serve! http-server-close! http-request-header
@@ -18,16 +20,12 @@
 
 (struct http-connection [head event-head] [server (ptr void)] [stream u32] [parser http-parser]
   [request http-request] [buf (array u8 16384)] [out buffer] [pipe stream-pipe]
-  [reading i32] [busy i32] [piping i32] [closing i32] [feeding i32] [take taker] [taken (ptr void)]
+  [reading i32] [busy i32] [piping i32] [closing i32] [feeding i32] [take taker] [taken (ptr void)] [timer u32]
   [next (ptr http-connection)])
 
-(struct http-server [head event-head] [listener u32] [port u32] [options (ptr u8)] [problem (ptr u8)] [user (ptr void)]
-  [connections (ptr http-connection)] [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))])
-
-(define (same? [a (ptr u8)] [b (ptr u8)]) -> i32
-  (let ([i u32 0])
-    (while (and (== (@ a i) (@ b i)) (!= (@ a i) 0)) (+= i 1))
-    (== (@ a i) (@ b i))))
+(struct http-server [head event-head] [listener u32] [port u32] [options (ptr u8)] [idle f64] [most u32] [count u32]
+  [problem (ptr u8)] [user (ptr void)] [connections (ptr http-connection)]
+  [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))])
 
 ;; ---- connections ----
 
@@ -38,13 +36,22 @@
 (define (read-more! [c (ptr http-connection)])
   (unless (-> c reading)
     (set! (-> c reading) 1)
+    (when (> (-> (server-of c) idle) 0.0)
+      (set! (-> c timer) (timer-after (-> (server-of c) idle) (cast (ptr void) c))))
     (stream-read! (-> c stream) (-> c buf) 16384)))
+
+(define (disarm! [c (ptr http-connection)])
+  (when (!= (-> c timer) 0)
+    (timer-cancel (-> c timer))
+    (set! (-> c timer) 0)))
 
 (define (may-read! [c (ptr http-connection)])
   (when (or (not (-> c busy)) (not (-> c request ended))) (read-more! c)))
 
 (define (unlink! [c (ptr http-connection)])
   (let ([s (server-of c)])
+    (-= (-> s count) 1)
+    (disarm! c)
     (if (== (-> s connections) c)
         (set! (-> s connections) (-> c next))
         (let ([before (-> s connections)])
@@ -92,7 +99,7 @@
           (set! (-> r answered) 0)
           (set! (-> r on-body) 0)
           (set! (-> r on-end) 0)
-          (when (or (and (!= wish 0) (http-has? wish "close")) (same? (-> h version) "HTTP/1.0")) (set! (-> c closing) 1))
+          (when (or (and (!= wish 0) (http-has? wish "close")) (== (strcmp (-> h version) "HTTP/1.0") 0)) (set! (-> c closing) 1))
           ((-> (server-of c) handle) r)))))
 
 (define (on-body [p (ptr http-parser)] [bytes (ptr u8)] [n u32])
@@ -122,8 +129,11 @@
 
 (define (connection-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (let ([c (cast (ptr http-connection) tag)])
-    (when (== kind stream-read) (set! (-> c reading) 0))
-    (cond [(and (== kind stream-read) (> value 0))
+    (when (and (== source stream-source) (== kind stream-read))
+      (set! (-> c reading) 0)
+      (disarm! c))
+    (cond [(== source timer-source) (when (== id (-> c timer)) (drop! c))]
+          [(and (== kind stream-read) (> value 0))
            (set! (-> c feeding) 1)
            (let ([used (http-feed! (& (-> c parser)) (-> c buf) (cast u32 value))])
              (set! (-> c feeding) 0)
@@ -137,17 +147,20 @@
           [(== kind stream-failed) (drop! c)])))
 
 (define (accept! [s (ptr http-server)] [stream u32])
-  (let ([c (cast (ptr http-connection) (calloc 1 (sizeof http-connection)))])
-    (set! (-> c head handle) connection-heard)
-    (set! (-> c server) (cast (ptr void) s))
-    (set! (-> c stream) stream)
-    (http-parser-init! (& (-> c parser)) (cast (ptr void) c) on-head on-body on-end)
-    (set! (-> c out) (make-buffer))
-    (set! (-> c request connection) (cast (ptr void) c))
-    (set! (-> c next) (-> s connections))
-    (set! (-> s connections) c)
-    (stream-tag! stream (cast (ptr void) c))
-    (read-more! c)))
+  (if (and (> (-> s most) 0) (>= (-> s count) (-> s most)))
+      (stream-close stream)
+      (let ([c (cast (ptr http-connection) (calloc 1 (sizeof http-connection)))])
+        (set! (-> c head handle) connection-heard)
+        (set! (-> c server) (cast (ptr void) s))
+        (set! (-> c stream) stream)
+        (http-parser-init! (& (-> c parser)) (cast (ptr void) c) on-head on-body on-end)
+        (set! (-> c out) (make-buffer))
+        (set! (-> c request connection) (cast (ptr void) c))
+        (set! (-> c next) (-> s connections))
+        (set! (-> s connections) c)
+        (+= (-> s count) 1)
+        (stream-tag! stream (cast (ptr void) c))
+        (read-more! c))))
 
 ;; ---- answering ----
 
@@ -228,6 +241,7 @@
   (set! (-> s head handle) server-heard)
   (set! (-> s handle) handle)
   (set! (-> s connections) 0)
+  (set! (-> s count) 0)
   (set! (-> s port) 0)
   (set! (-> s problem) 0)
   (set! (-> s listener) (net-listen port (if (== (-> s options) 0) "" (-> s options)) (cast (ptr void) s)))
