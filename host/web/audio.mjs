@@ -1,5 +1,6 @@
 // The host module "audio": sound files and synthesized tones.
 import { resolvePath } from './subhost-web.mjs';
+import { errors } from '../subhost-core.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -75,13 +76,14 @@ export function audio() {
           sounds.set(id, decoded);
           loading--;
           startWaiting();
-          caller.event(LOADED, id, 0);
+          caller.event(LOADED, id, 0, 0);
         },
         (e) => {
           console.error(`audio: cannot load the sound ${name}: ${e.message}`);
           loading--;
           startWaiting();
-          caller.event(FAILED, id, 0, utf8.encode(`cannot load the sound ${name}: ${e.message}`));
+          caller.event(FAILED, id, 0, e.name === 'EncodingError' ? errors.invalid : errors.missing,
+            utf8.encode(`cannot load the sound ${name}: ${e.message}`));
         },
       );
     },

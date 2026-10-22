@@ -165,6 +165,9 @@ export class Exit {
   }
 }
 
+// The value of a failed event.
+export const errors = { missing: 1, unreachable: 2, refused: 3, timeout: 4, invalid: 5, aborted: 6 };
+
 export function createHost(platform) {
   const registry = new Map();
   const modules = new Map();
@@ -178,6 +181,9 @@ export function createHost(platform) {
   let draining = false;
   const queue = [];
   let current = null;
+  let deliveries = 0;
+  let warned = false;
+  const closers = [];
 
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
@@ -268,6 +274,17 @@ export function createHost(platform) {
     return `${named[1]}${f} ${found.where}`;
   }
 
+  function guarded(module, name, f) {
+    return (...args) => {
+      try {
+        return f(...args);
+      } catch (e) {
+        if (e instanceof Exit || e instanceof WebAssembly.RuntimeError || e instanceof WebAssembly.Exception) throw e;
+        hostTrap(`${module}.${name}: ${e.message}`);
+      }
+    };
+  }
+
   function callerOf(self, who, made) {
     const memory = () => {
       const m = self.exports && self.exports.memory;
@@ -286,10 +303,14 @@ export function createHost(platform) {
       error(message) {
         lastError = message;
       },
-      event(kind, id, value, bytes, data) {
-        event(made.source, kind, id, value, bytes, data);
+      event(kind, id, tag, value, bytes, data) {
+        event(made.source, kind, id, tag, value, bytes, data);
+      },
+      forget(id) {
+        for (let i = queue.length - 1; i >= 0; i--) if (queue[i].source === made.source && queue[i].id === id) queue.splice(i, 1);
       },
       current: () => current,
+      modules: () => (platform.modules ? [...platform.modules.keys()] : []),
     };
   }
 
@@ -419,8 +440,12 @@ export function createHost(platform) {
           value = refused(`${from}.${imp.name}`);
         } else {
           if (!made.has(from)) {
+            const info = {};
+            const { source, end: close, ...given } = platform.modules.get(from)(callerOf(self, from, info));
+            info.source = source;
             const functions = {};
-            Object.assign(functions, platform.modules.get(from)(callerOf(self, from, functions)));
+            for (const [name, f] of Object.entries(given)) functions[name] = guarded(from, name, f);
+            if (close) closers.push(close);
             made.set(from, functions);
           }
           value = made.get(from)[imp.name];
@@ -474,12 +499,14 @@ export function createHost(platform) {
       running = false;
     }
     entry = names.length > 0 ? registry.get(names[names.length - 1]) : {};
+    if (typeof entry.main !== 'function') drain();
     return entry;
   }
 
   function end(reason) {
     ended = true;
     queue.length = 0;
+    for (const close of closers.splice(0)) close();
     if (platform.ended) platform.ended(reason);
   }
 
@@ -529,9 +556,9 @@ export function createHost(platform) {
     }
   }
 
-  function event(source, kind, id, value, bytes, data) {
+  function event(source, kind, id, tag, value, bytes, data) {
     if (ended) return;
-    queue.push({ source, kind, id, value, bytes: bytes || null, data: data === undefined ? null : data });
+    queue.push({ source, kind, id, tag, value, bytes: bytes || null, data: data === undefined ? null : data });
     if (!running) drain();
   }
 
@@ -546,10 +573,14 @@ export function createHost(platform) {
         if (typeof onEvent === 'function') {
           current = e;
           try {
-            ok = call(onEvent, [e.source, e.kind, e.id, e.value, e.bytes ? e.bytes.length : 0]);
+            ok = call(onEvent, [e.source, e.kind, e.id, e.tag, e.value]);
           } finally {
             current = null;
           }
+          deliveries++;
+        } else if (!warned) {
+          warned = true;
+          platform.report('an event arrived, but the program has no on-event');
         }
         if (platform.delivered) platform.delivered(e, ok);
       }
@@ -566,6 +597,9 @@ export function createHost(platform) {
     event,
     get ended() {
       return ended;
+    },
+    get deliveries() {
+      return deliveries;
     },
     get lastError() {
       return lastError;

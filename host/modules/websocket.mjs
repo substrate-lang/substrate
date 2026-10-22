@@ -1,4 +1,6 @@
 // The host module "websocket": connections whose messages arrive as events.
+import { errors } from '../subhost-core.mjs';
+
 const utf8 = new TextEncoder();
 
 const SOURCE = 7;
@@ -11,20 +13,30 @@ const DRAINED = 5;
 const full = 1 << 20;
 
 export function websocket() {
+  const sockets = new Map();
+  let next = 1;
   return (caller) => {
-    const sockets = new Map();
-    let next = 1;
     const drainLater = (id, s) => {
+      if (s.polling) return;
+      s.polling = true;
       const check = () => {
         if (sockets.get(id) !== s) return;
-        if (s.ws.bufferedAmount <= full) caller.event(DRAINED, id, 0);
-        else setTimeout(check, 10);
+        if (s.ws.bufferedAmount > full) {
+          setTimeout(check, 10);
+          return;
+        }
+        s.polling = false;
+        caller.event(DRAINED, id, s.tag, 0);
       };
       setTimeout(check, 10);
     };
     return {
       source: SOURCE,
-      connect(ptr, len) {
+      end() {
+        for (const s of sockets.values()) s.ws.close(1000);
+        sockets.clear();
+      },
+      connect(ptr, len, tag) {
         const url = caller.string(ptr, len);
         let ws;
         try {
@@ -34,16 +46,20 @@ export function websocket() {
           return 0;
         }
         const id = next++;
-        const s = { ws };
+        const s = { ws, tag, polling: false };
         sockets.set(id, s);
         ws.binaryType = 'arraybuffer';
-        ws.onopen = () => caller.event(OPEN, id, 0);
-        ws.onmessage = (e) => caller.event(MESSAGE, id, 0, typeof e.data === 'string' ? utf8.encode(e.data) : new Uint8Array(e.data));
-        ws.onerror = () => caller.event(FAILED, id, 0, utf8.encode(`cannot connect to ${url}`));
+        ws.onopen = () => caller.event(OPEN, id, tag, 0);
+        ws.onmessage = (e) => caller.event(MESSAGE, id, tag, 0, typeof e.data === 'string' ? utf8.encode(e.data) : new Uint8Array(e.data));
+        ws.onerror = () => {
+          if (sockets.get(id) !== s) return;
+          sockets.delete(id);
+          caller.event(FAILED, id, tag, errors.unreachable, utf8.encode(`cannot connect to ${url}`));
+        };
         ws.onclose = (e) => {
           if (sockets.get(id) !== s) return;
           sockets.delete(id);
-          caller.event(CLOSED, id, e.code);
+          caller.event(CLOSED, id, tag, e.code);
         };
         return id;
       },
@@ -60,6 +76,7 @@ export function websocket() {
         if (!s) return;
         sockets.delete(id);
         s.ws.close(code || 1000);
+        caller.forget(id);
       },
     };
   };

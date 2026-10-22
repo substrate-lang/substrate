@@ -30,6 +30,7 @@ for t in "${tests[@]}"; do
   rm -rf "${program:?}"
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
+  args=("${args[@]/@program/$root/$program}")
   options=()
   if [ -f "$base.host" ]; then read -r -a options < "$base.host"; fi
   actual="$(cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$program" -c "$cache" 2>&1 &&
@@ -53,6 +54,28 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
+# The event tests again, against the real modules and a local server.
+server=""
+for t in tests/events/*.sub; do
+  name="$(basename "$t" .sub)"
+  [ -f "tests/events/$name.real" ] || continue
+  if [ -z "$server" ]; then
+    : > "$builds/servers.url"
+    node tests/events/servers.mjs > "$builds/servers.url" & server=$!
+    for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
+    url="$(cat "$builds/servers.url")"
+  fi
+  actual="$(cd tests/events && "$host" -g clock,random,timer,fetch,websocket "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
+  code=$?
+  if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL tests/events/$name, with the real modules: output differs (exit $code)"
+    diff <(echo "$actual") "tests/events/$name.out" | head -20
+  fi
+done
+[ -n "$server" ] && kill "$server"
 # The session tests.
 for t in tests/session/*.sub; do
   name="$(basename "$t" .sub)"

@@ -37,7 +37,7 @@ const available = {
 };
 const fakes = { clock: fakeClock, timer: fakeTimer, fetch: (root) => fakeFetch(root || '.'), websocket: fakeWebsocket };
 const modules = new Map();
-if (grants.length === 0) for (const name of Object.keys(available)) modules.set(name, available[name]());
+if (grants.length === 0) for (const name of ['clock', 'random', 'timer', 'guest']) modules.set(name, available[name]());
 for (const grant of grants) {
   const [name, how] = grant.split('=');
   const [kind, argument] = how === undefined ? [] : how.split(':');

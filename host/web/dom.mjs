@@ -1,5 +1,6 @@
 // The host module "dom": applies a program's patches to the page, and sends it the page's events.
 import { resolvePath } from './subhost-web.mjs';
+import { errors } from '../subhost-core.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
@@ -22,7 +23,7 @@ export function dom(root) {
   let app = null;
   let caller = null;
 
-  const give = (e, message) => caller.event(HEARD, message, 0, null, e);
+  const give = (e, message) => caller.event(HEARD, message, message, 0, null, e);
 
   const event = () => {
     const e = caller && caller.current();
@@ -297,12 +298,12 @@ export function dom(root) {
           loading++;
           image.onload = () => {
             finished();
-            caller.event(IMAGE_LOADED, id, 0);
+            caller.event(IMAGE_LOADED, id, 0, 0);
           };
           image.onerror = () => {
             finished();
             console.error(`dom: cannot load the image ${name}`);
-            caller.event(IMAGE_FAILED, id, 0, utf8.encode(`cannot load the image ${name}`));
+            caller.event(IMAGE_FAILED, id, 0, errors.missing, utf8.encode(`cannot load the image ${name}`));
           };
           image.src = url;
           images.set(w[i + 1], image);

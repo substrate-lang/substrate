@@ -1,5 +1,6 @@
 // The host module "gpu": WebGPU, as batches of commands from the program, and events back.
 import { resolvePath } from './subhost-web.mjs';
+import { errors } from '../subhost-core.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
@@ -75,7 +76,7 @@ export async function gpu(options = {}) {
   let app = null;
   let caller = null;
   function event(kind, id, data) {
-    if (caller) caller.event(kind, id, 0, data);
+    if (caller) caller.event(kind, id, 0, kind === ERROR ? errors.invalid : 0, data);
   }
   const error = (id, message) => event(ERROR, id, utf8.encode(message));
 

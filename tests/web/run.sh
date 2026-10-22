@@ -24,6 +24,7 @@ lib/web/site.sh lib/web/examples/counter.sub "$sites/counter"
 lib/web/site.sh lib/web/examples/rows.sub "$sites/rows"
 lib/web/repl/site.sh "$sites/repl"
 lib/web/site.sh tests/web/focus.sub "$sites/focus"
+lib/web/site.sh tests/web/floor.sub "$sites/floor"
 lib/web/site.sh tests/web/fields.sub "$sites/fields"
 lib/web/site.sh tests/web/assets.sub "$sites/assets"
 lib/web/site.sh tests/web/canvas.sub "$sites/canvas"
@@ -41,6 +42,6 @@ lib/web/site.sh tests/web/guests.sub "$sites/guests" tests/web/guests.html
 bin/sub build tests/web/a-guest.sub -o "$sites/guests/guest"
 host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
 rm -r "${sites:?}/guests/guest"
-node tests/web/pages.mjs "$sites" counter rows focus fields assets canvas snake platformer sounds stopped stopped-at-start \
+node tests/web/pages.mjs "$sites" counter rows focus floor fields assets canvas snake platformer sounds stopped stopped-at-start \
   guests repl gpu sprites sprites-canvas blocks valley || status=1
 exit $status

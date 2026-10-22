@@ -1,4 +1,6 @@
 // The host module "fetch": HTTP requests, answered as events.
+import { errors } from '../subhost-core.mjs';
+
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
 
@@ -31,15 +33,21 @@ export function parseRequest(bytes) {
   return { method, url, headers, body: body && body.length > 0 ? body : null };
 }
 
+const errorOf = (e) => {
+  if (e.name === 'AbortError') return errors.aborted;
+  if (e.code === 'ERR_INVALID_URL' || /URL/.test(e.message)) return errors.invalid;
+  return errors.unreachable;
+};
+
 export function fetchModule() {
+  const requests = new Map();
+  let next = 1;
   return (caller) => {
-    const requests = new Map();
-    let next = 1;
-    const fail = (id, state, message) => {
+    const fail = (id, state, e) => {
       if (state.closed) return;
       state.closed = true;
       requests.delete(id);
-      caller.event(FAILED, id, 0, utf8.encode(message));
+      caller.event(FAILED, id, state.tag, errorOf(e), utf8.encode(e.message));
     };
     async function fill(id, state, at, cap) {
       if (!state.done && (!state.chunk || state.at >= state.chunk.length)) {
@@ -57,15 +65,22 @@ export function fetchModule() {
         caller.memory().set(state.chunk.subarray(state.at, state.at + n), at);
         state.at += n;
       }
-      if (n === 0) {
+      if (state.done && (!state.chunk || state.at >= state.chunk.length)) {
         state.closed = true;
         requests.delete(id);
       }
-      caller.event(READ, id, n);
+      caller.event(READ, id, state.tag, n);
     }
     return {
       source: SOURCE,
-      start(ptr, len) {
+      end() {
+        for (const state of requests.values()) {
+          state.closed = true;
+          state.controller.abort();
+        }
+        requests.clear();
+      },
+      start(ptr, len, tag) {
         let request;
         try {
           request = parseRequest(caller.memory().slice(caller.u(ptr), caller.u(ptr) + len));
@@ -74,7 +89,7 @@ export function fetchModule() {
           return 0;
         }
         const id = next++;
-        const state = { controller: new AbortController(), reader: null, chunk: null, at: 0, done: false, closed: false };
+        const state = { tag, controller: new AbortController(), reader: null, chunk: null, at: 0, done: false, closed: false };
         requests.set(id, state);
         fetch(request.url, { method: request.method, headers: request.headers, body: request.body, signal: state.controller.signal })
           .then((response) => {
@@ -82,14 +97,14 @@ export function fetchModule() {
             state.reader = response.body ? response.body.getReader() : null;
             state.done = state.reader === null;
             const headers = [...response.headers].map(([name, value]) => `${name}: ${value}\n`).join('');
-            caller.event(HEAD, id, response.status, utf8.encode(headers));
-          }, (e) => fail(id, state, e.message));
+            caller.event(HEAD, id, tag, response.status, utf8.encode(headers));
+          }, (e) => fail(id, state, e));
         return id;
       },
       read(id, buf, cap) {
         const state = requests.get(id);
         if (!state || (!state.reader && !state.done)) return -1;
-        fill(id, state, caller.u(buf), cap).catch((e) => fail(id, state, e.message));
+        fill(id, state, caller.u(buf), cap).catch((e) => fail(id, state, e));
         return 0;
       },
       abort(id) {
@@ -98,6 +113,7 @@ export function fetchModule() {
         state.closed = true;
         requests.delete(id);
         state.controller.abort();
+        caller.forget(id);
       },
     };
   };

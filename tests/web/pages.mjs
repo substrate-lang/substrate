@@ -138,7 +138,7 @@ const checks = {
     check('repl: an input that corrupts the session fails', (await last()).split('\n')[0],
       '! (memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8))) => 8');
     check('repl: the page reports that the session crashed', (await last()).split('\n').pop(),
-      'trap: memory access out of bounds');
+      'The session crashed while evaluating this input. A new session was started.');
     await say('(fib 10)');
     check('repl: earlier definitions survive the crash', await last(), '(fib 10) => 55');
 
@@ -170,19 +170,19 @@ const checks = {
     await page.click('#append');
     same('rows: append 1,000 rows', await ids(), [...swapped, ...upTo(1000, 1001)]);
 
-    await page.evaluate(`(() => {
-      window.kept = document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a");
-      window.given = 0;
-      window.app.delivered = () => { window.given++; };
-    })()`);
+    await page.evaluate('window.kept = document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a")');
     await page.click('#clear');
     same('rows: clear removes every row', await ids(), []);
     check('rows: clear leaves only the placeholder node', await page.evaluate('document.querySelector("tbody").childNodes.length'), 1);
-    await page.evaluate('(() => { window.given = 0; window.kept.click(); })()');
-    check('rows: a click on a removed row does not reach the program', await page.evaluate('window.given'), 0);
+    const delivered = (click) => page.evaluate(`(() => {
+      const before = window.app.host.deliveries;
+      ${click};
+      return window.app.host.deliveries - before;
+    })()`);
+    check('rows: a click on a removed row does not reach the program', await delivered('window.kept.click()'), 0);
     await page.click('#create');
-    check('rows: a click on a current row reaches the program once', await page.evaluate(
-      '(() => { window.given = 0; document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a").click(); return window.given; })()'), 1);
+    check('rows: a click on a current row reaches the program once',
+      await delivered('document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a").click()'), 1);
   },
 
   async fields(page) {
@@ -617,6 +617,15 @@ const checks = {
     check('assets: and only where it was drawn', await pixel(2, 2), '255,255,255,255');
     await page.waitFor('document.getElementById("picture").complete', 10000);
     check('assets: an image asset is shown by its URL', await page.evaluate('document.getElementById("picture").naturalWidth'), 4);
+  },
+
+  async floor(page) {
+    const shown = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    await page.waitFor('document.getElementById("fired").textContent === "1" && document.getElementById("text").textContent !== ""', 10000);
+    check('floor: the timer fired once', await shown('fired'), '1');
+    check('floor: the asset was fetched', await shown('text'), 'An asset, read as a file.');
+    check('floor: with the status 200', await shown('status'), '200');
+    check('floor: nothing is written to the console', page.log.join('\n'), '');
   },
 
   async focus(page) {

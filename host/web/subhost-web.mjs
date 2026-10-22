@@ -76,7 +76,7 @@ export function run(options, names, wasm) {
   const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 
-  const app = { files, cwd, entry: null, ended: false, delivered: options.delivered || null };
+  const app = { files, cwd, entry: null, ended: false };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
   const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
@@ -103,9 +103,7 @@ export function run(options, names, wasm) {
     },
     report,
     ended,
-    delivered(event, ok) {
-      if (app.delivered) app.delivered(event, ok);
-    },
+    delivered: options.delivered,
     modules,
     memoryPages: options.memoryPages || 0,
   });

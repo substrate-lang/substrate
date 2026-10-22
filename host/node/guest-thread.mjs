@@ -1,91 +1,58 @@
-// A guest's worker thread on Node: runs one program, its output sent to the parent in batches.
+// A guest's worker thread on Node: runs one program, with the guest module's worker side.
 import fs from 'node:fs';
 import path from 'node:path';
 import { parentPort } from 'node:worker_threads';
 import { createHost, Exit } from '../subhost-core.mjs';
-import { batcher, isUnder } from '../guest-common.mjs';
+import { guestSide, isUnder } from '../guest-side.mjs';
 
-const utf8 = new TextEncoder();
+const side = guestSide((m, transfer) => parentPort.postMessage(m, transfer));
 
-const SOURCE = 3;
-const MESSAGE = 1;
+const real = (p) => {
+  try {
+    return fs.realpathSync(p);
+  } catch (e) {
+    return path.join(real(path.dirname(p)), path.basename(p));
+  }
+};
 
-let host = null;
-let ended = false;
-
-const out = batcher((fd, bytes) => parentPort.postMessage({ type: 'output', fd, bytes }, [bytes.buffer]));
-
-const guest = (caller) => ({
-  source: SOURCE,
-  start() {
-    caller.error('guest.start: a guest cannot start guests of its own');
-    return 0;
-  },
-  send(g, ptr, length) {
-    if (g !== 0) return -1;
-    out.flush();
-    const bytes = caller.memory().slice(caller.u(ptr), caller.u(ptr) + length);
-    parentPort.postMessage({ type: 'message', bytes }, [bytes.buffer]);
-    return 0;
-  },
-  stop() {},
-});
-
-function reportDone(result) {
-  out.flush();
-  if (!ended) parentPort.postMessage({ type: 'done', trap: result === false ? host.lastError : '' });
-}
-
-function endWith(reason) {
-  ended = true;
-  out.flush();
-  parentPort.postMessage({ type: 'ended', reason });
-}
-
-parentPort.on('message', (m) => {
+parentPort.on('message', async (m) => {
   if (m.type === 'start') {
-    const may = (dirs, p) => dirs.some((d) => isUnder(d, path.resolve(p)));
-    host = createHost({
+    const readable = m.readable.map(real);
+    const writable = m.writable.map(real);
+    const may = (dirs, p) => {
+      const r = real(path.resolve(p));
+      return dirs.some((d) => isUnder(d, r));
+    };
+    const modules = new Map(Object.entries({ guest: side.guest, ...await side.modules(m.modules) }));
+    const host = createHost({
       args: m.args,
-      write(fd, bytes) {
-        out.output(fd, bytes);
-      },
+      write: side.write,
       readFile(p) {
-        if (!may(m.readable, p)) throw new Error('No such file or directory');
+        if (!may(readable, p)) throw new Error('No such file or directory');
         return fs.readFileSync(p);
       },
       writeFile(p, bytes) {
-        if (!may(m.writable, p)) throw new Error('Permission denied');
+        if (!may(writable, p)) throw new Error('Permission denied');
         fs.writeFileSync(p, bytes);
       },
       exit(code) {
         throw new Exit(code);
       },
-      report(message) {
-        out.output(2, utf8.encode(`error: ${message}\n`));
-      },
-      ended: endWith,
-      delivered(event, ok) {
-        if (event.source === SOURCE && event.id === 0) reportDone(ok);
-      },
-      modules: new Map([['guest', guest]]),
+      report: side.report,
+      ended: side.ended,
+      delivered: side.delivered,
+      modules,
       memoryPages: m.memory * 16,
     });
-    let names;
-    try {
-      names = fs.readFileSync(`${m.dir}/program`, 'utf8').split('\n').filter((n) => n !== '');
-    } catch (e) {
-      endWith(`no program found in ${m.dir}`);
-      return;
-    }
+    const names = fs.readFileSync(`${m.dir}/program`, 'utf8').split('\n').filter((n) => n !== '');
     const entry = host.load(names, (name) => fs.readFileSync(`${m.dir}/${name}.wasm`));
     if (!entry) {
-      out.output(2, utf8.encode(`error: ${host.lastError}\n`));
-      endWith('exit 2');
+      side.report(host.lastError);
+      side.ended('exit 2');
       return;
     }
-    reportDone(typeof entry.main === 'function' ? host.call(entry.main, []) : undefined);
-  } else if (m.type === 'message' && host && !ended) {
-    host.event(SOURCE, MESSAGE, 0, 0, m.bytes);
+    side.started(host, typeof entry.main === 'function' ? host.call(entry.main, []) : undefined);
+  } else if (m.type === 'message') {
+    side.message(m.bytes);
   }
 });
