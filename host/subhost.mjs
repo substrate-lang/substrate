@@ -10,10 +10,15 @@ import { timer } from './modules/timer.mjs';
 import { fetchModule } from './modules/fetch.mjs';
 import { websocket } from './modules/websocket.mjs';
 import { guests } from './node/guest.mjs';
+import { netModule } from './node/net.mjs';
+import { processes } from './node/process.mjs';
+import { stdin } from './node/stdin.mjs';
+import { env } from './node/env.mjs';
+import { fsModule } from './node/fs.mjs';
 import { fakeClock, fakeTimer, fakeFetch, fakeWebsocket } from './node/fake.mjs';
 
 function usage() {
-  process.stderr.write('usage: node host/subhost.mjs [-g MODULE[=fake[:DIR]],...] DIR [arg ...]\n');
+  process.stderr.write('usage: node host/subhost.mjs [-g MODULE[=fake[:DIR]|=tls:CERT:KEY],...] DIR [arg ...]\n');
   process.exit(64);
 }
 
@@ -34,18 +39,30 @@ const available = {
   fetch: () => fetchModule(),
   websocket: () => websocket(),
   guest: () => guests({ cwd: process.cwd() }),
+  net: () => netModule(),
+  process: () => processes(),
+  stdin: () => stdin(),
+  env: () => env(),
+  fs: () => fsModule(),
 };
-const fakes = { clock: fakeClock, timer: fakeTimer, fetch: (root) => fakeFetch(root || '.'), websocket: fakeWebsocket };
+const variants = {
+  'clock=fake': () => fakeClock(),
+  'timer=fake': () => fakeTimer(),
+  'fetch=fake': (root) => fakeFetch(root || '.'),
+  'websocket=fake': () => fakeWebsocket(),
+  'net=tls': (cert, key) => netModule({ tls: { cert: fs.readFileSync(cert), key: fs.readFileSync(key) } }),
+};
 const modules = new Map();
-if (grants.length === 0) for (const name of ['clock', 'random', 'timer', 'guest']) modules.set(name, available[name]());
+if (grants.length === 0) for (const name of ['clock', 'random', 'timer', 'guest', 'stdin', 'env', 'fs']) modules.set(name, available[name]());
 for (const grant of grants) {
   const [name, how] = grant.split('=');
-  const [kind, argument] = how === undefined ? [] : how.split(':');
-  if (!(name in available) || (how !== undefined && (kind !== 'fake' || !(name in fakes)))) {
+  const [kind, ...args] = how === undefined ? [] : how.split(':');
+  const variant = `${name}=${kind}`;
+  if (!(name in available) || (how !== undefined && !(variant in variants))) {
     process.stderr.write(`subhost: no module ${grant}\n`);
     process.exit(64);
   }
-  modules.set(name, how === undefined ? available[name]() : fakes[name](argument));
+  modules.set(name, how === undefined ? available[name]() : variants[variant](...args));
 }
 
 function systemError(e) {

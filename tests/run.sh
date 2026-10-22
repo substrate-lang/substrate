@@ -33,8 +33,10 @@ for t in "${tests[@]}"; do
   args=("${args[@]/@program/$root/$program}")
   options=()
   if [ -f "$base.host" ]; then read -r -a options < "$base.host"; fi
+  input=/dev/null
+  if [ -f "$base.in" ]; then input="$root/$base.in"; fi
   actual="$(cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$program" -c "$cache" 2>&1 &&
-            "$host" ${options[@]+"${options[@]}"} "$root/$program" ${args[@]+"${args[@]}"} 2>&1)"
+            "$host" ${options[@]+"${options[@]}"} "$root/$program" ${args[@]+"${args[@]}"} 2>&1 < "$input")"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then
