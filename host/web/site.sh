@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
     -g)
       [ $# -ge 3 ] || usage
       program "$3" "$out/$2"
-      "$root/host/web/pack.mjs" -o "$out/$2.pack" -C "$out/$2" .
+      "$root/bin/sub" pack -o "$out/$2.pack" -C "$out/$2" .
       rm -r "${out:?}/$2"
       shift 3 ;;
     -f)
@@ -41,7 +41,7 @@ while [ $# -gt 0 ]; do
         paths+=("$1")
         shift
       done
-      "$root/host/web/pack.mjs" -o "$out/$name.pack" -C "$root" "${paths[@]}" ;;
+      "$root/bin/sub" pack -o "$out/$name.pack" -C "$root" "${paths[@]}" ;;
     *) usage ;;
   esac
 done
@@ -55,6 +55,6 @@ fi
 cp "$root"/host/*.mjs "$out/host/"
 cp "$root"/host/modules/*.mjs "$out/host/modules/"
 for f in "$root"/host/web/*.mjs; do
-  case "$(basename "$f")" in pack.mjs | serve.mjs | browser.mjs) ;; *) cp "$f" "$out/host/web/" ;; esac
+  case "$(basename "$f")" in browser.mjs) ;; *) cp "$f" "$out/host/web/" ;; esac
 done
 cp "$page" "$out/index.html"

@@ -56,6 +56,7 @@ export function netModule(granted = {}) {
           if (listeners.get(id) === server) caller.event(LISTENING, id, tag, server.address().port);
         });
         server.on(server instanceof tls.Server ? 'secureConnection' : 'connection', (socket) => {
+          socket.setNoDelay(true);
           caller.event(ACCEPT, id, tag, caller.streams.add(tag, nodeSource(socket)));
         });
         server.on('error', (e) => {
@@ -79,6 +80,7 @@ export function netModule(granted = {}) {
         }
         let connected = false;
         let id = 0;
+        socket.setNoDelay(true);
         socket.on('error', (e) => {
           if (connected || !caller.streams.drop(id)) return;
           caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));

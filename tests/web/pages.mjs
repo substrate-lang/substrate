@@ -748,7 +748,7 @@ const checks = {
 const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 
 // Port 0: any free port.
-const server = spawn(path.join(here, '../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
+const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 async function run(group) {
   await withBrowser(async (open) => {

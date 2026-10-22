@@ -6,7 +6,7 @@ import { withBrowser } from '../../host/web/browser.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites] = process.argv.slice(2);
-const server = spawn(path.join(here, '../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
+const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 
 try {

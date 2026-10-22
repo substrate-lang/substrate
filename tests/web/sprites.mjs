@@ -11,7 +11,7 @@ const bigCounts = [100000, 200000];
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const column = (text, width) => String(text).padStart(width);
 
-const server = spawn(path.join(here, '../../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
+const server = spawn(path.join(here, '../../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 try {
   console.log('renderer                     sprites   frame ms   drawing ms   gpu ms   frames a second');

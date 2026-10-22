@@ -9,7 +9,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const [site, ...names] = process.argv.slice(2);
 
 // Port 0: any free port.
-const server = spawn(path.join(here, '../../host/web/serve.mjs'), [site, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
+const server = spawn(path.join(here, '../../bin/sub'), ['serve', site, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 
 let failed = 0;
