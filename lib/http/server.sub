@@ -1,21 +1,25 @@
 ;; An HTTP server over net: a listener whose connections are parsed, each request handed to a handler, which
-;; answers with a head and then bytes, a stream, or nothing. One request at a time on a connection: the next is
-;; read once the answer is complete, and one arriving before that closes the connection after the answer.
+;; answers with a head and then bytes, a stream, or nothing, or takes the connection's stream for itself. One
+;; request at a time on a connection: the next is read once the answer is complete, and one arriving before that
+;; closes the connection after the answer.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
 (require-unqualified http "http.sub")
 
 (provide http-server http-request http-serve! http-server-close! http-request-header
-         http-respond! http-header! http-length! http-send! http-send-text! http-send-stream! http-finish!)
+         http-respond! http-header! http-length! http-send! http-send-text! http-send-stream! http-finish! http-take!)
 
 (struct http-request [connection (ptr void)] [method (ptr u8)] [target (ptr u8)] [head (ptr http-head)]
   [user (ptr void)] [ended i32] [answered i32]
   [on-body (fn ((ptr http-request) (ptr u8) u32))] [on-end (fn ((ptr http-request)))])
 
+(typedef taker (fn ((ptr void) u32 (ptr u8) u32)))
+
 (struct http-connection [head event-head] [server (ptr void)] [stream u32] [parser http-parser]
   [request http-request] [buf (array u8 16384)] [out buffer] [pipe stream-pipe]
-  [reading i32] [busy i32] [piping i32] [closing i32] [next (ptr http-connection)])
+  [reading i32] [busy i32] [piping i32] [closing i32] [feeding i32] [take taker] [taken (ptr void)]
+  [next (ptr http-connection)])
 
 (struct http-server [head event-head] [listener u32] [port u32] [problem (ptr u8)] [user (ptr void)]
   [connections (ptr http-connection)] [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))])
@@ -101,13 +105,32 @@
     (when (!= (-> r on-end) 0) ((-> r on-end) r))
     (settle! c)))
 
+;; The stream goes to its taker with the bytes read beyond the request: those the parser holds of a next
+;; message, when the request has ended, then these.
+(define (hand-over! [c (ptr http-connection)] [bytes (ptr u8)] [n u32])
+  (let ([take (-> c take)] [held (& (-> c parser head line))])
+    (set! (-> c take) 0)
+    (unless (-> c request ended) (set! (-> held length) 0))
+    (buffer-add! held bytes n)
+    (unlink! c)
+    (stream-tag! (-> c stream) 0)
+    (take (-> c taken) (-> c stream) (-> held bytes) (-> held length))
+    (buffer-free! (& (-> c out)))
+    (buffer-free! held)
+    (buffer-free! (& (-> c parser line)))
+    (free c)))
+
 (define (connection-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (let ([c (cast (ptr http-connection) tag)])
+    (when (== kind stream-read) (set! (-> c reading) 0))
     (cond [(and (== kind stream-read) (> value 0))
-           (set! (-> c reading) 0)
-           (if (< (http-feed! (& (-> c parser)) (-> c buf) (cast u32 value)) 0)
-               (bad-request! c)
-               (may-read! c))]
+           (set! (-> c feeding) 1)
+           (let ([used (http-feed! (& (-> c parser)) (-> c buf) (cast u32 value))])
+             (set! (-> c feeding) 0)
+             (cond [(< used 0) (bad-request! c)]
+                   [(!= (-> c take) 0) (hand-over! c (+ (-> c buf) used) (- (cast u32 value) used))]
+                   [else (may-read! c)]))]
+          [(and (!= (-> c take) 0) (not (-> c reading))) (hand-over! c 0 0)]
           [(== kind stream-read) (drop! c)]
           [(== kind stream-drained) (when (-> c piping) (stream-pipe-drained! (& (-> c pipe))))]
           [(== kind stream-finished) (drop! c)]
@@ -177,6 +200,16 @@
     (send-head! c)
     (set! (-> c piping) 1)
     (stream-pipe-start! (& (-> c pipe)) from (-> c stream) 0 piped)))
+
+;; The head alone is sent, and the connection's stream is the taker's, untagged, with the bytes read beyond the
+;; request: once the handler returns, or at once when called later.
+(define (http-take! [r (ptr http-request)] [take taker] [tag (ptr void)])
+  (let ([c (connection-of r)])
+    (send-head! c)
+    (set! (-> c take) take)
+    (set! (-> c taken) tag)
+    (http-parser-stop! (& (-> c parser)))
+    (unless (or (-> c feeding) (-> c reading)) (hand-over! c 0 0))))
 
 ;; ---- the server ----
 

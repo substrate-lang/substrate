@@ -26,7 +26,8 @@ mkdir -p "$builds/tls"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
 
-tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub)
+tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
+       tests/crypto/*.sub tests/encoding/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
@@ -62,14 +63,15 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
-# The event tests again, against the real modules and a local server.
+# The event tests again, against the real modules and the server in tests/events/fixtures.
 server=""
 for t in tests/events/*.sub; do
   name="$(basename "$t" .sub)"
   [ -f "tests/events/$name.real" ] || continue
   if [ -z "$server" ]; then
     : > "$builds/servers.url"
-    node tests/events/servers.mjs > "$builds/servers.url" & server=$!
+    (cd tests/events/fixtures && "$root/bin/sub" build servers.sub -o "$root/$builds/events/servers" -c "$cache")
+    "$host" -g net,fs "$root/$builds/events/servers" "$root/tests/events/files" > "$builds/servers.url" & server=$!
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi

@@ -1,0 +1,208 @@
+;; A WebSocket server, echoing: the host module's client sends a message and closes; a raw connection upgrades
+;; and sends a fragmented message, a ping and a long message, then closes; another sends an unmasked frame; and
+;; a plain request is refused.
+(require-unqualified events "../../host/events.sub")
+(require-unqualified stream "../../host/stream.sub")
+(require-unqualified net "../../host/node/net.sub")
+(require-unqualified fetch "../../host/modules/fetch.sub")
+(require-unqualified websocket "../../host/modules/websocket.sub")
+(require-unqualified host "../../host/host.sub")
+(require-unqualified http "../../lib/http/http.sub")
+(require-unqualified server "../../lib/http/server.sub")
+(require-unqualified ws "../../lib/http/websocket.sub")
+
+(struct raw [head event-head] [stream u32] [parser http-parser] [in (array u8 4096)] [frames buffer] [unmasked i32]
+  [upgraded i32])
+
+(define server http-server)
+(define echo ws-connection)
+(define client event-head)
+(define plain event-head)
+(define raw-a raw)
+(define raw-b raw)
+(define step i32 0)
+(define waiting i32 0)
+
+(define (url-of [scheme (ptr u8)] [path (ptr u8)]) -> (ptr u8)
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) scheme)
+    (buffer-add-string! (& b) "127.0.0.1:")
+    (http-add-decimal! (& b) (cast i64 (-> server port)))
+    (buffer-add-string! (& b) path)
+    (buffer-add-byte! (& b) 0)
+    (-> b bytes)))
+
+(define (show [who (ptr u8)] [what (ptr u8)] [p (ptr u8)] [n u32])
+  (printf "~a: ~a ~a bytes" who what n)
+  (when (<= n 20)
+    (printf ": ")
+    (host-write 1 p (cast i32 n)))
+  (printf "\n"))
+
+;; ---- the server ----
+
+(define (echoed [w (ptr ws-connection)] [p (ptr u8)] [n u32] [kind i32])
+  (show "server" (if (== kind ws-text) "text" "binary") p n)
+  (ws-send! w p n kind))
+
+(define (echo-closed [w (ptr ws-connection)] [code i32])
+  (printf "server: closed ~a\n" code)
+  (done!))
+
+(define (handle [r (ptr http-request)])
+  (if (ws-accept! (& echo) r)
+      (begin
+        (printf "server: upgraded ~a\n" (-> r target))
+        (set! (-> echo on-message) echoed)
+        (set! (-> echo on-closed) echo-closed))
+      (begin
+        (http-respond! r 426)
+        (http-send-text! r "upgrade required"))))
+
+;; ---- the module's client ----
+
+(define (client-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (cond [(== kind websocket-open)
+         (printf "client: open\n")
+         (websocket-send-text id "hello")]
+        [(== kind websocket-message)
+         (let ([m (events-take-text)])
+           (printf "client: message ~a\n" m)
+           (free m))
+         (websocket-close id 1000)]
+        [(== kind websocket-closed) (printf "client: closed ~a\n" value)]
+        [(== kind websocket-failed)
+         (let ([m (events-take-text)])
+           (printf "client: failed ~a: ~a\n" value m)
+           (free m))]))
+
+;; ---- raw connections ----
+
+(define (add-frame! [b (ptr buffer)] [fin i32] [opcode i32] [p (ptr u8)] [n u32] [masked i32])
+  (buffer-add-byte! b (bit-or (if fin 128 0) opcode))
+  (if (< n 126)
+      (buffer-add-byte! b (bit-or (if masked 128 0) (cast i32 n)))
+      (begin
+        (buffer-add-byte! b (bit-or (if masked 128 0) 126))
+        (buffer-add-byte! b (cast i32 (>> n 8)))
+        (buffer-add-byte! b (cast i32 (bit-and n 255)))))
+  (when masked (for ([i i32 1]) (<= i 4) (+= i 1) (buffer-add-byte! b i)))
+  (for ([i u32 0]) (< i n) (+= i 1)
+    (buffer-add-byte! b (if masked (bit-xor (@ p i) (+ 1 (bit-and i 3))) (@ p i)))))
+
+(define (raw-send! [r (ptr raw)])
+  (let ([b (make-buffer)] [long (array u8 300)] [code (array u8 2)])
+    (memset long 120 300)
+    (if (-> r unmasked)
+        (add-frame! (& b) 1 1 "x" 1 0)
+        (begin
+          (add-frame! (& b) 0 1 "hel" 3 1)
+          (add-frame! (& b) 1 9 "p" 1 1)
+          (add-frame! (& b) 1 0 "lo" 2 1)
+          (add-frame! (& b) 1 1 long 300 1)
+          (set! (@ code 0) 3)
+          (set! (@ code 1) 233)
+          (add-frame! (& b) 1 8 code 2 1)))
+    (stream-write (-> r stream) (-> b bytes) (-> b length))
+    (buffer-free! (& b))))
+
+(define (raw-frame [opcode i32] [p (ptr u8)] [n u32])
+  (cond [(== opcode 10) (show "raw" "pong" p n)]
+        [(== opcode 1) (show "raw" "text" p n)]
+        [(== opcode 2) (show "raw" "binary" p n)]
+        [(== opcode 8) (printf "raw: close ~a\n" (if (>= n 2) (bit-or (<< (cast i32 (@ p 0)) 8) (cast i32 (@ p 1))) 1005))]
+        [else (printf "raw: opcode ~a\n" opcode)]))
+
+(define (raw-frames! [r (ptr raw)])
+  (let ([b (& (-> r frames))] [at u32 0] [more 1])
+    (while more
+      (let* ([p (+ (-> b bytes) at)] [avail (- (-> b length) at)] [head u32 2] [len u32 0])
+        (when (>= avail 2)
+          (set! len (bit-and (@ p 1) 127))
+          (when (== len 126)
+            (set! head 4)
+            (set! len (if (< avail 4) 0 (bit-or (<< (cast u32 (@ p 2)) 8) (cast u32 (@ p 3)))))))
+        (if (or (< avail 2) (< avail (+ head len)))
+            (set! more 0)
+            (begin
+              (raw-frame (bit-and (@ p 0) 15) (+ p head) len)
+              (+= at (+ head len))))))
+    (memcpy (-> b bytes) (+ (-> b bytes) at) (- (-> b length) at))
+    (-= (-> b length) at)))
+
+(define (raw-head [p (ptr http-parser)])
+  (let ([r (cast (ptr raw) (-> p user))])
+    (printf "raw: ~a ~a\n" (-> p head status) (http-header (& (-> p head)) "sec-websocket-accept"))
+    (http-parser-stop! p)))
+
+(define (no-body [p (ptr http-parser)] [bytes (ptr u8)] [n u32]) (begin))
+(define (no-end [p (ptr http-parser)]) (begin))
+
+(define (raw-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([r (cast (ptr raw) tag)])
+    (cond [(== kind net-connected)
+           (stream-write-text id "GET /chat HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+           (stream-read! id (-> r in) 4096)]
+          [(== kind net-failed)
+           (let ([m (events-take-text)])
+             (printf "raw: failed ~a: ~a\n" value m)
+             (free m))]
+          [(and (== kind stream-read) (> value 0))
+           (if (-> r upgraded)
+               (buffer-add! (& (-> r frames)) (-> r in) (cast u32 value))
+               (let ([used (http-feed! (& (-> r parser)) (-> r in) (cast u32 value))])
+                 (set! (-> r upgraded) 1)
+                 (buffer-add! (& (-> r frames)) (+ (-> r in) used) (- (cast u32 value) used))
+                 (raw-send! r)))
+           (raw-frames! r)
+           (stream-read! id (-> r in) 4096)]
+          [(== kind stream-read)
+           (printf "raw: end\n")
+           (stream-close id)
+           (done!)]
+          [(== kind stream-failed)
+           (let ([m (events-take-text)])
+             (printf "raw: stream failed ~a: ~a\n" value m)
+             (free m))])))
+
+(define (raw-start! [r (ptr raw)] [unmasked i32])
+  (set! (-> r head handle) raw-heard)
+  (set! (-> r frames) (make-buffer))
+  (set! (-> r unmasked) unmasked)
+  (set! (-> r upgraded) 0)
+  (http-parser-init! (& (-> r parser)) (cast (ptr void) r) raw-head no-body no-end)
+  (set! (-> r stream) (net-connect "127.0.0.1" (-> server port) "" (cast (ptr void) r))))
+
+;; ---- the plain request, and the steps ----
+
+(define (plain-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (== kind fetch-head)
+    (printf "plain: ~a\n" value)
+    (stream-close id)
+    (done!)))
+
+(define (next!)
+  (+= step 1)
+  (case step
+    [(1) (set! waiting 1) (websocket-connect (url-of "ws://" "/") (& client))]
+    [(2) (set! waiting 2) (raw-start! (& raw-a) 0)]
+    [(3) (set! waiting 2) (raw-start! (& raw-b) 1)]
+    [(4) (set! waiting 1) (fetch-get (url-of "http://" "/") (& plain))]
+    [(5) (http-server-close! (& server))]))
+
+(define (done!)
+  (-= waiting 1)
+  (when (== waiting 0) (next!)))
+
+(define (listening [s (ptr http-server)])
+  (printf "listening\n")
+  (next!))
+
+(define (main)
+  (set! (-> client handle) client-heard)
+  (set! (-> plain handle) plain-heard)
+  (set! (-> server listening) listening)
+  (http-serve! (& server) 0 handle))
+
+(define (on-event [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (events-dispatch source kind id tag value))
