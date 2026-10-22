@@ -342,8 +342,8 @@ const checks = {
     await page.press('ArrowRight');
     check('snake: an arrow key starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
     await page.waitFor(`(() => {
-      const d = document.getElementById("board").getContext("2d").getImageData(13 * 20 + 10, 10 * 20 + 10, 1, 1).data;
-      return d[0] === 180 && d[1] === 241;
+      const d = document.getElementById("board").getContext("2d").getImageData(10 * 20 + 10, 10 * 20 + 10, 1, 1).data;
+      return d[0] === 16 && d[1] === 20;
     })()`, 5000);
     check('snake: the snake has moved, and left its old cells', await cell(10, 10), empty);
 
