@@ -7,8 +7,8 @@
 (provide pruned stripped)
 
 (struct wasm [name datum] [p (ptr u8)] [size u32] [sections datum] [imports datum] [funcs datum] [nimports u32]
-        [exports datum] [start i32] [elems datum] [count u32] [starts (ptr u32)] [ends (ptr u32)] [live (ptr u8)]
-        [kept datum])
+        [exports datum] [by-name (ptr hash-table)] [start i32] [count u32] [starts (ptr u32)] [ends (ptr u32)]
+        [live (ptr u8)] [kept (ptr hash-table)])
 
 ;; ---- reading ----
 
@@ -24,10 +24,10 @@
     (set! (-> w funcs) nil)
     (set! (-> w nimports) 0)
     (set! (-> w exports) nil)
+    (set! (-> w by-name) (make-table))
     (set! (-> w start) -1)
-    (set! (-> w elems) nil)
     (set! (-> w count) 0)
-    (set! (-> w kept) nil)
+    (set! (-> w kept) (make-table))
     (read-from! (-> w p) 8 (-> w size))
     (while (< (position) (-> w size))
       (set! head (position))
@@ -49,7 +49,7 @@
       (read-from! (-> w p) (cast u32 (integer-value (caddr (car ss)))) (cast u32 (integer-value (cadddr (car ss)))))
       (cond [(== id 7) (read-exports! w)]
             [(== id 8) (set! (-> w start) (cast i32 (uleb)))]
-            [(== id 9) (read-elems! w)]
+            [(== id 9) (read-elems!)]
             [(== id 10) (read-bodies! w)])
       (set! ss (cdr ss)))
     (set! (-> w live) (cast (ptr u8) (arena-alloc (current-arena) (+ (-> w nimports) (-> w count) 1))))
@@ -72,18 +72,19 @@
             [else (byte) (uleb)]))))
 
 (define (read-exports! [w (ptr wasm)])
-  (let ([export datum 0] [kind u32 0])
+  (let ([export datum 0] [kind u32 0] [index u32 0])
     (for ([i u32 (uleb)]) (> i 0) (-= i 1)
       (set! export (name))
       (set! kind (byte))
-      (set! (-> w exports) (cons `(,export ,(make-integer kind) ,(make-integer (uleb))) (-> w exports))))
+      (set! index (uleb))
+      (when (== kind 0) (datum-put! (-> w by-name) export (make-integer index)))
+      (set! (-> w exports) (cons `(,export ,(make-integer kind) ,(make-integer index)) (-> w exports))))
     (set! (-> w exports) (reverse (-> w exports)))))
 
-(define (read-elems! [w (ptr wasm)])
+(define (read-elems!)
   (for ([i u32 (uleb)]) (> i 0) (-= i 1)
-    (unless (and (== (uleb) 1) (== (byte) 0)) (unreadable))
-    (for ([j u32 (uleb)]) (> j 0) (-= j 1)
-      (set! (-> w elems) (cons (make-integer (uleb)) (-> w elems))))))
+    (unless (and (== (uleb) 3) (== (byte) 0)) (unreadable))
+    (for ([j u32 (uleb)]) (> j 0) (-= j 1) (uleb))))
 
 (define (read-bodies! [w (ptr wasm)])
   (let ([n (uleb)] [size u32 0])
@@ -151,54 +152,45 @@
   0)
 
 (define (exported [w (ptr wasm)] [name datum]) -> i64
-  (let ([es (-> w exports)])
-    (while (pair? es)
-      (when (and (== (integer-value (cadr (car es))) 0) (string=? (car (car es)) name)) (return (integer-value (caddr (car es)))))
-      (set! es (cdr es)))
-    -1))
+  (let ([j (datum-get (-> w by-name) name)]) (if (== j 0) -1 (integer-value j))))
 
-(define (reach! [ws datum])
+(define (loads-code? [f datum]) -> i32
+  (and (string=? (car f) '"host") (or (string=? (cdr f) '"instantiate") (string=? (cdr f) '"export_index"))))
+
+(define (reach! [ws datum]) -> i32
   (while (pair? work)
     (let* ([item (car work)] [w (cast (ptr wasm) (car item))] [i (cast u32 (integer-value (cdr item)))])
       (set! work (cdr work))
       (if (< i (-> w nimports))
           (let* ([f (list-ref (-> w funcs) i)] [owner (wasm-named ws (car f))])
+            (when (loads-code? f) (return 1))
             (unless (== owner 0)
               (let ([j (exported owner (cdr f))]) (when (>= j 0) (mark! owner (cast u32 j))))))
           (let ([k (- i (-> w nimports))])
             (for-each (lambda ([t datum]) (mark! w (cast u32 (integer-value t))))
-                      (calls-in (-> w p) (@ (-> w starts) k) (@ (-> w ends) k))))))))
-
-(define (loads-code? [w (ptr wasm)]) -> i32
-  (ormap (lambda ([imp datum]) -> i32
-           (and (string=? (car imp) '"host") (or (string=? (cdr imp) '"instantiate") (string=? (cdr imp) '"export_index"))))
-         (-> w imports)))
+                      (calls-in (-> w p) (@ (-> w starts) k) (@ (-> w ends) k)))))))
+  0)
 
 (define (pruned [modules datum]) -> datum
   (let ([ws (map (lambda ([m datum]) -> datum (cast datum (new-wasm (car m) (cdr m)))) modules)] [entry (ptr wasm) 0])
-    (when (ormap (lambda ([x datum]) -> i32 (loads-code? (cast (ptr wasm) x))) ws) (return modules))
     (for-each (lambda ([x datum]) (read-rest! (cast (ptr wasm) x))) ws)
     (set! entry (cast (ptr wasm) (last ws)))
     (set! work nil)
-    (let ([l ws] [w (ptr wasm) 0] [fs datum 0] [is datum 0] [owner (ptr wasm) 0])
+    (let ([l ws] [w (ptr wasm) 0] [is datum 0] [owner (ptr wasm) 0])
       (while (pair? l)
         (set! w (cast (ptr wasm) (car l)))
         (when (>= (-> w start) 0) (mark! w (cast u32 (-> w start))))
-        (set! fs (-> w elems))
-        (while (pair? fs)
-          (mark! w (cast u32 (integer-value (car fs))))
-          (set! fs (cdr fs)))
         (set! is (-> w imports))
         (while (pair? is)
           (set! owner (wasm-named ws (car (car is))))
-          (unless (== owner 0) (set! (-> owner kept) (cons (cdr (car is)) (-> owner kept))))
+          (unless (== owner 0) (datum-put! (-> owner kept) (cdr (car is)) (boolean 1)))
           (set! is (cdr is)))
         (set! l (cdr l))))
     (let ([es (-> entry exports)])
       (while (pair? es)
         (when (== (integer-value (cadr (car es))) 0) (mark! entry (cast u32 (integer-value (caddr (car es))))))
         (set! es (cdr es))))
-    (reach! ws)
+    (when (reach! ws) (return modules))
     (map (lambda ([x datum]) -> datum
            (let ([w (cast (ptr wasm) x)]) (cons (-> w name) (rewritten w (== w entry)))))
          ws)))
@@ -258,7 +250,7 @@
   (let ([q (make-buffer)] [kept nil] [es (-> w exports)] [kind i64 0])
     (while (pair? es)
       (set! kind (integer-value (cadr (car es))))
-      (when (or entry (== kind 1) (== kind 2) (!= (member (car (car es)) (-> w kept)) 0))
+      (when (or entry (== kind 1) (== kind 2) (!= (datum-get (-> w kept) (car (car es))) 0))
         (set! kept (cons (car es) kept)))
       (set! es (cdr es)))
     (set! kept (reverse kept))

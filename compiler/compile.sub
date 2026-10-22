@@ -21,7 +21,7 @@
         [substrate-table datum] [own-fidx datum] [own-slots datum]
         [literals (ptr serializer)] [literals-table datum] [exported (ptr hash-table)]
         [fname datum] [imported (ptr hash-table)] [slots datum] [slot-imports datum] [extra-places datum]
-        [segment datum] [sbrk datum] [statics datum] [data-size u32] [zero-size u32] [data-block datum] [zero-block datum])
+        [places u32] [sbrk datum] [statics datum] [data-size u32] [zero-size u32] [data-block datum] [zero-block datum])
 
 (struct compiled [info datum] [sig datum] [locals datum] [asm (ptr asm)] [next (ptr compiled)])
 
@@ -199,7 +199,7 @@
     (set! (-> ms slots) 0)
     (set! (-> ms slot-imports) nil)
     (set! (-> ms extra-places) nil)
-    (set! (-> ms segment) nil)
+    (set! (-> ms places) 0)
     (set! (-> ms sbrk) 0)
     (set! (-> ms statics) nil)
     (set! (-> ms data-size) 0)
@@ -476,8 +476,23 @@
          (code-of ms fc labels (caddr args) 'i32)
          (call! fc `(call_indirect (func ,params ,results) ,table) results expected tail))]
       [(== kind 'func-index)
-       (emit! fc `(global.get ,(fidx-synth! ms (car args) (and (!= (-> ms substrate-table) 0) (pair? (cdr args))))))
-       (fit fc '(i32) expected)]
+       (let* ([f (car args)] [own (and (!= (-> ms substrate-table) 0) (pair? (cdr args)))] [s (fidx-synth! ms f own)]
+              [base (cond [own (own-slots! ms)]
+                          [(and (>= (func-info-place f) 0) (external? ms (func-info-instance f))) (slots-of! ms (func-info-instance f))]
+                          [else (-> ms slots)])])
+         (emit! fc `(global.get ,s))
+         (emit! fc '(i32.eqz))
+         (emit! fc `(if ,(cell nil)))
+         (emit! fc `(global.get ,base))
+         (emit! fc `(i32.const ,(slot-place! ms f own)))
+         (emit! fc '(i32.add))
+         (emit! fc `(global.set ,s))
+         (emit! fc `(global.get ,s))
+         (emit! fc `(ref.func ,f))
+         (emit! fc `(table.set ,(small (if own 1 0))))
+         (emit! fc '(end))
+         (emit! fc `(global.get ,s))
+         (fit fc '(i32) expected))]
       [(== kind 'static)
        (let ([size (cast u32 (integer-value (cadr args)))] [align (cast u32 (integer-value (caddr args)))] [bytes (cadddr args)]
              [at u32 0])
@@ -724,7 +739,13 @@
                 (set-func-info-instance! (cadr f) self)
                 (set-func-info-export! (cadr f) (export-name! ms (func-info-name (cadr f)))))
               func-forms)
-    (for-each (lambda ([f datum]) (set-func-info-place! (cadr f) -1)) func-forms)
+    (let ([fs func-forms] [place i32 0])
+      (while (pair? fs)
+        (set-func-info-place! (cadr (car fs)) (if (!= table-form 0) place -1))
+        (+= place 1)
+        (set! fs (cdr fs))))
+    (set! (-> ms places) (length func-forms))
+    (when (!= table-form 0) (set! (-> ms slots) (new-synth! ms 'slots 0)))
     (for-each (lambda ([f datum])
                 (set-global-info-instance! (cadr f) self)
                 (set-global-info-export! (cadr f) (export-name! ms (global-info-name (cadr f)))))
@@ -750,7 +771,7 @@
     (when (and (-> ms uses-table) (== table-form 0))
       (raise-compile-error (-> ms table-loc) '"this code uses a table, but the module defines none: add (table size)"))
     (set! setup (new-asm))
-    (when (!= table-form 0) (slots-code! ms setup first (length func-forms)))
+    (when (!= table-form 0) (slots-code! ms setup))
     (block-code! ms setup)
     (for-each (lambda ([s datum])
                 (setup-code! ms setup start-fc s literal-segment))
@@ -776,85 +797,38 @@
          (set! (-> ms fname) '__start)
          (cx ms fc 0 (cadr f) nil 0)]))
 
-(define (slots-code! [ms (ptr mstate)] [setup (ptr asm)] [head (ptr compiled)] [n u32])
-  (let ([k (place-functions! ms head)] [end n] [others nil] [fs (reverse (-> ms fidx))] [os (reverse (-> ms own-fidx))])
-    (while (pair? fs)
-      (let ([f (car (car fs))])
-        (cond [(< (func-info-place f) 0) (set! end (extra-place! ms f end))]
-              [(external? ms (func-info-instance f)) (set! others (cons f others))]))
-      (set! fs (cdr fs)))
-    (while (pair? os)
-      (when (external? ms (func-info-instance (car (car os)))) (set! end (extra-place! ms (car (car os)) end)))
-      (set! os (cdr os)))
-    (set! others (reverse others))
-    (set! (-> ms segment)
-          (append (-> ms segment) (append (reverse (map (lambda ([e datum]) -> datum (car e)) (-> ms extra-places))) others)))
-    (when (> end 0)
-      (set! (-> ms slots) (grow-slots! ms setup 0 end))
-      (fill-slots! setup 0 (-> ms slots) 0 0 k)
-      (fill-slots! setup 0 (-> ms slots) n k (- end n))
-      (let ([i (+ k (- end n))])
-        (while (pair? others)
-          (let ([f (car others)])
-            (fill-slots! setup 0 (slots-of! ms (func-info-instance f)) (cast u32 (func-info-place f)) i 1))
-          (+= i 1)
-          (set! others (cdr others))))
-      (unless (null? (-> ms own-fidx))
-        (set! (-> ms own-slots) (grow-slots! ms setup 1 end))
-        (fill-slots! setup 1 (-> ms own-slots) 0 0 k)
-        (fill-slots! setup 1 (-> ms own-slots) n k (- end n)))
-      (unless (null? (-> ms segment)) (instr! setup '(elem.drop 0))))))
+(define (slots-code! [ms (ptr mstate)] [setup (ptr asm)])
+  (when (> (-> ms places) 0)
+    (grow-slots! setup 0 (-> ms slots) (-> ms places))
+    (unless (== (-> ms own-slots) 0) (grow-slots! setup 1 (-> ms own-slots) (-> ms places)))))
 
-(define (taken? [ms (ptr mstate)] [info datum]) -> i32
-  (or (!= (assq info (-> ms fidx)) 0) (!= (assq info (-> ms own-fidx)) 0)))
+(define (own-slots! [ms (ptr mstate)]) -> datum
+  (when (== (-> ms own-slots) 0) (set! (-> ms own-slots) (new-synth! ms 'slots 0)))
+  (-> ms own-slots))
 
-(define (place-functions! [ms (ptr mstate)] [head (ptr compiled)]) -> u32
-  (let ([rest compiled] [a head] [b (ptr compiled) 0] [cf (-> head next)] [next (ptr compiled) 0] [k u32 0] [i i32 0])
-    (set! b (& rest))
-    (while (!= cf 0)
-      (set! next (-> cf next))
-      (if (taken? ms (-> cf info))
-          (begin
-            (set! (-> a next) cf)
-            (set! a cf)
-            (set! (-> ms segment) (cons (-> cf info) (-> ms segment)))
-            (+= k 1))
-          (begin
-            (set! (-> b next) cf)
-            (set! b cf)))
-      (set! cf next))
-    (set! (-> b next) 0)
-    (set! (-> a next) (-> rest next))
-    (set! (-> ms segment) (reverse (-> ms segment)))
-    (set! cf (-> head next))
-    (while (!= cf 0)
-      (set-func-info-place! (-> cf info) i)
-      (+= i 1)
-      (set! cf (-> cf next)))
-    k))
+(define (taken-functions [ms (ptr mstate)]) -> datum
+  (let ([out nil] [l (append (-> ms fidx) (-> ms own-fidx))])
+    (while (pair? l)
+      (when (== (memq (car (car l)) out) 0) (set! out (cons (car (car l)) out)))
+      (set! l (cdr l)))
+    (reverse out)))
 
-(define (extra-place! [ms (ptr mstate)] [f datum] [n u32]) -> u32
-  (if (!= (assq f (-> ms extra-places)) 0)
-      n
-      (begin (set! (-> ms extra-places) (cons (cons f (small n)) (-> ms extra-places))) (+ n 1))))
+(define (slot-place! [ms (ptr mstate)] [f datum] [own i32]) -> datum
+  (if (or (< (func-info-place f) 0) (and own (external? ms (func-info-instance f))))
+      (let ([known (assq f (-> ms extra-places))])
+        (if (!= known 0)
+            (cdr known)
+            (let ([p (small (-> ms places))])
+              (set! (-> ms extra-places) (cons (cons f p) (-> ms extra-places)))
+              (+= (-> ms places) 1)
+              p)))
+      (small (func-info-place f))))
 
-(define (grow-slots! [ms (ptr mstate)] [setup (ptr asm)] [t i32] [n u32]) -> datum
-  (let ([s (new-synth! ms 'slots 0)])
-    (instr! setup '(ref.null func))
-    (instr! setup `(i32.const ,(small n)))
-    (instr! setup `(table.grow ,(small t)))
-    (instr! setup `(global.set ,s))
-    s))
-
-(define (fill-slots! [setup (ptr asm)] [t i32] [base datum] [at u32] [from u32] [n u32])
-  (when (> n 0)
-    (instr! setup `(global.get ,base))
-    (unless (== at 0)
-      (instr! setup `(i32.const ,(small at)))
-      (instr! setup '(i32.add)))
-    (instr! setup `(i32.const ,(small from)))
-    (instr! setup `(i32.const ,(small n)))
-    (instr! setup `(table.init 0 ,(small t)))))
+(define (grow-slots! [setup (ptr asm)] [t i32] [s datum] [n u32])
+  (instr! setup '(ref.null func))
+  (instr! setup `(i32.const ,(small n)))
+  (instr! setup `(table.grow ,(small t)))
+  (instr! setup `(global.set ,s)))
 
 (define (aligned [n u32] [a u32]) -> u32 (* (/ (+ n (- a 1)) a) a))
 
@@ -901,16 +875,7 @@
 (define (setup-code! [ms (ptr mstate)] [setup (ptr asm)] [fc (ptr fctx)] [s datum] [segment datum])
   (let ([sy (synth-of s)])
     (cond
-      [(or (== (-> sy kind) 'slots) (== (-> sy kind) 'block)) (begin)]
-      [(or (== (-> sy kind) 'fidx) (== (-> sy kind) 'own-fidx))
-       (let* ([f (-> sy info)] [extra (assq f (-> ms extra-places))]
-              [first (cond [(== (-> sy kind) 'own-fidx) (-> ms own-slots)]
-                           [(and (== extra 0) (external? ms (func-info-instance f))) (slots-of! ms (func-info-instance f))]
-                           [else (-> ms slots)])])
-         (instr! setup `(global.get ,first))
-         (instr! setup `(i32.const ,(if (!= extra 0) (cdr extra) (small (func-info-place f)))))
-         (instr! setup '(i32.add))
-         (instr! setup `(global.set ,s)))]
+      [(!= (memq (-> sy kind) '(slots block fidx own-fidx)) 0) (begin)]
       [else
        (let ([n (small (string-length segment))] [at (small (temp-local! fc 'i32))] [d (small (if (> (-> ms data-size) 0) 1 0))])
          (note-func! ms literal-buffer-info)
@@ -1074,7 +1039,7 @@
     (set! (-> m globals) wglobals)
     (set! (-> m exports) exports)
     (set! (-> m start) (if has-start (small start-index) 0))
-    (set! (-> m slots) (map (lambda ([info datum]) -> datum (index-of (-> lk funcs) info "a function")) (-> ms segment)))
+    (set! (-> m slots) (map (lambda ([info datum]) -> datum (index-of (-> lk funcs) info "a function")) (taken-functions ms)))
     (set! (-> m datas) (append (if (> (-> ms data-size) 0) (cons (block-bytes ms) nil) nil)
                                (if (!= literal-segment 0) (cons literal-segment nil) nil)))
     (set! (-> m names) (cons (-> ms self) names))
