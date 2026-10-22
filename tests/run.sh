@@ -21,7 +21,7 @@ same_program() {
 pass=0
 fail=0
 
-tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub)
+tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
@@ -30,8 +30,10 @@ for t in "${tests[@]}"; do
   rm -rf "${program:?}"
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
+  options=()
+  if [ -f "$base.host" ]; then read -r -a options < "$base.host"; fi
   actual="$(cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$program" -c "$cache" 2>&1 &&
-            "$host" "$root/$program" ${args[@]+"${args[@]}"} 2>&1)"
+            "$host" ${options[@]+"${options[@]}"} "$root/$program" ${args[@]+"${args[@]}"} 2>&1)"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then

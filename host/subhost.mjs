@@ -4,11 +4,48 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import util from 'node:util';
 import { createHost } from './subhost-core.mjs';
+import { clock } from './modules/clock.mjs';
+import { random } from './modules/random.mjs';
+import { timer } from './modules/timer.mjs';
+import { fetchModule } from './modules/fetch.mjs';
+import { websocket } from './modules/websocket.mjs';
+import { guests } from './node/guest.mjs';
+import { fakeClock, fakeTimer, fakeFetch, fakeWebsocket } from './node/fake.mjs';
 
-const [dir, ...programArgs] = process.argv.slice(2);
-if (!dir) {
-  process.stderr.write('usage: node host/subhost.mjs DIR [arg ...]\n');
+function usage() {
+  process.stderr.write('usage: node host/subhost.mjs [-g MODULE[=fake[:DIR]],...] DIR [arg ...]\n');
   process.exit(64);
+}
+
+const argv = process.argv.slice(2);
+const grants = [];
+while (argv.length > 0 && argv[0] === '-g') {
+  if (argv.length < 2) usage();
+  grants.push(...argv[1].split(','));
+  argv.splice(0, 2);
+}
+const [dir, ...programArgs] = argv;
+if (!dir) usage();
+
+const available = {
+  clock: () => clock(),
+  random: () => random(),
+  timer: () => timer(),
+  fetch: () => fetchModule(),
+  websocket: () => websocket(),
+  guest: () => guests({ cwd: process.cwd() }),
+};
+const fakes = { clock: fakeClock, timer: fakeTimer, fetch: (root) => fakeFetch(root || '.'), websocket: fakeWebsocket };
+const modules = new Map();
+if (grants.length === 0) for (const name of Object.keys(available)) modules.set(name, available[name]());
+for (const grant of grants) {
+  const [name, how] = grant.split('=');
+  const [kind, argument] = how === undefined ? [] : how.split(':');
+  if (!(name in available) || (how !== undefined && (kind !== 'fake' || !(name in fakes)))) {
+    process.stderr.write(`subhost: no module ${grant}\n`);
+    process.exit(64);
+  }
+  modules.set(name, how === undefined ? available[name]() : fakes[name](argument));
 }
 
 function systemError(e) {
@@ -57,6 +94,7 @@ const host = createHost({
   ended() {
     process.exit(2);
   },
+  modules,
   keyOf: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 });
 
