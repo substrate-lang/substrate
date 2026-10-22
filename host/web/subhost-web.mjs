@@ -1,18 +1,10 @@
 // The host for a web page: runs a program in a browser, its files kept in memory.
 import { createHost, Exit } from '../subhost-core.mjs';
+import { fsModule } from '../fs.mjs';
+import { pageFiles, resolvePath } from './fs.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
-
-export function resolvePath(cwd, path) {
-  const out = [];
-  for (const seg of (path.startsWith('/') ? path : `${cwd}/${path}`).split('/')) {
-    if (seg === '' || seg === '.') continue;
-    if (seg === '..') out.pop();
-    else out.push(seg);
-  }
-  return `/${out.join('/')}`;
-}
 
 export function unpack(bytes, dir, files) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -79,6 +71,7 @@ export function run(options, names, wasm) {
   const app = { files, cwd, entry: null, ended: false };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
+  if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd), { write: options.writable }));
   const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
   const ended = (reason) => {
     app.ended = true;
@@ -88,16 +81,6 @@ export function run(options, names, wasm) {
   const host = createHost({
     args: options.args || [],
     write: output,
-    readFile(path) {
-      const bytes = files.get(resolvePath(cwd, path));
-      if (!bytes) throw new Error('No such file or directory');
-      return bytes;
-    },
-    writeFile(path, bytes) {
-      const to = resolvePath(cwd, path);
-      if (options.mayWrite && !options.mayWrite(to)) throw new Error('Permission denied');
-      files.set(to, bytes);
-    },
     exit(code) {
       throw new Exit(code);
     },

@@ -368,38 +368,6 @@ export function createHost(platform) {
         memory().set(b.subarray(0, cap), u(bp));
         return b.length;
       },
-      read_file(pp, pl, bp, cap) {
-        const path = string(pp, pl);
-        let b;
-        try {
-          b = platform.readFile(path);
-        } catch (e) {
-          lastError = `${path}: ${e.message}`;
-          return -1;
-        }
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
-      },
-      write_file(pp, pl, bp, len) {
-        const path = string(pp, pl);
-        try {
-          platform.writeFile(path, memory().slice(u(bp), u(bp) + len));
-        } catch (e) {
-          lastError = `${path}: ${e.message}`;
-          return -1;
-        }
-        return 0;
-      },
-      make_dir(pp, pl) {
-        const path = string(pp, pl);
-        try {
-          if (platform.makeDir) platform.makeDir(path);
-        } catch (e) {
-          lastError = `${path}: ${e.message}`;
-          return -1;
-        }
-        return 0;
-      },
       exit(code) {
         platform.exit(code);
       },

@@ -2,7 +2,6 @@
 // The host for Node: runs the program that `sub build` wrote to DIR, on V8.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import util from 'node:util';
 import { createHost } from './subhost-core.mjs';
 import { clock } from './modules/clock.mjs';
 import { random } from './modules/random.mjs';
@@ -14,7 +13,8 @@ import { netModule } from './node/net.mjs';
 import { processes } from './node/process.mjs';
 import { stdin } from './node/stdin.mjs';
 import { env } from './node/env.mjs';
-import { fsModule } from './node/fs.mjs';
+import { fsModule } from './fs.mjs';
+import { nodeFiles } from './node/fs.mjs';
 import { fakeClock, fakeTimer, fakeFetch, fakeWebsocket } from './node/fake.mjs';
 
 function usage() {
@@ -43,7 +43,7 @@ const available = {
   process: () => processes(),
   stdin: () => stdin(),
   env: () => env(),
-  fs: () => fsModule(),
+  fs: () => fsModule(nodeFiles()),
 };
 const variants = {
   'clock=fake': () => fakeClock(),
@@ -65,12 +65,6 @@ for (const grant of grants) {
   modules.set(name, how === undefined ? available[name]() : variants[variant](...args));
 }
 
-function systemError(e) {
-  if (typeof e.errno !== 'number') return e;
-  const m = util.getSystemErrorMessage(e.errno);
-  return new Error(m.charAt(0).toUpperCase() + m.slice(1));
-}
-
 const host = createHost({
   args: programArgs,
   write(fd, bytes) {
@@ -79,27 +73,6 @@ const host = createHost({
     } catch (e) {
       if (e.code === 'EPIPE') process.exit(141);
       throw e;
-    }
-  },
-  readFile(path) {
-    try {
-      return fs.readFileSync(path);
-    } catch (e) {
-      throw systemError(e);
-    }
-  },
-  writeFile(path, bytes) {
-    try {
-      fs.writeFileSync(path, bytes);
-    } catch (e) {
-      throw systemError(e);
-    }
-  },
-  makeDir(path) {
-    try {
-      fs.mkdirSync(path, { recursive: true });
-    } catch (e) {
-      throw systemError(e);
     }
   },
   exit(code) {

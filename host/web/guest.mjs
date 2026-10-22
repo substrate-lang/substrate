@@ -1,7 +1,7 @@
 // The host module "guest" in a browser: the worker is a Web Worker, and the program's files are the page's.
-import { resolvePath } from './subhost-web.mjs';
+import { resolvePath } from './fs.mjs';
 import { guestModule } from '../guest.mjs';
-import { isUnder } from '../guest-side.mjs';
+import { isUnder } from '../fs.mjs';
 
 const text = new TextDecoder();
 

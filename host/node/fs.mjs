@@ -1,63 +1,45 @@
-// The host module "fs": the file system beside host.read_file, write_file and make_dir; open gives a stream.
-// stat: the size, -1 if missing, -2 for a directory. open's modes: read 0, write 1, append 2.
+// Node's files, for fs.mjs: the file system.
 import fs from 'node:fs';
+import path from 'node:path';
+import util from 'node:util';
 import { nodeSource } from '../streams.mjs';
-
-const utf8 = new TextEncoder();
 
 const modes = { 0: 'r', 1: 'w', 2: 'a' };
 
-export function fsModule() {
-  return (caller) => {
-    const attempt = (f) => {
-      try {
-        return f();
-      } catch (e) {
-        caller.error(e.message);
-        return -1;
-      }
-    };
-    return {
-      stat(ptr, len) {
-        const path = caller.string(ptr, len);
-        try {
-          const s = fs.statSync(path);
-          return s.isDirectory() ? -2n : BigInt(s.size);
-        } catch (e) {
-          caller.error(e.message);
-          return -1n;
-        }
-      },
-      list(ptr, len, buf, cap) {
-        return attempt(() => {
-          const bytes = utf8.encode(fs.readdirSync(caller.string(ptr, len)).sort().map((n) => `${n}\n`).join(''));
-          caller.memory().set(bytes.subarray(0, cap), caller.u(buf));
-          return bytes.length;
-        });
-      },
-      remove(ptr, len) {
-        return attempt(() => {
-          fs.rmSync(caller.string(ptr, len));
-          return 0;
-        });
-      },
-      rename(fromPtr, fromLen, toPtr, toLen) {
-        return attempt(() => {
-          fs.renameSync(caller.string(fromPtr, fromLen), caller.string(toPtr, toLen));
-          return 0;
-        });
-      },
-      open(ptr, len, mode, tag) {
-        let fd;
-        try {
-          fd = fs.openSync(caller.string(ptr, len), modes[mode] || 'r');
-        } catch (e) {
-          caller.error(e.message);
-          return 0;
-        }
-        const stream = mode === 0 ? fs.createReadStream('', { fd }) : fs.createWriteStream('', { fd });
-        return caller.streams.add(tag, nodeSource(stream));
-      },
-    };
+const real = (p) => {
+  try {
+    return fs.realpathSync(p);
+  } catch (e) {
+    return path.join(real(path.dirname(p)), path.basename(p));
+  }
+};
+
+const plain = (f) => (...args) => {
+  try {
+    return f(...args);
+  } catch (e) {
+    if (typeof e.errno !== 'number') throw e;
+    const m = util.getSystemErrorMessage(e.errno);
+    throw new Error(m.charAt(0).toUpperCase() + m.slice(1));
+  }
+};
+
+export function nodeFiles() {
+  return {
+    resolve: (p) => real(path.resolve(p)),
+    read: plain((p) => fs.readFileSync(p)),
+    write: plain((p, bytes) => fs.writeFileSync(p, bytes)),
+    makeDir: plain((p) => fs.mkdirSync(p, { recursive: true })),
+    stat: plain((p) => {
+      const s = fs.statSync(p);
+      return s.isDirectory() ? -2 : s.size;
+    }),
+    list: plain((p) => fs.readdirSync(p).sort()),
+    remove: plain((p) => fs.rmSync(p)),
+    rename: plain((from, to) => fs.renameSync(from, to)),
+    open: plain((p, mode) => {
+      const fd = fs.openSync(p, modes[mode] || 'r');
+      return nodeSource(mode === 0 ? fs.createReadStream('', { fd }) : fs.createWriteStream('', { fd }));
+    }),
   };
 }

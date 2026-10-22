@@ -5,8 +5,6 @@ const utf8 = new TextEncoder();
 const SOURCE = 3;
 const MESSAGE = 1;
 
-export const isUnder = (dir, path) => path === dir || path.startsWith(dir === '/' ? dir : `${dir}/`);
-
 const floor = {
   clock: () => import('./modules/clock.mjs').then((m) => m.clock()),
   random: () => import('./modules/random.mjs').then((m) => m.random()),

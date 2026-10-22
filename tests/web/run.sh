@@ -10,38 +10,30 @@ mkdir -p build
 bin/sub expand build/empty.sub > /dev/null
 
 site="$sites/session"
-rm -rf "${site:?}"
-mkdir -p "$site/host/web"
-cp host/subhost-core.mjs host/streams.mjs host/errors.mjs "$site/host/"
-cp host/web/subhost-web.mjs "$site/host/web/"
-cp -r build/sub "$site/program"
-host/web/pack.mjs -o "$site/files.pack" compiler/substrate.sub compiler/wasm.sub compiler/writer.sub compiler/syntax.sub compiler/host.sub compiler/macros.sub lib/nodes.sub lib/scheme lib/bend tests/session
-cp tests/web/session.html "$site/index.html"
+host/web/site.sh "$site" build/sub -p tests/web/session.html -f files compiler/substrate.sub compiler/wasm.sub \
+  compiler/writer.sub compiler/syntax.sub compiler/macros.sub host/host.sub host/fs.sub lib/nodes.sub lib/scheme lib/bend tests/session
 status=0
 node tests/web/session.mjs "$site" funcs scheme substrate switch bend || status=1
 
-lib/web/site.sh lib/web/examples/counter.sub "$sites/counter"
-lib/web/site.sh lib/web/examples/rows.sub "$sites/rows"
-lib/web/repl/site.sh "$sites/repl"
-lib/web/site.sh tests/web/focus.sub "$sites/focus"
-lib/web/site.sh tests/web/floor.sub "$sites/floor"
-lib/web/site.sh tests/web/fields.sub "$sites/fields"
-lib/web/site.sh tests/web/assets.sub "$sites/assets"
-lib/web/site.sh tests/web/canvas.sub "$sites/canvas"
-lib/web/site.sh lib/web/examples/snake/snake.sub "$sites/snake" lib/web/examples/snake/page.html
-lib/web/site.sh lib/web/examples/platformer/platformer.sub "$sites/platformer" lib/web/examples/platformer/page.html
-lib/web/site.sh lib/web/examples/blocks/blocks.sub "$sites/blocks" lib/web/examples/blocks/page.html
-lib/web/site.sh lib/web/examples/valley/valley.sub "$sites/valley" lib/web/examples/valley/page.html
-lib/web/site.sh tests/web/sounds.sub "$sites/sounds" lib/web/examples/platformer/page.html
-lib/web/site.sh tests/web/stopped.sub "$sites/stopped"
-lib/web/site.sh tests/web/stopped-at-start.sub "$sites/stopped-at-start"
-lib/web/site.sh tests/web/gpu.sub "$sites/gpu" tests/web/gpu.html
-lib/web/site.sh tests/web/sprites.sub "$sites/sprites" tests/web/sprites.html
-lib/web/site.sh tests/web/sprites-canvas.sub "$sites/sprites-canvas" tests/web/sprites.html
-lib/web/site.sh tests/web/guests.sub "$sites/guests" tests/web/guests.html
-bin/sub build tests/web/a-guest.sub -o "$sites/guests/guest"
-host/web/pack.mjs -o "$sites/guests/guest.pack" -C "$sites/guests/guest" .
-rm -r "${sites:?}/guests/guest"
+host/web/site.sh "$sites/counter" lib/web/examples/counter.sub
+host/web/site.sh "$sites/rows" lib/web/examples/rows.sub
+make -s repl OUT="${OUT:-build}"
+host/web/site.sh "$sites/focus" tests/web/focus.sub
+host/web/site.sh "$sites/floor" tests/web/floor.sub
+host/web/site.sh "$sites/fields" tests/web/fields.sub
+host/web/site.sh "$sites/assets" tests/web/assets.sub
+host/web/site.sh "$sites/canvas" tests/web/canvas.sub
+host/web/site.sh "$sites/snake" lib/web/examples/snake/snake.sub -p lib/web/examples/snake/page.html
+host/web/site.sh "$sites/platformer" lib/web/examples/platformer/platformer.sub -p lib/web/examples/platformer/page.html
+host/web/site.sh "$sites/blocks" lib/web/examples/blocks/blocks.sub -p lib/web/examples/blocks/page.html
+host/web/site.sh "$sites/valley" lib/web/examples/valley/valley.sub -p lib/web/examples/valley/page.html
+host/web/site.sh "$sites/sounds" tests/web/sounds.sub -p lib/web/examples/platformer/page.html
+host/web/site.sh "$sites/stopped" tests/web/stopped.sub
+host/web/site.sh "$sites/stopped-at-start" tests/web/stopped-at-start.sub
+host/web/site.sh "$sites/gpu" tests/web/gpu.sub -p tests/web/gpu.html
+host/web/site.sh "$sites/sprites" tests/web/sprites.sub -p tests/web/sprites.html
+host/web/site.sh "$sites/sprites-canvas" tests/web/sprites-canvas.sub -p tests/web/sprites.html
+host/web/site.sh "$sites/guests" tests/web/guests.sub -p tests/web/guests.html -g guest tests/web/a-guest.sub
 node tests/web/pages.mjs "$sites" counter rows focus floor fields assets canvas snake platformer sounds stopped stopped-at-start \
   guests repl gpu sprites sprites-canvas blocks valley || status=1
 exit $status

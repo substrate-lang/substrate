@@ -1,6 +1,6 @@
 // A guest's Web Worker: runs one program, with the guest module's worker side.
 import { run } from './subhost-web.mjs';
-import { guestSide, isUnder } from '../guest-side.mjs';
+import { guestSide } from '../guest-side.mjs';
 
 const side = guestSide((m, transfer) => self.postMessage(m, transfer));
 
@@ -13,7 +13,7 @@ self.onmessage = async (e) => {
       files: m.files,
       cwd: m.cwd,
       output: side.write,
-      mayWrite: (path) => m.writable.some((dir) => isUnder(dir, path)),
+      writable: m.writable,
       memoryPages: m.memory * 16,
       modules: { guest: side.guest, ...modules },
       onEnd: side.ended,

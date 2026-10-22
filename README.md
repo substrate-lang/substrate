@@ -34,7 +34,7 @@ In the dev shell (`nix develop`):
     host/subhost.mjs DIR [ARG ...]    # run it
     bin/sub eval FILE                 # FILE's forms, one at a time, as a session
     bin/sub expand FILE               # FILE's expansion
-    lib/web/site.sh FILE OUT          # a web site for a page program
-    lib/web/repl/site.sh OUT          # the REPL's site
+    host/web/site.sh OUT FILE         # a web site for a page program
+    make repl                         # the REPL's site, in build/web/repl
     host/web/serve.mjs OUT            # serve a site locally
     bench/*/run.sh                    # benchmarks
