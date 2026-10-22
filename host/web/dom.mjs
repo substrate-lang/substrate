@@ -1,6 +1,6 @@
 // The host module "dom": applies a program's patches to the page, and sends it the page's events.
 import { resolvePath } from './subhost-web.mjs';
-import { errors } from '../subhost-core.mjs';
+import { errors } from '../errors.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();

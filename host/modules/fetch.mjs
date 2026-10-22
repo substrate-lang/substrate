@@ -1,13 +1,14 @@
-// The host module "fetch": HTTP requests, answered as events.
-import { errors } from '../subhost-core.mjs';
+// The host module "fetch": HTTP requests, answered as events. The request's id is its response body's stream.
+// Kinds: head 1, value the status, bytes the header lines; failed 2, value the error code.
+import { errorOf } from '../errors.mjs';
+import { readerSource } from '../streams.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
 
 const SOURCE = 6;
 const HEAD = 1;
-const READ = 2;
-const FAILED = 3;
+const FAILED = 2;
 
 // A request: a line with the method and the URL, header lines, an empty line, then the body.
 export function parseRequest(bytes) {
@@ -33,88 +34,39 @@ export function parseRequest(bytes) {
   return { method, url, headers, body: body && body.length > 0 ? body : null };
 }
 
-const errorOf = (e) => {
-  if (e.name === 'AbortError') return errors.aborted;
-  if (e.code === 'ERR_INVALID_URL' || /URL/.test(e.message)) return errors.invalid;
-  return errors.unreachable;
-};
-
 export function fetchModule() {
-  const requests = new Map();
-  let next = 1;
-  return (caller) => {
-    const fail = (id, state, e) => {
-      if (state.closed) return;
-      state.closed = true;
-      requests.delete(id);
-      caller.event(FAILED, id, state.tag, errorOf(e), utf8.encode(e.message));
-    };
-    async function fill(id, state, at, cap) {
-      if (!state.done && (!state.chunk || state.at >= state.chunk.length)) {
-        const { value, done } = await state.reader.read();
-        if (state.closed) return;
-        if (done) state.done = true;
-        else {
-          state.chunk = value;
-          state.at = 0;
-        }
-      }
-      let n = 0;
-      if (state.chunk && state.at < state.chunk.length) {
-        n = Math.min(cap, state.chunk.length - state.at);
-        caller.memory().set(state.chunk.subarray(state.at, state.at + n), at);
-        state.at += n;
-      }
-      if (state.done && (!state.chunk || state.at >= state.chunk.length)) {
-        state.closed = true;
-        requests.delete(id);
-      }
-      caller.event(READ, id, state.tag, n);
-    }
-    return {
-      source: SOURCE,
-      end() {
-        for (const state of requests.values()) {
-          state.closed = true;
-          state.controller.abort();
-        }
-        requests.clear();
-      },
-      start(ptr, len, tag) {
-        let request;
-        try {
-          request = parseRequest(caller.memory().slice(caller.u(ptr), caller.u(ptr) + len));
-        } catch (e) {
-          caller.error(e.message);
-          return 0;
-        }
-        const id = next++;
-        const state = { tag, controller: new AbortController(), reader: null, chunk: null, at: 0, done: false, closed: false };
-        requests.set(id, state);
-        fetch(request.url, { method: request.method, headers: request.headers, body: request.body, signal: state.controller.signal })
-          .then((response) => {
-            if (state.closed) return;
-            state.reader = response.body ? response.body.getReader() : null;
-            state.done = state.reader === null;
-            const headers = [...response.headers].map(([name, value]) => `${name}: ${value}\n`).join('');
-            caller.event(HEAD, id, tag, response.status, utf8.encode(headers));
-          }, (e) => fail(id, state, e));
-        return id;
-      },
-      read(id, buf, cap) {
-        const state = requests.get(id);
-        if (!state || (!state.reader && !state.done)) return -1;
-        fill(id, state, caller.u(buf), cap).catch((e) => fail(id, state, e));
+  return (caller) => ({
+    source: SOURCE,
+    start(ptr, len, tag) {
+      let request;
+      try {
+        request = parseRequest(caller.memory().slice(caller.u(ptr), caller.u(ptr) + len));
+      } catch (e) {
+        caller.error(e.message);
         return 0;
-      },
-      abort(id) {
-        const state = requests.get(id);
-        if (!state) return;
-        state.closed = true;
-        requests.delete(id);
-        state.controller.abort();
-        caller.forget(id);
-      },
-    };
-  };
+      }
+      const controller = new AbortController();
+      let response = null;
+      let settle;
+      const ready = new Promise((resolve) => {
+        settle = resolve;
+      });
+      const id = caller.streams.add(tag, readerSource(async () => {
+        await ready;
+        return response && response.body ? response.body.getReader() : null;
+      }, () => controller.abort()));
+      fetch(request.url, { method: request.method, headers: request.headers, body: request.body, signal: controller.signal })
+        .then((r) => {
+          response = r;
+          settle();
+          const headers = [...r.headers].map(([name, value]) => `${name}: ${value}\n`).join('');
+          caller.event(HEAD, id, tag, r.status, utf8.encode(headers));
+        }, (e) => {
+          settle();
+          caller.streams.drop(id);
+          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
+        });
+      return id;
+    },
+  });
 }

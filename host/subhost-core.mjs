@@ -1,4 +1,5 @@
 // The JavaScript host, shared by Node (subhost.mjs) and the browser (web/subhost-web.mjs).
+import { createStreams, STREAM } from './streams.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
@@ -165,9 +166,6 @@ export class Exit {
   }
 }
 
-// The value of a failed event.
-export const errors = { missing: 1, unreachable: 2, refused: 3, timeout: 4, invalid: 5, aborted: 6 };
-
 export function createHost(platform) {
   const registry = new Map();
   const modules = new Map();
@@ -184,6 +182,15 @@ export function createHost(platform) {
   let deliveries = 0;
   let warned = false;
   const closers = [];
+  const streams = createStreams({
+    raise: (kind, id, tag, value, bytes) => event(STREAM, kind, id, tag, value, bytes),
+    forget: (id) => forgetEvents(STREAM, id),
+    trap: (message) => hostTrap(message),
+  });
+
+  function forgetEvents(source, id) {
+    for (let i = queue.length - 1; i >= 0; i--) if (queue[i].source === source && queue[i].id === id) queue.splice(i, 1);
+  }
 
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
@@ -307,10 +314,11 @@ export function createHost(platform) {
         event(made.source, kind, id, tag, value, bytes, data);
       },
       forget(id) {
-        for (let i = queue.length - 1; i >= 0; i--) if (queue[i].source === made.source && queue[i].id === id) queue.splice(i, 1);
+        forgetEvents(made.source, id);
       },
       current: () => current,
       modules: () => (platform.modules ? [...platform.modules.keys()] : []),
+      streams: { add: streams.add, tag: streams.tag, drop: streams.drop, close: streams.close },
     };
   }
 
@@ -435,6 +443,10 @@ export function createHost(platform) {
         if (!made.has('events')) made.set('events', eventImports(self));
         value = made.get('events')[imp.name];
         if (compileTime && value) value = refused(`events.${imp.name}`);
+      } else if (imp.module === 'stream') {
+        if (!made.has('stream')) made.set('stream', streams.imports(callerOf(self, 'stream')));
+        value = made.get('stream')[imp.name];
+        if (compileTime && value) value = refused(`stream.${imp.name}`);
       } else if (platform.modules && platform.modules.has(from)) {
         if (compileTime) {
           value = refused(`${from}.${imp.name}`);
@@ -507,6 +519,7 @@ export function createHost(platform) {
     ended = true;
     queue.length = 0;
     for (const close of closers.splice(0)) close();
+    streams.end();
     if (platform.ended) platform.ended(reason);
   }
 

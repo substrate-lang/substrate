@@ -69,67 +69,36 @@ export function fakeTimer() {
 }
 
 export function fakeFetch(root) {
-  const requests = new Map();
-  let next = 1;
-  return (caller) => {
-    return {
-      source: 6,
-      end() {
-        for (const state of requests.values()) state.closed = true;
-        requests.clear();
-      },
-      start(ptr, len, tag) {
-        let request;
-        try {
-          request = parseRequest(caller.memory().slice(caller.u(ptr), caller.u(ptr) + len));
-        } catch (e) {
-          caller.error(e.message);
-          return 0;
-        }
-        const id = next++;
-        let status = 200;
-        let body;
-        try {
-          body = fs.readFileSync(path.join(root, new URL(request.url, 'http://fake/').pathname));
-        } catch (e) {
-          status = 404;
-          body = utf8.encode('not found');
-        }
-        const state = { tag, body, at: 0, headed: false, closed: false };
-        requests.set(id, state);
-        soon(() => {
-          if (state.closed) return;
-          state.headed = true;
-          caller.event(1, id, tag, status, utf8.encode(`content-length: ${body.length}\n`));
-        });
-        return id;
-      },
-      read(id, buf, cap) {
-        const state = requests.get(id);
-        if (!state || !state.headed) return -1;
-        const at = caller.u(buf);
-        soon(() => {
-          if (state.closed) return;
-          const n = Math.min(cap, state.body.length - state.at);
-          caller.memory().set(state.body.subarray(state.at, state.at + n), at);
-          state.at += n;
-          if (n === 0 && state.at >= state.body.length) {
-            state.closed = true;
-            requests.delete(id);
-          }
-          caller.event(2, id, state.tag, n);
-        });
+  return (caller) => ({
+    source: 6,
+    start(ptr, len, tag) {
+      let request;
+      try {
+        request = parseRequest(caller.memory().slice(caller.u(ptr), caller.u(ptr) + len));
+      } catch (e) {
+        caller.error(e.message);
         return 0;
-      },
-      abort(id) {
-        const state = requests.get(id);
-        if (!state) return;
-        state.closed = true;
-        requests.delete(id);
-        caller.forget(id);
-      },
-    };
-  };
+      }
+      let status = 200;
+      let body;
+      try {
+        body = fs.readFileSync(path.join(root, new URL(request.url, 'http://fake/').pathname));
+      } catch (e) {
+        status = 404;
+        body = utf8.encode('not found');
+      }
+      let sent = false;
+      const id = caller.streams.add(tag, {
+        pull: () => new Promise((resolve) => soon(() => {
+          resolve(sent ? null : body);
+          sent = true;
+        })),
+        close() {},
+      });
+      soon(() => caller.event(1, id, tag, status, utf8.encode(`content-length: ${body.length}\n`)));
+      return id;
+    },
+  });
 }
 
 export function fakeWebsocket() {

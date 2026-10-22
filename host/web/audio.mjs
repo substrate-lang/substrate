@@ -1,6 +1,6 @@
 // The host module "audio": sound files and synthesized tones.
 import { resolvePath } from './subhost-web.mjs';
-import { errors } from '../subhost-core.mjs';
+import { errors } from '../errors.mjs';
 
 const utf8 = new TextEncoder();
 

@@ -1,6 +1,6 @@
 // The host module "gpu": WebGPU, as batches of commands from the program, and events back.
 import { resolvePath } from './subhost-web.mjs';
-import { errors } from '../subhost-core.mjs';
+import { errors } from '../errors.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();

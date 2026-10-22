@@ -12,7 +12,7 @@ bin/sub expand build/empty.sub > /dev/null
 site="$sites/session"
 rm -rf "${site:?}"
 mkdir -p "$site/host/web"
-cp host/subhost-core.mjs "$site/host/"
+cp host/subhost-core.mjs host/streams.mjs host/errors.mjs "$site/host/"
 cp host/web/subhost-web.mjs "$site/host/web/"
 cp -r build/sub "$site/program"
 host/web/pack.mjs -o "$site/files.pack" compiler/substrate.sub compiler/wasm.sub compiler/writer.sub compiler/syntax.sub compiler/host.sub compiler/macros.sub lib/nodes.sub lib/scheme lib/bend tests/session

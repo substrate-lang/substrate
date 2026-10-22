@@ -1,5 +1,5 @@
 // The host module "websocket": connections whose messages arrive as events.
-import { errors } from '../subhost-core.mjs';
+import { errors } from '../errors.mjs';
 
 const utf8 = new TextEncoder();
 
