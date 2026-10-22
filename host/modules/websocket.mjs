@@ -75,7 +75,7 @@ export function websocket() {
         const s = sockets.get(id);
         if (!s) return;
         sockets.delete(id);
-        s.ws.close(code || 1000);
+        s.ws.close(code === 1000 || (code >= 3000 && code <= 4999) ? code : 1000);
         caller.forget(id);
       },
     };

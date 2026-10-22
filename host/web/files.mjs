@@ -3,6 +3,7 @@
 // pick's options are lines: multiple; accept TYPES.
 import { errors } from '../errors.mjs';
 import { readerSource } from '../streams.mjs';
+import { settings } from '../settings.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -13,15 +14,12 @@ const FAILED = 3;
 
 function parseOptions(text) {
   const options = { multiple: false, accept: '' };
-  for (const line of text.split('\n')) {
-    const space = line.indexOf(' ');
-    const word = space < 0 ? line : line.slice(0, space);
-    const value = space < 0 ? '' : line.slice(space + 1);
-    if (word === '') continue;
+  settings(text, 'files.pick', (word, value) => {
     if (word === 'multiple') options.multiple = true;
     else if (word === 'accept') options.accept = value;
-    else throw new Error(`files.pick: unknown option "${word}"`);
-  }
+    else return false;
+    return true;
+  });
   return options;
 }
 
@@ -62,7 +60,13 @@ export function files() {
           if (!ended) caller.event(FAILED, id, tag, errors.aborted, utf8.encode('cancelled'));
         };
         document.body.append(input);
-        input.click();
+        try {
+          input.showPicker();
+        } catch (e) {
+          input.remove();
+          caller.error(e.message);
+          return 0;
+        }
         return id;
       },
       save(np, nl, ptr, len) {
