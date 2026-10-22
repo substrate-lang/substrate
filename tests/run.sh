@@ -21,6 +21,11 @@ same_program() {
 pass=0
 fail=0
 
+# A certificate for the TLS test, trusted by its client because the launcher granted it.
+mkdir -p "$builds/tls"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
+  -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
+
 tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
@@ -33,6 +38,7 @@ for t in "${tests[@]}"; do
   args=("${args[@]/@program/$root/$program}")
   options=()
   if [ -f "$base.host" ]; then read -r -a options < "$base.host"; fi
+  options=("${options[@]//@build/$root/$builds}")
   input=/dev/null
   if [ -f "$base.in" ]; then input="$root/$base.in"; fi
   actual="$(cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$program" -c "$cache" 2>&1 &&

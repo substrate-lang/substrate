@@ -30,6 +30,7 @@ function parseOptions(text) {
 
 export function netModule(granted = {}) {
   const listeners = new Map();
+  const ca = granted.tls ? [...tls.rootCertificates, granted.tls.cert] : undefined;
   let next = 1;
   return (caller) => {
     return {
@@ -69,7 +70,9 @@ export function netModule(granted = {}) {
         try {
           const host = caller.string(hostPtr, hostLen);
           const options = parseOptions(caller.string(ptr, len));
-          socket = options.tls ? tls.connect({ host, port, servername: host }) : net.connect({ host, port });
+          socket = options.tls
+            ? tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, ca })
+            : net.connect({ host, port });
         } catch (e) {
           caller.error(e.message);
           return 0;

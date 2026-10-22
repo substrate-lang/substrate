@@ -45,12 +45,21 @@ const available = {
   env: () => env(),
   fs: () => fsModule(nodeFiles()),
 };
+function granted(file) {
+  try {
+    return fs.readFileSync(file);
+  } catch (e) {
+    process.stderr.write(`subhost: cannot read ${file}\n`);
+    process.exit(64);
+  }
+}
+
 const variants = {
   'clock=fake': () => fakeClock(),
   'timer=fake': () => fakeTimer(),
   'fetch=fake': (root) => fakeFetch(root || '.'),
   'websocket=fake': () => fakeWebsocket(),
-  'net=tls': (cert, key) => netModule({ tls: { cert: fs.readFileSync(cert), key: fs.readFileSync(key) } }),
+  'net=tls': (cert, key) => netModule({ tls: { cert: granted(cert), key: granted(key) } }),
 };
 const modules = new Map();
 if (grants.length === 0) for (const name of ['clock', 'random', 'timer', 'guest', 'stdin', 'env', 'fs']) modules.set(name, available[name]());
