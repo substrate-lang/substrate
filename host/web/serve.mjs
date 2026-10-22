@@ -6,7 +6,7 @@ import path from 'node:path';
 
 const [dir, port = '8000'] = process.argv.slice(2);
 if (!dir) {
-  process.stderr.write('usage: host/web/serve.mjs DIR [PORT]\n');
+  process.stderr.write('usage: sub serve DIR [PORT]\n');
   process.exit(64);
 }
 const root = path.resolve(dir);

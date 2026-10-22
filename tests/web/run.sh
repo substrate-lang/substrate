@@ -10,30 +10,29 @@ mkdir -p build
 bin/sub expand build/empty.sub > /dev/null
 
 site="$sites/session"
-host/web/site.sh "$site" build/sub -p tests/web/session.html -f files compiler/substrate.sub compiler/wasm.sub \
-  compiler/writer.sub compiler/syntax.sub compiler/macros.sub host/host.sub host/fs.sub lib/nodes.sub lib/scheme lib/bend tests/session
+bin/sub site "$site" build/sub -p tests/web/session.html -f files compiler host lib/nodes.sub lib/scheme lib/bend tests/session
 status=0
 node tests/web/session.mjs "$site" funcs scheme substrate switch bend || status=1
 
-host/web/site.sh "$sites/counter" lib/web/examples/counter.sub
-host/web/site.sh "$sites/rows" lib/web/examples/rows.sub
+bin/sub site "$sites/counter" lib/web/examples/counter.sub
+bin/sub site "$sites/rows" lib/web/examples/rows.sub
 make -s repl OUT="${OUT:-build}"
-host/web/site.sh "$sites/focus" tests/web/focus.sub
-host/web/site.sh "$sites/floor" tests/web/floor.sub
-host/web/site.sh "$sites/fields" tests/web/fields.sub
-host/web/site.sh "$sites/assets" tests/web/assets.sub
-host/web/site.sh "$sites/canvas" tests/web/canvas.sub
-host/web/site.sh "$sites/snake" lib/web/examples/snake/snake.sub -p lib/web/examples/snake/page.html
-host/web/site.sh "$sites/platformer" lib/web/examples/platformer/platformer.sub -p lib/web/examples/platformer/page.html
-host/web/site.sh "$sites/blocks" lib/web/examples/blocks/blocks.sub -p lib/web/examples/blocks/page.html
-host/web/site.sh "$sites/valley" lib/web/examples/valley/valley.sub -p lib/web/examples/valley/page.html
-host/web/site.sh "$sites/sounds" tests/web/sounds.sub -p lib/web/examples/platformer/page.html
-host/web/site.sh "$sites/stopped" tests/web/stopped.sub
-host/web/site.sh "$sites/stopped-at-start" tests/web/stopped-at-start.sub
-host/web/site.sh "$sites/gpu" tests/web/gpu.sub -p tests/web/gpu.html
-host/web/site.sh "$sites/sprites" tests/web/sprites.sub -p tests/web/sprites.html
-host/web/site.sh "$sites/sprites-canvas" tests/web/sprites-canvas.sub -p tests/web/sprites.html
-host/web/site.sh "$sites/guests" tests/web/guests.sub -p tests/web/guests.html -g guest tests/web/a-guest.sub
+bin/sub site "$sites/focus" tests/web/focus.sub
+bin/sub site "$sites/floor" tests/web/floor.sub
+bin/sub site "$sites/fields" tests/web/fields.sub
+bin/sub site "$sites/assets" tests/web/assets.sub
+bin/sub site "$sites/canvas" tests/web/canvas.sub
+bin/sub site "$sites/snake" lib/web/examples/snake/snake.sub -p lib/web/examples/snake/page.html
+bin/sub site "$sites/platformer" lib/web/examples/platformer/platformer.sub -p lib/web/examples/platformer/page.html
+bin/sub site "$sites/blocks" lib/web/examples/blocks/blocks.sub -p lib/web/examples/blocks/page.html
+bin/sub site "$sites/valley" lib/web/examples/valley/valley.sub -p lib/web/examples/valley/page.html
+bin/sub site "$sites/sounds" tests/web/sounds.sub -p lib/web/examples/platformer/page.html
+bin/sub site "$sites/stopped" tests/web/stopped.sub
+bin/sub site "$sites/stopped-at-start" tests/web/stopped-at-start.sub
+bin/sub site "$sites/gpu" tests/web/gpu.sub -p tests/web/gpu.html
+bin/sub site "$sites/sprites" tests/web/sprites.sub -p tests/web/sprites.html
+bin/sub site "$sites/sprites-canvas" tests/web/sprites-canvas.sub -p tests/web/sprites.html
+bin/sub site "$sites/guests" tests/web/guests.sub -p tests/web/guests.html -g guest tests/web/a-guest.sub
 node tests/web/pages.mjs "$sites" counter rows focus floor fields assets canvas snake platformer sounds stopped stopped-at-start \
   guests repl gpu sprites sprites-canvas blocks valley || status=1
 exit $status

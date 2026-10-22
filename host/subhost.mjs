@@ -18,7 +18,7 @@ import { nodeFiles } from './node/fs.mjs';
 import { fakeClock, fakeTimer, fakeFetch, fakeWebsocket } from './node/fake.mjs';
 
 function usage() {
-  process.stderr.write('usage: node host/subhost.mjs [-g MODULE[=fake[:DIR]|=tls:CERT:KEY],...] DIR [arg ...]\n');
+  process.stderr.write('usage: sub run [-g MODULE[=fake[:DIR]|=tls:CERT:KEY],...] DIR [arg ...]\n');
   process.exit(64);
 }
 
