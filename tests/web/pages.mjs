@@ -148,6 +148,54 @@ const checks = {
     await say('(fib 11)');
     check('repl: Clear keeps the session', await shown(), '(fib 11) => 89');
 
+    await page.click('nav button:nth-of-type(3)');
+    await idle();
+    check('repl: the URL carries the language', await page.evaluate('location.search'), '?language=bend');
+    await page.evaluate('location.href = location.pathname + "?language=substrate"');
+    await page.waitFor('window.ready && location.search === "?language=substrate"', 20000);
+    await idle();
+    check('repl: a language in the URL opens that session', await shown(), '(language substrate "compiler/substrate.sub") => ');
+
+    await say('(define (sq [x i32]) -> i32 (* x x))');
+    await say('(sq 4)');
+    const downloads = path.resolve(sites, 'repl-downloads');
+    fs.rmSync(downloads, { recursive: true, force: true });
+    fs.mkdirSync(downloads);
+    await page.downloadsTo(downloads);
+    await page.click('#save');
+    const saved = path.join(downloads, 'session.sub');
+    for (let i = 0; i < 100 && !fs.existsSync(saved); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    check('repl: Save downloads the inputs as a session file', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file',
+      '(language substrate "compiler/substrate.sub")\n\n(define (sq [x i32]) -> i32 (* x x))\n\n(sq 4)\n');
+
+    const forms = path.join(downloads, 'forms.sub');
+    fs.writeFileSync(forms, '(define (cube [x i32]) -> i32\n  (* x x x))\n\n(cube 3)\n');
+    await page.chooseFiles([forms]);
+    await page.click('#load');
+    await page.waitFor('document.querySelectorAll("section.entry").length === 5', 20000);
+    await idle();
+    check('repl: Load evaluates a file\'s forms in turn', (await entries()).slice(3).join('\n'),
+      '(define (cube [x i32]) -> i32\n  (* x x x)) => \n(cube 3) => 27');
+
+    await page.grant(['clipboardReadWrite', 'clipboardSanitizedWrite']);
+    await page.command('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await page.click('#copy');
+    const transcript = await page.evaluate(`[...document.querySelectorAll('section.entry')].map((s) => {
+      const output = s.querySelector('.output');
+      return s.querySelector('.input').textContent + '\\n'
+        + (output ? output.textContent.split('\\n').map((l) => ';; ' + l).join('\\n') + '\\n' : '');
+    }).join('\\n')`);
+    await page.waitFor('navigator.clipboard.readText().then((t) => t !== "")', 10000);
+    check('repl: Copy puts the transcript on the clipboard, outputs as comments',
+      await page.evaluate('navigator.clipboard.readText()'), transcript);
+
+    await page.type('(sq 1');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await page.evaluate('window.ready = false; location.reload()');
+    await page.waitFor('window.ready', 20000);
+    await idle();
+    check('repl: the draft survives a reload', await fieldText(), '(sq 1');
+    check('repl: and the language is the URL\'s', await shown(), '(language substrate "compiler/substrate.sub") => ');
   },
 
   async rows(page) {
@@ -365,6 +413,18 @@ const checks = {
     check('snake: the button starts a new game too', await text('status'), 'Press an arrow key to start.');
     await page.press('a');
     check('snake: the A key turns left and starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
+
+    await page.evaluate(`new Promise((resolve) => {
+      const r = indexedDB.open('snake', 1);
+      r.onsuccess = () => {
+        const t = r.result.transaction('keys', 'readwrite');
+        t.objectStore('keys').put(new TextEncoder().encode('42'), 'best');
+        t.oncomplete = resolve;
+      };
+    })`);
+    await page.evaluate('window.ready = false; location.reload()');
+    await page.waitFor('window.ready && document.getElementById("best").textContent === "42"', 20000);
+    check('snake: the best score is kept across reloads', await text('best'), '42');
   },
 
   async platformer(page) {
