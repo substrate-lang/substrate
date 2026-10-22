@@ -72,8 +72,11 @@ export async function withBrowser(use, options = {}) {
       const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
       const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
       const log = [];
+      let chooser = null;
       listeners.set(sessionId, (message) => {
-        if (message.method === 'Runtime.consoleAPICalled') {
+        if (message.method === 'Page.fileChooserOpened' && chooser) {
+          chooser(message.params);
+        } else if (message.method === 'Runtime.consoleAPICalled') {
           log.push(message.params.args.map((a) => (a.value !== undefined ? String(a.value) : a.description)).join(' '));
         } else if (message.method === 'Runtime.exceptionThrown') {
           const d = message.params.exceptionDetails;
@@ -95,6 +98,16 @@ export async function withBrowser(use, options = {}) {
       const page = {
         log,
         evaluate,
+        command,
+        grant: (permissions) => send('Browser.grantPermissions', { permissions, origin: new URL(url).origin }),
+        downloadsTo: (dir) => send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir }),
+        async chooseFiles(files) {
+          await command('Page.setInterceptFileChooserDialog', { enabled: true });
+          chooser = ({ backendNodeId }) => {
+            chooser = null;
+            command('DOM.setFileInputFiles', { files, backendNodeId }).catch((e) => log.push(`files: ${e.message}`));
+          };
+        },
         async waitFor(js, ms = 10000) {
           const until = Date.now() + ms;
           const late = {};

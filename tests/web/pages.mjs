@@ -1,5 +1,6 @@
 // Browser tests: each check opens its page, acts as a user would, and compares.
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withBrowser, webgpuFlags } from '../../host/web/browser.mjs';
@@ -617,6 +618,48 @@ const checks = {
     check('assets: and only where it was drawn', await pixel(2, 2), '255,255,255,255');
     await page.waitFor('document.getElementById("picture").complete', 10000);
     check('assets: an image asset is shown by its URL', await page.evaluate('document.getElementById("picture").naturalWidth'), 4);
+  },
+
+  async storage(page) {
+    await page.waitFor('document.getElementById("step").textContent === "6"', 10000);
+    check('storage: set, got, a missing key, listed, removed, gone', await page.evaluate('document.getElementById("log").textContent'),
+      '2 0 \n1 1 hello\n1 0 \n3 1 greeting\n\n2 0 \n1 0 \n');
+  },
+
+  async location(page) {
+    const text = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    const first = `${url}location/index.html`;
+    await page.waitFor('document.getElementById("back").textContent !== ""', 10000);
+    check('location: the URL', await text('first'), first);
+    check('location: after a push', await text('pushed'), `${first}?page=2`);
+    check('location: back again, as an event', await text('back'), first);
+  },
+
+  async clipboard(page) {
+    await page.grant(['clipboardReadWrite', 'clipboardSanitizedWrite']);
+    await page.command('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await page.click('#copy');
+    await page.waitFor('document.getElementById("shown").textContent !== "waiting"', 10000);
+    check('clipboard: text written, then read back', await page.evaluate('document.getElementById("shown").textContent'),
+      'read: copied text');
+  },
+
+  async files(page) {
+    const text = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    const picked = [path.join(here, '../events/files/hello.txt'), path.join(here, 'assets/note.txt')];
+    await page.chooseFiles(picked);
+    await page.click('#pick');
+    await page.waitFor('document.getElementById("picked").textContent === "2" && document.getElementById("shown").textContent.split("\\n").length === 3', 10000);
+    check('files: two files picked, each read whole, in turn', await text('shown'),
+      picked.map((p) => `${path.basename(p)} ${fs.statSync(p).size} ${fs.readFileSync(p, 'utf8')}\n`).join(''));
+    const downloads = path.resolve(sites, 'files-downloads');
+    fs.rmSync(downloads, { recursive: true, force: true });
+    fs.mkdirSync(downloads);
+    await page.downloadsTo(downloads);
+    await page.click('#save');
+    const saved = path.join(downloads, 'saved.txt');
+    for (let i = 0; i < 100 && !fs.existsSync(saved); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    check('files: bytes saved as a download', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file', 'saved bytes');
   },
 
   async floor(page) {

@@ -1,0 +1,77 @@
+// The host module "files": the user's files, picked, each a stream; and bytes saved as a file.
+// Kinds: file 1, value the stream, bytes the name; picked 2, value how many; failed 3, value the error code.
+// pick's options are lines: multiple; accept TYPES.
+import { errors } from '../errors.mjs';
+import { readerSource } from '../streams.mjs';
+
+const utf8 = new TextEncoder();
+
+const SOURCE = 14;
+const FILE = 1;
+const PICKED = 2;
+const FAILED = 3;
+
+function parseOptions(text) {
+  const options = { multiple: false, accept: '' };
+  for (const line of text.split('\n')) {
+    const space = line.indexOf(' ');
+    const word = space < 0 ? line : line.slice(0, space);
+    const value = space < 0 ? '' : line.slice(space + 1);
+    if (word === '') continue;
+    if (word === 'multiple') options.multiple = true;
+    else if (word === 'accept') options.accept = value;
+    else throw new Error(`files.pick: unknown option "${word}"`);
+  }
+  return options;
+}
+
+export function files() {
+  return (caller) => {
+    let next = 1;
+    let ended = false;
+    return {
+      source: SOURCE,
+      end() {
+        ended = true;
+      },
+      pick(ptr, len, tag) {
+        let options;
+        try {
+          options = parseOptions(caller.string(ptr, len));
+        } catch (e) {
+          caller.error(e.message);
+          return 0;
+        }
+        const id = next++;
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.multiple = options.multiple;
+        input.accept = options.accept;
+        input.style.display = 'none';
+        input.onchange = () => {
+          input.remove();
+          if (ended) return;
+          for (const f of input.files) {
+            const stream = caller.streams.add(tag, readerSource(() => f.stream().getReader(), () => {}));
+            caller.event(FILE, id, tag, stream, utf8.encode(f.name));
+          }
+          caller.event(PICKED, id, tag, input.files.length);
+        };
+        input.oncancel = () => {
+          input.remove();
+          if (!ended) caller.event(FAILED, id, tag, errors.aborted, utf8.encode('cancelled'));
+        };
+        document.body.append(input);
+        input.click();
+        return id;
+      },
+      save(np, nl, ptr, len) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([caller.memory().slice(caller.u(ptr), caller.u(ptr) + len)]));
+        a.download = caller.string(np, nl);
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      },
+    };
+  };
+}

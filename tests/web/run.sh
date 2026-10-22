@@ -19,6 +19,10 @@ bin/sub site "$sites/rows" lib/web/examples/rows.sub
 make -s repl OUT="${OUT:-build}"
 bin/sub site "$sites/focus" tests/web/focus.sub
 bin/sub site "$sites/floor" tests/web/floor.sub
+bin/sub site "$sites/storage" tests/web/storage.sub
+bin/sub site "$sites/location" tests/web/location.sub
+bin/sub site "$sites/clipboard" tests/web/clipboard.sub
+bin/sub site "$sites/files" tests/web/files.sub
 bin/sub site "$sites/fields" tests/web/fields.sub
 bin/sub site "$sites/assets" tests/web/assets.sub
 bin/sub site "$sites/canvas" tests/web/canvas.sub
@@ -33,6 +37,6 @@ bin/sub site "$sites/gpu" tests/web/gpu.sub -p tests/web/gpu.html
 bin/sub site "$sites/sprites" tests/web/sprites.sub -p tests/web/sprites.html
 bin/sub site "$sites/sprites-canvas" tests/web/sprites-canvas.sub -p tests/web/sprites.html
 bin/sub site "$sites/guests" tests/web/guests.sub -p tests/web/guests.html -g guest tests/web/a-guest.sub
-node tests/web/pages.mjs "$sites" counter rows focus floor fields assets canvas snake platformer sounds stopped stopped-at-start \
-  guests repl gpu sprites sprites-canvas blocks valley || status=1
+node tests/web/pages.mjs "$sites" counter rows focus floor storage location clipboard files fields assets canvas snake platformer \
+  sounds stopped stopped-at-start guests repl gpu sprites sprites-canvas blocks valley || status=1
 exit $status
