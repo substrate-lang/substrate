@@ -29,9 +29,9 @@ function parseOptions(text) {
 }
 
 export function netModule(granted = {}) {
+  const listeners = new Map();
+  let next = 1;
   return (caller) => {
-    const listeners = new Map();
-    let next = 1;
     return {
       source: SOURCE,
       end() {
@@ -51,7 +51,9 @@ export function netModule(granted = {}) {
         }
         const id = next++;
         listeners.set(id, server);
-        server.on('listening', () => caller.event(LISTENING, id, tag, server.address().port));
+        server.on('listening', () => {
+          if (listeners.get(id) === server) caller.event(LISTENING, id, tag, server.address().port);
+        });
         server.on(server instanceof tls.Server ? 'secureConnection' : 'connection', (socket) => {
           caller.event(ACCEPT, id, tag, caller.streams.add(tag, nodeSource(socket)));
         });
@@ -75,8 +77,7 @@ export function netModule(granted = {}) {
         let connected = false;
         let id = 0;
         socket.on('error', (e) => {
-          if (connected) return;
-          caller.streams.drop(id);
+          if (connected || !caller.streams.drop(id)) return;
           caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
         });
         id = caller.streams.add(tag, nodeSource(socket));

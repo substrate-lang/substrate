@@ -54,7 +54,7 @@ export function dom(root) {
       if (!frameRequest) frameRequest = requestAnimationFrame(frame);
       return;
     }
-    const entry = { type, handler: null };
+    const entry = { type, message, handler: null };
     entry.handler = (e) => {
       const list = windowListeners.get(id);
       if (list && list.includes(entry)) give(e, message);
@@ -68,10 +68,19 @@ export function dom(root) {
 
   const unlisten = (id) => {
     const n = nodes.get(id);
-    if (n instanceof Node && n.subListeners) n.subListeners = null;
-    for (const { type, handler } of windowListeners.get(id) || []) windowTarget(type).removeEventListener(type, handler);
+    if (n instanceof Node && n.subListeners) {
+      for (const message of Object.values(n.subListeners)) caller.forget(message);
+      n.subListeners = null;
+    }
+    for (const { type, message, handler } of windowListeners.get(id) || []) {
+      windowTarget(type).removeEventListener(type, handler);
+      caller.forget(message);
+    }
     windowListeners.delete(id);
-    frames.delete(id);
+    if (frames.has(id)) {
+      caller.forget(frames.get(id));
+      frames.delete(id);
+    }
   };
 
   function template(html) {
@@ -225,13 +234,10 @@ export function dom(root) {
           break;
         }
         case 3:
-          taken(nodes.get(w[i + 1]));
-          // No break here.
         case 4:
-          for (let id = w[i + 1]; id <= w[i + 1] + w[i + 2]; id++) {
-            unlisten(id);
-            nodes.delete(id);
-          }
+          for (let id = w[i + 1]; id <= w[i + 1] + w[i + 2]; id++) unlisten(id);
+          if (w[i] === 3) taken(nodes.get(w[i + 1]));
+          for (let id = w[i + 1]; id <= w[i + 1] + w[i + 2]; id++) nodes.delete(id);
           i += 3;
           break;
         case 5:

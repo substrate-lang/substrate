@@ -59,11 +59,12 @@ export function fetchModule() {
         .then((r) => {
           response = r;
           settle();
+          if (!caller.streams.open(id)) return;
           const headers = [...r.headers].map(([name, value]) => `${name}: ${value}\n`).join('');
           caller.event(HEAD, id, tag, r.status, utf8.encode(headers));
         }, (e) => {
           settle();
-          caller.streams.drop(id);
+          if (!caller.streams.drop(id)) return;
           caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
         });
       return id;

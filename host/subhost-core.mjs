@@ -318,7 +318,7 @@ export function createHost(platform) {
       },
       current: () => current,
       modules: () => (platform.modules ? [...platform.modules.keys()] : []),
-      streams: { add: streams.add, tag: streams.tag, drop: streams.drop, close: streams.close },
+      streams: { add: streams.add, tag: streams.tag, drop: streams.drop, close: streams.close, open: streams.open },
     };
   }
 

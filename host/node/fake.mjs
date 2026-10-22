@@ -95,7 +95,9 @@ export function fakeFetch(root) {
         })),
         close() {},
       });
-      soon(() => caller.event(1, id, tag, status, utf8.encode(`content-length: ${body.length}\n`)));
+      soon(() => {
+        if (caller.streams.open(id)) caller.event(1, id, tag, status, utf8.encode(`content-length: ${body.length}\n`));
+      });
       return id;
     },
   });

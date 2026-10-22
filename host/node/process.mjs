@@ -1,6 +1,7 @@
 // The host module "process": child programs, their three pipes being streams.
 // Kinds: exit 1, value the exit code, or 128 plus the signal; failed 2, value the error code.
-// A spec is lines: program PATH; arg TEXT; dir PATH; env NAME=VALUE.
+// A spec is lines: program PATH; arg TEXT; dir PATH; env NAME=VALUE; and stdin, stdout or stderr followed by
+// ignore or inherit, for a pipe the program will not read or write.
 import child from 'node:child_process';
 import os from 'node:os';
 import { errorOf } from '../errors.mjs';
@@ -12,8 +13,10 @@ const SOURCE = 10;
 const EXIT = 1;
 const FAILED = 2;
 
+const pipes = ['stdin', 'stdout', 'stderr'];
+
 function parseSpec(text) {
-  const spec = { program: null, args: [], dir: null, env: {} };
+  const spec = { program: null, args: [], dir: null, env: {}, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' };
   for (const line of text.split('\n')) {
     const space = line.indexOf(' ');
     const word = space < 0 ? line : line.slice(0, space);
@@ -25,16 +28,17 @@ function parseSpec(text) {
     else if (word === 'env') {
       const equals = value.indexOf('=');
       spec.env[equals < 0 ? value : value.slice(0, equals)] = equals < 0 ? '' : value.slice(equals + 1);
-    } else throw new Error(`process.spawn: unknown setting "${word}" in the spec`);
+    } else if (pipes.includes(word) && (value === 'ignore' || value === 'inherit')) spec[word] = value;
+    else throw new Error(`process.spawn: unknown setting "${word}" in the spec`);
   }
   if (spec.program === null) throw new Error('process.spawn: the spec has no "program" line');
   return spec;
 }
 
 export function processes() {
+  const children = new Map();
+  let next = 1;
   return (caller) => {
-    const children = new Map();
-    let next = 1;
     return {
       source: SOURCE,
       end() {
@@ -49,19 +53,15 @@ export function processes() {
           process = child.spawn(spec.program, spec.args, {
             cwd: spec.dir || undefined,
             env: { ...globalThis.process.env, ...spec.env },
-            stdio: ['pipe', 'pipe', 'pipe'],
+            stdio: pipes.map((pipe) => spec[pipe]),
           });
         } catch (e) {
           caller.error(e.message);
           return 0;
         }
         const id = next++;
-        const c = {
-          process,
-          stdin: caller.streams.add(tag, nodeSource(process.stdin)),
-          stdout: caller.streams.add(tag, nodeSource(process.stdout)),
-          stderr: caller.streams.add(tag, nodeSource(process.stderr)),
-        };
+        const c = { process };
+        for (const pipe of pipes) c[pipe] = spec[pipe] === 'pipe' ? caller.streams.add(tag, nodeSource(process[pipe])) : 0;
         children.set(id, c);
         process.on('error', (e) => {
           if (children.get(id) !== c) return;

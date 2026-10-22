@@ -45,10 +45,11 @@ export function createStreams(host) {
 
   function drop(id) {
     const s = open.get(id);
-    if (!s) return;
+    if (!s) return false;
     open.delete(id);
     s.closed = true;
     host.forget(id);
+    return true;
   }
 
   function close(id) {
@@ -87,6 +88,7 @@ export function createStreams(host) {
     tag,
     drop,
     close,
+    open: (id) => open.has(id),
     end() {
       for (const id of [...open.keys()]) close(id);
     },
@@ -96,6 +98,7 @@ export function createStreams(host) {
           const s = open.get(id);
           if (!s) return -1;
           if (s.reading) host.trap(`stream.read: a read is already posted for stream ${id}`);
+          if (cap === 0) host.trap('stream.read: a read with no room');
           s.reading = true;
           fill(id, s, caller.memory, caller.u(buf), cap);
           return 0;
