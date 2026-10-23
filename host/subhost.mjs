@@ -1,9 +1,9 @@
 #!/usr/bin/env -S node --stack-size=4000
-// The host for Node: runs the program that `sub build` wrote to DIR, on V8. A granted module is loaded only
-// when the program imports it.
+// The host for Node: runs the program that `sub build` wrote to DIR, on V8. A granted module is loaded when a
+// wasm module importing it is instantiated, which code the program loads at run time may do too.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import { createHost, Exit, importedModules } from './subhost-core.mjs';
+import { createHost, Exit } from './subhost-core.mjs';
 import { known, loadModule, nameOf } from './node/modules.mjs';
 
 function usage() {
@@ -41,18 +41,15 @@ function read(file) {
 }
 const names = read(`${dir}/program`).toString().split('\n').filter((n) => n !== '');
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
-const needed = new Set();
-for (const b of bytes.values()) for (const name of importedModules(b)) needed.add(name);
-const modules = new Map();
-for (const [name, spec] of grants) {
-  if (!needed.has(name)) continue;
-  try {
-    modules.set(name, await loadModule(spec));
-  } catch (e) {
-    process.stderr.write(`subhost: ${e.message}\n`);
-    process.exit(64);
-  }
-}
+const loaded = new Map();
+const modules = {
+  has: (name) => grants.has(name),
+  get(name) {
+    if (!loaded.has(name)) loaded.set(name, loadModule(grants.get(name)));
+    return loaded.get(name);
+  },
+  keys: () => grants.keys(),
+};
 
 const host = createHost({
   args: programArgs,

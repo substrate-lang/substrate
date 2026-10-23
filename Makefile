@@ -15,7 +15,7 @@ seed:
 
 repl:
 	bin/sub site $(OUT)/web/repl lib/web/repl/repl.sub -p lib/web/repl/page.html \
-	  -f files compiler host lib/nodes.sub lib/scheme lib/bend
+	  -f files $(shell find compiler host lib/scheme lib/bend -name '*.sub' | sort) lib/nodes.sub
 
 clean:
 	rm -rf build

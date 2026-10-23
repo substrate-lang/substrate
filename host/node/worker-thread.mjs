@@ -6,7 +6,7 @@ import { loadModule, nameOf } from './modules.mjs';
 
 const side = workerSide((m, transfer) => parentPort.postMessage(m, transfer));
 
-parentPort.on('message', async (m) => {
+parentPort.on('message', (m) => {
   if (m.type === 'start') {
     const wasm = new Map(m.modules);
     const needed = imported(wasm);
@@ -14,7 +14,7 @@ parentPort.on('message', async (m) => {
     for (const spec of m.grants) {
       const name = nameOf(spec);
       if (!needed.has(name) || modules.has(name)) continue;
-      modules.set(name, name === 'stdin' ? absent(name, needed.get(name)) : await loadModule(spec));
+      modules.set(name, name === 'stdin' ? absent(name, needed.get(name)) : loadModule(spec));
     }
     const host = createHost({
       args: [m.argument],
@@ -37,7 +37,7 @@ parentPort.on('message', async (m) => {
     }
     const f = entry[m.entry];
     if (typeof f !== 'function') {
-      side.report(`worker.run: no function ${m.entry}`);
+      side.report(`worker.start: no function ${m.entry}`);
       side.ended(2, '');
       return;
     }

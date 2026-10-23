@@ -161,9 +161,6 @@ function importMap(bytes) {
   return map;
 }
 
-// The names of the modules a wasm module imports from, read from its import section.
-export const importedModules = (bytes) => new Set(imports(bytes).keys());
-
 // What a wasm module imports: each module's name, with the names of the functions imported from it.
 export function imports(bytes) {
   let at = 8;
@@ -488,7 +485,14 @@ export function createHost(platform) {
         } else {
           if (!made.has(from)) {
             const info = {};
-            const { source, end: close, ...given } = platform.modules.get(from)(callerOf(self, from, info));
+            let factory;
+            try {
+              factory = platform.modules.get(from);
+            } catch (e) {
+              lastError = `instantiate ${name}: ${from}: ${e.message}`;
+              return false;
+            }
+            const { source, end: close, ...given } = factory(callerOf(self, from, info));
             info.source = source;
             const functions = {};
             for (const [name, f] of Object.entries(given)) functions[name] = guarded(from, name, f);

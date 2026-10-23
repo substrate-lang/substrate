@@ -9,7 +9,8 @@
 
 (struct wasm [name datum] [p (ptr u8)] [size u32] [sections datum] [imports datum] [spans datum] [funcs datum]
         [nimports u32] [exports datum] [by-name (ptr hash-table)] [start i32] [count u32] [starts (ptr u32)]
-        [ends (ptr u32)] [live (ptr u8)] [kept (ptr hash-table)] [indexes (ptr u32)])
+        [ends (ptr u32)] [sites buffer] [site-starts (ptr u32)] [site-ends (ptr u32)] [live (ptr u8)]
+        [kept (ptr hash-table)] [indexes (ptr u32)])
 
 ;; ---- reading ----
 
@@ -57,7 +58,10 @@
             [(== id 10) (read-bodies! w)])
       (set! ss (cdr ss)))
     (set! (-> w live) (cast (ptr u8) (arena-alloc (current-arena) (+ (-> w nimports) (-> w count) 1))))
-    (memset (-> w live) 0 (+ (-> w nimports) (-> w count) 1))))
+    (memset (-> w live) 0 (+ (-> w nimports) (-> w count) 1))
+    (set! (-> w sites) (make-buffer))
+    (set! (-> w site-starts) (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ (-> w count) 1)))))
+    (set! (-> w site-ends) (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ (-> w count) 1)))))))
 
 ;; Each import's span is its kind and its bytes' start and end.
 (define (read-imports! [w (ptr wasm)])
@@ -106,9 +110,11 @@
 
 ;; ---- what a body calls ----
 
-(define (calls-in [p (ptr u8)] [start u32] [end u32]) -> datum
-  (let ([out nil] [b u32 0] [d datum 0] [ks datum 0])
-    (read-from! p start end)
+;; What body k calls, each function index's place noted in sites: its offset, its length and the index.
+(define (calls-in [w (ptr wasm)] [k u32]) -> datum
+  (let ([out nil] [b u32 0] [d datum 0] [ks datum 0] [end (@ (-> w ends) k)] [here u32 0] [site (array u32 3)])
+    (read-from! (-> w p) (@ (-> w starts) k) end)
+    (set! (@ (-> w site-starts) k) (-> w sites length))
     (for ([i u32 (uleb)]) (> i 0) (-= i 1)
       (uleb)
       (byte))
@@ -120,10 +126,17 @@
         (set! ks (cdr d))
         (while (pair? ks)
           (if (== (car ks) 'func)
-              (set! out (cons (make-integer (uleb)) out))
+              (begin
+                (set! here (position))
+                (set! (@ site 2) (uleb))
+                (set! (@ site 0) here)
+                (set! (@ site 1) (- (position) here))
+                (buffer-add! (& (-> w sites)) (cast (ptr u8) site) 12)
+                (set! out (cons (make-integer (@ site 2)) out)))
               (skip-immediate (car ks)))
           (set! ks (cdr ks)))))
     (unless (== (position) end) (unreadable))
+    (set! (@ (-> w site-ends) k) (-> w sites length))
     out))
 
 (define (skip-immediate [k datum])
@@ -178,8 +191,7 @@
               (let ([j (exported owner (cdr f))]) (when (>= j 0) (mark! owner (cast u32 j))))))
           (let ([k (- i (-> w nimports))])
             (unless (== w entry)
-              (for-each (lambda ([t datum]) (mark! w (cast u32 (integer-value t))))
-                        (calls-in (-> w p) (@ (-> w starts) k) (@ (-> w ends) k))))))))
+              (for-each (lambda ([t datum]) (mark! w (cast u32 (integer-value t)))) (calls-in w k)))))))
   0)
 
 (define (pruned [modules datum]) -> datum
@@ -198,11 +210,14 @@
           (set! is (cdr is)))
         (set! l (cdr l))))
     (for ([i u32 0]) (< i (+ (-> entry nimports) (-> entry count))) (+= i 1) (mark! entry i))
-    (when (reach! ws entry) (return modules))
-    (map (lambda ([x datum]) -> datum
-           (let ([w (cast (ptr wasm) x)])
-             (cons (-> w name) (if (== w entry) (without w '("substrate")) (rewritten w)))))
-         ws)))
+    (let ([out modules])
+      (unless (reach! ws entry)
+        (set! out (map (lambda ([x datum]) -> datum
+                         (let ([w (cast (ptr wasm) x)])
+                           (cons (-> w name) (if (== w entry) (without w '("substrate")) (rewritten w)))))
+                       ws)))
+      (for-each (lambda ([x datum]) (buffer-free! (& (-> (cast (ptr wasm) x) sites)))) ws)
+      out)))
 
 ;; ---- the new indices ----
 
@@ -355,31 +370,16 @@
           (set! kept (cdr kept)))))
     (section-out out 9 (& q))))
 
-;; A body copied, with each function index written anew in as many bytes as before.
-(define (body! [q (ptr buffer)] [w (ptr wasm)] [start u32] [end u32])
-  (let ([from start] [b u32 0] [d datum 0] [ks datum 0] [here u32 0] [old u32 0])
-    (read-from! (-> w p) start end)
-    (for ([i u32 (uleb)]) (> i 0) (-= i 1)
-      (uleb)
-      (byte))
-    (while (< (position) end)
-      (set! b (byte))
-      (unless (or (== b #x05) (== b #x0B))
-        (set! d (decoding-of b (if (or (== b #xFC) (== b #x1C)) (uleb) 0)))
-        (when (== d 0) (unreadable))
-        (set! ks (cdr d))
-        (while (pair? ks)
-          (if (== (car ks) 'func)
-              (begin
-                (set! here (position))
-                (set! old (uleb))
-                (buffer-add! q (+ (-> w p) from) (- here from))
-                (write-uleb-padded q (renumbered w old) (- (position) here))
-                (set! from (position)))
-              (skip-immediate (car ks)))
-          (set! ks (cdr ks)))))
-    (unless (== (position) end) (unreadable))
-    (buffer-add! q (+ (-> w p) from) (- end from))))
+;; Body k copied, with each function index written anew in as many bytes as before.
+(define (body! [q (ptr buffer)] [w (ptr wasm)] [k u32])
+  (let ([from (@ (-> w starts) k)] [at (@ (-> w site-starts) k)] [site (ptr u32) 0])
+    (while (< at (@ (-> w site-ends) k))
+      (set! site (cast (ptr u32) (+ (-> w sites bytes) at)))
+      (buffer-add! q (+ (-> w p) from) (- (@ site 0) from))
+      (write-uleb-padded q (renumbered w (@ site 2)) (@ site 1))
+      (set! from (+ (@ site 0) (@ site 1)))
+      (+= at 12))
+    (buffer-add! q (+ (-> w p) from) (- (@ (-> w ends) k) from))))
 
 (define (code! [out (ptr buffer)] [w (ptr wasm)] [news (ptr u32)])
   (let ([q (make-buffer)] [n (-> w count)] [size u32 0] [base u32 0] [kept u32 0] [before u32 0])
@@ -391,7 +391,7 @@
         (write-uleb (& q) size)
         (set! (@ news k) (-> q length))
         (set! before (-> q length))
-        (body! (& q) w (@ (-> w starts) k) (@ (-> w ends) k))
+        (body! (& q) w k)
         (unless (== (- (-> q length) before) size) (unreadable))))
     (set! base (+ (-> out length) 1 (uleb-length (-> q length))))
     (for ([k u32 0]) (< k n) (+= k 1) (+= (@ news k) base))
