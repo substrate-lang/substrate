@@ -339,24 +339,20 @@ export function dom(root) {
   const module = (theCaller, theApp) => {
     caller = theCaller;
     app = theApp;
-    const copied = (s, buf, cap) => {
-      const bytes = utf8.encode(s);
-      caller.memory().set(bytes.subarray(0, cap), caller.u(buf));
-      return bytes.length;
-    };
+    const held = (s) => caller.hold(utf8.encode(s));
     return {
       source: SOURCE,
       apply(ptr, length) {
         apply(caller.memory(), caller.u(ptr), length);
       },
-      event_value(buf, cap) {
+      event_value() {
         const e = event();
         const target = e && e.target;
-        return copied(target && typeof target.value === 'string' ? target.value : '', buf, cap);
+        return held(target && typeof target.value === 'string' ? target.value : '');
       },
-      event_key(buf, cap) {
+      event_key() {
         const e = event();
-        return copied(e && typeof e.key === 'string' ? e.key : '', buf, cap);
+        return held(e && typeof e.key === 'string' ? e.key : '');
       },
       event_flags() {
         const e = event();

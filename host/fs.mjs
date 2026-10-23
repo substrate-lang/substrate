@@ -1,7 +1,7 @@
 // The host module "fs": files by path. node/fs.mjs and web/fs.mjs each give their files.
-// read_file(path, buf, cap): the size, and up to cap bytes; -1 if missing. write_file, make_dir, remove, rename:
-// 0, or -1. stat: the size, -1 if missing, -2 for a directory. list: the names, each ended by a zero. open gives a
-// stream; its modes: read 0, write 1, append 2.
+// read_file(path): the size, the bytes held for host.take; -1 if missing. write_file, make_dir, remove, rename:
+// 0, or -1. stat: the size, -1 if missing, -2 for a directory. list: the names, each ended by a zero, held. open
+// gives a stream; its modes: read 0, write 1, append 2.
 import { joined } from './entries.mjs';
 
 const utf8 = new TextEncoder();
@@ -16,7 +16,9 @@ export function fsModule(files) {
         return -1;
       }
     };
+    // With buf given, the seed's older shape: the bytes are copied at once.
     const give = (bytes, buf, cap) => {
+      if (buf === undefined) return caller.hold(bytes);
       caller.memory().set(bytes.subarray(0, cap), caller.u(buf));
       return bytes.length;
     };

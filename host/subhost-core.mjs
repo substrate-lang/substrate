@@ -1,5 +1,6 @@
 // The JavaScript host, shared by Node (subhost.mjs) and the browser (web/subhost-web.mjs).
 import { createStreams, STREAM } from './streams.mjs';
+import { joined } from './entries.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
@@ -230,6 +231,7 @@ export function createHost(platform) {
   const registry = new Map();
   const modules = new Map();
   let lastError = '';
+  let held = new Uint8Array(0);
   // The running program: its modules' names in load order, and how to get one's bytes.
   let programNames = [];
   let programBytes = null;
@@ -256,7 +258,7 @@ export function createHost(platform) {
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
 
-  const COMPILE_TIME_HOST = new Set(['write', 'trap', 'error_message']);
+  const COMPILE_TIME_HOST = new Set(['write', 'trap', 'error_message', 'take']);
   const refused = (what) => () => hostTrap(`${what} is not available while compiling`);
 
   function hostTrap(message) {
@@ -371,6 +373,10 @@ export function createHost(platform) {
       error(message) {
         lastError = message;
       },
+      hold(bytes) {
+        held = bytes;
+        return bytes.length;
+      },
       event(kind, id, tag, value, bytes, data) {
         event(made.source, kind, id, tag, value, bytes, data);
       },
@@ -397,8 +403,14 @@ export function createHost(platform) {
   }
 
   function hostImports(self) {
-    const { memory, string, u } = callerOf(self, 'host');
+    const { memory, string, u, hold } = callerOf(self, 'host');
+    // A call that gives bytes returns their length and holds them for take, which copies up to cap. With bp
+    // given, the seed's older shape: the bytes are copied at once, and the module names end with newlines.
     return {
+      take(bp, cap) {
+        memory().set(held.subarray(0, cap), u(bp));
+        return held.length;
+      },
       write(fd, ptr, len) {
         platform.write(fd === 2 ? 2 : 1, memory().subarray(u(ptr), u(ptr) + len));
         return len;
@@ -422,6 +434,7 @@ export function createHost(platform) {
       },
       error_message(bp, cap) {
         const b = utf8.encode(lastError);
+        if (bp === undefined) return hold(b);
         memory().set(b.subarray(0, cap), u(bp));
         return b.length;
       },
@@ -429,6 +442,7 @@ export function createHost(platform) {
         if (i < 0 || i >= platform.args.length) return -1;
         const a = platform.args[i];
         const b = typeof a === 'string' ? utf8.encode(a) : a;
+        if (bp === undefined) return hold(b);
         memory().set(b.subarray(0, cap), u(bp));
         return b.length;
       },
@@ -436,6 +450,7 @@ export function createHost(platform) {
         platform.exit(code);
       },
       program_modules(bp, cap) {
+        if (bp === undefined) return hold(utf8.encode(joined(programNames)));
         const b = utf8.encode(programNames.map((n) => `${n}\n`).join(''));
         memory().set(b.subarray(0, cap), u(bp));
         return b.length;
@@ -447,6 +462,7 @@ export function createHost(platform) {
           return -1;
         }
         const b = programBytes(name);
+        if (bp === undefined) return hold(b);
         memory().set(b.subarray(0, cap), u(bp));
         return b.length;
       },
