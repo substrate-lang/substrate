@@ -82,6 +82,6 @@ if (!entry) {
   process.stderr.write(`error: ${host.lastError}\n`);
   process.exit(2);
 }
-if (typeof entry.main === 'function' && !host.call(entry.main, []) && typeof entry['on-event'] !== 'function') {
+if (typeof entry.main === 'function' && !host.call(entry.main, []) && !host.onEvent) {
   process.exit(2);
 }

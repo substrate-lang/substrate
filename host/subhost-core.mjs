@@ -177,6 +177,8 @@ export function createHost(platform) {
   let programNames = [];
   let programBytes = null;
   let entry = null;
+  let onEvent = null;
+  let onTrap = null;
   let ended = false;
   let running = false;
   let active = false;
@@ -502,8 +504,19 @@ export function createHost(platform) {
       running = false;
     }
     entry = names.length > 0 ? registry.get(names[names.length - 1]) : {};
+    onEvent = latest(names, 'on-event');
+    onTrap = latest(names, 'on-trap');
     if (typeof entry.main !== 'function') drain();
     return entry;
+  }
+
+  // The function of that name from the last of the modules that exports one.
+  function latest(names, name) {
+    for (let i = names.length - 1; i >= 0; i--) {
+      const f = registry.get(names[i])[name];
+      if (typeof f === 'function') return f;
+    }
+    return null;
   }
 
   // The program is over: code is its exit code, or -1 with the reason when it trapped.
@@ -545,8 +558,7 @@ export function createHost(platform) {
       }
       if (!trapped(e)) throw e;
       // on-trap gives 1 when the program recovered; with 0, or none, the error is reported and the program ends.
-      const onTrap = entry && entry['on-trap'];
-      if (typeof onTrap === 'function') {
+      if (onTrap) {
         try {
           if (onTrap() !== 0) return false;
         } catch (e2) {
@@ -582,9 +594,8 @@ export function createHost(platform) {
     try {
       while (queue.length > 0 && !ended) {
         const e = queue.shift();
-        const onEvent = entry && entry['on-event'];
         let ok;
-        if (typeof onEvent === 'function') {
+        if (onEvent) {
           current = e;
           try {
             ok = call(onEvent, [e.source, e.kind, e.id, e.tag, e.value]);
@@ -614,6 +625,9 @@ export function createHost(platform) {
     },
     get deliveries() {
       return deliveries;
+    },
+    get onEvent() {
+      return onEvent;
     },
     get lastError() {
       return lastError;
