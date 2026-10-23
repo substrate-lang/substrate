@@ -3,16 +3,17 @@
 ;; request at a time on a connection: the next is read once the answer is complete, and one arriving before that
 ;; closes the connection after the answer. A request's on-body gets each piece of its body and on-end its end,
 ;; with failed set when the body was malformed, which also closes the connection after the answer. Set before
-;; serving: whether to use TLS, how many milliseconds a connection may wait for bytes, and how many connections
-;; there may be, the last two unlimited when 0.
+;; serving: whether to use TLS, how many milliseconds a connection may wait for bytes or for a whole head, and how
+;; many connections there may be, the last two unlimited when 0.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
 (require-unqualified timer "../../host/modules/timer.sub")
 (require-unqualified http "http.sub")
 
-(provide http-server http-request http-serve! http-server-close! http-request-header
-         http-respond! http-header! http-length! http-send! http-send-text! http-send-stream! http-finish! http-take!)
+(provide http-server http-request http-serve! http-server-close! http-server-release! http-request-header
+         http-request-server http-respond! http-header! http-length! http-send! http-send-text! http-send-stream!
+         http-finish! http-take!)
 
 (struct http-request [connection (ptr void)] [method (ptr u8)] [target (ptr u8)] [head (ptr http-head)]
   [user (ptr void)] [ended i32] [failed i32] [answered i32]
@@ -35,11 +36,14 @@
 
 (define (server-of [c (ptr http-connection)]) -> (ptr http-server) (cast (ptr http-server) (-> c server)))
 
+(define (arm! [c (ptr http-connection)])
+  (when (> (-> (server-of c) idle) 0.0)
+    (set! (-> c timer) (timer-after (-> (server-of c) idle) (cast (ptr void) c)))))
+
 (define (read-more! [c (ptr http-connection)])
   (unless (-> c reading)
     (set! (-> c reading) 1)
-    (when (> (-> (server-of c) idle) 0.0)
-      (set! (-> c timer) (timer-after (-> (server-of c) idle) (cast (ptr void) c))))
+    (when (== (-> c timer) 0) (arm! c))
     (stream-read! (-> c stream) (-> c buf) 16384)))
 
 (define (disarm! [c (ptr http-connection)])
@@ -52,7 +56,6 @@
 
 (define (unlink! [c (ptr http-connection)])
   (let ([s (server-of c)])
-    (-= (-> s count) 1)
     (disarm! c)
     (if (== (-> s connections) c)
         (set! (-> s connections) (-> c next))
@@ -65,6 +68,7 @@
     (set! (-> c piping) 0)
     (stream-close (-> c pipe from)))
   (stream-close (-> c stream))
+  (-= (-> (server-of c) count) 1)
   (unlink! c)
   (buffer-free! (& (-> c out)))
   (buffer-free! (& (-> c parser head line)))
@@ -140,14 +144,15 @@
 
 (define (connection-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (let ([c (cast (ptr http-connection) tag)])
-    (when (and (== source stream-source) (== kind stream-read))
-      (set! (-> c reading) 0)
-      (disarm! c))
+    (when (and (== source stream-source) (== kind stream-read)) (set! (-> c reading) 0))
     (cond [(== source timer-source) (when (== id (-> c timer)) (drop! c))]
           [(and (== kind stream-read) (> value 0))
            (set! (-> c feeding) 1)
            (let ([used (http-feed! (& (-> c parser)) (-> c buf) (cast u32 value))])
              (set! (-> c feeding) 0)
+             (unless (and (not (-> c busy)) (> (-> c parser head line length) 0))
+               (disarm! c)
+               (when (-> c reading) (arm! c)))
              (cond [(< used 0) (bad-request! c)]
                    [(!= (-> c take) 0) (hand-over! c (+ (-> c buf) used) (- (cast u32 value) used))]
                    [else (may-read! c)]))]
@@ -176,6 +181,8 @@
 ;; ---- answering ----
 
 (define (http-request-header [r (ptr http-request)] [name (ptr u8)]) -> (ptr u8) (http-header (-> r head) name))
+
+(define (http-request-server [r (ptr http-request)]) -> (ptr http-server) (server-of (connection-of r)))
 
 (define (http-respond! [r (ptr http-request)] [status i32])
   (let ([c (connection-of r)])
@@ -227,7 +234,8 @@
     (stream-pipe-start! (& (-> c pipe)) from (-> c stream) n 0 piped)))
 
 ;; The head alone is sent, and the connection's stream is the taker's, untagged, with the bytes read beyond the
-;; request: once the handler returns, or at once when called later.
+;; request: once the handler returns, or at once when called later. It counts among the server's connections until
+;; the taker calls http-server-release!.
 (define (http-take! [r (ptr http-request)] [take taker] [tag (ptr void)])
   (let ([c (connection-of r)])
     (send-head! c)
@@ -262,3 +270,5 @@
 (define (http-server-close! [s (ptr http-server)])
   (net-close (-> s listener))
   (while (!= (-> s connections) 0) (drop! (-> s connections))))
+
+(define (http-server-release! [s (ptr http-server)]) (-= (-> s count) 1))
