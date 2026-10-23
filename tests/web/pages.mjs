@@ -147,6 +147,9 @@ const checks = {
     check('repl: Clear empties the page', await shown(), '');
     await say('(fib 11)');
     check('repl: Clear keeps the session', await shown(), '(fib 11) => 89');
+    await say('(begin-for-syntax (require-unqualified macros "compiler/macros.sub"))');
+    check('repl: code run while compiling can require the compiler\'s macros', await last(),
+      '(begin-for-syntax (require-unqualified macros "compiler/macros.sub")) => ');
 
     await page.click('nav button:nth-of-type(3)');
     await idle();
