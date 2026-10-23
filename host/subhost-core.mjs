@@ -376,6 +376,7 @@ export function createHost(platform) {
       current: () => current,
       grants: () => platform.grants || new Map(platform.modules ? [...platform.modules.keys()].map((n) => [n, n]) : []),
       module: (name) => (platform.modules ? platform.modules.get(name) : undefined),
+      program: () => ({ names: programNames, bytes: programBytes }),
       streams: { add: streams.add, tag: streams.tag, drop: streams.drop, close: streams.close, open: streams.open },
     };
   }
@@ -422,7 +423,8 @@ export function createHost(platform) {
       },
       arg(i, bp, cap) {
         if (i < 0 || i >= platform.args.length) return -1;
-        const b = utf8.encode(platform.args[i]);
+        const a = platform.args[i];
+        const b = typeof a === 'string' ? utf8.encode(a) : a;
         memory().set(b.subarray(0, cap), u(bp));
         return b.length;
       },

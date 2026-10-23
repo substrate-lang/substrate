@@ -22,7 +22,7 @@ const [dir, ...programArgs] = argv;
 if (!dir) usage();
 
 const grants = new Map();
-if (specs.length === 0) for (const name of ['clock', 'random', 'timer', 'guest', 'stdin', 'env', 'fs']) grants.set(name, name);
+if (specs.length === 0) for (const name of ['clock', 'random', 'timer', 'worker', 'stdin', 'env', 'fs']) grants.set(name, name);
 for (const spec of specs) {
   if (!known(spec)) {
     process.stderr.write(`subhost: no module ${spec}\n`);

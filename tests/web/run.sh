@@ -36,7 +36,7 @@ bin/sub site "$sites/stopped-at-start" tests/web/stopped-at-start.sub
 bin/sub site "$sites/gpu" tests/web/gpu.sub -p tests/web/gpu.html
 bin/sub site "$sites/sprites" tests/web/sprites.sub -p tests/web/sprites.html
 bin/sub site "$sites/sprites-canvas" tests/web/sprites-canvas.sub -p tests/web/sprites.html
-bin/sub site "$sites/guests" tests/web/guests.sub -p tests/web/guests.html -g guest tests/web/a-guest.sub
+bin/sub site "$sites/workers" tests/web/workers.sub -p tests/web/workers.html -g worker tests/web/a-worker.sub
 node tests/web/pages.mjs "$sites" counter rows focus floor storage location clipboard files fields assets canvas snake platformer \
-  sounds stopped stopped-at-start guests repl gpu sprites sprites-canvas blocks valley || status=1
+  sounds stopped stopped-at-start workers repl gpu sprites sprites-canvas blocks valley || status=1
 exit $status

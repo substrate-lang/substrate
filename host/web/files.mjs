@@ -1,9 +1,8 @@
 // The host module "files": the user's files, picked, each a stream; and bytes saved as a file.
 // Kinds: file 1, value the stream, bytes the name; picked 2, value how many; failed 3, value the error code.
-// pick's options are lines: multiple; accept TYPES.
+// pick takes whether several may be picked, and the types accepted, "" for any.
 import { errors } from '../errors.mjs';
 import { readerSource } from '../streams.mjs';
-import { settings } from '../settings.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -11,17 +10,6 @@ const SOURCE = 14;
 const FILE = 1;
 const PICKED = 2;
 const FAILED = 3;
-
-function parseOptions(text) {
-  const options = { multiple: false, accept: '' };
-  settings(text, 'files.pick', (word, value) => {
-    if (word === 'multiple') options.multiple = true;
-    else if (word === 'accept') options.accept = value;
-    else return false;
-    return true;
-  });
-  return options;
-}
 
 export function files() {
   return (caller) => {
@@ -32,19 +20,12 @@ export function files() {
       end() {
         ended = true;
       },
-      pick(ptr, len, tag) {
-        let options;
-        try {
-          options = parseOptions(caller.string(ptr, len));
-        } catch (e) {
-          caller.error(e.message);
-          return 0;
-        }
+      pick(multiple, ap, al, tag) {
         const id = next++;
         const input = document.createElement('input');
         input.type = 'file';
-        input.multiple = options.multiple;
-        input.accept = options.accept;
+        input.multiple = multiple !== 0;
+        input.accept = caller.string(ap, al);
         input.style.display = 'none';
         input.onchange = () => {
           input.remove();

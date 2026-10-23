@@ -16,7 +16,7 @@ const loaders = {
   timer: () => import('../modules/timer.mjs').then((m) => m.timer()),
   fetch: () => import('../modules/fetch.mjs').then((m) => m.fetchModule()),
   websocket: () => import('../modules/websocket.mjs').then((m) => m.websocket()),
-  guest: () => import('./guest.mjs').then((m) => m.guests({ cwd: process.cwd() })),
+  worker: () => import('./worker.mjs').then((m) => m.workers({ cwd: process.cwd() })),
   net: () => import('./net.mjs').then((m) => m.netModule()),
   process: () => import('./process.mjs').then((m) => m.processes()),
   stdin: () => import('./stdin.mjs').then((m) => m.stdin()),

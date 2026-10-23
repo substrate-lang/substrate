@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds a web site into OUT: the program, the host, the page, and packs for guests and files.
+# Builds a web site into OUT: the program, the host, the page, and packs of programs and files.
 # sub site OUT FILE [-p PAGE] [-g NAME FILE] [-f NAME PATH ...]
-# FILE: a program's source, or a directory `sub build` wrote. -g builds FILE as NAME.pack, for a guest.
+# FILE: a program's source, or a directory `sub build` wrote. -g builds FILE as NAME.pack, for a worker.
 # -f packs the PATHs, from the repository's root, as NAME.pack.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -14,7 +14,7 @@ out="$1"
 file="$2"
 shift 2
 page="$root/host/web/page.html"
-if [ -e "$out" ] && { [ ! -d "$out" ] || { [ -n "$(ls -A "$out")" ] && [ ! -f "$out/program/program" ]; }; }; then
+if [ -e "$out" ] && { [ ! -d "$out" ] || { [ -n "$(ls -A "$out")" ] && [ ! -d "$out/host/web" ]; }; }; then
   echo "site: $out is not a site, so it is not replaced" >&2
   exit 1
 fi

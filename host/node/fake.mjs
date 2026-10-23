@@ -3,7 +3,6 @@
 // such work is left, as the earliest timer fires.
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseRequest } from '../modules/fetch.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -71,18 +70,12 @@ export function fakeTimer() {
 export function fakeFetch(root) {
   return (caller) => ({
     source: 6,
-    start(ptr, len, tag) {
-      let request;
-      try {
-        request = parseRequest(caller.memory().slice(caller.u(ptr), caller.u(ptr) + len));
-      } catch (e) {
-        caller.error(e.message);
-        return 0;
-      }
+    start(mp, ml, up, ul, hp, hl, bp, bl, tag) {
+      const url = caller.string(up, ul);
       let status = 200;
       let body;
       try {
-        body = fs.readFileSync(path.join(root, new URL(request.url, 'http://fake/').pathname));
+        body = fs.readFileSync(path.join(root, new URL(url, 'http://fake/').pathname));
       } catch (e) {
         status = 404;
         body = utf8.encode('not found');
@@ -96,7 +89,7 @@ export function fakeFetch(root) {
         close() {},
       });
       soon(() => {
-        if (caller.streams.open(id)) caller.event(1, id, tag, status, utf8.encode(`content-length: ${body.length}\n`));
+        if (caller.streams.open(id)) caller.event(1, id, tag, status, utf8.encode(`content-length\0${body.length}\0`));
       });
       return id;
     },

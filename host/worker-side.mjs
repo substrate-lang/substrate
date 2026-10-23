@@ -1,11 +1,11 @@
-// A guest's side of the guest module, shared by the browser's worker and Node's thread: its output in
+// A worker's own side of the worker module, shared by the browser's worker and Node's thread: its output in
 // batches, the parent's messages as events, when it is busy, and what it reports back.
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
 const MESSAGE = 1;
 
-// Output goes at most every 30 ms, and when the guest becomes idle.
+// Output goes at most every 30 ms, and when the worker becomes idle.
 function batcher(post) {
   const pieces = [];
   let pendingBytes = 0;
@@ -55,20 +55,31 @@ function batcher(post) {
 }
 
 // post(message, transfer) sends to the parent.
-export function guestSide(post) {
+export function workerSide(post) {
   const out = batcher(post);
   let host = null;
   let ended = false;
   const waiting = [];
 
-  const guest = (caller) => ({
+  const refused = (caller) => {
+    caller.error('worker.new: a worker cannot start workers');
+    return -1;
+  };
+
+  const worker = (caller) => ({
     source: SOURCE,
-    start() {
-      caller.error('guest.start: a guest cannot start guests of its own');
+    new() {
+      refused(caller);
       return 0;
     },
-    send(g, ptr, length) {
-      if (g !== 0) return -1;
+    grant: () => refused(caller),
+    read: () => refused(caller),
+    write: () => refused(caller),
+    limit() {},
+    module: () => refused(caller),
+    run: () => refused(caller),
+    send(w, ptr, length) {
+      if (w !== 0) return -1;
       out.flush();
       const bytes = caller.memory().slice(caller.u(ptr), caller.u(ptr) + length);
       post({ type: 'message', bytes }, [bytes.buffer]);
@@ -83,7 +94,7 @@ export function guestSide(post) {
   }
 
   return {
-    guest,
+    worker,
     write: out.output,
     report(message) {
       out.output(2, utf8.encode(`error: ${message}\n`));

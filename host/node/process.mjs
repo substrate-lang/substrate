@@ -1,12 +1,12 @@
 // The host module "process": child programs, their three pipes being streams.
 // Kinds: exit 1, value the exit code, or 128 plus the signal; failed 2, value the error code.
-// A spec is lines: program PATH; arg TEXT; dir PATH; env NAME=VALUE; and stdin, stdout or stderr followed by
-// ignore or inherit, for a pipe the program will not read or write.
+// spawn takes the program, its arguments and environment as entries each ended by a zero, NAME=VALUE for the
+// environment, a directory, "" for the parent's, and a mode for each pipe: 0 a stream, 1 ignored, 2 the parent's.
 import child from 'node:child_process';
 import os from 'node:os';
 import { errorOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
-import { settings } from '../settings.mjs';
+import { entries } from '../entries.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -15,23 +15,6 @@ const EXIT = 1;
 const FAILED = 2;
 
 const pipes = ['stdin', 'stdout', 'stderr'];
-
-function parseSpec(text) {
-  const spec = { program: null, args: [], dir: null, env: {}, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' };
-  settings(text, 'process.spawn', (word, value) => {
-    if (word === 'program') spec.program = value;
-    else if (word === 'arg') spec.args.push(value);
-    else if (word === 'dir') spec.dir = value;
-    else if (word === 'env') {
-      const equals = value.indexOf('=');
-      spec.env[equals < 0 ? value : value.slice(0, equals)] = equals < 0 ? '' : value.slice(equals + 1);
-    } else if (pipes.includes(word) && (value === 'ignore' || value === 'inherit')) spec[word] = value;
-    else return false;
-    return true;
-  });
-  if (spec.program === null) throw new Error('process.spawn: the spec has no "program" line');
-  return spec;
-}
 
 export function processes() {
   const children = new Map();
@@ -43,15 +26,19 @@ export function processes() {
         for (const c of children.values()) c.process.kill();
         children.clear();
       },
-      spawn(ptr, len, tag) {
-        let spec;
+      spawn(pp, pl, ap, al, dp, dl, ep, el, stdin, stdout, stderr, tag) {
+        const modes = [stdin, stdout, stderr].map((mode) => ['pipe', 'ignore', 'inherit'][mode] || 'pipe');
         let process;
         try {
-          spec = parseSpec(caller.string(ptr, len));
-          process = child.spawn(spec.program, spec.args, {
-            cwd: spec.dir || undefined,
-            env: { ...globalThis.process.env, ...spec.env },
-            stdio: pipes.map((pipe) => spec[pipe]),
+          const env = {};
+          for (const e of entries(caller.string(ep, el))) {
+            const equals = e.indexOf('=');
+            env[equals < 0 ? e : e.slice(0, equals)] = equals < 0 ? '' : e.slice(equals + 1);
+          }
+          process = child.spawn(caller.string(pp, pl), entries(caller.string(ap, al)), {
+            cwd: caller.string(dp, dl) || undefined,
+            env: { ...globalThis.process.env, ...env },
+            stdio: modes,
           });
         } catch (e) {
           caller.error(e.message);
@@ -59,7 +46,9 @@ export function processes() {
         }
         const id = next++;
         const c = { process };
-        for (const pipe of pipes) c[pipe] = spec[pipe] === 'pipe' ? caller.streams.add(tag, nodeSource(process[pipe])) : 0;
+        pipes.forEach((pipe, i) => {
+          c[pipe] = modes[i] === 'pipe' ? caller.streams.add(tag, nodeSource(process[pipe])) : 0;
+        });
         children.set(id, c);
         process.on('error', (e) => {
           if (children.get(id) !== c) return;

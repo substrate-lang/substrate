@@ -104,6 +104,6 @@ export function run(options, names, wasm) {
     report(host.lastError);
     ended('exit 2');
   }
-  app.started = app.call('main');
+  app.started = app.call(options.entry || 'main');
   return app;
 }

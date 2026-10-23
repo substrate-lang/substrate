@@ -1,0 +1,169 @@
+;; A page that starts workers running a-worker.sub, packed under /worker, and logs every event from them.
+(require-unqualified web "../../lib/web/web.sub")
+(require-unqualified worker "../../host/worker.sub")
+(require-unqualified fs "../../host/fs.sub")
+
+(struct model [log buffer] [first u32] [second u32] [third u32] [step u32] [ticks u32])
+
+(variant message
+  [worker-event [w u32] [kind u32]]
+  [tick] [stop])
+(messages message)
+
+(define (log! [m (ptr model)] [s (ptr u8)])
+  (buffer-add-string! (& (-> m log)) s)
+  (buffer-add-byte! (& (-> m log)) 0)
+  (-= (-> m log length) 1))
+
+(define (log-number! [m (ptr model)] [n i32])
+  (when (< n 0) (log! m "-") (set! n (- 0 n)))
+  (when (>= n 10) (log-number! m (/ n 10)))
+  (let ([digit (array u8 2)])
+    (set! (@ digit 0) (cast u8 (+ #\0 (% n 10))))
+    (set! (@ digit 1) 0)
+    (log! m digit)))
+
+(define (command [step u32]) -> (ptr u8)
+  (case step
+    [(0) "add 5"]
+    [(1) "add 37"]
+    [(2) "say hello"]
+    [(3) "warn careful"]
+    [(4) "read /data/note.txt"]
+    [(5) "read /secret/key.txt"]
+    [(6) "write /out/made.txt"]
+    [(7) "read /out/made.txt"]
+    [(8) "write /data/note.txt"]
+    [(9) "trap"]
+    [(10) "add 1"]
+    [(11) "worker"]
+    [(12) "grow 32"]
+    [(13) "add 1"]
+    [(14) "exit 3"]
+    [else 0]))
+
+(define (send-next! [m (ptr model)])
+  (let ([c (command (-> m step))])
+    (when (!= c 0)
+      (+= (-> m step) 1)
+      (worker-send-text (-> m first) c))))
+
+;; A worker planned with the modules of the program packed under DIR; 0 when there is none.
+(define (plan! [m (ptr model)] [dir (ptr u8)]) -> u32
+  (let* ([n u32 0] [path (make-buffer)] [list (ptr u8) 0])
+    (buffer-add-string! (& path) dir)
+    (buffer-add-string! (& path) "/program")
+    (buffer-add-byte! (& path) 0)
+    (set! list (fs-read-file (-> path bytes) (& n)))
+    (buffer-free! (& path))
+    (when (== list 0)
+      (log! m "no program in ")
+      (log! m dir)
+      (log! m "\n")
+      (return 0))
+    (let ([w (worker-new 0)] [at u32 0])
+      (while (< at n)
+        (let ([end at])
+          (while (and (< end n) (!= (@ list end) 10)) (+= end 1))
+          (when (> end at)
+            (let ([name (make-buffer)] [file (make-buffer)] [size u32 0])
+              (buffer-add! (& name) (+ list at) (- end at))
+              (buffer-add-byte! (& name) 0)
+              (buffer-add-string! (& file) dir)
+              (buffer-add-byte! (& file) 47)
+              (buffer-add! (& file) (+ list at) (- end at))
+              (buffer-add-string! (& file) ".wasm")
+              (buffer-add-byte! (& file) 0)
+              (let ([bytes (fs-read-file (-> file bytes) (& size))])
+                (when (!= bytes 0)
+                  (worker-module! w (-> name bytes) bytes size)
+                  (free bytes)))
+              (buffer-free! (& name))
+              (buffer-free! (& file))))
+          (set! at (+ end 1))))
+      (free list)
+      w)))
+
+(define (run! [m (ptr model)] [w u32] [argument (ptr u8)]) -> u32
+  (if (< (worker-run! w "main" argument (strlen argument)) 0)
+      (let ([why (worker-error)])
+        (log! m "no worker: ")
+        (log! m why)
+        (log! m "\n")
+        (free why)
+        0)
+      w))
+
+(define (init [m (ptr model)])
+  (event-handler! worker-source worker-heard)
+  (set! (-> m log) (make-buffer))
+  (log! m "")
+  (let ([w (plan! m "/worker")])
+    (worker-read! w "/data")
+    (worker-write! w "/out")
+    (worker-limit! w 5000 33554432)
+    (set! (-> m first) (run! m w "one")))
+  (send-next! m))
+
+(define (log-event! [m (ptr model)] [w u32] [kind u32])
+  (let ([data (events-take-text)])
+    (log-number! m (cast i32 w))
+    (log! m (cond [(== kind worker-message) " message"]
+                  [(== kind worker-stdout) " stdout"]
+                  [(== kind worker-stderr) " stderr"]
+                  [(== kind worker-done) " done"]
+                  [else " ended"]))
+    (when (!= (@ data) 0) (log! m ": "))
+    (log! m data)
+    (let ([n (strlen data)])
+      (when (or (== n 0) (!= (@ data (- n 1)) 10)) (log! m "\n")))
+    (free data)))
+
+(define (update [m (ptr model)] [e (ptr message)])
+  (match e
+    [(worker-event w kind)
+     (log-event! m w kind)
+     (cond
+       [(and (== w (-> m first)) (== kind worker-message)) (send-next! m)]
+       [(and (== w (-> m first)) (== kind worker-ended))
+        (log! m "send to worker 1 returned ")
+        (log-number! m (worker-send-text w "add 1"))
+        (log! m "\n")
+        (let ([second (plan! m "/worker")])
+          (worker-limit! second 300 0)
+          (set! (-> m second) (run! m second "")))
+        (worker-send-text (-> m second) "loop")]
+       [(and (== w (-> m second)) (== kind worker-ended))
+        (set! (-> m third) (run! m (plan! m "/worker") ""))
+        (worker-send-text (-> m third) "add 2")]
+       [(and (== w (-> m third)) (== kind worker-message))
+        (worker-send-text (-> m third) "loop")
+        (log! m "worker 3 is now looping\n")])]
+    [tick (+= (-> m ticks) 1)]
+    [stop
+     (worker-stop (-> m third))
+     (log! m "stopped worker 3; send to it returned ")
+     (log-number! m (worker-send-text (-> m third) "add 1"))
+     (log! m "\n")
+     (let ([w (worker-new 0)])
+       (when (< (worker-grant! w "dom") 0)
+         (let ([why (worker-error)])
+           (log! m "no grant: ")
+           (log! m why)
+           (log! m "\n")
+           (free why)))
+       (worker-stop w))
+     (plan! m "/nowhere")
+     (log! m "finished\n")]))
+
+(define (worker-heard [source u32] [kind u32] [w u32] [tag (ptr void)] [value i32])
+  (let ([e message (worker-event w kind)])
+    (send! (& e))))
+
+(view (page [m (ptr model)])
+  (button ([id "tick"] [on click tick]) "tick")
+  (span ([id "ticks"]) (int (-> m ticks)))
+  (button ([id "stop"] [on click stop]) "stop")
+  (pre ([id "log"]) (text (-> m log bytes))))
+
+(app model message init update page)

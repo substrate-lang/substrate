@@ -26,7 +26,7 @@ mkdir -p "$builds/tls"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
 
-# A directory with a link out of it, for the guest test.
+# A directory with a link out of it, for the worker test.
 mkdir -p "$builds/bounds/inside" "$builds/bounds/outside"
 echo secret > "$builds/bounds/outside/secret.txt"
 ln -s ../outside "$builds/bounds/inside/link"

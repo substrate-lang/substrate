@@ -1,6 +1,7 @@
 ;; The REPL web page: the half the user sees.
 (require-unqualified web "../web.sub")
-(require-unqualified guest "../../../host/guest.sub")
+(require-unqualified worker "../../../host/worker.sub")
+(require-unqualified fs "../../../host/fs.sub")
 (require-unqualified stream "../../../host/stream.sub")
 (require-unqualified storage "../../../host/web/storage.sub")
 (require-unqualified location "../../../host/web/location.sub")
@@ -36,7 +37,7 @@
   [key-pressed [key (ptr u8)] [shift i32]]
   [run] [stop] [clear] [save] [load] [loaded] [copy]
   [use [language u32]]
-  [guest-event [guest u32] [kind u32]])
+  [worker-event [w u32] [kind u32]])
 (messages message)
 
 (define loading stream-reader)
@@ -109,16 +110,15 @@
   (set! (-> m recalled) 0)
   (+= (-> m focus) 1))
 
-;; ---- the session guest ----
+;; ---- the session worker ----
 
-(define (session-spec) -> (ptr u8) "program /session\nread /src")
 
 (define (send-input! [m (ptr model)] [id u32] [input (ptr u8)])
   (let ([b (make-buffer)] [number (array u32 1)])
     (set! (@ number 0) id)
     (buffer-add! (& b) (cast (ptr u8) number) 4)
     (buffer-add-string! (& b) input)
-    (guest-send (-> m session) (-> b bytes) (-> b length))
+    (worker-send (-> m session) (-> b bytes) (-> b length))
     (buffer-free! (& b))))
 
 (define (remember! [m (ptr model)] [id u32] [input (ptr u8)])
@@ -136,12 +136,39 @@
     (free (-> (+ (-> m history) i) input)))
   (set! (-> m history-count) 0))
 
-(define (start-guest! [m (ptr model)])
+;; The session: a worker on the compiler's modules, packed under /session, reading the sources under /src.
+(define (start-worker! [m (ptr model)])
   (free (-> m problem))
   (set! (-> m problem) 0)
   (set! (-> m started) 0)
-  (set! (-> m session) (guest-start (session-spec) 0))
-  (when (== (-> m session) 0) (set! (-> m problem) (guest-error))))
+  (set! (-> m session) 0)
+  (let* ([n u32 0] [list (fs-read-file "/session/program" (& n))] [w (worker-new 0)] [at u32 0])
+    (when (== list 0)
+      (set! (-> m problem) (copy-text "the session is missing"))
+      (return))
+    (while (< at n)
+      (let ([end at])
+        (while (and (< end n) (!= (@ list end) 10)) (+= end 1))
+        (when (> end at)
+          (let ([name (make-buffer)] [file (make-buffer)] [size u32 0])
+            (buffer-add! (& name) (+ list at) (- end at))
+            (buffer-add-byte! (& name) 0)
+            (buffer-add-string! (& file) "/session/")
+            (buffer-add! (& file) (+ list at) (- end at))
+            (buffer-add-string! (& file) ".wasm")
+            (buffer-add-byte! (& file) 0)
+            (let ([bytes (fs-read-file (-> file bytes) (& size))])
+              (when (!= bytes 0)
+                (worker-module! w (-> name bytes) bytes size)
+                (free bytes)))
+            (buffer-free! (& name))
+            (buffer-free! (& file))))
+        (set! at (+ end 1))))
+    (free list)
+    (worker-read! w "/src")
+    (if (< (worker-run! w "main" "" 0) 0)
+        (set! (-> m problem) (worker-error))
+        (set! (-> m session) w))))
 
 (define (evaluate! [m (ptr model)] [input (ptr u8)])
   (let* ([i (add-entry! m input)] [e (+ (-> m entries) i)])
@@ -249,7 +276,7 @@
     (buffer-free! (& b))))
 
 (define (start-session! [m (ptr model)] [language u32])
-  (when (!= (-> m session) 0) (guest-stop (-> m session)))
+  (when (!= (-> m session) 0) (worker-stop (-> m session)))
   (clear! m)
   (forget-history! m)
   (drop-queue! m)
@@ -258,7 +285,7 @@
   (set! (-> m pending) -1)
   (set! (-> m replaying) 0)
   (set! (-> m failed-starts) 0)
-  (start-guest! m)
+  (start-worker! m)
   (let ([input (language-input language)])
     (when (and (!= input 0) (!= (-> m session) 0)) (evaluate! m input)))
   (set! (-> m recalled) (-> m count)))
@@ -280,7 +307,7 @@
         (free (-> m problem))
         (set! (-> m problem) (copy-text why)))
       (begin
-        (start-guest! m)
+        (start-worker! m)
         (when (!= (-> m session) 0)
           (for ([i u32 0]) (< i (-> m history-count)) (+= i 1)
             (send-input! m (-> (+ (-> m history) i) id) (-> (+ (-> m history) i) input)))
@@ -301,16 +328,16 @@
     (set! (-> m failed-starts) 0)
     (+= (-> m scroll) 1)))
 
-(define (handle-guest-event! [m (ptr model)] [g u32] [kind u32])
+(define (handle-worker-event! [m (ptr model)] [g u32] [kind u32])
   (when (and (== g (-> m session)) (!= g 0))
     (cond
-      [(== kind guest-ended)
+      [(== kind worker-ended)
        (let ([why (events-take-text)] [failed (and (>= (-> m pending) 0) (not (-> m answered)))])
          (when failed (add-line! (+ (-> m entries) (-> m pending)) why))
          (restore-session! m (if failed "The session crashed while evaluating this input. A new session was started." why))
          (free why))]
 
-      [(== kind guest-done)
+      [(== kind worker-done)
        (cond [(not (-> m started)) (set! (-> m started) 1)]
              [(> (-> m replaying) 0)
               (-= (-> m replaying) 1)
@@ -320,14 +347,14 @@
               (set! (-> m pending) -1)
               (evaluate-next! m)]
              [else
-              (guest-stop g)
+              (worker-stop g)
               (restore-session! m "The session crashed while evaluating this input. A new session was started.")])]
 
       [(> (-> m replaying) 0) (begin)]
 
       [(or (< (-> m pending) 0) (-> m answered)) (begin)]
 
-      [(== kind guest-message) (finish-entry! m)]
+      [(== kind worker-message) (finish-entry! m)]
 
       [else
        (let ([printed (make-buffer)])
@@ -375,7 +402,7 @@
   (drop-queue! m)
   (cond [(> (-> m replaying) 0) (start-session! m (-> m language))]
         [(>= (-> m pending) 0)
-         (guest-stop (-> m session))
+         (worker-stop (-> m session))
          (set! (-> m failed-starts) 0)
          (restore-session! m "Stopped.")])
   (+= (-> m focus) 1))
@@ -406,17 +433,17 @@
     [stop (stop! m)]
     [clear (unless (busy? m) (clear! m))]
     [save (save! m)]
-    [load (files-pick "" 0)]
+    [load (files-pick 0 "" 0)]
     [loaded
      (buffer-add-byte! (& (-> loading bytes)) 0)
      (load-forms! m (-> loading bytes bytes))
      (buffer-free! (& (-> loading bytes)))]
     [copy (copy! m)]
     [(use language) (start-session! m language)]
-    [(guest-event g kind) (handle-guest-event! m g kind)]))
+    [(worker-event g kind) (handle-worker-event! m g kind)]))
 
-(define (guest-heard [source u32] [kind u32] [g u32] [tag (ptr void)] [value i32])
-  (let ([e message (guest-event g kind)])
+(define (worker-heard [source u32] [kind u32] [g u32] [tag (ptr void)] [value i32])
+  (let ([e message (worker-event g kind)])
     (send! (& e))))
 
 (define (trapped [m (ptr model)]) (+= (-> m focus) 1))
@@ -428,7 +455,7 @@
       (free text))))
 
 (define (init [m (ptr model)])
-  (event-handler! guest-source guest-heard)
+  (event-handler! worker-source worker-heard)
   (event-handler! files-source files-heard)
   (event-handler! storage-source storage-heard)
   (set! (-> m draft) (copy-text ""))

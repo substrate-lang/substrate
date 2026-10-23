@@ -1,11 +1,10 @@
 // The host module "net": TCP listeners, and connections, which are streams.
 // Kinds: listening 1, value the port; accept 2, value the new connection's stream; connected 3; failed 4,
-// value the error code. The options are lines: tls; host NAME.
+// value the error code. A listener's host is the address to bind, "" for 127.0.0.1; secure asks for TLS.
 import net from 'node:net';
 import tls from 'node:tls';
 import { errorOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
-import { settings } from '../settings.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -14,17 +13,6 @@ const LISTENING = 1;
 const ACCEPT = 2;
 const CONNECTED = 3;
 const FAILED = 4;
-
-function parseOptions(text) {
-  const options = { tls: false, host: null };
-  settings(text, 'net', (word, value) => {
-    if (word === 'tls') options.tls = true;
-    else if (word === 'host') options.host = value;
-    else return false;
-    return true;
-  });
-  return options;
-}
 
 export function netModule(granted = {}) {
   const listeners = new Map();
@@ -37,13 +25,13 @@ export function netModule(granted = {}) {
         for (const server of listeners.values()) server.close();
         listeners.clear();
       },
-      listen(port, ptr, len, tag) {
+      listen(port, hp, hl, secure, tag) {
         let server;
         try {
-          const options = parseOptions(caller.string(ptr, len));
-          if (options.tls && !granted.tls) throw new Error('net.listen: no certificate was granted for tls');
-          server = options.tls ? tls.createServer(granted.tls) : net.createServer();
-          server.listen(port, options.host || '127.0.0.1');
+          const host = caller.string(hp, hl);
+          if (secure && !granted.tls) throw new Error('net.listen: no certificate was granted for tls');
+          server = secure ? tls.createServer(granted.tls) : net.createServer();
+          server.listen(port, host || '127.0.0.1');
         } catch (e) {
           caller.error(e.message);
           return 0;
@@ -64,12 +52,11 @@ export function netModule(granted = {}) {
         });
         return id;
       },
-      connect(hostPtr, hostLen, port, ptr, len, tag) {
+      connect(hp, hl, port, secure, tag) {
         let socket;
         try {
-          const host = caller.string(hostPtr, hostLen);
-          const options = parseOptions(caller.string(ptr, len));
-          socket = options.tls
+          const host = caller.string(hp, hl);
+          socket = secure
             ? tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, ca })
             : net.connect({ host, port });
         } catch (e) {

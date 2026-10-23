@@ -272,17 +272,17 @@ const checks = {
     check('fields: a custom event, named by a string in the template', await shown(), 'abc|ArrowDown|1|1');
   },
 
-  async guests(page) {
+  async workers(page) {
     const log = async () => (await page.evaluate('document.getElementById("log").textContent'))
       .split('\n').filter((l) => !l.startsWith('    ')).join('\n');
-    await page.waitFor('document.getElementById("log").textContent.includes("guest 3 is now looping")', 30000);
+    await page.waitFor('document.getElementById("log").textContent.includes("worker 3 is now looping")', 30000);
     await page.click('#tick');
     await page.click('#tick');
-    check('guests: the page responds while a guest loops forever', await page.evaluate('document.getElementById("ticks").textContent'), '2');
+    check('workers: the page responds while a worker loops forever', await page.evaluate('document.getElementById("ticks").textContent'), '2');
     await page.click('#stop');
     await page.waitFor('document.getElementById("log").textContent.endsWith("finished\\n")');
-    check('guests: the log of events', await log(), [
-      '1 stdout: a guest, one, two words',
+    check('workers: the log of events', await log(), [
+      '1 stdout: a worker, one',
       '1 done',
       '1 message: total 5',
       '1 done',
@@ -308,30 +308,29 @@ const checks = {
       '1 done: trap: divide by zero',
       '1 message: total 43',
       '1 done',
-      '1 message: no guest: guest.start: a guest cannot start guests of its own',
+      '1 message: no worker: worker.new: a worker cannot start workers',
       '1 done',
       '1 message: out of memory before 32 MiB',
       '1 done',
       '1 message: total 44',
       '1 done',
       '1 ended: exit 3',
-      'send to guest 1 returned -1',
-      '2 stdout: a guest',
+      'send to worker 1 returned -1',
+      '2 stdout: a worker',
       '2 done',
       '2 ended: time limit exceeded (300 ms)',
-      '3 stdout: a guest',
+      '3 stdout: a worker',
       '3 done',
       '3 message: total 2',
-      'guest 3 is now looping',
+      'worker 3 is now looping',
       '3 done',
-      'stopped guest 3; send to it returned -1',
-      'no guest: guest.start: no program found in /nowhere',
-      'no guest: guest.start: unknown setting "frobnicate"',
-      'no guest: guest.start: "time" needs a positive whole number, not "soon"',
+      'stopped worker 3; send to it returned -1',
+      'no grant: worker.grant: no module dom to grant',
+      'no program in /nowhere',
       'finished',
       '',
     ].join('\n'));
-    check('guests: a file written by a guest does not appear in the page\'s files',
+    check('workers: a file written by a worker does not appear in the page\'s files',
       await page.evaluate('window.app.files.has("/out/made.txt")'), false);
   },
 
@@ -683,7 +682,7 @@ const checks = {
   async storage(page) {
     await page.waitFor('document.getElementById("step").textContent === "6"', 10000);
     check('storage: set, got, a missing key, listed, removed, gone', await page.evaluate('document.getElementById("log").textContent'),
-      '2 0 \n1 1 hello\n1 0 \n3 1 greeting\n\n2 0 \n1 0 \n');
+      '2 0 \n1 1 hello\n1 0 \n3 1 greeting\n2 0 \n1 0 \n');
   },
 
   async location(page) {
