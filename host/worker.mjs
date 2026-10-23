@@ -1,7 +1,7 @@
-// The host module "worker": this program, or another program's modules, run on a thread of its own, sharing
-// nothing but messages. A worker is planned with new, limit and module, then run, calling one of its functions
-// with bytes as its argument. It has its parent's modules; one a thread cannot have traps when called. The
-// browser and Node each give their way of starting a thread.
+// The host module "worker": this program's functions run on threads of their own, sharing nothing but messages.
+// start runs the named function on a thread, with bytes as the worker's argument, under a time limit and a
+// memory limit. A worker has its parent's modules; one a thread cannot have traps when called. The browser and
+// Node each give their way of starting a thread.
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
@@ -11,11 +11,11 @@ const STDERR = 3;
 const DONE = 4;
 const ENDED = 5;
 
-// spawn(plan, app) starts a thread running the plan and returns it: post(message, transfer), terminate(),
-// onMessage(f) and onError(f), f given the reason.
+// spawn(plan, app) starts a thread running the plan: this program's modules, the function, its argument, the
+// grants and the memory's pages. It returns the thread: post(message, transfer), terminate(), onMessage(f) and
+// onError(f), f given the reason.
 export function workerModule({ spawn }) {
   let caller = null;
-  const planned = new Map();
   const alive = new Map();
   let nextNumber = 1;
 
@@ -42,39 +42,31 @@ export function workerModule({ spawn }) {
       : null;
   };
 
-  const refuse = (message) => {
-    caller.error(message);
-    return -1;
-  };
-
-  function run(w, entry, argument, app) {
-    const p = planned.get(w);
-    if (!p) return -1;
-    planned.delete(w);
-    if (p.modules.length === 0) {
-      const program = caller.program();
-      for (const name of program.names) p.modules.push([name, program.bytes(name)]);
-    }
+  function start(entry, argument, time, pages, tag, app) {
+    const program = caller.program();
+    const modules = program.names.map((name) => [name, program.bytes(name)]);
     let thread;
     try {
-      thread = spawn({ ...p, entry, argument, grants: [...caller.grants().values()] }, app);
+      thread = spawn({ modules, entry, argument, grants: [...caller.grants().values()], pages }, app);
     } catch (e) {
-      return refuse(e.message);
+      caller.error(e.message);
+      return 0;
     }
-    const worker = { thread, tag: p.tag, time: p.time, timer: null };
+    const w = nextNumber++;
+    const worker = { thread, tag, time, timer: null };
     alive.set(w, worker);
     thread.onMessage((m) => {
       if (alive.get(w) !== worker) return;
-      if (m.type === 'output') deliver(w, p.tag, m.fd === 2 ? STDERR : STDOUT, 0, m.bytes);
-      else if (m.type === 'message') deliver(w, p.tag, MESSAGE, 0, m.bytes);
-      else if (m.type === 'done') deliver(w, p.tag, DONE, 0, utf8.encode(m.trap));
+      if (m.type === 'output') deliver(w, tag, m.fd === 2 ? STDERR : STDOUT, 0, m.bytes);
+      else if (m.type === 'message') deliver(w, tag, MESSAGE, 0, m.bytes);
+      else if (m.type === 'done') deliver(w, tag, DONE, 0, utf8.encode(m.trap));
       else if (m.type === 'busy') limit(w, worker);
       else if (m.type === 'idle') clearTimeout(worker.timer);
       else if (m.type === 'ended') end(w, m.code, m.reason);
     });
     thread.onError((reason) => end(w, -1, reason));
     limit(w, worker);
-    return 0;
+    return w;
   }
 
   return (theCaller, app) => {
@@ -85,27 +77,9 @@ export function workerModule({ spawn }) {
       source: SOURCE,
       end() {
         for (const w of [...alive.keys()]) end(w, -1, null);
-        planned.clear();
       },
-      new(tag) {
-        const w = nextNumber++;
-        planned.set(w, { tag, time: 0, pages: 0, modules: [] });
-        return w;
-      },
-      limit(w, ms, size) {
-        const p = planned.get(w);
-        if (!p) return;
-        p.time = ms >>> 0;
-        p.pages = Math.ceil((size >>> 0) / 65536);
-      },
-      module(w, np, nl, bp, bl) {
-        const p = planned.get(w);
-        if (!p) return -1;
-        p.modules.push([string(np, nl), bytes(bp, bl)]);
-        return 0;
-      },
-      run(w, np, nl, bp, bl) {
-        return run(w, string(np, nl), bytes(bp, bl), app);
+      start(np, nl, bp, bl, time, size, tag) {
+        return start(string(np, nl), bytes(bp, bl), time >>> 0, Math.ceil((size >>> 0) / 65536), tag, app);
       },
       send(w, ptr, len) {
         const worker = alive.get(w);
@@ -115,7 +89,6 @@ export function workerModule({ spawn }) {
         return 0;
       },
       stop(w) {
-        planned.delete(w);
         end(w, -1, null);
       },
     };

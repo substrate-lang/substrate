@@ -1,8 +1,9 @@
-;; A page that starts workers, a-worker.sub packed under /worker and then one of its own functions, and logs
-;; every event from them.
+;; A page that starts workers, each a function of this program, and logs every event from them. worker-main
+;; carries out text commands from the page and replies to each; own prints, then asks the page's dom, which a
+;; worker cannot have.
 (require-unqualified web "../../lib/web/web.sub")
 (require-unqualified worker "../../host/worker.sub")
-(require-unqualified program "../../host/worker-program.sub")
+(require-unqualified fs "../../host/fs.sub")
 
 (struct model [log buffer] [first u32] [second u32] [third u32] [own u32] [step u32] [ticks u32])
 
@@ -10,6 +11,115 @@
   [worker-event [w u32] [kind u32] [value i32]]
   [tick] [stop])
 (messages message)
+
+;; ---- the workers ----
+
+(define total i64 0)
+(define zero i32 0)
+
+(define (starts? [s (ptr u8)] [prefix (ptr u8)]) -> i32
+  (let ([n (strlen prefix)])
+    (and (>= (strlen s) n) (== (memcmp s prefix n) 0))))
+
+(define (number [s (ptr u8)]) -> i64
+  (let ([n i64 0] [i u32 0])
+    (while (and (>= (@ s i) #\0) (<= (@ s i) #\9))
+      (set! n (+ (* n 10) (- (@ s i) #\0)))
+      (+= i 1))
+    n))
+
+(define (add-number! [b (ptr buffer)] [n i64])
+  (when (>= n 10) (add-number! b (/ n 10)))
+  (buffer-add-byte! b (cast i32 (+ #\0 (% n 10)))))
+
+(define (add-error! [b (ptr buffer)])
+  (let* ([p (host-error-text)] [i u32 0])
+    (while (and (!= (@ p i) 0) (!= (@ p i) 10)) (+= i 1))
+    (buffer-add! b p i)
+    (free p)))
+
+(define (reply! [b (ptr buffer)])
+  (worker-send 0 (-> b bytes) (-> b length))
+  (buffer-free! b))
+
+(define (reply-text! [s (ptr u8)]) (worker-send-text 0 s))
+
+(define (write-line! [fd i32] [b (ptr buffer)])
+  (buffer-add-byte! b 10)
+  (host-write fd (-> b bytes) (cast i32 (-> b length)))
+  (buffer-free! b))
+
+(define (worker-main)
+  (event-handler! worker-source on-message)
+  (trap-handler! worker-trapped)
+  (let ([b (make-buffer)] [p (array u8 64)])
+    (buffer-add-string! (& b) "a worker")
+    (let ([n (host-arg 0 p 63)])
+      (when (> n 0)
+        (set! (@ p n) 0)
+        (buffer-add-string! (& b) ", ")
+        (buffer-add-string! (& b) p)))
+    (write-line! 1 (& b))))
+
+(define (on-message [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (== kind worker-message)
+    (let ([m (events-take-text)] [b (make-buffer)])
+      (cond [(starts? m "add ")
+             (+= total (number (+ m 4)))
+             (buffer-add-string! (& b) "total ")
+             (add-number! (& b) total)
+             (reply! (& b))]
+            [(starts? m "say ")
+             (buffer-add-string! (& b) (+ m 4))
+             (write-line! 1 (& b))
+             (reply-text! "said")]
+            [(starts? m "warn ")
+             (buffer-add-string! (& b) (+ m 5))
+             (write-line! 2 (& b))
+             (reply-text! "warned")]
+            [(starts? m "read ")
+             (let* ([path (+ m 5)] [n (fs-read path (strlen path) 0 0)])
+               (if (< n 0)
+                   (begin (buffer-add-string! (& b) "cannot read ") (add-error! (& b)))
+                   (begin (buffer-add-string! (& b) "read ") (add-number! (& b) n) (buffer-add-string! (& b) " bytes")))
+               (reply! (& b)))]
+            [(starts? m "write ")
+             (let ([path (+ m 6)])
+               (if (< (fs-write path (strlen path) "written" 7) 0)
+                   (begin (buffer-add-string! (& b) "cannot write ") (add-error! (& b)))
+                   (buffer-add-string! (& b) "wrote"))
+               (reply! (& b)))]
+            [(starts? m "trap") (reply-text! (if (== (/ 1 zero) 0) "no trap" "no trap"))]
+            [(starts? m "loop") (while 1 (+= total 0))]
+            [(starts? m "grow ")
+             (let ([most (* 2 (number (+ m 5)))] [n i64 0])
+               (while (and (< n most) (!= (malloc 1048576) 0)) (+= n 1))
+               (buffer-add-string! (& b) (if (< n most) "out of memory before " "allocated more than "))
+               (add-number! (& b) (if (< n most) (number (+ m 5)) most))
+               (buffer-add-string! (& b) " MiB")
+               (reply! (& b)))]
+            [(starts? m "worker")
+             (let ([w (worker-start "worker-main" "" 0 0 0)] [why (host-error-text)])
+               (buffer-add-string! (& b) (if (== w 0) "no worker: " "started a worker: "))
+               (buffer-add-string! (& b) why)
+               (free why)
+               (reply! (& b)))]
+            [(starts? m "exit ") (host-exit (cast i32 (number (+ m 5))))]
+            [else (reply-text! "?")])
+      (free m))))
+
+(define (worker-trapped)
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "trapped: ")
+    (add-error! (& b))
+    (reply! (& b))))
+
+(define (own)
+  (printf "own: started\n")
+  (let ([n (dom-images-loading)])
+    (printf "images loading: ~a\n" n)))
+
+;; ---- the page ----
 
 (define (log! [m (ptr model)] [s (ptr u8)])
   (buffer-add-string! (& (-> m log)) s)
@@ -47,41 +157,25 @@
       (+= (-> m step) 1)
       (worker-send-text (-> m first) c))))
 
-;; A worker planned with the modules of the program packed under DIR; 0 when there is none.
-(define (plan! [m (ptr model)] [dir (ptr u8)]) -> u32
-  (let ([w (worker-new 0)])
-    (if (< (worker-program! w dir) 0)
-        (begin
-          (worker-stop w)
-          (log! m "no program in ")
-          (log! m dir)
-          (log! m "\n")
-          0)
-        w)))
-
-(define (run! [m (ptr model)] [w u32] [argument (ptr u8)]) -> u32
-  (if (< (worker-run! w "main" argument (strlen argument)) 0)
+(define (start! [m (ptr model)] [function (ptr u8)] [argument (ptr u8)] [o (ptr worker-options)]) -> u32
+  (let ([w (worker-start function argument (strlen argument) o 0)])
+    (when (== w 0)
       (let ([why (host-error-text)])
         (log! m "no worker: ")
         (log! m why)
         (log! m "\n")
-        (free why)
-        0)
-      w))
-
-;; This program's own function on a thread: it prints, then asks the page's dom, which a worker cannot have.
-(define (own)
-  (printf "own: started\n")
-  (let ([n (dom-images-loading)])
-    (printf "images loading: ~a\n" n)))
+        (free why)))
+    w))
 
 (define (init [m (ptr model)])
   (event-handler! worker-source worker-heard)
   (set! (-> m log) (make-buffer))
   (log! m "")
-  (let ([w (plan! m "/worker")])
-    (worker-limit! w 5000 33554432)
-    (set! (-> m first) (run! m w "one")))
+  (let ([o worker-options])
+    (worker-options-init! (& o))
+    (set! (-> o time) 5000)
+    (set! (-> o memory) 33554432)
+    (set! (-> m first) (start! m "worker-main" "one" (& o))))
   (send-next! m))
 
 (define (log-event! [m (ptr model)] [w u32] [kind u32] [value i32])
@@ -112,12 +206,13 @@
         (log! m "send to worker 1 returned ")
         (log-number! m (worker-send-text w "add 1"))
         (log! m "\n")
-        (let ([second (plan! m "/worker")])
-          (worker-limit! second 300 0)
-          (set! (-> m second) (run! m second "")))
+        (let ([o worker-options])
+          (worker-options-init! (& o))
+          (set! (-> o time) 300)
+          (set! (-> m second) (start! m "worker-main" "" (& o))))
         (worker-send-text (-> m second) "loop")]
        [(and (== w (-> m second)) (== kind worker-ended))
-        (set! (-> m third) (run! m (plan! m "/worker") ""))
+        (set! (-> m third) (start! m "worker-main" "" 0))
         (worker-send-text (-> m third) "add 2")]
        [(and (== w (-> m third)) (== kind worker-message))
         (worker-send-text (-> m third) "loop")
@@ -129,12 +224,13 @@
      (log! m "stopped worker 3; send to it returned ")
      (log-number! m (worker-send-text (-> m third) "add 1"))
      (log! m "\n")
-     (plan! m "/nowhere")
-     (set! (-> m own) (worker-start "own" "" 0 0))]))
+     (set! (-> m own) (start! m "own" "" 0))]))
 
 (define (worker-heard [source u32] [kind u32] [w u32] [tag (ptr void)] [value i32])
   (let ([e message (worker-event w kind value)])
     (send! (& e))))
+
+(define (on-trap) -> i32 (reset-stack!) (trap-dispatch))
 
 (view (page [m (ptr model)])
   (button ([id "tick"] [on click tick]) "tick")

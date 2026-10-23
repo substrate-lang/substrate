@@ -82,20 +82,12 @@ export function workerSide(post) {
   let ended = false;
   const waiting = [];
 
-  const refused = (caller) => {
-    caller.error('worker.new: a worker cannot start workers');
-    return -1;
-  };
-
   const worker = (caller) => ({
     source: SOURCE,
-    new() {
-      refused(caller);
+    start() {
+      caller.error('worker.start: a worker cannot start workers');
       return 0;
     },
-    limit() {},
-    module: () => refused(caller),
-    run: () => refused(caller),
     send(w, ptr, length) {
       if (w !== 0) return -1;
       out.flush();
