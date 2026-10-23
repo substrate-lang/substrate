@@ -6,6 +6,7 @@ cd "$root"
 sites="${OUT:-build}/web"
 
 mkdir -p build
+rm -rf "${sites:?}"
 : > build/empty.sub
 bin/sub expand build/empty.sub > /dev/null
 

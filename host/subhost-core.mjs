@@ -421,8 +421,8 @@ export function createHost(platform) {
         return typeof f === 'function' ? table.grow(1, f) : -1;
       },
       error_message(bp, cap) {
-        const b = utf8.encode(lastError).subarray(0, cap);
-        memory().set(b, u(bp));
+        const b = utf8.encode(lastError);
+        memory().set(b.subarray(0, cap), u(bp));
         return b.length;
       },
       arg(i, bp, cap) {

@@ -2,7 +2,7 @@
 # Builds a web site into OUT: the program, the host, the page, and packs of programs and files.
 # sub site OUT FILE [-p PAGE] [-w NAME FILE] [-f NAME PATH ...]
 # FILE: a program's source, or a directory `sub build` wrote. -w builds FILE as NAME.pack, a program for a worker.
-# -f packs the PATHs, from the repository's root, as NAME.pack.
+# -f packs the PATHs, from the repository's root, as NAME.pack. A site holds .site, and only a site is replaced.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 usage() {
@@ -14,12 +14,13 @@ out="$1"
 file="$2"
 shift 2
 page="$root/host/web/page.html"
-if [ -e "$out" ] && { [ ! -d "$out" ] || { [ -n "$(ls -A "$out")" ] && [ ! -d "$out/host/web" ]; }; }; then
+if [ -e "$out" ] && { [ ! -d "$out" ] || { [ -n "$(ls -A "$out")" ] && [ ! -e "$out/.site" ]; }; }; then
   echo "site: $out is not a site, so it is not replaced" >&2
   exit 1
 fi
 rm -rf "${out:?}"
 mkdir -p "$out/host/modules" "$out/host/web"
+echo "$file" > "$out/.site"
 program() {
   if [ -d "$1" ]; then cp -r "$1" "$2"; else "$root/bin/sub" build "$1" -o "$2"; fi
 }
