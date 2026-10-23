@@ -5,13 +5,20 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 
+const read = new Map();
 const granted = (file) => {
-  try {
-    return fs.readFileSync(file);
-  } catch (e) {
-    throw new Error(`cannot read ${file}`);
+  if (!read.has(file)) {
+    try {
+      read.set(file, fs.readFileSync(file));
+    } catch (e) {
+      throw new Error(`cannot read ${file}`);
+    }
   }
+  return read.get(file);
 };
+
+// The specs whose arguments are files, read when the spec is checked.
+const naming = new Set(['net=tls']);
 
 const loaders = {
   clock: () => require('../modules/clock.mjs').clock(),
@@ -40,9 +47,16 @@ const parts = (spec) => {
 
 export const nameOf = (spec) => parts(spec).name;
 
-export function known(spec) {
-  const { name, key } = parts(spec);
-  return name in loaders && key in loaders;
+// What is wrong with a spec, or null: no such module, or a file it names that cannot be read.
+export function problem(spec) {
+  const { name, key, args } = parts(spec);
+  if (!(name in loaders && key in loaders)) return `no module ${spec}`;
+  try {
+    if (naming.has(key)) for (const file of args) granted(file);
+  } catch (e) {
+    return e.message;
+  }
+  return null;
 }
 
 export function loadModule(spec) {

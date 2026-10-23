@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createHost, Exit } from './subhost-core.mjs';
-import { grantedModules, known, nameOf } from './node/modules.mjs';
+import { grantedModules, nameOf, problem } from './node/modules.mjs';
 
 function usage() {
   process.stderr.write('usage: sub run [-g MODULE[=fake[:DIR]|=tls:CERT:KEY],...] DIR [arg ...]\n');
@@ -24,8 +24,9 @@ if (!dir) usage();
 const grants = new Map();
 if (specs.length === 0) for (const name of ['clock', 'random', 'timer', 'worker', 'stdin', 'env', 'fs']) grants.set(name, name);
 for (const spec of specs) {
-  if (!known(spec)) {
-    process.stderr.write(`subhost: no module ${spec}\n`);
+  const wrong = problem(spec);
+  if (wrong) {
+    process.stderr.write(`subhost: ${wrong}\n`);
     process.exit(64);
   }
   grants.set(nameOf(spec), spec);
@@ -42,16 +43,6 @@ function read(file) {
 const names = read(`${dir}/program`).toString().split('\n').filter((n) => n !== '');
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
 const modules = grantedModules(grants);
-// A spec that names files is loaded now.
-for (const [name, spec] of grants) {
-  if (!spec.includes(':')) continue;
-  try {
-    modules.get(name);
-  } catch (e) {
-    process.stderr.write(`subhost: ${e.message}\n`);
-    process.exit(64);
-  }
-}
 
 const host = createHost({
   args: programArgs,
