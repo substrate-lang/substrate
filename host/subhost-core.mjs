@@ -585,11 +585,11 @@ export function createHost(platform) {
         return false;
       }
       if (!trapped(e)) throw e;
+      // on-trap gives 1 when the program recovered; with 0, or none, the error is reported and the program ends.
       const onTrap = entry && entry['on-trap'];
       if (typeof onTrap === 'function') {
         try {
-          onTrap();
-          return false;
+          if (onTrap() !== 0) return false;
         } catch (e2) {
           if (e2 instanceof Exit) {
             end(e2.code, '');
