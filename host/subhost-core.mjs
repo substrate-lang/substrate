@@ -328,13 +328,10 @@ export function createHost(platform) {
       },
       trap: hostTrap,
       give,
-      // With err undefined, the seed's older shape: the last error.
       fail(err, message) {
-        if (err === undefined) lastError = message;
-        else if (err) {
-          const p = give(utf8.encode(message), 0);
-          new DataView(memory().buffer).setUint32(u(err), p, true);
-        }
+        if (!err) return;
+        const p = give(utf8.encode(message), 0);
+        new DataView(memory().buffer).setUint32(u(err), p, true);
       },
       event(kind, id, tag, value, bytes, data) {
         event(made.source, kind, id, tag, value, bytes, data);
@@ -389,10 +386,6 @@ export function createHost(platform) {
         const exports = registry.get(string(ip, il));
         const f = exports && exports[string(fp, fl)];
         return typeof f === 'function' ? table.grow(1, f) : -1;
-      },
-      // The seed's.
-      error_message(out) {
-        return give(utf8.encode(lastError), out);
       },
       arg(i, out) {
         if (i < 0 || i >= platform.args.length) return 0;
