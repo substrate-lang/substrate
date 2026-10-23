@@ -339,20 +339,20 @@ export function dom(root) {
   const module = (theCaller, theApp) => {
     caller = theCaller;
     app = theApp;
-    const held = (s) => caller.hold(utf8.encode(s));
+    const given = (s, out) => caller.give(utf8.encode(s), out);
     return {
       source: SOURCE,
       apply(ptr, length) {
         apply(caller.memory(), caller.u(ptr), length);
       },
-      event_value() {
+      event_value(out) {
         const e = event();
         const target = e && e.target;
-        return held(target && typeof target.value === 'string' ? target.value : '');
+        return given(target && typeof target.value === 'string' ? target.value : '', out);
       },
-      event_key() {
+      event_key(out) {
         const e = event();
-        return held(e && typeof e.key === 'string' ? e.key : '');
+        return given(e && typeof e.key === 'string' ? e.key : '', out);
       },
       event_flags() {
         const e = event();

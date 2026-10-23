@@ -227,6 +227,8 @@ export class Exit {
 export function createHost(platform) {
   const registry = new Map();
   const modules = new Map();
+  // A memory's malloc, from the module that exports both.
+  const allocators = new WeakMap();
   let lastError = '';
   let held = new Uint8Array(0);
   // The running program: its modules' names in load order, and how to get one's bytes.
@@ -359,6 +361,21 @@ export function createHost(platform) {
       return new Uint8Array(m.buffer);
     };
     const u = (ptr) => ptr >>> 0;
+    const give = (bytes, out) => {
+      const malloc = allocators.get(self.exports.memory);
+      if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
+      const p = malloc(bytes.length + 1) >>> 0;
+      if (p === 0) hostTrap(`${who}: out of memory`);
+      const m = memory();
+      m.set(bytes, p);
+      m[p + bytes.length] = 0;
+      if (out) new DataView(m.buffer).setUint32(u(out), bytes.length, true);
+      return p;
+    };
+    const hold = (bytes) => {
+      held = bytes;
+      return bytes.length;
+    };
     return {
       memory,
       u,
@@ -370,10 +387,10 @@ export function createHost(platform) {
       error(message) {
         lastError = message;
       },
-      hold(bytes) {
-        held = bytes;
-        return bytes.length;
-      },
+      give,
+      hold,
+      // With out undefined, the seed's older shape: the length, the bytes held for take.
+      given: (bytes, out) => (out === undefined ? hold(bytes) : give(bytes, out)),
       event(kind, id, tag, value, bytes, data) {
         event(made.source, kind, id, tag, value, bytes, data);
       },
@@ -400,8 +417,10 @@ export function createHost(platform) {
   }
 
   function hostImports(self) {
-    const { memory, string, u, hold } = callerOf(self, 'host');
-    // A call that gives bytes returns their length and holds them for take, which copies up to cap.
+    const { memory, string, u, given } = callerOf(self, 'host');
+    // A call that gives bytes returns them in a block from the program's malloc, ended by a zero, with their length
+    // at out unless out is 0; or 0 when there are none. The seed's older shape gives -1 then.
+    const none = (out) => (out === undefined ? -1 : 0);
     return {
       take(bp, cap) {
         memory().set(held.subarray(0, cap), u(bp));
@@ -428,27 +447,27 @@ export function createHost(platform) {
         const f = exports && exports[string(fp, fl)];
         return typeof f === 'function' ? table.grow(1, f) : -1;
       },
-      error_message() {
-        return hold(utf8.encode(lastError));
+      error_message(out) {
+        return given(utf8.encode(lastError), out);
       },
-      arg(i) {
-        if (i < 0 || i >= platform.args.length) return -1;
+      arg(i, out) {
+        if (i < 0 || i >= platform.args.length) return none(out);
         const a = platform.args[i];
-        return hold(typeof a === 'string' ? utf8.encode(a) : a);
+        return given(typeof a === 'string' ? utf8.encode(a) : a, out);
       },
       exit(code) {
         platform.exit(code);
       },
-      program_modules() {
-        return hold(utf8.encode(joined(programNames)));
+      program_modules(out) {
+        return given(utf8.encode(joined(programNames)), out);
       },
-      module_bytes(np, nl) {
+      module_bytes(np, nl, out) {
         const name = string(np, nl);
         if (!programNames.includes(name)) {
           lastError = `the running program has no module ${name}`;
-          return -1;
+          return none(out);
         }
-        return hold(programBytes(name));
+        return given(programBytes(name), out);
       },
     };
   }
@@ -513,6 +532,8 @@ export function createHost(platform) {
     }
     try {
       self.exports = new WebAssembly.Instance(module, imports).exports;
+      const { memory, malloc } = self.exports;
+      if (memory && typeof malloc === 'function' && !allocators.has(memory)) allocators.set(memory, malloc);
       const start = self.exports[START_EXPORT];
       if (start) start();
     } catch (e) {

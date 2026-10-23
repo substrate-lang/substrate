@@ -3,9 +3,9 @@ const utf8 = new TextEncoder();
 
 export function env() {
   return (caller) => ({
-    get(ptr, len) {
+    get(ptr, len, out) {
       const value = process.env[caller.string(ptr, len)];
-      return value === undefined ? -1 : caller.hold(utf8.encode(value));
+      return value === undefined ? 0 : caller.give(utf8.encode(value), out);
     },
   });
 }

@@ -23,7 +23,7 @@ export function locationModule() {
       end() {
         removeEventListener('popstate', popped);
       },
-      get: () => caller.hold(utf8.encode(globalThis.location.href)),
+      get: (out) => caller.give(utf8.encode(globalThis.location.href), out),
       push: (ptr, len) => move((url) => history.pushState(null, '', url), ptr, len),
       replace: (ptr, len) => move((url) => history.replaceState(null, '', url), ptr, len),
       back() {

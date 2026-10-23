@@ -1,6 +1,6 @@
 // The host module "fs": files by path. node/fs.mjs and web/fs.mjs each give their files.
-// read_file(path): the size, the bytes held for host.take; -1 if missing. write_file, make_dir, remove, rename:
-// 0, or -1. stat: the size, -1 if missing, -2 for a directory. list: the names, each ended by a zero, held. open
+// read_file and list give their bytes as host.arg does, 0 if missing: the file's, or the names, each ended by a
+// zero. write_file, make_dir, remove, rename: 0, or -1. stat: the size, -1 if missing, -2 for a directory. open
 // gives a stream; its modes: read 0, write 1, append 2.
 import { joined } from './entries.mjs';
 
@@ -8,18 +8,18 @@ const utf8 = new TextEncoder();
 
 export function fsModule(files) {
   return (caller) => {
-    const attempt = (path, f) => {
+    const attempt = (path, f, failed = -1) => {
       try {
         return f();
       } catch (e) {
         caller.error(`${path}: ${e.message}`);
-        return -1;
+        return failed;
       }
     };
     return {
-      read_file(pp, pl) {
+      read_file(pp, pl, out) {
         const path = caller.string(pp, pl);
-        return attempt(path, () => caller.hold(files.read(path)));
+        return attempt(path, () => caller.given(files.read(path), out), out === undefined ? -1 : 0);
       },
       write_file(pp, pl, ptr, len) {
         const path = caller.string(pp, pl);
@@ -34,9 +34,9 @@ export function fsModule(files) {
         const path = caller.string(pp, pl);
         return BigInt(attempt(path, () => files.stat(path)));
       },
-      list(pp, pl) {
+      list(pp, pl, out) {
         const path = caller.string(pp, pl);
-        return attempt(path, () => caller.hold(utf8.encode(joined(files.list(path)))));
+        return attempt(path, () => caller.given(utf8.encode(joined(files.list(path))), out), out === undefined ? -1 : 0);
       },
       remove(pp, pl) {
         const path = caller.string(pp, pl);
