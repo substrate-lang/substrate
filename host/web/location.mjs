@@ -9,12 +9,12 @@ export function locationModule() {
   return (caller) => {
     const popped = () => caller.event(CHANGED, 0, 0, 0, utf8.encode(globalThis.location.href));
     addEventListener('popstate', popped);
-    const move = (go, ptr, len) => {
+    const move = (go, ptr, len, err) => {
       try {
         go(caller.string(ptr, len));
         return 0;
       } catch (e) {
-        caller.error(e.message);
+        caller.fail(err, e.message);
         return -1;
       }
     };
@@ -24,8 +24,8 @@ export function locationModule() {
         removeEventListener('popstate', popped);
       },
       get: (out) => caller.give(utf8.encode(globalThis.location.href), out),
-      push: (ptr, len) => move((url) => history.pushState(null, '', url), ptr, len),
-      replace: (ptr, len) => move((url) => history.replaceState(null, '', url), ptr, len),
+      push: (ptr, len, err) => move((url) => history.pushState(null, '', url), ptr, len, err),
+      replace: (ptr, len, err) => move((url) => history.replaceState(null, '', url), ptr, len, err),
       back() {
         history.back();
       },

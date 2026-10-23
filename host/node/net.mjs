@@ -25,7 +25,7 @@ export function netModule(granted = {}) {
         for (const server of listeners.values()) server.close();
         listeners.clear();
       },
-      listen(port, hp, hl, secure, tag) {
+      listen(port, hp, hl, secure, tag, err) {
         let server;
         try {
           const host = caller.string(hp, hl);
@@ -33,7 +33,7 @@ export function netModule(granted = {}) {
           server = secure ? tls.createServer(granted.tls) : net.createServer();
           server.listen(port, host || '127.0.0.1');
         } catch (e) {
-          caller.error(e.message);
+          caller.fail(err, e.message);
           return 0;
         }
         const id = next++;
@@ -52,7 +52,7 @@ export function netModule(granted = {}) {
         });
         return id;
       },
-      connect(port, hp, hl, secure, tag) {
+      connect(port, hp, hl, secure, tag, err) {
         let socket;
         try {
           const host = caller.string(hp, hl);
@@ -60,7 +60,7 @@ export function netModule(granted = {}) {
             ? tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, ca })
             : net.connect({ host, port });
         } catch (e) {
-          caller.error(e.message);
+          caller.fail(err, e.message);
           return 0;
         }
         let connected = false;

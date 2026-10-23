@@ -20,7 +20,7 @@ export function files() {
       end() {
         ended = true;
       },
-      pick(multiple, ap, al, tag) {
+      pick(multiple, ap, al, tag, err) {
         const id = next++;
         const input = document.createElement('input');
         input.type = 'file';
@@ -45,7 +45,7 @@ export function files() {
           input.showPicker();
         } catch (e) {
           input.remove();
-          caller.error(e.message);
+          caller.fail(err, e.message);
           return 0;
         }
         return id;

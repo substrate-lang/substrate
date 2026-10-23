@@ -36,13 +36,13 @@ export function websocket() {
         for (const s of sockets.values()) s.ws.close(1000);
         sockets.clear();
       },
-      connect(ptr, len, tag) {
+      connect(ptr, len, tag, err) {
         const url = caller.string(ptr, len);
         let ws;
         try {
           ws = new WebSocket(url);
         } catch (e) {
-          caller.error(e.message);
+          caller.fail(err, e.message);
           return 0;
         }
         const id = next++;

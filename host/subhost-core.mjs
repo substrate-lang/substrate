@@ -298,6 +298,19 @@ export function createHost(platform) {
     };
   }
 
+  // Bytes in a block from the malloc of memory m, ended by a zero; their length at out unless out is 0.
+  function giveIn(m, bytes, out, who) {
+    const malloc = m && allocators.get(m);
+    if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
+    const p = malloc(bytes.length + 1) >>> 0;
+    if (p === 0) hostTrap(`${who}: out of memory`);
+    const view = new Uint8Array(m.buffer);
+    view.set(bytes, p);
+    view[p + bytes.length] = 0;
+    if (out) new DataView(m.buffer).setUint32(out >>> 0, bytes.length, true);
+    return p;
+  }
+
   function callerOf(self, who, made) {
     const memory = () => {
       const m = self.exports && self.exports.memory;
@@ -305,6 +318,7 @@ export function createHost(platform) {
       return new Uint8Array(m.buffer);
     };
     const u = (ptr) => ptr >>> 0;
+    const give = (bytes, out) => giveIn(self.exports && self.exports.memory, bytes, out, who);
     return {
       memory,
       u,
@@ -313,19 +327,14 @@ export function createHost(platform) {
         return self.exports;
       },
       trap: hostTrap,
-      error(message) {
-        lastError = message;
-      },
-      give(bytes, out) {
-        const malloc = allocators.get(self.exports.memory);
-        if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
-        const p = malloc(bytes.length + 1) >>> 0;
-        if (p === 0) hostTrap(`${who}: out of memory`);
-        const m = memory();
-        m.set(bytes, p);
-        m[p + bytes.length] = 0;
-        if (out) new DataView(m.buffer).setUint32(u(out), bytes.length, true);
-        return p;
+      give,
+      // With err undefined, the seed's older shape: the last error.
+      fail(err, message) {
+        if (err === undefined) lastError = message;
+        else if (err) {
+          const p = give(utf8.encode(message), 0);
+          new DataView(memory().buffer).setUint32(u(err), p, true);
+        }
       },
       event(kind, id, tag, value, bytes, data) {
         event(made.source, kind, id, tag, value, bytes, data);
@@ -353,9 +362,10 @@ export function createHost(platform) {
   }
 
   function hostImports(self) {
-    const { memory, string, u, give } = callerOf(self, 'host');
+    const { memory, string, u, give, fail } = callerOf(self, 'host');
     // A call that gives bytes returns them in a block from the program's malloc, ended by a zero, with their length
-    // at out unless out is 0; or 0 when there are none.
+    // at out unless out is 0; or 0 when there are none. A call that can fail puts its reason, given the same way, at
+    // err unless err is 0.
     return {
       write(fd, ptr, len) {
         platform.write(fd === 2 ? 2 : 1, memory().subarray(u(ptr), u(ptr) + len));
@@ -365,11 +375,13 @@ export function createHost(platform) {
         hostTrap(string(ptr, len));
       },
       // compileTime is 1 for code the compiler runs while compiling.
-      instantiate(np, nl, bp, bl, mp, ml, compileTime) {
+      instantiate(np, nl, bp, bl, mp, ml, compileTime, err) {
         const name = string(np, nl);
         const bytes = memory().slice(u(bp), u(bp) + bl);
         const map = importMap(memory().slice(u(mp), u(mp) + ml));
-        return instantiate(name, bytes, map, compileTime !== 0) ? 0 : 1;
+        if (instantiate(name, bytes, map, compileTime !== 0)) return 0;
+        fail(err, lastError);
+        return 1;
       },
       export_index(ip, il, fp, fl) {
         const table = self.exports.table;
@@ -378,6 +390,7 @@ export function createHost(platform) {
         const f = exports && exports[string(fp, fl)];
         return typeof f === 'function' ? table.grow(1, f) : -1;
       },
+      // The seed's.
       error_message(out) {
         return give(utf8.encode(lastError), out);
       },
@@ -394,11 +407,7 @@ export function createHost(platform) {
       },
       module_bytes(np, nl, out) {
         const name = string(np, nl);
-        if (!programNames.includes(name)) {
-          lastError = `the running program has no module ${name}`;
-          return 0;
-        }
-        return give(programBytes(name), out);
+        return programNames.includes(name) ? give(programBytes(name), out) : 0;
       },
     };
   }
@@ -557,10 +566,11 @@ export function createHost(platform) {
         return false;
       }
       if (!trapped(e)) throw e;
-      // on-trap gives 1 when the program recovered; with 0, or none, the error is reported and the program ends.
-      if (onTrap) {
+      // on-trap, given the trap's message in a block from the program's malloc, gives 1 when the program recovered;
+      // with 0, or none, the error is reported and the program ends.
+      if (onTrap && allocators.has(entry.memory)) {
         try {
-          if (onTrap() !== 0) return false;
+          if (onTrap(giveIn(entry.memory, utf8.encode(lastError), 0, 'on-trap')) !== 0) return false;
         } catch (e2) {
           if (e2 instanceof Exit) {
             end(e2.code, '');

@@ -13,9 +13,9 @@ export function clipboard() {
   return (caller) => {
     let next = 1;
     let ended = false;
-    const attempt = (tag, ask, answer) => {
+    const attempt = (tag, err, ask, answer) => {
       if (!navigator.clipboard) {
-        caller.error('clipboard: none');
+        caller.fail(err, 'clipboard: none');
         return 0;
       }
       const id = next++;
@@ -31,10 +31,11 @@ export function clipboard() {
       end() {
         ended = true;
       },
-      read: (tag) => attempt(tag, () => navigator.clipboard.readText(), (id, text) => caller.event(TEXT, id, tag, 0, utf8.encode(text))),
-      write(ptr, len, tag) {
+      read: (tag, err) => attempt(tag, err, () => navigator.clipboard.readText(),
+        (id, text) => caller.event(TEXT, id, tag, 0, utf8.encode(text))),
+      write(ptr, len, tag, err) {
         const text = caller.string(ptr, len);
-        return attempt(tag, () => navigator.clipboard.writeText(text), (id) => caller.event(WRITTEN, id, tag, 0));
+        return attempt(tag, err, () => navigator.clipboard.writeText(text), (id) => caller.event(WRITTEN, id, tag, 0));
       },
     };
   };

@@ -42,14 +42,14 @@ export function workerModule({ spawn }) {
       : null;
   };
 
-  function start(entry, argument, time, pages, tag, app) {
+  function start(entry, argument, time, pages, tag, app, err) {
     const program = caller.program();
     const modules = program.names.map((name) => [name, program.bytes(name)]);
     let thread;
     try {
       thread = spawn({ modules, entry, argument, grants: [...caller.grants().values()], pages }, app);
     } catch (e) {
-      caller.error(e.message);
+      caller.fail(err, e.message);
       return 0;
     }
     const w = nextNumber++;
@@ -78,8 +78,8 @@ export function workerModule({ spawn }) {
       end() {
         for (const w of [...alive.keys()]) end(w, -1, null);
       },
-      start(np, nl, bp, bl, time, size, tag) {
-        return start(string(np, nl), bytes(bp, bl), time >>> 0, Math.ceil((size >>> 0) / 65536), tag, app);
+      start(np, nl, bp, bl, time, size, tag, err) {
+        return start(string(np, nl), bytes(bp, bl), time >>> 0, Math.ceil((size >>> 0) / 65536), tag, app, err);
       },
       send(w, ptr, len) {
         const worker = alive.get(w);

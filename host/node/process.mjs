@@ -27,7 +27,7 @@ export function processes() {
         for (const c of children.values()) c.process.kill();
         children.clear();
       },
-      spawn(pp, pl, ap, al, dp, dl, ep, el, stdin, stdout, stderr, tag) {
+      spawn(pp, pl, ap, al, dp, dl, ep, el, stdin, stdout, stderr, tag, err) {
         const modes = [stdin, stdout, stderr].map((mode) => ['pipe', 'ignore', 'inherit'][mode] || 'pipe');
         let process;
         try {
@@ -43,7 +43,7 @@ export function processes() {
             stdio: modes,
           });
         } catch (e) {
-          caller.error(e.message);
+          caller.fail(err, e.message);
           return 0;
         }
         const id = next++;
