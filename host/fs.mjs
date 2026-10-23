@@ -19,7 +19,7 @@ export function fsModule(files) {
     return {
       read_file(pp, pl, out) {
         const path = caller.string(pp, pl);
-        return attempt(path, () => caller.given(files.read(path), out), out === undefined ? -1 : 0);
+        return attempt(path, () => caller.give(files.read(path), out), 0);
       },
       write_file(pp, pl, ptr, len) {
         const path = caller.string(pp, pl);
@@ -36,7 +36,7 @@ export function fsModule(files) {
       },
       list(pp, pl, out) {
         const path = caller.string(pp, pl);
-        return attempt(path, () => caller.given(utf8.encode(joined(files.list(path))), out), out === undefined ? -1 : 0);
+        return attempt(path, () => caller.give(utf8.encode(joined(files.list(path))), out), 0);
       },
       remove(pp, pl) {
         const path = caller.string(pp, pl);

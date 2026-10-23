@@ -230,7 +230,6 @@ export function createHost(platform) {
   // A memory's malloc, from the module that exports both.
   const allocators = new WeakMap();
   let lastError = '';
-  let held = new Uint8Array(0);
   // The running program: its modules' names in load order, and how to get one's bytes.
   let programNames = [];
   let programBytes = null;
@@ -257,7 +256,7 @@ export function createHost(platform) {
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
 
-  const COMPILE_TIME_HOST = new Set(['write', 'trap', 'error_message', 'take']);
+  const COMPILE_TIME_HOST = new Set(['write', 'trap']);
   const refused = (what) => () => hostTrap(`${what} is not available while compiling`);
 
   function hostTrap(message) {
@@ -361,21 +360,6 @@ export function createHost(platform) {
       return new Uint8Array(m.buffer);
     };
     const u = (ptr) => ptr >>> 0;
-    const give = (bytes, out) => {
-      const malloc = allocators.get(self.exports.memory);
-      if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
-      const p = malloc(bytes.length + 1) >>> 0;
-      if (p === 0) hostTrap(`${who}: out of memory`);
-      const m = memory();
-      m.set(bytes, p);
-      m[p + bytes.length] = 0;
-      if (out) new DataView(m.buffer).setUint32(u(out), bytes.length, true);
-      return p;
-    };
-    const hold = (bytes) => {
-      held = bytes;
-      return bytes.length;
-    };
     return {
       memory,
       u,
@@ -387,10 +371,17 @@ export function createHost(platform) {
       error(message) {
         lastError = message;
       },
-      give,
-      hold,
-      // With out undefined, the seed's older shape: the length, the bytes held for take.
-      given: (bytes, out) => (out === undefined ? hold(bytes) : give(bytes, out)),
+      give(bytes, out) {
+        const malloc = allocators.get(self.exports.memory);
+        if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
+        const p = malloc(bytes.length + 1) >>> 0;
+        if (p === 0) hostTrap(`${who}: out of memory`);
+        const m = memory();
+        m.set(bytes, p);
+        m[p + bytes.length] = 0;
+        if (out) new DataView(m.buffer).setUint32(u(out), bytes.length, true);
+        return p;
+      },
       event(kind, id, tag, value, bytes, data) {
         event(made.source, kind, id, tag, value, bytes, data);
       },
@@ -417,15 +408,10 @@ export function createHost(platform) {
   }
 
   function hostImports(self) {
-    const { memory, string, u, given } = callerOf(self, 'host');
+    const { memory, string, u, give } = callerOf(self, 'host');
     // A call that gives bytes returns them in a block from the program's malloc, ended by a zero, with their length
-    // at out unless out is 0; or 0 when there are none. The seed's older shape gives -1 then.
-    const none = (out) => (out === undefined ? -1 : 0);
+    // at out unless out is 0; or 0 when there are none.
     return {
-      take(bp, cap) {
-        memory().set(held.subarray(0, cap), u(bp));
-        return held.length;
-      },
       write(fd, ptr, len) {
         platform.write(fd === 2 ? 2 : 1, memory().subarray(u(ptr), u(ptr) + len));
         return len;
@@ -448,26 +434,26 @@ export function createHost(platform) {
         return typeof f === 'function' ? table.grow(1, f) : -1;
       },
       error_message(out) {
-        return given(utf8.encode(lastError), out);
+        return give(utf8.encode(lastError), out);
       },
       arg(i, out) {
-        if (i < 0 || i >= platform.args.length) return none(out);
+        if (i < 0 || i >= platform.args.length) return 0;
         const a = platform.args[i];
-        return given(typeof a === 'string' ? utf8.encode(a) : a, out);
+        return give(typeof a === 'string' ? utf8.encode(a) : a, out);
       },
       exit(code) {
         platform.exit(code);
       },
       program_modules(out) {
-        return given(utf8.encode(joined(programNames)), out);
+        return give(utf8.encode(joined(programNames)), out);
       },
       module_bytes(np, nl, out) {
         const name = string(np, nl);
         if (!programNames.includes(name)) {
           lastError = `the running program has no module ${name}`;
-          return none(out);
+          return 0;
         }
-        return given(programBytes(name), out);
+        return give(programBytes(name), out);
       },
     };
   }
