@@ -160,6 +160,62 @@ function importMap(bytes) {
   return map;
 }
 
+// The names of the modules a wasm module imports from, read from its import section.
+export function importedModules(bytes) {
+  let at = 8;
+  const byte = () => bytes[at++];
+  const uleb = () => {
+    let n = 0;
+    let shift = 0;
+    let b;
+    do {
+      b = byte();
+      n += (b & 127) * 2 ** shift;
+      shift += 7;
+    } while (b & 128);
+    return n;
+  };
+  const name = () => {
+    const n = uleb();
+    at += n;
+    return text.decode(bytes.subarray(at - n, at));
+  };
+  const limits = () => {
+    const flags = byte();
+    uleb();
+    if (flags & 1) uleb();
+  };
+  const names = new Set();
+  while (at < bytes.length) {
+    const id = byte();
+    const size = uleb();
+    const end = at + size;
+    if (id === 2) {
+      for (let n = uleb(); n > 0; n--) {
+        names.add(name());
+        name();
+        const kind = byte();
+        if (kind === 0) uleb();
+        else if (kind === 1) {
+          byte();
+          limits();
+        } else if (kind === 2) limits();
+        else if (kind === 3) {
+          byte();
+          byte();
+        } else if (kind === 4) {
+          byte();
+          uleb();
+        }
+      }
+      break;
+    }
+    if (id > 2) break;
+    at = end;
+  }
+  return names;
+}
+
 export class Exit {
   constructor(code) {
     this.code = code;
@@ -176,6 +232,7 @@ export function createHost(platform) {
   let entry = null;
   let ended = false;
   let running = false;
+  let active = false;
   let draining = false;
   const queue = [];
   let current = null;
@@ -317,7 +374,8 @@ export function createHost(platform) {
         forgetEvents(made.source, id);
       },
       current: () => current,
-      modules: () => (platform.modules ? [...platform.modules.keys()] : []),
+      grants: () => platform.grants || new Map(platform.modules ? [...platform.modules.keys()].map((n) => [n, n]) : []),
+      module: (name) => (platform.modules ? platform.modules.get(name) : undefined),
       streams: { add: streams.add, tag: streams.tag, drop: streams.drop, close: streams.close, open: streams.open },
     };
   }
@@ -505,7 +563,12 @@ export function createHost(platform) {
   function call(f, args) {
     if (ended) return false;
     const outer = running;
+    const first = !active;
     running = true;
+    if (first) {
+      active = true;
+      if (platform.active) platform.active(true);
+    }
     try {
       f(...args);
       return true;
@@ -534,6 +597,10 @@ export function createHost(platform) {
     } finally {
       running = outer;
       if (!outer) drain();
+      if (first) {
+        active = false;
+        if (platform.active) platform.active(false);
+      }
     }
   }
 

@@ -6,6 +6,7 @@ import child from 'node:child_process';
 import os from 'node:os';
 import { errorOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
+import { settings } from '../settings.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -17,11 +18,7 @@ const pipes = ['stdin', 'stdout', 'stderr'];
 
 function parseSpec(text) {
   const spec = { program: null, args: [], dir: null, env: {}, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' };
-  for (const line of text.split('\n')) {
-    const space = line.indexOf(' ');
-    const word = space < 0 ? line : line.slice(0, space);
-    const value = space < 0 ? '' : line.slice(space + 1);
-    if (word === '') continue;
+  settings(text, 'process.spawn', (word, value) => {
     if (word === 'program') spec.program = value;
     else if (word === 'arg') spec.args.push(value);
     else if (word === 'dir') spec.dir = value;
@@ -29,8 +26,9 @@ function parseSpec(text) {
       const equals = value.indexOf('=');
       spec.env[equals < 0 ? value : value.slice(0, equals)] = equals < 0 ? '' : value.slice(equals + 1);
     } else if (pipes.includes(word) && (value === 'ignore' || value === 'inherit')) spec[word] = value;
-    else throw new Error(`process.spawn: unknown setting "${word}" in the spec`);
-  }
+    else return false;
+    return true;
+  });
   if (spec.program === null) throw new Error('process.spawn: the spec has no "program" line');
   return spec;
 }

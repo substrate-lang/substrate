@@ -5,17 +5,14 @@ import { createHost, Exit } from '../subhost-core.mjs';
 import { fsModule } from '../fs.mjs';
 import { guestSide } from '../guest-side.mjs';
 import { nodeFiles } from './fs.mjs';
+import { loadModule, nameOf } from './modules.mjs';
 
 const side = guestSide((m, transfer) => parentPort.postMessage(m, transfer));
 
 parentPort.on('message', async (m) => {
   if (m.type === 'start') {
-    const files = nodeFiles();
-    const modules = new Map(Object.entries({
-      guest: side.guest,
-      fs: fsModule(files, { read: m.readable.map(files.resolve), write: m.writable.map(files.resolve) }),
-      ...await side.modules(m.modules),
-    }));
+    const modules = new Map([['guest', side.guest], ['fs', fsModule(nodeFiles(), { read: m.readable, write: m.writable })]]);
+    for (const spec of m.modules) modules.set(nameOf(spec), await loadModule(spec));
     const host = createHost({
       args: m.args,
       write: side.write,
@@ -25,6 +22,7 @@ parentPort.on('message', async (m) => {
       report: side.report,
       ended: side.ended,
       delivered: side.delivered,
+      active: side.active,
       modules,
       memoryPages: m.memory * 16,
     });

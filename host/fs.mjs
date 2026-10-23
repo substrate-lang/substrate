@@ -7,9 +7,12 @@ const utf8 = new TextEncoder();
 
 export const isUnder = (dir, path) => path === dir || path.startsWith(dir === '/' ? dir : `${dir}/`);
 
+// Whether a resolved path lies in one of the directories; no directories means anywhere.
+export const within = (dirs, path) => !dirs || dirs.some((dir) => isUnder(dir, path));
+
 export function fsModule(files, bounds = {}) {
-  const within = (dirs, path) => !dirs || dirs.some((dir) => isUnder(dir, files.resolve(path)));
-  return (caller) => {
+  const inside = (dirs, path) => !dirs || within(dirs, files.resolve(path));
+  const module = (caller) => {
     const attempt = (path, f) => {
       try {
         return f();
@@ -19,11 +22,11 @@ export function fsModule(files, bounds = {}) {
       }
     };
     const readable = (path) => {
-      if (!within(bounds.read, path)) throw new Error('No such file or directory');
+      if (!inside(bounds.read, path)) throw new Error('No such file or directory');
       return path;
     };
     const writable = (path) => {
-      if (!within(bounds.write, path)) throw new Error('Permission denied');
+      if (!inside(bounds.write, path)) throw new Error('Permission denied');
       return path;
     };
     const give = (bytes, buf, cap) => {
@@ -72,4 +75,6 @@ export function fsModule(files, bounds = {}) {
       },
     };
   };
+  module.bounds = bounds;
+  return module;
 }

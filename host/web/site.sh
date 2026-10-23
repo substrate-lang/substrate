@@ -14,6 +14,10 @@ out="$1"
 file="$2"
 shift 2
 page="$root/host/web/page.html"
+if [ -e "$out" ] && { [ ! -d "$out" ] || { [ -n "$(ls -A "$out")" ] && [ ! -f "$out/program/program" ]; }; }; then
+  echo "site: $out is not a site, so it is not replaced" >&2
+  exit 1
+fi
 rm -rf "${out:?}"
 mkdir -p "$out/host/modules" "$out/host/web"
 program() {

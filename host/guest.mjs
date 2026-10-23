@@ -1,5 +1,8 @@
 // The host module "guest": runs another program in a worker, sharing nothing but messages. The
-// browser and Node each give it their way of starting a worker.
+// browser and Node each give it their way of starting a worker. A guest gets only what its parent has: its
+// program and folders must be within the parent's, and its modules are the parent's grants.
+import { settings } from './settings.mjs';
+
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
@@ -19,11 +22,7 @@ export function parseSpec(spec) {
     }
     return Number(value);
   };
-  for (const line of spec.split('\n')) {
-    if (line.trim() === '') continue;
-    const space = line.indexOf(' ');
-    const word = space < 0 ? line : line.slice(0, space);
-    const value = space < 0 ? '' : line.slice(space + 1);
+  settings(spec, 'guest.start', (word, value) => {
     if (word === 'program') result.program = value;
     else if (word === 'arg') result.args.push(value);
     else if (word === 'read') result.read.push(value);
@@ -31,14 +30,16 @@ export function parseSpec(spec) {
     else if (word === 'module') result.modules.push(value);
     else if (word === 'time') result.time = positiveInteger(word, value);
     else if (word === 'memory') result.memory = positiveInteger(word, value);
-    else throw new Error(`guest.start: unknown setting "${word}" in the spec`);
-  }
+    else return false;
+    return true;
+  });
   if (result.program === null) throw new Error('guest.start: the spec has no "program" line');
   return result;
 }
 
-// spawn(spec, app) starts a worker running the spec's program and returns it: post(message, transfer),
-// terminate(), onMessage(f) and onError(f), f given the reason.
+// spawn(spec, app, bounds) starts a worker running the spec's program, whose folders must lie within the
+// parent's bounds, and returns it: post(message, transfer), terminate(), onMessage(f) and onError(f), f given
+// the reason. The spec's modules are the parent's grants for them.
 export function guestModule(spawn) {
   let caller = null;
   const alive = new Map();
@@ -58,35 +59,36 @@ export function guestModule(spawn) {
     if (reason !== null) deliver(g, guest.tag, ENDED, utf8.encode(reason));
   };
 
-  const restartTimer = (g, guest) => {
+  // The time limit runs while the guest is busy: from its start, and from each call into it.
+  const limit = (g, guest) => {
     clearTimeout(guest.timer);
-    guest.timer = guest.time > 0 && guest.unfinished > 0
-      ? setTimeout(() => end(g, `time limit exceeded (${guest.time} ms)`), guest.time)
-      : null;
+    guest.timer = guest.time > 0 ? setTimeout(() => end(g, `time limit exceeded (${guest.time} ms)`), guest.time) : null;
   };
 
   function start(specText, tag, app) {
     const spec = parseSpec(specText);
-    const granted = caller.modules();
-    for (const name of spec.modules) {
-      if (!floorModules.includes(name) || !granted.includes(name)) throw new Error(`guest.start: no module ${name} to grant`);
-    }
-    const worker = spawn(spec, app);
+    const grants = caller.grants();
+    const modules = spec.modules.map((name) => {
+      if (!floorModules.includes(name) || !grants.has(name)) throw new Error(`guest.start: no module ${name} to grant`);
+      return grants.get(name);
+    });
+    if (!grants.has('fs')) throw new Error('guest.start: no files to grant');
+    const fs = caller.module('fs');
+    const worker = spawn({ ...spec, modules }, app, (fs && fs.bounds) || {});
     const g = nextNumber++;
-    const guest = { worker, tag, time: spec.time, unfinished: 1, timer: null };
+    const guest = { worker, tag, time: spec.time, timer: null };
     alive.set(g, guest);
     worker.onMessage((m) => {
       if (alive.get(g) !== guest) return;
       if (m.type === 'output') deliver(g, tag, m.fd === 2 ? STDERR : STDOUT, m.bytes);
       else if (m.type === 'message') deliver(g, tag, MESSAGE, m.bytes);
-      else if (m.type === 'done') {
-        guest.unfinished--;
-        restartTimer(g, guest);
-        deliver(g, tag, DONE, utf8.encode(m.trap));
-      } else if (m.type === 'ended') end(g, m.reason);
+      else if (m.type === 'done') deliver(g, tag, DONE, utf8.encode(m.trap));
+      else if (m.type === 'busy') limit(g, guest);
+      else if (m.type === 'idle') clearTimeout(guest.timer);
+      else if (m.type === 'ended') end(g, m.reason);
     });
     worker.onError((reason) => end(g, reason));
-    restartTimer(g, guest);
+    limit(g, guest);
     return g;
   }
 
@@ -110,7 +112,6 @@ export function guestModule(spawn) {
         if (!guest) return -1;
         const bytes = caller.memory().slice(caller.u(ptr), caller.u(ptr) + length);
         guest.worker.post({ type: 'message', bytes }, [bytes.buffer]);
-        if (guest.unfinished++ === 0) restartTimer(g, guest);
         return 0;
       },
       stop(g) {

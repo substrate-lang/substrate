@@ -5,6 +5,7 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { errorOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
+import { settings } from '../settings.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -16,15 +17,12 @@ const FAILED = 4;
 
 function parseOptions(text) {
   const options = { tls: false, host: null };
-  for (const line of text.split('\n')) {
-    const space = line.indexOf(' ');
-    const word = space < 0 ? line : line.slice(0, space);
-    const value = space < 0 ? '' : line.slice(space + 1);
-    if (word === '') continue;
+  settings(text, 'net', (word, value) => {
     if (word === 'tls') options.tls = true;
     else if (word === 'host') options.host = value;
-    else throw new Error(`net: unknown option "${word}"`);
-  }
+    else return false;
+    return true;
+  });
   return options;
 }
 

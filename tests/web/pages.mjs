@@ -326,7 +326,7 @@ const checks = {
       '3 done',
       'stopped guest 3; send to it returned -1',
       'no guest: guest.start: no program found in /nowhere',
-      'no guest: guest.start: unknown setting "frobnicate" in the spec',
+      'no guest: guest.start: unknown setting "frobnicate"',
       'no guest: guest.start: "time" needs a positive whole number, not "soon"',
       'finished',
       '',

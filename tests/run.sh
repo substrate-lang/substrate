@@ -26,6 +26,11 @@ mkdir -p "$builds/tls"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
 
+# A directory with a link out of it, for the guest test.
+mkdir -p "$builds/bounds/inside" "$builds/bounds/outside"
+echo secret > "$builds/bounds/outside/secret.txt"
+ln -s ../outside "$builds/bounds/inside/link"
+
 tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
        tests/crypto/*.sub tests/encoding/*.sub)
 for t in "${tests[@]}"; do
@@ -37,13 +42,14 @@ for t in "${tests[@]}"; do
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
   args=("${args[@]/@program/$root/$program}")
+  args=("${args[@]//@build/$root/$builds}")
   options=()
   if [ -f "$base.host" ]; then read -r -a options < "$base.host"; fi
   options=("${options[@]//@build/$root/$builds}")
   input=/dev/null
   if [ -f "$base.in" ]; then input="$root/$base.in"; fi
   actual="$(cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$program" -c "$cache" 2>&1 &&
-            "$host" ${options[@]+"${options[@]}"} "$root/$program" ${args[@]+"${args[@]}"} 2>&1 < "$input")"
+            timeout 60 "$host" ${options[@]+"${options[@]}"} "$root/$program" ${args[@]+"${args[@]}"} 2>&1 < "$input")"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then
@@ -75,7 +81,7 @@ for t in tests/events/*.sub; do
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
-  actual="$(cd tests/events && "$host" -g clock,random,timer,fetch,websocket,net,fs "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
+  actual="$(cd tests/events && timeout 60 "$host" -g clock,random,timer,fetch,websocket,net,fs "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
   code=$?
   if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then
     pass=$((pass + 1))

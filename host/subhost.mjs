@@ -1,21 +1,10 @@
 #!/usr/bin/env -S node --stack-size=4000
-// The host for Node: runs the program that `sub build` wrote to DIR, on V8.
+// The host for Node: runs the program that `sub build` wrote to DIR, on V8. A granted module is loaded only
+// when the program imports it.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import { createHost } from './subhost-core.mjs';
-import { clock } from './modules/clock.mjs';
-import { random } from './modules/random.mjs';
-import { timer } from './modules/timer.mjs';
-import { fetchModule } from './modules/fetch.mjs';
-import { websocket } from './modules/websocket.mjs';
-import { guests } from './node/guest.mjs';
-import { netModule } from './node/net.mjs';
-import { processes } from './node/process.mjs';
-import { stdin } from './node/stdin.mjs';
-import { env } from './node/env.mjs';
-import { fsModule } from './fs.mjs';
-import { nodeFiles } from './node/fs.mjs';
-import { fakeClock, fakeTimer, fakeFetch, fakeWebsocket } from './node/fake.mjs';
+import { createHost, Exit, importedModules } from './subhost-core.mjs';
+import { known, loadModule, nameOf } from './node/modules.mjs';
 
 function usage() {
   process.stderr.write('usage: sub run [-g MODULE[=fake[:DIR]|=tls:CERT:KEY],...] DIR [arg ...]\n');
@@ -23,55 +12,46 @@ function usage() {
 }
 
 const argv = process.argv.slice(2);
-const grants = [];
+const specs = [];
 while (argv.length > 0 && argv[0] === '-g') {
   if (argv.length < 2) usage();
-  grants.push(...argv[1].split(','));
+  specs.push(...argv[1].split(','));
   argv.splice(0, 2);
 }
 const [dir, ...programArgs] = argv;
 if (!dir) usage();
 
-const available = {
-  clock: () => clock(),
-  random: () => random(),
-  timer: () => timer(),
-  fetch: () => fetchModule(),
-  websocket: () => websocket(),
-  guest: () => guests({ cwd: process.cwd() }),
-  net: () => netModule(),
-  process: () => processes(),
-  stdin: () => stdin(),
-  env: () => env(),
-  fs: () => fsModule(nodeFiles()),
-};
-function granted(file) {
+const grants = new Map();
+if (specs.length === 0) for (const name of ['clock', 'random', 'timer', 'guest', 'stdin', 'env', 'fs']) grants.set(name, name);
+for (const spec of specs) {
+  if (!known(spec)) {
+    process.stderr.write(`subhost: no module ${spec}\n`);
+    process.exit(64);
+  }
+  grants.set(nameOf(spec), spec);
+}
+
+function read(file) {
   try {
     return fs.readFileSync(file);
   } catch (e) {
     process.stderr.write(`subhost: cannot read ${file}\n`);
-    process.exit(64);
+    process.exit(1);
   }
 }
-
-const variants = {
-  'clock=fake': () => fakeClock(),
-  'timer=fake': () => fakeTimer(),
-  'fetch=fake': (root) => fakeFetch(root || '.'),
-  'websocket=fake': () => fakeWebsocket(),
-  'net=tls': (cert, key) => netModule({ tls: { cert: granted(cert), key: granted(key) } }),
-};
+const names = read(`${dir}/program`).toString().split('\n').filter((n) => n !== '');
+const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
+const needed = new Set();
+for (const b of bytes.values()) for (const name of importedModules(b)) needed.add(name);
 const modules = new Map();
-if (grants.length === 0) for (const name of ['clock', 'random', 'timer', 'guest', 'stdin', 'env', 'fs']) modules.set(name, available[name]());
-for (const grant of grants) {
-  const [name, how] = grant.split('=');
-  const [kind, ...args] = how === undefined ? [] : how.split(':');
-  const variant = `${name}=${kind}`;
-  if (!(name in available) || (how !== undefined && !(variant in variants))) {
-    process.stderr.write(`subhost: no module ${grant}\n`);
+for (const [name, spec] of grants) {
+  if (!needed.has(name)) continue;
+  try {
+    modules.set(name, await loadModule(spec));
+  } catch (e) {
+    process.stderr.write(`subhost: ${e.message}\n`);
     process.exit(64);
   }
-  modules.set(name, how === undefined ? available[name]() : variants[variant](...args));
 }
 
 const host = createHost({
@@ -85,33 +65,20 @@ const host = createHost({
     }
   },
   exit(code) {
-    process.exit(code);
+    throw new Exit(code);
   },
   report(message) {
     process.stderr.write(`error: ${message}\n`);
   },
-  ended() {
-    process.exit(2);
+  ended(reason) {
+    process.exit(reason.startsWith('exit ') ? Number(reason.slice(5)) : 2);
   },
   modules,
+  grants,
   keyOf: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 });
 
-let names;
-try {
-  names = fs.readFileSync(`${dir}/program`, 'utf8').split('\n').filter((n) => n !== '');
-} catch (e) {
-  process.stderr.write(`subhost: cannot read ${dir}/program\n`);
-  process.exit(1);
-}
-const entry = host.load(names, (name) => {
-  try {
-    return fs.readFileSync(`${dir}/${name}.wasm`);
-  } catch (e) {
-    process.stderr.write(`subhost: cannot read ${dir}/${name}.wasm\n`);
-    process.exit(1);
-  }
-});
+const entry = host.load(names, (name) => bytes.get(name));
 if (!entry) {
   process.stderr.write(`error: ${host.lastError}\n`);
   process.exit(2);

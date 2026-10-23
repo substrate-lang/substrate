@@ -1,7 +1,6 @@
 // Node's files, for fs.mjs: the file system.
 import fs from 'node:fs';
 import path from 'node:path';
-import util from 'node:util';
 import { nodeSource } from '../streams.mjs';
 
 const modes = { 0: 'r', 1: 'w', 2: 'a' };
@@ -19,14 +18,14 @@ const plain = (f) => (...args) => {
     return f(...args);
   } catch (e) {
     if (typeof e.errno !== 'number') throw e;
-    const m = util.getSystemErrorMessage(e.errno);
+    const m = e.message.replace(/^[A-Z]+: /, '').replace(/, [a-z]+ '.*$/, '');
     throw new Error(m.charAt(0).toUpperCase() + m.slice(1));
   }
 };
 
 export function nodeFiles() {
   return {
-    resolve: (p) => real(path.resolve(p)),
+    resolve: (p) => real(path.isAbsolute(p) ? p : `${process.cwd()}/${p}`),
     read: plain((p) => fs.readFileSync(p)),
     write: plain((p, bytes) => fs.writeFileSync(p, bytes)),
     makeDir: plain((p) => fs.mkdirSync(p, { recursive: true })),
