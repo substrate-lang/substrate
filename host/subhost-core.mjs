@@ -506,18 +506,15 @@ export function createHost(platform) {
       running = false;
     }
     entry = names.length > 0 ? registry.get(names[names.length - 1]) : {};
-    onEvent = latest(names, 'on-event');
-    onTrap = latest(names, 'on-trap');
+    onEvent = hook(names, 'on-event');
+    onTrap = hook(names, 'on-trap');
     if (typeof entry.main !== 'function') drain();
     return entry;
   }
 
-  // The function of that name from the last of the modules that exports one.
-  function latest(names, name) {
-    for (let i = names.length - 1; i >= 0; i--) {
-      const f = registry.get(names[i])[name];
-      if (typeof f === 'function') return f;
-    }
+  // The main module's function of that name, or else the first module's: the language's own.
+  function hook(names, name) {
+    for (const m of [entry, registry.get(names[0])]) if (m && typeof m[name] === 'function') return m[name];
     return null;
   }
 
