@@ -296,13 +296,9 @@ const checks = {
       '1 done',
       '1 message: read 12 bytes',
       '1 done',
-      '1 message: cannot read /secret/key.txt: No such file or directory',
+      '1 message: cannot write /out/made.txt: Read-only file system',
       '1 done',
-      '1 message: wrote',
-      '1 done',
-      '1 message: read 7 bytes',
-      '1 done',
-      '1 message: cannot write /data/note.txt: Permission denied',
+      '1 message: cannot read /out/made.txt: No such file or directory',
       '1 done',
       '1 message: trapped: trap: divide by zero',
       '1 done: trap: divide by zero',
@@ -325,13 +321,13 @@ const checks = {
       'worker 3 is now looping',
       '3 done',
       'stopped worker 3; send to it returned -1',
-      'no grant: worker.grant: no module dom to grant',
       'no program in /nowhere',
+      '5 stdout: own: started',
+      '5 stderr: error: trap: dom.images_loading is not available in a worker',
+      '5 ended: trap: dom.images_loading is not available in a worker',
       'finished',
       '',
     ].join('\n'));
-    check('workers: a file written by a worker does not appear in the page\'s files',
-      await page.evaluate('window.app.files.has("/out/made.txt")'), false);
   },
 
   async canvas(page) {

@@ -71,11 +71,11 @@ export function run(options, names, wasm) {
   const app = { files, cwd, entry: null, ended: false };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
-  if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd), { write: options.writable }));
+  if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd)));
   const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
-  const ended = (reason) => {
+  const ended = (code, reason) => {
     app.ended = true;
-    if (options.onEnd) options.onEnd(reason);
+    if (options.onEnd) options.onEnd(code, reason);
   };
 
   const host = createHost({
@@ -102,7 +102,7 @@ export function run(options, names, wasm) {
   app.entry = host.load(names, (name) => wasm.get(name));
   if (!app.entry) {
     report(host.lastError);
-    ended('exit 2');
+    ended(2, '');
   }
   app.started = app.call(options.entry || 'main');
   return app;

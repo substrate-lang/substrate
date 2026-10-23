@@ -1,17 +1,8 @@
 // Node's files, for fs.mjs: the file system.
 import fs from 'node:fs';
-import path from 'node:path';
 import { nodeSource } from '../streams.mjs';
 
 const modes = { 0: 'r', 1: 'w', 2: 'a' };
-
-const real = (p) => {
-  try {
-    return fs.realpathSync(p);
-  } catch (e) {
-    return path.join(real(path.dirname(p)), path.basename(p));
-  }
-};
 
 const plain = (f) => (...args) => {
   try {
@@ -25,7 +16,6 @@ const plain = (f) => (...args) => {
 
 export function nodeFiles() {
   return {
-    resolve: (p) => real(path.isAbsolute(p) ? p : `${process.cwd()}/${p}`),
     read: plain((p) => fs.readFileSync(p)),
     write: plain((p, bytes) => fs.writeFileSync(p, bytes)),
     makeDir: plain((p) => fs.mkdirSync(p, { recursive: true })),

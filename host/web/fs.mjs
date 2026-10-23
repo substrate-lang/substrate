@@ -12,7 +12,7 @@ export function resolvePath(cwd, path) {
 const missing = () => new Error('No such file or directory');
 const under = (dir) => (dir === '/' ? '/' : `${dir}/`);
 
-function joined(chunks) {
+function concat(chunks) {
   const bytes = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
   let at = 0;
   for (const c of chunks) {
@@ -30,7 +30,6 @@ export function pageFiles(files, cwd) {
     return bytes;
   };
   return {
-    resolve: at,
     read,
     write(p, bytes) {
       files.set(at(p), bytes);
@@ -65,7 +64,7 @@ export function pageFiles(files, cwd) {
         return { pull: async () => (given ? null : ((given = true), bytes)), close() {} };
       }
       const chunks = mode === 2 && files.has(key) ? [files.get(key)] : [];
-      const keep = () => files.set(key, joined(chunks));
+      const keep = () => files.set(key, concat(chunks));
       const source = {
         pull: async () => null,
         write(bytes) {

@@ -52,7 +52,7 @@ export function netModule(granted = {}) {
         });
         return id;
       },
-      connect(hp, hl, port, secure, tag) {
+      connect(port, hp, hl, secure, tag) {
         let socket;
         try {
           const host = caller.string(hp, hl);

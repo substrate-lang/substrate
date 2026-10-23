@@ -70,8 +70,8 @@ const host = createHost({
   report(message) {
     process.stderr.write(`error: ${message}\n`);
   },
-  ended(reason) {
-    process.exit(reason.startsWith('exit ') ? Number(reason.slice(5)) : 2);
+  ended(code) {
+    process.exit(code < 0 ? 2 : code);
   },
   modules,
   grants,

@@ -161,7 +161,10 @@ function importMap(bytes) {
 }
 
 // The names of the modules a wasm module imports from, read from its import section.
-export function importedModules(bytes) {
+export const importedModules = (bytes) => new Set(imports(bytes).keys());
+
+// What a wasm module imports: each module's name, with the names of the functions imported from it.
+export function imports(bytes) {
   let at = 8;
   const byte = () => bytes[at++];
   const uleb = () => {
@@ -185,15 +188,16 @@ export function importedModules(bytes) {
     uleb();
     if (flags & 1) uleb();
   };
-  const names = new Set();
+  const names = new Map();
   while (at < bytes.length) {
     const id = byte();
     const size = uleb();
     const end = at + size;
     if (id === 2) {
       for (let n = uleb(); n > 0; n--) {
-        names.add(name());
-        name();
+        const from = name();
+        if (!names.has(from)) names.set(from, new Set());
+        names.get(from).add(name());
         const kind = byte();
         if (kind === 0) uleb();
         else if (kind === 1) {
@@ -527,7 +531,7 @@ export function createHost(platform) {
           loaded = instantiate(name, bytesOf(name), new Map());
         } catch (e) {
           if (e instanceof Exit) {
-            end(`exit ${e.code}`);
+            end(e.code, '');
             return {};
           }
           if (!(e instanceof WebAssembly.Exception)) throw e;
@@ -543,12 +547,13 @@ export function createHost(platform) {
     return entry;
   }
 
-  function end(reason) {
+  // The program is over: code is its exit code, or -1 with the reason when it trapped.
+  function end(code, reason) {
     ended = true;
     queue.length = 0;
     for (const close of closers.splice(0)) close();
     streams.end();
-    if (platform.ended) platform.ended(reason);
+    if (platform.ended) platform.ended(code, reason);
   }
 
   function trapped(e) {
@@ -576,7 +581,7 @@ export function createHost(platform) {
       return true;
     } catch (e) {
       if (e instanceof Exit) {
-        end(`exit ${e.code}`);
+        end(e.code, '');
         return false;
       }
       if (!trapped(e)) throw e;
@@ -587,14 +592,14 @@ export function createHost(platform) {
           return false;
         } catch (e2) {
           if (e2 instanceof Exit) {
-            end(`exit ${e2.code}`);
+            end(e2.code, '');
             return false;
           }
           if (!trapped(e2)) throw e2;
         }
       }
       platform.report(lastError);
-      end(lastError);
+      end(-1, lastError);
       return false;
     } finally {
       running = outer;

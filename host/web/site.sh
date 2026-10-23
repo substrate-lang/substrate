@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Builds a web site into OUT: the program, the host, the page, and packs of programs and files.
-# sub site OUT FILE [-p PAGE] [-g NAME FILE] [-f NAME PATH ...]
-# FILE: a program's source, or a directory `sub build` wrote. -g builds FILE as NAME.pack, for a worker.
+# sub site OUT FILE [-p PAGE] [-w NAME FILE] [-f NAME PATH ...]
+# FILE: a program's source, or a directory `sub build` wrote. -w builds FILE as NAME.pack, a program for a worker.
 # -f packs the PATHs, from the repository's root, as NAME.pack.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 usage() {
-  echo "usage: sub site OUT FILE [-p PAGE] [-g NAME FILE] [-f NAME PATH ...]" >&2
+  echo "usage: sub site OUT FILE [-p PAGE] [-w NAME FILE] [-f NAME PATH ...]" >&2
   exit 64
 }
 [ $# -ge 2 ] || usage
@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || usage
       page="$2"
       shift 2 ;;
-    -g)
+    -w)
       [ $# -ge 3 ] || usage
       program "$3" "$out/$2"
       "$root/bin/sub" pack -o "$out/$2.pack" -C "$out/$2" .

@@ -1,12 +1,13 @@
-;; A page that starts workers running a-worker.sub, packed under /worker, and logs every event from them.
+;; A page that starts workers, a-worker.sub packed under /worker and then one of its own functions, and logs
+;; every event from them.
 (require-unqualified web "../../lib/web/web.sub")
 (require-unqualified worker "../../host/worker.sub")
-(require-unqualified fs "../../host/fs.sub")
+(require-unqualified program "../../host/worker-program.sub")
 
-(struct model [log buffer] [first u32] [second u32] [third u32] [step u32] [ticks u32])
+(struct model [log buffer] [first u32] [second u32] [third u32] [own u32] [step u32] [ticks u32])
 
 (variant message
-  [worker-event [w u32] [kind u32]]
+  [worker-event [w u32] [kind u32] [value i32]]
   [tick] [stop])
 (messages message)
 
@@ -30,16 +31,14 @@
     [(2) "say hello"]
     [(3) "warn careful"]
     [(4) "read /data/note.txt"]
-    [(5) "read /secret/key.txt"]
-    [(6) "write /out/made.txt"]
-    [(7) "read /out/made.txt"]
-    [(8) "write /data/note.txt"]
-    [(9) "trap"]
-    [(10) "add 1"]
-    [(11) "worker"]
-    [(12) "grow 32"]
-    [(13) "add 1"]
-    [(14) "exit 3"]
+    [(5) "write /out/made.txt"]
+    [(6) "read /out/made.txt"]
+    [(7) "trap"]
+    [(8) "add 1"]
+    [(9) "worker"]
+    [(10) "grow 32"]
+    [(11) "add 1"]
+    [(12) "exit 3"]
     [else 0]))
 
 (define (send-next! [m (ptr model)])
@@ -50,39 +49,15 @@
 
 ;; A worker planned with the modules of the program packed under DIR; 0 when there is none.
 (define (plan! [m (ptr model)] [dir (ptr u8)]) -> u32
-  (let* ([n u32 0] [path (make-buffer)] [list (ptr u8) 0])
-    (buffer-add-string! (& path) dir)
-    (buffer-add-string! (& path) "/program")
-    (buffer-add-byte! (& path) 0)
-    (set! list (fs-read-file (-> path bytes) (& n)))
-    (buffer-free! (& path))
-    (when (== list 0)
-      (log! m "no program in ")
-      (log! m dir)
-      (log! m "\n")
-      (return 0))
-    (let ([w (worker-new 0)] [at u32 0])
-      (while (< at n)
-        (let ([end at])
-          (while (and (< end n) (!= (@ list end) 10)) (+= end 1))
-          (when (> end at)
-            (let ([name (make-buffer)] [file (make-buffer)] [size u32 0])
-              (buffer-add! (& name) (+ list at) (- end at))
-              (buffer-add-byte! (& name) 0)
-              (buffer-add-string! (& file) dir)
-              (buffer-add-byte! (& file) 47)
-              (buffer-add! (& file) (+ list at) (- end at))
-              (buffer-add-string! (& file) ".wasm")
-              (buffer-add-byte! (& file) 0)
-              (let ([bytes (fs-read-file (-> file bytes) (& size))])
-                (when (!= bytes 0)
-                  (worker-module! w (-> name bytes) bytes size)
-                  (free bytes)))
-              (buffer-free! (& name))
-              (buffer-free! (& file))))
-          (set! at (+ end 1))))
-      (free list)
-      w)))
+  (let ([w (worker-new 0)])
+    (if (< (worker-program! w dir) 0)
+        (begin
+          (worker-stop w)
+          (log! m "no program in ")
+          (log! m dir)
+          (log! m "\n")
+          0)
+        w)))
 
 (define (run! [m (ptr model)] [w u32] [argument (ptr u8)]) -> u32
   (if (< (worker-run! w "main" argument (strlen argument)) 0)
@@ -94,18 +69,22 @@
         0)
       w))
 
+;; This program's own function on a thread: it prints, then asks the page's dom, which a worker cannot have.
+(define (own)
+  (printf "own: started\n")
+  (let ([n (dom-images-loading)])
+    (printf "images loading: ~a\n" n)))
+
 (define (init [m (ptr model)])
   (event-handler! worker-source worker-heard)
   (set! (-> m log) (make-buffer))
   (log! m "")
   (let ([w (plan! m "/worker")])
-    (worker-read! w "/data")
-    (worker-write! w "/out")
     (worker-limit! w 5000 33554432)
     (set! (-> m first) (run! m w "one")))
   (send-next! m))
 
-(define (log-event! [m (ptr model)] [w u32] [kind u32])
+(define (log-event! [m (ptr model)] [w u32] [kind u32] [value i32])
   (let ([data (events-take-text)])
     (log-number! m (cast i32 w))
     (log! m (cond [(== kind worker-message) " message"]
@@ -113,16 +92,20 @@
                   [(== kind worker-stderr) " stderr"]
                   [(== kind worker-done) " done"]
                   [else " ended"]))
-    (when (!= (@ data) 0) (log! m ": "))
-    (log! m data)
+    (cond [(and (== kind worker-ended) (>= value 0))
+           (log! m ": exit ")
+           (log-number! m value)]
+          [(!= (@ data) 0)
+           (log! m ": ")
+           (log! m data)])
     (let ([n (strlen data)])
       (when (or (== n 0) (!= (@ data (- n 1)) 10)) (log! m "\n")))
     (free data)))
 
 (define (update [m (ptr model)] [e (ptr message)])
   (match e
-    [(worker-event w kind)
-     (log-event! m w kind)
+    [(worker-event w kind value)
+     (log-event! m w kind value)
      (cond
        [(and (== w (-> m first)) (== kind worker-message)) (send-next! m)]
        [(and (== w (-> m first)) (== kind worker-ended))
@@ -138,26 +121,19 @@
         (worker-send-text (-> m third) "add 2")]
        [(and (== w (-> m third)) (== kind worker-message))
         (worker-send-text (-> m third) "loop")
-        (log! m "worker 3 is now looping\n")])]
+        (log! m "worker 3 is now looping\n")]
+       [(and (== w (-> m own)) (== kind worker-ended)) (log! m "finished\n")])]
     [tick (+= (-> m ticks) 1)]
     [stop
      (worker-stop (-> m third))
      (log! m "stopped worker 3; send to it returned ")
      (log-number! m (worker-send-text (-> m third) "add 1"))
      (log! m "\n")
-     (let ([w (worker-new 0)])
-       (when (< (worker-grant! w "dom") 0)
-         (let ([why (worker-error)])
-           (log! m "no grant: ")
-           (log! m why)
-           (log! m "\n")
-           (free why)))
-       (worker-stop w))
      (plan! m "/nowhere")
-     (log! m "finished\n")]))
+     (set! (-> m own) (worker-start "own" "" 0 0))]))
 
 (define (worker-heard [source u32] [kind u32] [w u32] [tag (ptr void)] [value i32])
-  (let ([e message (worker-event w kind)])
+  (let ([e message (worker-event w kind value)])
     (send! (& e))))
 
 (view (page [m (ptr model)])
