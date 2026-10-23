@@ -1,30 +1,9 @@
 // A worker's own side of the worker module, shared by the browser's worker and Node's thread: its output in
 // batches, the parent's messages as events, when it is busy, and what it reports back.
-import { imports } from './subhost-core.mjs';
-
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
 const MESSAGE = 1;
-
-// What the worker's modules import from host modules: each module's name, with its functions' names.
-export function imported(wasm) {
-  const needed = new Map();
-  for (const bytes of wasm.values()) {
-    for (const [name, functions] of imports(bytes)) {
-      if (!needed.has(name)) needed.set(name, new Set());
-      for (const f of functions) needed.get(name).add(f);
-    }
-  }
-  return needed;
-}
-
-// A module a thread cannot have: each of its functions traps when called.
-export const absent = (name, functions) => (caller) => {
-  const module = { source: 0 };
-  for (const f of functions) module[f] = () => caller.trap(`${name}.${f} is not available in a worker`);
-  return module;
-};
 
 // Output goes at most every 30 ms, and when the worker becomes idle.
 function batcher(post) {

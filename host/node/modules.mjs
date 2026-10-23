@@ -49,3 +49,16 @@ export function loadModule(spec) {
   const { key, args } = parts(spec);
   return loaders[key](...args);
 }
+
+// The modules granted by grants, a map from name to spec, each loaded when first wanted; own has some made already.
+export function grantedModules(grants, own = new Map()) {
+  const loaded = new Map(own);
+  return {
+    has: (name) => grants.has(name) || loaded.has(name),
+    get(name) {
+      if (!loaded.has(name)) loaded.set(name, loadModule(grants.get(name)));
+      return loaded.get(name);
+    },
+    keys: () => grants.keys(),
+  };
+}

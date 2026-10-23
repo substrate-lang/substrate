@@ -3,7 +3,7 @@
 import { run } from './subhost-web.mjs';
 import { fsModule } from '../fs.mjs';
 import { pageFiles } from './fs.mjs';
-import { absent, imported, workerSide } from '../worker-side.mjs';
+import { workerSide } from '../worker-side.mjs';
 
 const loaders = {
   clock: () => import('../modules/clock.mjs').then((m) => m.clock()),
@@ -33,11 +33,12 @@ self.onmessage = async (e) => {
   const m = e.data;
   if (m.type === 'start') {
     const wasm = new Map(m.modules);
-    const needed = imported(wasm);
     const modules = { worker: side.worker, fs: fsModule(readOnly(pageFiles(m.files, m.cwd))) };
+    const absent = new Set();
     for (const name of m.grants) {
-      if (!needed.has(name) || name in modules) continue;
-      modules[name] = loaders[name] ? await loaders[name]() : absent(name, needed.get(name));
+      if (name in modules) continue;
+      if (loaders[name]) modules[name] = await loaders[name]();
+      else absent.add(name);
     }
     const app = run({
       args: [m.argument],
@@ -46,6 +47,7 @@ self.onmessage = async (e) => {
       output: side.write,
       memoryPages: m.pages,
       modules,
+      absent,
       entry: m.entry,
       onEnd: side.ended,
       delivered: side.delivered,

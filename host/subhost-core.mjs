@@ -161,63 +161,6 @@ function importMap(bytes) {
   return map;
 }
 
-// What a wasm module imports: each module's name, with the names of the functions imported from it.
-export function imports(bytes) {
-  let at = 8;
-  const byte = () => bytes[at++];
-  const uleb = () => {
-    let n = 0;
-    let shift = 0;
-    let b;
-    do {
-      b = byte();
-      n += (b & 127) * 2 ** shift;
-      shift += 7;
-    } while (b & 128);
-    return n;
-  };
-  const name = () => {
-    const n = uleb();
-    at += n;
-    return text.decode(bytes.subarray(at - n, at));
-  };
-  const limits = () => {
-    const flags = byte();
-    uleb();
-    if (flags & 1) uleb();
-  };
-  const names = new Map();
-  while (at < bytes.length) {
-    const id = byte();
-    const size = uleb();
-    const end = at + size;
-    if (id === 2) {
-      for (let n = uleb(); n > 0; n--) {
-        const from = name();
-        if (!names.has(from)) names.set(from, new Set());
-        names.get(from).add(name());
-        const kind = byte();
-        if (kind === 0) uleb();
-        else if (kind === 1) {
-          byte();
-          limits();
-        } else if (kind === 2) limits();
-        else if (kind === 3) {
-          byte();
-          byte();
-        } else if (kind === 4) {
-          byte();
-          uleb();
-        }
-      }
-      break;
-    }
-    if (id > 2) break;
-    at = end;
-  }
-  return names;
-}
-
 export class Exit {
   constructor(code) {
     this.code = code;
@@ -257,7 +200,7 @@ export function createHost(platform) {
   let trapMessage = null;
 
   const COMPILE_TIME_HOST = new Set(['write', 'trap']);
-  const refused = (what) => () => hostTrap(`${what} is not available while compiling`);
+  const refused = (what, where = 'while compiling') => () => hostTrap(`${what} is not available ${where}`);
 
   function hostTrap(message) {
     trapMessage = message;
@@ -484,6 +427,8 @@ export function createHost(platform) {
         if (!made.has('stream')) made.set('stream', streams.imports(callerOf(self, 'stream')));
         value = made.get('stream')[imp.name];
         if (compileTime && value) value = refused(`stream.${imp.name}`);
+      } else if (platform.absent && platform.absent.has(from)) {
+        value = refused(`${from}.${imp.name}`, 'in a worker');
       } else if (platform.modules && platform.modules.has(from)) {
         if (compileTime) {
           value = refused(`${from}.${imp.name}`);

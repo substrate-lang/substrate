@@ -89,6 +89,7 @@ export function run(options, names, wasm) {
     delivered: options.delivered,
     active: options.active,
     modules,
+    absent: options.absent,
     memoryPages: options.memoryPages || 0,
   });
   app.host = host;
