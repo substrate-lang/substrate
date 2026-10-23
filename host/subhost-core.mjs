@@ -404,8 +404,7 @@ export function createHost(platform) {
 
   function hostImports(self) {
     const { memory, string, u, hold } = callerOf(self, 'host');
-    // A call that gives bytes returns their length and holds them for take, which copies up to cap. With bp
-    // given, the seed's older shape: the bytes are copied at once, and the module names end with newlines.
+    // A call that gives bytes returns their length and holds them for take, which copies up to cap.
     return {
       take(bp, cap) {
         memory().set(held.subarray(0, cap), u(bp));
@@ -432,39 +431,27 @@ export function createHost(platform) {
         const f = exports && exports[string(fp, fl)];
         return typeof f === 'function' ? table.grow(1, f) : -1;
       },
-      error_message(bp, cap) {
-        const b = utf8.encode(lastError);
-        if (bp === undefined) return hold(b);
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
+      error_message() {
+        return hold(utf8.encode(lastError));
       },
-      arg(i, bp, cap) {
+      arg(i) {
         if (i < 0 || i >= platform.args.length) return -1;
         const a = platform.args[i];
-        const b = typeof a === 'string' ? utf8.encode(a) : a;
-        if (bp === undefined) return hold(b);
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
+        return hold(typeof a === 'string' ? utf8.encode(a) : a);
       },
       exit(code) {
         platform.exit(code);
       },
-      program_modules(bp, cap) {
-        if (bp === undefined) return hold(utf8.encode(joined(programNames)));
-        const b = utf8.encode(programNames.map((n) => `${n}\n`).join(''));
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
+      program_modules() {
+        return hold(utf8.encode(joined(programNames)));
       },
-      module_bytes(np, nl, bp, cap) {
+      module_bytes(np, nl) {
         const name = string(np, nl);
         if (!programNames.includes(name)) {
           lastError = `the running program has no module ${name}`;
           return -1;
         }
-        const b = programBytes(name);
-        if (bp === undefined) return hold(b);
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
+        return hold(programBytes(name));
       },
     };
   }

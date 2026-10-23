@@ -16,16 +16,10 @@ export function fsModule(files) {
         return -1;
       }
     };
-    // With buf given, the seed's older shape: the bytes are copied at once.
-    const give = (bytes, buf, cap) => {
-      if (buf === undefined) return caller.hold(bytes);
-      caller.memory().set(bytes.subarray(0, cap), caller.u(buf));
-      return bytes.length;
-    };
     return {
-      read_file(pp, pl, buf, cap) {
+      read_file(pp, pl) {
         const path = caller.string(pp, pl);
-        return attempt(path, () => give(files.read(path), buf, cap));
+        return attempt(path, () => caller.hold(files.read(path)));
       },
       write_file(pp, pl, ptr, len) {
         const path = caller.string(pp, pl);
@@ -40,9 +34,9 @@ export function fsModule(files) {
         const path = caller.string(pp, pl);
         return BigInt(attempt(path, () => files.stat(path)));
       },
-      list(pp, pl, buf, cap) {
+      list(pp, pl) {
         const path = caller.string(pp, pl);
-        return attempt(path, () => give(utf8.encode(joined(files.list(path))), buf, cap));
+        return attempt(path, () => caller.hold(utf8.encode(joined(files.list(path)))));
       },
       remove(pp, pl) {
         const path = caller.string(pp, pl);
