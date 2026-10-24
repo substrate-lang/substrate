@@ -21,7 +21,7 @@ same_program() {
 pass=0
 fail=0
 
-# A certificate for the TLS test, trusted by its client because the launcher granted it.
+# A certificate for the TLS tests, which their clients trust because it is granted.
 mkdir -p "$builds/tls"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null

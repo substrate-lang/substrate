@@ -1,8 +1,4 @@
-// The host module "net": TCP listeners, and connections, which are streams.
-// Kinds: listening 1, value the port; accept 2, value the new connection's stream; connected 3; failed 4,
-// value the error code. A listener's host is the address to bind, "" for 127.0.0.1; secure asks for TLS; most is
-// how many of its connections may be open at once, 0 for any, a connection beyond that being closed at once. A
-// connection's two sides end apart: the peer's end is a read of 0, and this side's is finish.
+// The host module "net" (net.sub).
 import net from 'node:net';
 import tls from 'node:tls';
 import { errorOf, reasonOf } from '../errors.mjs';

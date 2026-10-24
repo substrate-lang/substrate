@@ -1,4 +1,4 @@
-// node sprites.mjs SITES [hardware]: the many-sprites game timed with the 2D context and with WebGPU.
+// node sprites.mjs SITES [hardware] times the many-sprites game drawn with the 2D context and with WebGPU.
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

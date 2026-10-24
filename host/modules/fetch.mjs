@@ -1,6 +1,4 @@
-// The host module "fetch": HTTP requests, answered as events. The request's id is its response body's stream.
-// Kinds: head 1, value the status, bytes the headers as entries, a name then its value, each ended by a zero;
-// failed 2, value the error code. start takes the method, the URL, headers as such entries, and the body.
+// The host module "fetch" (fetch.sub).
 import { errors, errorOf, reasonOf } from '../errors.mjs';
 import { readerSource } from '../streams.mjs';
 import { entries, joined } from '../entries.mjs';
@@ -13,7 +11,7 @@ const FAILED = 2;
 
 const base = globalThis.location ? globalThis.location.href : undefined;
 
-// fetch fails with a TypeError when the network does: before the head, with the code in its cause on Node.
+// fetch fails with a TypeError when the network fails, and on Node the error's cause has the code.
 const headError = (e) => (e.name === 'TypeError' && !(e.cause instanceof Error) ? errors.unreachable : errorOf(e));
 const bodyError = (e) => (e.name === 'TypeError' ? errors.aborted : errorOf(e));
 

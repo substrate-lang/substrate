@@ -1,6 +1,4 @@
-// The host module "storage": keys and their bytes, kept by the browser in IndexedDB.
-// Kinds: got 1, value 1 if the key was found, bytes its value; done 2; keys 3, value how many, bytes the keys,
-// each ended by a zero; failed 4, value the error code.
+// The host module "storage" (storage.sub), kept in IndexedDB.
 import { errorOf, reasonOf } from '../errors.mjs';
 import { joined } from '../entries.mjs';
 

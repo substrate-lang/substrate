@@ -1,5 +1,5 @@
-// The modules a Node host grants, each loaded when first wanted. A spec names one: NAME; NAME=fake for clock,
-// timer, fetch and websocket, with fetch=fake:DIR answering from DIR; net=tls:CERT:KEY.
+// The modules a Node host can grant, each loaded when first needed. A spec is NAME; NAME=fake for clock, timer,
+// fetch or websocket; fetch=fake:DIR, which answers from DIR; or net=tls:CERT:KEY.
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 
@@ -47,10 +47,10 @@ const parts = (spec) => {
 
 export const nameOf = (spec) => parts(spec).name;
 
-// Why a program cannot have a module: it could be granted but was not; null for any other.
+// ungranted gives the message for a module that could be granted but was not, or null.
 export const ungranted = (name) => (Object.hasOwn(loaders, name) ? `${name} is not granted (-g ${name})` : null);
 
-// What is wrong with a spec, or null: no such module, or a file it names that cannot be read.
+// problem says what is wrong with a spec, or gives null.
 export function problem(spec) {
   const { name, key, args } = parts(spec);
   if (!(name in loaders && key in loaders)) return `no module ${spec}`;
@@ -67,7 +67,7 @@ export function loadModule(spec) {
   return loaders[key](...args);
 }
 
-// The modules granted by grants, a map from name to spec, each loaded when first wanted; own has some made already.
+// grantedModules gives the modules in grants, a map from name to spec, and those already made in own.
 export function grantedModules(grants, own = new Map()) {
   const loaded = new Map(own);
   return {

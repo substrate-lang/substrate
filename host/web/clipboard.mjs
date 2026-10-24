@@ -1,5 +1,4 @@
-// The host module "clipboard": text, read and written with the user's leave.
-// Kinds: text 1, bytes the text; written 2; failed 3, value the error code.
+// The host module "clipboard" (clipboard.sub).
 import { errorOf, reasonOf } from '../errors.mjs';
 
 const utf8 = new TextEncoder();

@@ -1,5 +1,5 @@
-// A worker's Web Worker: runs its modules, with the worker module's own side and those of the page's modules a
-// worker can have. Its files are a copy of the page's, which it cannot write.
+// A worker's Web Worker runs the worker's modules, with the worker module's own side and the page's modules that a
+// worker can have. Its files are a read-only copy of the page's.
 import { run } from './subhost-web.mjs';
 import { fsModule } from '../fs.mjs';
 import { pageFiles } from './fs.mjs';

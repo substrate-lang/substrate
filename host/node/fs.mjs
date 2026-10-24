@@ -1,4 +1,4 @@
-// Node's files, for fs.mjs: the file system.
+// Node's file system, for fs.mjs.
 import fs from 'node:fs';
 import { nodeSource } from '../streams.mjs';
 

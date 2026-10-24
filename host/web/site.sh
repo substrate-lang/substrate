@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Builds a web site into OUT: the program, the host, the page, and packs of files.
-# sub site OUT FILE [-p PAGE] [-f NAME PATH ...]
-# FILE: a program's source, or a directory `sub build` wrote. -f packs the PATHs, from the repository's root, as
-# NAME.pack. A site holds .site, and only a site is replaced.
+# sub site OUT FILE [-p PAGE] [-f NAME PATH ...] builds a web site into OUT from FILE, a program's source or a
+# directory that `sub build` wrote. -f packs the PATHs, relative to the repository's root, as NAME.pack. OUT is
+# replaced only when it holds a .site file.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 usage() {

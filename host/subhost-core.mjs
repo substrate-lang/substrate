@@ -298,7 +298,8 @@ export function createHost(platform) {
     };
   }
 
-  // Bytes in a block from the malloc of memory m, ended by a zero; their length at out unless out is 0.
+  // giveIn copies bytes into a block from memory m's malloc, ended by a zero, and stores the length at out unless out
+  // is 0.
   function giveIn(m, bytes, out, who) {
     const malloc = m && allocators.get(m);
     if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
@@ -357,9 +358,7 @@ export function createHost(platform) {
 
   function hostImports(self) {
     const { memory, string, u, give, fail } = callerOf(self, 'host');
-    // A call that gives bytes returns them in a block from the program's malloc, ended by a zero, with their length
-    // at out unless out is 0; or 0 when there are none. A call that can fail puts its reason, given the same way, at
-    // err unless err is 0.
+    // These calls give bytes and failures as the host section of compiler/substrate.sub says.
     return {
       write(fd, ptr, len) {
         platform.write(fd === 2 ? 2 : 1, memory().subarray(u(ptr), u(ptr) + len));
@@ -510,13 +509,13 @@ export function createHost(platform) {
     return entry;
   }
 
-  // The main module's function of that name, or else the first module's: the language's own.
+  // hook finds the named function in the main module, or else in the first module, the language's.
   function hook(names, name) {
     for (const m of [entry, registry.get(names[0])]) if (m && typeof m[name] === 'function') return m[name];
     return null;
   }
 
-  // The program is over: code is its exit code, or -1 with the reason when it trapped.
+  // end runs when the program is over, with its exit code, or with -1 and the reason after a trap.
   function end(code, reason) {
     ended = true;
     queue.length = 0;
@@ -554,8 +553,7 @@ export function createHost(platform) {
         return false;
       }
       if (!trapped(e)) throw e;
-      // on-trap, given the trap's message in a block from the program's malloc, gives 1 when the program recovered;
-      // with 0, or none, the error is reported and the program ends.
+      // When on-trap returns 0, or there is none, the error is reported and the program ends.
       if (onTrap && allocators.has(entry.memory)) {
         try {
           if (onTrap(giveIn(entry.memory, utf8.encode(lastError), 0, 'on-trap')) !== 0) return false;

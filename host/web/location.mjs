@@ -1,5 +1,4 @@
-// The host module "location": the page's URL, and the history it moves through.
-// Kinds: changed 1, bytes the URL, after the user goes back or forward; untagged.
+// The host module "location" (location.sub).
 const utf8 = new TextEncoder();
 
 const SOURCE = 12;

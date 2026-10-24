@@ -1,5 +1,4 @@
-// The host module "websocket": connections whose messages arrive as events. A message is text 1 or binary 2: its
-// event's value, and how send sends it.
+// The host module "websocket" (websocket.sub).
 import { errors } from '../errors.mjs';
 
 const utf8 = new TextEncoder();

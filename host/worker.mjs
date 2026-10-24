@@ -1,7 +1,4 @@
-// The host module "worker": this program's functions run on threads of their own, sharing nothing but messages.
-// start runs the named function on a thread, with bytes as the worker's argument, under a time limit and a
-// memory limit, its output going to this program's or coming as events. A worker has its parent's modules; one a
-// thread cannot have traps when called. The browser and Node each give their way of starting a thread.
+// The host module "worker" (worker.sub). The browser and Node each give spawn, their way of starting a thread.
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
@@ -11,9 +8,8 @@ const STDERR = 3;
 const DONE = 4;
 const ENDED = 5;
 
-// spawn(plan, app) starts a thread running the plan: this program's modules, the function, its argument, the
-// grants, the memory's pages, and whether its output is heard as events. It returns the thread: post(message,
-// transfer), terminate(), onMessage(f) and onError(f), f given the reason.
+// spawn(plan, app) starts a thread running the plan, and returns it with post(message, transfer), terminate(),
+// onMessage(f) and onError(f).
 export function workerModule({ spawn }) {
   let caller = null;
   const alive = new Map();
@@ -23,7 +19,7 @@ export function workerModule({ spawn }) {
     if (caller) caller.event(kind, w, tag, value, bytes);
   };
 
-  // code is the worker's exit code, or -1 with the reason; a null reason ends it without an event.
+  // end takes the worker's exit code, or -1 and the reason; with a null reason, no event is sent.
   const end = (w, code, reason) => {
     const worker = alive.get(w);
     if (!worker) return;
@@ -34,7 +30,7 @@ export function workerModule({ spawn }) {
     if (reason !== null) deliver(w, worker.tag, ENDED, code, utf8.encode(reason));
   };
 
-  // The time limit runs while the worker is busy: from its start, and from each call into it.
+  // The time limit starts again each time the worker becomes busy.
   const limit = (w, worker) => {
     clearTimeout(worker.timer);
     worker.timer = worker.time > 0

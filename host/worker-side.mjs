@@ -1,12 +1,12 @@
-// A worker's own side of the worker module, shared by the browser's worker and Node's thread: its output in
-// batches, the parent's messages as events, when it is busy, and what it reports back.
+// The worker module's side inside a worker, in a browser or on Node. It batches output, delivers the parent's
+// messages as events, and reports back.
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
 const MESSAGE = 1;
 
-// Output goes at most every 30 ms, and when the worker becomes idle. When the parent hears it as events, it is
-// dropped while 1 MiB of it waits.
+// Output is sent at most every 30 ms and when the worker becomes idle. Output heard as events is dropped while
+// 1 MiB of it waits.
 function batcher(post) {
   const pieces = [];
   let pendingBytes = 0;

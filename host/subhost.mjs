@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --stack-size=4000
-// The host for Node: runs the program that `sub build` wrote to DIR, on V8. A granted module is loaded when a
-// wasm module importing it is instantiated, which code the program loads at run time may do too.
+// The host for Node runs the program that `sub build` wrote to DIR. A granted module loads when a wasm module that
+// imports it is instantiated.
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createHost, Exit } from './subhost-core.mjs';

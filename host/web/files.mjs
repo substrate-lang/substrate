@@ -1,6 +1,4 @@
-// The host module "files": the user's files, picked, each a stream; and bytes saved as a file.
-// Kinds: file 1, value the stream, bytes the name; picked 2, value how many; failed 3, value the error code.
-// pick takes whether several may be picked, and the types accepted, "" for any.
+// The host module "files" (files.sub).
 import { errors } from '../errors.mjs';
 import { readerSource } from '../streams.mjs';
 

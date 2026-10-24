@@ -1,7 +1,4 @@
-// The host module "fs": files by path. node/fs.mjs and web/fs.mjs each give their files.
-// read_file and list give their bytes as host.arg does, 0 if missing: the file's, or the names, each ended by a
-// zero. write_file, make_dir, remove, rename: 0, or -1. stat: the size, -1 if missing, -2 for a directory. open
-// gives a stream; its modes: read 0, write 1, append 2. Each puts a failure's reason at err, as host.instantiate does.
+// The host module "fs" (fs.sub), over the files that node/fs.mjs or web/fs.mjs gives.
 import { joined } from './entries.mjs';
 
 const utf8 = new TextEncoder();

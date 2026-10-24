@@ -1,8 +1,4 @@
-// The host module "process": child programs, their three pipes being streams.
-// Kinds: exit 1, value the exit code, or 128 plus the signal; failed 2, value the error code.
-// spawn takes the program, its arguments and environment as entries each ended by a zero, NAME=VALUE for the
-// environment, added to the parent's unless clear is set, a directory, "" for the parent's, and a mode for each
-// pipe: 0 a stream, 1 ignored, 2 the parent's.
+// The host module "process" (process.sub).
 import child from 'node:child_process';
 import os from 'node:os';
 import { errorOf, reasonOf } from '../errors.mjs';

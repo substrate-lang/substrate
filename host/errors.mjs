@@ -1,4 +1,4 @@
-// The value of a failed event, and the one a JavaScript error gets.
+// The error codes of failed events (events.sub), and errorOf, which gives a JavaScript error its code.
 export const errors = {
   missing: 1, unreachable: 2, refused: 3, timeout: 4, invalid: 5, aborted: 6, denied: 7, inUse: 8, other: 9,
 };
@@ -21,7 +21,7 @@ export function errorOf(e) {
   return errors.other;
 }
 
-// The message, and its cause's.
+// reasonOf gives an error's message followed by its cause's.
 export function reasonOf(e) {
   return e.cause instanceof Error ? `${e.message}: ${reasonOf(e.cause)}` : e.message;
 }

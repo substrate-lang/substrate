@@ -1,9 +1,7 @@
-// The host module "stream": the byte streams other modules make, read and written as events.
-// Kinds: read 1, value the bytes read, 0 at the end; drained 2; failed 3, value the error code; finished 4,
-// once everything written before finish has been.
-// A source: pull() gives a promise of the next bytes, null at the end; write(bytes) is false when full;
-// finish(); close(); and it is told drained(), finished() and failed(e). A source that has its own errorOf(e) gives
-// its failures' codes.
+// The host module "stream" (stream.sub): byte streams other modules make from sources. A source that can be read
+// has pull(), which gives a promise of the next bytes, or of null at the end. One that can be written has
+// write(bytes), which gives false when full, and finish(). Each has close(), and may have errorOf(e) to give its
+// failures' codes. The streams set its drained(), finished() and failed(e).
 import { errorOf, reasonOf } from './errors.mjs';
 
 const utf8 = new TextEncoder();
@@ -126,7 +124,7 @@ export function createStreams(host) {
   };
 }
 
-// A source over a web stream's reader, got once ready; null when there is none.
+// readerSource reads the web stream reader that getReader gives; a null reader is an empty stream.
 export function readerSource(getReader, cancel) {
   let reader = null;
   let none = false;
@@ -145,7 +143,7 @@ export function readerSource(getReader, cancel) {
   };
 }
 
-// A source over a Node stream, read only while a read is posted.
+// nodeSource reads a Node stream only while a read is posted.
 export function nodeSource(stream) {
   const chunks = [];
   let waiting = null;

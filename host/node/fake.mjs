@@ -1,6 +1,5 @@
-// Fakes of the clock, timer, fetch and websocket modules, for tests: one simulated world, where requests
-// are answered from a directory, a connection echoes what it is sent, and time passes only when no
-// such work is left, as the earliest timer fires.
+// Fake clock, timer, fetch and websocket modules for tests. Fetch answers from a directory, a connection echoes
+// what it is sent, and time moves to the earliest timer once no other work is left.
 import fs from 'node:fs';
 import path from 'node:path';
 

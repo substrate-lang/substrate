@@ -1,4 +1,4 @@
-// A worker's thread on Node: runs its modules, with the worker module's own side and the parent's modules.
+// A worker's thread on Node runs the worker's modules, with the worker module's own side and the parent's modules.
 import { parentPort } from 'node:worker_threads';
 import { createHost, Exit } from '../subhost-core.mjs';
 import { workerSide } from '../worker-side.mjs';

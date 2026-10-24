@@ -1,4 +1,4 @@
-// A page's files, for fs.mjs: in memory, under the program's working directory.
+// A page's files for fs.mjs, kept in memory under the program's working directory.
 export function resolvePath(cwd, path) {
   const out = [];
   for (const seg of (path.startsWith('/') ? path : `${cwd}/${path}`).split('/')) {
