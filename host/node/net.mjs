@@ -1,7 +1,8 @@
 // The host module "net": TCP listeners, and connections, which are streams.
 // Kinds: listening 1, value the port; accept 2, value the new connection's stream; connected 3; failed 4,
 // value the error code. A listener's host is the address to bind, "" for 127.0.0.1; secure asks for TLS; most is
-// how many of its connections may be open at once, 0 for any, a connection beyond that being closed at once.
+// how many of its connections may be open at once, 0 for any, a connection beyond that being closed at once. A
+// connection's two sides end apart: the peer's end is a read of 0, and this side's is finish.
 import net from 'node:net';
 import tls from 'node:tls';
 import { errorOf } from '../errors.mjs';
@@ -31,7 +32,9 @@ export function netModule(granted = {}) {
         try {
           const host = caller.string(hp, hl);
           if (secure && !granted.tls) throw new Error('net.listen: no certificate was granted for tls');
-          server = secure ? tls.createServer(granted.tls) : net.createServer();
+          server = secure
+            ? tls.createServer({ ...granted.tls, allowHalfOpen: true })
+            : net.createServer({ allowHalfOpen: true });
           if (most > 0) server.maxConnections = most;
           server.listen(port, host || '127.0.0.1');
         } catch (e) {
@@ -59,8 +62,8 @@ export function netModule(granted = {}) {
         try {
           const host = caller.string(hp, hl);
           socket = secure
-            ? tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, ca })
-            : net.connect({ host, port });
+            ? tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, ca, allowHalfOpen: true })
+            : net.connect({ host, port, allowHalfOpen: true });
         } catch (e) {
           caller.fail(err, e.message);
           return 0;
