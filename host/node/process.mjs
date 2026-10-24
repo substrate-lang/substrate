@@ -1,8 +1,8 @@
 // The host module "process": child programs, their three pipes being streams.
 // Kinds: exit 1, value the exit code, or 128 plus the signal; failed 2, value the error code.
 // spawn takes the program, its arguments and environment as entries each ended by a zero, NAME=VALUE for the
-// environment, the parent's when there are none, a directory, "" for the parent's, and a mode for each pipe:
-// 0 a stream, 1 ignored, 2 the parent's.
+// environment, added to the parent's unless clear is set, a directory, "" for the parent's, and a mode for each
+// pipe: 0 a stream, 1 ignored, 2 the parent's.
 import child from 'node:child_process';
 import os from 'node:os';
 import { errorOf, reasonOf } from '../errors.mjs';
@@ -27,19 +27,18 @@ export function processes() {
         for (const c of children.values()) c.process.kill();
         children.clear();
       },
-      spawn(pp, pl, ap, al, dp, dl, ep, el, stdin, stdout, stderr, tag, err) {
+      spawn(pp, pl, ap, al, dp, dl, ep, el, clear, stdin, stdout, stderr, tag, err) {
         const modes = [stdin, stdout, stderr].map((mode) => ['pipe', 'ignore', 'inherit'][mode] || 'pipe');
         let process;
         try {
-          const env = {};
-          const given = entries(caller.string(ep, el));
-          for (const e of given) {
+          const env = clear ? {} : { ...globalThis.process.env };
+          for (const e of entries(caller.string(ep, el))) {
             const equals = e.indexOf('=');
             env[equals < 0 ? e : e.slice(0, equals)] = equals < 0 ? '' : e.slice(equals + 1);
           }
           process = child.spawn(caller.string(pp, pl), entries(caller.string(ap, al)), {
             cwd: caller.string(dp, dl) || undefined,
-            env: given.length > 0 ? env : undefined,
+            env,
             stdio: modes,
           });
         } catch (e) {
