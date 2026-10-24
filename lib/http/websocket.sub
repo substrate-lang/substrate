@@ -1,7 +1,8 @@
 ;; WebSockets (RFC 6455) on the server: a request upgraded, then messages framed over its stream. The peer's
 ;; messages and the end are calls; ws-close! starts the closing handshake, which the peer's close completes. A peer
-;; silent for the server's idle limit is pinged, and ended if it stays silent as long again. Text that is not UTF-8
-;; ends the connection with 1007, and a broken frame or close code with 1002.
+;; silent for the server's idle limit is pinged, and ended if it stays silent as long again. Nothing is read while
+;; the stream is full, and what the peer sends after a close is dropped. Text that is not UTF-8 ends the connection
+;; with 1007, and a broken frame or close code with 1002.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified timer "../../host/modules/timer.sub")
@@ -26,7 +27,7 @@
 
 (struct ws-connection [head event-head] [stream u32] [user (ptr void)] [server (ptr http-server)]
   [in (array u8 16384)] [frames buffer] [message buffer] [out buffer]
-  [kind i32] [state i32] [code i32] [reading i32] [timer u32] [pinged i32]
+  [kind i32] [state i32] [code i32] [reading i32] [full i32] [timer u32] [pinged i32]
   [on-message (fn ((ptr ws-connection) (ptr u8) u32 i32))]
   [on-closed (fn ((ptr ws-connection) i32))]
   [on-drained (fn ((ptr ws-connection)))])
@@ -63,7 +64,9 @@
            (for ([i u32 0]) (< i 8) (+= i 1)
              (buffer-add-byte! out (cast i32 (bit-and (>> (cast u64 n) (* 8 (- 7 i))) 255))))])
     (buffer-add! out p n)
-    (stream-write (-> w stream) (-> out bytes) (-> out length))))
+    (let ([written (stream-write (-> w stream) (-> out bytes) (-> out length))])
+      (when (== written 1) (set! (-> w full) 1))
+      written)))
 
 (define (write-close! [w (ptr ws-connection)] [code i32])
   (let ([pair (array u8 2)])
@@ -173,15 +176,18 @@
   (when (> (-> w server idle) 0.0) (set! (-> w timer) (timer-after (-> w server idle) (cast (ptr void) w)))))
 
 (define (read-more! [w (ptr ws-connection)])
-  (when (and (< (-> w state) state-closed) (not (-> w reading)))
-    (set! (-> w reading) 1)
+  (when (< (-> w state) state-closed)
     (when (== (-> w timer) 0) (arm! w))
-    (when (< (stream-read! (-> w stream) (-> w in) 16384) 0) (ended! w 1006))))
+    (unless (or (-> w reading) (-> w full))
+      (set! (-> w reading) 1)
+      (when (< (stream-read! (-> w stream) (-> w in) 16384) 0) (ended! w 1006)))))
+
+(define (lost! [w (ptr ws-connection)]) (ended! w (if (== (-> w state) state-finishing) (-> w code) 1006)))
 
 (define (silent! [w (ptr ws-connection)])
   (set! (-> w timer) 0)
   (if (or (-> w pinged) (!= (-> w state) state-open))
-      (ended! w 1006)
+      (lost! w)
       (begin
         (set! (-> w pinged) 1)
         (write-frame! w 9 0 0)
@@ -192,15 +198,18 @@
     (cond [(== source timer-source) (when (== id (-> w timer)) (silent! w))]
           [(and (== kind stream-read) (> value 0))
            (set! (-> w reading) 0)
-           (set! (-> w pinged) 0)
-           (disarm! w)
-           (buffer-add! (& (-> w frames)) (-> w in) (cast u32 value))
-           (unframe! w)
+           (when (< (-> w state) state-finishing)
+             (set! (-> w pinged) 0)
+             (disarm! w)
+             (buffer-add! (& (-> w frames)) (-> w in) (cast u32 value))
+             (unframe! w))
            (read-more! w)]
-          [(== kind stream-read) (ended! w (if (== (-> w state) state-finishing) (-> w code) 1006))]
+          [(or (== kind stream-read) (== kind stream-failed)) (lost! w)]
           [(== kind stream-finished) (ended! w (-> w code))]
-          [(== kind stream-failed) (ended! w (if (== (-> w state) state-finishing) (-> w code) 1006))]
-          [(== kind stream-drained) (when (!= (-> w on-drained) 0) ((-> w on-drained) w))])))
+          [(== kind stream-drained)
+           (set! (-> w full) 0)
+           (when (!= (-> w on-drained) 0) ((-> w on-drained) w))
+           (read-more! w)])))
 
 (define (taken [tag (ptr void)] [stream u32] [bytes (ptr u8)] [n u32])
   (let ([w (cast (ptr ws-connection) tag)])
@@ -247,6 +256,7 @@
     (set! (-> w state) state-open)
     (set! (-> w code) 1005)
     (set! (-> w reading) 0)
+    (set! (-> w full) 0)
     (http-respond! r 101)
     (http-header! r "upgrade" "websocket")
     (http-header! r "connection" "upgrade")

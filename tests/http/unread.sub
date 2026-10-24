@@ -1,59 +1,98 @@
-;; A client that sends 32 requests at once for a 1 MiB answer and reads nothing for a while: the server stops
-;; answering until the client reads, then every answer comes.
+;; Clients that send at once what asks for 32 MiB back and read nothing for a while: 32 requests for a 1 MiB
+;; answer, then 64 WebSocket messages of 512 KiB to echo. The server stops answering until a client reads, and then
+;; everything comes.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
 (require-unqualified timer "../../host/modules/timer.sub")
 (require-unqualified http "../../lib/http/http.sub")
 (require-unqualified server "../../lib/http/server.sub")
+(require-unqualified ws "../../lib/http/websocket.sub")
 
-(const sent u32 32)
 (const size u32 1048576)
 
 (define server http-server)
+(define echo ws-connection)
 (define client event-head)
 (define parser http-parser)
 (define big (ptr u8) 0)
+(define frame (array u8 14))
 (define in (array u8 65536))
 (define stream u32 0)
+(define part i32 0)
+(define sent u32 0)
+(define expected i64 0)
 (define handled u32 0)
-(define answers u32 0)
 (define bytes i64 0)
+(define upgraded i32 0)
+
+(define (echoed [w (ptr ws-connection)] [p (ptr u8)] [n u32] [kind i32])
+  (+= handled 1)
+  (ws-send! w p n kind))
 
 (define (handle [r (ptr http-request)])
-  (+= handled 1)
-  (http-respond! r 200)
-  (http-send! r big size))
+  (cond [(not (ws-upgrade? r))
+         (+= handled 1)
+         (http-respond! r 200)
+         (http-send! r big size)]
+        [(ws-accept! (& echo) r) (set! (-> echo on-message) echoed)]))
 
-(define (no-head [p (ptr http-parser)]) (begin))
+(define (head [p (ptr http-parser)])
+  (when (== (-> p head status) 101)
+    (set! upgraded 1)
+    (http-parser-stop! p)))
 (define (body [p (ptr http-parser)] [b (ptr u8)] [n u32]) (+= bytes (cast i64 n)))
-(define (answer [p (ptr http-parser)]) (+= answers 1))
+(define (no-end [p (ptr http-parser)]) (begin))
+
+(define (start! [p i32] [n u32] [total i64])
+  (set! part p)
+  (set! sent n)
+  (set! expected total)
+  (set! handled 0)
+  (set! bytes 0)
+  (net-connect (-> server port) "127.0.0.1" 0 (& client) 0))
+
+(define (ask! [id u32])
+  (let ([b (make-buffer)])
+    (if (== part 1)
+        (for ([i u32 0]) (< i sent) (+= i 1) (buffer-add-string! (& b) "GET / HTTP/1.1\r\nhost: x\r\n\r\n"))
+        (begin
+          (buffer-add-string! (& b) "GET / HTTP/1.1\r\nhost: x\r\nupgrade: websocket\r\nconnection: upgrade\r\n")
+          (buffer-add-string! (& b) "sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n")
+          (for ([i u32 0]) (< i sent) (+= i 1)
+            (buffer-add! (& b) frame 14)
+            (buffer-add! (& b) big (/ size 2)))))
+    (stream-write id (-> b bytes) (-> b length))
+    (buffer-free! (& b))))
 
 (define (heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (cond [(== source timer-source)
-         (printf "answered while nothing was read: ~a\n" (if (< handled sent) "some" "all"))
+         (printf "~a while nothing was read: ~a\n" (if (== part 1) "answered" "echoed")
+                 (if (< handled sent) "some" "all"))
          (stream-read! stream in 65536)]
         [(== kind net-connected)
          (set! stream id)
-         (let ([b (make-buffer)])
-           (for ([i u32 0]) (< i sent) (+= i 1) (buffer-add-string! (& b) "GET / HTTP/1.1\r\nhost: x\r\n\r\n"))
-           (stream-write id (-> b bytes) (-> b length))
-           (buffer-free! (& b)))
+         (ask! id)
          (timer-after 500.0 (& client))]
         [(and (== kind stream-read) (> value 0))
-         (http-feed! (& parser) in (cast u32 value))
-         (if (< answers sent)
-             (stream-read! id in 65536)
-             (begin
-               (printf "read: ~a answers, ~a bytes\n" answers bytes)
-               (stream-close id)
-               (http-server-close! (& server))))]))
+         (if upgraded
+             (+= bytes (cast i64 value))
+             (let ([used (http-feed! (& parser) in (cast u32 value))])
+               (when upgraded (+= bytes (cast i64 (- value used))))))
+         (cond [(< bytes expected) (stream-read! id in 65536)]
+               [else
+                (printf "read: ~a bytes\n" bytes)
+                (stream-close id)
+                (if (== part 1) (start! 2 64 33555072) (http-server-close! (& server)))])]))
 
-(define (listening [s (ptr http-server)]) (net-connect (-> s port) "127.0.0.1" 0 (& client) 0))
+(define (listening [s (ptr http-server)]) (start! 1 32 33554432))
 
 (define (main)
   (set! big (cast (ptr u8) (calloc 1 size)))
+  (set! (@ frame 0) 130)
+  (set! (@ frame 1) 255)
+  (set! (@ frame 7) 8)
   (set! (-> client handle) heard)
-  (http-parser-init! (& parser) 0 no-head body answer)
+  (http-parser-init! (& parser) 0 head body no-end)
   (set! (-> server listening) listening)
   (http-serve! (& server) 0 handle))
