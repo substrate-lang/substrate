@@ -1,7 +1,7 @@
 // The host module "fetch": HTTP requests, answered as events. The request's id is its response body's stream.
 // Kinds: head 1, value the status, bytes the headers as entries, a name then its value, each ended by a zero;
 // failed 2, value the error code. start takes the method, the URL, headers as such entries, and the body.
-import { errorOf, reasonOf } from '../errors.mjs';
+import { errors, errorOf, reasonOf } from '../errors.mjs';
 import { readerSource } from '../streams.mjs';
 import { entries, joined } from '../entries.mjs';
 
@@ -10,6 +10,12 @@ const utf8 = new TextEncoder();
 const SOURCE = 6;
 const HEAD = 1;
 const FAILED = 2;
+
+const base = globalThis.location ? globalThis.location.href : undefined;
+
+// fetch fails with a TypeError when the network does: before the head, with the code in its cause on Node.
+const headError = (e) => (e.name === 'TypeError' && !(e.cause instanceof Error) ? errors.unreachable : errorOf(e));
+const bodyError = (e) => (e.name === 'TypeError' ? errors.aborted : errorOf(e));
 
 export function fetchModule() {
   return (caller) => ({
@@ -27,10 +33,12 @@ export function fetchModule() {
       const ready = new Promise((resolve) => {
         settle = resolve;
       });
-      const id = caller.streams.add(tag, readerSource(async () => {
+      const source = readerSource(async () => {
         await ready;
         return response && response.body ? response.body.getReader() : null;
-      }, () => controller.abort()));
+      }, () => controller.abort());
+      source.errorOf = bodyError;
+      const id = caller.streams.add(tag, source);
       fetch(url, { method, headers, body, signal: controller.signal })
         .then((r) => {
           response = r;
@@ -40,7 +48,8 @@ export function fetchModule() {
         }, (e) => {
           settle();
           if (!caller.streams.drop(id)) return;
-          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(reasonOf(e)));
+          caller.event(FAILED, id, tag, URL.canParse(url, base) ? headError(e) : errors.invalid,
+            utf8.encode(reasonOf(e)));
         });
       return id;
     },

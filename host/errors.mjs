@@ -15,10 +15,10 @@ export function errorOf(e) {
   if (e.code === 'EADDRINUSE') return errors.inUse;
   if (e.code === 'ECONNRESET' || e.code === 'EPIPE') return errors.aborted;
   if (e.code === 'ETIMEDOUT' || e.name === 'TimeoutError') return errors.timeout;
-  if (e.code === 'ERR_INVALID_URL' || e.code === 'EINVAL' || /URL/.test(e.message)) return errors.invalid;
+  if (e.code === 'ERR_INVALID_URL' || e.code === 'EINVAL') return errors.invalid;
   if (unreachable.has(e.code)) return errors.unreachable;
   if (e.cause instanceof Error) return errorOf(e.cause);
-  return e.name === 'TypeError' ? errors.unreachable : errors.other;
+  return errors.other;
 }
 
 // The message, and its cause's.

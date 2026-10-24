@@ -2,7 +2,8 @@
 // Kinds: read 1, value the bytes read, 0 at the end; drained 2; failed 3, value the error code; finished 4,
 // once everything written before finish has been.
 // A source: pull() gives a promise of the next bytes, null at the end; write(bytes) is false when full;
-// finish(); close(); and it is told drained(), finished() and failed(e).
+// finish(); close(); and it is told drained(), finished() and failed(e). A source that has its own errorOf(e) gives
+// its failures' codes.
 import { errorOf, reasonOf } from './errors.mjs';
 
 const utf8 = new TextEncoder();
@@ -21,7 +22,7 @@ export function createStreams(host) {
     if (open.get(id) !== s) return;
     open.delete(id);
     s.closed = true;
-    host.raise(FAILED, id, s.tag, errorOf(e), utf8.encode(reasonOf(e)));
+    host.raise(FAILED, id, s.tag, (s.source.errorOf || errorOf)(e), utf8.encode(reasonOf(e)));
   }
 
   function add(tag, source) {
