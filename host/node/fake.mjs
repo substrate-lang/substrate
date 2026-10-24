@@ -113,11 +113,11 @@ export function fakeWebsocket() {
         });
         return id;
       },
-      send(id, ptr, len) {
+      send(id, ptr, len, kind) {
         if (!open.has(id)) return -1;
         const bytes = caller.memory().slice(caller.u(ptr), caller.u(ptr) + len);
         soon(() => {
-          if (open.has(id)) caller.event(2, id, open.get(id), 0, bytes);
+          if (open.has(id)) caller.event(2, id, open.get(id), kind, bytes);
         });
         return 0;
       },

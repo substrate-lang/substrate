@@ -1,7 +1,9 @@
-// The host module "websocket": connections whose messages arrive as events.
+// The host module "websocket": connections whose messages arrive as events. A message is text 1 or binary 2: its
+// event's value, and how send sends it.
 import { errors } from '../errors.mjs';
 
 const utf8 = new TextEncoder();
+const text = new TextDecoder();
 
 const SOURCE = 7;
 const OPEN = 1;
@@ -9,6 +11,8 @@ const MESSAGE = 2;
 const CLOSED = 3;
 const FAILED = 4;
 const DRAINED = 5;
+const TEXT = 1;
+const BINARY = 2;
 
 const full = 1 << 20;
 
@@ -50,7 +54,10 @@ export function websocket() {
         sockets.set(id, s);
         ws.binaryType = 'arraybuffer';
         ws.onopen = () => caller.event(OPEN, id, tag, 0);
-        ws.onmessage = (e) => caller.event(MESSAGE, id, tag, 0, typeof e.data === 'string' ? utf8.encode(e.data) : new Uint8Array(e.data));
+        ws.onmessage = (e) => {
+          if (typeof e.data === 'string') caller.event(MESSAGE, id, tag, TEXT, utf8.encode(e.data));
+          else caller.event(MESSAGE, id, tag, BINARY, new Uint8Array(e.data));
+        };
         ws.onerror = () => {
           if (sockets.get(id) !== s) return;
           sockets.delete(id);
@@ -63,10 +70,11 @@ export function websocket() {
         };
         return id;
       },
-      send(id, ptr, len) {
+      send(id, ptr, len, kind) {
         const s = sockets.get(id);
         if (!s) return -1;
-        s.ws.send(caller.memory().slice(caller.u(ptr), caller.u(ptr) + len));
+        const bytes = caller.memory().slice(caller.u(ptr), caller.u(ptr) + len);
+        s.ws.send(kind === TEXT ? text.decode(bytes) : bytes);
         if (s.ws.bufferedAmount <= full) return 0;
         drainLater(id, s);
         return 1;
