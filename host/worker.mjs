@@ -1,7 +1,7 @@
 // The host module "worker": this program's functions run on threads of their own, sharing nothing but messages.
 // start runs the named function on a thread, with bytes as the worker's argument, under a time limit and a
-// memory limit. A worker has its parent's modules; one a thread cannot have traps when called. The browser and
-// Node each give their way of starting a thread.
+// memory limit, its output going to this program's or coming as events. A worker has its parent's modules; one a
+// thread cannot have traps when called. The browser and Node each give their way of starting a thread.
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
@@ -42,7 +42,7 @@ export function workerModule({ spawn }) {
       : null;
   };
 
-  function start(entry, argument, time, pages, tag, app, err) {
+  function start(entry, argument, time, pages, heard, tag, app, err) {
     const program = caller.program();
     const modules = program.names.map((name) => [name, program.bytes(name)]);
     let thread;
@@ -57,7 +57,8 @@ export function workerModule({ spawn }) {
     alive.set(w, worker);
     thread.onMessage((m) => {
       if (alive.get(w) !== worker) return;
-      if (m.type === 'output') deliver(w, tag, m.fd === 2 ? STDERR : STDOUT, 0, m.bytes);
+      if (m.type === 'output' && !heard) caller.write(m.fd, m.bytes);
+      else if (m.type === 'output') deliver(w, tag, m.fd === 2 ? STDERR : STDOUT, 0, m.bytes);
       else if (m.type === 'message') deliver(w, tag, MESSAGE, 0, m.bytes);
       else if (m.type === 'done') deliver(w, tag, DONE, 0, utf8.encode(m.trap));
       else if (m.type === 'busy') limit(w, worker);
@@ -78,8 +79,9 @@ export function workerModule({ spawn }) {
       end() {
         for (const w of [...alive.keys()]) end(w, -1, null);
       },
-      start(np, nl, bp, bl, time, size, tag, err) {
-        return start(string(np, nl), bytes(bp, bl), time >>> 0, Math.ceil((size >>> 0) / 65536), tag, app, err);
+      start(np, nl, bp, bl, time, size, heard, tag, err) {
+        return start(string(np, nl), bytes(bp, bl), time >>> 0, Math.ceil((size >>> 0) / 65536), heard !== 0, tag, app,
+          err);
       },
       send(w, ptr, len) {
         const worker = alive.get(w);

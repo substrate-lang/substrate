@@ -327,6 +327,7 @@ export function createHost(platform) {
         return self.exports;
       },
       trap: hostTrap,
+      write: (fd, bytes) => platform.write(fd === 2 ? 2 : 1, bytes),
       give,
       fail(err, message) {
         if (!err) return;

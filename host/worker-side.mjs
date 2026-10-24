@@ -63,7 +63,7 @@ export function workerSide(post) {
 
   const worker = (caller) => ({
     source: SOURCE,
-    start(np, nl, bp, bl, time, size, tag, err) {
+    start(np, nl, bp, bl, time, size, heard, tag, err) {
       caller.fail(err, 'worker.start: a worker cannot start workers');
       return 0;
     },
