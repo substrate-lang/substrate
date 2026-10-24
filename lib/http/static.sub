@@ -1,0 +1,126 @@
+;; Static files: http-static! answers with the file at the request's path under root, or a directory's index.html,
+;; and redirects a directory named without its slash. Answers carry cache-control: no-store.
+(require-unqualified fs "../../host/fs.sub")
+(require-unqualified http "http.sub")
+(require-unqualified server "server.sub")
+
+(provide http-static! http-answer-text!)
+
+;; Files up to this size are read and sent whole; larger ones are piped.
+(const whole i64 262144)
+
+(define (extension [path (ptr u8)]) -> (ptr u8)
+  (let ([i (strlen path)])
+    (while (and (> i 0) (!= (@ path (- i 1)) 46) (!= (@ path (- i 1)) 47)) (-= i 1))
+    (if (and (> i 0) (== (@ path (- i 1)) 46)) (+ path i) "")))
+
+(define (content-type [path (ptr u8)]) -> (ptr u8)
+  (let ([e (extension path)])
+    (cond [(== (strcmp e "html") 0) "text/html; charset=utf-8"]
+          [(or (== (strcmp e "mjs") 0) (== (strcmp e "js") 0)) "text/javascript; charset=utf-8"]
+          [(== (strcmp e "css") 0) "text/css; charset=utf-8"]
+          [(== (strcmp e "wasm") 0) "application/wasm"]
+          [(== (strcmp e "json") 0) "application/json"]
+          [(or (== (strcmp e "txt") 0) (== (strcmp e "sub") 0)) "text/plain; charset=utf-8"]
+          [(== (strcmp e "svg") 0) "image/svg+xml"]
+          [(== (strcmp e "png") 0) "image/png"]
+          [(or (== (strcmp e "jpg") 0) (== (strcmp e "jpeg") 0)) "image/jpeg"]
+          [(== (strcmp e "gif") 0) "image/gif"]
+          [(== (strcmp e "webp") 0) "image/webp"]
+          [(== (strcmp e "wav") 0) "audio/wav"]
+          [(== (strcmp e "mp3") 0) "audio/mpeg"]
+          [(== (strcmp e "ogg") 0) "audio/ogg"]
+          [(== (strcmp e "woff2") 0) "font/woff2"]
+          [else "application/octet-stream"])))
+
+(define (hex-digit [c u8]) -> i32
+  (cond [(and (>= c 48) (<= c 57)) (- c 48)]
+        [(and (>= c 97) (<= c 102)) (+ (- c 97) 10)]
+        [(and (>= c 65) (<= c 70)) (+ (- c 65) 10)]
+        [else -1]))
+
+;; add-path! adds the target's decoded path to the buffer, and returns 0 when it is malformed or leaves the root.
+(define (add-path! [b (ptr buffer)] [target (ptr u8)]) -> i32
+  (let ([i u32 0] [start (-> b length)])
+    (while (and (!= (@ target i) 0) (!= (@ target i) 63))
+      (let ([c (@ target i)])
+        (if (== c 37)
+            (let ([high (hex-digit (@ target (+ i 1)))] [low (if (== (@ target (+ i 1)) 0) -1 (hex-digit (@ target (+ i 2))))])
+              (when (or (< high 0) (< low 0) (== (+ high low) 0)) (return 0))
+              (buffer-add-byte! b (+ (* high 16) low))
+              (+= i 3))
+            (begin
+              (buffer-add-byte! b c)
+              (+= i 1)))))
+    (buffer-add-byte! b 0)
+    (-= (-> b length) 1)
+    (let ([path (+ (-> b bytes) start)])
+      (when (!= (@ path 0) 47) (return 0))
+      (for ([j u32 0]) (!= (@ path j) 0) (+= j 1)
+        (when (and (== (@ path j) 47) (== (@ path (+ j 1)) 46) (== (@ path (+ j 2)) 46)
+                   (or (== (@ path (+ j 3)) 47) (== (@ path (+ j 3)) 0)))
+          (return 0))))
+    1))
+
+(define (http-answer-text! [r (ptr http-request)] [status i32] [text (ptr u8)])
+  (http-respond! r status)
+  (http-header! r "content-type" "text/plain; charset=utf-8")
+  (http-send-text! r text))
+
+(define (moved! [r (ptr http-request)])
+  (let ([t (-> r target)] [i u32 0] [last u32 0] [to (make-buffer)])
+    (while (and (!= (@ t i) 0) (!= (@ t i) 63))
+      (when (== (@ t i) 47) (set! last (+ i 1)))
+      (+= i 1))
+    (buffer-add-string! (& to) "./")
+    (buffer-add! (& to) (+ t last) (- i last))
+    (buffer-add-byte! (& to) 47)
+    (buffer-add-string! (& to) (+ t i))
+    (buffer-add-byte! (& to) 0)
+    (http-respond! r 301)
+    (http-header! r "location" (-> to bytes))
+    (http-finish! r)
+    (buffer-free! (& to))))
+
+(define (found! [r (ptr http-request)] [path (ptr u8)])
+  (http-respond! r 200)
+  (http-header! r "content-type" (content-type path))
+  (http-header! r "cache-control" "no-store"))
+
+(define (http-static! [r (ptr http-request)] [root (ptr u8)])
+  (let ([path (make-buffer)] [head? (== (strcmp (-> r method) "HEAD") 0)] [slash 0])
+    (buffer-add-string! (& path) root)
+    (cond
+      [(not (or head? (== (strcmp (-> r method) "GET") 0)))
+       (http-respond! r 405)
+       (http-header! r "allow" "GET, HEAD")
+       (http-header! r "content-type" "text/plain; charset=utf-8")
+       (http-send-text! r "method not allowed")]
+      [(not (add-path! (& path) (-> r target))) (http-answer-text! r 400 "bad request")]
+      [else
+       (set! slash (== (@ (-> path bytes) (- (-> path length) 1)) 47))
+       (when slash (buffer-add-string! (& path) "index.html"))
+       (buffer-add-byte! (& path) 0)
+       (let ([size (fs-stat (-> path bytes) 0)])
+         (cond [(and (== size -2) (not slash)) (moved! r)]
+               [(< size 0) (http-answer-text! r 404 "not found")]
+               [head?
+                (found! r (-> path bytes))
+                (http-length! r size)
+                (http-finish! r)]
+               [(<= size whole)
+                (let* ([n u32 0] [bytes (fs-read-file (-> path bytes) (& n) 0)])
+                  (if (== bytes 0)
+                      (http-answer-text! r 500 "cannot read the file")
+                      (begin
+                        (found! r (-> path bytes))
+                        (http-send! r bytes n)
+                        (free bytes))))]
+               [else
+                (let ([file (fs-open (-> path bytes) fs-read-mode 0 0)])
+                  (if (== file 0)
+                      (http-answer-text! r 500 "cannot read the file")
+                      (begin
+                        (found! r (-> path bytes))
+                        (http-send-stream! r file size))))]))])
+    (buffer-free! (& path))))

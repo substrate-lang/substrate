@@ -3,7 +3,7 @@
 (require-unqualified core "core.sub")
 (require-unqualified ops "ops.sub")
 (require-unqualified rd "reader.sub")
-(require-unqualified host "host.sub")
+(require-unqualified fs "../host/fs.sub")
 (require-unqualified cmp "compile.sub")
 (require-unqualified running "running.sub")
 (require-unqualified ser "serialize.sub")
@@ -11,7 +11,7 @@
 (require-unqualified checker "checker.sub")
 
 (provide set-repository-root! set-package-root! install-core! compile-module-file expand-module-file
-         content-hash wasm-module program-wasm-modules trap-report set-cache-directory!
+         content-hash wasm-module program-wasm-modules trap-report host-error set-cache-directory!
          session-open! session-eval! session-eval-text! session-eval-file! session-error session-recover!)
 
 (define core-forms datum
@@ -627,13 +627,13 @@
 (define (package-file [path datum]) -> datum
   (if (absolute-path? path) path (string-append (package-directory) (string-append '"/" path))))
 
-(define (source-text [file datum] [path datum]) -> datum
-  (let* ([name (make-buffer)] [n u32 0] [p (ptr u8) 0] [s datum 0])
+(define (source-text [path datum]) -> datum
+  (let* ([file (package-file path)] [name (make-buffer)] [n u32 0] [p (ptr u8) 0] [s datum 0] [why (ptr u8) 0])
     (buffer-add! (& name) (string-bytes file) (string-length file))
     (buffer-add-byte! (& name) 0)
-    (set! p (read-file-bytes (-> name bytes) (& n)))
+    (set! p (fs-read-file (-> name bytes) (& n) (& why)))
     (buffer-free! (& name))
-    (when (== p 0) (fail-at 0 "no module file ~a" (list1 path)))
+    (when (== p 0) (fail-at 0 "cannot read the module ~a" (list1 (host-error why))))
     (set! s (bytes->string p n))
     (free p)
     s))
@@ -645,7 +645,7 @@
           [(!= known 0) (fail-at 0 "cyclic require: ~a requires itself" (list1 path))]
           [(begin (set! cached (load-cached path)) (!= cached 0)) cached]
           [else
-           (let* ([text (source-text (package-file path) path)] [m (new-unit path (provisional-name path))] [saved current])
+           (let* ([text (source-text path)] [m (new-unit path (provisional-name path))] [saved current])
              (hash-set! (& registry) key (cast u32 m))
              (set! compiling (keep-cons (string->symbol path) compiling))
              (begin-module-arena)
@@ -667,7 +667,7 @@
 
 (define (expand-module-file [source datum] [f (closure (datum))])
   (let ([path (canonical-path source)])
-    (let* ([text (source-text (package-file path) path)] [m (new-unit path (provisional-name path))])
+    (let* ([text (source-text path)] [m (new-unit path (provisional-name path))])
       (hash-set! (& registry) (cast u64 (string->symbol path)) (cast u32 m))
       (begin-module-arena)
       (set! current (new-comp m))
@@ -932,7 +932,7 @@
   (let ([name (make-buffer)] [bytes (data-bytes d)] [ok i32 0])
     (buffer-add! (& name) (string-bytes path) (string-length path))
     (buffer-add-byte! (& name) 0)
-    (set! ok (write-file-bytes (-> name bytes) (string-bytes bytes) (string-length bytes)))
+    (set! ok (>= (fs-write-file (-> name bytes) (string-bytes bytes) (string-length bytes) 0) 0))
     (buffer-free! (& name))
     ok))
 
@@ -961,7 +961,7 @@
     (set! hash (section d 'hash))
     (set! requires (section d 'requires))
     (unless (and (string? hash)
-                 (string=? (module-hash path (source-text (package-file path) path)
+                 (string=? (module-hash path (source-text path)
                                         (map (lambda ([r datum]) -> datum (cdr r)) requires))
                            hash))
       (return 0))
@@ -1751,8 +1751,12 @@
       (instantiate! name (-> p bytes) (-> p imports) (-> p scopes) t 0 (>= (+ q (cast i32 t)) 1))
       (hash-set! (-> current instances) key 1))))
 
+(define (instantiate-bytes [np (ptr u8)] [nl u32] [b (ptr u8)] [bl u32] [mp (ptr u8)] [ml u32] [compile-time i32]
+                           [err (ptr (ptr u8))]) -> i32
+  (== (host-instantiate np nl b bl mp ml compile-time err) 0))
+
 (define (instantiate! [name datum] [bytes datum] [imports datum] [scopes datum] [t u32] [where datum] [compile-time i32])
-  (let ([m (make-buffer)] [map (import-map imports t)] [ok i32 0])
+  (let ([m (make-buffer)] [map (import-map imports t)] [ok i32 0] [why (ptr u8) 0])
     (while (pair? map)
       (buffer-add! (& m) (string-bytes (car (car map))) (string-length (car (car map))))
       (buffer-add-byte! (& m) 0)
@@ -1761,7 +1765,7 @@
       (set! map (cdr map)))
     (set-scope-map! (scope-map-of scopes t) (length scopes))
     (try (set! ok (instantiate-bytes (string-bytes name) (string-length name) (string-bytes bytes) (string-length bytes)
-                                     (-> m bytes) (-> m length) compile-time))
+                                     (-> m bytes) (-> m length) compile-time (& why)))
          [catch compile-error (message blamed loc)
           (set-scope-map! 0 0)
           (buffer-free! (& m))
@@ -1770,8 +1774,8 @@
     (buffer-free! (& m))
     (unless ok
       (if session-running
-          (fail-at where "~a" (list1 (session-failure (host-error))))
-          (fail-at where "compile-time code failed: ~a" (list1 (host-error)))))))
+          (fail-at where "~a" (list1 (session-failure (host-error why))))
+          (fail-at where "compile-time code failed: ~a" (list1 (host-error why)))))))
 
 (define (scope-map-of [scopes datum] [t u32]) -> (ptr u32)
   (let ([p (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ (length scopes) 1))))] [i u32 0] [sc u32 0] [o datum 0])
@@ -1783,9 +1787,10 @@
       (set! scopes (cdr scopes)))
     p))
 
-(define (host-error) -> datum
-  (let* ([p (cast (ptr u8) (arena-alloc (current-arena) 2048))] [n (cast u32 (host-error-message p 2048))])
-    (bytes->string p n)))
+(define (host-error [why (ptr u8)]) -> datum
+  (let ([s (bytes->string why (strlen why))])
+    (free why)
+    s))
 
 (define (instantiate-wasm-module! [name datum] [forms datum] [where datum])
   (set-current-source! (module-source))
@@ -2075,8 +2080,8 @@
     (set! to-syntax saved)
     (run-compile-time-wasm-module! code (+ phase 1) f)))
 
-(define (trap-report) -> datum
-  (let ([msg (host-error)] [loc (if (syntax? api-where) (syntax-srcloc api-where) 0)])
+(define (trap-report [why (ptr u8)]) -> datum
+  (let ([msg (bytes->string why (strlen why))] [loc (if (syntax? api-where) (syntax-srcloc api-where) 0)])
     (cond [(!= loc 0)
            (format-message "~a:~a:~a: error: ~a\n"
                            `(,(-> loc source) ,(make-integer (-> loc line)) ,(make-integer (+ (-> loc col) 1)) ,msg))]
@@ -2230,7 +2235,7 @@
     (if ok (session-eval! forms) 0)))
 
 (define (session-eval-file! [source datum] [report (closure (datum))])
-  (let* ([path (canonical-path source)] [text (source-text (package-file path) path)]
+  (let* ([path (canonical-path source)] [text (source-text path)]
          [forms (read-all (string-bytes text) (string-length text) (string->symbol path))])
     (while (pair? forms)
       (unless (session-eval! (list1 (car forms))) (report (session-error)))

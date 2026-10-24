@@ -21,7 +21,13 @@ same_program() {
 pass=0
 fail=0
 
-tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub)
+# A certificate for the TLS tests, which their clients trust because it is granted.
+mkdir -p "$builds/tls"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
+  -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
+
+tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
+       tests/crypto/*.sub tests/encoding/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
@@ -30,8 +36,15 @@ for t in "${tests[@]}"; do
   rm -rf "${program:?}"
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
+  args=("${args[@]/@program/$root/$program}")
+  args=("${args[@]//@build/$root/$builds}")
+  options=()
+  if [ -f "$base.host" ]; then read -r -a options < "$base.host"; fi
+  options=("${options[@]//@build/$root/$builds}")
+  input=/dev/null
+  if [ -f "$base.in" ]; then input="$root/$base.in"; fi
   actual="$(cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$program" -c "$cache" 2>&1 &&
-            "$host" "$root/$program" ${args[@]+"${args[@]}"} 2>&1)"
+            timeout 60 "$host" ${options[@]+"${options[@]}"} "$root/$program" ${args[@]+"${args[@]}"} 2>&1 < "$input")"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then
@@ -51,6 +64,29 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
+# The event tests again, against the real modules and the server in tests/events/fixtures.
+server=""
+for t in tests/events/*.sub; do
+  name="$(basename "$t" .sub)"
+  [ -f "tests/events/$name.real" ] || continue
+  if [ -z "$server" ]; then
+    : > "$builds/servers.url"
+    (cd tests/events/fixtures && "$root/bin/sub" build servers.sub -o "$root/$builds/events/servers" -c "$cache")
+    "$host" -g net,fs,timer,clock "$root/$builds/events/servers" "$root/tests/events/files" > "$builds/servers.url" & server=$!
+    for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
+    url="$(cat "$builds/servers.url")"
+  fi
+  actual="$(cd tests/events && timeout 60 "$host" -g clock,random,timer,fetch,websocket,net,fs "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
+  code=$?
+  if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL tests/events/$name, with the real modules: output differs (exit $code)"
+    diff <(echo "$actual") "tests/events/$name.out" | head -20
+  fi
+done
+[ -n "$server" ] && kill "$server"
 # The session tests.
 for t in tests/session/*.sub; do
   name="$(basename "$t" .sub)"
@@ -109,6 +145,8 @@ changed="$builds/changed"
 rm -rf "${changed:?}"
 mkdir -p "$changed/tests/substrate"
 cp -r compiler "$changed/"
+mkdir -p "$changed/host"
+cp host/fs.sub "$changed/host/"
 cp tests/substrate/forms.sub "$changed/tests/substrate/"
 from_changed() {
   "$host" "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \

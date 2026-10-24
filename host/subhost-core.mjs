@@ -1,4 +1,6 @@
 // The JavaScript host, shared by Node (subhost.mjs) and the browser (web/subhost-web.mjs).
+import { createStreams, STREAM } from './streams.mjs';
+import { joined } from './entries.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
@@ -159,19 +161,48 @@ function importMap(bytes) {
   return map;
 }
 
+export class Exit {
+  constructor(code) {
+    this.code = code;
+  }
+}
+
 export function createHost(platform) {
   const registry = new Map();
   const modules = new Map();
+  // A memory's malloc, from the module that exports both.
+  const allocators = new WeakMap();
   let lastError = '';
   // The running program: its modules' names in load order, and how to get one's bytes.
   let programNames = [];
   let programBytes = null;
+  let entry = null;
+  let onEvent = null;
+  let onTrap = null;
+  let ended = false;
+  let running = false;
+  let active = false;
+  let draining = false;
+  const queue = [];
+  let current = null;
+  let deliveries = 0;
+  let warned = false;
+  const closers = [];
+  const streams = createStreams({
+    raise: (kind, id, tag, value, bytes) => event(STREAM, kind, id, tag, value, bytes),
+    forget: (id) => forgetEvents(STREAM, id),
+    trap: (message) => hostTrap(message),
+  });
+
+  function forgetEvents(source, id) {
+    for (let i = queue.length - 1; i >= 0; i--) if (queue[i].source === source && queue[i].id === id) queue.splice(i, 1);
+  }
 
   const trapper = new WebAssembly.Instance(new WebAssembly.Module(trapperBytes)).exports;
   let trapMessage = null;
 
-  const COMPILE_TIME_HOST = new Set(['write', 'trap', 'error_message']);
-  const refused = (what) => () => hostTrap(`${what} is not available while compiling`);
+  const COMPILE_TIME_HOST = new Set(['write', 'trap']);
+  const refused = (what, where = 'while compiling') => () => hostTrap(`${what} is not available ${where}`);
 
   function hostTrap(message) {
     trapMessage = message;
@@ -256,13 +287,39 @@ export function createHost(platform) {
     return `${named[1]}${f} ${found.where}`;
   }
 
-  function callerOf(self, who) {
+  function guarded(module, name, f) {
+    return (...args) => {
+      try {
+        return f(...args);
+      } catch (e) {
+        if (e instanceof Exit || e instanceof WebAssembly.RuntimeError || e instanceof WebAssembly.Exception) throw e;
+        hostTrap(`${module}.${name}: ${e.message}`);
+      }
+    };
+  }
+
+  // giveIn copies bytes into a block from memory m's malloc, ended by a zero, and stores the length at out unless out
+  // is 0.
+  function giveIn(m, bytes, out, who) {
+    const malloc = m && allocators.get(m);
+    if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
+    const p = malloc(bytes.length + 1) >>> 0;
+    if (p === 0) hostTrap(`${who}: out of memory`);
+    const view = new Uint8Array(m.buffer);
+    view.set(bytes, p);
+    view[p + bytes.length] = 0;
+    if (out) new DataView(m.buffer).setUint32(out >>> 0, bytes.length, true);
+    return p;
+  }
+
+  function callerOf(self, who, made) {
     const memory = () => {
       const m = self.exports && self.exports.memory;
       if (!m) hostTrap(`${who}: the caller exports no memory, or is still starting`);
       return new Uint8Array(m.buffer);
     };
     const u = (ptr) => ptr >>> 0;
+    const give = (bytes, out) => giveIn(self.exports && self.exports.memory, bytes, out, who);
     return {
       memory,
       u,
@@ -271,14 +328,37 @@ export function createHost(platform) {
         return self.exports;
       },
       trap: hostTrap,
-      error(message) {
-        lastError = message;
+      write: (fd, bytes) => platform.write(fd === 2 ? 2 : 1, bytes),
+      give,
+      fail(err, message) {
+        if (!err) return;
+        const p = give(utf8.encode(message), 0);
+        new DataView(memory().buffer).setUint32(u(err), p, true);
       },
+      event(kind, id, tag, value, bytes, data) {
+        event(made.source, kind, id, tag, value, bytes, data);
+      },
+      forget(id) {
+        forgetEvents(made.source, id);
+      },
+      current: () => current,
+      grants: () => platform.grants || new Map(platform.modules ? [...platform.modules.keys()].map((n) => [n, n]) : []),
+      module: (name) => (platform.modules ? platform.modules.get(name) : undefined),
+      program: () => ({ names: programNames, bytes: programBytes }),
+      streams: { add: streams.add, tag: streams.tag, drop: streams.drop, close: streams.close, open: streams.open },
+    };
+  }
+
+  function eventImports(self) {
+    const { give } = callerOf(self, 'events');
+    return {
+      take: (out) => (current && current.bytes ? give(current.bytes, out) : 0),
     };
   }
 
   function hostImports(self) {
-    const { memory, string, u } = callerOf(self, 'host');
+    const { memory, string, u, give, fail } = callerOf(self, 'host');
+    // These calls give bytes and failures as the host section of compiler/substrate.sub says.
     return {
       write(fd, ptr, len) {
         platform.write(fd === 2 ? 2 : 1, memory().subarray(u(ptr), u(ptr) + len));
@@ -288,11 +368,13 @@ export function createHost(platform) {
         hostTrap(string(ptr, len));
       },
       // compileTime is 1 for code the compiler runs while compiling.
-      instantiate(np, nl, bp, bl, mp, ml, compileTime) {
+      instantiate(np, nl, bp, bl, mp, ml, compileTime, err) {
         const name = string(np, nl);
         const bytes = memory().slice(u(bp), u(bp) + bl);
         const map = importMap(memory().slice(u(mp), u(mp) + ml));
-        return instantiate(name, bytes, map, compileTime !== 0) ? 0 : 1;
+        if (instantiate(name, bytes, map, compileTime !== 0)) return 0;
+        fail(err, lastError);
+        return 1;
       },
       export_index(ip, il, fp, fl) {
         const table = self.exports.table;
@@ -301,66 +383,20 @@ export function createHost(platform) {
         const f = exports && exports[string(fp, fl)];
         return typeof f === 'function' ? table.grow(1, f) : -1;
       },
-      error_message(bp, cap) {
-        const b = utf8.encode(lastError).subarray(0, cap);
-        memory().set(b, u(bp));
-        return b.length;
-      },
-      arg(i, bp, cap) {
-        if (i < 0 || i >= platform.args.length) return -1;
-        const b = utf8.encode(platform.args[i]);
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
-      },
-      read_file(pp, pl, bp, cap) {
-        const path = string(pp, pl);
-        let b;
-        try {
-          b = platform.readFile(path);
-        } catch (e) {
-          lastError = `${path}: ${e.message}`;
-          return -1;
-        }
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
-      },
-      write_file(pp, pl, bp, len) {
-        const path = string(pp, pl);
-        try {
-          platform.writeFile(path, memory().slice(u(bp), u(bp) + len));
-        } catch (e) {
-          lastError = `${path}: ${e.message}`;
-          return -1;
-        }
-        return 0;
-      },
-      make_dir(pp, pl) {
-        const path = string(pp, pl);
-        try {
-          if (platform.makeDir) platform.makeDir(path);
-        } catch (e) {
-          lastError = `${path}: ${e.message}`;
-          return -1;
-        }
-        return 0;
+      arg(i, out) {
+        if (i < 0 || i >= platform.args.length) return 0;
+        const a = platform.args[i];
+        return give(typeof a === 'string' ? utf8.encode(a) : a, out);
       },
       exit(code) {
         platform.exit(code);
       },
-      program_modules(bp, cap) {
-        const b = utf8.encode(programNames.map((n) => `${n}\n`).join(''));
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
+      program_modules(out) {
+        return give(utf8.encode(joined(programNames)), out);
       },
-      module_bytes(np, nl, bp, cap) {
+      module_bytes(np, nl, out) {
         const name = string(np, nl);
-        if (!programNames.includes(name)) {
-          lastError = `the running program has no module ${name}`;
-          return -1;
-        }
-        const b = programBytes(name);
-        memory().set(b.subarray(0, cap), u(bp));
-        return b.length;
+        return programNames.includes(name) ? give(programBytes(name), out) : 0;
       },
     };
   }
@@ -383,11 +419,36 @@ export function createHost(platform) {
         if (!made.has('host')) made.set('host', hostImports(self));
         value = made.get('host')[imp.name];
         if (compileTime && value && !COMPILE_TIME_HOST.has(imp.name)) value = refused(`host.${imp.name}`);
+      } else if (imp.module === 'events') {
+        if (!made.has('events')) made.set('events', eventImports(self));
+        value = made.get('events')[imp.name];
+        if (compileTime && value) value = refused(`events.${imp.name}`);
+      } else if (imp.module === 'stream') {
+        if (!made.has('stream')) made.set('stream', streams.imports(callerOf(self, 'stream')));
+        value = made.get('stream')[imp.name];
+        if (compileTime && value) value = refused(`stream.${imp.name}`);
+      } else if (platform.absent && platform.absent.has(from)) {
+        value = refused(`${from}.${imp.name}`, 'in a worker');
       } else if (platform.modules && platform.modules.has(from)) {
         if (compileTime) {
           value = refused(`${from}.${imp.name}`);
         } else {
-          if (!made.has(from)) made.set(from, platform.modules.get(from)(callerOf(self, from)));
+          if (!made.has(from)) {
+            const info = {};
+            let factory;
+            try {
+              factory = platform.modules.get(from);
+            } catch (e) {
+              lastError = `instantiate ${name}: ${from}: ${e.message}`;
+              return false;
+            }
+            const { source, end: close, ...given } = factory(callerOf(self, from, info));
+            info.source = source;
+            const functions = {};
+            for (const [name, f] of Object.entries(given)) functions[name] = guarded(from, name, f);
+            if (close) closers.push(close);
+            made.set(from, functions);
+          }
           value = made.get(from)[imp.name];
         }
       } else {
@@ -395,13 +456,16 @@ export function createHost(platform) {
         value = exports && exports[imp.name];
       }
       if (value === undefined) {
-        lastError = `instantiate ${name}: no import ${from}.${imp.name}`;
+        const why = platform.ungranted && !made.has(from) && !registry.has(from) && platform.ungranted(from);
+        lastError = `instantiate ${name}: ${why || `no import ${from}.${imp.name}`}`;
         return false;
       }
       (imports[imp.module] ||= {})[imp.name] = value;
     }
     try {
       self.exports = new WebAssembly.Instance(module, imports).exports;
+      const { memory, malloc } = self.exports;
+      if (memory && typeof malloc === 'function' && !allocators.has(memory)) allocators.set(memory, malloc);
       const start = self.exports[START_EXPORT];
       if (start) start();
     } catch (e) {
@@ -419,43 +483,130 @@ export function createHost(platform) {
   function load(names, bytesOf) {
     programNames = names;
     programBytes = bytesOf;
-    for (const name of names) {
-      let loaded;
-      try {
-        loaded = instantiate(name, bytesOf(name), new Map());
-      } catch (e) {
-        if (!(e instanceof WebAssembly.Exception)) throw e;
-        lastError = 'uncaught exception';
+    running = true;
+    try {
+      for (const name of names) {
+        let loaded;
+        try {
+          loaded = instantiate(name, bytesOf(name), new Map());
+        } catch (e) {
+          if (e instanceof Exit) {
+            end(e.code, '');
+            return {};
+          }
+          if (!(e instanceof WebAssembly.Exception)) throw e;
+          lastError = 'uncaught exception';
+        }
+        if (!loaded) return null;
       }
-      if (!loaded) return null;
+    } finally {
+      running = false;
     }
-    return names.length > 0 ? registry.get(names[names.length - 1]) : {};
+    entry = names.length > 0 ? registry.get(names[names.length - 1]) : {};
+    onEvent = hook(names, 'on-event');
+    onTrap = hook(names, 'on-trap');
+    if (typeof entry.main !== 'function') drain();
+    return entry;
   }
 
-  function call(entry, f, args, report) {
+  // hook finds the named function in the main module, or else in the first module, the language's.
+  function hook(names, name) {
+    for (const m of [entry, registry.get(names[0])]) if (m && typeof m[name] === 'function') return m[name];
+    return null;
+  }
+
+  // end runs when the program is over, with its exit code, or with -1 and the reason after a trap.
+  function end(code, reason) {
+    ended = true;
+    queue.length = 0;
+    for (const close of closers.splice(0)) close();
+    streams.end();
+    if (platform.ended) platform.ended(code, reason);
+  }
+
+  function trapped(e) {
+    if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
+      lastError = `trap: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}\n${backtrace(e)}`;
+    } else if (e instanceof WebAssembly.Exception) {
+      lastError = 'uncaught exception';
+    } else {
+      return false;
+    }
+    return true;
+  }
+
+  function call(f, args) {
+    if (ended) return false;
+    const outer = running;
+    const first = !active;
+    running = true;
+    if (first) {
+      active = true;
+      if (platform.active) platform.active(true);
+    }
     try {
       f(...args);
       return true;
     } catch (e) {
-      if (e instanceof WebAssembly.RuntimeError || e instanceof RangeError) {
-        lastError = `trap: ${e instanceof WebAssembly.RuntimeError ? trapMessageOf(e) : e.message}\n${backtrace(e)}`;
-      } else if (e instanceof WebAssembly.Exception) {
-        lastError = 'uncaught exception';
-      } else {
-        throw e;
+      if (e instanceof Exit) {
+        end(e.code, '');
+        return false;
       }
-      const onTrap = entry['on-trap'];
-      if (typeof onTrap === 'function') {
+      if (!trapped(e)) throw e;
+      // When on-trap returns 0, or there is none, the error is reported and the program ends.
+      if (onTrap && allocators.has(entry.memory)) {
         try {
-          onTrap();
-          return false;
+          if (onTrap(giveIn(entry.memory, utf8.encode(lastError), 0, 'on-trap')) !== 0) return false;
         } catch (e2) {
-          if (!(e2 instanceof WebAssembly.RuntimeError || e2 instanceof RangeError ||
-                e2 instanceof WebAssembly.Exception)) throw e2;
+          if (e2 instanceof Exit) {
+            end(e2.code, '');
+            return false;
+          }
+          if (!trapped(e2)) throw e2;
         }
       }
-      report(lastError);
+      platform.report(lastError);
+      end(-1, lastError);
       return false;
+    } finally {
+      running = outer;
+      if (!outer) drain();
+      if (first) {
+        active = false;
+        if (platform.active) platform.active(false);
+      }
+    }
+  }
+
+  function event(source, kind, id, tag, value, bytes, data) {
+    if (ended) return;
+    queue.push({ source, kind, id, tag, value, bytes: bytes || null, data: data === undefined ? null : data });
+    if (!running) drain();
+  }
+
+  function drain() {
+    if (draining || running) return;
+    draining = true;
+    try {
+      while (queue.length > 0 && !ended) {
+        const e = queue.shift();
+        let ok;
+        if (onEvent) {
+          current = e;
+          try {
+            ok = call(onEvent, [e.source, e.kind, e.id, e.tag, e.value]);
+          } finally {
+            current = null;
+          }
+          deliveries++;
+        } else if (!warned) {
+          warned = true;
+          platform.report('an event arrived, but the program has no on-event');
+        }
+        if (platform.delivered) platform.delivered(e, ok);
+      }
+    } finally {
+      draining = false;
     }
   }
 
@@ -464,6 +615,16 @@ export function createHost(platform) {
     instantiate,
     load,
     call,
+    event,
+    get ended() {
+      return ended;
+    },
+    get deliveries() {
+      return deliveries;
+    },
+    get onEvent() {
+      return onEvent;
+    },
     get lastError() {
       return lastError;
     },

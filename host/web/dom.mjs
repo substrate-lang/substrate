@@ -1,8 +1,14 @@
-// The host module "dom": applies a program's patches to the page, and calls it for events.
-import { resolvePath } from './subhost-web.mjs';
+// The host module "dom": applies a program's patches to the page, and sends it the page's events.
+import { resolvePath } from './fs.mjs';
+import { errors } from '../errors.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
+
+const SOURCE = 1;
+const HEARD = 1;
+const IMAGE_LOADED = 2;
+const IMAGE_FAILED = 3;
 
 const imageTypes = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
@@ -14,29 +20,18 @@ export function dom(root) {
   const nodes = new Map([[0, root]]);
   const images = new Map();
   let loading = 0;
-  let event = null;
   let app = null;
-  let applying = false;
-  const waiting = [];
+  let caller = null;
 
-  const give = (e, message) => {
-    const outer = event;
-    event = e;
-    try {
-      app.call('on-event', message);
-    } finally {
-      event = outer;
-    }
+  const give = (e, message) => caller.event(HEARD, message, message, 0, null, e);
+
+  const event = () => {
+    const e = caller && caller.current();
+    return e && e.source === SOURCE ? e.data : null;
   };
 
   const listener = (e) => {
-    const node = e.currentTarget;
-    if (applying) waiting.push(() => heard(e, node));
-    else heard(e, node);
-  };
-
-  const heard = (e, node) => {
-    const messages = node.subListeners;
+    const messages = e.currentTarget.subListeners;
     if (messages && e.type in messages) give(e, messages[e.type]);
   };
 
@@ -59,14 +54,10 @@ export function dom(root) {
       if (!frameRequest) frameRequest = requestAnimationFrame(frame);
       return;
     }
-    const entry = { type, handler: null };
-    const deliver = (e) => {
+    const entry = { type, message, handler: null };
+    entry.handler = (e) => {
       const list = windowListeners.get(id);
       if (list && list.includes(entry)) give(e, message);
-    };
-    entry.handler = (e) => {
-      if (applying) waiting.push(() => deliver(e));
-      else deliver(e);
     };
     windowTarget(type).addEventListener(type, entry.handler);
     if (!windowListeners.has(id)) windowListeners.set(id, []);
@@ -77,10 +68,19 @@ export function dom(root) {
 
   const unlisten = (id) => {
     const n = nodes.get(id);
-    if (n instanceof Node && n.subListeners) n.subListeners = null;
-    for (const { type, handler } of windowListeners.get(id) || []) windowTarget(type).removeEventListener(type, handler);
+    if (n instanceof Node && n.subListeners) {
+      for (const message of Object.values(n.subListeners)) caller.forget(message);
+      n.subListeners = null;
+    }
+    for (const { type, message, handler } of windowListeners.get(id) || []) {
+      windowTarget(type).removeEventListener(type, handler);
+      caller.forget(message);
+    }
     windowListeners.delete(id);
-    frames.delete(id);
+    if (frames.has(id)) {
+      caller.forget(frames.get(id));
+      frames.delete(id);
+    }
   };
 
   function template(html) {
@@ -234,13 +234,10 @@ export function dom(root) {
           break;
         }
         case 3:
-          taken(nodes.get(w[i + 1]));
-          // No break here.
         case 4:
-          for (let id = w[i + 1]; id <= w[i + 1] + w[i + 2]; id++) {
-            unlisten(id);
-            nodes.delete(id);
-          }
+          for (let id = w[i + 1]; id <= w[i + 1] + w[i + 2]; id++) unlisten(id);
+          if (w[i] === 3) taken(nodes.get(w[i + 1]));
+          for (let id = w[i + 1]; id <= w[i + 1] + w[i + 2]; id++) nodes.delete(id);
           i += 3;
           break;
         case 5:
@@ -299,15 +296,20 @@ export function dom(root) {
           const bytes = app.files.get(resolvePath(app.cwd, name));
           const type = imageTypes[name.slice(name.lastIndexOf('.') + 1).toLowerCase()] || '';
           const url = bytes ? URL.createObjectURL(new Blob([bytes], { type })) : name;
+          const id = w[i + 1];
           const finished = () => {
             loading--;
             if (bytes) URL.revokeObjectURL(url);
           };
           loading++;
-          image.onload = finished;
+          image.onload = () => {
+            finished();
+            caller.event(IMAGE_LOADED, id, 0, 0);
+          };
           image.onerror = () => {
             finished();
             console.error(`dom: cannot load the image ${name}`);
+            caller.event(IMAGE_FAILED, id, 0, errors.missing, utf8.encode(`cannot load the image ${name}`));
           };
           image.src = url;
           images.set(w[i + 1], image);
@@ -330,48 +332,44 @@ export function dom(root) {
 
   function apply(memory, ptr, length) {
     const after = [];
-    applying = true;
-    try {
-      patches(memory, ptr, length, after);
-    } finally {
-      applying = false;
-    }
+    patches(memory, ptr, length, after);
     for (const f of after) f();
-    while (waiting.length > 0) waiting.shift()();
   }
 
-  const module = (caller, theApp) => {
+  const module = (theCaller, theApp) => {
+    caller = theCaller;
     app = theApp;
-    const copied = (s, buf, cap) => {
-      const bytes = utf8.encode(s);
-      caller.memory().set(bytes.subarray(0, cap), caller.u(buf));
-      return bytes.length;
-    };
+    const given = (s, out) => caller.give(utf8.encode(s), out);
     return {
+      source: SOURCE,
       apply(ptr, length) {
         apply(caller.memory(), caller.u(ptr), length);
       },
-      event_value(buf, cap) {
-        const target = event && event.target;
-        return copied(target && typeof target.value === 'string' ? target.value : '', buf, cap);
+      event_value(out) {
+        const e = event();
+        const target = e && e.target;
+        return given(target && typeof target.value === 'string' ? target.value : '', out);
       },
-      event_key(buf, cap) {
-        return copied(event && typeof event.key === 'string' ? event.key : '', buf, cap);
+      event_key(out) {
+        const e = event();
+        return given(e && typeof e.key === 'string' ? e.key : '', out);
       },
       event_flags() {
-        if (!event) return 0;
-        return (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0) |
-          (event.target && event.target.checked === true ? 16 : 0) | (document.pointerLockElement ? 32 : 0);
+        const e = event();
+        if (!e) return 0;
+        return (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0) |
+          (e.target && e.target.checked === true ? 16 : 0) | (document.pointerLockElement ? 32 : 0);
       },
       event_number(which) {
-        if (!event) return 0;
+        const e = event();
+        if (!e) return 0;
         switch (which) {
-          case 0: return event.timeStamp || 0;
-          case 1: return event.offsetX || 0;
-          case 2: return event.offsetY || 0;
-          case 3: return event.movementX || 0;
-          case 4: return event.movementY || 0;
-          case 5: return event.button || 0;
+          case 0: return e.timeStamp || 0;
+          case 1: return e.offsetX || 0;
+          case 2: return e.offsetY || 0;
+          case 3: return e.movementX || 0;
+          case 4: return e.movementY || 0;
+          case 5: return e.button || 0;
           default: return 0;
         }
       },
@@ -379,7 +377,8 @@ export function dom(root) {
         return loading;
       },
       prevent_default() {
-        if (event && event.preventDefault) event.preventDefault();
+        const e = event();
+        if (e && e.preventDefault) e.preventDefault();
       },
     };
   };

@@ -1,8 +1,9 @@
 // Browser tests: each check opens its page, acts as a user would, and compares.
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withBrowser, webgpuFlags } from '../../host/web/browser.mjs';
+import { withBrowser, webgpuFlags } from './browser.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites, ...names] = process.argv.slice(2);
 
@@ -49,7 +50,7 @@ const checks = {
     };
     const fieldText = () => page.evaluate('document.querySelector("textarea").value');
 
-    const scheme = '(language scheme "lib/scheme/scheme.sub") => ';
+    const scheme = '(language scheme "lib/languages/scheme/scheme.sub") => ';
     await idle();
     check('repl: the page starts a Scheme session', await shown(), scheme);
     check('repl: the text box has the focus', await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
@@ -146,7 +147,58 @@ const checks = {
     check('repl: Clear empties the page', await shown(), '');
     await say('(fib 11)');
     check('repl: Clear keeps the session', await shown(), '(fib 11) => 89');
+    await say('(begin-for-syntax (require-unqualified macros "compiler/macros.sub"))');
+    check('repl: code run while compiling can require the compiler\'s macros', await last(),
+      '(begin-for-syntax (require-unqualified macros "compiler/macros.sub")) => ');
 
+    await page.click('nav button:nth-of-type(3)');
+    await idle();
+    check('repl: the URL carries the language', await page.evaluate('location.search'), '?language=bend');
+    await page.evaluate('location.href = location.pathname + "?language=substrate"');
+    await page.waitFor('window.ready && location.search === "?language=substrate"', 20000);
+    await idle();
+    check('repl: a language in the URL opens that session', await shown(), '(language substrate "compiler/substrate.sub") => ');
+
+    await say('(define (sq [x i32]) -> i32 (* x x))');
+    await say('(sq 4)');
+    const downloads = path.resolve(sites, 'repl-downloads');
+    fs.rmSync(downloads, { recursive: true, force: true });
+    fs.mkdirSync(downloads);
+    await page.downloadsTo(downloads);
+    await page.click('#save');
+    const saved = path.join(downloads, 'session.sub');
+    for (let i = 0; i < 100 && !fs.existsSync(saved); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    check('repl: Save downloads the inputs as a session file', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file',
+      '(language substrate "compiler/substrate.sub")\n\n(define (sq [x i32]) -> i32 (* x x))\n\n(sq 4)\n');
+
+    const forms = path.join(downloads, 'forms.sub');
+    fs.writeFileSync(forms, '(define (cube [x i32]) -> i32\n  (* x x x))\n\n(cube 3)\n');
+    await page.chooseFiles([forms]);
+    await page.click('#load');
+    await page.waitFor('document.querySelectorAll("section.entry").length === 5', 20000);
+    await idle();
+    check('repl: Load evaluates a file\'s forms in turn', (await entries()).slice(3).join('\n'),
+      '(define (cube [x i32]) -> i32\n  (* x x x)) => \n(cube 3) => 27');
+
+    await page.grant(['clipboardReadWrite', 'clipboardSanitizedWrite']);
+    await page.command('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await page.click('#copy');
+    const transcript = await page.evaluate(`[...document.querySelectorAll('section.entry')].map((s) => {
+      const output = s.querySelector('.output');
+      return s.querySelector('.input').textContent + '\\n'
+        + (output ? output.textContent.split('\\n').map((l) => ';; ' + l).join('\\n') + '\\n' : '');
+    }).join('\\n')`);
+    await page.waitFor('navigator.clipboard.readText().then((t) => t !== "")', 10000);
+    check('repl: Copy puts the transcript on the clipboard, outputs as comments',
+      await page.evaluate('navigator.clipboard.readText()'), transcript);
+
+    await page.type('(sq 1');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await page.evaluate('window.ready = false; location.reload()');
+    await page.waitFor('window.ready', 20000);
+    await idle();
+    check('repl: the draft survives a reload', await fieldText(), '(sq 1');
+    check('repl: and the language is the URL\'s', await shown(), '(language substrate "compiler/substrate.sub") => ');
   },
 
   async rows(page) {
@@ -170,20 +222,19 @@ const checks = {
     await page.click('#append');
     same('rows: append 1,000 rows', await ids(), [...swapped, ...upTo(1000, 1001)]);
 
-    await page.evaluate(`(() => {
-      window.kept = document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a");
-      window.given = 0;
-      const call = window.app.call;
-      window.app.call = (...args) => { window.given++; return call(...args); };
-    })()`);
+    await page.evaluate('window.kept = document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a")');
     await page.click('#clear');
     same('rows: clear removes every row', await ids(), []);
     check('rows: clear leaves only the placeholder node', await page.evaluate('document.querySelector("tbody").childNodes.length'), 1);
-    await page.evaluate('(() => { window.given = 0; window.kept.click(); })()');
-    check('rows: a click on a removed row does not reach the program', await page.evaluate('window.given'), 0);
+    const delivered = (click) => page.evaluate(`(() => {
+      const before = window.app.host.deliveries;
+      ${click};
+      return window.app.host.deliveries - before;
+    })()`);
+    check('rows: a click on a removed row does not reach the program', await delivered('window.kept.click()'), 0);
     await page.click('#create');
-    check('rows: a click on a current row reaches the program once', await page.evaluate(
-      '(() => { window.given = 0; document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a").click(); return window.given; })()'), 1);
+    check('rows: a click on a current row reaches the program once',
+      await delivered('document.querySelector("tbody tr:nth-child(7) td:nth-child(2) a").click()'), 1);
   },
 
   async fields(page) {
@@ -224,17 +275,17 @@ const checks = {
     check('fields: a custom event, named by a string in the template', await shown(), 'abc|ArrowDown|1|1');
   },
 
-  async guests(page) {
+  async workers(page) {
     const log = async () => (await page.evaluate('document.getElementById("log").textContent'))
       .split('\n').filter((l) => !l.startsWith('    ')).join('\n');
-    await page.waitFor('document.getElementById("log").textContent.includes("guest 3 is now looping")', 30000);
+    await page.waitFor('document.getElementById("log").textContent.includes("worker 3 is now looping")', 30000);
     await page.click('#tick');
     await page.click('#tick');
-    check('guests: the page responds while a guest loops forever', await page.evaluate('document.getElementById("ticks").textContent'), '2');
+    check('workers: the page responds while a worker loops forever', await page.evaluate('document.getElementById("ticks").textContent'), '2');
     await page.click('#stop');
     await page.waitFor('document.getElementById("log").textContent.endsWith("finished\\n")');
-    check('guests: the log of events', await log(), [
-      '1 stdout: a guest, one, two words',
+    check('workers: the log of events', await log(), [
+      '1 stdout: a worker, one',
       '1 done',
       '1 message: total 5',
       '1 done',
@@ -248,43 +299,37 @@ const checks = {
       '1 done',
       '1 message: read 12 bytes',
       '1 done',
-      '1 message: cannot read /secret/key.txt: No such file or directory',
+      '1 message: cannot write /out/made.txt: Read-only file system',
       '1 done',
-      '1 message: wrote',
-      '1 done',
-      '1 message: read 7 bytes',
-      '1 done',
-      '1 message: cannot write /data/note.txt: Permission denied',
+      '1 message: cannot read /out/made.txt: No such file or directory',
       '1 done',
       '1 message: trapped: trap: divide by zero',
       '1 done: trap: divide by zero',
       '1 message: total 43',
       '1 done',
-      '1 message: no guest: guest.start: a guest cannot start guests of its own',
+      '1 message: no worker: worker.start: a worker cannot start workers',
       '1 done',
       '1 message: out of memory before 32 MiB',
       '1 done',
       '1 message: total 44',
       '1 done',
       '1 ended: exit 3',
-      'send to guest 1 returned -1',
-      '2 stdout: a guest',
+      'send to worker 1 returned -1',
+      '2 stdout: a worker',
       '2 done',
       '2 ended: time limit exceeded (300 ms)',
-      '3 stdout: a guest',
+      '3 stdout: a worker',
       '3 done',
       '3 message: total 2',
-      'guest 3 is now looping',
+      'worker 3 is now looping',
       '3 done',
-      'stopped guest 3; send to it returned -1',
-      'no guest: guest.start: no program found in /nowhere',
-      'no guest: guest.start: unknown setting "frobnicate" in the spec',
-      'no guest: guest.start: "time" needs a positive whole number, not "soon"',
+      'stopped worker 3; send to it returned -1',
+      '4 stdout: own: started',
+      '4 stderr: error: trap: dom.images_loading is not available in a worker',
+      '4 ended: trap: dom.images_loading is not available in a worker',
       'finished',
       '',
     ].join('\n'));
-    check('guests: a file written by a guest does not appear in the page\'s files',
-      await page.evaluate('window.app.files.has("/out/made.txt")'), false);
   },
 
   async canvas(page) {
@@ -343,8 +388,8 @@ const checks = {
     await page.press('ArrowRight');
     check('snake: an arrow key starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
     await page.waitFor(`(() => {
-      const d = document.getElementById("board").getContext("2d").getImageData(13 * 20 + 10, 10 * 20 + 10, 1, 1).data;
-      return d[0] === 180 && d[1] === 241;
+      const d = document.getElementById("board").getContext("2d").getImageData(10 * 20 + 10, 10 * 20 + 10, 1, 1).data;
+      return d[0] === 16 && d[1] === 20;
     })()`, 5000);
     check('snake: the snake has moved, and left its old cells', await cell(10, 10), empty);
 
@@ -365,6 +410,18 @@ const checks = {
     check('snake: the button starts a new game too', await text('status'), 'Press an arrow key to start.');
     await page.press('a');
     check('snake: the A key turns left and starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
+
+    await page.evaluate(`new Promise((resolve) => {
+      const r = indexedDB.open('snake', 1);
+      r.onsuccess = () => {
+        const t = r.result.transaction('keys', 'readwrite');
+        t.objectStore('keys').put(new TextEncoder().encode('42'), 'best');
+        t.oncomplete = resolve;
+      };
+    })`);
+    await page.evaluate('window.ready = false; location.reload()');
+    await page.waitFor('window.ready && document.getElementById("best").textContent === "42"', 20000);
+    check('snake: the best score is kept across reloads', await text('best'), '42');
   },
 
   async platformer(page) {
@@ -620,6 +677,57 @@ const checks = {
     check('assets: an image asset is shown by its URL', await page.evaluate('document.getElementById("picture").naturalWidth'), 4);
   },
 
+  async storage(page) {
+    await page.waitFor('document.getElementById("step").textContent === "6"', 10000);
+    check('storage: set, got, a missing key, listed, removed, gone', await page.evaluate('document.getElementById("log").textContent'),
+      '2 0 \n1 1 hello\n1 0 \n3 1 greeting\n2 0 \n1 0 \n');
+  },
+
+  async location(page) {
+    const text = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    const first = `${url}location/index.html`;
+    await page.waitFor('document.getElementById("back").textContent !== ""', 10000);
+    check('location: the URL', await text('first'), first);
+    check('location: after a push', await text('pushed'), `${first}?page=2`);
+    check('location: back again, as an event', await text('back'), first);
+  },
+
+  async clipboard(page) {
+    await page.grant(['clipboardReadWrite', 'clipboardSanitizedWrite']);
+    await page.command('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await page.click('#copy');
+    await page.waitFor('document.getElementById("shown").textContent !== "waiting"', 10000);
+    check('clipboard: text written, then read back', await page.evaluate('document.getElementById("shown").textContent'),
+      'read: copied text');
+  },
+
+  async files(page) {
+    const text = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    const picked = [path.join(here, '../events/files/hello.txt'), path.join(here, 'assets/note.txt')];
+    await page.chooseFiles(picked);
+    await page.click('#pick');
+    await page.waitFor('document.getElementById("picked").textContent === "2" && document.getElementById("shown").textContent.split("\\n").length === 3', 10000);
+    check('files: two files picked, each read whole, in turn', await text('shown'),
+      picked.map((p) => `${path.basename(p)} ${fs.statSync(p).size} ${fs.readFileSync(p, 'utf8')}\n`).join(''));
+    const downloads = path.resolve(sites, 'files-downloads');
+    fs.rmSync(downloads, { recursive: true, force: true });
+    fs.mkdirSync(downloads);
+    await page.downloadsTo(downloads);
+    await page.click('#save');
+    const saved = path.join(downloads, 'saved.txt');
+    for (let i = 0; i < 100 && !fs.existsSync(saved); i++) await new Promise((resolve) => setTimeout(resolve, 50));
+    check('files: bytes saved as a download', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file', 'saved bytes');
+  },
+
+  async floor(page) {
+    const shown = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    await page.waitFor('document.getElementById("fired").textContent === "1" && document.getElementById("text").textContent !== ""', 10000);
+    check('floor: the timer fired once', await shown('fired'), '1');
+    check('floor: the asset was fetched', await shown('text'), 'An asset, read as a file.');
+    check('floor: with the status 200', await shown('status'), '200');
+    check('floor: nothing is written to the console', page.log.join('\n'), '');
+  },
+
   async focus(page) {
     const counts = () => page.evaluate('document.getElementById("counts").textContent');
     const marks = () => page.evaluate('document.querySelectorAll("span.mark").length');
@@ -637,7 +745,7 @@ const checks = {
 const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 
 // Port 0: any free port.
-const server = spawn(path.join(here, '../../host/web/serve.mjs'), [sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
+const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
 async function run(group) {
   await withBrowser(async (open) => {

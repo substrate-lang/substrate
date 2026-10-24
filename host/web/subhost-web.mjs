@@ -1,24 +1,10 @@
 // The host for a web page: runs a program in a browser, its files kept in memory.
-import { createHost } from '../subhost-core.mjs';
+import { createHost, Exit } from '../subhost-core.mjs';
+import { fsModule } from '../fs.mjs';
+import { pageFiles, resolvePath } from './fs.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
-
-class Exit {
-  constructor(code) {
-    this.code = code;
-  }
-}
-
-export function resolvePath(cwd, path) {
-  const out = [];
-  for (const seg of (path.startsWith('/') ? path : `${cwd}/${path}`).split('/')) {
-    if (seg === '' || seg === '.') continue;
-    if (seg === '..') out.pop();
-    else out.push(seg);
-  }
-  return `/${out.join('/')}`;
-}
 
 export function unpack(bytes, dir, files) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -85,55 +71,40 @@ export function run(options, names, wasm) {
   const app = { files, cwd, entry: null, ended: false };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
+  if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd)));
+  const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
+  const ended = (code, reason) => {
+    app.ended = true;
+    if (options.onEnd) options.onEnd(code, reason);
+  };
 
   const host = createHost({
     args: options.args || [],
     write: output,
-    readFile(path) {
-      const bytes = files.get(resolvePath(cwd, path));
-      if (!bytes) throw new Error('No such file or directory');
-      return bytes;
-    },
-    writeFile(path, bytes) {
-      const to = resolvePath(cwd, path);
-      if (options.mayWrite && !options.mayWrite(to)) throw new Error('Permission denied');
-      files.set(to, bytes);
-    },
     exit(code) {
       throw new Exit(code);
     },
+    report,
+    ended,
+    delivered: options.delivered,
+    active: options.active,
     modules,
+    absent: options.absent,
     memoryPages: options.memoryPages || 0,
   });
   app.host = host;
 
-  const running = (f) => {
-    if (app.ended) return false;
-    try {
-      return f();
-    } catch (e) {
-      if (!(e instanceof Exit)) throw e;
-      app.ended = true;
-      if (options.onExit) options.onExit(e.code);
-      return false;
-    }
-  };
-  const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
-
   app.call = (name, ...args) => {
     const f = app.entry && app.entry[name];
     if (typeof f !== 'function') return undefined;
-    return running(() => host.call(app.entry, f, args, report));
+    return host.call(f, args);
   };
 
-  running(() => {
-    app.entry = host.load(names, (name) => wasm.get(name));
-    if (!app.entry) {
-      report(host.lastError);
-      throw new Exit(2);
-    }
-    return true;
-  });
-  app.started = app.call('main');
+  app.entry = host.load(names, (name) => wasm.get(name));
+  if (!app.entry) {
+    report(host.lastError);
+    ended(2, '');
+  }
+  app.started = app.call(options.entry || 'main');
   return app;
 }
