@@ -1,7 +1,7 @@
 // The host module "fetch": HTTP requests, answered as events. The request's id is its response body's stream.
 // Kinds: head 1, value the status, bytes the headers as entries, a name then its value, each ended by a zero;
 // failed 2, value the error code. start takes the method, the URL, headers as such entries, and the body.
-import { errorOf } from '../errors.mjs';
+import { errorOf, reasonOf } from '../errors.mjs';
 import { readerSource } from '../streams.mjs';
 import { entries, joined } from '../entries.mjs';
 
@@ -40,7 +40,7 @@ export function fetchModule() {
         }, (e) => {
           settle();
           if (!caller.streams.drop(id)) return;
-          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
+          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(reasonOf(e)));
         });
       return id;
     },

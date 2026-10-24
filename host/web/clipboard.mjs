@@ -1,6 +1,6 @@
 // The host module "clipboard": text, read and written with the user's leave.
 // Kinds: text 1, bytes the text; written 2; failed 3, value the error code.
-import { errorOf } from '../errors.mjs';
+import { errorOf, reasonOf } from '../errors.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -22,7 +22,7 @@ export function clipboard() {
       ask().then((result) => {
         if (!ended) answer(id, result);
       }, (e) => {
-        if (!ended) caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
+        if (!ended) caller.event(FAILED, id, tag, errorOf(e), utf8.encode(reasonOf(e)));
       });
       return id;
     };

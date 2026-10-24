@@ -3,7 +3,7 @@
 // once everything written before finish has been.
 // A source: pull() gives a promise of the next bytes, null at the end; write(bytes) is false when full;
 // finish(); close(); and it is told drained(), finished() and failed(e).
-import { errorOf } from './errors.mjs';
+import { errorOf, reasonOf } from './errors.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -21,7 +21,7 @@ export function createStreams(host) {
     if (open.get(id) !== s) return;
     open.delete(id);
     s.closed = true;
-    host.raise(FAILED, id, s.tag, errorOf(e), utf8.encode(e.message));
+    host.raise(FAILED, id, s.tag, errorOf(e), utf8.encode(reasonOf(e)));
   }
 
   function add(tag, source) {

@@ -5,7 +5,7 @@
 // connection's two sides end apart: the peer's end is a read of 0, and this side's is finish.
 import net from 'node:net';
 import tls from 'node:tls';
-import { errorOf } from '../errors.mjs';
+import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
 
 const utf8 = new TextEncoder();
@@ -53,7 +53,7 @@ export function netModule(granted = {}) {
         server.on('error', (e) => {
           if (listeners.get(id) !== server) return;
           listeners.delete(id);
-          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
+          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(reasonOf(e)));
         });
         return id;
       },
@@ -73,7 +73,7 @@ export function netModule(granted = {}) {
         socket.setNoDelay(true);
         socket.on('error', (e) => {
           if (connected || !caller.streams.drop(id)) return;
-          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
+          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(reasonOf(e)));
         });
         id = caller.streams.add(tag, nodeSource(socket));
         socket.once(socket instanceof tls.TLSSocket ? 'secureConnect' : 'connect', () => {

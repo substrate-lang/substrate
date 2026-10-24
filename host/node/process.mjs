@@ -5,7 +5,7 @@
 // 0 a stream, 1 ignored, 2 the parent's.
 import child from 'node:child_process';
 import os from 'node:os';
-import { errorOf } from '../errors.mjs';
+import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
 import { entries } from '../entries.mjs';
 
@@ -55,7 +55,7 @@ export function processes() {
         process.on('error', (e) => {
           if (children.get(id) !== c) return;
           children.delete(id);
-          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
+          caller.event(FAILED, id, tag, errorOf(e), utf8.encode(reasonOf(e)));
         });
         process.on('close', (code, signal) => {
           if (children.get(id) !== c) return;

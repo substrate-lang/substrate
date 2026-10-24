@@ -1,7 +1,7 @@
 // The host module "storage": keys and their bytes, kept by the browser in IndexedDB.
 // Kinds: got 1, value 1 if the key was found, bytes its value; done 2; keys 3, value how many, bytes the keys,
 // each ended by a zero; failed 4, value the error code.
-import { errorOf } from '../errors.mjs';
+import { errorOf, reasonOf } from '../errors.mjs';
 import { joined } from '../entries.mjs';
 
 const utf8 = new TextEncoder();
@@ -32,7 +32,7 @@ export function storage(name = 'substrate') {
       })).then((result) => {
         if (!ended) answer(id, result);
       }, (e) => {
-        if (!ended) caller.event(FAILED, id, tag, errorOf(e), utf8.encode(e.message));
+        if (!ended) caller.event(FAILED, id, tag, errorOf(e), utf8.encode(reasonOf(e)));
       });
       return id;
     };
