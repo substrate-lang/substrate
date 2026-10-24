@@ -50,10 +50,13 @@ export function websocket() {
           return 0;
         }
         const id = next++;
-        const s = { ws, tag, polling: false };
+        const s = { ws, tag, polling: false, opened: false };
         sockets.set(id, s);
         ws.binaryType = 'arraybuffer';
-        ws.onopen = () => caller.event(OPEN, id, tag, 0);
+        ws.onopen = () => {
+          s.opened = true;
+          caller.event(OPEN, id, tag, 0);
+        };
         ws.onmessage = (e) => {
           if (typeof e.data === 'string') caller.event(MESSAGE, id, tag, TEXT, utf8.encode(e.data));
           else caller.event(MESSAGE, id, tag, BINARY, new Uint8Array(e.data));
@@ -61,7 +64,8 @@ export function websocket() {
         ws.onerror = () => {
           if (sockets.get(id) !== s) return;
           sockets.delete(id);
-          caller.event(FAILED, id, tag, errors.unreachable, utf8.encode(`cannot connect to ${url}`));
+          const why = s.opened ? `the connection to ${url} failed` : `cannot connect to ${url}`;
+          caller.event(FAILED, id, tag, s.opened ? errors.aborted : errors.unreachable, utf8.encode(why));
         };
         ws.onclose = (e) => {
           if (sockets.get(id) !== s) return;
