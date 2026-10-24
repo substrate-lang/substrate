@@ -12,8 +12,8 @@ const DONE = 4;
 const ENDED = 5;
 
 // spawn(plan, app) starts a thread running the plan: this program's modules, the function, its argument, the
-// grants and the memory's pages. It returns the thread: post(message, transfer), terminate(), onMessage(f) and
-// onError(f), f given the reason.
+// grants, the memory's pages, and whether its output is heard as events. It returns the thread: post(message,
+// transfer), terminate(), onMessage(f) and onError(f), f given the reason.
 export function workerModule({ spawn }) {
   let caller = null;
   const alive = new Map();
@@ -47,7 +47,7 @@ export function workerModule({ spawn }) {
     const modules = program.names.map((name) => [name, program.bytes(name)]);
     let thread;
     try {
-      thread = spawn({ modules, entry, argument, grants: [...caller.grants().values()], pages }, app);
+      thread = spawn({ modules, entry, argument, grants: [...caller.grants().values()], pages, heard }, app);
     } catch (e) {
       caller.fail(err, e.message);
       return 0;

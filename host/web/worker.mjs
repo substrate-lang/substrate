@@ -14,6 +14,7 @@ export function workers() {
         cwd: app.cwd,
         grants: plan.grants,
         pages: plan.pages,
+        heard: plan.heard,
       });
       return {
         post: (m, transfer) => thread.postMessage(m, transfer),

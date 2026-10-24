@@ -8,6 +8,7 @@ const side = workerSide((m, transfer) => parentPort.postMessage(m, transfer));
 
 parentPort.on('message', (m) => {
   if (m.type === 'start') {
+    if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
     const grants = new Map(m.grants.map((spec) => [nameOf(spec), spec]));
     const modules = grantedModules(grants, new Map([['worker', side.worker]]));

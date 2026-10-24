@@ -5,13 +5,15 @@ const utf8 = new TextEncoder();
 const SOURCE = 3;
 const MESSAGE = 1;
 
-// Output goes at most every 30 ms, and when the worker becomes idle.
+// Output goes at most every 30 ms, and when the worker becomes idle. When the parent hears it as events, it is
+// dropped while 1 MiB of it waits.
 function batcher(post) {
   const pieces = [];
   let pendingBytes = 0;
   let droppedBytes = 0;
   let lastSend = 0;
   let timer = null;
+  let limited = false;
   const maxPending = 1 << 20;
 
   function flush() {
@@ -41,7 +43,7 @@ function batcher(post) {
   }
 
   function output(fd, bytes) {
-    if (pendingBytes + bytes.length > maxPending) droppedBytes += bytes.length;
+    if (limited && pendingBytes + bytes.length > maxPending) droppedBytes += bytes.length;
     else {
       pieces.push([fd, bytes.slice()]);
       pendingBytes += bytes.length;
@@ -51,7 +53,13 @@ function batcher(post) {
     else if (timer === null) timer = setTimeout(flush, 30 - since);
   }
 
-  return { output, flush };
+  return {
+    output,
+    flush,
+    limit() {
+      limited = true;
+    },
+  };
 }
 
 // post(message, transfer) sends to the parent.
@@ -85,6 +93,7 @@ export function workerSide(post) {
   return {
     worker,
     write: out.output,
+    limitOutput: out.limit,
     report(message) {
       out.output(2, utf8.encode(`error: ${message}\n`));
     },

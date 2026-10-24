@@ -32,6 +32,7 @@ const side = workerSide((m, transfer) => self.postMessage(m, transfer));
 self.onmessage = async (e) => {
   const m = e.data;
   if (m.type === 'start') {
+    if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
     const modules = { worker: side.worker, fs: fsModule(readOnly(pageFiles(m.files, m.cwd))) };
     const absent = new Set();

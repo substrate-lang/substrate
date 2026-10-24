@@ -13,6 +13,7 @@ export function workers() {
         argument: plan.argument,
         grants: plan.grants,
         pages: plan.pages,
+        heard: plan.heard,
       });
       return {
         post: (m, transfer) => thread.postMessage(m, transfer),
