@@ -72,7 +72,7 @@ for t in tests/events/*.sub; do
   if [ -z "$server" ]; then
     : > "$builds/servers.url"
     (cd tests/events/fixtures && "$root/bin/sub" build servers.sub -o "$root/$builds/events/servers" -c "$cache")
-    "$host" -g net,fs,timer "$root/$builds/events/servers" "$root/tests/events/files" > "$builds/servers.url" & server=$!
+    "$host" -g net,fs,timer,clock "$root/$builds/events/servers" "$root/tests/events/files" > "$builds/servers.url" & server=$!
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
