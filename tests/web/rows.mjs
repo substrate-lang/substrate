@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withBrowser } from '../../host/web/browser.mjs';
+import { withBrowser } from './browser.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites] = process.argv.slice(2);

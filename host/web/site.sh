@@ -53,7 +53,5 @@ else
 fi
 cp "$root"/host/*.mjs "$out/host/"
 cp "$root"/host/modules/*.mjs "$out/host/modules/"
-for f in "$root"/host/web/*.mjs; do
-  case "$(basename "$f")" in browser.mjs) ;; *) cp "$f" "$out/host/web/" ;; esac
-done
+cp "$root"/host/web/*.mjs "$out/host/web/"
 cp "$page" "$out/index.html"

@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withBrowser, webgpuFlags } from '../../host/web/browser.mjs';
+import { withBrowser, webgpuFlags } from './browser.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites, ...names] = process.argv.slice(2);
 
@@ -50,7 +50,7 @@ const checks = {
     };
     const fieldText = () => page.evaluate('document.querySelector("textarea").value');
 
-    const scheme = '(language scheme "lib/scheme/scheme.sub") => ';
+    const scheme = '(language scheme "lib/languages/scheme/scheme.sub") => ';
     await idle();
     check('repl: the page starts a Scheme session', await shown(), scheme);
     check('repl: the text box has the focus', await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');

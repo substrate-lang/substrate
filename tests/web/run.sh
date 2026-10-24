@@ -12,7 +12,7 @@ bin/sub expand build/empty.sub > /dev/null
 
 site="$sites/session"
 bin/sub site "$site" build/sub -p tests/web/session.html \
-  -f files $(find compiler host lib/scheme lib/bend tests/session -name '*.sub' | sort) lib/nodes.sub
+  -f files $(find compiler host lib/languages/scheme lib/languages/bend tests/session -name '*.sub' | sort) lib/languages/nodes.sub
 status=0
 node tests/web/session.mjs "$site" funcs scheme substrate switch bend || status=1
 

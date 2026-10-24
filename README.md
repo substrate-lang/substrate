@@ -12,11 +12,12 @@ compiler is written in it, builds itself, and runs in a browser.
   lowers Substrate's other forms. `substrate.sub` is the default language,
   `wasm.sub` gives wasm's forms as `wasm:name`, and `syntax.sub` and
   `macros.sub` hold the data and tools macros work with.
-- `lib/`: languages written in Substrate: `scheme/`, a Scheme;
-  `bend/`, a dependently typed language; and, experimental, `shade/`, GPU
-  programs compiled to WGSL, and `web/`, programs in a web page, a game
-  library, examples and a REPL. Beside them is what they share:
-  `nodes.sub` for run-time nodes.
+- `lib/`: libraries written in Substrate. `languages/` holds the languages
+  built on it, `scheme/`, a Scheme, and `bend/`, a dependently typed
+  language, with `nodes.sub`, the run-time nodes they share. `http/` is an
+  HTTP/1.1 server with WebSockets and static files. `web/` (experimental)
+  holds programs in a web page: a UI library, WebGPU and `shade/` for GPU
+  programs compiled to WGSL, a game library, examples and a REPL.
 - `host/`: what runs compiled programs: `subhost.mjs` on Node, and `web/` in a
   browser (experimental).
 - `seed/`: a checked-in build of the compiler, which builds it from source.

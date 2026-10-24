@@ -16,7 +16,7 @@ seed:
 repl:
 	bin/sub site $(OUT)/web/repl lib/web/repl/repl.sub -p lib/web/repl/page.html \
 	  -f files $(addprefix compiler/,macros.sub substrate.sub syntax.sub wasm.sub writer.sub) \
-	  $(shell find host lib/scheme lib/bend -name '*.sub' | sort) lib/nodes.sub
+	  $(shell find host lib/languages/scheme lib/languages/bend -name '*.sub' | sort) lib/languages/nodes.sub
 
 clean:
 	rm -rf build
