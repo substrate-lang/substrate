@@ -1,6 +1,9 @@
 ;; An HTTP server over net: a listener whose connections are parsed, each request handed to a handler, which
-;; answers with a head and then bytes, a stream, or nothing, or takes the connection's stream for itself. A
-;; connection's requests are answered one at a time, in order: one that comes early waits for the answer before it.
+;; answers with a head and then bytes, a stream, or nothing, or takes the connection's stream for itself. The server
+;; adds the length of an answer's bytes or stream, or 0 when it has nothing, except that an answer to HEAD with
+;; nothing has only the length the handler gives. No body is sent for HEAD, and neither length nor body for 204 or
+;; 304. A connection's requests are answered one at a time, in order: one that comes early waits for the answer
+;; before it.
 ;; A request's on-body gets each piece of its body and on-end its end, with failed set when the body was malformed,
 ;; which also closes the connection after the answer. A head that is not a request, or has two Hosts, or none in
 ;; HTTP/1.1, is malformed; one that expects 100-continue is sent 100 Continue before its handler is called. Answers
@@ -19,7 +22,7 @@
          http-finish! http-take!)
 
 (struct http-request [connection (ptr void)] [method (ptr u8)] [target (ptr u8)] [head (ptr http-head)]
-  [user (ptr void)] [ended i32] [failed i32] [answered i32]
+  [user (ptr void)] [ended i32] [failed i32] [answered i32] [status i32]
   [on-body (fn ((ptr http-request) (ptr u8) u32))] [on-end (fn ((ptr http-request)))])
 
 (typedef taker (fn ((ptr void) u32 (ptr u8) u32)))
@@ -199,6 +202,7 @@
 
 (define (http-respond! [r (ptr http-request)] [status i32])
   (let ([c (connection-of r)])
+    (set! (-> r status) status)
     (set! (-> c out length) 0)
     (http-write-status! (& (-> c out)) status)
     (http-write-date! (& (-> c out)) (clock-now))
@@ -208,6 +212,10 @@
   (http-write-header! (& (-> (connection-of r) out)) name value))
 
 (define (http-length! [r (ptr http-request)] [n i64]) (http-write-number! (& (-> (connection-of r) out)) "content-length" n))
+
+(define (has-length? [r (ptr http-request)]) -> i32 (not (or (== (-> r status) 204) (== (-> r status) 304))))
+
+(define (has-body? [r (ptr http-request)]) -> i32 (and (has-length? r) (!= (strcmp (-> r method) "HEAD") 0)))
 
 (define (send-head! [c (ptr http-connection)])
   (http-write-end! (& (-> c out)))
@@ -220,20 +228,20 @@
 
 (define (http-finish! [r (ptr http-request)])
   (let ([c (connection-of r)])
+    (when (has-body? r) (http-length! r 0))
     (send-head! c)
     (answered! c)))
 
 (define (http-send! [r (ptr http-request)] [bytes (ptr u8)] [n u32])
   (let ([c (connection-of r)])
+    (when (has-length? r) (http-length! r (cast i64 n)))
     (http-write-end! (& (-> c out)))
-    (buffer-add! (& (-> c out)) bytes n)
+    (when (has-body? r) (buffer-add! (& (-> c out)) bytes n))
     (stream-write (-> c stream) (-> c out bytes) (-> c out length))
     (set! (-> c out length) 0)
     (answered! c)))
 
-(define (http-send-text! [r (ptr http-request)] [text (ptr u8)])
-  (http-length! r (cast i64 (strlen text)))
-  (http-send! r text (strlen text)))
+(define (http-send-text! [r (ptr http-request)] [text (ptr u8)]) (http-send! r text (strlen text)))
 
 (define (piped [p (ptr stream-pipe)])
   (let ([c (cast (ptr http-connection) (- (cast u32 p) (offsetof http-connection pipe)))])
@@ -244,12 +252,18 @@
 ;; bytes closes it too.
 (define (http-send-stream! [r (ptr http-request)] [from u32] [n i64])
   (let ([c (connection-of r)])
-    (when (and (< n 0) (not (-> c closing)))
-      (set! (-> c closing) 1)
-      (http-write-header! (& (-> c out)) "connection" "close"))
+    (cond [(>= n 0) (when (has-length? r) (http-length! r n))]
+          [(not (-> c closing))
+           (set! (-> c closing) 1)
+           (http-write-header! (& (-> c out)) "connection" "close")])
     (send-head! c)
-    (set! (-> c piping) 1)
-    (stream-pipe-start! (& (-> c pipe)) from (-> c stream) n 0 piped)))
+    (if (has-body? r)
+        (begin
+          (set! (-> c piping) 1)
+          (stream-pipe-start! (& (-> c pipe)) from (-> c stream) n 0 piped))
+        (begin
+          (stream-close from)
+          (answered! c)))))
 
 ;; The head alone is sent, and the connection's stream is the taker's, untagged, with the bytes read beyond the
 ;; request: once the handler returns, or at once when called later. It counts among the server's connections until
