@@ -80,8 +80,8 @@ export function workerModule({ spawn }) {
         for (const w of [...alive.keys()]) end(w, -1, null);
       },
       start(np, nl, bp, bl, time, size, heard, tag, err) {
-        return start(string(np, nl), bytes(bp, bl), time >>> 0, Math.ceil((size >>> 0) / 65536), heard !== 0, tag, app,
-          err);
+        const pages = Math.ceil((size >>> 0) / 65536);
+        return start(string(np, nl), bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err);
       },
       send(w, ptr, len) {
         const worker = alive.get(w);
