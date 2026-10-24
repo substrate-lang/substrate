@@ -84,10 +84,13 @@ export function websocket() {
         return 1;
       },
       close(id, code) {
+        if (code !== 1000 && (code < 3000 || code > 4999)) {
+          caller.trap(`websocket.close: the code must be 1000 or 3000 to 4999, not ${code}`);
+        }
         const s = sockets.get(id);
         if (!s) return;
         sockets.delete(id);
-        s.ws.close(code === 1000 || (code >= 3000 && code <= 4999) ? code : 1000);
+        s.ws.close(code);
         caller.forget(id);
       },
     };
