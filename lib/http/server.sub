@@ -3,13 +3,14 @@
 ;; adds the length of an answer's bytes or stream, or 0 when it has nothing, except that an answer to HEAD with
 ;; nothing has only the length the handler gives. No body is sent for HEAD, and neither length nor body for 204 or
 ;; 304. A connection's requests are answered one at a time, in order: one that comes early waits for the answer
-;; before it. A request's on-body gets each piece of its body and on-end its end, with failed set when the body was
-;; malformed, which also closes the connection after the answer. A head that is not a request, or has two Hosts, or
-;; none in HTTP/1.1, is malformed. A target in absolute form, http://host/path, is given as its path, its host taking
-;; the Host's place. A request that expects 100-continue is sent 100 Continue before its handler is called. Answers
-;; are dated by the clock. Set before serving: whether to use TLS, how many milliseconds a connection may wait for
-;; bytes or for a whole head, and how many connections there may be, the last two unlimited when 0. When listening
-;; fails, at once or later, problem holds the reason.
+;; before it, and for that answer to drain when the stream is full. A request's on-body gets each piece of its body
+;; and on-end its end, with failed set when the body was malformed, which also closes the connection after the
+;; answer. A head that is not a request, or has two Hosts, or none in HTTP/1.1, is malformed. A target in absolute
+;; form, http://host/path, is given as its path, its host taking the Host's place. A request that expects
+;; 100-continue is sent 100 Continue before its handler is called. Answers are dated by the clock. Set before
+;; serving: whether to use TLS, how many milliseconds a connection may wait for bytes or for a whole head, and how
+;; many connections there may be, the last two unlimited when 0. When listening fails, at once or later, problem
+;; holds the reason.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
@@ -31,7 +32,7 @@
 
 (struct http-connection [head event-head] [server (ptr void)] [stream u32] [parser http-parser]
   [request http-request] [buf (array u8 16384)] [out buffer] [sending (ptr sending)]
-  [reading i32] [busy i32] [closing i32] [feeding i32] [take taker] [taken (ptr void)] [timer u32]
+  [reading i32] [busy i32] [closing i32] [feeding i32] [full i32] [take taker] [taken (ptr void)] [timer u32]
   [rest (ptr u8)] [rest-length u32] [next (ptr http-connection)])
 
 (struct http-server [head event-head] [listener u32] [port u32] [secure i32] [idle f64] [most u32]
@@ -86,9 +87,11 @@
   (when (and (-> c busy) (-> c request ended) (-> c request answered))
     (set! (-> c busy) 0)
     (cond [(-> c closing) (stream-finish (-> c stream))]
-          [(not (-> c feeding))
-           (http-parser-resume! (& (-> c parser)))
-           (feed! c (-> c rest) (-> c rest-length))])))
+          [(not (or (-> c feeding) (-> c full))) (resume! c)])))
+
+(define (resume! [c (ptr http-connection)])
+  (http-parser-resume! (& (-> c parser)))
+  (feed! c (-> c rest) (-> c rest-length)))
 
 (define (bad-request! [c (ptr http-connection)])
   (set! (-> c closing) 1)
@@ -161,7 +164,7 @@
   (let* ([c (cast (ptr http-connection) (-> p user))] [r (& (-> c request))])
     (set! (-> r ended) 1)
     (when (!= (-> r on-end) 0) ((-> r on-end) r))
-    (when (or (not (-> r answered)) (-> c closing)) (http-parser-stop! p))
+    (when (or (not (-> r answered)) (-> c closing) (-> c full)) (http-parser-stop! p))
     (settle! c)))
 
 ;; The stream goes to its taker with the bytes read beyond the request: those the parser holds of a next
@@ -204,7 +207,11 @@
           [(== kind stream-read)
            (set! (-> c closing) 1)
            (stream-finish (-> c stream))]
-          [(== kind stream-drained) (unless (== (-> c sending) 0) (stream-pipe-drained! (& (-> c sending pipe))))]
+          [(== kind stream-drained)
+           (let ([waited (-> c full)])
+             (set! (-> c full) 0)
+             (cond [(!= (-> c sending) 0) (stream-pipe-drained! (& (-> c sending pipe)))]
+                   [(and waited (not (or (-> c busy) (-> c closing)))) (resume! c)]))]
           [(== kind stream-finished) (drop! c)]
           [(== kind stream-failed) (drop! c)])))
 
@@ -244,9 +251,10 @@
 
 (define (has-body? [r (ptr http-request)]) -> i32 (and (has-length? r) (!= (strcmp (-> r method) "HEAD") 0)))
 
-(define (send-head! [c (ptr http-connection)])
+(define (send! [c (ptr http-connection)] [bytes (ptr u8)] [n u32])
   (http-write-end! (& (-> c out)))
-  (stream-write (-> c stream) (-> c out bytes) (-> c out length))
+  (buffer-add! (& (-> c out)) bytes n)
+  (when (== (stream-write (-> c stream) (-> c out bytes) (-> c out length)) 1) (set! (-> c full) 1))
   (set! (-> c out length) 0))
 
 (define (answered! [c (ptr http-connection)])
@@ -256,16 +264,13 @@
 (define (http-finish! [r (ptr http-request)])
   (let ([c (connection-of r)])
     (when (has-body? r) (http-length! r 0))
-    (send-head! c)
+    (send! c 0 0)
     (answered! c)))
 
 (define (http-send! [r (ptr http-request)] [bytes (ptr u8)] [n u32])
   (let ([c (connection-of r)])
     (when (has-length? r) (http-length! r (cast i64 n)))
-    (http-write-end! (& (-> c out)))
-    (when (has-body? r) (buffer-add! (& (-> c out)) bytes n))
-    (stream-write (-> c stream) (-> c out bytes) (-> c out length))
-    (set! (-> c out length) 0)
+    (send! c bytes (if (has-body? r) n 0))
     (answered! c)))
 
 (define (http-send-text! [r (ptr http-request)] [text (ptr u8)]) (http-send! r text (strlen text)))
@@ -284,7 +289,7 @@
           [(not (-> c closing))
            (set! (-> c closing) 1)
            (http-write-header! (& (-> c out)) "connection" "close")])
-    (send-head! c)
+    (send! c 0 0)
     (if (has-body? r)
         (let ([s (cast (ptr sending) (malloc (sizeof sending)))])
           (set! (-> s connection) (cast (ptr void) c))
@@ -299,7 +304,7 @@
 ;; the stream closes.
 (define (http-take! [r (ptr http-request)] [take taker] [tag (ptr void)])
   (let ([c (connection-of r)])
-    (send-head! c)
+    (send! c 0 0)
     (set! (-> c take) take)
     (set! (-> c taken) tag)
     (http-parser-stop! (& (-> c parser)))
