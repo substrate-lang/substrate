@@ -98,6 +98,7 @@ export function createStreams(host) {
         read(id, buf, cap) {
           const s = open.get(id);
           if (!s) return -1;
+          if (!s.source.pull) host.trap(`stream.read: stream ${id} cannot be read`);
           if (s.reading) host.trap(`stream.read: a read is already posted for stream ${id}`);
           if (cap === 0) host.trap('stream.read: a read with no room');
           s.reading = true;
@@ -106,7 +107,8 @@ export function createStreams(host) {
         },
         write(id, ptr, len) {
           const s = open.get(id);
-          if (!s || !s.source.write) return -1;
+          if (!s) return -1;
+          if (!s.source.write) host.trap(`stream.write: stream ${id} cannot be written`);
           return s.source.write(caller.memory().slice(caller.u(ptr), caller.u(ptr) + len)) ? 0 : 1;
         },
         finish(id) {
@@ -157,7 +159,7 @@ export function nodeSource(stream) {
     return true;
   };
   const source = {
-    pull() {
+    pull: stream.readable ? () => {
       if (chunks.length > 0) return Promise.resolve(chunks.shift());
       if (error) return Promise.reject(error);
       if (ended) return Promise.resolve(null);
@@ -165,7 +167,7 @@ export function nodeSource(stream) {
         waiting = { resolve, reject };
         stream.resume();
       });
-    },
+    } : undefined,
     write: stream.writable ? (bytes) => stream.write(bytes) : undefined,
     finish: stream.writable ? () => stream.end() : undefined,
     close: () => stream.destroy(),

@@ -66,7 +66,6 @@ export function pageFiles(files, cwd) {
       const chunks = mode === 2 && files.has(key) ? [files.get(key)] : [];
       const keep = () => files.set(key, concat(chunks));
       const source = {
-        pull: async () => null,
         write(bytes) {
           chunks.push(bytes);
           return true;
