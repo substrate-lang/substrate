@@ -1,7 +1,7 @@
 ;; An HTTP server over net: a listener whose connections are parsed, each request handed to a handler, which
-;; answers with a head and then bytes, a stream, or nothing, or takes the connection's stream for itself. One
-;; request at a time on a connection: the next is read once the answer is complete, and one arriving before that
-;; closes the connection after the answer. A request's on-body gets each piece of its body and on-end its end,
+;; answers with a head and then bytes, a stream, or nothing, or takes the connection's stream for itself. A
+;; connection's requests are answered one at a time, in order: one that comes early waits for the answer before it.
+;; A request's on-body gets each piece of its body and on-end its end,
 ;; with failed set when the body was malformed, which also closes the connection after the answer. A head that is
 ;; not a request, or has two Hosts, or none in HTTP/1.1, is malformed. Set before
 ;; serving: whether to use TLS, how many milliseconds a connection may wait for bytes or for a whole head, and how
@@ -26,7 +26,7 @@
 (struct http-connection [head event-head] [server (ptr void)] [stream u32] [parser http-parser]
   [request http-request] [buf (array u8 16384)] [out buffer] [pipe stream-pipe]
   [reading i32] [busy i32] [piping i32] [closing i32] [feeding i32] [take taker] [taken (ptr void)] [timer u32]
-  [next (ptr http-connection)])
+  [rest (ptr u8)] [rest-length u32] [next (ptr http-connection)])
 
 (struct http-server [head event-head] [listener u32] [port u32] [secure i32] [idle f64] [most u32]
   [problem (ptr u8)] [user (ptr void)] [connections (ptr http-connection)]
@@ -79,9 +79,10 @@
 (define (settle! [c (ptr http-connection)])
   (when (and (-> c busy) (-> c request ended) (-> c request answered))
     (set! (-> c busy) 0)
-    (if (-> c closing)
-        (stream-finish (-> c stream))
-        (may-read! c))))
+    (cond [(-> c closing) (stream-finish (-> c stream))]
+          [(not (-> c feeding))
+           (http-parser-resume! (& (-> c parser)))
+           (feed! c (-> c rest) (-> c rest-length))])))
 
 (define (bad-request! [c (ptr http-connection)])
   (set! (-> c closing) 1)
@@ -100,25 +101,21 @@
 (define (on-head [p (ptr http-parser)])
   (let* ([c (cast (ptr http-connection) (-> p user))] [r (& (-> c request))] [h (& (-> p head))]
          [old (== (strcmp (-> h version) "HTTP/1.0") 0)] [hosts (http-header-count h "host")])
-    (cond [(or (== (-> h method) 0) (> hosts 1) (and (== hosts 0) (not old))) (http-parser-refuse! p)]
-          [(-> c busy)
-           (set! (-> c closing) 1)
-           (set! (-> r on-body) 0)
-           (set! (-> r on-end) 0)]
-          [else
-           (let ([wish (http-header h "connection")])
-             (set! (-> c busy) 1)
-             (set! (-> r method) (-> h method))
-             (set! (-> r target) (-> h target))
-             (set! (-> r head) h)
-             (set! (-> r user) 0)
-             (set! (-> r ended) 0)
-             (set! (-> r failed) 0)
-             (set! (-> r answered) 0)
-             (set! (-> r on-body) 0)
-             (set! (-> r on-end) 0)
-             (when (or (and (!= wish 0) (http-has? wish "close")) old) (set! (-> c closing) 1))
-             ((-> (server-of c) handle) r))])))
+    (if (or (== (-> h method) 0) (> hosts 1) (and (== hosts 0) (not old)))
+        (http-parser-refuse! p)
+        (let ([wish (http-header h "connection")])
+          (set! (-> c busy) 1)
+          (set! (-> r method) (-> h method))
+          (set! (-> r target) (-> h target))
+          (set! (-> r head) h)
+          (set! (-> r user) 0)
+          (set! (-> r ended) 0)
+          (set! (-> r failed) 0)
+          (set! (-> r answered) 0)
+          (set! (-> r on-body) 0)
+          (set! (-> r on-end) 0)
+          (when (or (and (!= wish 0) (http-has? wish "close")) old) (set! (-> c closing) 1))
+          ((-> (server-of c) handle) r)))))
 
 (define (on-body [p (ptr http-parser)] [bytes (ptr u8)] [n u32])
   (let* ([c (cast (ptr http-connection) (-> p user))] [r (& (-> c request))])
@@ -128,6 +125,7 @@
   (let* ([c (cast (ptr http-connection) (-> p user))] [r (& (-> c request))])
     (set! (-> r ended) 1)
     (when (!= (-> r on-end) 0) ((-> r on-end) r))
+    (when (or (not (-> r answered)) (-> c closing)) (http-parser-stop! p))
     (settle! c)))
 
 ;; The stream goes to its taker with the bytes read beyond the request: those the parser holds of a next
@@ -145,20 +143,26 @@
     (buffer-free! (& (-> c parser line)))
     (free c)))
 
+(define (feed! [c (ptr http-connection)] [p (ptr u8)] [n u32])
+  (set! (-> c rest-length) 0)
+  (set! (-> c feeding) 1)
+  (let ([used (http-feed! (& (-> c parser)) p n)])
+    (set! (-> c feeding) 0)
+    (unless (and (not (-> c busy)) (> (-> c parser head line length) 0))
+      (disarm! c)
+      (when (-> c reading) (arm! c)))
+    (cond [(< used 0) (bad-request! c)]
+          [(!= (-> c take) 0) (hand-over! c (+ p used) (- n (cast u32 used)))]
+          [(< (cast u32 used) n)
+           (set! (-> c rest) (+ p used))
+           (set! (-> c rest-length) (- n (cast u32 used)))]
+          [else (may-read! c)])))
+
 (define (connection-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (let ([c (cast (ptr http-connection) tag)])
     (when (and (== source stream-source) (== kind stream-read)) (set! (-> c reading) 0))
     (cond [(== source timer-source) (when (== id (-> c timer)) (drop! c))]
-          [(and (== kind stream-read) (> value 0))
-           (set! (-> c feeding) 1)
-           (let ([used (http-feed! (& (-> c parser)) (-> c buf) (cast u32 value))])
-             (set! (-> c feeding) 0)
-             (unless (and (not (-> c busy)) (> (-> c parser head line length) 0))
-               (disarm! c)
-               (when (-> c reading) (arm! c)))
-             (cond [(< used 0) (bad-request! c)]
-                   [(!= (-> c take) 0) (hand-over! c (+ (-> c buf) used) (- (cast u32 value) used))]
-                   [else (may-read! c)]))]
+          [(and (== kind stream-read) (> value 0)) (feed! c (-> c buf) (cast u32 value))]
           [(and (!= (-> c take) 0) (not (-> c reading))) (hand-over! c 0 0)]
           [(== kind stream-read) (drop! c)]
           [(== kind stream-drained) (when (-> c piping) (stream-pipe-drained! (& (-> c pipe))))]
@@ -242,7 +246,7 @@
     (set! (-> c take) take)
     (set! (-> c taken) tag)
     (http-parser-stop! (& (-> c parser)))
-    (unless (or (-> c feeding) (-> c reading)) (hand-over! c 0 0))))
+    (unless (or (-> c feeding) (-> c reading)) (hand-over! c (-> c rest) (-> c rest-length)))))
 
 ;; ---- the server ----
 

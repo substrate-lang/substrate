@@ -1,0 +1,85 @@
+;; A server sent requests, each connection's at once: two behind a slow answer, answered in order; one with no
+;; Host, one with two, and a response, refused; and an HTTP/1.0 request with no Host, answered.
+(require-unqualified events "../../host/events.sub")
+(require-unqualified stream "../../host/stream.sub")
+(require-unqualified net "../../host/node/net.sub")
+(require-unqualified timer "../../host/modules/timer.sub")
+(require-unqualified http "../../lib/http/http.sub")
+(require-unqualified server "../../lib/http/server.sub")
+
+(struct side [head event-head] [name (ptr u8)] [request (ptr u8)] [parser http-parser] [body buffer]
+  [in (array u8 1024)])
+
+(struct delay [head event-head] [request (ptr http-request)])
+
+(define server http-server)
+(define late delay)
+(define sides (array side 5))
+(define at u32 0)
+
+(define (answer! [r (ptr http-request)] [text (ptr u8)])
+  (http-respond! r 200)
+  (http-send-text! r text))
+
+(define (later [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (answer! (-> (cast (ptr delay) tag) request) "slow"))
+
+(define (handle [r (ptr http-request)])
+  (if (== (strcmp (-> r target) "/slow") 0)
+      (begin
+        (set! (-> late request) r)
+        (timer-after 20.0 (& late)))
+      (answer! r (-> r target))))
+
+(define (side-head [p (ptr http-parser)])
+  (let ([s (cast (ptr side) (-> p user))])
+    (set! (-> s body length) 0)
+    (printf "~a: ~a" (-> s name) (-> p head status))))
+
+(define (side-body [p (ptr http-parser)] [bytes (ptr u8)] [n u32])
+  (buffer-add! (& (-> (cast (ptr side) (-> p user)) body)) bytes n))
+
+(define (side-end [p (ptr http-parser)])
+  (let ([s (cast (ptr side) (-> p user))])
+    (if (== (-> s body length) 0)
+        (printf "\n")
+        (begin
+          (buffer-add-byte! (& (-> s body)) 0)
+          (printf " ~a\n" (-> s body bytes))))))
+
+(define (start! [s (ptr side)])
+  (http-parser-init! (& (-> s parser)) (cast (ptr void) s) side-head side-body side-end)
+  (set! (-> s body) (make-buffer))
+  (net-connect (-> server port) "127.0.0.1" 0 s 0))
+
+(define (heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([s (cast (ptr side) tag)])
+    (cond [(== kind net-connected)
+           (stream-write-text id (-> s request))
+           (stream-read! id (-> s in) 1024)]
+          [(and (== kind stream-read) (> value 0))
+           (when (< (http-feed! (& (-> s parser)) (-> s in) (cast u32 value)) 0) (printf "~a: malformed\n" (-> s name)))
+           (stream-read! id (-> s in) 1024)]
+          [(or (== kind stream-read) (== kind stream-failed))
+           (printf "~a: closed\n" (-> s name))
+           (stream-close id)
+           (+= at 1)
+           (if (< at 5) (start! (& (@ sides at))) (http-server-close! (& server)))])))
+
+(define (side! [i u32] [name (ptr u8)] [request (ptr u8)])
+  (let ([s (& (@ sides i))])
+    (set! (-> s head handle) heard)
+    (set! (-> s name) name)
+    (set! (-> s request) request)))
+
+(define (listening [s (ptr http-server)]) (start! (& (@ sides 0))))
+
+(define (main)
+  (side! 0 "pipelined" "GET /slow HTTP/1.1\r\nhost: x\r\n\r\nGET /fast HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+  (side! 1 "no host" "GET / HTTP/1.1\r\n\r\n")
+  (side! 2 "two hosts" "GET / HTTP/1.1\r\nhost: a\r\nhost: b\r\n\r\n")
+  (side! 3 "response" "HTTP/1.1 200 OK\r\n\r\n")
+  (side! 4 "old" "GET /old HTTP/1.0\r\n\r\n")
+  (set! (-> late head handle) later)
+  (set! (-> server listening) listening)
+  (http-serve! (& server) 0 handle))
