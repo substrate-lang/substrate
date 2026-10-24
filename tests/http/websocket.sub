@@ -1,6 +1,6 @@
 ;; A WebSocket server, echoing: the host module's client sends text and bytes and closes; a raw connection upgrades
-;; and sends a fragmented message, a ping and a long message, then closes; another sends an unmasked frame; and
-;; a plain request is refused.
+;; and sends a fragmented message, a ping and a long message, then closes; others send an unmasked frame, text that
+;; is not UTF-8, and a close code never sent; a handshake of version 8 is refused; and a plain request is refused.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
@@ -10,8 +10,13 @@
 (require-unqualified server "../../lib/http/server.sub")
 (require-unqualified ws "../../lib/http/websocket.sub")
 
-(struct raw [head event-head] [stream u32] [parser http-parser] [in (array u8 4096)] [frames buffer] [unmasked i32]
-  [upgraded i32])
+(struct raw [head event-head] [stream u32] [parser http-parser] [in (array u8 4096)] [frames buffer] [mode i32]
+  [version (ptr u8)] [upgraded i32])
+
+(const raw-good i32 0)
+(const raw-unmasked i32 1)
+(const raw-not-utf-8 i32 2)
+(const raw-bad-code i32 3)
 
 (define server http-server)
 (define echo ws-connection)
@@ -19,6 +24,9 @@
 (define plain event-head)
 (define raw-a raw)
 (define raw-b raw)
+(define raw-c raw)
+(define raw-d raw)
+(define raw-e raw)
 (define step i32 0)
 (define waiting i32 0)
 
@@ -49,14 +57,14 @@
   (done!))
 
 (define (handle [r (ptr http-request)])
-  (if (ws-accept! (& echo) r)
-      (begin
-        (printf "server: upgraded ~a\n" (-> r target))
-        (set! (-> echo on-message) echoed)
-        (set! (-> echo on-closed) echo-closed))
-      (begin
-        (http-respond! r 426)
-        (http-send-text! r "upgrade required"))))
+  (cond [(not (ws-upgrade? r))
+         (http-respond! r 426)
+         (http-send-text! r "upgrade required")]
+        [(ws-accept! (& echo) r)
+         (printf "server: upgraded ~a\n" (-> r target))
+         (set! (-> echo on-message) echoed)
+         (set! (-> echo on-closed) echo-closed)]
+        [else (printf "server: refused\n")]))
 
 ;; ---- the module's client ----
 
@@ -92,18 +100,23 @@
     (buffer-add-byte! b (if masked (bit-xor (@ p i) (+ 1 (bit-and i 3))) (@ p i)))))
 
 (define (raw-send! [r (ptr raw)])
-  (let ([b (make-buffer)] [long (array u8 300)] [code (array u8 2)])
+  (let ([b (make-buffer)] [long (array u8 300)] [code (array u8 2)] [bad (array u8 1)])
     (memset long 120 300)
-    (if (-> r unmasked)
-        (add-frame! (& b) 1 1 "x" 1 0)
-        (begin
-          (add-frame! (& b) 0 1 "hel" 3 1)
-          (add-frame! (& b) 1 9 "p" 1 1)
-          (add-frame! (& b) 1 0 "lo" 2 1)
-          (add-frame! (& b) 1 1 long 300 1)
-          (set! (@ code 0) 3)
-          (set! (@ code 1) 233)
-          (add-frame! (& b) 1 8 code 2 1)))
+    (set! (@ bad 0) 255)
+    (cond [(== (-> r mode) raw-unmasked) (add-frame! (& b) 1 1 "x" 1 0)]
+          [(== (-> r mode) raw-not-utf-8) (add-frame! (& b) 1 1 bad 1 1)]
+          [(== (-> r mode) raw-bad-code)
+           (set! (@ code 0) 3)
+           (set! (@ code 1) 231)
+           (add-frame! (& b) 1 8 code 2 1)]
+          [else
+           (add-frame! (& b) 0 1 "hel" 3 1)
+           (add-frame! (& b) 1 9 "p" 1 1)
+           (add-frame! (& b) 1 0 "lo" 2 1)
+           (add-frame! (& b) 1 1 long 300 1)
+           (set! (@ code 0) 3)
+           (set! (@ code 1) 233)
+           (add-frame! (& b) 1 8 code 2 1)])
     (stream-write (-> r stream) (-> b bytes) (-> b length))
     (buffer-free! (& b))))
 
@@ -132,29 +145,46 @@
     (-= (-> b length) at)))
 
 (define (raw-head [p (ptr http-parser)])
-  (let ([r (cast (ptr raw) (-> p user))])
-    (printf "raw: ~a ~a\n" (-> p head status) (http-header (& (-> p head)) "sec-websocket-accept"))
+  (let ([h (& (-> p head))])
+    (printf "raw: ~a ~a\n" (-> h status)
+            (http-header h (if (== (-> h status) 101) "sec-websocket-accept" "sec-websocket-version")))
     (http-parser-stop! p)))
 
 (define (no-body [p (ptr http-parser)] [bytes (ptr u8)] [n u32]) (begin))
 (define (no-end [p (ptr http-parser)]) (begin))
 
+(define (raw-request! [r (ptr raw)] [id u32])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "GET /chat HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n")
+    (buffer-add-string! (& b) "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: ")
+    (buffer-add-string! (& b) (-> r version))
+    (buffer-add-string! (& b) "\r\n\r\n")
+    (stream-write id (-> b bytes) (-> b length))
+    (buffer-free! (& b))))
+
 (define (raw-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (let ([r (cast (ptr raw) tag)])
     (cond [(== kind net-connected)
-           (stream-write-text id "GET /chat HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+           (raw-request! r id)
            (stream-read! id (-> r in) 4096)]
           [(== kind net-failed)
            (let ([m (events-take-text)])
              (printf "raw: failed ~a: ~a\n" value m)
              (free m))]
+          [(and (== kind stream-read) (> value 0) (not (-> r upgraded)))
+           (let ([used (http-feed! (& (-> r parser)) (-> r in) (cast u32 value))])
+             (if (== (-> r parser head status) 101)
+                 (begin
+                   (set! (-> r upgraded) 1)
+                   (buffer-add! (& (-> r frames)) (+ (-> r in) used) (- (cast u32 value) used))
+                   (raw-send! r)
+                   (raw-frames! r)
+                   (stream-read! id (-> r in) 4096))
+                 (begin
+                   (stream-close id)
+                   (done!))))]
           [(and (== kind stream-read) (> value 0))
-           (if (-> r upgraded)
-               (buffer-add! (& (-> r frames)) (-> r in) (cast u32 value))
-               (let ([used (http-feed! (& (-> r parser)) (-> r in) (cast u32 value))])
-                 (set! (-> r upgraded) 1)
-                 (buffer-add! (& (-> r frames)) (+ (-> r in) used) (- (cast u32 value) used))
-                 (raw-send! r)))
+           (buffer-add! (& (-> r frames)) (-> r in) (cast u32 value))
            (raw-frames! r)
            (stream-read! id (-> r in) 4096)]
           [(== kind stream-read)
@@ -166,10 +196,11 @@
              (printf "raw: stream failed ~a: ~a\n" value m)
              (free m))])))
 
-(define (raw-start! [r (ptr raw)] [unmasked i32])
+(define (raw-start! [r (ptr raw)] [mode i32] [version (ptr u8)])
   (set! (-> r head handle) raw-heard)
   (set! (-> r frames) (make-buffer))
-  (set! (-> r unmasked) unmasked)
+  (set! (-> r mode) mode)
+  (set! (-> r version) version)
   (set! (-> r upgraded) 0)
   (http-parser-init! (& (-> r parser)) (cast (ptr void) r) raw-head no-body no-end)
   (set! (-> r stream) (net-connect (-> server port) "127.0.0.1" 0 (cast (ptr void) r) 0)))
@@ -186,10 +217,13 @@
   (+= step 1)
   (case step
     [(1) (set! waiting 1) (websocket-connect (url-of "ws://" "/") (& client) 0)]
-    [(2) (set! waiting 2) (raw-start! (& raw-a) 0)]
-    [(3) (set! waiting 2) (raw-start! (& raw-b) 1)]
-    [(4) (set! waiting 1) (fetch-get (url-of "http://" "/") (& plain))]
-    [(5) (http-server-close! (& server))]))
+    [(2) (set! waiting 2) (raw-start! (& raw-a) raw-good "13")]
+    [(3) (set! waiting 2) (raw-start! (& raw-b) raw-unmasked "13")]
+    [(4) (set! waiting 2) (raw-start! (& raw-c) raw-not-utf-8 "13")]
+    [(5) (set! waiting 2) (raw-start! (& raw-d) raw-bad-code "13")]
+    [(6) (set! waiting 1) (raw-start! (& raw-e) raw-good "8")]
+    [(7) (set! waiting 1) (fetch-get (url-of "http://" "/") (& plain))]
+    [(8) (http-server-close! (& server))]))
 
 (define (done!)
   (-= waiting 1)

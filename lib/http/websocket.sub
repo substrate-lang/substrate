@@ -1,6 +1,7 @@
 ;; WebSockets (RFC 6455) on the server: a request upgraded, then messages framed over its stream. The peer's
 ;; messages and the end are calls; ws-close! starts the closing handshake, which the peer's close completes. A peer
-;; silent for the server's idle limit is pinged, and ended after a second.
+;; silent for the server's idle limit is pinged, and ended after a second. Text that is not UTF-8 ends the
+;; connection with 1007, and a broken frame or close code with 1002.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified timer "../../host/modules/timer.sub")
@@ -8,6 +9,7 @@
 (require-unqualified server "server.sub")
 (require-unqualified sha1 "../crypto/sha1.sub")
 (require-unqualified base64 "../encoding/base64.sub")
+(require-unqualified utf8 "../encoding/utf8.sub")
 
 (provide ws-connection ws-text ws-binary ws-upgrade? ws-accept! ws-send! ws-send-text! ws-close!)
 
@@ -31,20 +33,18 @@
 
 (define guid (ptr u8) "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 
-(define (lower [c u8]) -> i32 (if (and (>= c 65) (<= c 90)) (+ c 32) c))
-
-(define (has-word? [s (ptr u8)] [word (ptr u8)]) -> i32
-  (let ([n (strlen word)] [i u32 0])
-    (while (>= (strlen (+ s i)) n)
-      (let ([j u32 0])
-        (while (and (< j n) (== (lower (@ s (+ i j))) (@ word j))) (+= j 1))
-        (when (== j n) (return 1)))
-      (+= i 1))
-    0))
-
+;; Whether the request asks for a WebSocket.
 (define (ws-upgrade? [r (ptr http-request)]) -> i32
-  (let ([upgrade (http-request-header r "upgrade")])
-    (and (!= upgrade 0) (has-word? upgrade "websocket") (!= (http-request-header r "sec-websocket-key") 0))))
+  (let ([upgrade (http-request-header r "upgrade")]) (and (!= upgrade 0) (http-has? upgrade "websocket"))))
+
+(define (key? [k (ptr u8)]) -> i32
+  (let ([b (make-buffer)] [ok 0])
+    (when (!= k 0) (set! ok (and (base64-decode! (& b) k (strlen k)) (== (-> b length) 16))))
+    (buffer-free! (& b))
+    ok))
+
+(define (closing-code? [code i32]) -> i32
+  (or (and (>= code 1000) (<= code 1014) (!= code 1004) (!= code 1005) (!= code 1006)) (and (>= code 3000) (<= code 4999))))
 
 ;; ---- frames out ----
 
@@ -99,13 +99,17 @@
 ;; ---- frames in ----
 
 (define (deliver! [w (ptr ws-connection)] [p (ptr u8)] [n u32] [kind i32])
-  (when (and (== (-> w state) state-open) (!= (-> w on-message) 0)) ((-> w on-message) w p n kind)))
+  (cond [(and (== kind ws-text) (not (utf-8? p n))) (fail! w 1007)]
+        [(and (== (-> w state) state-open) (!= (-> w on-message) 0)) ((-> w on-message) w p n kind)]))
 
 (define (frame! [w (ptr ws-connection)] [fin i32] [opcode i32] [p (ptr u8)] [n u32])
   (cond [(== opcode 8)
          (let ([code (if (>= n 2) (bit-or (<< (cast i32 (@ p 0)) 8) (cast i32 (@ p 1))) 1005)])
-           (when (== (-> w state) state-open) (write-close! w code))
-           (finish! w (if (== (-> w state) state-closing) (-> w code) code)))]
+           (cond [(or (== n 1) (and (>= n 2) (not (closing-code? code)))) (fail! w 1002)]
+                 [(not (utf-8? (+ p 2) (if (> n 2) (- n 2) 0))) (fail! w 1007)]
+                 [else
+                  (when (== (-> w state) state-open) (write-close! w code))
+                  (finish! w (if (== (-> w state) state-closing) (-> w code) code))]))]
         [(== opcode 9) (when (== (-> w state) state-open) (write-frame! w 10 p n))]
         [(== opcode 10) (begin)]
         [(or (== opcode 1) (== opcode 2))
@@ -207,11 +211,25 @@
 
 ;; ---- the connection ----
 
-;; 1 when the request asks for an upgrade, which is then answered and the stream taken; the callbacks and user
-;; are the caller's to set.
+(define (refuse! [r (ptr http-request)] [status i32])
+  (http-respond! r status)
+  (when (== status 426) (http-header! r "sec-websocket-version" "13"))
+  (http-length! r 0)
+  (http-finish! r))
+
+;; Answers a request that asks for a WebSocket: 1 when it is accepted and the stream taken, the callbacks and user
+;; being the caller's to set; 0 when its handshake is wrong, answered with 400, or with 426 for a version not 13.
 (define (ws-accept! [w (ptr ws-connection)] [r (ptr http-request)]) -> i32
-  (unless (ws-upgrade? r) (return 0))
-  (let ([key (http-request-header r "sec-websocket-key")] [s sha1] [digest (array u8 20)] [accept (make-buffer)])
+  (let ([key (http-request-header r "sec-websocket-key")] [version (http-request-header r "sec-websocket-version")]
+        [connection (http-request-header r "connection")] [s sha1] [digest (array u8 20)] [accept buffer])
+    (when (or (not (ws-upgrade? r)) (!= (strcmp (-> r method) "GET") 0) (== (strcmp (-> r head version) "HTTP/1.0") 0)
+              (== connection 0) (not (http-has? connection "upgrade")) (not (key? key)))
+      (refuse! r 400)
+      (return 0))
+    (when (or (== version 0) (!= (strcmp version "13") 0))
+      (refuse! r 426)
+      (return 0))
+    (set! accept (make-buffer))
     (sha1-init! (& s))
     (sha1-add! (& s) key (strlen key))
     (sha1-add! (& s) guid 36)
