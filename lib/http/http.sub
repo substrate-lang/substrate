@@ -4,12 +4,13 @@
 (provide http-head http-header http-header-count http-parser http-parser-init! http-feed! http-parser-closed!
          http-parser-stop! http-parser-resume! http-parser-refuse! http-parser-no-body! http-write-request!
          http-write-status! http-write-date! http-write-header! http-write-number! http-write-end! http-write-chunk!
-         http-reason http-decimal http-header-has? http-same? http-add-decimal!)
+         http-write-last-chunk! http-reason http-decimal http-header-has? http-same? http-add-decimal!)
 
 ;; Beyond these, a message is malformed.
 (const max-headers u32 100)
 (const max-head u32 16384)
 (const max-line u32 1024)
+(const max-excess i64 16384)
 
 (struct http-head [line buffer] [names (array (ptr u8) 100)] [values (array (ptr u8) 100)] [count u32]
   [method (ptr u8)] [target (ptr u8)] [version (ptr u8)] [status i32] [reason (ptr u8)])
@@ -25,7 +26,7 @@
 (const state-refused i32 8)
 (const state-no-body i32 9)
 
-(struct http-parser [head http-head] [line buffer] [state i32] [remaining i64] [user (ptr void)]
+(struct http-parser [head http-head] [line buffer] [state i32] [remaining i64] [excess i64] [user (ptr void)]
   [on-head (fn ((ptr http-parser)))] [on-body (fn ((ptr http-parser) (ptr u8) u32))] [on-end (fn ((ptr http-parser)))])
 
 ;; ---- text ----
@@ -226,6 +227,7 @@
   (set! (-> p line) (make-buffer))
   (set! (-> p state) state-head)
   (set! (-> p remaining) 0)
+  (set! (-> p excess) 0)
   (set! (-> p user) user)
   (set! (-> p on-head) on-head)
   (set! (-> p on-body) on-body)
@@ -237,7 +239,8 @@
   (set! (-> p head line length) 0)
   (set! (-> p head count) 0)
   (set! (-> p line length) 0)
-  (set! (-> p remaining) 0))
+  (set! (-> p remaining) 0)
+  (set! (-> p excess) 0))
 
 (define (body-expected? [status i32]) -> i32
   (not (or (< status 200) (== status 204) (== status 304))))
@@ -284,6 +287,13 @@
     (while (or (== (@ s i) 32) (== (@ s i) 9)) (+= i 1))
     (if (or (== digits 0) (> digits 15) (and (!= (@ s i) 59) (!= (@ s i) 13))) -1 n)))
 
+;; The bytes of a chunked body besides its data count toward max-excess, less 16 for each chunk and twice its
+;; data, as in Go's net/http.
+(define (overhead! [p (ptr http-parser)] [n i64]) -> i32
+  (+= (-> p excess) n)
+  (when (< (-> p excess) 0) (set! (-> p excess) 0))
+  (<= (-> p excess) max-excess))
+
 (define (take-body! [p (ptr http-parser)] [bytes (ptr u8)] [i u32] [n u32]) -> u32
   (let ([take (if (< (cast i64 (- n i)) (-> p remaining)) (- n i) (cast u32 (-> p remaining)))])
     ((-> p on-body) p (+ bytes i) take)
@@ -311,7 +321,8 @@
            (+= i 1)
            (when (== c 10)
              (let ([size (chunk-size (& (-> p line)))])
-               (when (< size 0) (return -1))
+               (unless (and (>= size 0) (overhead! p (- (cast i64 (+ (-> p line length) 2)) (+ 16 (* 2 size)))))
+                 (return -1))
                (set! (-> p line length) 0)
                (if (== size 0)
                    (set! (-> p state) state-trailers)
@@ -333,7 +344,7 @@
            (when (> (-> p line length) max-line) (return -1))
            (+= i 1)
            (when (== c 10)
-             (unless (crlf-line? (& (-> p line))) (return -1))
+             (unless (and (crlf-line? (& (-> p line))) (overhead! p (cast i64 (-> p line length)))) (return -1))
              (if (== (-> p line length) 2) (end! p) (set! (-> p line length) 0)))]
           [(== state state-until-close)
            ((-> p on-body) p (+ bytes i) (- n i))
@@ -475,8 +486,12 @@
 
 (define (http-write-end! [b (ptr buffer)]) (buffer-add-string! b "\r\n"))
 
+;; An empty chunk is not written, since it would end the body.
 (define (http-write-chunk! [b (ptr buffer)] [p (ptr u8)] [n u32])
-  (add-hex! b n)
-  (buffer-add-string! b "\r\n")
-  (buffer-add! b p n)
-  (buffer-add-string! b "\r\n"))
+  (when (> n 0)
+    (add-hex! b n)
+    (buffer-add-string! b "\r\n")
+    (buffer-add! b p n)
+    (buffer-add-string! b "\r\n")))
+
+(define (http-write-last-chunk! [b (ptr buffer)]) (buffer-add-string! b "0\r\n\r\n"))
