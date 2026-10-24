@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createHost, Exit } from './subhost-core.mjs';
-import { grantedModules, nameOf, problem } from './node/modules.mjs';
+import { grantedModules, nameOf, problem, ungranted } from './node/modules.mjs';
 
 function usage() {
   process.stderr.write('usage: sub run [-g MODULE[=fake[:DIR]|=tls:CERT:KEY],...] DIR [arg ...]\n');
@@ -65,6 +65,7 @@ const host = createHost({
   },
   modules,
   grants,
+  ungranted,
   keyOf: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 });
 

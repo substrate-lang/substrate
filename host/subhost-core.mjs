@@ -457,7 +457,8 @@ export function createHost(platform) {
         value = exports && exports[imp.name];
       }
       if (value === undefined) {
-        lastError = `instantiate ${name}: no import ${from}.${imp.name}`;
+        const why = platform.ungranted && !made.has(from) && !registry.has(from) && platform.ungranted(from);
+        lastError = `instantiate ${name}: ${why || `no import ${from}.${imp.name}`}`;
         return false;
       }
       (imports[imp.module] ||= {})[imp.name] = value;

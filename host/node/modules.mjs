@@ -47,6 +47,9 @@ const parts = (spec) => {
 
 export const nameOf = (spec) => parts(spec).name;
 
+// Why a program cannot have a module: it could be granted but was not; null for any other.
+export const ungranted = (name) => (Object.hasOwn(loaders, name) ? `${name} is not granted (-g ${name})` : null);
+
 // What is wrong with a spec, or null: no such module, or a file it names that cannot be read.
 export function problem(spec) {
   const { name, key, args } = parts(spec);

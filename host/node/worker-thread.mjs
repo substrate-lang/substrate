@@ -2,7 +2,7 @@
 import { parentPort } from 'node:worker_threads';
 import { createHost, Exit } from '../subhost-core.mjs';
 import { workerSide } from '../worker-side.mjs';
-import { grantedModules, nameOf } from './modules.mjs';
+import { grantedModules, nameOf, ungranted } from './modules.mjs';
 
 const side = workerSide((m, transfer) => parentPort.postMessage(m, transfer));
 
@@ -23,6 +23,7 @@ parentPort.on('message', (m) => {
       delivered: side.delivered,
       active: side.active,
       modules,
+      ungranted,
       absent: new Set(grants.has('stdin') ? ['stdin'] : []),
       memoryPages: m.pages,
     });
