@@ -348,13 +348,9 @@ export function createHost(platform) {
   }
 
   function eventImports(self) {
-    const { memory, u } = callerOf(self, 'events');
+    const { give } = callerOf(self, 'events');
     return {
-      take(buf, cap) {
-        if (!current || !current.bytes) return 0;
-        memory().set(current.bytes.subarray(0, cap), u(buf));
-        return current.bytes.length;
-      },
+      take: (out) => (current && current.bytes ? give(current.bytes, out) : 0),
     };
   }
 
