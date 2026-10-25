@@ -1,7 +1,9 @@
 // Fake clock, timer, fetch and websocket modules for tests. Fetch answers from a directory, a connection echoes
-// what it is sent, and time moves to the earliest timer once no other work is left.
+// what it is sent, and time moves to the earliest timer once no other work is left. The grants still apply.
 import fs from 'node:fs';
 import path from 'node:path';
+import { errors } from '../errors.mjs';
+import { mayUrl } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -66,15 +68,22 @@ export function fakeTimer() {
   };
 }
 
-export function fakeFetch(root) {
+export function fakeFetch(root, grants) {
   return (caller) => ({
     source: 6,
     start(mp, ml, up, ul, hp, hl, bp, bl, tag) {
-      const url = caller.string(up, ul);
+      const url = new URL(caller.string(up, ul), 'http://fake/');
+      if (!mayUrl(grants.net, url)) {
+        const id = caller.streams.add(tag, { pull: async () => null, close() {} });
+        caller.streams.drop(id);
+        const why = utf8.encode(`fetch: ${url.host} is not granted (--allow-net)`);
+        soon(() => caller.event(2, id, tag, errors.notGranted, why));
+        return id;
+      }
       let status = 200;
       let body;
       try {
-        body = fs.readFileSync(path.join(root, new URL(url, 'http://fake/').pathname));
+        body = fs.readFileSync(path.join(root, url.pathname));
       } catch (e) {
         status = 404;
         body = utf8.encode('not found');
@@ -95,7 +104,7 @@ export function fakeFetch(root) {
   });
 }
 
-export function fakeWebsocket() {
+export function fakeWebsocket(grants) {
   const open = new Map();
   let next = 1;
   return (caller) => {
@@ -104,7 +113,12 @@ export function fakeWebsocket() {
       end() {
         open.clear();
       },
-      connect(ptr, len, tag) {
+      connect(ptr, len, tag, err) {
+        const url = new URL(caller.string(ptr, len));
+        if (!mayUrl(grants.net, url)) {
+          caller.fail(err, `websocket.connect: ${url.host} is not granted (--allow-net)`);
+          return 0;
+        }
         const id = next++;
         open.set(id, tag);
         soon(() => {

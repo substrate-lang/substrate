@@ -1,36 +1,41 @@
 #!/usr/bin/env -S node --stack-size=4000
-// The host for Node runs the program that `sub build` wrote to DIR. A granted module loads when a wasm module that
-// imports it is instantiated.
+// The host for Node runs the program that `sub build` wrote to DIR, with the grants its flags give (grants.mjs).
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { createHost, Exit } from './subhost-core.mjs';
-import { grantedModules, nameOf, problem, ungranted } from './node/modules.mjs';
+import { grantFlag, grantsOf, noGrants } from './grants.mjs';
+import { hostFlag, hostModules, setupOf } from './node/modules.mjs';
+
+const require = createRequire(import.meta.url);
+const realPath = (p) => require('./node/fs.mjs').realPath(p);
 
 function usage() {
-  process.stderr.write('usage: sub run [-g MODULE[=fake[:DIR]|=tls:CERT:KEY],...] DIR [arg ...]\n');
+  process.stderr.write('usage: sub run [FLAG ...] DIR [ARG ...]\n'
+    + '  grants: -A, -R[=PATH,...], -W[=PATH,...], -N[=HOST[:PORT],...], -E[=NAME,...], --allow-run,\n'
+    + '          --deny-read=PATH,..., --deny-write=PATH,..., --deny-net=HOST,..., --deny-env=NAME,...\n'
+    + '  setup: --fake=NAME,... (clock, timer, websocket, fetch:DIR), --tls-cert=FILE --tls-key=FILE\n');
+  process.exit(64);
+}
+
+function fail(message) {
+  process.stderr.write(`subhost: ${message}\n`);
   process.exit(64);
 }
 
 const argv = process.argv.slice(2);
-const specs = [];
-while (argv.length > 0 && argv[0] === '-g') {
-  if (argv.length < 2) usage();
-  specs.push(...argv[1].split(','));
-  argv.splice(0, 2);
+const setup = setupOf(noGrants());
+while (argv.length > 0 && argv[0].startsWith('-')) {
+  const flag = argv.shift();
+  try {
+    if (!grantFlag(setup.grants, flag, realPath) && !hostFlag(setup, flag)) usage();
+  } catch (e) {
+    fail(e.message);
+  }
 }
+if (setup.tls && !(setup.tls.cert && setup.tls.key)) fail('--tls-cert and --tls-key go together');
 const [dir, ...programArgs] = argv;
 if (!dir) usage();
-
-const grants = new Map();
-if (specs.length === 0) for (const name of ['clock', 'random', 'timer', 'worker', 'stdin', 'env', 'fs']) grants.set(name, name);
-for (const spec of specs) {
-  const wrong = problem(spec);
-  if (wrong) {
-    process.stderr.write(`subhost: ${wrong}\n`);
-    process.exit(64);
-  }
-  grants.set(nameOf(spec), spec);
-}
 
 function read(file) {
   try {
@@ -42,7 +47,6 @@ function read(file) {
 }
 const names = read(`${dir}/program`).toString().split('\n').filter((n) => n !== '');
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
-const modules = grantedModules(grants);
 
 const host = createHost({
   args: programArgs,
@@ -63,9 +67,9 @@ const host = createHost({
   ended(code) {
     process.exit(code < 0 ? 2 : code);
   },
-  modules,
-  grants,
-  ungranted,
+  modules: hostModules(setup),
+  grants: setup.grants,
+  parseGrants: (list) => grantsOf(list, realPath),
   keyOf: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 });
 

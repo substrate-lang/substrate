@@ -3,6 +3,7 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
+import { mayHost, notGranted } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -12,9 +13,13 @@ const ACCEPT = 2;
 const CONNECTED = 3;
 const FAILED = 4;
 
-export function netModule(granted = {}) {
+export function netModule(grants, certificate) {
   const listeners = new Map();
-  const ca = granted.tls ? [...tls.rootCertificates, granted.tls.cert] : undefined;
+  const ca = certificate ? [...tls.rootCertificates, certificate.cert] : undefined;
+  const reach = (call, host, port) => {
+    const shown = host.includes(':') ? `[${host}]` : host;
+    if (!mayHost(grants.net, host, port)) throw notGranted(`${call}: ${shown}:${port} is not granted (--allow-net)`);
+  };
   let next = 1;
   return (caller) => {
     return {
@@ -26,13 +31,16 @@ export function netModule(granted = {}) {
       listen(port, hp, hl, secure, most, tag, err) {
         let server;
         try {
-          const host = caller.string(hp, hl);
-          if (secure && !granted.tls) throw new Error('net.listen: no certificate was granted for tls');
+          const host = caller.string(hp, hl) || '127.0.0.1';
+          reach('net.listen', host, port);
+          if (secure && !certificate) {
+            throw new Error('net.listen: TLS needs the host started with --tls-cert and --tls-key');
+          }
           server = secure
-            ? tls.createServer({ ...granted.tls, allowHalfOpen: true })
+            ? tls.createServer({ ...certificate, allowHalfOpen: true })
             : net.createServer({ allowHalfOpen: true });
           if (most > 0) server.maxConnections = most;
-          server.listen(port, host || '127.0.0.1');
+          server.listen(port, host);
         } catch (e) {
           caller.fail(err, e.message);
           return 0;
@@ -57,6 +65,7 @@ export function netModule(granted = {}) {
         let socket;
         try {
           const host = caller.string(hp, hl);
+          reach('net.connect', host, port);
           socket = secure
             ? tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, ca, allowHalfOpen: true })
             : net.connect({ host, port, allowHalfOpen: true });

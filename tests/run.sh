@@ -72,11 +72,12 @@ for t in tests/events/*.sub; do
   if [ -z "$server" ]; then
     : > "$builds/servers.url"
     (cd tests/events/fixtures && "$root/bin/sub" build servers.sub -o "$root/$builds/events/servers" -c "$cache")
-    "$host" -g net,fs,timer,clock "$root/$builds/events/servers" "$root/tests/events/files" > "$builds/servers.url" & server=$!
+    "$host" -N=127.0.0.1 -R="$root/tests/events/files" "$root/$builds/events/servers" "$root/tests/events/files" \
+      > "$builds/servers.url" & server=$!
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
-  actual="$(cd tests/events && timeout 60 "$host" -g clock,random,timer,fetch,websocket,net,fs "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
+  actual="$(cd tests/events && timeout 60 "$host" -N=127.0.0.1 -R=. "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
   code=$?
   if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then
     pass=$((pass + 1))
@@ -149,7 +150,7 @@ mkdir -p "$changed/host"
 cp host/fs.sub "$changed/host/"
 cp tests/substrate/forms.sub "$changed/tests/substrate/"
 from_changed() {
-  "$host" "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
+  "$host" -R -W "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
     -p "$root/$changed" -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
 }
 echo ';; changed' >> "$changed/compiler/substrate.sub"

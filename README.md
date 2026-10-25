@@ -28,7 +28,7 @@ compiler is written in it, builds itself, and runs in a browser.
 In the dev shell (`nix develop`):
 
     bin/sub build FILE -o DIR         # FILE's program, into DIR
-    bin/sub run DIR [ARG ...]         # run it
+    bin/sub run [GRANT ...] DIR [ARG ...]   # run it, granted -R, -W, -N, -E, --allow-run or -A
     bin/sub eval FILE                 # FILE's forms, one at a time, as a session
     bin/sub expand FILE               # FILE's expansion
     bin/sub site OUT FILE             # a web site for a page program

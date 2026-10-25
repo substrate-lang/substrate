@@ -2,7 +2,9 @@
 import { parentPort } from 'node:worker_threads';
 import { createHost, Exit } from '../subhost-core.mjs';
 import { workerSide } from '../worker-side.mjs';
-import { grantedModules, nameOf, ungranted } from './modules.mjs';
+import { grantsOf } from '../grants.mjs';
+import { hostModules } from './modules.mjs';
+import { realPath } from './fs.mjs';
 
 const side = workerSide((m, transfer) => parentPort.postMessage(m, transfer));
 
@@ -10,8 +12,7 @@ parentPort.on('message', (m) => {
   if (m.type === 'start') {
     if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
-    const grants = new Map(m.grants.map((spec) => [nameOf(spec), spec]));
-    const modules = grantedModules(grants, new Map([['worker', side.worker]]));
+    const setup = { grants: m.grants, fakes: new Map(m.fakes), tls: m.tls };
     const host = createHost({
       args: [m.argument],
       write: side.write,
@@ -22,9 +23,10 @@ parentPort.on('message', (m) => {
       ended: side.ended,
       delivered: side.delivered,
       active: side.active,
-      modules,
-      ungranted,
-      absent: new Set(grants.has('stdin') ? ['stdin'] : []),
+      modules: hostModules(setup, new Map([['worker', side.worker]])),
+      grants: m.grants,
+      parseGrants: (list) => grantsOf(list, realPath),
+      absent: new Set(['stdin']),
       memoryPages: m.pages,
     });
     const entry = host.load([...wasm.keys()], (name) => wasm.get(name));

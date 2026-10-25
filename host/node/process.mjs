@@ -13,7 +13,7 @@ const FAILED = 2;
 
 const pipes = ['stdin', 'stdout', 'stderr'];
 
-export function processes() {
+export function processes(grants) {
   const children = new Map();
   let next = 1;
   return (caller) => {
@@ -24,6 +24,10 @@ export function processes() {
         children.clear();
       },
       spawn(pp, pl, ap, al, dp, dl, ep, el, clear, stdin, stdout, stderr, tag, err) {
+        if (!grants.run) {
+          caller.fail(err, 'process.spawn: running programs is not granted (--allow-run)');
+          return 0;
+        }
         const modes = [stdin, stdout, stderr].map((mode) => ['pipe', 'ignore', 'inherit'][mode] || 'pipe');
         let process;
         try {

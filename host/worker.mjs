@@ -1,4 +1,7 @@
 // The host module "worker" (worker.sub). The browser and Node each give spawn, their way of starting a thread.
+import { entries } from './entries.mjs';
+import { within } from './grants.mjs';
+
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
@@ -38,12 +41,12 @@ export function workerModule({ spawn }) {
       : null;
   };
 
-  function start(entry, argument, time, pages, heard, tag, app, err) {
+  function start(entry, argument, time, pages, heard, tag, app, err, grants) {
     const program = caller.program();
     const modules = program.names.map((name) => [name, program.bytes(name)]);
     let thread;
     try {
-      thread = spawn({ modules, entry, argument, grants: [...caller.grants().values()], pages, heard }, app);
+      thread = spawn({ modules, entry, argument, grants, names: caller.moduleNames(), pages, heard }, app);
     } catch (e) {
       caller.fail(err, e.message);
       return 0;
@@ -75,9 +78,18 @@ export function workerModule({ spawn }) {
       end() {
         for (const w of [...alive.keys()]) end(w, -1, null);
       },
-      start(np, nl, bp, bl, time, size, heard, tag, err) {
+      start(np, nl, bp, bl, time, size, heard, tag, gp, gl, err) {
         const pages = Math.ceil((size >>> 0) / 65536);
-        return start(string(np, nl), bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err);
+        let grants = caller.grants();
+        if (gl > 0) {
+          try {
+            grants = within(caller.parseGrants(entries(string(gp, gl))), grants);
+          } catch (e) {
+            caller.fail(err, `worker.start: ${e.message}`);
+            return 0;
+          }
+        }
+        return start(string(np, nl), bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err, grants);
       },
       send(w, ptr, len) {
         const worker = alive.get(w);

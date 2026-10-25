@@ -1,5 +1,6 @@
 // The host module "websocket" (websocket.sub).
 import { errors } from '../errors.mjs';
+import { mayUrl } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
@@ -15,7 +16,8 @@ const BINARY = 2;
 
 const full = 1 << 20;
 
-export function websocket() {
+// grants is undefined for a page, which may connect anywhere.
+export function websocket(grants) {
   const sockets = new Map();
   let next = 1;
   return (caller) => {
@@ -41,6 +43,10 @@ export function websocket() {
       },
       connect(ptr, len, tag, err) {
         const url = caller.string(ptr, len);
+        if (grants && URL.canParse(url) && !mayUrl(grants.net, new URL(url))) {
+          caller.fail(err, `websocket.connect: ${new URL(url).host} is not granted (--allow-net)`);
+          return 0;
+        }
         let ws;
         try {
           ws = new WebSocket(url);
