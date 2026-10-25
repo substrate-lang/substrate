@@ -4,7 +4,7 @@ import { createHost, Exit } from '../subhost-core.mjs';
 import { workerSide } from '../worker-side.mjs';
 import { grantsOf } from '../grants.mjs';
 import { hostModules } from './modules.mjs';
-import { realPath } from './fs.mjs';
+import { resolveGrant } from './fs.mjs';
 
 const side = workerSide((m, transfer) => parentPort.postMessage(m, transfer));
 
@@ -25,7 +25,7 @@ parentPort.on('message', (m) => {
       active: side.active,
       modules: hostModules(setup, new Map([['worker', side.worker]])),
       grants: m.grants,
-      parseGrants: (list) => grantsOf(list, realPath),
+      parseGrants: (list) => grantsOf(list, resolveGrant),
       absent: new Set(['stdin']),
       memoryPages: m.pages,
     });

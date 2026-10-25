@@ -8,12 +8,13 @@ import { grantFlag, grantsOf, noGrants } from './grants.mjs';
 import { hostFlag, hostModules, setupOf } from './node/modules.mjs';
 
 const require = createRequire(import.meta.url);
-const realPath = (p) => require('./node/fs.mjs').realPath(p);
+const resolveGrant = (p, k) => require('./node/fs.mjs').resolveGrant(p, k);
 
 function usage() {
   process.stderr.write('usage: sub run [FLAG ...] DIR [ARG ...]\n'
-    + '  grants: -A, -R[=PATH,...], -W[=PATH,...], -N[=HOST[:PORT],...], -E[=NAME,...], --allow-run,\n'
-    + '          --deny-read=PATH,..., --deny-write=PATH,..., --deny-net=HOST[:PORT],..., --deny-env=NAME,...\n'
+    + '  grants: -A, -R[=PATH,...], -W[=PATH,...], -N[=HOST[:PORT],...], -E[=NAME,...], --allow-run[=PROGRAM,...],\n'
+    + '          --deny-read=PATH,..., --deny-write=PATH,..., --deny-net=HOST[:PORT],..., --deny-env=NAME,...,\n'
+    + '          --deny-run=PROGRAM,...\n'
     + '          a HOST is NAME, *.NAME, ADDRESS or ADDRESS/BITS\n'
     + '  setup: --fake=NAME,... (clock, timer, websocket, fetch:DIR), --tls-cert=FILE --tls-key=FILE\n');
   process.exit(64);
@@ -29,7 +30,7 @@ const setup = setupOf(noGrants());
 while (argv.length > 0 && argv[0].startsWith('-')) {
   const flag = argv.shift();
   try {
-    if (!grantFlag(setup.grants, flag, realPath) && !hostFlag(setup, flag)) usage();
+    if (!grantFlag(setup.grants, flag, resolveGrant) && !hostFlag(setup, flag)) usage();
   } catch (e) {
     fail(e.message);
   }
@@ -70,7 +71,7 @@ const host = createHost({
   },
   modules: hostModules(setup),
   grants: setup.grants,
-  parseGrants: (list) => grantsOf(list, realPath),
+  parseGrants: (list) => grantsOf(list, resolveGrant),
   keyOf: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 });
 

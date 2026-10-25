@@ -4,6 +4,8 @@ import os from 'node:os';
 import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
 import { entries } from '../entries.mjs';
+import { mayRun, notGranted, unlimited } from '../grants.mjs';
+import { programFile } from './fs.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -12,6 +14,20 @@ const EXIT = 1;
 const FAILED = 2;
 
 const pipes = ['stdin', 'stdout', 'stderr'];
+
+// fileToRun gives the file a program runs when the grant lets it run, or the program itself when no file has that
+// name and the grant is not a list; it refuses the variables the dynamic loader reads.
+function fileToRun(grant, program, cwd, env, added) {
+  const file = grant.all || grant.items.length > 0 ? programFile(program, cwd, env.PATH ?? '/usr/bin:/bin') : null;
+  if (file === null ? !grant.all : !mayRun(grant, file, program)) {
+    throw notGranted(`process.spawn: ${program} is not granted (--allow-run)`);
+  }
+  const loader = added.find((e) => /^\s*(LD_|DYLD_)/i.test(e));
+  if (loader !== undefined) {
+    throw notGranted(`process.spawn: setting ${loader.split('=')[0].trim()} is not granted (--allow-run)`);
+  }
+  return file ?? program;
+}
 
 export function processes(grants) {
   const children = new Map();
@@ -24,23 +40,19 @@ export function processes(grants) {
         children.clear();
       },
       spawn(pp, pl, ap, al, dp, dl, ep, el, clear, stdin, stdout, stderr, tag, err) {
-        if (!grants.run) {
-          caller.fail(err, 'process.spawn: running programs is not granted (--allow-run)');
-          return 0;
-        }
         const modes = [stdin, stdout, stderr].map((mode) => ['pipe', 'ignore', 'inherit'][mode] || 'pipe');
         let process;
         try {
+          const program = caller.string(pp, pl);
+          const cwd = caller.string(dp, dl) || undefined;
+          const added = entries(caller.string(ep, el));
           const env = clear ? {} : { ...globalThis.process.env };
-          for (const e of entries(caller.string(ep, el))) {
+          for (const e of added) {
             const equals = e.indexOf('=');
             env[equals < 0 ? e : e.slice(0, equals)] = equals < 0 ? '' : e.slice(equals + 1);
           }
-          process = child.spawn(caller.string(pp, pl), entries(caller.string(ap, al)), {
-            cwd: caller.string(dp, dl) || undefined,
-            env,
-            stdio: modes,
-          });
+          const file = unlimited(grants.run) ? program : fileToRun(grants.run, program, cwd, env, added);
+          process = child.spawn(file, entries(caller.string(ap, al)), { argv0: program, cwd, env, stdio: modes });
         } catch (e) {
           caller.fail(err, e.message);
           return 0;

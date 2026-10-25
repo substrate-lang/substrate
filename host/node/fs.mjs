@@ -35,6 +35,28 @@ export function realPath(p, follow = true) {
   return parent === null ? null : `${parent === '/' ? '' : parent}/${base}`;
 }
 
+// programFile gives the file a program runs, found as spawn finds it: from dir for a name with a slash, and otherwise
+// in the first directory of path with an executable file of that name; it gives null when there is none. The links
+// of its directories are followed and its own is not, so each name of a program with several stays apart.
+export function programFile(name, dir = '.', path = process.env.PATH ?? '') {
+  if (name.includes('/')) return realPath(name.startsWith('/') ? name : `${dir}/${name}`, false);
+  for (const d of path.split(':')) {
+    const p = `${d.startsWith('/') ? d : `${dir}/${d}`}/${name}`;
+    try {
+      if (fs.statSync(p).isFile()) {
+        fs.accessSync(p, fs.constants.X_OK);
+        return realPath(p, false);
+      }
+    } catch (e) {
+      if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR' && e.code !== 'EACCES') throw e;
+    }
+  }
+  return null;
+}
+
+// resolveGrant gives a granted path absolute with its links followed, and a granted program the file it runs.
+export const resolveGrant = (text, k) => (k === 'run' ? programFile(text) : realPath(text));
+
 // Resolved paths are kept until the program renames or removes a file in any of its threads, which add to changes.
 export function nodeFiles(grants, changes) {
   const known = new Map();

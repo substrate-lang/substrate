@@ -1,17 +1,18 @@
 // What a program may do beyond computing: read and write files, reach hosts, read the environment and run
 // programs. The flags are Deno's: -A, -R, -W, -N, -E and --allow-run, the lists scoped, with --deny-* over them.
-const kinds = ['read', 'write', 'net', 'env'];
+const kinds = ['read', 'write', 'net', 'env', 'run'];
 const short = { read: '-R', write: '-W', net: '-N', env: '-E' };
-export const flags = { read: '--allow-read', write: '--allow-write', net: '--allow-net', env: '--allow-env' };
+export const flags = {
+  read: '--allow-read', write: '--allow-write', net: '--allow-net', env: '--allow-env', run: '--allow-run',
+};
 
 const kind = () => ({ all: false, items: [], deny: { all: false, items: [] } });
 
-export const noGrants = () => ({ read: kind(), write: kind(), net: kind(), env: kind(), run: false });
+export const noGrants = () => ({ read: kind(), write: kind(), net: kind(), env: kind(), run: kind() });
 
 export function allGrants() {
   const g = noGrants();
   for (const k of kinds) g[k].all = true;
-  g.run = true;
   return g;
 }
 
@@ -115,9 +116,11 @@ export function hostOf(text) {
   return { host: canonical, port: portOf(text, port) };
 }
 
-const itemOf = (k, text, resolve) => {
-  if (k === 'read' || k === 'write') return resolve(text);
-  return k === 'net' ? hostOf(text) : text;
+// resolve gives each path and program as a file, except a program denied by a name, which has no slash.
+const itemOf = (k, text, resolve, deny) => {
+  if (k === 'net') return hostOf(text);
+  if (k === 'env' || (k === 'run' && deny && !text.includes('/'))) return text;
+  return resolve(text, k);
 };
 
 // grantFlag adds a grant flag to g and returns true, or returns false for a flag that is not one.
@@ -125,11 +128,9 @@ export function grantFlag(g, flag, resolve) {
   const equals = flag.indexOf('=');
   const name = equals < 0 ? flag : flag.slice(0, equals);
   const value = equals < 0 ? null : flag.slice(equals + 1);
-  if (name === '-A' || name === '--allow-all' || name === '--allow-run') {
-    const why = name === '--allow-run' ? ', since a child program is not sandboxed' : '';
-    if (value !== null) throw new Error(`${name} takes no list${why}`);
-    if (name !== '--allow-run') for (const k of kinds) g[k].all = true;
-    g.run = true;
+  if (name === '-A' || name === '--allow-all') {
+    if (value !== null) throw new Error(`${name} takes no list`);
+    for (const k of kinds) g[k].all = true;
     return true;
   }
   for (const k of kinds) {
@@ -139,7 +140,9 @@ export function grantFlag(g, flag, resolve) {
     else {
       const list = listOf(value);
       if (list.includes('')) throw new Error(`${flag} has an empty item`);
-      into.items.push(...list.map((text) => itemOf(k, text, resolve)));
+      const items = list.map((text) => itemOf(k, text, resolve, into === g[k].deny)).filter((item) => item !== null);
+      into.items.push(...items);
+      if (into === g.run) g.write.deny.items.push(...items, ...items.map((item) => resolve(item, 'write')));
     }
     return true;
   }
@@ -170,6 +173,14 @@ const inside = (list, p) => {
 // mayPath takes a path as the host resolved it: absolute, with its symbolic links followed.
 export const mayPath = (grant, p) => inside(grant, p) && !inside(grant.deny, p);
 export const mayEnv = (grant, name) => may(grant, (item) => named(item, name));
+
+const fileName = (p) => p.slice(p.lastIndexOf('/') + 1);
+const runs = (item, file, program) => (item.includes('/')
+  ? under(file, item)
+  : item === fileName(file) || item === fileName(program));
+// mayRun takes the file a program runs, as the host found it, and the program as it was named.
+export const mayRun = (grant, file, program) => (grant.all || grant.items.includes(file))
+  && !among(grant.deny, (item) => runs(item, file, program));
 export const mayHost = (grant, host, port) => {
   const h = canonicalHost(host);
   return may(grant, (item) => reaches(item, h, port));
@@ -190,6 +201,7 @@ export const deniesAddress = (grant, address, port) => {
 
 const covers = (k, outer, inner) => {
   if (k === 'read' || k === 'write') return under(inner, outer);
+  if (k === 'run') return outer === inner;
   if (k === 'env') return named(outer, inner);
   if (inner.bits === undefined) return reaches(outer, inner.host, inner.port);
   return outer.bits !== undefined && outer.bits <= inner.bits && reaches(outer, inner.host, inner.port);
@@ -210,7 +222,5 @@ export function within(asked, parent) {
     const deny = { all: a.deny.all || p.deny.all, items: [...a.deny.items, ...p.deny.items] };
     out[k] = { all: a.all, items: [...a.items], deny };
   }
-  if (asked.run && !parent.run) throw new Error('--allow-run reaches beyond the parent\'s grants');
-  out.run = asked.run;
   return out;
 }
