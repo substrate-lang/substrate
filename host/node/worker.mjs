@@ -14,7 +14,6 @@ export function workers(setup) {
         grants: plan.grants,
         fakes: [...setup.fakes],
         tls: setup.tls,
-        changes: setup.changes,
         loader: setup.loader,
         pages: plan.pages,
         heard: plan.heard,

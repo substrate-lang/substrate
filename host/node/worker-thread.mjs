@@ -12,7 +12,7 @@ parentPort.on('message', (m) => {
   if (m.type === 'start') {
     if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
-    const setup = { grants: m.grants, fakes: new Map(m.fakes), tls: m.tls, changes: m.changes, loader: m.loader };
+    const setup = { grants: m.grants, fakes: new Map(m.fakes), tls: m.tls, loader: m.loader };
     const host = createHost({
       args: [m.argument],
       write: side.write,

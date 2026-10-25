@@ -21,15 +21,14 @@ const loaders = {
   process: (s) => require('./process.mjs').processes(s.grants, s.loader),
   stdin: () => require('./stdin.mjs').stdin(),
   env: (s) => require('./env.mjs').env(s.grants),
-  fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants, s.changes)),
+  fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants)),
 };
 
 const fakeable = new Set(['clock', 'timer', 'fetch', 'websocket']);
 
-// changes counts the renames and removals of the program's threads, which share it, and loader holds the dynamic
-// loader's variables as the host started with them.
+// loader holds the dynamic loader's variables as the host started with them.
 export const setupOf = (grants) => ({
-  grants, fakes: new Map(), tls: null, changes: new Int32Array(new SharedArrayBuffer(4)),
+  grants, fakes: new Map(), tls: null,
   loader: Object.fromEntries(Object.entries(process.env).filter(([name]) => isLoaderVariable(name))),
 });
 

@@ -4,7 +4,8 @@ import path from 'node:path';
 import { nodeSource } from '../streams.mjs';
 import { allowsAll, mayPath, pathDenied, under } from '../grants.mjs';
 
-const modes = { 0: 'r', 1: 'w', 2: 'a' };
+const { O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
+const modes = { 0: O_RDONLY, 1: O_WRONLY | O_CREAT | O_TRUNC, 2: O_WRONLY | O_CREAT | O_APPEND };
 
 const plain = (f) => (...args) => {
   try {
@@ -72,62 +73,64 @@ const pipe = (p) => {
   }
 };
 const usable = (p, k) => devices.has(p) || (p === '/dev/tty' && k === 'read') || under(p, '/proc/pressure') || pipe(p);
+const unresolved = process.platform === 'linux' ? (p) => under(p, '/proc') || under(p, '/dev') : () => false;
+const missing = () => Object.assign(new Error('ENOENT: no such file or directory'), { errno: -2, code: 'ENOENT' });
+const readFile = (p, flag) => fs.readFileSync(p, { flag });
 
-// A path as given is kept with its absolute form, which the grants compare (key), and where its links lead (real),
-// until the program renames or removes a file in any of its threads, which add to changes.
-export function nodeFiles(grants, changes) {
+// A path as given is kept with its absolute form and the form the grants compare (key).
+export function nodeFiles(grants) {
   const everything = allowsAll(grants);
   const known = new Map();
-  let last = { p: null, seen: -1 };
-  const at = (p, follow) => {
-    const seen = Atomics.load(changes, 0);
-    let hit = last.p === p && last.seen === seen ? last : known.get(p);
-    if (hit === undefined || hit.seen !== seen) {
+  let last = { p: null };
+  const allowed = (k, p) => {
+    let hit = last.p === p ? last : known.get(p);
+    if (hit === undefined) {
       const abs = path.resolve(p);
-      hit = { p, seen, abs, key: comparable(abs), real: null };
+      hit = { p, abs, key: comparable(abs) };
       if (known.size >= 4096) known.clear();
       known.set(p, hit);
     }
-    if (follow && hit.real === null) hit.real = special(hit.abs) ? hit.abs : realPath(hit.abs);
     last = hit;
-    return hit;
+    if (!mayPath(grants[k], hit.key)) throw pathDenied(k);
+    return hit.abs;
   };
-  const allowed = (k, p, follow) => {
-    const found = at(p, follow);
-    if (!mayPath(grants[k], found.key)) throw pathDenied(k);
-    return found;
+  const checked = (k, p) => {
+    if (special(p) && !usable(p, k)) throw pathDenied(k, '--allow-all');
+    return p;
   };
-  // opened checks a path as the calls that open it do, following its links when follow is set.
-  const opened = (k, p, follow = true) => {
-    if (everything) return p;
-    const found = allowed(k, p, follow);
-    const checked = follow ? found.real : found.abs;
-    if (special(checked) && !usable(checked, k)) throw pathDenied(k, '--allow-all');
-    return found.abs;
-  };
-  const changing = (f) => (...args) => {
+  // at gives the path a call that does not follow links works on, checked as Deno checks it.
+  const at = (k, p) => (everything ? p : checked(k, allowed(k, p)));
+  // opening gives open(where, flag) for where the links of p lead now, checked and opened without following a link
+  // at its end, which is reported as missing, as Deno opens a path; on Linux, Deno leaves /proc and /dev unresolved.
+  const opening = (k, p, flag, open) => {
+    const abs = allowed(k, p);
+    if (unresolved(abs)) return open(checked(k, abs), flag);
+    const where = checked(k, realPath(abs));
     try {
-      return f(...args);
-    } finally {
-      Atomics.add(changes, 0, 1);
+      return open(where, flag | O_NOFOLLOW);
+    } catch (e) {
+      throw e.code === 'ELOOP' ? missing() : e;
     }
   };
   return {
-    read: plain((p) => fs.readFileSync(opened('read', p))),
-    write: plain((p, bytes) => fs.writeFileSync(opened('write', p), bytes)),
-    makeDir: plain((p) => fs.mkdirSync(opened('write', p, false), { recursive: true })),
+    read: plain((p) => (everything ? fs.readFileSync(p) : opening('read', p, O_RDONLY, readFile))),
+    write: plain((p, bytes) => (everything
+      ? fs.writeFileSync(p, bytes)
+      : opening('write', p, modes[1], (where, flag) => fs.writeFileSync(where, bytes, { flag })))),
+    makeDir: plain((p) => fs.mkdirSync(at('write', p), { recursive: true })),
     stat: plain((p) => {
-      const s = fs.statSync(opened('read', p, false));
+      const s = fs.statSync(at('read', p));
       return s.isDirectory() ? -2 : s.size;
     }),
-    list: plain((p) => fs.readdirSync(opened('read', p, false)).sort()),
-    remove: plain(changing((p) => fs.rmSync(everything ? p : allowed('write', p, false).abs))),
-    rename: plain(changing((from, to) => {
-      opened('read', from, false);
-      fs.renameSync(opened('write', from, false), opened('write', to, false));
-    })),
+    list: plain((p) => fs.readdirSync(at('read', p)).sort()),
+    remove: plain((p) => fs.rmSync(everything ? p : allowed('write', p))),
+    rename: plain((from, to) => {
+      at('read', from);
+      fs.renameSync(at('write', from), at('write', to));
+    }),
     open: plain((p, mode) => {
-      const fd = fs.openSync(opened(mode === 0 ? 'read' : 'write', p), modes[mode] || 'r');
+      const flag = modes[mode] ?? O_RDONLY;
+      const fd = everything ? fs.openSync(p, flag) : opening(mode === 0 ? 'read' : 'write', p, flag, fs.openSync);
       return nodeSource(mode === 0 ? fs.createReadStream('', { fd }) : fs.createWriteStream('', { fd }));
     }),
   };
