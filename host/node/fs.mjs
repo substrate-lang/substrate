@@ -35,13 +35,44 @@ export function realPath(p, follow = true) {
   return parent === null ? null : `${parent === '/' ? '' : parent}/${base}`;
 }
 
-export function nodeFiles(grants) {
+// Resolved paths are kept until the program renames or removes a file in any of its threads, which add to changes.
+export function nodeFiles(grants, changes) {
+  const known = new Map();
+  let last = { abs: '', real: '', seen: -1 };
+  const resolved = (p) => {
+    const abs = p.startsWith('/') ? p : `${process.cwd()}/${p}`;
+    const seen = Atomics.load(changes, 0);
+    if (last.abs === abs && last.seen === seen) return last.real;
+    const hit = known.get(abs);
+    if (hit !== undefined && hit.seen === seen) {
+      last = { abs, ...hit };
+      return hit.real;
+    }
+    let real;
+    try {
+      real = fs.realpathSync.native(abs);
+    } catch (e) {
+      if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') throw e;
+      return realPath(abs);
+    }
+    if (known.size >= 4096) known.clear();
+    known.set(abs, { real, seen });
+    last = { abs, real, seen };
+    return real;
+  };
   const checked = (k, p, follow = true) => {
     if (unlimited(grants[k])) return p;
-    const real = realPath(p, follow);
+    const real = follow ? resolved(p) : realPath(p, false);
     if (real === null) throw new Error('No such file or directory');
     if (!mayPath(grants[k], real)) throw pathDenied(k);
     return real;
+  };
+  const changing = (f) => (...args) => {
+    try {
+      return f(...args);
+    } finally {
+      Atomics.add(changes, 0, 1);
+    }
   };
   return {
     read: plain((p) => fs.readFileSync(checked('read', p))),
@@ -52,8 +83,8 @@ export function nodeFiles(grants) {
       return s.isDirectory() ? -2 : s.size;
     }),
     list: plain((p) => fs.readdirSync(checked('read', p)).sort()),
-    remove: plain((p) => fs.rmSync(checked('write', p, false))),
-    rename: plain((from, to) => fs.renameSync(checked('write', from, false), checked('write', to, false))),
+    remove: plain(changing((p) => fs.rmSync(checked('write', p, false)))),
+    rename: plain(changing((from, to) => fs.renameSync(checked('write', from, false), checked('write', to, false)))),
     open: plain((p, mode) => {
       const fd = fs.openSync(checked(mode === 0 ? 'read' : 'write', p), modes[mode] || 'r');
       return nodeSource(mode === 0 ? fs.createReadStream('', { fd }) : fs.createWriteStream('', { fd }));

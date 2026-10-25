@@ -21,12 +21,15 @@ const loaders = {
   process: (s) => require('./process.mjs').processes(s.grants),
   stdin: () => require('./stdin.mjs').stdin(),
   env: (s) => require('./env.mjs').env(s.grants),
-  fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants)),
+  fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants, s.changes)),
 };
 
 const fakeable = new Set(['clock', 'timer', 'fetch', 'websocket']);
 
-export const setupOf = (grants) => ({ grants, fakes: new Map(), tls: null });
+// changes counts the renames and removals of the program's threads, which share it.
+export const setupOf = (grants) => ({
+  grants, fakes: new Map(), tls: null, changes: new Int32Array(new SharedArrayBuffer(4)),
+});
 
 // hostFlag adds a flag that sets the host up and returns true, or returns false for any other flag. The flags are
 // --fake=NAME,... for clock, timer, websocket and fetch, with fetch:DIR to answer from DIR, and --tls-cert=FILE

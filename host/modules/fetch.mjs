@@ -33,10 +33,10 @@ async function fetchChecked(net, url, init, redirects) {
     const r = await fetch(at, { method, headers, body, signal: init.signal, redirect: 'manual' });
     const location = r.headers.get('location');
     if (!moved.has(r.status) || location === null) return r;
-    if (hops === 20) throw new TypeError('fetch: too many redirects');
+    if (hops === 20) throw new Error('fetch: too many redirects');
     const next = new URL(location, at);
     if (next.protocol !== 'http:' && next.protocol !== 'https:') {
-      throw new TypeError(`fetch: a redirect to ${next.protocol}`);
+      throw new Error(`fetch: a redirect to ${next.protocol}`);
     }
     if ((r.status === 303 && method !== 'GET' && method !== 'HEAD') || (r.status <= 302 && method === 'POST')) {
       method = 'GET';

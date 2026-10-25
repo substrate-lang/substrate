@@ -41,6 +41,26 @@ export function listOf(text) {
   return list;
 }
 
+const urlHost = (bare) => {
+  if (/[@/?#\\%\s]/.test(bare)) return bare.toLowerCase();
+  try {
+    return new URL(`http://${bare.includes(':') ? `[${bare}]` : bare}/`).hostname.replace(/^\[(.*)\]$/, '$1');
+  } catch {
+    return bare.toLowerCase();
+  }
+};
+
+// canonicalHost writes a host as the URL standard does, with IPv4 in dotted decimal, IPv6 compressed and names in
+// lowercase punycode, and without a final dot; an IPv6 address that maps an IPv4 one becomes that IPv4 address. A
+// host with a character the standard would cut it at, or decode, is left as it is, matching no grant.
+export function canonicalHost(host) {
+  const h = urlHost(host.replace(/^\[(.*)\]$/, '$1')).replace(/\.$/, '');
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+  if (!mapped) return h;
+  const [a, b] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
+  return `${a >> 8}.${a & 255}.${b >> 8}.${b & 255}`;
+}
+
 // A host is a name or an address, in brackets for IPv6, or *.name for its subdomains, with an optional port.
 export function hostOf(text) {
   let host = text;
@@ -56,7 +76,7 @@ export function hostOf(text) {
   if (host === '' || (port !== null && !(/^\d+$/.test(port) && Number(port) <= 65535))) {
     throw new Error(`${text} is not a host or host:port`);
   }
-  return { host: host.toLowerCase(), port: port === null ? null : Number(port) };
+  return { host: canonicalHost(host), port: port === null ? null : Number(port) };
 }
 
 const itemOf = (k, text, resolve) => {
@@ -97,18 +117,24 @@ export function grantsOf(list, resolve) {
   return g;
 }
 
-const under = (p, root) => root === '/' || p === root || p.startsWith(`${root}/`);
+const under = (p, root) => root === '/' || p === root || (p.startsWith(root) && p.charCodeAt(root.length) === 47);
 const named = (item, name) => item === name || (item.endsWith('*') && name.startsWith(item.slice(0, -1)));
 const reaches = (item, host, port) => (item.port === null || item.port === port)
   && (item.host === host || (item.host.startsWith('*.') && host.endsWith(item.host.slice(1))));
 const among = (list, test) => list.all || list.items.some(test);
 const may = (grant, test) => among(grant, test) && !among(grant.deny, test);
 
+const inside = (list, p) => {
+  if (list.all) return true;
+  for (const root of list.items) if (under(p, root)) return true;
+  return false;
+};
+
 // mayPath takes a path as the host resolved it: absolute, with its symbolic links followed.
-export const mayPath = (grant, p) => may(grant, (root) => under(p, root));
+export const mayPath = (grant, p) => inside(grant, p) && !inside(grant.deny, p);
 export const mayEnv = (grant, name) => may(grant, (item) => named(item, name));
 export const mayHost = (grant, host, port) => {
-  const h = host.replace(/^\[(.*)\]$/, '$1').toLowerCase();
+  const h = canonicalHost(host);
   return may(grant, (item) => reaches(item, h, port));
 };
 const ports = { 'http:': 80, 'https:': 443, 'ws:': 80, 'wss:': 443 };
