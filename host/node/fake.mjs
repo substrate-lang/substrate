@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { errors } from '../errors.mjs';
+import { entries } from '../entries.mjs';
 import { mayUrl } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
@@ -113,16 +114,17 @@ export function fakeWebsocket(grants) {
       end() {
         open.clear();
       },
-      connect(ptr, len, tag, err) {
-        const url = new URL(caller.string(ptr, len));
+      connect(up, ul, pp, pl, hp, hl, tag, err) {
+        const url = new URL(caller.string(up, ul));
         if (!mayUrl(grants.net, url)) {
           caller.fail(err, `websocket.connect: ${url.host} is not granted (--allow-net)`);
           return 0;
         }
+        const [protocol = ''] = entries(caller.string(pp, pl));
         const id = next++;
         open.set(id, tag);
         soon(() => {
-          if (open.has(id)) caller.event(1, id, tag, 0);
+          if (open.has(id)) caller.event(1, id, tag, 0, utf8.encode(protocol));
         });
         return id;
       },

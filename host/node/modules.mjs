@@ -15,7 +15,7 @@ const loaders = {
     : require('../modules/fetch.mjs').fetchModule(s.grants, true, require('./resolve.mjs').dispatchers(s.grants))),
   websocket: (s) => (s.fakes.has('websocket')
     ? require('./fake.mjs').fakeWebsocket(s.grants)
-    : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants))),
+    : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants), true)),
   worker: (s) => require('./worker.mjs').workers(s),
   net: (s) => require('./net.mjs').netModule(s.grants, s.tls),
   process: (s) => require('./process.mjs').processes(s.grants, s.loader),
