@@ -60,6 +60,7 @@ export function pageFiles(files, cwd, grants) {
       if (!files.delete(at('write', p))) throw missing();
     },
     rename(from, to) {
+      at('read', from);
       const bytes = files.get(at('write', from));
       if (!bytes) throw missing();
       files.delete(at('write', from));

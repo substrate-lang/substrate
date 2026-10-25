@@ -55,11 +55,13 @@ const urlHost = (bare) => {
   }
 };
 
-// canonicalHost writes a host as the URL standard does, with IPv4 in dotted decimal, IPv6 compressed and names in
-// lowercase punycode, and without a final dot; an IPv6 address that maps an IPv4 one becomes that IPv4 address. A
-// host with a character the standard would cut it at, or decode, is left as it is, matching no grant.
+// canonicalHost writes a host as the URL standard does, with IPv4 in dotted decimal, IPv6 compressed and without its
+// %zone, and names in lowercase punycode, and without a final dot; an IPv6 address that maps an IPv4 one becomes that
+// IPv4 address. A host with a character the standard would cut it at, or decode, is left as it is, matching no grant.
 export function canonicalHost(host) {
-  const h = urlHost(host.replace(/^\[(.*)\]$/, '$1')).replace(/\.$/, '');
+  const bare = host.replace(/^\[(.*)\]$/, '$1');
+  const zone = bare.includes(':') ? bare.indexOf('%') : -1;
+  const h = urlHost(zone < 0 ? bare : bare.slice(0, zone)).replace(/\.$/, '');
   const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
   if (!mapped) return h;
   const [a, b] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
@@ -69,7 +71,7 @@ export function canonicalHost(host) {
 // bytesOf gives the bytes of an address as canonicalHost writes it, or null for a name.
 function bytesOf(host) {
   const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
-  if (v4) return v4.slice(1).map(Number);
+  if (v4) return v4.slice(1).every((n) => Number(n) <= 255) ? v4.slice(1).map(Number) : null;
   if (!/^[0-9a-f:]+$/.test(host)) return null;
   const [head, tail] = host.split('::');
   const groups = (s) => (s ? s.split(':') : []);
@@ -88,6 +90,8 @@ const inSubnet = (item, host) => {
   return true;
 };
 
+const badAddress = (host) => host.includes(':') && !URL.canParse(`http://[${host}]/`);
+
 const portOf = (text, port) => {
   if (port === null) return null;
   if (!(/^\d+$/.test(port) && Number(port) <= 65535)) throw new Error(`${text} is not a host or host:port`);
@@ -102,7 +106,7 @@ export function hostOf(text) {
     const host = canonicalHost(subnet[1]);
     const bytes = bytesOf(host);
     const bits = Number(subnet[2]);
-    if (bytes === null || bits > bytes.length * 8) throw new Error(`${text} is not a subnet`);
+    if (bytes === null || badAddress(host) || bits > bytes.length * 8) throw new Error(`${text} is not a subnet`);
     return { host, port: portOf(text, subnet[3] === undefined ? null : subnet[3]), bits, bytes };
   }
   let host = text;
@@ -116,7 +120,9 @@ export function hostOf(text) {
     port = text.slice(text.indexOf(':') + 1);
   }
   const canonical = canonicalHost(host);
-  if (canonical === '' || /[@/?#\\%\s]/.test(canonical)) throw new Error(`${text} is not a host or host:port`);
+  if (canonical === '' || /[@/?#\\%\s]/.test(canonical) || badAddress(canonical)) {
+    throw new Error(`${text} is not a host or host:port`);
+  }
   return { host: canonical, port: portOf(text, port) };
 }
 
@@ -185,10 +191,12 @@ const stemOf = (p) => {
   const dot = base.lastIndexOf('.');
   return dot > 0 ? base.slice(0, dot) : base;
 };
-// A denied name covers a file whose stem is the name in any case, or starts with the name and a dot.
+const asciiLower = (s) => s.replace(/[A-Z]+/g, (letters) => letters.toLowerCase());
+// A denied name covers a file whose stem is the name with its ASCII letters in any case, or starts with the name and a
+// dot.
 const covered = (name, p) => {
-  const stem = stemOf(p).toLowerCase();
-  const n = name.toLowerCase();
+  const stem = asciiLower(stemOf(p));
+  const n = asciiLower(name);
   return stem.startsWith(n) && (stem.length === n.length || stem[n.length] === '.');
 };
 const runs = (item, file, program) => {

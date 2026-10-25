@@ -21,7 +21,7 @@ function refuse(grant, file, program, env, loader) {
   if (!mayRun(grant, file === null ? null : comparable(file), program)) {
     throw notGranted(`process.spawn: ${program} is not granted (--allow-run)`);
   }
-  const changed = Object.keys(env).filter((name) => isLoaderVariable(name) && env[name].trim() !== ''
+  const changed = Object.keys(env).filter((name) => isLoaderVariable(name) && env[name] !== ''
     && env[name] !== loader[name]);
   if (changed.length > 0) {
     throw notGranted(`process.spawn: changing ${changed.sort().join(', ')} for a program is not granted (--allow-run)`);

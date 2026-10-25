@@ -69,19 +69,26 @@ export function fetchModule(grants, redirects = false, dispatcherFor = () => und
       const body = bl > 0 ? caller.memory().slice(caller.u(bp), caller.u(bp) + bl) : null;
       const controller = new AbortController();
       let response = null;
+      let reader = null;
       let settle;
       const ready = new Promise((resolve) => {
         settle = resolve;
       });
       const source = readerSource(async () => {
         await ready;
-        return response && response.body ? response.body.getReader() : null;
-      }, () => controller.abort());
+        reader = response && response.body ? response.body.getReader() : null;
+        return reader;
+      }, () => {
+        if (reader) reader.cancel().catch(() => {});
+        else if (response && response.body) response.body.cancel().catch(() => {});
+        else controller.abort();
+      });
       source.errorOf = bodyError;
       const id = caller.streams.add(tag, source);
       const init = { method, headers, body, signal: controller.signal };
-      const request = grants && !unlimited(grants.net) && URL.canParse(url, base)
-        ? fetchChecked(grants.net, new URL(url, base), init, redirects, dispatcherFor)
+      const target = URL.canParse(url, base) ? new URL(url, base) : null;
+      const request = grants && !unlimited(grants.net) && target && /^https?:$/.test(target.protocol)
+        ? fetchChecked(grants.net, target, init, redirects, dispatcherFor)
         : fetch(url, init);
       request
         .then((r) => {

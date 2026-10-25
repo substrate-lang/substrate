@@ -31,6 +31,7 @@ export function netModule(grants, certificate) {
       },
       listen(port, hp, hl, secure, most, tag, err) {
         let server;
+        let id = 0;
         try {
           const host = caller.string(hp, hl) || '127.0.0.1';
           reach('net.listen', host, port);
@@ -41,12 +42,18 @@ export function netModule(grants, certificate) {
             ? tls.createServer({ ...certificate, allowHalfOpen: true })
             : net.createServer({ allowHalfOpen: true });
           if (most > 0) server.maxConnections = most;
-          server.listen(port, host);
+          if (addressDenials(grants.net) && !net.isIP(host)) {
+            lookupWithin(grants, 'net.listen', port)(host, {}, (e, address) => {
+              if (listeners.get(id) !== server) return;
+              if (e) server.emit('error', e);
+              else server.listen(port, address);
+            });
+          } else server.listen(port, host);
         } catch (e) {
           caller.fail(err, e.message);
           return 0;
         }
-        const id = next++;
+        id = next++;
         listeners.set(id, server);
         server.on('listening', () => {
           if (listeners.get(id) === server) caller.event(LISTENING, id, tag, server.address().port);

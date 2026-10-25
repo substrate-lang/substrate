@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { nodeSource } from '../streams.mjs';
-import { allowsAll, mayPath, pathDenied, under, unlimited } from '../grants.mjs';
+import { allowsAll, mayPath, pathDenied, under } from '../grants.mjs';
 
 const modes = { 0: 'r', 1: 'w', 2: 'a' };
 
@@ -17,7 +17,9 @@ const plain = (f) => (...args) => {
 };
 
 // comparable gives a path as Deno compares paths, which on macOS is in one Unicode form and case.
-export const comparable = process.platform === 'darwin' ? (p) => p.normalize('NFKD').toLowerCase() : (p) => p;
+export const comparable = process.platform === 'darwin'
+  ? (p) => p.normalize('NFKD').toUpperCase().toLowerCase()
+  : (p) => p;
 
 // realPath gives an absolute path with its links followed; of a path that does not exist yet, it follows the part
 // that does.
@@ -56,8 +58,8 @@ export const resolveGrant = (text, k) => {
   return p === null ? null : comparable(p);
 };
 
-// Deno's rules for /dev, /proc and /sys: the four devices any program may use, a pipe the host was given as
-// /dev/fd/N or /proc/self/fd/N past 2, a process's environ with all of -E, and anything else there with -A.
+// Deno's rules for /dev, /proc and /sys: the four devices any program may use, /dev/tty for reading, /proc/pressure,
+// a pipe the host was given as /dev/fd/N or /proc/self/fd/N past 2, and anything else there with -A.
 const devices = new Set(['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom']);
 const special = (p) => under(p, '/dev') || under(p, '/proc') || under(p, '/sys');
 const pipe = (p) => {
@@ -69,11 +71,7 @@ const pipe = (p) => {
     return false;
   }
 };
-const specialDenied = (grants, p, k) => {
-  if (devices.has(p) || pipe(p)) return null;
-  if (under(p, '/proc') && p.endsWith('/environ')) return unlimited(grants.env) ? null : pathDenied(k, '--allow-env');
-  return pathDenied(k, '--allow-all');
-};
+const usable = (p, k) => devices.has(p) || (p === '/dev/tty' && k === 'read') || under(p, '/proc/pressure') || pipe(p);
 
 // A path as given is kept with its absolute form, which the grants compare (key), and where its links lead (real),
 // until the program renames or removes a file in any of its threads, which add to changes.
@@ -104,10 +102,7 @@ export function nodeFiles(grants, changes) {
     if (everything) return p;
     const found = allowed(k, p, follow);
     const checked = follow ? found.real : found.abs;
-    if (special(checked)) {
-      const why = specialDenied(grants, checked, k);
-      if (why !== null) throw why;
-    }
+    if (special(checked) && !usable(checked, k)) throw pathDenied(k, '--allow-all');
     return found.abs;
   };
   const changing = (f) => (...args) => {
