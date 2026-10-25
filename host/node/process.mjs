@@ -90,6 +90,7 @@ export function processes(grants, loader) {
         const c = children.get(id);
         if (c) c.process.kill(signal || 'SIGTERM');
       },
+      pid: () => globalThis.process.pid,
     };
   };
 }

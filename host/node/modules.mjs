@@ -23,6 +23,7 @@ const loaders = {
   env: (s) => require('./env.mjs').env(s.grants),
   fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants)),
   watch: (s) => require('./watch.mjs').watchModule(s.grants),
+  signal: () => require('./signal.mjs').signals(),
 };
 
 const fakeable = new Set(['clock', 'timer', 'fetch', 'websocket']);
