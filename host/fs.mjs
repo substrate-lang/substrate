@@ -40,13 +40,6 @@ export function fsModule(files) {
         const path = caller.string(pp, pl);
         return attempt(path, err, () => (files.makeDir(path), 0));
       },
-      stat(pp, pl, err) {
-        const path = caller.string(pp, pl);
-        return BigInt(attempt(path, err, () => {
-          const [kind, size] = files.info(path, true);
-          return kind === 2 ? -2 : size;
-        }));
-      },
       info(pp, pl, follow, err) {
         const path = caller.string(pp, pl);
         return attempt(path, err, () => files.info(path, follow !== 0), [0, 0, 0, 0]);
