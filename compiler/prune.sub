@@ -9,7 +9,8 @@
 (struct wasm [name datum] [p (ptr u8)] [size u32] [sections datum] [imports datum] [spans datum] [funcs datum]
         [nimports u32] [exports datum] [by-name (ptr hash-table)] [start i32] [count u32] [starts (ptr u32)]
         [ends (ptr u32)] [sites buffer] [site-starts (ptr u32)] [site-ends (ptr u32)] [live (ptr u8)]
-        [kept (ptr hash-table)] [indexes (ptr u32)])
+        [kept (ptr hash-table)] [indexes (ptr u32)] [global-imports datum] [global-exports (ptr hash-table)]
+        [tables datum] [nglobals u32] [ndatas u32] [table-functions (ptr u8)] [read-globals (ptr u8)] [read-datas (ptr u8)])
 
 ;; ---- reading ----
 
@@ -31,6 +32,11 @@
     (set! (-> w count) 0)
     (set! (-> w kept) (make-table))
     (set! (-> w indexes) 0)
+    (set! (-> w global-imports) nil)
+    (set! (-> w global-exports) (make-table))
+    (set! (-> w tables) nil)
+    (set! (-> w nglobals) 0)
+    (set! (-> w ndatas) 0)
     (read-from! (-> w p) 8 (-> w size))
     (while (< (position) (-> w size))
       (set! head (position))
@@ -39,11 +45,15 @@
       (+= next (position))
       (set! (-> w sections)
             (cons `(,(make-integer id) ,(make-integer head) ,(make-integer (position)) ,(make-integer next)) (-> w sections)))
-      (when (== id 2) (read-imports! w))
+      (cond [(== id 2) (read-imports! w)]
+            [(== id 6) (set! (-> w nglobals) (uleb))]
+            [(== id 12) (set! (-> w ndatas) (uleb))])
       (read-from! (-> w p) next (-> w size)))
     (set! (-> w sections) (reverse (-> w sections)))
     (set! (-> w spans) (reverse (-> w spans)))
     (set! (-> w funcs) (reverse (-> w funcs)))
+    (set! (-> w global-imports) (reverse (-> w global-imports)))
+    (+= (-> w nglobals) (length (-> w global-imports)))
     w))
 
 (define (read-rest! [w (ptr wasm)])
@@ -58,6 +68,13 @@
       (set! ss (cdr ss)))
     (set! (-> w live) (cast (ptr u8) (arena-alloc (current-arena) (+ (-> w nimports) (-> w count) 1))))
     (memset (-> w live) 0 (+ (-> w nimports) (-> w count) 1))
+    (set! (-> w table-functions) (cast (ptr u8) (arena-alloc (current-arena) (+ (-> w nimports) (-> w count) 1))))
+    (memset (-> w table-functions) 0 (+ (-> w nimports) (-> w count) 1))
+    (for-each (lambda ([t datum]) (set! (@ (-> w table-functions) (cast u32 (integer-value (car t)))) 1)) (-> w tables))
+    (set! (-> w read-globals) (cast (ptr u8) (arena-alloc (current-arena) (+ (-> w nglobals) 1))))
+    (memset (-> w read-globals) 0 (+ (-> w nglobals) 1))
+    (set! (-> w read-datas) (cast (ptr u8) (arena-alloc (current-arena) (+ (-> w ndatas) 1))))
+    (memset (-> w read-datas) 0 (+ (-> w ndatas) 1))
     (set! (-> w sites) (make-buffer))
     (set! (-> w site-starts) (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ (-> w count) 1)))))
     (set! (-> w site-ends) (cast (ptr u32) (arena-alloc (current-arena) (* 4 (+ (-> w count) 1)))))))
@@ -77,7 +94,10 @@
              (+= (-> w nimports) 1)]
             [(== kind 1) (byte) (limits)]
             [(== kind 2) (limits)]
-            [(== kind 3) (byte) (byte)]
+            [(== kind 3)
+             (byte)
+             (byte)
+             (set! (-> w global-imports) (cons (cons module field) (-> w global-imports)))]
             [else (byte) (uleb)])
       (set! (-> w spans) (cons `(,(make-integer kind) ,(make-integer start) ,(make-integer (position))) (-> w spans))))))
 
@@ -88,6 +108,11 @@
       (set! kind (byte))
       (set! index (uleb))
       (when (== kind 0) (datum-put! (-> w by-name) export (make-integer index)))
+      (when (== kind 3) (datum-put! (-> w global-exports) export (make-integer index)))
+      (when (and (== kind 0) (> (string-length export) 6) (== (memcmp (string-bytes export) "%init:" 6) 0))
+        (set! (-> w tables)
+              (cons (cons (make-integer index) (bytes->string (+ (string-bytes export) 6) (- (string-length export) 6)))
+                    (-> w tables))))
       (set! (-> w exports) (cons `(,export ,(make-integer kind) ,(make-integer index)) (-> w exports))))
     (set! (-> w exports) (reverse (-> w exports)))))
 
@@ -109,9 +134,11 @@
 
 ;; ---- what a body calls ----
 
-;; calls-in returns the functions body k calls, and adds each function index's offset, length and value to sites.
+;; calls-in returns the functions body k calls, and adds each function index's offset, length and value to sites, and
+;; the globals and data segments it uses to read-globals and read-datas.
 (define (calls-in [w (ptr wasm)] [k u32]) -> datum
-  (let ([out nil] [b u32 0] [d datum 0] [ks datum 0] [end (@ (-> w ends) k)] [here u32 0] [site (array u32 3)])
+  (let ([out nil] [b u32 0] [sub u32 0] [d datum 0] [ks datum 0] [end (@ (-> w ends) k)] [here u32 0]
+        [site (array u32 3)])
     (read-from! (-> w p) (@ (-> w starts) k) end)
     (set! (@ (-> w site-starts) k) (-> w sites length))
     (for ([i u32 (uleb)]) (> i 0) (-= i 1)
@@ -120,19 +147,23 @@
     (while (< (position) end)
       (set! b (byte))
       (unless (or (== b #x05) (== b #x0B))
-        (set! d (decoding-of b (if (or (== b #xFC) (== b #x1C)) (uleb) 0)))
+        (set! sub (if (or (== b #xFC) (== b #x1C)) (uleb) 0))
+        (set! d (decoding-of b sub))
         (when (== d 0) (unreadable))
         (set! ks (cdr d))
         (while (pair? ks)
-          (if (== (car ks) 'func)
-              (begin
-                (set! here (position))
-                (set! (@ site 2) (uleb))
-                (set! (@ site 0) here)
-                (set! (@ site 1) (- (position) here))
-                (buffer-add! (& (-> w sites)) (cast (ptr u8) site) 12)
-                (set! out (cons (make-integer (@ site 2)) out)))
-              (skip-immediate (car ks)))
+          (cond [(== (car ks) 'func)
+                 (set! here (position))
+                 (set! (@ site 2) (uleb))
+                 (set! (@ site 0) here)
+                 (set! (@ site 1) (- (position) here))
+                 (buffer-add! (& (-> w sites)) (cast (ptr u8) site) 12)
+                 (set! out (cons (make-integer (@ site 2)) out))]
+                [(== (car ks) 'global)
+                 (let ([g (uleb)]) (when (< g (-> w nglobals)) (set! (@ (-> w read-globals) g) 1)))]
+                [(and (== b #xFC) (or (== sub 8) (== sub 9)) (== ks (cdr d)))
+                 (let ([s (uleb)]) (when (< s (-> w ndatas)) (set! (@ (-> w read-datas) s) 1)))]
+                [else (skip-immediate (car ks))])
           (set! ks (cdr ks)))))
     (unless (== (position) end) (unreadable))
     (set! (@ (-> w site-ends) k) (-> w sites length))
@@ -190,8 +221,47 @@
               (let ([j (exported owner (cdr f))]) (when (>= j 0) (mark! owner (cast u32 j))))))
           (let ([k (- i (-> w nimports))])
             (unless (== w entry)
-              (for-each (lambda ([t datum]) (mark! w (cast u32 (integer-value t)))) (calls-in w k)))))))
+              (for-each (lambda ([t datum])
+                          (let ([j (cast u32 (integer-value t))]) (unless (table-function? w j) (mark! w j))))
+                        (calls-in w k)))))))
   0)
+
+(define (table-function? [w (ptr wasm)] [i u32]) -> i32
+  (and (< i (+ (-> w nimports) (-> w count))) (!= (@ (-> w table-functions) i) 0)))
+
+;; tables! keeps the function that copies in a global array of number literals (compile.sub's table!) when a kept
+;; function reads the global.
+(define (tables! [ws datum] [entry (ptr wasm)])
+  (let ([more 1] [l datum 0] [w (ptr wasm) 0] [ts datum 0] [i u32 0])
+    (while more
+      (set! more 0)
+      (set! l ws)
+      (while (pair? l)
+        (set! w (cast (ptr wasm) (car l)))
+        (set! ts (-> w tables))
+        (while (pair? ts)
+          (set! i (cast u32 (integer-value (car (car ts)))))
+          (when (and (not (live? w i)) (global-read? ws entry w (cdr (car ts))))
+            (mark! w i)
+            (set! more 1))
+          (set! ts (cdr ts)))
+        (set! l (cdr l)))
+      (when more (reach! ws entry)))))
+
+(define (global-read? [ws datum] [entry (ptr wasm)] [w (ptr wasm)] [name datum]) -> i32
+  (let ([g (datum-get (-> w global-exports) name)] [l ws])
+    (when (or (== g 0) (!= (@ (-> w read-globals) (cast u32 (integer-value g))) 0)) (return 1))
+    (while (pair? l)
+      (let ([v (cast (ptr wasm) (car l))] [is datum 0] [i u32 0])
+        (set! is (-> v global-imports))
+        (while (pair? is)
+          (when (and (string=? (car (car is)) (-> w name)) (string=? (cdr (car is)) name)
+                     (or (== v entry) (!= (@ (-> v read-globals) i) 0)))
+            (return 1))
+          (+= i 1)
+          (set! is (cdr is))))
+      (set! l (cdr l)))
+    0))
 
 (define (keep! [w (ptr wasm)] [name datum])
   (let ([j (exported w name)])
@@ -249,6 +319,7 @@
     (let ([out modules])
       (unless (reach! ws entry)
         (keep-hooks! ws entry)
+        (tables! ws entry)
         (set! out (map (lambda ([x datum]) -> datum
                          (let ([w (cast (ptr wasm) x)])
                            (cons (-> w name) (if (== w entry) (without w '("substrate")) (rewritten w)))))
@@ -307,6 +378,7 @@
               [(== id 8) (start! (& out) w)]
               [(== id 9) (elements! (& out) w start end)]
               [(== id 10) (code! (& out) w news)]
+              [(== id 11) (datas! (& out) w start end)]
               [(string=? custom '"substrate") (begin)]
               [(string=? custom '"name") (names! (& out) w start end)]
               [(string=? custom '"source-locations") (locations! (& out) w start end news)]
@@ -407,16 +479,40 @@
           (set! kept (cdr kept)))))
     (section-out out 9 (& q))))
 
-;; body! copies body k, rewriting each function index in as many bytes as before.
+;; body! copies body k, rewriting each function index in as many bytes as before, and a call of a table function
+;; tables! did not keep as nops.
 (define (body! [q (ptr buffer)] [w (ptr wasm)] [k u32])
   (let ([from (@ (-> w starts) k)] [at (@ (-> w site-starts) k)] [site (ptr u32) 0])
     (while (< at (@ (-> w site-ends) k))
       (set! site (cast (ptr u32) (+ (-> w sites bytes) at)))
-      (buffer-add! q (+ (-> w p) from) (- (@ site 0) from))
-      (write-uleb-padded q (renumbered w (@ site 2)) (@ site 1))
+      (if (and (not (live? w (@ site 2))) (table-function? w (@ site 2)))
+          (begin
+            (buffer-add! q (+ (-> w p) from) (- (@ site 0) from 1))
+            (for ([i u32 0]) (<= i (@ site 1)) (+= i 1) (buffer-add-byte! q 1)))
+          (begin
+            (buffer-add! q (+ (-> w p) from) (- (@ site 0) from))
+            (write-uleb-padded q (renumbered w (@ site 2)) (@ site 1))))
       (set! from (+ (@ site 0) (@ site 1)))
       (+= at 12))
     (buffer-add! q (+ (-> w p) from) (- (@ (-> w ends) k) from))))
+
+;; datas! empties each data segment no kept function reads.
+(define (datas! [out (ptr buffer)] [w (ptr wasm)] [start u32] [end u32])
+  (let ([q (make-buffer)] [from u32 0] [n u32 0])
+    (read-from! (-> w p) start end)
+    (let ([count (uleb)])
+      (write-uleb (& q) count)
+      (for ([i u32 0]) (< i count) (+= i 1)
+        (set! from (position))
+        (unless (== (uleb) 1) (unreadable))
+        (set! n (uleb))
+        (skip n)
+        (if (!= (@ (-> w read-datas) i) 0)
+            (buffer-add! (& q) (+ (-> w p) from) (- (position) from))
+            (begin
+              (buffer-add-byte! (& q) 1)
+              (buffer-add-byte! (& q) 0)))))
+    (section-out out 11 (& q))))
 
 (define (code! [out (ptr buffer)] [w (ptr wasm)] [news (ptr u32)])
   (let ([q (make-buffer)] [n (-> w count)] [size u32 0] [base u32 0] [kept u32 0] [before u32 0])
