@@ -13,7 +13,8 @@ const realPath = (p) => require('./node/fs.mjs').realPath(p);
 function usage() {
   process.stderr.write('usage: sub run [FLAG ...] DIR [ARG ...]\n'
     + '  grants: -A, -R[=PATH,...], -W[=PATH,...], -N[=HOST[:PORT],...], -E[=NAME,...], --allow-run,\n'
-    + '          --deny-read=PATH,..., --deny-write=PATH,..., --deny-net=HOST,..., --deny-env=NAME,...\n'
+    + '          --deny-read=PATH,..., --deny-write=PATH,..., --deny-net=HOST[:PORT],..., --deny-env=NAME,...\n'
+    + '          a HOST is NAME, *.NAME, ADDRESS or ADDRESS/BITS\n'
     + '  setup: --fake=NAME,... (clock, timer, websocket, fetch:DIR), --tls-cert=FILE --tls-key=FILE\n');
   process.exit(64);
 }

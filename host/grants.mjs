@@ -61,8 +61,45 @@ export function canonicalHost(host) {
   return `${a >> 8}.${a & 255}.${b >> 8}.${b & 255}`;
 }
 
-// A host is a name or an address, in brackets for IPv6, or *.name for its subdomains, with an optional port.
+// bytesOf gives the bytes of an address as canonicalHost writes it, or null for a name.
+function bytesOf(host) {
+  const v4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(host);
+  if (v4) return v4.slice(1).map(Number);
+  if (!/^[0-9a-f:]+$/.test(host)) return null;
+  const [head, tail] = host.split('::');
+  const groups = (s) => (s ? s.split(':') : []);
+  const missing = 8 - groups(head).length - groups(tail).length;
+  const all = tail === undefined ? groups(head) : [...groups(head), ...Array(missing).fill('0'), ...groups(tail)];
+  return all.length === 8 ? all.flatMap((g) => [parseInt(g, 16) >> 8, parseInt(g, 16) & 255]) : null;
+}
+
+const inSubnet = (item, host) => {
+  const b = bytesOf(host);
+  if (b === null || b.length !== item.bytes.length) return false;
+  for (let bit = 0; bit < item.bits; bit++) {
+    const mask = 128 >> (bit % 8);
+    if ((b[bit >> 3] & mask) !== (item.bytes[bit >> 3] & mask)) return false;
+  }
+  return true;
+};
+
+const portOf = (text, port) => {
+  if (port === null) return null;
+  if (!(/^\d+$/.test(port) && Number(port) <= 65535)) throw new Error(`${text} is not a host or host:port`);
+  return Number(port);
+};
+
+// A host is a name or an address, in brackets for IPv6, or *.name for its subdomains, or a subnet, ADDRESS/BITS;
+// each with an optional port.
 export function hostOf(text) {
+  const subnet = /^\[?([^\]/]+)\]?\/(\d{1,3})(?::(.*))?$/.exec(text);
+  if (subnet) {
+    const host = canonicalHost(subnet[1]);
+    const bytes = bytesOf(host);
+    const bits = Number(subnet[2]);
+    if (bytes === null || bits > bytes.length * 8) throw new Error(`${text} is not a subnet`);
+    return { host, port: portOf(text, subnet[3] === undefined ? null : subnet[3]), bits, bytes };
+  }
   let host = text;
   let port = null;
   const bracketed = /^\[([^\]]*)\](?::(.*))?$/.exec(text);
@@ -73,10 +110,9 @@ export function hostOf(text) {
     host = text.slice(0, text.indexOf(':'));
     port = text.slice(text.indexOf(':') + 1);
   }
-  if (host === '' || (port !== null && !(/^\d+$/.test(port) && Number(port) <= 65535))) {
-    throw new Error(`${text} is not a host or host:port`);
-  }
-  return { host: canonicalHost(host), port: port === null ? null : Number(port) };
+  const canonical = canonicalHost(host);
+  if (canonical === '' || /[@/?#\\%\s]/.test(canonical)) throw new Error(`${text} is not a host or host:port`);
+  return { host: canonical, port: portOf(text, port) };
 }
 
 const itemOf = (k, text, resolve) => {
@@ -119,8 +155,9 @@ export function grantsOf(list, resolve) {
 
 const under = (p, root) => root === '/' || p === root || (p.startsWith(root) && p.charCodeAt(root.length) === 47);
 const named = (item, name) => item === name || (item.endsWith('*') && name.startsWith(item.slice(0, -1)));
-const reaches = (item, host, port) => (item.port === null || item.port === port)
-  && (item.host === host || (item.host.startsWith('*.') && host.endsWith(item.host.slice(1))));
+const reaches = (item, host, port) => (item.port === null || item.port === port) && (item.bits === undefined
+  ? item.host === host || (item.host.startsWith('*.') && host.endsWith(item.host.slice(1)))
+  : inSubnet(item, host));
 const among = (list, test) => list.all || list.items.some(test);
 const may = (grant, test) => among(grant, test) && !among(grant.deny, test);
 
@@ -138,15 +175,24 @@ export const mayHost = (grant, host, port) => {
   return may(grant, (item) => reaches(item, h, port));
 };
 const ports = { 'http:': 80, 'https:': 443, 'ws:': 80, 'wss:': 443 };
-export const mayUrl = (grant, url) => {
-  const port = url.port === '' ? ports[url.protocol] || 0 : Number(url.port);
-  return mayHost(grant, url.hostname, port);
-};
+export const portOfUrl = (url) => (url.port === '' ? ports[url.protocol] || 0 : Number(url.port));
+export const mayUrl = (grant, url) => mayHost(grant, url.hostname, portOfUrl(url));
 export const unlimited = (grant) => grant.all && !grant.deny.all && grant.deny.items.length === 0;
+
+// addressDenials tells whether a deny list names addresses or subnets, and deniesAddress whether it denies an address
+// (node/resolve.mjs).
+const isAddress = (item) => item.bits !== undefined || bytesOf(item.host) !== null;
+export const addressDenials = (grant) => grant.deny.items.some(isAddress);
+export const deniesAddress = (grant, address, port) => {
+  const a = canonicalHost(address);
+  return grant.deny.items.some((item) => isAddress(item) && reaches(item, a, port));
+};
 
 const covers = (k, outer, inner) => {
   if (k === 'read' || k === 'write') return under(inner, outer);
-  return k === 'env' ? named(outer, inner) : reaches(outer, inner.host, inner.port);
+  if (k === 'env') return named(outer, inner);
+  if (inner.bits === undefined) return reaches(outer, inner.host, inner.port);
+  return outer.bits !== undefined && outer.bits <= inner.bits && reaches(outer, inner.host, inner.port);
 };
 
 // within gives a worker's grants: those asked for, which must lie inside its parent's, with the parent's denials.
@@ -157,7 +203,8 @@ export function within(asked, parent) {
     const p = parent[k];
     const beyond = a.all ? !p.all : a.items.find((item) => !among(p, (outer) => covers(k, outer, item)));
     if (beyond) {
-      const item = k === 'net' ? `${beyond.host}${beyond.port === null ? '' : `:${beyond.port}`}` : beyond;
+      const subnet = beyond.bits === undefined ? '' : `/${beyond.bits}`;
+      const item = k === 'net' ? `${beyond.host}${subnet}${beyond.port === null ? '' : `:${beyond.port}`}` : beyond;
       throw new Error(`${flags[k]}${beyond === true ? '' : `=${item}`} reaches beyond the parent's grants`);
     }
     const deny = { all: a.deny.all || p.deny.all, items: [...a.deny.items, ...p.deny.items] };

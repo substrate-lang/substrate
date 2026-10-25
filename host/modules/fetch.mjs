@@ -2,7 +2,7 @@
 import { errors, errorOf, reasonOf } from '../errors.mjs';
 import { readerSource } from '../streams.mjs';
 import { entries, joined } from '../entries.mjs';
-import { mayUrl, notGranted, unlimited } from '../grants.mjs';
+import { mayUrl, notGranted, portOfUrl, unlimited } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -22,15 +22,21 @@ const bodyHeaders = new Set([
 ]);
 const credentials = new Set(['authorization', 'cookie', 'proxy-authorization']);
 
+const unwrapNotGranted = (e) => {
+  throw e.cause instanceof Error && e.cause.name === 'NotGrantedError' ? e.cause : e;
+};
+
 // fetchChecked fetches a URL that the grants reach. With redirects, it follows the redirects itself, as the fetch
 // standard says to, and checks each; without, the platform follows them.
-async function fetchChecked(net, url, init, redirects) {
+async function fetchChecked(net, url, init, redirects, dispatcherFor) {
   let at = url;
   let { method, headers, body } = init;
   for (let hops = 0; ; hops++) {
     if (!mayUrl(net, at)) throw notGranted(`fetch: ${at.host} is not granted (--allow-net)`);
     if (!redirects) return fetch(at, init);
-    const r = await fetch(at, { method, headers, body, signal: init.signal, redirect: 'manual' });
+    const dispatcher = dispatcherFor(portOfUrl(at));
+    const r = await fetch(at, { method, headers, body, signal: init.signal, redirect: 'manual', dispatcher })
+      .catch(unwrapNotGranted);
     const location = r.headers.get('location');
     if (!moved.has(r.status) || location === null) return r;
     if (hops === 20) throw new Error('fetch: too many redirects');
@@ -49,8 +55,9 @@ async function fetchChecked(net, url, init, redirects) {
   }
 }
 
-// grants is undefined for a page, which may fetch anything; redirects is true on Node.
-export function fetchModule(grants, redirects = false) {
+// grants is undefined for a page, which may fetch anything; on Node, redirects is true and dispatcherFor gives a
+// port's dispatcher (node/resolve.mjs).
+export function fetchModule(grants, redirects = false, dispatcherFor = () => undefined) {
   return (caller) => ({
     source: SOURCE,
     start(mp, ml, up, ul, hp, hl, bp, bl, tag) {
@@ -74,7 +81,7 @@ export function fetchModule(grants, redirects = false) {
       const id = caller.streams.add(tag, source);
       const init = { method, headers, body, signal: controller.signal };
       const request = grants && !unlimited(grants.net) && URL.canParse(url, base)
-        ? fetchChecked(grants.net, new URL(url, base), init, redirects)
+        ? fetchChecked(grants.net, new URL(url, base), init, redirects, dispatcherFor)
         : fetch(url, init);
       request
         .then((r) => {

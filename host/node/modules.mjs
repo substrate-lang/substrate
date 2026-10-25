@@ -12,10 +12,10 @@ const loaders = {
   timer: (s) => (s.fakes.has('timer') ? require('./fake.mjs').fakeTimer() : require('../modules/timer.mjs').timer()),
   fetch: (s) => (s.fakes.has('fetch')
     ? require('./fake.mjs').fakeFetch(s.fakes.get('fetch') || '.', s.grants)
-    : require('../modules/fetch.mjs').fetchModule(s.grants, true)),
+    : require('../modules/fetch.mjs').fetchModule(s.grants, true, require('./resolve.mjs').dispatchers(s.grants))),
   websocket: (s) => (s.fakes.has('websocket')
     ? require('./fake.mjs').fakeWebsocket(s.grants)
-    : require('../modules/websocket.mjs').websocket(s.grants)),
+    : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants))),
   worker: (s) => require('./worker.mjs').workers(s),
   net: (s) => require('./net.mjs').netModule(s.grants, s.tls),
   process: (s) => require('./process.mjs').processes(s.grants),

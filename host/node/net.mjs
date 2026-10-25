@@ -3,7 +3,8 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
-import { mayHost, notGranted } from '../grants.mjs';
+import { addressDenials, mayHost, notGranted } from '../grants.mjs';
+import { lookupWithin } from './resolve.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -66,9 +67,11 @@ export function netModule(grants, certificate) {
         try {
           const host = caller.string(hp, hl);
           reach('net.connect', host, port);
+          const lookup = addressDenials(grants.net) ? lookupWithin(grants, 'net.connect', port) : undefined;
+          const servername = net.isIP(host) ? undefined : host;
           socket = secure
-            ? tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, ca, allowHalfOpen: true })
-            : net.connect({ host, port, allowHalfOpen: true });
+            ? tls.connect({ host, port, servername, ca, allowHalfOpen: true, lookup })
+            : net.connect({ host, port, allowHalfOpen: true, lookup });
         } catch (e) {
           caller.fail(err, e.message);
           return 0;
