@@ -13,6 +13,7 @@ export function workers() {
         files: app.files,
         cwd: app.cwd,
         grants: plan.grants,
+        names: plan.names,
         pages: plan.pages,
         heard: plan.heard,
       });

@@ -4,6 +4,8 @@ import os from 'node:os';
 import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
 import { entries } from '../entries.mjs';
+import { isLoaderVariable, mayRun, notGranted, unlimited } from '../grants.mjs';
+import { comparable, programFile } from './fs.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -13,7 +15,20 @@ const FAILED = 2;
 
 const pipes = ['stdin', 'stdout', 'stderr'];
 
-export function processes() {
+// refuse throws unless the grant lets the program run, as the file found for it, with the dynamic loader's variables
+// the host started with (loader).
+function refuse(grant, file, program, env, loader) {
+  if (!mayRun(grant, file === null ? null : comparable(file), program)) {
+    throw notGranted(`process.spawn: ${program} is not granted (--allow-run)`);
+  }
+  const changed = Object.keys(env).filter((name) => isLoaderVariable(name) && env[name] !== ''
+    && env[name] !== loader[name]);
+  if (changed.length > 0) {
+    throw notGranted(`process.spawn: changing ${changed.sort().join(', ')} for a program is not granted (--allow-run)`);
+  }
+}
+
+export function processes(grants, loader) {
   const children = new Map();
   let next = 1;
   return (caller) => {
@@ -27,16 +42,16 @@ export function processes() {
         const modes = [stdin, stdout, stderr].map((mode) => ['pipe', 'ignore', 'inherit'][mode] || 'pipe');
         let process;
         try {
+          const program = caller.string(pp, pl);
+          const cwd = caller.string(dp, dl) || undefined;
           const env = clear ? {} : { ...globalThis.process.env };
           for (const e of entries(caller.string(ep, el))) {
             const equals = e.indexOf('=');
             env[equals < 0 ? e : e.slice(0, equals)] = equals < 0 ? '' : e.slice(equals + 1);
           }
-          process = child.spawn(caller.string(pp, pl), entries(caller.string(ap, al)), {
-            cwd: caller.string(dp, dl) || undefined,
-            env,
-            stdio: modes,
-          });
+          const file = programFile(program, cwd, env.PATH ?? '/usr/bin:/bin');
+          if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
+          process = child.spawn(file ?? program, entries(caller.string(ap, al)), { cwd, env, stdio: modes });
         } catch (e) {
           caller.fail(err, e.message);
           return 0;

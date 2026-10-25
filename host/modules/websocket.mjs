@@ -1,5 +1,6 @@
 // The host module "websocket" (websocket.sub).
 import { errors } from '../errors.mjs';
+import { mayUrl, portOfUrl } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
@@ -15,7 +16,9 @@ const BINARY = 2;
 
 const full = 1 << 20;
 
-export function websocket() {
+// grants is undefined for a page, which may connect anywhere; on Node, guard gives a socket's dispatcher
+// (node/resolve.mjs).
+export function websocket(grants, guard) {
   const sockets = new Map();
   let next = 1;
   return (caller) => {
@@ -41,15 +44,21 @@ export function websocket() {
       },
       connect(ptr, len, tag, err) {
         const url = caller.string(ptr, len);
-        let ws;
+        if (grants && URL.canParse(url) && !mayUrl(grants.net, new URL(url))) {
+          caller.fail(err, `websocket.connect: ${new URL(url).host} is not granted (--allow-net)`);
+          return 0;
+        }
+        const s = { ws: null, tag, polling: false, opened: false, denied: null };
         try {
-          ws = new WebSocket(url);
+          s.ws = guard && URL.canParse(url)
+            ? new WebSocket(url, { dispatcher: guard(portOfUrl(new URL(url)), (why) => { s.denied = why; }) })
+            : new WebSocket(url);
         } catch (e) {
           caller.fail(err, e.message);
           return 0;
         }
         const id = next++;
-        const s = { ws, tag, polling: false, opened: false };
+        const { ws } = s;
         sockets.set(id, s);
         ws.binaryType = 'arraybuffer';
         ws.onopen = () => {
@@ -63,6 +72,10 @@ export function websocket() {
         ws.onerror = () => {
           if (sockets.get(id) !== s) return;
           sockets.delete(id);
+          if (s.denied !== null) {
+            caller.event(FAILED, id, tag, errors.notGranted, utf8.encode(s.denied));
+            return;
+          }
           const why = s.opened ? `the connection to ${url} failed` : `cannot connect to ${url}`;
           caller.event(FAILED, id, tag, s.opened ? errors.aborted : errors.unreachable, utf8.encode(why));
         };

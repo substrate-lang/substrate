@@ -1,81 +1,71 @@
-// The modules a Node host can grant, each loaded when first needed. A spec is NAME; NAME=fake for clock, timer,
-// fetch or websocket; fetch=fake:DIR, which answers from DIR; or net=tls:CERT:KEY.
+// The host modules of a program on Node, each made when first needed, with the program's grants and the fakes
+// and certificate the host was set up with.
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import { isLoaderVariable, listOf } from '../grants.mjs';
 
 const require = createRequire(import.meta.url);
 
-const read = new Map();
-const granted = (file) => {
-  if (!read.has(file)) {
+const loaders = {
+  clock: (s) => (s.fakes.has('clock') ? require('./fake.mjs').fakeClock() : require('../modules/clock.mjs').clock()),
+  random: () => require('../modules/random.mjs').random(),
+  timer: (s) => (s.fakes.has('timer') ? require('./fake.mjs').fakeTimer() : require('../modules/timer.mjs').timer()),
+  fetch: (s) => (s.fakes.has('fetch')
+    ? require('./fake.mjs').fakeFetch(s.fakes.get('fetch') || '.', s.grants)
+    : require('../modules/fetch.mjs').fetchModule(s.grants, true, require('./resolve.mjs').dispatchers(s.grants))),
+  websocket: (s) => (s.fakes.has('websocket')
+    ? require('./fake.mjs').fakeWebsocket(s.grants)
+    : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants))),
+  worker: (s) => require('./worker.mjs').workers(s),
+  net: (s) => require('./net.mjs').netModule(s.grants, s.tls),
+  process: (s) => require('./process.mjs').processes(s.grants, s.loader),
+  stdin: () => require('./stdin.mjs').stdin(),
+  env: (s) => require('./env.mjs').env(s.grants),
+  fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants)),
+};
+
+const fakeable = new Set(['clock', 'timer', 'fetch', 'websocket']);
+
+// loader holds the dynamic loader's variables as the host started with them.
+export const setupOf = (grants) => ({
+  grants, fakes: new Map(), tls: null,
+  loader: Object.fromEntries(Object.entries(process.env).filter(([name]) => isLoaderVariable(name))),
+});
+
+// hostFlag adds a flag that sets the host up and returns true, or returns false for any other flag. The flags are
+// --fake=NAME,... for clock, timer, websocket and fetch, with fetch:DIR to answer from DIR, and --tls-cert=FILE
+// with --tls-key=FILE.
+export function hostFlag(setup, flag) {
+  if (flag.startsWith('--fake=')) {
+    for (const item of listOf(flag.slice(7))) {
+      const colon = item.indexOf(':');
+      const name = colon < 0 ? item : item.slice(0, colon);
+      if (!fakeable.has(name) || (colon >= 0 && name !== 'fetch')) throw new Error(`no fake ${item}`);
+      setup.fakes.set(name, colon < 0 ? null : item.slice(colon + 1));
+    }
+    return true;
+  }
+  for (const part of ['cert', 'key']) {
+    if (!flag.startsWith(`--tls-${part}=`)) continue;
+    const file = flag.slice(part.length + 7);
     try {
-      read.set(file, fs.readFileSync(file));
+      (setup.tls ||= {})[part] = fs.readFileSync(file);
     } catch (e) {
       throw new Error(`cannot read ${file}`);
     }
+    return true;
   }
-  return read.get(file);
-};
-
-// The specs whose arguments are files, read when the spec is checked.
-const naming = new Set(['net=tls']);
-
-const loaders = {
-  clock: () => require('../modules/clock.mjs').clock(),
-  random: () => require('../modules/random.mjs').random(),
-  timer: () => require('../modules/timer.mjs').timer(),
-  fetch: () => require('../modules/fetch.mjs').fetchModule(),
-  websocket: () => require('../modules/websocket.mjs').websocket(),
-  worker: () => require('./worker.mjs').workers(),
-  net: () => require('./net.mjs').netModule(),
-  process: () => require('./process.mjs').processes(),
-  stdin: () => require('./stdin.mjs').stdin(),
-  env: () => require('./env.mjs').env(),
-  fs: () => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles()),
-  'clock=fake': () => require('./fake.mjs').fakeClock(),
-  'timer=fake': () => require('./fake.mjs').fakeTimer(),
-  'fetch=fake': (root) => require('./fake.mjs').fakeFetch(root || '.'),
-  'websocket=fake': () => require('./fake.mjs').fakeWebsocket(),
-  'net=tls': (cert, key) => require('./net.mjs').netModule({ tls: { cert: granted(cert), key: granted(key) } }),
-};
-
-const parts = (spec) => {
-  const [name, how] = spec.split('=');
-  const [kind, ...args] = how === undefined ? [] : how.split(':');
-  return { name, key: how === undefined ? name : `${name}=${kind}`, args };
-};
-
-export const nameOf = (spec) => parts(spec).name;
-
-// ungranted gives the message for a module that could be granted but was not, or null.
-export const ungranted = (name) => (Object.hasOwn(loaders, name) ? `${name} is not granted (-g ${name})` : null);
-
-// problem says what is wrong with a spec, or gives null.
-export function problem(spec) {
-  const { name, key, args } = parts(spec);
-  if (!(name in loaders && key in loaders)) return `no module ${spec}`;
-  try {
-    if (naming.has(key)) for (const file of args) granted(file);
-  } catch (e) {
-    return e.message;
-  }
-  return null;
+  return false;
 }
 
-export function loadModule(spec) {
-  const { key, args } = parts(spec);
-  return loaders[key](...args);
-}
-
-// grantedModules gives the modules in grants, a map from name to spec, and those already made in own.
-export function grantedModules(grants, own = new Map()) {
-  const loaded = new Map(own);
+export function hostModules(setup, own = new Map()) {
+  const made = new Map(own);
   return {
-    has: (name) => grants.has(name) || loaded.has(name),
+    has: (name) => made.has(name) || Object.hasOwn(loaders, name),
     get(name) {
-      if (!loaded.has(name)) loaded.set(name, loadModule(grants.get(name)));
-      return loaded.get(name);
+      if (!made.has(name)) made.set(name, loaders[name](setup));
+      return made.get(name);
     },
-    keys: () => grants.keys(),
+    keys: () => Object.keys(loaders),
   };
 }

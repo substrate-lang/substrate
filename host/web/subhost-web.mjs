@@ -1,6 +1,8 @@
-// The host for a web page: runs a program in a browser, its files kept in memory.
+// The host for a web page: runs a program in a browser, its files kept in memory. A page has every grant, and its
+// workers may be given fewer.
 import { createHost, Exit } from '../subhost-core.mjs';
 import { fsModule } from '../fs.mjs';
+import { allGrants, grantsOf } from '../grants.mjs';
 import { pageFiles, resolvePath } from './fs.mjs';
 
 const text = new TextDecoder();
@@ -90,6 +92,8 @@ export function run(options, names, wasm) {
     active: options.active,
     modules,
     absent: options.absent,
+    grants: options.grants || allGrants(),
+    parseGrants: (list) => grantsOf(list, (p) => resolvePath(cwd, p)),
     memoryPages: options.memoryPages || 0,
   });
   app.host = host;

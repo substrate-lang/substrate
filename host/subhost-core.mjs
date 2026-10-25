@@ -342,7 +342,9 @@ export function createHost(platform) {
         forgetEvents(made.source, id);
       },
       current: () => current,
-      grants: () => platform.grants || new Map(platform.modules ? [...platform.modules.keys()].map((n) => [n, n]) : []),
+      grants: () => platform.grants,
+      parseGrants: (list) => platform.parseGrants(list),
+      moduleNames: () => (platform.modules ? [...platform.modules.keys()] : []),
       module: (name) => (platform.modules ? platform.modules.get(name) : undefined),
       program: () => ({ names: programNames, bytes: programBytes }),
       streams: { add: streams.add, tag: streams.tag, drop: streams.drop, close: streams.close, open: streams.open },
@@ -456,8 +458,7 @@ export function createHost(platform) {
         value = exports && exports[imp.name];
       }
       if (value === undefined) {
-        const why = platform.ungranted && !made.has(from) && !registry.has(from) && platform.ungranted(from);
-        lastError = `instantiate ${name}: ${why || `no import ${from}.${imp.name}`}`;
+        lastError = `instantiate ${name}: no import ${from}.${imp.name}`;
         return false;
       }
       (imports[imp.module] ||= {})[imp.name] = value;

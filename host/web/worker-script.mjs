@@ -1,5 +1,5 @@
 // A worker's Web Worker runs the worker's modules, with the worker module's own side and the page's modules that a
-// worker can have. Its files are a read-only copy of the page's.
+// worker can have, within the worker's grants. Its files are a read-only copy of the page's.
 import { run } from './subhost-web.mjs';
 import { fsModule } from '../fs.mjs';
 import { pageFiles } from './fs.mjs';
@@ -9,8 +9,8 @@ const loaders = {
   clock: () => import('../modules/clock.mjs').then((m) => m.clock()),
   random: () => import('../modules/random.mjs').then((m) => m.random()),
   timer: () => import('../modules/timer.mjs').then((m) => m.timer()),
-  fetch: () => import('../modules/fetch.mjs').then((m) => m.fetchModule()),
-  websocket: () => import('../modules/websocket.mjs').then((m) => m.websocket()),
+  fetch: (grants) => import('../modules/fetch.mjs').then((m) => m.fetchModule(grants)),
+  websocket: (grants) => import('../modules/websocket.mjs').then((m) => m.websocket(grants)),
 };
 
 function readOnly(files) {
@@ -34,11 +34,11 @@ self.onmessage = async (e) => {
   if (m.type === 'start') {
     if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
-    const modules = { worker: side.worker, fs: fsModule(readOnly(pageFiles(m.files, m.cwd))) };
+    const modules = { worker: side.worker, fs: fsModule(readOnly(pageFiles(m.files, m.cwd, m.grants))) };
     const absent = new Set();
-    for (const name of m.grants) {
+    for (const name of m.names) {
       if (name in modules) continue;
-      if (loaders[name]) modules[name] = await loaders[name]();
+      if (loaders[name]) modules[name] = await loaders[name](m.grants);
       else absent.add(name);
     }
     const app = run({
@@ -49,6 +49,7 @@ self.onmessage = async (e) => {
       memoryPages: m.pages,
       modules,
       absent,
+      grants: m.grants,
       entry: m.entry,
       onEnd: side.ended,
       delivered: side.delivered,

@@ -1,4 +1,6 @@
-// A page's files for fs.mjs, kept in memory under the program's working directory.
+// A page's files for fs.mjs, kept in memory under the program's working directory, within the grants if given.
+import { mayPath, pathDenied, unlimited } from '../grants.mjs';
+
 export function resolvePath(cwd, path) {
   const out = [];
   for (const seg of (path.startsWith('/') ? path : `${cwd}/${path}`).split('/')) {
@@ -22,47 +24,55 @@ function concat(chunks) {
   return bytes;
 }
 
-export function pageFiles(files, cwd) {
-  const at = (p) => resolvePath(cwd, p);
+export function pageFiles(files, cwd, grants) {
+  const at = (k, p) => {
+    const key = resolvePath(cwd, p);
+    if (grants && !unlimited(grants[k]) && !mayPath(grants[k], key)) throw pathDenied(k);
+    return key;
+  };
   const read = (p) => {
-    const bytes = files.get(at(p));
+    const bytes = files.get(at('read', p));
     if (!bytes) throw missing();
     return bytes;
   };
   return {
     read,
     write(p, bytes) {
-      files.set(at(p), bytes);
+      files.set(at('write', p), bytes);
     },
-    makeDir() {},
+    makeDir(p) {
+      at('write', p);
+    },
     stat(p) {
-      const key = at(p);
+      const key = at('read', p);
       if (files.has(key)) return files.get(key).length;
       for (const k of files.keys()) if (k.startsWith(under(key))) return -2;
       throw missing();
     },
     list(p) {
-      const prefix = under(at(p));
+      const prefix = under(at('read', p));
       const names = new Set();
       for (const k of files.keys()) if (k.startsWith(prefix)) names.add(k.slice(prefix.length).split('/')[0]);
       if (names.size === 0) throw missing();
       return [...names].sort();
     },
     remove(p) {
-      if (!files.delete(at(p))) throw missing();
+      if (!files.delete(at('write', p))) throw missing();
     },
     rename(from, to) {
-      const bytes = read(from);
-      files.delete(at(from));
-      files.set(at(to), bytes);
+      at('read', from);
+      const bytes = files.get(at('write', from));
+      if (!bytes) throw missing();
+      files.delete(at('write', from));
+      files.set(at('write', to), bytes);
     },
     open(p, mode) {
-      const key = at(p);
       if (mode === 0) {
         const bytes = read(p);
         let given = false;
         return { pull: async () => (given ? null : ((given = true), bytes)), close() {} };
       }
+      const key = at('write', p);
       const chunks = mode === 2 && files.has(key) ? [files.get(key)] : [];
       const keep = () => files.set(key, concat(chunks));
       const source = {
