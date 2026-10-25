@@ -184,6 +184,8 @@ const inside = (list, p) => {
 
 // mayPath takes a path absolute and without . or .. parts; its links are not followed.
 export const mayPath = (grant, p) => inside(grant, p) && !inside(grant.deny, p);
+// mayTree takes a path as mayPath does, for a call on everything under it, which a denied path inside also stops.
+export const mayTree = (grant, p) => mayPath(grant, p) && !grant.deny.items.some((root) => under(root, p));
 export const mayEnv = (grant, name) => may(grant, (item) => named(item, name));
 
 const stemOf = (p) => {

@@ -1,8 +1,10 @@
 // Node's file system, for fs.mjs, within the grants.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { nodeSource } from '../streams.mjs';
-import { allowsAll, mayPath, pathDenied, under } from '../grants.mjs';
+import { allowsAll, mayPath, mayTree, notGranted, pathDenied, under, unlimited } from '../grants.mjs';
+import { sameFile, tempName } from '../fs.mjs';
 
 const { O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
 const modes = { 0: O_RDONLY, 1: O_WRONLY | O_CREAT | O_TRUNC, 2: O_WRONLY | O_CREAT | O_APPEND };
@@ -76,13 +78,14 @@ const usable = (p, k) => devices.has(p) || (p === '/dev/tty' && k === 'read') ||
 const unresolved = process.platform === 'linux' ? (p) => under(p, '/proc') || under(p, '/dev') : () => false;
 const missing = () => Object.assign(new Error('ENOENT: no such file or directory'), { errno: -2, code: 'ENOENT' });
 const readFile = (p, flag) => fs.readFileSync(p, { flag });
+const infoOf = (s) => [s.isFile() ? 1 : s.isDirectory() ? 2 : s.isSymbolicLink() ? 3 : 4, s.size, s.mtimeMs, s.mode];
 
 // A path as given is kept with its absolute form and the form the grants compare (key).
 export function nodeFiles(grants) {
   const everything = allowsAll(grants);
   const known = new Map();
   let last = { p: null };
-  const allowed = (k, p) => {
+  const allowed = (k, p, tree = false) => {
     let hit = last.p === p ? last : known.get(p);
     if (hit === undefined) {
       const abs = path.resolve(p);
@@ -91,7 +94,7 @@ export function nodeFiles(grants) {
       known.set(p, hit);
     }
     last = hit;
-    if (!mayPath(grants[k], hit.key)) throw pathDenied(k);
+    if (!(tree ? mayTree : mayPath)(grants[k], hit.key)) throw pathDenied(k);
     return hit.abs;
   };
   const checked = (k, p) => {
@@ -112,18 +115,61 @@ export function nodeFiles(grants) {
       throw e.code === 'ELOOP' ? missing() : e;
     }
   };
+  const resolved = (k, p) => {
+    const abs = allowed(k, p);
+    return checked(k, unresolved(abs) ? abs : realPath(abs));
+  };
   return {
     read: plain((p) => (everything ? fs.readFileSync(p) : opening('read', p, O_RDONLY, readFile))),
     write: plain((p, bytes) => (everything
       ? fs.writeFileSync(p, bytes)
       : opening('write', p, modes[1], (where, flag) => fs.writeFileSync(where, bytes, { flag })))),
     makeDir: plain((p) => fs.mkdirSync(at('write', p), { recursive: true })),
-    stat: plain((p) => {
-      const s = fs.statSync(at('read', p));
-      return s.isDirectory() ? -2 : s.size;
-    }),
+    info: plain((p, follow) => infoOf((follow ? fs.statSync : fs.lstatSync)(at('read', p)))),
     list: plain((p) => fs.readdirSync(at('read', p)).sort()),
-    remove: plain((p) => fs.rmSync(everything ? p : allowed('write', p))),
+    remove: plain((p, recursive) => {
+      const where = everything ? p : allowed('write', p, recursive);
+      if (!fs.lstatSync(where).isDirectory()) fs.unlinkSync(where);
+      else if (recursive) fs.rmSync(where, { recursive: true });
+      else fs.rmdirSync(where);
+    }),
+    readLink: plain((p) => fs.readlinkSync(at('read', p))),
+    realPath: plain((p) => fs.realpathSync.native(at('read', p))),
+    symlink: plain((target, p) => {
+      if (!(unlimited(grants.read) && unlimited(grants.write))) {
+        throw notGranted('making a link is not granted (all of --allow-read and --allow-write)');
+      }
+      fs.symlinkSync(target, p);
+    }),
+    copy: plain((from, to) => {
+      const source = everything ? from : resolved('read', from);
+      const target = at('write', to);
+      try {
+        const [a, b] = [fs.statSync(source), fs.statSync(target)];
+        if (a.dev === b.dev && a.ino === b.ino) throw sameFile();
+      } catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+      }
+      fs.copyFileSync(source, target);
+    }),
+    chmod: plain((p, mode) => fs.chmodSync(at('write', p), mode)),
+    makeTemp: plain((dir, prefix, suffix, file) => {
+      const base = dir ?? os.tmpdir();
+      if (!everything) checked('write', allowed('write', base));
+      for (let tries = 0; tries < 10; tries++) {
+        const name = tempName(prefix, suffix);
+        const made = path.join(base, name);
+        try {
+          if (file) fs.closeSync(fs.openSync(made, 'wx', 0o600));
+          else fs.mkdirSync(made, { mode: 0o700 });
+          return dir === null ? made : `${dir.replace(/\/$/, '')}/${name}`;
+        } catch (e) {
+          if (e.code !== 'EEXIST') throw e;
+        }
+      }
+      throw new Error(`too many temporary ${file ? 'files' : 'directories'} exist`);
+    }),
+    cwd: plain(() => process.cwd()),
     rename: plain((from, to) => {
       at('read', from);
       fs.renameSync(at('write', from), at('write', to));

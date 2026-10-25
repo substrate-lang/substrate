@@ -1,5 +1,7 @@
-// A page's files for fs.mjs, kept in memory under the program's working directory, within the grants if given.
-import { mayPath, pathDenied, unlimited } from '../grants.mjs';
+// A page's files for fs.mjs, kept in memory under the program's working directory, within the grants if given. A
+// directory is there while a file is in it, and there are no links or modes.
+import { mayPath, mayTree, pathDenied, unlimited } from '../grants.mjs';
+import { sameFile, tempName } from '../fs.mjs';
 
 export function resolvePath(cwd, path) {
   const out = [];
@@ -12,6 +14,7 @@ export function resolvePath(cwd, path) {
 }
 
 const missing = () => new Error('No such file or directory');
+const unsupported = () => new Error('Operation not supported');
 const under = (dir) => (dir === '/' ? '/' : `${dir}/`);
 
 function concat(chunks) {
@@ -25,9 +28,10 @@ function concat(chunks) {
 }
 
 export function pageFiles(files, cwd, grants) {
-  const at = (k, p) => {
+  const times = new Map();
+  const at = (k, p, tree = false) => {
     const key = resolvePath(cwd, p);
-    if (grants && !unlimited(grants[k]) && !mayPath(grants[k], key)) throw pathDenied(k);
+    if (grants && !unlimited(grants[k]) && !(tree ? mayTree : mayPath)(grants[k], key)) throw pathDenied(k);
     return key;
   };
   const read = (p) => {
@@ -35,20 +39,25 @@ export function pageFiles(files, cwd, grants) {
     if (!bytes) throw missing();
     return bytes;
   };
+  const keep = (key, bytes) => {
+    files.set(key, bytes);
+    times.set(key, Date.now());
+  };
+  const inside = (key) => [...files.keys()].filter((k) => k.startsWith(under(key)));
+  const info = (key) => {
+    if (files.has(key)) return [1, files.get(key).length, times.get(key) ?? 0, 0];
+    if (inside(key).length > 0) return [2, 0, 0, 0];
+    throw missing();
+  };
   return {
     read,
     write(p, bytes) {
-      files.set(at('write', p), bytes);
+      keep(at('write', p), bytes);
     },
     makeDir(p) {
       at('write', p);
     },
-    stat(p) {
-      const key = at('read', p);
-      if (files.has(key)) return files.get(key).length;
-      for (const k of files.keys()) if (k.startsWith(under(key))) return -2;
-      throw missing();
-    },
+    info: (p) => info(at('read', p)),
     list(p) {
       const prefix = under(at('read', p));
       const names = new Set();
@@ -56,16 +65,56 @@ export function pageFiles(files, cwd, grants) {
       if (names.size === 0) throw missing();
       return [...names].sort();
     },
-    remove(p) {
-      if (!files.delete(at('write', p))) throw missing();
+    remove(p, recursive) {
+      const key = at('write', p, recursive);
+      if (files.delete(key)) return;
+      const keys = inside(key);
+      if (keys.length === 0) throw missing();
+      if (!recursive) throw new Error('Directory not empty');
+      for (const k of keys) files.delete(k);
     },
     rename(from, to) {
       at('read', from);
       const bytes = files.get(at('write', from));
       if (!bytes) throw missing();
       files.delete(at('write', from));
-      files.set(at('write', to), bytes);
+      keep(at('write', to), bytes);
     },
+    readLink(p) {
+      info(at('read', p));
+      throw new Error('Invalid argument');
+    },
+    realPath(p) {
+      const key = at('read', p);
+      info(key);
+      return key;
+    },
+    symlink() {
+      throw unsupported();
+    },
+    copy(from, to) {
+      const bytes = read(from);
+      const target = at('write', to);
+      if (target === resolvePath(cwd, from)) throw sameFile();
+      keep(target, bytes);
+    },
+    chmod(p) {
+      info(at('write', p));
+      throw unsupported();
+    },
+    makeTemp(dir, prefix, suffix, file) {
+      const base = dir === null ? '/tmp' : dir.replace(/\/$/, '');
+      at('write', base);
+      for (let tries = 0; tries < 10; tries++) {
+        const made = `${base}/${tempName(prefix, suffix)}`;
+        const key = resolvePath(cwd, made);
+        if (files.has(key) || inside(key).length > 0) continue;
+        if (file) keep(key, new Uint8Array(0));
+        return made;
+      }
+      throw new Error(`too many temporary ${file ? 'files' : 'directories'} exist`);
+    },
+    cwd: () => cwd,
     open(p, mode) {
       if (mode === 0) {
         const bytes = read(p);
@@ -74,17 +123,17 @@ export function pageFiles(files, cwd, grants) {
       }
       const key = at('write', p);
       const chunks = mode === 2 && files.has(key) ? [files.get(key)] : [];
-      const keep = () => files.set(key, concat(chunks));
+      const save = () => keep(key, concat(chunks));
       const source = {
         write(bytes) {
           chunks.push(bytes);
           return true;
         },
         finish() {
-          keep();
+          save();
           source.finished();
         },
-        close: keep,
+        close: save,
       };
       return source;
     },

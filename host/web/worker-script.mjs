@@ -23,6 +23,10 @@ function readOnly(files) {
     makeDir: refused,
     remove: refused,
     rename: refused,
+    symlink: refused,
+    copy: refused,
+    chmod: refused,
+    makeTemp: refused,
     open: (p, mode) => (mode === 0 ? files.open(p, mode) : refused()),
   };
 }
