@@ -1,11 +1,11 @@
 // The host module "worker" on Node: the thread is a worker thread, set up as its parent's host was.
-import { Worker } from 'node:worker_threads';
+import { SHARE_ENV, Worker } from 'node:worker_threads';
 import { workerModule } from '../worker.mjs';
 
 export function workers(setup) {
   return workerModule({
     spawn(plan) {
-      const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url));
+      const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url), { env: SHARE_ENV });
       thread.postMessage({
         type: 'start',
         modules: plan.modules,
@@ -15,6 +15,7 @@ export function workers(setup) {
         fakes: [...setup.fakes],
         tls: setup.tls,
         changes: setup.changes,
+        loader: setup.loader,
         pages: plan.pages,
         heard: plan.heard,
       });

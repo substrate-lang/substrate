@@ -9,6 +9,11 @@ import { hostFlag, hostModules, setupOf } from './node/modules.mjs';
 
 const require = createRequire(import.meta.url);
 const resolveGrant = (p, k) => require('./node/fs.mjs').resolveGrant(p, k);
+const resolveFlag = (p, k) => {
+  const item = resolveGrant(p, k);
+  if (item === null) process.stderr.write(`subhost: --allow-run: ${p} is not found, so it is not granted\n`);
+  return item;
+};
 
 function usage() {
   process.stderr.write('usage: sub run [FLAG ...] DIR [ARG ...]\n'
@@ -30,7 +35,7 @@ const setup = setupOf(noGrants());
 while (argv.length > 0 && argv[0].startsWith('-')) {
   const flag = argv.shift();
   try {
-    if (!grantFlag(setup.grants, flag, resolveGrant) && !hostFlag(setup, flag)) usage();
+    if (!grantFlag(setup.grants, flag, resolveFlag) && !hostFlag(setup, flag)) usage();
   } catch (e) {
     fail(e.message);
   }

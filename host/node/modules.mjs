@@ -2,7 +2,7 @@
 // and certificate the host was set up with.
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
-import { listOf } from '../grants.mjs';
+import { isLoaderVariable, listOf } from '../grants.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -18,7 +18,7 @@ const loaders = {
     : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants))),
   worker: (s) => require('./worker.mjs').workers(s),
   net: (s) => require('./net.mjs').netModule(s.grants, s.tls),
-  process: (s) => require('./process.mjs').processes(s.grants),
+  process: (s) => require('./process.mjs').processes(s.grants, s.loader),
   stdin: () => require('./stdin.mjs').stdin(),
   env: (s) => require('./env.mjs').env(s.grants),
   fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants, s.changes)),
@@ -26,9 +26,11 @@ const loaders = {
 
 const fakeable = new Set(['clock', 'timer', 'fetch', 'websocket']);
 
-// changes counts the renames and removals of the program's threads, which share it.
+// changes counts the renames and removals of the program's threads, which share it, and loader holds the dynamic
+// loader's variables as the host started with them.
 export const setupOf = (grants) => ({
   grants, fakes: new Map(), tls: null, changes: new Int32Array(new SharedArrayBuffer(4)),
+  loader: Object.fromEntries(Object.entries(process.env).filter(([name]) => isLoaderVariable(name))),
 });
 
 // hostFlag adds a flag that sets the host up and returns true, or returns false for any other flag. The flags are

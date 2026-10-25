@@ -1,5 +1,7 @@
 // What a program may do beyond computing: read and write files, reach hosts, read the environment and run
-// programs. The flags are Deno's: -A, -R, -W, -N, -E and --allow-run, the lists scoped, with --deny-* over them.
+// programs. The grants match Deno's permissions wherever the two overlap, except that the host never prompts, a page
+// cannot check where fetch is redirected or where names resolve, and a child may keep the dynamic loader's variables
+// the host started with.
 const kinds = ['read', 'write', 'net', 'env', 'run'];
 const short = { read: '-R', write: '-W', net: '-N', env: '-E' };
 export const flags = {
@@ -22,7 +24,9 @@ export function notGranted(message) {
   return e;
 }
 
-export const pathDenied = (k) => notGranted(`${k === 'read' ? 'reading' : 'writing'} is not granted (${flags[k]})`);
+export const pathDenied = (k, flag = flags[k]) => notGranted(
+  `${k === 'read' ? 'reading' : 'writing'} is not granted (${flag})`,
+);
 
 // The items of a list have commas between them, and ",," is a comma within one.
 export function listOf(text) {
@@ -142,7 +146,7 @@ export function grantFlag(g, flag, resolve) {
       if (list.includes('')) throw new Error(`${flag} has an empty item`);
       const items = list.map((text) => itemOf(k, text, resolve, into === g[k].deny)).filter((item) => item !== null);
       into.items.push(...items);
-      if (into === g.run) g.write.deny.items.push(...items, ...items.map((item) => resolve(item, 'write')));
+      if (into === g.run) g.write.deny.items.push(...items);
     }
     return true;
   }
@@ -156,10 +160,12 @@ export function grantsOf(list, resolve) {
   return g;
 }
 
-const under = (p, root) => root === '/' || p === root || (p.startsWith(root) && p.charCodeAt(root.length) === 47);
+export const under = (p, root) => root === '/' || p === root
+  || (p.startsWith(root) && p.charCodeAt(root.length) === 47);
 const named = (item, name) => item === name || (item.endsWith('*') && name.startsWith(item.slice(0, -1)));
+const wildcard = (item, host) => item.startsWith('*.') && (host === item.slice(2) || host.endsWith(item.slice(1)));
 const reaches = (item, host, port) => (item.port === null || item.port === port) && (item.bits === undefined
-  ? item.host === host || (item.host.startsWith('*.') && host.endsWith(item.host.slice(1)))
+  ? item.host === host || wildcard(item.host, host)
   : inSubnet(item, host));
 const among = (list, test) => list.all || list.items.some(test);
 const may = (grant, test) => among(grant, test) && !among(grant.deny, test);
@@ -170,16 +176,27 @@ const inside = (list, p) => {
   return false;
 };
 
-// mayPath takes a path as the host resolved it: absolute, with its symbolic links followed.
+// mayPath takes a path absolute and without . or .. parts; its links are not followed.
 export const mayPath = (grant, p) => inside(grant, p) && !inside(grant.deny, p);
 export const mayEnv = (grant, name) => may(grant, (item) => named(item, name));
 
-const fileName = (p) => p.slice(p.lastIndexOf('/') + 1);
-const runs = (item, file, program) => (item.includes('/')
-  ? under(file, item)
-  : item === fileName(file) || item === fileName(program));
-// mayRun takes the file a program runs, as the host found it, and the program as it was named.
-export const mayRun = (grant, file, program) => (grant.all || grant.items.includes(file))
+const stemOf = (p) => {
+  const base = p.slice(p.lastIndexOf('/') + 1);
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(0, dot) : base;
+};
+// A denied name covers a file whose stem is the name in any case, or starts with the name and a dot.
+const covered = (name, p) => {
+  const stem = stemOf(p).toLowerCase();
+  const n = name.toLowerCase();
+  return stem.startsWith(n) && (stem.length === n.length || stem[n.length] === '.');
+};
+const runs = (item, file, program) => {
+  if (file === null) return item.includes('/') ? covered(program, item) : item === program;
+  return item.includes('/') ? under(file, item) : covered(item, file);
+};
+// mayRun takes the file a program runs, as the host found it, or null when there is none, and the program as named.
+export const mayRun = (grant, file, program) => (grant.all || (file !== null && grant.items.includes(file)))
   && !among(grant.deny, (item) => runs(item, file, program));
 export const mayHost = (grant, host, port) => {
   const h = canonicalHost(host);
@@ -189,6 +206,10 @@ const ports = { 'http:': 80, 'https:': 443, 'ws:': 80, 'wss:': 443 };
 export const portOfUrl = (url) => (url.port === '' ? ports[url.protocol] || 0 : Number(url.port));
 export const mayUrl = (grant, url) => mayHost(grant, url.hostname, portOfUrl(url));
 export const unlimited = (grant) => grant.all && !grant.deny.all && grant.deny.items.length === 0;
+export const allowsAll = (g) => kinds.every((k) => unlimited(g[k]));
+
+// The dynamic loader's variables, which only all of --allow-run lets a program change for a child (node/process.mjs).
+export const isLoaderVariable = (name) => /^\s*(LD_|DYLD_)/i.test(name);
 
 // addressDenials tells whether a deny list names addresses or subnets, and deniesAddress whether it denies an address
 // (node/resolve.mjs).
