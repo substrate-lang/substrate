@@ -9,13 +9,19 @@ import { sameFile, tempName } from '../fs.mjs';
 const { O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
 const modes = { 0: O_RDONLY, 1: O_WRONLY | O_CREAT | O_TRUNC, 2: O_WRONLY | O_CREAT | O_APPEND };
 
+// plainMessage gives an error's message, a system error's without its code and path.
+export function plainMessage(e) {
+  if (typeof e.errno !== 'number') return e.message;
+  const m = e.message.replace(/^[A-Z]+: /, '').replace(/, [a-z]+ '.*$/, '');
+  return m.charAt(0).toUpperCase() + m.slice(1);
+}
+
 const plain = (f) => (...args) => {
   try {
     return f(...args);
   } catch (e) {
     if (typeof e.errno !== 'number') throw e;
-    const m = e.message.replace(/^[A-Z]+: /, '').replace(/, [a-z]+ '.*$/, '');
-    throw new Error(m.charAt(0).toUpperCase() + m.slice(1));
+    throw new Error(plainMessage(e));
   }
 };
 
@@ -79,6 +85,15 @@ const unresolved = process.platform === 'linux' ? (p) => under(p, '/proc') || un
 const missing = () => Object.assign(new Error('ENOENT: no such file or directory'), { errno: -2, code: 'ENOENT' });
 const readFile = (p, flag) => fs.readFileSync(p, { flag });
 const infoOf = (s) => [s.isFile() ? 1 : s.isDirectory() ? 2 : s.isSymbolicLink() ? 3 : 4, s.size, s.mtimeMs, s.mode];
+
+// literalPath gives p absolute, checked as a call that does not follow its links is.
+export function literalPath(grants, k, p) {
+  const abs = path.resolve(p);
+  if (allowsAll(grants)) return abs;
+  if (!mayPath(grants[k], comparable(abs))) throw pathDenied(k);
+  if (special(abs) && !usable(abs, k)) throw pathDenied(k, '--allow-all');
+  return abs;
+}
 
 // A path as given is kept with its absolute form and the form the grants compare (key).
 export function nodeFiles(grants) {
