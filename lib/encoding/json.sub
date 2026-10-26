@@ -1,8 +1,8 @@
 ;; JSON (RFC 8259): values after cJSON's, in an arena; a token reader after Go's Decoder.Token; writing as JavaScript's
-;; JSON.stringify writes.
+;; JSON.stringify writes, but -0 as -0; and the json form, a type's writer and reader after serde's derive.
 (require-unqualified utf8 "utf8.sub")
 
-(provide json-value json-null json-boolean json-number json-string json-array json-object json-member json-error
+(provide json json-value json-null json-boolean json-number json-string json-array json-object json-member json-error
          json-parse json-write! json-get json-at json-count json-as-i64 json-as-f64 json-as-string json-as-bool
          json-push! json-add! json-insert! json-replace! json-replace-at! json-remove! json-remove-at! json-copy
          json-equal? json-reader json-reader-start! json-reader-free! json-next! json-skip!
@@ -441,13 +441,13 @@
       (while (< (-> pad bytes length) need) (buffer-add-string! (& (-> pad bytes)) (-> pad indent)))
       (buffer-add! b (slice (-> pad bytes bytes) need)))))
 
-;; write-number! writes x as JavaScript's Number::toString does.
+;; write-number! writes x as JavaScript's Number::toString does, but -0 as -0.
 (define (write-number! [b (ptr buffer)] [x f64])
   (when (or (!= x x) (== x (/ 1.0 0.0)) (== x (/ -1.0 0.0)))
     (buffer-add-string! b "null")
     (return))
   (when (== x 0.0)
-    (buffer-add-byte! b #\0)
+    (buffer-add-string! b (if (== (f64-bits x) 0) "0" "-0"))
     (return))
   (let* ([ds (array u8 24)] [(digits k) (shortest-digits (fabs x) #f (slice ds))] [n (cast i32 (-> digits length))])
     (when (< x 0.0) (buffer-add-byte! b #\-))
@@ -541,7 +541,7 @@
     [(json-number x text)
      (let* ([n (-> text length)] [negative (and (> n 0) (== (@ text 0) #\-))] [digits (slice text (if negative 1 0))]
             [k u64 0])
-       (and (> n 0) (digits? digits 10) (digits-integer digits 10 negative (& k))
+       (and (> n 0) (digits? digits 10) (digits-integer digits 10 negative (& k)) (or negative (<= k 9223372036854775807))
             (begin
               (set! (@ to) (cast i64 k))
               #t)))]
@@ -696,3 +696,247 @@
               (return #f))))
         #t]
        [_ #f])]))
+
+;; ---- reading into types ----
+
+(define (expect! [r (ptr json-reader)] [t u32] [want u32] [message string]) -> bool
+  (cond [(== t want) #t]
+        [(== t json-token-error) #f]
+        [else (reject! r message)]))
+
+(define (take-unsigned! [r (ptr json-reader)] [t u32] [most u64] [to (ptr u64)]) -> bool
+  (and (expect! r t json-token-number "expected a number")
+       (or (and (digits? (-> r token) 10) (digits-integer (-> r token) 10 #f to) (<= (@ to) most))
+           (reject! r "expected an integer within the field's type"))))
+
+(define (take-signed! [r (ptr json-reader)] [t u32] [least i64] [most i64] [to (ptr i64)]) -> bool
+  (unless (expect! r t json-token-number "expected a number") (return #f))
+  (let* ([negative (== (@ (-> r token) 0) #\-)] [digits (slice (-> r token) (if negative 1 0))] [k u64 0])
+    (or (and (digits? digits 10) (digits-integer digits 10 negative (& k))
+             (if negative (>= (cast i64 k) least) (<= k (cast u64 most)))
+             (begin (set! (@ to) (cast i64 k)) #t))
+        (reject! r "expected an integer within the field's type"))))
+
+(define (take-float! [r (ptr json-reader)] [t u32] [to (ptr f64)]) -> bool
+  (and (expect! r t json-token-number "expected a number")
+       (begin (set! (@ to) (-> r number)) #t)))
+
+(define (take-bool! [r (ptr json-reader)] [t u32] [to (ptr bool)]) -> bool
+  (cond [(== t json-token-true) (set! (@ to) #t) #t]
+        [(== t json-token-false) (set! (@ to) #f) #t]
+        [else (expect! r t json-token-true "expected true or false")]))
+
+(define (take-text! [r (ptr json-reader)] [a (ptr arena)] [t u32] [to (ptr string)]) -> bool
+  (and (expect! r t json-token-string "expected a string")
+       (begin (set! (@ to) (arena-text a (-> r token))) #t)))
+
+(define (end-of-text! [r (ptr json-reader)]) -> bool (== (json-next! r) json-token-end))
+
+(define (finish! [r (ptr json-reader)] [ok bool] [err (ptr json-error)]) -> bool
+  (when (and (not ok) (!= err 0)) (set! (@ err) (-> r error)))
+  (json-reader-free! r)
+  ok)
+
+(define (put-signed! [b (ptr buffer)] [n i64])
+  (if (< n 0)
+      (begin (buffer-add-byte! b #\-) (write-digits b (- 0 (cast u64 n)) 10))
+      (write-digits b (cast u64 n) 10)))
+
+;; ---- the json form ----
+
+(begin-for-syntax
+  (require-unqualified macros "../../compiler/macros.sub")
+  (require-unqualified derive "../meta/derive.sub")
+
+  (define unsigned-limits datum '((u8 255) (u16 65535) (u32 4294967295) (u64 18446744073709551615)))
+  (define signed-limits datum
+    '((i8 -128 127) (i16 -32768 32767) (i32 -2147483648 2147483647) (i64 -9223372036854775808 9223372036854775807)))
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (json-form [s datum]) -> datum (derive s 'json '"json-write!" definitions))
+
+  (define (definitions [t datum] [info datum]) -> datum
+    (if (== (car info) 'struct) (struct-code t (caddr info)) (variant-code t (caddr info))))
+
+  (define (name-text [x datum]) -> datum (literal (string->datum (symbol->string (syntax-e x)))))
+
+  ;; A field's or case's name as a JSON string.
+  (define (quoted [x datum]) -> datum
+    (let ([b (make-buffer)] [s (symbol->string (syntax-e x))] [d datum 0])
+      (buffer-add-byte! (& b) #\")
+      (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+        (when (or (== (@ s i) #\") (== (@ s i) #\\)) (buffer-add-byte! (& b) #\\))
+        (buffer-add-byte! (& b) (@ s i)))
+      (buffer-add-byte! (& b) #\")
+      (set! d (string->datum (buffer-string (& b))))
+      (buffer-free! (& b))
+      d))
+
+  (define (struct-code [t datum] [fields datum]) -> datum
+    `(,#`(define (#,(derive-name t '"json-write!") [b (ptr buffer)] [v (ptr #,t)])
+           #,@(object-write fields (for/list ([f fields]) #`(-> v #,(car f)))))
+      ,#`(define (#,(derive-name t '"json-read-from!") [r (ptr json-reader)] [a (ptr arena)] [token u32] [v (ptr #,t)]) -> bool
+           #,(object-read #`token fields (for/list ([f fields]) #`(-> v #,(car f))))
+           #t)
+      ,(entry t)))
+
+  (define (variant-code [t datum] [cases datum]) -> datum
+    (let ([writes nil] [names nil] [objects nil])
+      (for/each ([c cases])
+        (let ([xs (for/list ([f (cdr c)]) (derive-fresh 'f))])
+          (if (null? (cdr c))
+              (begin
+                (set! writes (cons #`[(#,(car c)) (buffer-add-string! b #,(literal (quoted (car c))))] writes))
+                (set! names (cons #`[(== (-> r token) #,(name-text (car c))) (set! (@ v) (#,(car c)))] names)))
+              (begin
+                (set! writes (cons #`[(#,(car c) #,@xs)
+                                      (buffer-add-string! b #,(literal (format "{~a:" `(,(quoted (car c))))))
+                                      #,@(object-write (cdr c) xs)
+                                      (buffer-add-byte! b #\})]
+                                   writes))
+                (set! objects (cons #`[(== (-> r token) #,(name-text (car c)))
+                                       (let (#,@(for/list ([f (cdr c)] [x xs]) #`[#,x #,(type-syntax (cdr f))]))
+                                         #,(object-read #`(json-next! r) (cdr c) xs)
+                                         (set! (@ v) (#,(car c) #,@xs)))]
+                                    objects))))))
+      `(,#`(define (#,(derive-name t '"json-write!") [b (ptr buffer)] [v (ptr #,t)])
+             (match v #,@(reverse writes)))
+        ,#`(define (#,(derive-name t '"json-read-from!") [r (ptr json-reader)] [a (ptr arena)] [token u32] [v (ptr #,t)]) -> bool
+             (cond [(== token json-token-string)
+                    (cond #,@(reverse names)
+                          [else (return (reject! r "unknown case"))])]
+                   [(== token json-token-start-object)
+                    (unless (expect! r (json-next! r) json-token-key "expected a case") (return #f))
+                    (cond #,@(reverse objects)
+                          [else (return (reject! r "unknown case"))])
+                    (unless (expect! r (json-next! r) json-token-end-object "expected one case") (return #f))]
+                   [else (return (expect! r token json-token-string "expected a case"))])
+             #t)
+        ,(entry t))))
+
+  (define (entry [t datum]) -> datum
+    #`(define (#,(derive-name t '"json-read") [a (ptr arena)] [text string] [v (ptr #,t)] [err (ptr json-error)]) -> bool
+        (let ([r json-reader])
+          (json-reader-start! (& r) text)
+          (finish! (& r) (and (#,(derive-name t '"json-read-from!") (& r) a (json-next! (& r)) v) (end-of-text! (& r))) err))))
+
+  (define (optional? [type datum]) -> bool (and (pair? type) (== (car type) 'ptr)))
+
+  ;; Code writing an object's fields from their places.
+  (define (object-write [fields datum] [places datum]) -> datum
+    (if (null? fields)
+        `(,#`(buffer-add-string! b "{}"))
+        (let ([out nil] [first #t])
+          (for/each ([f fields] [p places])
+            (set! out (cons #`(buffer-add-string! b #,(literal (format "~a~a:" `(,(if first '"{" '",") ,(quoted (car f))))))
+                            out))
+            (set! out (cons (write-code (cdr f) p (car f)) out))
+            (set! first #f))
+          (reverse (cons #`(buffer-add-byte! b #\}) out)))))
+
+  ;; Code reading an object, whose first token is token, into its fields' places.
+  (define (object-read [token datum] [fields datum] [places datum]) -> datum
+    (let ([seen (derive-fresh 'seen)] [k (derive-fresh 'k)] [n (literal (make-integer (if (null? fields) 1 (length fields))))]
+          [i 0] [arms nil] [checks nil] [defaults nil])
+      (for/each ([f fields] [p places])
+        (let ([index (literal (make-integer i))] [u (derive-fresh 'u)])
+          (set! arms (cons #`[(== (-> r token) #,(name-text (car f)))
+                              (let ([#,u (json-next! r)]) #,(read-code (cdr f) p (car f) u))
+                              (set! (@ #,seen #,index) #t)]
+                           arms))
+          (if (optional? (cdr f))
+              (set! defaults (cons #`(set! #,p 0) defaults))
+              (set! checks (cons #`(unless (@ #,seen #,index)
+                                     (return (reject! r #,(literal (format "missing field ~a" `(,(syntax-e (car f))))))))
+                                 checks))))
+        (+= i 1))
+      #`(let ([#,seen (array bool #,n)] [#,k u32 0])
+          (memset #,seen 0 #,n)
+          #,@(reverse defaults)
+          (unless (expect! r #,token json-token-start-object "expected an object") (return #f))
+          (while #t
+            (set! #,k (json-next! r))
+            (cond [(== #,k json-token-end-object) (break)]
+                  [(!= #,k json-token-key) (return #f)]
+                  #,@(reverse arms)
+                  [else (unless (json-skip! r) (return #f))]))
+          #,@(reverse checks))))
+
+  ;; Code writing the value at place p, of the field where.
+  (define (write-code [type datum] [p datum] [where datum]) -> datum
+    (cond [(symbol? type)
+           (cond [(!= (assq type unsigned-limits) 0) #`(write-digits b (cast u64 #,p) 10)]
+                 [(!= (assq type signed-limits) 0) #`(put-signed! b (cast i64 #,p))]
+                 [(== type 'f32) #`(write-number! b (cast f64 #,p))]
+                 [(== type 'f64) #`(write-number! b #,p)]
+                 [(== type 'bool) #`(buffer-add-string! b (if #,p "true" "false"))]
+                 [else #`(write-text! b #,p)])]
+          [(identifier? type) (derive-want! type) #`(#,(derive-name type '"json-write!") b (& #,p))]
+          [(== (car type) 'ptr)
+           #`(if (== #,p 0) (buffer-add-string! b "null") #,(write-code (cadr type) #`(@ #,p) where))]
+          [(or (== (car type) 'slice) (== (car type) 'array))
+           (let ([i (derive-fresh 'i)] [n (if (== (car type) 'slice) #`(-> #,p length) (literal (caddr type)))])
+             #`(begin (buffer-add-byte! b #\[)
+                      (for ([#,i u32 0]) (< #,i #,n) (+= #,i 1)
+                        (when (> #,i 0) (buffer-add-byte! b #\,))
+                        #,(write-code (cadr type) #`(@ #,p #,i) where))
+                      (buffer-add-byte! b #\])))]
+          [else (raise-syntax-error 'json "this field's type has no JSON form" where)]))
+
+  ;; Code reading into place p, of the field where, the value whose first token is u.
+  (define (read-code [type datum] [p datum] [where datum] [u datum]) -> datum
+    (cond [(symbol? type)
+           (let ([unsigned (assq type unsigned-limits)] [signed (assq type signed-limits)] [n (derive-fresh 'n)])
+             (cond [(!= unsigned 0)
+                    #`(let ([#,n u64 0])
+                        (unless (take-unsigned! r #,u #,(literal (cadr unsigned)) (& #,n)) (return #f))
+                        (set! #,p (cast #,(literal type) #,n)))]
+                   [(!= signed 0)
+                    #`(let ([#,n i64 0])
+                        (unless (take-signed! r #,u #,(literal (cadr signed)) #,(literal (caddr signed)) (& #,n)) (return #f))
+                        (set! #,p (cast #,(literal type) #,n)))]
+                   [(== type 'f32)
+                    #`(let ([#,n f64 0.0]) (unless (take-float! r #,u (& #,n)) (return #f)) (set! #,p (cast f32 #,n)))]
+                   [(== type 'f64) #`(unless (take-float! r #,u (& #,p)) (return #f))]
+                   [(== type 'bool) #`(unless (take-bool! r #,u (& #,p)) (return #f))]
+                   [else #`(unless (take-text! r a #,u (& #,p)) (return #f))]))]
+          [(identifier? type)
+           (derive-want! type)
+           #`(unless (#,(derive-name type '"json-read-from!") r a #,u (& #,p)) (return #f))]
+          [(== (car type) 'ptr)
+           (let ([q (derive-fresh 'q)] [e (type-syntax (cadr type))])
+             #`(if (== #,u json-token-null)
+                   (set! #,p 0)
+                   (let ([#,q (cast (ptr #,e) (arena-alloc a (sizeof #,e)))])
+                     #,(read-code (cadr type) #`(@ #,q) where u)
+                     (set! #,p #,q))))]
+          [(== (car type) 'slice)
+           (let ([items (derive-fresh 'items)] [count (derive-fresh 'count)] [room (derive-fresh 'room)] [w (derive-fresh 'w)]
+                 [more (derive-fresh 'more)] [e (type-syntax (cadr type))])
+             #`(let ([#,items (ptr #,e) 0] [#,count u32 0] [#,room u32 0] [#,w u32 0])
+                 (unless (expect! r #,u json-token-start-array "expected an array") (return #f))
+                 (while #t
+                   (set! #,w (json-next! r))
+                   (when (== #,w json-token-end-array) (break))
+                   (when (== #,count #,room)
+                     (set! #,room (if (== #,room 0) 4 (* 2 #,room)))
+                     (let ([#,more (cast (ptr #,e) (arena-alloc a (* #,room (sizeof #,e))))])
+                       (when (> #,count 0) (memcpy #,more #,items (* #,count (sizeof #,e))))
+                       (set! #,items #,more)))
+                   #,(read-code (cadr type) #`(@ #,items #,count) where w)
+                   (+= #,count 1))
+                 (set! #,p (slice #,items #,count))))]
+          [(== (car type) 'array)
+           (let ([i (derive-fresh 'i)] [w (derive-fresh 'w)] [n (literal (caddr type))]
+                 [message (literal (format "expected an array of ~a items" `(,(caddr type))))])
+             #`(let ([#,w u32 0])
+                 (unless (expect! r #,u json-token-start-array "expected an array") (return #f))
+                 (for ([#,i u32 0]) (< #,i #,n) (+= #,i 1)
+                   (set! #,w (json-next! r))
+                   (when (== #,w json-token-end-array) (return (reject! r #,message)))
+                   #,(read-code (cadr type) #`(@ #,p #,i) where w))
+                 (unless (expect! r (json-next! r) json-token-end-array #,message) (return #f))))]
+          [else (raise-syntax-error 'json "this field's type has no JSON form" where)])))
+
+(define-syntax json json-form)
