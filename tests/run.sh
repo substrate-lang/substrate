@@ -20,6 +20,8 @@ same_program() {
 
 pass=0
 fail=0
+built=0
+unbuilt=0
 
 # A certificate for the TLS tests, which their clients trust because it is granted.
 mkdir -p "$builds/tls"
@@ -69,9 +71,9 @@ mapfile -t modules < <(find lib bench host tests/web -name '*.sub' -not -path 'b
 for m in "${modules[@]}"; do
   actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
-    pass=$((pass + 1))
+    built=$((built + 1))
   else
-    fail=$((fail + 1))
+    unbuilt=$((unbuilt + 1))
     echo "FAIL $m: does not build"
     echo "$actual" | head -10
   fi
@@ -180,5 +182,6 @@ else
   fail=$((fail + 1))
   echo "FAIL changed sources: a changed srcloc is not refused"
 fi
+echo "$built modules built, $unbuilt failed"
 echo "$pass passed, $fail failed; $again built again from the cache"
-[ $fail -eq 0 ]
+[ $fail -eq 0 ] && [ $unbuilt -eq 0 ]
