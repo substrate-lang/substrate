@@ -88,7 +88,7 @@ export function fsModule(files) {
         return attempt(path, err, () => (files.chmod(path, mode >>> 0), 0));
       },
       make_temp(dp, dl, xp, xl, sp, sl, file, err) {
-        const dir = dp === 0 ? null : caller.string(dp, dl);
+        const dir = dl === 0 ? null : caller.string(dp, dl);
         const made = () => files.makeTemp(dir, caller.string(xp, xl), caller.string(sp, sl), file !== 0);
         return attempt(dir ?? 'the temporary directory', err, () => caller.give(utf8.encode(made()), 0), 0);
       },

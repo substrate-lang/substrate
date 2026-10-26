@@ -332,7 +332,7 @@ export function createHost(platform) {
       give,
       fail(err, message) {
         if (!err) return;
-        const p = give(utf8.encode(message), 0);
+        const p = give(utf8.encode(message), u(err) + 4);
         new DataView(memory().buffer).setUint32(u(err), p, true);
       },
       event(kind, id, tag, value, bytes, data) {
