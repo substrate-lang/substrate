@@ -557,7 +557,8 @@ export function createHost(platform) {
       // When on-trap returns 0, or there is none, the error is reported and the program ends.
       if (onTrap && allocators.has(entry.memory)) {
         try {
-          if (onTrap(giveIn(entry.memory, utf8.encode(lastError), 0, 'on-trap')) !== 0) return false;
+          const message = utf8.encode(lastError);
+          if (onTrap(giveIn(entry.memory, message, 0, 'on-trap'), message.length) !== 0) return false;
         } catch (e2) {
           if (e2 instanceof Exit) {
             end(e2.code, '');

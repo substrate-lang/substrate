@@ -65,13 +65,13 @@ export function fsModule(files) {
         const path = caller.string(pp, pl);
         return attempt(path, err, () => caller.streams.add(tag, files.open(path, mode)), 0);
       },
-      read_link(pp, pl, err) {
+      read_link(pp, pl, out, err) {
         const path = caller.string(pp, pl);
-        return attempt(path, err, () => caller.give(utf8.encode(files.readLink(path)), 0), 0);
+        return attempt(path, err, () => caller.give(utf8.encode(files.readLink(path)), out), 0);
       },
-      real_path(pp, pl, err) {
+      real_path(pp, pl, out, err) {
         const path = caller.string(pp, pl);
-        return attempt(path, err, () => caller.give(utf8.encode(files.realPath(path)), 0), 0);
+        return attempt(path, err, () => caller.give(utf8.encode(files.realPath(path)), out), 0);
       },
       symlink(tp, tl, pp, pl, err) {
         const target = caller.string(tp, tl);
@@ -87,13 +87,13 @@ export function fsModule(files) {
         const path = caller.string(pp, pl);
         return attempt(path, err, () => (files.chmod(path, mode >>> 0), 0));
       },
-      make_temp(dp, dl, xp, xl, sp, sl, file, err) {
+      make_temp(dp, dl, xp, xl, sp, sl, file, out, err) {
         const dir = dl === 0 ? null : caller.string(dp, dl);
         const made = () => files.makeTemp(dir, caller.string(xp, xl), caller.string(sp, sl), file !== 0);
-        return attempt(dir ?? 'the temporary directory', err, () => caller.give(utf8.encode(made()), 0), 0);
+        return attempt(dir ?? 'the temporary directory', err, () => caller.give(utf8.encode(made()), out), 0);
       },
-      cwd(err) {
-        return attempt('.', err, () => caller.give(utf8.encode(files.cwd()), 0), 0);
+      cwd(out, err) {
+        return attempt('.', err, () => caller.give(utf8.encode(files.cwd()), out), 0);
       },
     };
   };
