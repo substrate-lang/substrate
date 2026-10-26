@@ -29,7 +29,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
 
 tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
-       tests/crypto/*.sub tests/encoding/*.sub)
+       tests/crypto/*.sub tests/encoding/*.sub tests/meta/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
