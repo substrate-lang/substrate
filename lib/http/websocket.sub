@@ -51,8 +51,8 @@
 
 ;; ---- frames out ----
 
-(define (write-frame! [w (ptr ws-connection)] [opcode i32] [p (ptr u8)] [n u32]) -> i32
-  (let ([out (& (-> w out))])
+(define (write-frame! [w (ptr ws-connection)] [opcode i32] [payload (slice u8)]) -> i32
+  (let ([out (& (-> w out))] [n (-> payload length)])
     (set! (-> out length) 0)
     (buffer-add-byte! out (bit-or 128 opcode))
     (cond [(< n 126) (buffer-add-byte! out (cast i32 n))]
@@ -64,7 +64,7 @@
            (buffer-add-byte! out 127)
            (for ([i u32 0]) (< i 8) (+= i 1)
              (buffer-add-byte! out (cast i32 (bit-and (>> (cast u64 n) (* 8 (- 7 i))) 255))))])
-    (buffer-add! out p n)
+    (buffer-add! out payload)
     (let ([written (stream-write (-> w stream) (buffer-bytes out))])
       (when (== written 1) (set! (-> w full) #t))
       written)))
@@ -73,7 +73,7 @@
   (let ([pair (array u8 2)])
     (set! (@ pair 0) (cast u8 (>> code 8)))
     (set! (@ pair 1) (cast u8 code))
-    (write-frame! w 8 pair (if (== code 1005) 0 2))))
+    (write-frame! w 8 (slice pair (if (== code 1005) 0 2)))))
 
 (define (disarm! [w (ptr ws-connection)])
   (when (!= (-> w timer) 0)
@@ -103,72 +103,74 @@
 
 ;; ---- frames in ----
 
-(define (deliver! [w (ptr ws-connection)] [p (ptr u8)] [n u32] [kind i32])
-  (cond [(and (== kind ws-text) (not (utf-8? (slice p n)))) (fail! w 1007)]
-        [(and (== (-> w state) state-open) (!= (-> w on-message) 0)) ((-> w on-message) w (slice p n) kind)]))
+(define (deliver! [w (ptr ws-connection)] [message (slice u8)] [kind i32])
+  (cond [(and (== kind ws-text) (not (utf-8? message))) (fail! w 1007)]
+        [(and (== (-> w state) state-open) (!= (-> w on-message) 0)) ((-> w on-message) w message kind)]))
 
-(define (frame! [w (ptr ws-connection)] [fin i32] [opcode i32] [p (ptr u8)] [n u32])
-  (cond [(== opcode 8)
-         (let ([code (if (>= n 2) (bit-or (<< (cast i32 (@ p 0)) 8) (cast i32 (@ p 1))) 1005)])
-           (cond [(or (== n 1) (and (>= n 2) (not (closing-code? code)))) (fail! w 1002)]
-                 [(not (utf-8? (slice (+ p 2) (if (> n 2) (- n 2) 0)))) (fail! w 1007)]
+(define (frame! [w (ptr ws-connection)] [fin i32] [opcode i32] [payload (slice u8)])
+  (let ([n (-> payload length)])
+    (cond [(== opcode 8)
+           (let ([code (if (>= n 2) (bit-or (<< (cast i32 (@ payload 0)) 8) (cast i32 (@ payload 1))) 1005)])
+             (cond [(or (== n 1) (and (>= n 2) (not (closing-code? code)))) (fail! w 1002)]
+                   [(not (utf-8? (slice payload (if (>= n 2) 2 0)))) (fail! w 1007)]
+                   [else
+                    (when (== (-> w state) state-open) (write-close! w code))
+                    (finish! w (if (== (-> w state) state-closing) (-> w code) code))]))]
+          [(== opcode 9) (when (== (-> w state) state-open) (write-frame! w 10 payload))]
+          [(== opcode 10) (begin)]
+          [(or (== opcode 1) (== opcode 2))
+           (cond [(!= (-> w kind) 0) (fail! w 1002)]
+                 [fin (deliver! w payload opcode)]
                  [else
-                  (when (== (-> w state) state-open) (write-close! w code))
-                  (finish! w (if (== (-> w state) state-closing) (-> w code) code))]))]
-        [(== opcode 9) (when (== (-> w state) state-open) (write-frame! w 10 p n))]
-        [(== opcode 10) (begin)]
-        [(or (== opcode 1) (== opcode 2))
-         (cond [(!= (-> w kind) 0) (fail! w 1002)]
-               [fin (deliver! w p n opcode)]
-               [else
-                (set! (-> w kind) opcode)
-                (set! (-> w message length) 0)
-                (buffer-add! (& (-> w message)) p n)])]
-        [(== opcode 0)
-         (cond [(== (-> w kind) 0) (fail! w 1002)]
-               [(> (+ (-> w message length) n) largest) (fail! w 1009)]
-               [else
-                (buffer-add! (& (-> w message)) p n)
-                (when fin
-                  (let ([kind (-> w kind)])
-                    (set! (-> w kind) 0)
-                    (deliver! w (-> w message bytes) (-> w message length) kind)))])]
-        [else (fail! w 1002)]))
+                  (set! (-> w kind) opcode)
+                  (set! (-> w message length) 0)
+                  (buffer-add! (& (-> w message)) payload)])]
+          [(== opcode 0)
+           (cond [(== (-> w kind) 0) (fail! w 1002)]
+                 [(> (+ (-> w message length) n) largest) (fail! w 1009)]
+                 [else
+                  (buffer-add! (& (-> w message)) payload)
+                  (when fin
+                    (let ([kind (-> w kind)])
+                      (set! (-> w kind) 0)
+                      (deliver! w (buffer-bytes (& (-> w message))) kind)))])]
+          [else (fail! w 1002)])))
 
 ;; next-frame! handles the frame at p and returns its size, or returns 0 when the frame is not complete.
-(define (next-frame! [w (ptr ws-connection)] [p (ptr u8)] [avail u32]) -> u32
-  (when (or (< avail 2) (>= (-> w state) state-finishing)) (return 0))
-  (let* ([first (@ p 0)] [opcode (bit-and first 15)] [fin (bit-and first 128)] [len (cast u64 (bit-and (@ p 1) 127))]
-         [head u32 6])
-    (cond [(== len 126)
-           (when (< avail 4) (return 0))
-           (set! len (bit-or (<< (cast u64 (@ p 2)) 8) (cast u64 (@ p 3))))
-           (set! head 8)]
-          [(== len 127)
-           (when (< avail 10) (return 0))
-           (set! len 0)
-           (for ([i u32 2]) (< i 10) (+= i 1) (set! len (bit-or (<< len 8) (cast u64 (@ p i)))))
-           (set! head 14)])
-    (cond [(or (!= (bit-and first 112) 0) (== (bit-and (@ p 1) 128) 0)
-               (and (>= opcode 8) (or (== fin 0) (> len 125))))
-           (fail! w 1002)
-           0]
-          [(> len (cast u64 largest))
-           (fail! w 1009)
-           0]
-          [(< (cast u64 avail) (+ (cast u64 head) len)) 0]
-          [else
-           (let ([n (cast u32 len)] [payload (+ p head)] [mask (+ p (- head 4))])
-             (for ([i u32 0]) (< i n) (+= i 1)
-               (set! (@ payload i) (bit-xor (@ payload i) (@ mask (bit-and i 3)))))
-             (frame! w fin opcode payload n)
-             (+ head n))])))
+(define (next-frame! [w (ptr ws-connection)] [frames (slice u8)]) -> u32
+  (let* ([p (-> frames items)] [avail (-> frames length)])
+    (when (or (< avail 2) (>= (-> w state) state-finishing)) (return 0))
+    (let* ([first (@ p 0)] [opcode (bit-and first 15)] [fin (bit-and first 128)] [len (cast u64 (bit-and (@ p 1) 127))]
+           [head u32 6])
+      (cond [(== len 126)
+             (when (< avail 4) (return 0))
+             (set! len (bit-or (<< (cast u64 (@ p 2)) 8) (cast u64 (@ p 3))))
+             (set! head 8)]
+            [(== len 127)
+             (when (< avail 10) (return 0))
+             (set! len 0)
+             (for ([i u32 2]) (< i 10) (+= i 1) (set! len (bit-or (<< len 8) (cast u64 (@ p i)))))
+             (set! head 14)])
+      (cond [(or (!= (bit-and first 112) 0) (== (bit-and (@ p 1) 128) 0)
+                 (and (>= opcode 8) (or (== fin 0) (> len 125))))
+             (fail! w 1002)
+             0]
+            [(> len (cast u64 largest))
+             (fail! w 1009)
+             0]
+            [(< (cast u64 avail) (+ (cast u64 head) len)) 0]
+            [else
+             (let ([n (cast u32 len)] [payload (+ p head)] [mask (+ p (- head 4))])
+               (for ([i u32 0]) (< i n) (+= i 1)
+                 (set! (@ payload i) (bit-xor (@ payload i) (@ mask (bit-and i 3)))))
+               (frame! w fin opcode (slice payload n))
+               (+ head n))]))))
 
 (define (unframe! [w (ptr ws-connection)])
-  (let* ([b (& (-> w frames))] [at u32 0] [size (next-frame! w (-> b bytes) (-> b length))])
+  (let* ([b (& (-> w frames))] [at u32 0] [size (next-frame! w (buffer-bytes b))])
     (while (> size 0)
       (+= at size)
-      (set! size (next-frame! w (+ (-> b bytes) at) (- (-> b length) at))))
+      (set! size (next-frame! w (slice (buffer-bytes b) at))))
     (when (> at 0)
       (memcpy (-> b bytes) (+ (-> b bytes) at) (- (-> b length) at))
       (-= (-> b length) at))))
@@ -191,7 +193,7 @@
       (lost! w)
       (begin
         (set! (-> w pinged) #t)
-        (write-frame! w 9 0 0)
+        (write-frame! w 9 0)
         (arm! w))))
 
 (define (ws-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
@@ -202,7 +204,7 @@
            (when (< (-> w state) state-finishing)
              (set! (-> w pinged) #f)
              (disarm! w)
-             (buffer-add! (& (-> w frames)) (-> w in) (cast u32 value))
+             (buffer-add! (& (-> w frames)) (slice (-> w in) (cast u32 value)))
              (unframe! w))
            (read-more! w)]
           [(or (== kind stream-read) (== kind stream-failed)) (lost! w)]
@@ -216,7 +218,7 @@
   (let ([w (cast (ptr ws-connection) tag)])
     (set! (-> w stream) stream)
     (stream-tag! stream (cast (ptr void) w))
-    (buffer-add! (& (-> w frames)) (-> b items) (-> b length))
+    (buffer-add! (& (-> w frames)) b)
     (unframe! w)
     (read-more! w)))
 
@@ -293,7 +295,7 @@
 
 ;; ws-send! returns what stream-write does, or -1 when the connection is not open.
 (define (ws-send! [w (ptr ws-connection)] [b (slice u8)] [kind i32]) -> i32
-  (if (== (-> w state) state-open) (write-frame! w kind (-> b items) (-> b length)) -1))
+  (if (== (-> w state) state-open) (write-frame! w kind b) -1))
 
 (define (ws-send-text! [w (ptr ws-connection)] [s string]) -> i32 (ws-send! w (cast (slice u8) s) ws-text))
 
