@@ -64,6 +64,19 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
+# Each module in lib, bench, host and tests/web builds; bench/bend/compile holds pieces that proofs.sh joins, so it is
+# left out.
+mapfile -t modules < <(find lib bench host tests/web -name '*.sub' -not -path 'bench/bend/compile/*' | sort)
+for m in "${modules[@]}"; do
+  actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
+  if [ $? -eq 0 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL $m: does not build"
+    echo "$actual" | head -10
+  fi
+done
 # The event tests again, against the real modules and the server in tests/events/fixtures.
 server=""
 for t in tests/events/*.sub; do
