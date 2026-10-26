@@ -298,16 +298,13 @@ export function createHost(platform) {
     };
   }
 
-  // giveIn copies bytes into a block from memory m's malloc, ended by a zero, and stores the length at out unless out
-  // is 0.
+  // giveIn copies bytes into a block from memory m's malloc, and stores the length at out unless out is 0.
   function giveIn(m, bytes, out, who) {
     const malloc = m && allocators.get(m);
     if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
-    const p = malloc(bytes.length + 1) >>> 0;
+    const p = malloc(bytes.length) >>> 0;
     if (p === 0) hostTrap(`${who}: out of memory`);
-    const view = new Uint8Array(m.buffer);
-    view.set(bytes, p);
-    view[p + bytes.length] = 0;
+    new Uint8Array(m.buffer).set(bytes, p);
     if (out) new DataView(m.buffer).setUint32(out >>> 0, bytes.length, true);
     return p;
   }
