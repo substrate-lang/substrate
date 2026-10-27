@@ -1,11 +1,9 @@
 ;; An HTTP/1.1 server over net. A handler answers each request with bytes, a stream or nothing, and the server adds
 ;; the length; or the handler takes the connection's stream. Each connection's requests are answered one at a time.
 ;; Before serving, set secure for TLS, idle to the milliseconds a connection may wait for bytes or a whole head, and
-;; most to the most connections at once; 0 means no limit. body-limit is the most bytes http-read-body! takes, 1 MiB
-;; when 0. When listening fails, problem holds the reason.
-;; A request lasts until it is answered and its body has ended, or, when its connection ends first, until it is
-;; answered; while its handler or one of its callbacks runs, it lasts until that returns. A trap while one runs answers
-;; it with 500 and closes its connection, and on-trap is told of the trap, or else stderr.
+;; most to the most connections at once; 0 means no limit. body-limit bounds http-read-body!, 1 MiB when 0. When
+;; listening fails, problem holds the reason. A request lasts until it is answered and its body has ended, and while its
+;; own code runs. A trap in that code answers it with 500, and on-trap is told, or else stderr.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
@@ -21,7 +19,7 @@
 (const default-body-limit u32 1048576)
 
 ;; A request's on-body gets each piece of its body, and its on-end sees failed set when the body was malformed; on-gone
-;; is called when its connection ends before it is answered. Its arena is the handler's, freed with the request.
+;; is called when its connection ends before its answer. Its arena is freed with it.
 (struct http-request [connection (ptr void)] [server (ptr void)] [method string] [target string] [head (ptr http-head)]
   [arena arena] [user (ptr void)] [route (ptr void)] [ended bool] [failed bool] [answered bool] [sent bool] [done bool]
   [depth u32] [outer (ptr http-request)] [status i32]
@@ -47,7 +45,7 @@
 
 ;; ---- requests ----
 
-;; The request whose handler or callback runs, linked to any it runs within.
+;; The request whose code runs, linked by outer to any it runs within.
 (define running (ptr http-request) 0)
 
 (define (connection-of [r (ptr http-request)]) -> (ptr http-connection) (cast (ptr http-connection) (-> r connection)))
@@ -77,7 +75,6 @@
   (http-head-free! (& (-> r own-head)))
   (free r))
 
-;; finished! releases a request whose exchange is over, or has it released when the code running for it returns.
 (define (finished! [r (ptr http-request)])
   (if (> (-> r depth) 0) (set! (-> r done) #t) (release! r)))
 
@@ -93,7 +90,6 @@
   (-= (-> r depth) 1)
   (when (and (== (-> r depth) 0) (-> r done)) (release! r)))
 
-;; run-handle! sends 100 Continue after the handler when the client waits for it and nothing has been sent.
 (define (run-handle! [r (ptr http-request)] [continue bool])
   (let ([previous (enter! r)])
     ((-> (http-request-server r) handle) r)
@@ -118,9 +114,8 @@
 
 ;; ---- traps ----
 
-;; http-trapped answers the running request, and any it runs within, with 500 and closes their connections; with none
-;; running it ends the program, as a trap without a handler does. http-serve! makes it the trap handler, and a program
-;; with its own calls it from there.
+;; The trap handler http-serve! sets, which a program with its own calls from it. With no request's code running, the
+;; program ends as with no handler.
 (define (http-trapped [why string])
   (let ([r running])
     (when (== r 0)
@@ -151,7 +146,6 @@
           (buffer-free! (& b)))
         ((-> s on-trap) r why))))
 
-;; fail! ends a request whose code trapped. One whose connection has gone waits for its answer, if it has none.
 (define (fail! [r (ptr http-request)])
   (let ([c (connection-of r)])
     (cond [(== c 0) (when (-> r answered) (release! r))]
@@ -206,7 +200,6 @@
           (while (and (!= before 0) (!= (-> before next) c)) (set! before (-> before next)))
           (when (!= before 0) (set! (-> before next) (-> c next)))))))
 
-;; drop! ends a connection. Its request, if it has one, is released when answered, and is told of it otherwise.
 (define (drop! [c (ptr http-connection)])
   (let ([r (-> c request)] [answering #f])
     (set! (-> c request) 0)
@@ -303,7 +296,6 @@
   (let* ([c (cast (ptr http-connection) (-> p user))] [r (-> c request)])
     (unless (or (== r 0) (== (-> r on-body) 0)) (run-body! r b))))
 
-;; on-end stops the parser while its request waits for an answer, and after a request already answered and released.
 (define (on-end [p (ptr http-parser)])
   (let* ([c (cast (ptr http-connection) (-> p user))] [r (-> c request)])
     (if (== r 0)
@@ -506,9 +498,8 @@
 
 ;; ---- reading bodies ----
 
-;; http-read-body! calls taken with the request's whole body once it has come. It answers 413 and closes the
-;; connection when the body would be longer than limit, or the server's limit when limit is 0, and 400 when the body is
-;; malformed.
+;; http-read-body! gives taken the whole body once it has come. A body longer than limit, the server's when 0, is
+;; answered with 413 and its connection closed; a malformed one with 400.
 (define (http-read-body! [r (ptr http-request)] [limit u32] [taken (fn ((ptr http-request) (slice u8)))])
   (let* ([s (http-request-server r)]
          [most (cond [(> limit 0) limit] [(> (-> s body-limit) 0) (-> s body-limit)] [else default-body-limit])]
@@ -569,8 +560,7 @@
 
 ;; ---- connections without streams ----
 
-;; http-connect! makes a connection to a server that has no stream, for tests: the server's bytes go to sink, and
-;; sink-ended is called when the server ends the connection. The server need not be listening.
+;; For tests: a connection to the server without a stream. The server need not be listening.
 (define (http-connect! [s (ptr http-server)] [sink (fn ((ptr void) (slice u8)))] [sink-ended (fn ((ptr void)))]
                        [tag (ptr void)]) -> (ptr void)
   (trap-handler! http-trapped)
@@ -580,7 +570,7 @@
     (set! (-> c sink-tag) tag)
     (cast (ptr void) c)))
 
-;; http-connection-feed! gives such a connection bytes from its client, which must stay unchanged until it ends.
+;; The bytes must stay unchanged until the connection ends.
 (define (http-connection-feed! [c (ptr void)] [b (slice u8)]) (feed! (cast (ptr http-connection) c) b))
 
 (define (http-connection-close! [c (ptr void)]) (drop! (cast (ptr http-connection) c)))
