@@ -1,7 +1,11 @@
 ;; An HTTP/1.1 server over net. A handler answers each request with bytes, a stream or nothing, and the server adds
 ;; the length; or the handler takes the connection's stream. Each connection's requests are answered one at a time.
 ;; Before serving, set secure for TLS, idle to the milliseconds a connection may wait for bytes or a whole head, and
-;; most to the most connections at once; 0 means no limit. When listening fails, problem holds the reason.
+;; most to the most connections at once; 0 means no limit. body-limit is the most bytes http-read-body! takes, 1 MiB
+;; when 0. When listening fails, problem holds the reason.
+;; A request lasts until it is answered and its body has ended, or, when its connection ends first, until it is
+;; answered; while its handler or one of its callbacks runs, it lasts until that returns. A trap while one runs answers
+;; it with 500 and closes its connection, and on-trap is told of the trap, or else stderr.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
@@ -9,40 +13,178 @@
 (require-unqualified clock "../../host/modules/clock.sub")
 (require-unqualified http "http.sub")
 
-(provide http-server http-request http-serve! http-server-close! http-request-header
-         http-request-server http-respond! http-header! http-length! http-send! http-send-text! http-send-stream!
-         http-finish! http-take!)
+(provide http-server http-request http-serve! http-server-close! http-request-header http-request-server
+         http-request-gone? http-respond! http-header! http-length! http-send! http-send-text! http-send-stream!
+         http-finish! http-take! http-read-body! http-answer-text! http-redirect! http-trapped
+         http-connect! http-connection-feed! http-connection-close!)
 
-;; A request's on-body gets each piece of its body, and its on-end sees failed set when the body was malformed.
-(struct http-request [connection (ptr void)] [method string] [target string] [head (ptr http-head)]
-  [user (ptr void)] [ended bool] [failed bool] [answered bool] [status i32]
-  [on-body (fn ((ptr http-request) (slice u8)))] [on-end (fn ((ptr http-request)))])
+(const default-body-limit u32 1048576)
+
+;; A request's on-body gets each piece of its body, and its on-end sees failed set when the body was malformed; on-gone
+;; is called when its connection ends before it is answered. Its arena is the handler's, freed with the request.
+(struct http-request [connection (ptr void)] [server (ptr void)] [method string] [target string] [head (ptr http-head)]
+  [arena arena] [user (ptr void)] [route (ptr void)] [ended bool] [failed bool] [answered bool] [sent bool] [done bool]
+  [depth u32] [outer (ptr http-request)] [status i32]
+  [on-body (fn ((ptr http-request) (slice u8)))] [on-end (fn ((ptr http-request)))] [on-gone (fn ((ptr http-request)))]
+  [body buffer] [limit u32] [taken (fn ((ptr http-request) (slice u8)))] [own-head http-head])
 
 (typedef taker (fn ((ptr void) u32 (slice u8))))
 
 (struct sending [pipe stream-pipe] [connection (ptr void)])
 
+(struct gathering [reader stream-reader] [connection (ptr void)] [n i64])
+
+;; A connection from http-connect! has no stream: its bytes go to sink, and sink-ended is called when it ends.
 (struct http-connection [head event-head] [server (ptr void)] [stream u32] [parser http-parser]
-  [request http-request] [buf (array u8 16384)] [out buffer] [sending (ptr sending)]
+  [request (ptr http-request)] [buf (array u8 16384)] [out buffer] [sending (ptr sending)] [gathering (ptr gathering)]
   [reading bool] [busy bool] [closing bool] [feeding bool] [full bool] [take taker] [taken (ptr void)] [timer u32]
-  [rest (slice u8)] [next (ptr http-connection)])
+  [rest (slice u8)] [next (ptr http-connection)]
+  [sink (fn ((ptr void) (slice u8)))] [sink-ended (fn ((ptr void)))] [sink-tag (ptr void)])
 
-(struct http-server [head event-head] [listener u32] [port u32] [secure bool] [idle f64] [most u32]
+(struct http-server [head event-head] [listener u32] [port u32] [secure bool] [idle f64] [most u32] [body-limit u32]
   [problem string] [user (ptr void)] [connections (ptr http-connection)]
-  [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))])
+  [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))] [on-trap (fn ((ptr http-request) string))])
 
-;; ---- connections ----
+;; ---- requests ----
+
+;; The request whose handler or callback runs, linked to any it runs within.
+(define running (ptr http-request) 0)
 
 (define (connection-of [r (ptr http-request)]) -> (ptr http-connection) (cast (ptr http-connection) (-> r connection)))
 
 (define (server-of [c (ptr http-connection)]) -> (ptr http-server) (cast (ptr http-server) (-> c server)))
+
+(define (http-request-server [r (ptr http-request)]) -> (ptr http-server) (cast (ptr http-server) (-> r server)))
+
+(define (http-request-gone? [r (ptr http-request)]) -> bool (== (-> r connection) 0))
+
+(define (http-request-header [r (ptr http-request)] [name string]) -> string (http-header (-> r head) name))
+
+(define (new-request! [c (ptr http-connection)] [h (ptr http-head)]) -> (ptr http-request)
+  (let ([r (cast (ptr http-request) (calloc 1 (sizeof http-request)))])
+    (set! (-> r connection) (cast (ptr void) c))
+    (set! (-> r server) (-> c server))
+    (http-head-copy! (& (-> r own-head)) h)
+    (set! (-> r head) (& (-> r own-head)))
+    (set! (-> r method) (-> r own-head method))
+    (set! (-> r target) (-> r own-head target))
+    (set! (-> c request) r)
+    r))
+
+(define (release! [r (ptr http-request)])
+  (arena-free (& (-> r arena)))
+  (buffer-free! (& (-> r body)))
+  (http-head-free! (& (-> r own-head)))
+  (free r))
+
+;; finished! releases a request whose exchange is over, or has it released when the code running for it returns.
+(define (finished! [r (ptr http-request)])
+  (if (> (-> r depth) 0) (set! (-> r done) #t) (release! r)))
+
+(define (enter! [r (ptr http-request)]) -> (ptr http-request)
+  (let ([previous running])
+    (set! (-> r outer) previous)
+    (set! running r)
+    (+= (-> r depth) 1)
+    previous))
+
+(define (leave! [r (ptr http-request)] [previous (ptr http-request)])
+  (set! running previous)
+  (-= (-> r depth) 1)
+  (when (and (== (-> r depth) 0) (-> r done)) (release! r)))
+
+;; run-handle! sends 100 Continue after the handler when the client waits for it and nothing has been sent.
+(define (run-handle! [r (ptr http-request)] [continue bool])
+  (let ([previous (enter! r)])
+    ((-> (http-request-server r) handle) r)
+    (when (and continue (not (-> r sent)) (!= (-> r connection) 0))
+      (out! (connection-of r) (cast (slice u8) "HTTP/1.1 100 Continue\r\n\r\n")))
+    (leave! r previous)))
+
+(define (run-body! [r (ptr http-request)] [b (slice u8)])
+  (let ([previous (enter! r)])
+    ((-> r on-body) r b)
+    (leave! r previous)))
+
+(define (run-end! [r (ptr http-request)])
+  (let ([previous (enter! r)])
+    ((-> r on-end) r)
+    (leave! r previous)))
+
+(define (run-gone! [r (ptr http-request)])
+  (let ([previous (enter! r)])
+    ((-> r on-gone) r)
+    (leave! r previous)))
+
+;; ---- traps ----
+
+;; http-trapped answers the running request, and any it runs within, with 500 and closes their connections; with none
+;; running it ends the program, as a trap without a handler does. http-serve! makes it the trap handler, and a program
+;; with its own calls it from there.
+(define (http-trapped [why string])
+  (let ([r running])
+    (when (== r 0)
+      (host-write 2 (cast (slice u8) "error: "))
+      (host-write 2 (cast (slice u8) why))
+      (host-write 2 (cast (slice u8) "\n"))
+      (host-exit 2))
+    (set! running 0)
+    (told! r why)
+    (while (!= r 0)
+      (let ([outer (-> r outer)])
+        (set! (-> r depth) 0)
+        (fail! r)
+        (set! r outer)))))
+
+(define (told! [r (ptr http-request)] [why string])
+  (let ([s (http-request-server r)])
+    (if (== (-> s on-trap) 0)
+        (let ([b (make-buffer)])
+          (buffer-add-string! (& b) "error: ")
+          (buffer-add-string! (& b) (-> r method))
+          (buffer-add-byte! (& b) 32)
+          (buffer-add-string! (& b) (-> r target))
+          (buffer-add-string! (& b) ": ")
+          (buffer-add-string! (& b) why)
+          (buffer-add-byte! (& b) 10)
+          (host-write 2 (buffer-bytes (& b)))
+          (buffer-free! (& b)))
+        ((-> s on-trap) r why))))
+
+;; fail! ends a request whose code trapped. One whose connection has gone waits for its answer, if it has none.
+(define (fail! [r (ptr http-request)])
+  (let ([c (connection-of r)])
+    (cond [(== c 0) (when (-> r answered) (release! r))]
+          [else
+           (set! (-> r ended) #t)
+           (set! (-> r on-body) 0)
+           (set! (-> r on-end) 0)
+           (set! (-> c feeding) #f)
+           (set! (-> c closing) #t)
+           (cond [(-> r answered) (settle! c)]
+                 [(-> r sent)
+                  (set! (-> r answered) #t)
+                  (drop! c)]
+                 [else (http-answer-text! r 500 "internal server error")])])))
+
+;; ---- connections ----
+
+(define (memory? [c (ptr http-connection)]) -> bool (!= (-> c sink) 0))
+
+(define (out! [c (ptr http-connection)] [b (slice u8)]) -> i32
+  (if (memory? c)
+      (begin ((-> c sink) (-> c sink-tag) b) 0)
+      (stream-write (-> c stream) b)))
+
+(define (finish-out! [c (ptr http-connection)])
+  (if (memory? c) ((-> c sink-ended) (-> c sink-tag)) (stream-finish (-> c stream))))
 
 (define (arm! [c (ptr http-connection)])
   (when (> (-> (server-of c) idle) 0.0)
     (set! (-> c timer) (timer-after (-> (server-of c) idle) (cast (ptr void) c)))))
 
 (define (read-more! [c (ptr http-connection)])
-  (unless (-> c reading)
+  (unless (or (-> c reading) (memory? c))
     (set! (-> c reading) #t)
     (when (== (-> c timer) 0) (arm! c))
     (stream-read! (-> c stream) (slice (-> c buf)))))
@@ -64,22 +206,40 @@
           (while (and (!= before 0) (!= (-> before next) c)) (set! before (-> before next)))
           (when (!= before 0) (set! (-> before next) (-> c next)))))))
 
+;; drop! ends a connection. Its request, if it has one, is released when answered, and is told of it otherwise.
 (define (drop! [c (ptr http-connection)])
-  (unless (== (-> c sending) 0)
-    (stream-close (-> c sending pipe from))
-    (free (-> c sending)))
-  (stream-close (-> c stream))
-  (unlink! c)
-  (buffer-free! (& (-> c out)))
-  (buffer-free! (& (-> c parser head line)))
-  (buffer-free! (& (-> c parser line)))
-  (free c))
+  (let ([r (-> c request)] [answering #f])
+    (set! (-> c request) 0)
+    (unless (== (-> c sending) 0)
+      (set! answering #t)
+      (stream-close (-> c sending pipe from))
+      (free (-> c sending)))
+    (unless (== (-> c gathering) 0)
+      (set! answering #t)
+      (stream-close (-> c gathering reader id))
+      (buffer-free! (& (-> c gathering reader bytes)))
+      (free (-> c gathering)))
+    (unless (memory? c) (stream-close (-> c stream)))
+    (unlink! c)
+    (buffer-free! (& (-> c out)))
+    (buffer-free! (& (-> c parser head line)))
+    (buffer-free! (& (-> c parser line)))
+    (free c)
+    (unless (== r 0)
+      (set! (-> r connection) 0)
+      (when answering (set! (-> r answered) #t))
+      (cond [(-> r answered) (finished! r)]
+            [(!= (-> r on-gone) 0) (run-gone! r)]))))
 
 (define (settle! [c (ptr http-connection)])
-  (when (and (-> c busy) (-> c request ended) (-> c request answered))
-    (set! (-> c busy) #f)
-    (cond [(-> c closing) (stream-finish (-> c stream))]
-          [(not (or (-> c feeding) (-> c full))) (resume! c)])))
+  (let ([r (-> c request)])
+    (when (and (-> c busy) (!= r 0) (-> r ended) (-> r answered))
+      (set! (-> c busy) #f)
+      (set! (-> c request) 0)
+      (set! (-> r connection) 0)
+      (finished! r)
+      (cond [(-> c closing) (finish-out! c)]
+            [(not (or (-> c feeding) (-> c full))) (resume! c)]))))
 
 (define (resume! [c (ptr http-connection)])
   (http-parser-resume! (& (-> c parser)))
@@ -87,23 +247,23 @@
 
 (define (bad-request! [c (ptr http-connection)])
   (set! (-> c closing) #t)
-  (cond [(not (-> c busy))
-         (let ([b (& (-> c out))])
-           (set! (-> b length) 0)
-           (http-write-status! b 400)
-           (http-write-date! b (clock-now))
-           (buffer-add-string! b "content-length: 0\r\nconnection: close\r\n\r\n")
-           (stream-write (-> c stream) (buffer-bytes b))
-           (set! (-> b length) 0))
-         (stream-finish (-> c stream))]
-        [(not (-> c request ended))
-         (let ([r (& (-> c request))])
+  (let ([r (-> c request)])
+    (cond [(not (-> c busy))
+           (let ([b (& (-> c out))])
+             (set! (-> b length) 0)
+             (http-write-status! b 400)
+             (http-write-date! b (clock-now))
+             (buffer-add-string! b "content-length: 0\r\nconnection: close\r\n\r\n")
+             (out! c (buffer-bytes b))
+             (set! (-> b length) 0))
+           (finish-out! c)]
+          [(not (-> r ended))
            (set! (-> r failed) #t)
            (set! (-> r ended) #t)
            (set! (-> r on-body) 0)
-           (when (!= (-> r on-end) 0) ((-> r on-end) r))
-           (settle! c))]
-        [else (settle! c)]))
+           (unless (== (-> r on-end) 0) (run-end! r))
+           (settle! c)]
+          [else (settle! c)])))
 
 ;; origin-form! turns a target in absolute form, scheme://host/path?query, into its path and query, and makes its host
 ;; the Host header's value. It returns #f when the host is empty or has user information.
@@ -130,42 +290,36 @@
     #t))
 
 (define (on-head [p (ptr http-parser)])
-  (let* ([c (cast (ptr http-connection) (-> p user))] [r (& (-> c request))] [h (& (-> p head))]
+  (let* ([c (cast (ptr http-connection) (-> p user))] [h (& (-> p head))]
          [old (== (-> h version) "HTTP/1.0")] [hosts (http-header-count h "host")])
     (if (or (!= (-> h status) 0) (> hosts 1) (and (== hosts 0) (not old)) (not (origin-form! h)))
         (http-parser-refuse! p)
-        (begin
+        (let ([r (new-request! c h)])
           (set! (-> c busy) #t)
-          (set! (-> r method) (-> h method))
-          (set! (-> r target) (-> h target))
-          (set! (-> r head) h)
-          (set! (-> r user) 0)
-          (set! (-> r ended) #f)
-          (set! (-> r failed) #f)
-          (set! (-> r answered) #f)
-          (set! (-> r on-body) 0)
-          (set! (-> r on-end) 0)
           (when (or old (http-header-has? h "connection" "close")) (set! (-> c closing) #t))
-          (when (and (not old) (http-header-has? h "expect" "100-continue"))
-            (stream-write-text (-> c stream) "HTTP/1.1 100 Continue\r\n\r\n"))
-          ((-> (server-of c) handle) r)))))
+          (run-handle! r (and (not old) (http-header-has? h "expect" "100-continue")))))))
 
 (define (on-body [p (ptr http-parser)] [b (slice u8)])
-  (let* ([c (cast (ptr http-connection) (-> p user))] [r (& (-> c request))])
-    (when (!= (-> r on-body) 0) ((-> r on-body) r b))))
+  (let* ([c (cast (ptr http-connection) (-> p user))] [r (-> c request)])
+    (unless (or (== r 0) (== (-> r on-body) 0)) (run-body! r b))))
 
+;; on-end stops the parser while its request waits for an answer, and after a request already answered and released.
 (define (on-end [p (ptr http-parser)])
-  (let* ([c (cast (ptr http-connection) (-> p user))] [r (& (-> c request))])
-    (set! (-> r ended) #t)
-    (when (!= (-> r on-end) 0) ((-> r on-end) r))
-    (when (or (not (-> r answered)) (-> c closing) (-> c full)) (http-parser-stop! p))
-    (settle! c)))
+  (let* ([c (cast (ptr http-connection) (-> p user))] [r (-> c request)])
+    (if (== r 0)
+        (http-parser-stop! p)
+        (begin
+          (set! (-> r ended) #t)
+          (unless (== (-> r on-end) 0) (run-end! r))
+          (when (or (and (== (-> c request) r) (not (-> r answered))) (-> c closing) (-> c full)) (http-parser-stop! p))
+          (settle! c)))))
 
 ;; hand-over! gives the connection's stream to its taker, with the bytes read beyond the request.
 (define (hand-over! [c (ptr http-connection)] [b (slice u8)])
-  (let ([take (-> c take)] [held (& (-> c parser head line))])
+  (let ([take (-> c take)] [held (& (-> c parser head line))] [r (-> c request)])
     (set! (-> c take) 0)
-    (unless (-> c request ended) (set! (-> held length) 0))
+    (set! (-> c request) 0)
+    (unless (and (!= r 0) (-> r ended)) (set! (-> held length) 0))
     (buffer-add! held b)
     (unlink! c)
     (stream-tag! (-> c stream) 0)
@@ -173,7 +327,11 @@
     (buffer-free! (& (-> c out)))
     (buffer-free! held)
     (buffer-free! (& (-> c parser line)))
-    (free c)))
+    (free c)
+    (unless (== r 0)
+      (set! (-> r connection) 0)
+      (set! (-> r answered) #t)
+      (finished! r))))
 
 (define (feed! [c (ptr http-connection)] [b (slice u8)])
   (set! (-> c rest) 0)
@@ -206,99 +364,181 @@
           [(== kind stream-finished) (drop! c)]
           [(== kind stream-failed) (drop! c)])))
 
-(define (accept! [s (ptr http-server)] [stream u32])
+(define (new-connection! [s (ptr http-server)] [stream u32]) -> (ptr http-connection)
   (let ([c (cast (ptr http-connection) (calloc 1 (sizeof http-connection)))])
     (set! (-> c head handle) connection-heard)
     (set! (-> c server) (cast (ptr void) s))
     (set! (-> c stream) stream)
     (http-parser-init! (& (-> c parser)) (cast (ptr void) c) on-head on-body on-end)
     (set! (-> c out) (make-buffer))
-    (set! (-> c request connection) (cast (ptr void) c))
     (set! (-> c next) (-> s connections))
     (set! (-> s connections) c)
+    c))
+
+(define (accept! [s (ptr http-server)] [stream u32])
+  (let ([c (new-connection! s stream)])
     (stream-tag! stream (cast (ptr void) c))
     (read-more! c)))
 
 ;; ---- answering ----
 
-(define (http-request-header [r (ptr http-request)] [name string]) -> string (http-header (-> r head) name))
-
-(define (http-request-server [r (ptr http-request)]) -> (ptr http-server) (server-of (connection-of r)))
-
 (define (http-respond! [r (ptr http-request)] [status i32])
   (let ([c (connection-of r)])
     (set! (-> r status) status)
-    (set! (-> c out length) 0)
-    (http-write-status! (& (-> c out)) status)
-    (http-write-date! (& (-> c out)) (clock-now))
-    (when (-> c closing) (http-write-header! (& (-> c out)) "connection" "close"))))
+    (unless (== c 0)
+      (set! (-> c out length) 0)
+      (http-write-status! (& (-> c out)) status)
+      (http-write-date! (& (-> c out)) (clock-now))
+      (when (-> c closing) (http-write-header! (& (-> c out)) "connection" "close")))))
 
 (define (http-header! [r (ptr http-request)] [name string] [value string])
-  (http-write-header! (& (-> (connection-of r) out)) name value))
+  (let ([c (connection-of r)])
+    (unless (== c 0) (http-write-header! (& (-> c out)) name value))))
 
-(define (http-length! [r (ptr http-request)] [n i64]) (http-write-number! (& (-> (connection-of r) out)) "content-length" n))
+(define (http-length! [r (ptr http-request)] [n i64])
+  (let ([c (connection-of r)])
+    (unless (== c 0) (http-write-number! (& (-> c out)) "content-length" n))))
 
 (define (has-length? [r (ptr http-request)]) -> bool (not (or (== (-> r status) 204) (== (-> r status) 304))))
 
 (define (has-body? [r (ptr http-request)]) -> bool (and (has-length? r) (!= (-> r method) "HEAD")))
 
-(define (send! [c (ptr http-connection)] [b (slice u8)])
-  (http-write-end! (& (-> c out)))
-  (buffer-add! (& (-> c out)) b)
-  (when (== (stream-write (-> c stream) (buffer-bytes (& (-> c out)))) 1) (set! (-> c full) #t))
-  (set! (-> c out length) 0))
+(define (send! [r (ptr http-request)] [b (slice u8)])
+  (let ([c (connection-of r)])
+    (set! (-> r sent) #t)
+    (unless (== c 0)
+      (http-write-end! (& (-> c out)))
+      (buffer-add! (& (-> c out)) b)
+      (when (== (out! c (buffer-bytes (& (-> c out)))) 1) (set! (-> c full) #t))
+      (set! (-> c out length) 0))))
 
-(define (answered! [c (ptr http-connection)])
-  (set! (-> c request answered) #t)
-  (settle! c))
+(define (answered! [r (ptr http-request)])
+  (set! (-> r answered) #t)
+  (let ([c (connection-of r)])
+    (if (== c 0) (finished! r) (settle! c))))
 
 (define (http-finish! [r (ptr http-request)])
-  (let ([c (connection-of r)])
-    (when (has-body? r) (http-length! r 0))
-    (send! c 0)
-    (answered! c)))
+  (when (has-body? r) (http-length! r 0))
+  (send! r 0)
+  (answered! r))
 
 (define (http-send! [r (ptr http-request)] [b (slice u8)])
-  (let ([c (connection-of r)])
-    (when (has-length? r) (http-length! r (cast i64 (-> b length))))
-    (send! c (slice (-> b items) (if (has-body? r) (-> b length) 0)))
-    (answered! c)))
+  (when (has-length? r) (http-length! r (cast i64 (-> b length))))
+  (send! r (slice (-> b items) (if (has-body? r) (-> b length) 0)))
+  (answered! r))
 
 (define (http-send-text! [r (ptr http-request)] [text string]) (http-send! r (cast (slice u8) text)))
+
+(define (http-answer-text! [r (ptr http-request)] [status i32] [text string])
+  (http-respond! r status)
+  (http-header! r "content-type" "text/plain; charset=utf-8")
+  (http-send-text! r text))
+
+(define (http-redirect! [r (ptr http-request)] [status i32] [location string])
+  (http-respond! r status)
+  (http-header! r "location" location)
+  (http-finish! r))
 
 (define (piped [p (ptr stream-pipe)])
   (let ([c (cast (ptr http-connection) (-> (cast (ptr sending) p) connection))] [failed (-> p failed)])
     (free (-> c sending))
     (set! (-> c sending) 0)
-    (if (!= failed 0) (drop! c) (answered! c))))
+    (if (!= failed 0)
+        (begin
+          (set! (-> c request answered) #t)
+          (drop! c))
+        (answered! (-> c request)))))
 
 ;; http-send-stream! sends n bytes of the stream. With n of -1 it sends all of it and closes the connection to end the
 ;; body. A stream that ends before n bytes also closes the connection.
 (define (http-send-stream! [r (ptr http-request)] [from u32] [n i64])
   (let ([c (connection-of r)])
+    (when (== c 0)
+      (stream-close from)
+      (answered! r)
+      (return))
     (cond [(>= n 0) (when (has-length? r) (http-length! r n))]
           [(not (-> c closing))
            (set! (-> c closing) #t)
            (http-write-header! (& (-> c out)) "connection" "close")])
-    (send! c 0)
-    (if (has-body? r)
-        (let ([s (cast (ptr sending) (malloc (sizeof sending)))])
-          (set! (-> s connection) (cast (ptr void) c))
-          (set! (-> c sending) s)
-          (stream-pipe-start! (& (-> s pipe)) from (-> c stream) n #f piped))
+    (send! r 0)
+    (cond [(not (has-body? r))
+           (stream-close from)
+           (answered! r)]
+          [(memory? c)
+           (let ([g (cast (ptr gathering) (calloc 1 (sizeof gathering)))])
+             (set! (-> g connection) (cast (ptr void) c))
+             (set! (-> g n) n)
+             (set! (-> c gathering) g)
+             (stream-read-all! (& (-> g reader)) from gathered))]
+          [else
+           (let ([s (cast (ptr sending) (malloc (sizeof sending)))])
+             (set! (-> s connection) (cast (ptr void) c))
+             (set! (-> c sending) s)
+             (stream-pipe-start! (& (-> s pipe)) from (-> c stream) n #f piped))])))
+
+(define (gathered [reader (ptr stream-reader)])
+  (let* ([g (cast (ptr gathering) reader)] [c (cast (ptr http-connection) (-> g connection))] [n (-> g n)]
+         [b (buffer-bytes (& (-> reader bytes)))] [failed (-> reader failed)] [r (-> c request)])
+    (set! (-> c gathering) 0)
+    (out! c (if (and (>= n 0) (< n (cast i64 (-> b length)))) (slice b 0 (cast u32 n)) b))
+    (stream-close (-> reader id))
+    (buffer-free! (& (-> reader bytes)))
+    (free g)
+    (if (!= failed 0)
         (begin
-          (stream-close from)
-          (answered! c)))))
+          (set! (-> r answered) #t)
+          (drop! c))
+        (answered! r))))
 
 ;; http-take! sends the head alone, and gives the connection's stream, untagged, to the taker once the handler has
 ;; returned. The connection counts toward most until the stream closes.
 (define (http-take! [r (ptr http-request)] [take taker] [tag (ptr void)])
   (let ([c (connection-of r)])
-    (send! c 0)
-    (set! (-> c take) take)
-    (set! (-> c taken) tag)
-    (http-parser-stop! (& (-> c parser)))
-    (unless (or (-> c feeding) (-> c reading)) (hand-over! c (-> c rest)))))
+    (cond [(== c 0) (answered! r)]
+          [(memory? c) (host-trap "http: a connection without a stream cannot be taken")]
+          [else
+           (send! r 0)
+           (set! (-> c take) take)
+           (set! (-> c taken) tag)
+           (http-parser-stop! (& (-> c parser)))
+           (unless (or (-> c feeding) (-> c reading)) (hand-over! c (-> c rest)))])))
+
+;; ---- reading bodies ----
+
+;; http-read-body! calls taken with the request's whole body once it has come. It answers 413 and closes the
+;; connection when the body would be longer than limit, or the server's limit when limit is 0, and 400 when the body is
+;; malformed.
+(define (http-read-body! [r (ptr http-request)] [limit u32] [taken (fn ((ptr http-request) (slice u8)))])
+  (let* ([s (http-request-server r)]
+         [most (cond [(> limit 0) limit] [(> (-> s body-limit) 0) (-> s body-limit)] [else default-body-limit])]
+         [length (http-request-header r "content-length")])
+    (set! (-> r limit) most)
+    (set! (-> r taken) taken)
+    (cond [(and (> (-> length length) 0) (> (http-decimal length) (cast i64 most))) (too-large! r)]
+          [(-> r ended) (taken r (buffer-bytes (& (-> r body))))]
+          [else
+           (set! (-> r on-body) body-piece)
+           (set! (-> r on-end) body-ended)])))
+
+(define (body-piece [r (ptr http-request)] [b (slice u8)])
+  (if (> (+ (cast u64 (-> r body length)) (cast u64 (-> b length))) (cast u64 (-> r limit)))
+      (too-large! r)
+      (buffer-add! (& (-> r body)) b)))
+
+(define (body-ended [r (ptr http-request)])
+  (cond [(-> r failed) (http-answer-text! r 400 "bad request")]
+        [else ((-> r taken) r (buffer-bytes (& (-> r body))))]))
+
+(define (too-large! [r (ptr http-request)])
+  (let ([c (connection-of r)])
+    (set! (-> r on-body) 0)
+    (set! (-> r on-end) 0)
+    (set! (-> r ended) #t)
+    (unless (== c 0)
+      (set! (-> c closing) #t)
+      (http-parser-stop! (& (-> c parser))))
+    (http-answer-text! r 413 "content too large")))
 
 ;; ---- the server ----
 
@@ -314,6 +554,7 @@
            (when (!= (-> s listening) 0) ((-> s listening) s))])))
 
 (define (http-serve! [s (ptr http-server)] [port u32] [handle (fn ((ptr http-request)))]) -> u32
+  (trap-handler! http-trapped)
   (set! (-> s head handle) server-heard)
   (set! (-> s handle) handle)
   (set! (-> s connections) 0)
@@ -323,5 +564,23 @@
   (-> s listener))
 
 (define (http-server-close! [s (ptr http-server)])
-  (net-close (-> s listener))
+  (unless (== (-> s listener) 0) (net-close (-> s listener)))
   (while (!= (-> s connections) 0) (drop! (-> s connections))))
+
+;; ---- connections without streams ----
+
+;; http-connect! makes a connection to a server that has no stream, for tests: the server's bytes go to sink, and
+;; sink-ended is called when the server ends the connection. The server need not be listening.
+(define (http-connect! [s (ptr http-server)] [sink (fn ((ptr void) (slice u8)))] [sink-ended (fn ((ptr void)))]
+                       [tag (ptr void)]) -> (ptr void)
+  (trap-handler! http-trapped)
+  (let ([c (new-connection! s 0)])
+    (set! (-> c sink) sink)
+    (set! (-> c sink-ended) sink-ended)
+    (set! (-> c sink-tag) tag)
+    (cast (ptr void) c)))
+
+;; http-connection-feed! gives such a connection bytes from its client, which must stay unchanged until it ends.
+(define (http-connection-feed! [c (ptr void)] [b (slice u8)]) (feed! (cast (ptr http-connection) c) b))
+
+(define (http-connection-close! [c (ptr void)]) (drop! (cast (ptr http-connection) c)))
