@@ -1,5 +1,6 @@
 // The host module "env" (env.sub).
-import { mayEnv } from '../grants.mjs';
+import { joined } from '../entries.mjs';
+import { mayEnv, unlimited } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -39,6 +40,17 @@ export function env(grants) {
         if (name === null) return -1;
         delete process.env[name];
         return 0;
+      },
+      list(out, err) {
+        const all = unlimited(grants.env);
+        if (!all && (grants.env.deny.all || (!grants.env.all && grants.env.items.length === 0))) {
+          caller.fail(err, 'env.list: the environment is not granted (--allow-env)');
+          return 0;
+        }
+        const names = Object.keys(process.env)
+          .filter((name) => name !== '' && !/[=\0]/.test(name) && (all || mayEnv(grants.env, name)))
+          .sort();
+        return caller.give(utf8.encode(joined(names.map((name) => `${name}=${process.env[name]}`))), out);
       },
     };
   };

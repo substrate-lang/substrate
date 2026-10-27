@@ -26,7 +26,7 @@ parentPort.on('message', (m) => {
       modules: hostModules(setup, new Map([['worker', side.worker]])),
       grants: m.grants,
       parseGrants: (list) => grantsOf(list, resolveGrant),
-      absent: new Set(['stdin']),
+      absent: new Set(['stdin', 'signal']),
       memoryPages: m.pages,
     });
     const entry = host.load([...wasm.keys()], (name) => wasm.get(name));

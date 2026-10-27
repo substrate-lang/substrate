@@ -15,13 +15,15 @@ const loaders = {
     : require('../modules/fetch.mjs').fetchModule(s.grants, true, require('./resolve.mjs').dispatchers(s.grants))),
   websocket: (s) => (s.fakes.has('websocket')
     ? require('./fake.mjs').fakeWebsocket(s.grants)
-    : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants))),
+    : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants), true)),
   worker: (s) => require('./worker.mjs').workers(s),
   net: (s) => require('./net.mjs').netModule(s.grants, s.tls),
   process: (s) => require('./process.mjs').processes(s.grants, s.loader),
   stdin: () => require('./stdin.mjs').stdin(),
   env: (s) => require('./env.mjs').env(s.grants),
   fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants)),
+  watch: (s) => require('./watch.mjs').watchModule(s.grants),
+  signal: () => require('./signal.mjs').signals(),
 };
 
 const fakeable = new Set(['clock', 'timer', 'fetch', 'websocket']);

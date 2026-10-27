@@ -6,7 +6,7 @@
 ;; ---- run-time support ----
 
 (struct render-settings [topology u32] [cull u32] [front u32] [blend u32]
-  [depth-format u32] [depth-compare u32] [depth-write u32]
+  [depth-format u32] [depth-compare u32] [depth-write bool]
   [target-count u32] [targets (array u32 4)]
   [groups u32])
 
@@ -50,7 +50,7 @@
   (require-unqualified macros "../../../compiler/macros.sub")
   (require-unqualified shade "../shade/core.sub")
 
-  (define (fail [where datum] [message datum]) -> datum (raise-syntax-error 'shader message where))
+  (define (fail [where datum] [message datum]) -> datum (raise-syntax-error 'shader (datum->string message) where))
 
   (define (shade-field-type [t datum]) -> datum
     (if (and (identifier? t) (== (syntax-e t) 'unorm8x4)) '(vec 4 f32) (shade-type t)))
@@ -66,30 +66,36 @@
   (define (number [n i64]) -> datum (literal (make-integer n)))
 
   (define (join [pieces datum]) -> datum
-    (let ([s '""])
+    (let ([b (make-buffer)] [s datum 0])
       (while (pair? pieces)
         (let ([p (car pieces)])
-          (set! s (string-append s (cond [(string? p) p]
-                                         [(symbol? p) (symbol->string p)]
-                                         [else (format '"~a" `(,p))]))))
+          (cond [(string? p) (buffer-add-string! (& b) (datum->string p))]
+                [(symbol? p) (buffer-add-string! (& b) (symbol->string p))]
+                [else (write-to (& b) p 1)]))
         (set! pieces (cdr pieces)))
+      (set! s (string->datum (buffer-string (& b))))
+      (buffer-free! (& b))
       s))
 
   (define (wgsl-name [s datum]) -> datum
-    (let* ([n (symbol-length s)] [bytes (cast (ptr u8) (malloc n))])
-      (memcpy bytes (symbol-bytes s) n)
+    (let* ([name (symbol->string s)] [n (-> name length)] [bytes (cast (ptr u8) (malloc n))] [d datum 0])
+      (memcpy bytes (-> name bytes) n)
       (for ([i u32 0]) (< i n) (+= i 1)
         (when (== (@ bytes i) #\-) (set! (@ bytes i) #\_)))
-      (bytes->string bytes n)))
+      (set! d (string->datum (cast string (slice bytes n))))
+      (free bytes)
+      d))
 
   (define (wgsl-struct-name [s datum]) -> datum
-    (let* ([name (wgsl-name s)] [n (string-length name)] [bytes (cast (ptr u8) (malloc n))])
-      (memcpy bytes (string-bytes name) n)
+    (let* ([name (datum->string (wgsl-name s))] [n (-> name length)] [bytes (cast (ptr u8) (malloc n))] [d datum 0])
+      (memcpy bytes (-> name bytes) n)
       (when (and (> n 0) (>= (@ bytes 0) #\a) (<= (@ bytes 0) #\z)) (set! (@ bytes 0) (cast u8 (- (@ bytes 0) 32))))
-      (bytes->string bytes n)))
+      (set! d (string->datum (cast string (slice bytes n))))
+      (free bytes)
+      d))
 
   (define (named [name datum] [rest datum]) -> datum
-    (datum->syntax name (string->symbol (join `(,(syntax-e name) "-" ,rest))) name))
+    (datum->syntax name (string->symbol (datum->string (join `(,(syntax-e name) "-" ,rest)))) name))
 
   (define (integer-of [d datum]) -> i64 (integer-value d))
 
@@ -154,7 +160,7 @@
                [element (element-of t)] [count (count-of t)] [array (!= element t)]
                [info (type-info (syntax-e element) element)])
           (when (== (syntax-e element) 'unorm8x4) (fail element '"unorm8x4 is only for vertex attributes; a buffer holds vec4 or u32"))
-          (when (and array (string=? space '"uniform") (< (type-size info) 16))
+          (when (and array (equal? space '"uniform") (< (type-size info) 16))
             (fail t '"an array in a uniform must have a stride that is a multiple of 16 (WGSL's rule): use vec4, mat3 or mat4 elements, or a storage buffer"))
           (let* ([align (type-align info)]
                  [stride (round-up (type-size info) align)]
@@ -176,14 +182,14 @@
       (while (pair? (cddr laid))
         (let* ([f (car laid)] [offset (integer-of (list-ref f 1))] [size (integer-of (list-ref f 2))])
           (when (> offset cursor)
-            (set! fields (cons #`[#,(literal (string->symbol (join `("pad" ,(make-integer pads))))) (array u8 #,(number (- offset cursor)))] fields))
+            (set! fields (cons #`[#,(literal (string->symbol (datum->string (join `("pad" ,(make-integer pads)))))) (array u8 #,(number (- offset cursor)))] fields))
             (set! pads (+ pads 1)))
           (set! fields (cons #`[#,(car f) #,(list-ref f 5)] fields))
           (set! cursor (+ offset size)))
         (set! laid (cdr laid)))
       (let ([size (integer-of (car laid))])
         (when (> size cursor)
-          (set! fields (cons #`[#,(literal (string->symbol (join `("pad" ,(make-integer pads))))) (array u8 #,(number (- size cursor)))] fields))))
+          (set! fields (cons #`[#,(literal (string->symbol (datum->string (join `("pad" ,(make-integer pads)))))) (array u8 #,(number (- size cursor)))] fields))))
       #`(struct #,name #,@(reverse fields))))
 
   (define (wgsl-struct [name datum] [laid datum]) -> datum
@@ -256,7 +262,7 @@
   (define (clause-fields [c datum]) -> datum (list-ref c 5))
   (define (clause-extra [c datum]) -> datum (list-ref c 6))
 
-  (define (buffer-clause? [c datum]) -> i32
+  (define (buffer-clause? [c datum]) -> bool
     (let ([k (clause-kind c)]) (or (== k 'uniform) (== k 'uniform-array) (== k 'storage))))
 
   (define (entry-kind [c datum]) -> i64
@@ -289,7 +295,7 @@
   (define (shader-form [s datum]) -> datum
     (syntax-match s
       [(_ (? identifier? name) c ...)
-       (let ([bindings nil] [inputs nil] [varyings nil] [varied 0] [builtins nil] [code '""] [names nil]
+       (let ([bindings nil] [inputs nil] [varyings nil] [varied #f] [builtins nil] [code '""] [names nil]
              [definitions nil] [wgsl '""] [groups i64 0]
              [outputs nil] [shaded nil] [entries nil] [libraries nil])
          (while (pair? c)
@@ -303,7 +309,7 @@
                     (set! bindings (cons read bindings)))]
                [(== (syntax-e (car l)) 'varyings)
                 (when varied (fail form '"there can be one varyings clause"))
-                (set! varied 1)
+                (set! varied #t)
                 (unless (null? (cdr l)) (set! varyings (fields-of (cdr l) form)))]
                [(== (syntax-e (car l)) 'builtins)
                 (let ([bl (cdr l)])
@@ -331,7 +337,7 @@
                 (let* ([size (cadr l)] [sl (syntax->list size)]
                        [text (if (== sl 0)
                                  (begin (unless (integer? (syntax-e size)) (fail size '"expected the workgroup's size, a number or (x y z)"))
-                                        (format '"~a" `(,(syntax-e size))))
+                                        (format "~a" `(,(syntax-e size))))
                                  (let ([t '""] [first 1])
                                    (unless (and (>= (length sl) 1) (<= (length sl) 3)) (fail size '"expected the workgroup's size, a number or (x y z)"))
                                    (while (pair? sl)
@@ -358,10 +364,10 @@
              (when (>= (clause-group (car b)) groups) (set! groups (+ (clause-group (car b)) 1)))
              (set! b (cdr b))))
          (for ([g i64 0]) (< g groups) (+= g 1)
-           (let ([found 0] [seen nil] [b bindings])
+           (let ([found #f] [seen nil] [b bindings])
              (while (pair? b)
                (when (== (clause-group (car b)) g)
-                 (set! found 1)
+                 (set! found #t)
                  (when (member (make-integer (clause-binding (car b))) seen)
                    (fail (clause-name (car b)) '"this binding number is used twice in its group"))
                  (set! seen (cons (make-integer (clause-binding (car b))) seen)))
@@ -380,7 +386,7 @@
                      (shade-global! (syntax-e (clause-name cl))
                                     (if (== (clause-kind cl) 'storage) `(array (struct ,(syntax-e (clause-name cl)))) `(struct ,(syntax-e (clause-name cl)))))
                      (set! wgsl (join `(,wgsl ,(wgsl-struct struct-name laid))))
-                     (set! definitions (cons (program-struct (named name (symbol->string (syntax-e (clause-name cl)))) laid) definitions))
+                     (set! definitions (cons (program-struct (named name (syntax-e (clause-name cl))) laid) definitions))
                      (when (== (clause-kind cl) 'uniform-array)
                        (set! definitions (cons #`(define #,(named name (join `(,(syntax-e (clause-name cl)) "-stride"))) u32 #,(number (round-up size 256))) definitions)))
                      (when (== (clause-kind cl) 'storage)
@@ -407,7 +413,7 @@
                    (set! location (+ location 1))
                    (set! offset (+ offset (type-size info))))
                  (set! fields (cdr fields)))
-               (set! definitions (cons #`(struct #,(named name (symbol->string (syntax-e (clause-name cl)))) #,@(reverse program-fields)) definitions))
+               (set! definitions (cons #`(struct #,(named name (syntax-e (clause-name cl))) #,@(reverse program-fields)) definitions))
                (set! buffers (cons #`(begin (gpu-vertex-buffer-layout! #,(number offset) #,(number (integer-of (clause-extra cl))) #,(number (length attributes)))
                                             #,@(reverse attributes))
                                    buffers)))
@@ -457,7 +463,7 @@
                        (let ([p (clause-name cl)] [k (clause-kind cl)])
                          (set! parameters (cons #`[#,p u32] parameters))
                          (set! binds (cons (cond [(== k 'uniform-array)
-                                                  #`(gpu-bind-buffer! #,(number (clause-binding cl)) #,p 0 (sizeof #,(named name (symbol->string (syntax-e p)))))]
+                                                  #`(gpu-bind-buffer! #,(number (clause-binding cl)) #,p 0 (sizeof #,(named name (syntax-e p))))]
                                                  [(buffer-clause? cl) #`(gpu-bind-buffer! #,(number (clause-binding cl)) #,p 0 0)]
                                                  [(or (== k 'sampler) (== k 'comparison-sampler)) #`(gpu-bind-sampler! #,(number (clause-binding cl)) #,p)]
                                                  [else #`(gpu-bind-texture! #,(number (clause-binding cl)) #,p)])
@@ -473,13 +479,13 @@
                              group-functions))))
              (set! layout-items (reverse layout-items))
              #`(begin
-                 (define #,(named name '"code") (ptr u8) #,(literal wgsl))
+                 (define #,(named name '"code") string #,(literal wgsl))
                  #,@(reverse definitions)
                  (struct #,shader-struct [shader u32] [layouts (array u32 #,(number (if (== groups 0) 1 groups)))])
                  (define (#,(named name '"init!") [s (ptr #,shader-struct)])
                    (set! (-> s shader) (gpu-shader! #,(named name '"code")))
                    #,@(reverse entries))
-                 (define (#,(named name '"render-pipeline!") [s (ptr #,shader-struct)] [vertex (ptr u8)] [fragment (ptr u8)] [settings (ptr render-settings)]) -> u32
+                 (define (#,(named name '"render-pipeline!") [s (ptr #,shader-struct)] [vertex string] [fragment string] [settings (ptr render-settings)]) -> u32
                    (let* ([used (if (== (-> settings groups) 0) #,(number groups) (-> settings groups))]
                           [pipeline (gpu-render-pipeline! (-> s shader) vertex fragment
                                                           (-> settings topology) (-> settings cull) (-> settings front) (-> settings blend)
@@ -489,7 +495,7 @@
                      (for ([i u32 0]) (< i (-> settings target-count)) (+= i 1) (gpu-target! (@ (-> settings targets) i)))
                      #,@(reverse buffers)
                      pipeline))
-                 (define (#,(named name '"compute-pipeline!") [s (ptr #,shader-struct)] [entry (ptr u8)]) -> u32
+                 (define (#,(named name '"compute-pipeline!") [s (ptr #,shader-struct)] [entry string]) -> u32
                    (let* ([used u32 #,(number groups)] [pipeline (gpu-compute-pipeline! (-> s shader) entry used)])
                      #,@layout-items
                      pipeline))

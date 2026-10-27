@@ -1,6 +1,7 @@
 ;; Scheme's runtime, in Substrate: closures and calls, errors, data, ports, the host.
 (require-unqualified v "values.sub")
 (require-unqualified fs "../../../host/fs.sub")
+(require-unqualified utf8 "../../encoding/utf8.sub")
 
 (provide exn
          make-closure closure-set! closure-ref closure-code procedure? call-closure
@@ -11,7 +12,7 @@
          make-box box? unbox set-box!
          make-vector vector? vector-length vector-ref vector-set! list->vector vector->list vector-fill! vector-copy
          vector-arg index-of count-of bound-of
-         make-bytes bytes? bytes-length bytes-ref bytes-set! bytes-arg bytes-data subbytes bytes-copy! bytes-append-list
+         make-bytes bytes? bytes-length bytes-ref bytes-set! bytes-arg datum->bytes bytes->datum subbytes bytes-copy! bytes-append-list
          bytes->list list->bytes bytes-of-list byte-arg
          make-struct-type struct-type-name make-struct struct-of? struct-arg struct-ref struct-set! struct-init! fresh-hash not-a-struct struct?
          make-hash-table table? hash-count hash-ref-value hash-has-key? hash-set-value! hash-update-value! hash-remove! hash-clear! table-walk
@@ -19,7 +20,7 @@
          int-value fixnum-value-of count-arg add sub mul quo rem floor-remainder compare bitwise shift
          number-string-of parse-number radix-value char-arg char-compare
          string-arg string-order string-compare symbol-arg string-append-list substring-of string->list-of
-         list->string-of bytes->string-of string->bytes-of decode-char utf8-length char-start? char-offset
+         list->string-of bytes->string-of string->bytes-of decode-char char-utf-8-length char-start? char-offset
          inside-char-error string-ref-char
          stdout-port stderr-port new-port port? port-arg port-bytes port-string port-length write-value write-to-port
          write-byte-to write-value-to port-flush line-start? out-format format-value write-format-to error-value
@@ -40,7 +41,7 @@
 
 (define (new-record [kind u32] [n u32]) -> datum (alloc-node (+ 4 n) kind))
 
-(define (record-of? [d datum] [kind u32]) -> i32 (tagged? d kind))
+(define (record-of? [d datum] [kind u32]) -> bool (tagged? d kind))
 
 (define (block-of [d datum]) -> (ptr void) (cast (ptr void) (+ (cast (ptr u8) d) 4)))
 
@@ -73,7 +74,7 @@
   (set-dropper! kind-port drop-port))
 (register-layouts!)
 
-(define (bool [x i32]) -> datum (if x true-node (cast datum 0)))
+(define (bool [x bool]) -> datum (if x true-node (cast datum 0)))
 (#%fact bool '(foreign borrowed))
 
 ;; ---- closures and calls ----
@@ -95,7 +96,7 @@
   (@ (-> (cast (ptr closure-block) (block-of c)) caps) i))
 (#%fact closure-ref '(foreign borrowed))
 
-(define (procedure? [v datum]) -> i32 (record-of? v kind-closure))
+(define (procedure? [v datum]) -> bool (record-of? v kind-closure))
 
 (define (closure-code [c datum]) -> u32
   (if (procedure? c)
@@ -109,7 +110,7 @@
     (k f nargs a0 a1 a2 a3)))
 (#%fact call-closure '(raises))
 
-(define (truth [v datum]) -> i32
+(define (truth [v datum]) -> bool
   (let ([t (!= v 0)])
     (drop v)
     t))
@@ -167,7 +168,7 @@
     d))
 (#%fact make-exn '(foreign owned 0))
 
-(define (exn? [v datum]) -> i32 (record-of? v kind-exn))
+(define (exn? [v datum]) -> bool (record-of? v kind-exn))
 
 (define (exn-message [v datum]) -> datum
   (if (exn? v)
@@ -178,39 +179,37 @@
 
 (define handlers datum 0)
 
-(define (taken? [v datum]) -> i32
+(define (taken? [v datum]) -> bool
   (let ([hs handlers])
     (while (pair? hs)
       (let ([ps (car hs)])
         (while (pair? ps)
-          (when (truth (call-closure (car ps) 1 (dup v) 0 0 0)) (return 1))
+          (when (truth (call-closure (car ps) 1 (dup v) 0 0 0)) (return #t))
           (set! ps (cdr ps))))
       (set! hs (cdr hs)))
-    0))
+    #f))
 
 (define (trap-with [b (ptr buffer)]) -> datum
-  (host-trap (-> b bytes) (-> b length))
+  (host-trap (buffer-string b))
   0)
 
 (define (raise-value [v datum]) -> datum
   (when (taken? v) (throw exn v))
   (let ([b (make-buffer)])
     (if (exn? v)
-        (let ([m (message-of v)]) (buffer-add! (& b) (string-bytes m) (string-length m)))
-        (begin (buffer-add-string! (& b) "uncaught exception: ") (write-value (& b) v 0)))
+        (buffer-add-string! (& b) (datum->string (message-of v)))
+        (begin (buffer-add-string! (& b) "uncaught exception: ") (write-value (& b) v #f)))
     (trap-with (& b))))
 (#%fact raise-value '(foreign diverges 0))
 (#%fact raise-value '(raises))
 
 (define (fail-with [b (ptr buffer)]) -> datum
-  (let ([m (bytes->string (-> b bytes) (-> b length))])
+  (let ([m (string->datum (buffer-string b))])
     (buffer-free! b)
     (raise-value (make-exn m))))
 
 (define (out-who [b (ptr buffer)] [who datum])
-  (if (symbol? who)
-      (buffer-add! b (symbol-bytes who) (symbol-length who))
-      (buffer-add! b (string-bytes who) (string-length who))))
+  (buffer-add-string! b (if (symbol? who) (symbol->string who) (datum->string who))))
 
 (define (stop-format [who datum] [form datum] [args datum]) -> datum
   (let ([b (make-buffer)])
@@ -245,7 +244,7 @@
 (define (not-a-function [v datum]) -> datum
   (let ([b (make-buffer)])
     (buffer-add-string! (& b) "called a value that is not a function: ")
-    (write-value (& b) v 0)
+    (write-value (& b) v #f)
     (trap-with (& b))))
 (#%fact not-a-function '(foreign diverges))
 
@@ -297,37 +296,34 @@
 
 ;; ---- equivalence ----
 
-(define (eq-values? [a datum] [b datum]) -> i32 (== a b))
+(define (eq-values? [a datum] [b datum]) -> bool (== a b))
 
-(define (eqv? [a datum] [b datum]) -> i32
-  (cond [(== a b) 1]
-        [(or (== a 0) (== b 0)) 0]
+(define (eqv? [a datum] [b datum]) -> bool
+  (cond [(== a b) #t]
+        [(or (== a 0) (== b 0)) #f]
         [(char? a) (and (char? b) (== (char->integer a) (char->integer b)))]
         [(integer? a) (and (integer? b) (== (integer-negative? a) (integer-negative? b)) (== (integer-value a) (integer-value b)))]
         [(flonum? a) (and (flonum? b) (== (f64-bits (flonum-value a)) (f64-bits (flonum-value b))))]
-        [else 0]))
+        [else #f]))
 
-(define (equal-values? [a datum] [b datum]) -> i32
-  (cond [(eqv? a b) 1]
-        [(or (== a 0) (== b 0)) 0]
+(define (equal-values? [a datum] [b datum]) -> bool
+  (cond [(eqv? a b) #t]
+        [(or (== a 0) (== b 0)) #f]
         [(pair? a) (and (pair? b) (equal-values? (car a) (car b)) (equal-values? (cdr a) (cdr b)))]
         [(string? a) (and (string? b) (string=? a b))]
         [(box? a) (and (box? b) (equal-values? (unbox a) (unbox b)))]
         [(vector? a)
-         (if (not (vector? b)) (return 0))
+         (if (not (vector? b)) (return #f))
          (let ([n (vector-length a)])
-           (when (!= n (vector-length b)) (return 0))
+           (when (!= n (vector-length b)) (return #f))
            (for ([i u32 0]) (< i n) (+= i 1)
-             (unless (equal-values? (vector-ref a i) (vector-ref b i)) (return 0)))
-           1)]
-        [(bytes? a)
-         (if (not (bytes? b)) (return 0))
-         (let ([n (bytes-length a)])
-           (and (== n (bytes-length b)) (== (memcmp (bytes-data a) (bytes-data b) n) 0)))]
-        [else 0]))
+             (unless (equal-values? (vector-item a i) (vector-item b i)) (return #f)))
+           #t)]
+        [(bytes? a) (and (bytes? b) (== (cast string (datum->bytes a)) (cast string (datum->bytes b))))]
+        [else #f]))
 
-(define (same? [a datum] [b datum] [by i32]) -> i32
-  (cond [(== a b) 1]
+(define (same? [a datum] [b datum] [by i32]) -> bool
+  (cond [(== a b) #t]
         [(== by 0) (eq-values? a b)]
         [(== by 1) (eqv? a b)]
         [else (equal-values? a b)]))
@@ -342,7 +338,7 @@
     d))
 (#%fact make-box '(foreign owned 0))
 
-(define (box? [v datum]) -> i32 (record-of? v kind-box))
+(define (box? [v datum]) -> bool (record-of? v kind-box))
 (define (unbox [b datum]) -> datum (-> (cast (ptr box-block) (block-of b)) value))
 (#%fact unbox '(foreign borrowed))
 (define (set-box! [b datum] [v datum])
@@ -411,7 +407,7 @@
                  [else (lit ("string<?" "string>?" "string<=?" "string>=?" "string=?"))])])
     (list-ref l op)))
 
-(define (compare [op i32] [a datum] [b datum]) -> i32
+(define (compare [op i32] [a datum] [b datum]) -> bool
   (let ([x (int-value a (compare-name 0 op))] [y (int-value b (compare-name 0 op))])
     (cond [(== op 0) (< x y)] [(== op 1) (> x y)] [(== op 2) (<= x y)] [(== op 3) (>= x y)] [else (== x y)])))
 
@@ -440,24 +436,24 @@
     (cond [(flonum? n)
            (when (!= (radix-value radix (lit "number->string")) 10)
              (wrong-type (lit "number->string") (lit "radix 10 for a flonum") radix))
-           (write-to (& b) n 0)]
+           (write-to (& b) n #f)]
           [else
            (let ([x (int-value n (lit "number->string"))] [r (cast u64 (radix-value radix (lit "number->string")))])
              (when (< x 0) (buffer-add-byte! (& b) 45))
              (write-digits (& b) (if (< x 0) (cast u64 (- 0 x)) (cast u64 x)) r))])
-    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (set! s (string->datum (buffer-string (& b))))
     (buffer-free! (& b))
     s))
 
 (define (parse-number [s datum] [radix i64]) -> datum
-  (let* ([p (string-bytes s)] [n (string-length s)] [from u32 0] [negative 0] [x u64 0] [f f64 0])
-    (when (== n 0) (return 0))
-    (when (and (== radix 10) (read-decimal p n (& f))) (return (make-flonum f)))
-    (when (or (== (@ p 0) #\-) (== (@ p 0) #\+))
-      (set! negative (== (@ p 0) #\-))
+  (let* ([text (datum->string s)] [from u32 0] [negative #f] [x u64 0] [f f64 0])
+    (when (== (-> text length) 0) (return 0))
+    (when (and (== radix 10) (read-decimal text (& f))) (return (make-flonum f)))
+    (when (or (== (@ text 0) #\-) (== (@ text 0) #\+))
+      (set! negative (== (@ text 0) #\-))
       (set! from 1))
-    (unless (digits? p from n (cast i32 radix)) (return 0))
-    (unless (digits-integer p from n (cast i32 radix) negative (& x)) (return 0))
+    (unless (digits? (slice text from) (cast i32 radix)) (return 0))
+    (unless (digits-integer (slice text from) (cast i32 radix) negative (& x)) (return 0))
     (when (and (not negative) (> x 9223372036854775807)) (return 0))
     (make-integer (cast i64 x))))
 
@@ -467,7 +463,7 @@
   (unless (char? c) (wrong-type who (lit "a character") c))
   (cast i32 (char->integer c)))
 
-(define (char-compare [op i32] [a datum] [b datum]) -> i32
+(define (char-compare [op i32] [a datum] [b datum]) -> bool
   (let ([x (cast u32 (char-arg a (compare-name 1 op)))] [y (cast u32 (char-arg b (compare-name 1 op)))])
     (cond [(== op 0) (< x y)] [(== op 1) (> x y)] [(== op 2) (<= x y)] [(== op 3) (>= x y)] [else (== x y)])))
 
@@ -483,31 +479,25 @@
   v)
 (#%fact symbol-arg '(foreign borrowed))
 
-(define (string-order [a datum] [b datum]) -> i32
-  (let* ([n (string-length a)] [m (string-length b)] [k (if (< n m) n m)]
-         [c (memcmp (string-bytes a) (string-bytes b) k)])
-    (cond [(!= c 0) (if (< c 0) -1 1)]
-          [(< n m) -1]
-          [(> n m) 1]
-          [else 0])))
+(define (string-order [a string] [b string]) -> i32 (cond [(< a b) -1] [(== a b) 0] [else 1]))
 
-(define (string-compare [op i32] [a datum] [b datum]) -> i32
-  (let ([o (string-order (string-arg a (compare-name 2 op)) (string-arg b (compare-name 2 op)))])
+(define (string-compare [op i32] [a datum] [b datum]) -> bool
+  (let ([o (string-order (datum->string (string-arg a (compare-name 2 op))) (datum->string (string-arg b (compare-name 2 op))))])
     (cond [(== op 0) (< o 0)] [(== op 1) (> o 0)] [(== op 2) (<= o 0)] [(== op 3) (>= o 0)] [else (== o 0)])))
 
 (define (string-append-list [l datum] [who datum]) -> datum
   (let ([b (make-buffer)] [s datum 0])
     (while (pair? l)
-      (let ([x (string-arg (car l) who)]) (buffer-add! (& b) (string-bytes x) (string-length x)))
+      (buffer-add-string! (& b) (datum->string (string-arg (car l) who)))
       (set! l (cdr l)))
-    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (set! s (string->datum (buffer-string (& b))))
     (buffer-free! (& b))
     s))
 
-(define (continuation-byte? [b i32]) -> i32 (== (bit-and b 192) 128))
+(define (continuation-byte? [b i32]) -> bool (== (bit-and b 192) 128))
 
-(define (char-start? [s datum] [i u32]) -> i32
-  (or (>= i (string-length s)) (not (continuation-byte? (@ (string-bytes s) i)))))
+(define (char-start? [s datum] [i u32]) -> bool
+  (or (>= i (string-length s)) (not (continuation-byte? (@ (datum->string s) i)))))
 
 (define (inside-char-error [who datum] [k datum]) -> datum
   (stop-format who (lit "byte ~s is inside a character") (cons k nil)))
@@ -531,7 +521,7 @@
     i))
 
 (define (decode-char [s datum] [i u32]) -> u32
-  (let* ([p (string-bytes s)] [b (cast u32 (@ p i))])
+  (let* ([p (datum->string s)] [b (cast u32 (@ p i))])
     (cond [(< b 128) b]
           [(< b 224) (bit-or (<< (bit-and b 31) 6) (bit-and (@ p (+ i 1)) 63))]
           [(< b 240) (bit-or (<< (bit-and b 15) 12)
@@ -539,7 +529,7 @@
           [else (bit-or (bit-or (<< (bit-and b 7) 18) (<< (bit-and (@ p (+ i 1)) 63) 12))
                         (bit-or (<< (bit-and (@ p (+ i 2)) 63) 6) (bit-and (@ p (+ i 3)) 63)))])))
 
-(define (utf8-length [cp u32]) -> u32
+(define (char-utf-8-length [cp u32]) -> u32
   (cond [(< cp 128) 1] [(< cp 2048) 2] [(< cp 65536) 3] [else 4]))
 
 (define (string-ref-char [s datum] [k datum]) -> datum
@@ -552,13 +542,13 @@
          [e (if (== end 0) (string-length x) (char-offset end x who))]
          [b (if (== start 0) 0 (char-offset start x who))])
     (when (> b e) (index-error who start))
-    (bytes->string (+ (string-bytes x) b) (- e b))))
+    (string->datum (slice (datum->string x) b e))))
 
 (define (string->list-of [s datum] [who datum]) -> datum
   (let* ([x (string-arg s who)] [n (string-length x)] [i u32 0] [count u32 0] [cps (ptr u32) 0] [l nil])
     (while (< i n)
       (+= count 1)
-      (+= i (utf8-length (decode-char x i))))
+      (+= i (char-utf-8-length (decode-char x i))))
     (set! cps (cast (ptr u32) (malloc (* (+ count 1) 4))))
     (set! i 0)
     (set! count 0)
@@ -566,7 +556,7 @@
       (let ([cp (decode-char x i)])
         (set! (@ cps count) cp)
         (+= count 1)
-        (+= i (utf8-length cp))))
+        (+= i (char-utf-8-length cp))))
     (while (> count 0)
       (-= count 1)
       (set! l (cons (integer->char (@ cps count)) l)))
@@ -579,55 +569,38 @@
       (buffer-add-utf-8! (& b) (cast u32 (char-arg (car l) who)))
       (set! l (cdr l)))
     (unless (null? l) (wrong-type who (lit "a list") chars))
-    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (set! s (string->datum (buffer-string (& b))))
     (buffer-free! (& b))
     s))
 
-(define (utf8-sequence [a (ptr u8)] [i u32] [e u32]) -> u32
-  (let ([b (cast u32 (@ a i))] [k u32 0] [lo u32 128] [hi u32 191])
-    (cond [(< b 128) (return 1)]
-          [(< b 194) (return 0)]
-          [(< b 224) (set! k 1)]
-          [(< b 240) (set! k 2) (when (== b 224) (set! lo 160)) (when (== b 237) (set! hi 159))]
-          [(< b 245) (set! k 3) (when (== b 240) (set! lo 144)) (when (== b 244) (set! hi 143))]
-          [else (return 0)])
-    (when (> (+ i k) (- e 1)) (return 0))
-    (for ([j u32 1]) (<= j k) (+= j 1)
-      (let ([c (cast u32 (@ a (+ i j)))])
-        (when (or (< c lo) (> c hi)) (return 0))
-        (set! lo 128)
-        (set! hi 191)))
-    (+ k 1)))
-
 (define (bytes->string-of [v datum] [err datum] [start datum] [end datum] [who datum]) -> datum
-  (let* ([a (bytes-data (bytes-arg v who))] [n (bytes-length v)]
+  (let* ([n (bytes-length (bytes-arg v who))]
          [e (if (== end 0) n (bound-of end n who))]
          [i (if (== start 0) 0 (bound-of start e who))]
+         [a (slice (datum->bytes v) 0 e)]
          [b (make-buffer)] [s datum 0]
          [replacement (if (== err 0) 0 (cast u32 (char-arg err who)))])
     (while (< i e)
-      (let ([k (utf8-sequence a i e)])
+      (let ([k (if (< (@ a i) 128) 1 (utf-8-length a i))])
         (cond [(== k 0)
                (when (== err 0) (wrong-type who (lit "UTF-8 bytes") v))
                (buffer-add-utf-8! (& b) replacement)
                (+= i 1)]
               [else
-               (buffer-add! (& b) (+ a i) k)
+               (buffer-add! (& b) (slice a i (+ i k)))
                (+= i k)])))
-    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (set! s (string->datum (buffer-string (& b))))
     (buffer-free! (& b))
     s))
 
 (define (string->bytes-of [s datum] [who datum]) -> datum
-  (let* ([x (string-arg s who)] [n (string-length x)] [d (make-bytes n 0)])
-    (memcpy (bytes-data d) (string-bytes x) n)
-    d))
+  (bytes->datum (cast (slice u8) (datum->string (string-arg s who)))))
 
 ;; ---- vectors ----
 
 (struct vector-block [n u32] [items (array datum 0)])
 
-(define (vector? [v datum]) -> i32 (record-of? v kind-vector))
+(define (vector? [v datum]) -> bool (record-of? v kind-vector))
 
 (define (make-vector [n u32] [fill datum]) -> datum
   (let* ([d (new-record kind-vector (+ (sizeof vector-block) (* n 4)))]
@@ -691,7 +664,7 @@
 
 (struct bytes-block [n u32] [data (array u8 0)])
 
-(define (bytes? [v datum]) -> i32 (record-of? v kind-bytes))
+(define (bytes? [v datum]) -> bool (record-of? v kind-bytes))
 
 (define (make-bytes [n u32] [fill i32]) -> datum
   (let* ([d (new-record kind-bytes (+ (sizeof bytes-block) n))]
@@ -706,9 +679,15 @@
 (#%fact bytes-arg '(foreign borrowed))
 
 (define (bytes-length [v datum]) -> u32 (-> (cast (ptr bytes-block) (block-of v)) n))
-(define (bytes-data [v datum]) -> (ptr u8) (cast (ptr u8) (-> (cast (ptr bytes-block) (block-of v)) data)))
-(define (bytes-ref [v datum] [i u32]) -> i32 (@ (bytes-data v) i))
-(define (bytes-set! [v datum] [i u32] [b i32]) (set! (@ (bytes-data v) i) b))
+(define (datum->bytes [v datum]) -> (slice u8)
+  (slice (cast (ptr u8) (-> (cast (ptr bytes-block) (block-of v)) data)) (bytes-length v)))
+(define (bytes->datum [b (slice u8)]) -> datum
+  (let* ([d (new-record kind-bytes (+ (sizeof bytes-block) (-> b length)))] [k (cast (ptr bytes-block) (block-of d))])
+    (set! (-> k n) (-> b length))
+    (memcpy (-> k data) (-> b items) (-> b length))
+    d))
+(define (bytes-ref [v datum] [i u32]) -> i32 (@ (datum->bytes v) i))
+(define (bytes-set! [v datum] [i u32] [b i32]) (set! (@ (datum->bytes v) i) b))
 
 (define (byte-arg [b datum] [who datum]) -> i32
   (let ([x (int-value b who)])
@@ -718,10 +697,8 @@
 (define (subbytes [v datum] [s datum] [e datum] [who datum]) -> datum
   (let* ([a (bytes-arg v who)] [n (bytes-length a)]
          [end (if (== e 0) n (bound-of e n who))]
-         [start (if (== s 0) 0 (bound-of s end who))]
-         [r (make-bytes (- end start) 0)])
-    (memcpy (bytes-data r) (+ (bytes-data a) start) (- end start))
-    r))
+         [start (if (== s 0) 0 (bound-of s end who))])
+    (bytes->datum (slice (datum->bytes a) start end))))
 
 (define (bytes-copy! [to datum] [at datum] [from datum] [s datum] [e datum]) -> datum
   (let* ([who (lit "bytes-copy!")] [t (bytes-arg to who)] [f (bytes-arg from who)]
@@ -729,7 +706,7 @@
          [start (if (== s 0) 0 (bound-of s end who))]
          [i (bound-of at (bytes-length t) who)])
     (when (> (- end start) (- (bytes-length t) i)) (index-error who at))
-    (memcpy (+ (bytes-data t) i) (+ (bytes-data f) start) (- end start))
+    (memcpy (-> (slice (datum->bytes t) i) items) (-> (slice (datum->bytes f) start) items) (- end start))
     0))
 
 (define (bytes-append-list [l datum]) -> datum
@@ -740,9 +717,9 @@
     (set! r (make-bytes n 0))
     (set! t l)
     (while (pair? t)
-      (let ([k (bytes-length (car t))])
-        (memcpy (+ (bytes-data r) i) (bytes-data (car t)) k)
-        (+= i k))
+      (let ([part (datum->bytes (car t))])
+        (memcpy (-> (slice (datum->bytes r) i) items) (-> part items) (-> part length))
+        (+= i (-> part length)))
       (set! t (cdr t)))
     r))
 
@@ -800,14 +777,14 @@
     d))
 (#%fact make-struct '(foreign owned 0))
 
-(define (struct? [v datum]) -> i32 (record-of? v kind-struct))
+(define (struct? [v datum]) -> bool (record-of? v kind-struct))
 
-(define (struct-of? [v datum] [t datum]) -> i32
+(define (struct-of? [v datum] [t datum]) -> bool
   (and (struct? v) (== (-> (cast (ptr struct-block) (block-of v)) type) t)))
 
 (define (struct-arg [v datum] [t datum] [who datum]) -> datum
   (unless (struct-of? v t)
-    (wrong-type who (string-append (lit "a ") (symbol->string (struct-type-name t))) v))
+    (wrong-type who (string-append (lit "a ") (string->datum (symbol->string (struct-type-name t)))) v))
   v)
 (#%fact struct-arg '(foreign borrowed))
 
@@ -821,7 +798,7 @@
   (set! (@ (-> (cast (ptr struct-block) (block-of v)) fields) i) x))
 (#%fact struct-init! '(foreign void 2))
 (define (not-a-struct [v datum] [t datum] [who datum]) -> datum
-  (wrong-type who (string-append (lit "a ") (symbol->string (struct-type-name t))) v))
+  (wrong-type who (string-append (lit "a ") (string->datum (symbol->string (struct-type-name t)))) v))
 (#%fact not-a-struct '(foreign diverges))
 (define (struct-hash [v datum]) -> u32 (-> (cast (ptr struct-block) (block-of v)) hash))
 
@@ -839,7 +816,7 @@
 (define (key-hash [k datum] [kind i32] [who datum]) -> u32
   (cond [(== k 0) 0]
         [(symbol? k) (symbol-hash k)]
-        [(keyword? k) (contents-hash (keyword->string k) 16 who)]
+        [(keyword? k) (text-hash (keyword->string k))]
         [(struct? k) (struct-hash k)]
         [(boolean? k) 1]
         [(null? k) 2]
@@ -851,11 +828,13 @@
          (wrong-type who (lit "a key with a hash (a symbol, keyword, struct, number, character, boolean or ()); make-hash takes others") k)
          0]))
 
+(define (text-hash [t string]) -> u32
+  (let ([h u32 2166136261])
+    (for ([i u32 0]) (< i (-> t length)) (+= i 1) (set! h (* (bit-xor h (@ t i)) 16777619)))
+    h))
+
 (define (contents-hash [k datum] [limit u32] [who datum]) -> u32
-  (cond [(string? k)
-         (let ([h u32 2166136261] [p (string-bytes k)] [n (string-length k)])
-           (for ([i u32 0]) (< i n) (+= i 1) (set! h (* (bit-xor h (@ p i)) 16777619)))
-           h)]
+  (cond [(string? k) (text-hash (datum->string k))]
         [(pair? k)
          (let ([h u32 3] [n u32 0])
            (while (and (pair? k) (< n limit))
@@ -866,11 +845,11 @@
         [(vector? k)
          (let ([h u32 5] [n (vector-length k)])
            (for ([i u32 0]) (and (< i n) (< i limit)) (+= i 1)
-             (set! h (+ (* h 31) (key-hash (vector-ref k i) 2 who))))
+             (set! h (+ (* h 31) (key-hash (vector-item k i) 2 who))))
            (mix h))]
         [(bytes? k)
-         (let ([h u32 7] [p (bytes-data k)] [n (bytes-length k)])
-           (for ([i u32 0]) (< i n) (+= i 1) (set! h (* (bit-xor h (@ p i)) 16777619)))
+         (let ([h u32 7] [t (datum->bytes k)])
+           (for ([i u32 0]) (< i (-> t length)) (+= i 1) (set! h (* (bit-xor h (@ t i)) 16777619)))
            h)]
         [else (wrong-type who (lit "a key with a hash or contents to hash") k) 0]))
 
@@ -888,7 +867,7 @@
     (set! (-> b buckets) (new-buckets 16))
     d))
 
-(define (table? [v datum]) -> i32 (record-of? v kind-table))
+(define (table? [v datum]) -> bool (record-of? v kind-table))
 
 (define (table-arg [t datum] [who datum]) -> (ptr table-block)
   (unless (table? t) (wrong-type who (lit "a hash table") t))
@@ -926,7 +905,7 @@
     (set! (@ (-> b buckets) i) e)
     (+= (-> b count) 1)))
 
-(define (hash-ref-value [t datum] [k datum] [failure datum] [has-failure i32] [who datum]) -> datum
+(define (hash-ref-value [t datum] [k datum] [failure datum] [has-failure bool] [who datum]) -> datum
   (let* ([b (table-arg t who)] [e (find-entry b k (key-hash k (-> b kind) who))])
     (cond [(!= e 0) (dup (-> e value))]
           [(not has-failure) (stop-format who (lit "no value found for key ~s") (cons k nil))]
@@ -934,11 +913,11 @@
           [else (dup failure)])))
 (#%fact hash-ref-value '(raises))
 
-(define (hash-has-key? [t datum] [k datum] [who datum]) -> i32
+(define (hash-has-key? [t datum] [k datum] [who datum]) -> bool
   (let ([b (table-arg t who)])
     (!= (find-entry b k (key-hash k (-> b kind) who)) 0)))
 
-(define (hash-update-value! [t datum] [k datum] [updater datum] [failure datum] [has-failure i32] [who datum])
+(define (hash-update-value! [t datum] [k datum] [updater datum] [failure datum] [has-failure bool] [who datum])
   (let* ([b (table-arg t who)] [h (key-hash k (-> b kind) who)] [e (find-entry b k h)]
          [old (cond [(!= e 0) (dup (-> e value))]
                     [(not has-failure) (stop-format who (lit "no value found for key ~s") (cons k nil))]
@@ -1036,7 +1015,7 @@
 (define (stderr-port) -> datum stderr)
 (#%fact stderr-port '(foreign borrowed))
 
-(define (port? [v datum]) -> i32 (record-of? v kind-port))
+(define (port? [v datum]) -> bool (record-of? v kind-port))
 
 (define (port-arg [v datum] [who datum]) -> datum
   (unless (port? v) (wrong-type who (lit "an output port") v))
@@ -1047,10 +1026,7 @@
 (define (port-fd [p datum]) -> i32 (-> (cast (ptr port-block) (block-of p)) fd))
 (define (port-length [p datum]) -> u32 (-> (port-buffer p) length))
 
-(define (port-bytes [p datum]) -> datum
-  (let* ([b (port-buffer p)] [r (make-bytes (-> b length) 0)])
-    (memcpy (bytes-data r) (-> b bytes) (-> b length))
-    r))
+(define (port-bytes [p datum]) -> datum (bytes->datum (buffer-bytes (port-buffer p))))
 
 (define (port-string [p datum] [who datum]) -> datum
   (bytes->string-of (port-bytes p) 0 0 0 who))
@@ -1058,18 +1034,18 @@
 (define (port-flush [p datum])
   (let ([fd (port-fd p)] [b (port-buffer p)])
     (when (< fd 0) (return))
-    (host-write fd (-> b bytes) (-> b length))
+    (host-write fd (buffer-bytes b))
     (when (and (== fd 1) (> (-> b length) 0))
       (set! line-start (== (@ (-> b bytes) (- (-> b length) 1)) 10)))
     (set! (-> b length) 0)))
 
-(define line-start i32 1)
-(define (line-start?) -> i32 line-start)
+(define line-start bool #t)
+(define (line-start?) -> bool line-start)
 
 (define (write-byte-to [p datum] [byte i32])
   (buffer-add-byte! (port-buffer p) byte))
 
-(define (write-value [b (ptr buffer)] [v datum] [display i32])
+(define (write-value [b (ptr buffer)] [v datum] [display bool])
   (cond [(pair? v) (write-pair b v display)]
         [(procedure? v) (buffer-add-string! b "#<procedure>")]
         [(box? v) (buffer-add-string! b "#&") (write-value b (unbox v) display)]
@@ -1077,13 +1053,12 @@
          (buffer-add-string! b "#(")
          (for ([i u32 0]) (< i (vector-length v)) (+= i 1)
            (when (> i 0) (buffer-add-byte! b 32))
-           (write-value b (vector-ref v i) display))
+           (write-value b (vector-item v i) display))
          (buffer-add-byte! b 41)]
-        [(bytes? v) (if display (buffer-add! b (bytes-data v) (bytes-length v)) (write-bytes-value b v))]
+        [(bytes? v) (if display (buffer-add! b (datum->bytes v)) (write-bytes-value b v))]
         [(struct? v)
          (buffer-add-string! b "#<")
-         (let ([n (struct-type-name (-> (cast (ptr struct-block) (block-of v)) type))])
-           (buffer-add! b (symbol-bytes n) (symbol-length n)))
+         (buffer-add-string! b (symbol->string (struct-type-name (-> (cast (ptr struct-block) (block-of v)) type))))
          (buffer-add-byte! b 62)]
         [(table? v) (write-table b v display)]
         [(port? v) (buffer-add-string! b "#<port>")]
@@ -1091,9 +1066,9 @@
         [(record-of? v kind-struct-type) (buffer-add-string! b "#<struct-type>")]
         [else (write-to b v display)]))
 
-(define (write-pair [b (ptr buffer)] [v datum] [display i32])
+(define (write-pair [b (ptr buffer)] [v datum] [display bool])
   (let ([prefix (abbreviation v)] [rest (cdr v)])
-    (when (!= prefix 0)
+    (when (!= (-> prefix length) 0)
       (buffer-add-string! b prefix)
       (return (write-value b (cadr v) display)))
     (buffer-add-byte! b 40)
@@ -1107,9 +1082,9 @@
       (write-value b rest display))
     (buffer-add-byte! b 41)))
 
-(define (abbreviation [v datum]) -> (ptr u8)
+(define (abbreviation [v datum]) -> string
   (let ([head (car v)] [rest (cdr v)])
-    (cond [(or (not (pair? rest)) (not (null? (cdr rest)))) 0]
+    (cond [(or (not (pair? rest)) (not (null? (cdr rest)))) ""]
           [(== head (lit quote)) "'"]
           [(== head (lit quasiquote)) "`"]
           [(== head (lit unquote)) ","]
@@ -1118,13 +1093,13 @@
           [(== head (lit quasisyntax)) "#`"]
           [(== head (lit unsyntax)) "#,"]
           [(== head (lit unsyntax-splicing)) "#,@"]
-          [else 0])))
+          [else ""])))
 
 (define (write-bytes-value [b (ptr buffer)] [v datum])
-  (let ([p (bytes-data v)] [n (bytes-length v)])
+  (let ([t (datum->bytes v)])
     (buffer-add-string! b "#\"")
-    (for ([i u32 0]) (< i n) (+= i 1)
-      (let ([c (cast i32 (@ p i))])
+    (for ([i u32 0]) (< i (-> t length)) (+= i 1)
+      (let ([c (cast i32 (@ t i))])
         (cond [(or (== c 34) (== c 92)) (buffer-add-byte! b 92) (buffer-add-byte! b c)]
               [(and (>= c 32) (< c 127)) (buffer-add-byte! b c)]
               [else
@@ -1134,7 +1109,7 @@
                (buffer-add-byte! b (+ 48 (bit-and c 7)))])))
     (buffer-add-byte! b 34)))
 
-(define (write-table [b (ptr buffer)] [t datum] [display i32])
+(define (write-table [b (ptr buffer)] [t datum] [display bool])
   (let ([kind (-> (table-arg t (lit "write")) kind)] [l (table-walk t 2 (lit "write"))])
     (buffer-add-string! b (cond [(== kind 0) "#hasheq("] [(== kind 1) "#hasheqv("] [else "#hash("]))
     (while (pair? l)
@@ -1143,18 +1118,18 @@
       (when (pair? l) (buffer-add-byte! b 32)))
     (buffer-add-byte! b 41)))
 
-(define (write-to-port [v datum] [p datum] [display i32])
+(define (write-to-port [v datum] [p datum] [display bool])
   (write-value (port-buffer p) v display)
   (port-flush p))
 
-(define (write-value-to [p datum] [v datum] [display i32])
+(define (write-value-to [p datum] [v datum] [display bool])
   (write-value (port-buffer p) v display))
 
 (define (format-error [who datum] [what datum]) -> datum (stop-format who (lit "~a") (cons what nil)))
 (#%fact format-error '(foreign diverges))
 
 (define (out-format [b (ptr buffer)] [who datum] [form datum] [args datum])
-  (let* ([f (string-arg form who)] [p (string-bytes f)] [n (string-length f)] [i u32 0])
+  (let* ([p (datum->string (string-arg form who))] [n (-> p length)] [i u32 0])
     (while (< i n)
       (let ([c (cast i32 (@ p i))])
         (cond [(!= c 126) (buffer-add-byte! b c) (+= i 1)]
@@ -1164,8 +1139,8 @@
                  (cond [(or (== d 126) (== d 37) (== d 110) (== d 78)) (buffer-add-byte! b (if (== d 126) 126 10))]
                        [else
                         (unless (pair? args) (format-error who (lit "the format string takes more arguments than it was given")))
-                        (cond [(or (== d 97) (== d 65)) (write-value b (car args) 1)]
-                              [(or (== d 115) (== d 83) (== d 118) (== d 86) (== d 101) (== d 69)) (write-value b (car args) 0)]
+                        (cond [(or (== d 97) (== d 65)) (write-value b (car args) #t)]
+                              [(or (== d 115) (== d 83) (== d 118) (== d 86) (== d 101) (== d 69)) (write-value b (car args) #f)]
                               [else (format-error who (lit "the format string has an unknown directive"))])
                         (set! args (cdr args))]))
                (+= i 2)])))
@@ -1178,7 +1153,7 @@
 (define (format-value [form datum] [args datum]) -> datum
   (let ([b (make-buffer)] [s datum 0])
     (out-format (& b) (lit "format") form args)
-    (set! s (bytes->string (-> b bytes) (-> b length)))
+    (set! s (string->datum (buffer-string (& b))))
     (buffer-free! (& b))
     s))
 
@@ -1186,27 +1161,27 @@
   (let ([b (make-buffer)])
     (cond [(and (symbol? first) (null? rest))
            (buffer-add-string! (& b) "error: ")
-           (write-value (& b) first 1)]
+           (write-value (& b) first #t)]
           [(symbol? first)
-           (write-value (& b) first 1)
+           (write-value (& b) first #t)
            (buffer-add-string! (& b) ": ")
            (out-format (& b) (lit "error") (car rest) (cdr rest))]
           [else
-           (write-value (& b) first 1)
+           (write-value (& b) first #t)
            (while (pair? rest)
              (buffer-add-byte! (& b) 32)
-             (write-value (& b) (car rest) 0)
+             (write-value (& b) (car rest) #f)
              (set! rest (cdr rest)))])
     (fail-with (& b))))
 (#%fact error-value '(raises))
 
 ;; ---- the host: files, the command line, instantiating code ----
 
-(define (host-message [b (ptr buffer)] [why (ptr u8)])
+(define (host-message [b (ptr buffer)] [why string])
   (buffer-add-string! b why)
-  (free why))
+  (free (-> why bytes)))
 
-(define (host-error [who datum] [why (ptr u8)]) -> datum
+(define (host-error [who datum] [why string]) -> datum
   (let ([b (make-buffer)])
     (out-who (& b) who)
     (buffer-add-string! (& b) ": ")
@@ -1214,40 +1189,25 @@
     (fail-with (& b))))
 
 (define (read-file [path datum] [who datum]) -> datum
-  (let* ([s (string-arg path who)] [n u32 0] [why (ptr u8) 0]
-         [p (fs-read (string-bytes s) (string-length s) (& n) (& why))] [r datum 0])
-    (when (== p 0) (host-error who why))
-    (set! r (make-bytes n 0))
-    (memcpy (bytes-data r) p n)
-    (free p)
+  (let* ([why string] [f (slice u8)] [r datum 0])
+    (when (< (fs-read-file (datum->string (string-arg path who)) (& f) (& why)) 0) (host-error who why))
+    (set! r (bytes->datum f))
+    (free (-> f items))
     r))
 
 (define (file->bytes [path datum]) -> datum (read-file path (lit "file->bytes")))
 (#%fact file->bytes '(raises))
 
-(define (file-exists? [path datum]) -> i32
-  (let* ([s (string-arg path (lit "file-exists?"))] [n (string-length s)] [p (cast (ptr u8) (malloc (+ n 1)))] [found 0])
-    (memcpy p (string-bytes s) n)
-    (set! (@ p n) 0)
-    (set! found (>= (fs-stat p 0) 0))
-    (free p)
-    found))
-
-(define (utf-8? [a (ptr u8)] [n u32]) -> i32
-  (let ([i u32 0] [k u32 0])
-    (while (< i n)
-      (set! k (utf8-sequence a i n))
-      (when (== k 0) (return 0))
-      (+= i k))
-    1))
+(define (file-exists? [path datum]) -> bool
+  (let ([info fs-info]) (>= (fs-stat (datum->string (string-arg path (lit "file-exists?"))) (& info) 0) 0)))
 
 (define (file->string [path datum]) -> datum
   (let ([v (read-file path (lit "file->string"))] [s datum 0])
-    (unless (utf-8? (bytes-data v) (bytes-length v))
+    (unless (utf-8? (datum->bytes v))
       (drop v)
       (let ([b (make-buffer)])
         (buffer-add-string! (& b) "file->string: the file is not UTF-8: ")
-        (write-value (& b) path 1)
+        (write-value (& b) path #t)
         (fail-with (& b))))
     (set! s (bytes->string-of v 0 0 0 (lit "file->string")))
     (drop v)
@@ -1255,9 +1215,9 @@
 (#%fact file->string '(raises))
 
 (define (display-to-file [v datum] [path datum]) -> datum
-  (let* ([s (string-arg path (lit "display-to-file"))] [b (make-buffer)] [why (ptr u8) 0])
-    (write-value (& b) v 1)
-    (when (< (fs-write (string-bytes s) (string-length s) (-> b bytes) (-> b length) (& why)) 0)
+  (let* ([s (string-arg path (lit "display-to-file"))] [b (make-buffer)] [why string])
+    (write-value (& b) v #t)
+    (when (< (fs-write-file (datum->string s) (buffer-bytes (& b)) (& why)) 0)
       (buffer-free! (& b))
       (host-error (lit "display-to-file") why))
     (buffer-free! (& b))
@@ -1265,42 +1225,31 @@
 (#%fact display-to-file '(raises))
 
 (define (command-line-arguments) -> datum
-  (let* ([n 0] [v datum 0] [len u32 0] [p (host-arg 0 0)])
-    (while (!= p 0)
-      (free p)
-      (+= n 1)
-      (set! p (host-arg n 0)))
-    (set! v (make-vector n 0))
-    (for ([i 0]) (< i n) (+= i 1)
-      (let* ([a (host-arg i (& len))] [bytes (make-bytes len 0)])
-        (memcpy (bytes-data bytes) a len)
-        (free a)
+  (let* ([args (host-args)] [v (make-vector (-> args length) 0)])
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1)
+      (let ([bytes (bytes->datum (cast (slice u8) (@ args i)))])
         (vector-set! v i (bytes->string-of bytes 0 0 0 (lit "current-command-line-arguments")))
         (drop bytes)))
+    (free (-> args items))
     v))
 
 (define (instantiate-code [name datum] [code datum] [imports datum]) -> datum
-  (let* ([s (string-arg name (lit "instantiate"))] [a (bytes-arg code (lit "instantiate"))] [l imports] [m (make-buffer)] [r datum 0]
-         [why (ptr u8) 0])
+  (let* ([s (string-arg name (lit "instantiate"))] [a (bytes-arg code (lit "instantiate"))] [l imports]
+         [pairs (cast (ptr string) (malloc (* 16 (length imports))))] [i u32 0] [r datum 0] [why string])
     (while (pair? l)
       (let ([e (car l)])
         (unless (pair? e) (wrong-type (lit "instantiate") (lit "a pair") e))
-        (let ([from (string-arg (car e) (lit "instantiate"))] [to (string-arg (cdr e) (lit "instantiate"))])
-          (buffer-add! (& m) (string-bytes from) (string-length from))
-          (buffer-add-byte! (& m) 0)
-          (buffer-add! (& m) (string-bytes to) (string-length to))
-          (buffer-add-byte! (& m) 0)))
+        (set! (@ pairs i) (datum->string (string-arg (car e) (lit "instantiate"))))
+        (set! (@ pairs (+ i 1)) (datum->string (string-arg (cdr e) (lit "instantiate"))))
+        (+= i 2))
       (set! l (cdr l)))
     (unless (null? l) (wrong-type (lit "instantiate") (lit "a list") imports))
-    (if (== (host-instantiate (string-bytes s) (string-length s) (bytes-data a) (bytes-length a) (-> m bytes) (-> m length) 0
-                              (& why))
-            0)
-        (set! r 0)
-        (let ([b (make-buffer)])
-          (host-message (& b) why)
-          (set! r (bytes->string (-> b bytes) (-> b length)))
-          (buffer-free! (& b))))
-    (buffer-free! (& m))
+    (unless (== (host-instantiate (datum->string s) (datum->bytes a) (slice pairs i) #f (& why)) 0)
+      (let ([b (make-buffer)])
+        (host-message (& b) why)
+        (set! r (string->datum (buffer-string (& b))))
+        (buffer-free! (& b))))
+    (free pairs)
     r))
 
 (define (exit-with [v datum])

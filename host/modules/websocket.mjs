@@ -1,5 +1,6 @@
 // The host module "websocket" (websocket.sub).
 import { errors } from '../errors.mjs';
+import { entries } from '../entries.mjs';
 import { mayUrl, portOfUrl } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
@@ -17,8 +18,8 @@ const BINARY = 2;
 const full = 1 << 20;
 
 // grants is undefined for a page, which may connect anywhere; on Node, guard gives a socket's dispatcher
-// (node/resolve.mjs).
-export function websocket(grants, guard) {
+// (node/resolve.mjs), and node is set, as only Node's WebSocket can send headers.
+export function websocket(grants, guard, node = false) {
   const sockets = new Map();
   let next = 1;
   return (caller) => {
@@ -42,17 +43,27 @@ export function websocket(grants, guard) {
         for (const s of sockets.values()) s.ws.close(1000);
         sockets.clear();
       },
-      connect(ptr, len, tag, err) {
-        const url = caller.string(ptr, len);
+      connect(up, ul, pp, pl, hp, hl, tag, err) {
+        const url = caller.string(up, ul);
         if (grants && URL.canParse(url) && !mayUrl(grants.net, new URL(url))) {
           caller.fail(err, `websocket.connect: ${new URL(url).host} is not granted (--allow-net)`);
           return 0;
         }
+        const protocols = entries(caller.string(pp, pl));
+        const list = entries(caller.string(hp, hl));
+        const headers = [];
+        for (let i = 0; i + 1 < list.length; i += 2) headers.push([list[i], list[i + 1]]);
+        if (headers.length > 0 && !node) {
+          caller.fail(err, 'websocket.connect: a page cannot send headers');
+          return 0;
+        }
         const s = { ws: null, tag, polling: false, opened: false, denied: null };
         try {
-          s.ws = guard && URL.canParse(url)
-            ? new WebSocket(url, { dispatcher: guard(portOfUrl(new URL(url)), (why) => { s.denied = why; }) })
-            : new WebSocket(url);
+          const denied = (why) => {
+            s.denied = why;
+          };
+          const dispatcher = guard && URL.canParse(url) ? guard(portOfUrl(new URL(url)), denied) : undefined;
+          s.ws = node ? new WebSocket(url, { protocols, headers, dispatcher }) : new WebSocket(url, protocols);
         } catch (e) {
           caller.fail(err, e.message);
           return 0;
@@ -63,7 +74,7 @@ export function websocket(grants, guard) {
         ws.binaryType = 'arraybuffer';
         ws.onopen = () => {
           s.opened = true;
-          caller.event(OPEN, id, tag, 0);
+          caller.event(OPEN, id, tag, 0, utf8.encode(ws.protocol));
         };
         ws.onmessage = (e) => {
           if (typeof e.data === 'string') caller.event(MESSAGE, id, tag, TEXT, utf8.encode(e.data));

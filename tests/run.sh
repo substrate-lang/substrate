@@ -20,6 +20,8 @@ same_program() {
 
 pass=0
 fail=0
+built=0
+unbuilt=0
 
 # A certificate for the TLS tests, which their clients trust because it is granted.
 mkdir -p "$builds/tls"
@@ -27,7 +29,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
 
 tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
-       tests/crypto/*.sub tests/encoding/*.sub)
+       tests/crypto/*.sub tests/encoding/*.sub tests/meta/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   dir="$(dirname "$t")"
@@ -62,6 +64,18 @@ for t in "${tests[@]}"; do
     fail=$((fail + 1))
     echo "FAIL $base: $problem"
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
+  fi
+done
+# Each module in lib, bench, host and tests/web builds, except the pieces in bench/bend/compile.
+mapfile -t modules < <(find lib bench host tests/web -name '*.sub' -not -path 'bench/bend/compile/*' | sort)
+for m in "${modules[@]}"; do
+  actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
+  if [ $? -eq 0 ]; then
+    built=$((built + 1))
+  else
+    unbuilt=$((unbuilt + 1))
+    echo "FAIL $m: does not build"
+    echo "$actual" | head -10
   fi
 done
 # The event tests again, against the real modules and the server in tests/events/fixtures.
@@ -168,5 +182,6 @@ else
   fail=$((fail + 1))
   echo "FAIL changed sources: a changed srcloc is not refused"
 fi
+echo "$built modules built, $unbuilt failed"
 echo "$pass passed, $fail failed; $again built again from the cache"
-[ $fail -eq 0 ]
+[ $fail -eq 0 ] && [ $unbuilt -eq 0 ]

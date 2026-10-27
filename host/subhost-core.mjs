@@ -298,16 +298,13 @@ export function createHost(platform) {
     };
   }
 
-  // giveIn copies bytes into a block from memory m's malloc, ended by a zero, and stores the length at out unless out
-  // is 0.
+  // giveIn copies bytes into a block from memory m's malloc, and stores the length at out unless out is 0.
   function giveIn(m, bytes, out, who) {
     const malloc = m && allocators.get(m);
     if (!malloc) hostTrap(`${who}: the caller's memory has no malloc`);
-    const p = malloc(bytes.length + 1) >>> 0;
+    const p = malloc(bytes.length) >>> 0;
     if (p === 0) hostTrap(`${who}: out of memory`);
-    const view = new Uint8Array(m.buffer);
-    view.set(bytes, p);
-    view[p + bytes.length] = 0;
+    new Uint8Array(m.buffer).set(bytes, p);
     if (out) new DataView(m.buffer).setUint32(out >>> 0, bytes.length, true);
     return p;
   }
@@ -332,7 +329,7 @@ export function createHost(platform) {
       give,
       fail(err, message) {
         if (!err) return;
-        const p = give(utf8.encode(message), 0);
+        const p = give(utf8.encode(message), u(err) + 4);
         new DataView(memory().buffer).setUint32(u(err), p, true);
       },
       event(kind, id, tag, value, bytes, data) {
@@ -557,7 +554,8 @@ export function createHost(platform) {
       // When on-trap returns 0, or there is none, the error is reported and the program ends.
       if (onTrap && allocators.has(entry.memory)) {
         try {
-          if (onTrap(giveIn(entry.memory, utf8.encode(lastError), 0, 'on-trap')) !== 0) return false;
+          const message = utf8.encode(lastError);
+          if (onTrap(giveIn(entry.memory, message, 0, 'on-trap'), message.length) !== 0) return false;
         } catch (e2) {
           if (e2 instanceof Exit) {
             end(e2.code, '');
