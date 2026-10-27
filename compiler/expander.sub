@@ -622,8 +622,10 @@
         (set! (@ digits k) (if (< d 10) (+ 48 d) (+ 87 d)))))
     (string->datum (cast string (slice digits)))))
 
+;; A manifest with dependencies is part of the hash of its package's modules, since it gives their names meaning.
 (define (module-hash [path datum] [text datum] [requires datum]) -> datum
-  (let ([parts `(,path ,text)])
+  (let* ([m (manifest-at (directory-path (absolute-of path)))]
+         [parts (if (or (== m 0) (null? (manifest-requires m))) `(,path ,text) `(,path ,text ,(manifest-text m)))])
     (while (pair? requires)
       (set! parts (append parts `(,(car (car requires)) ,(format "~a" (list1 (cadr (car requires)))))))
       (set! requires (cdr requires)))
@@ -632,13 +634,136 @@
 (define (package-file [path datum]) -> datum
   (if (absolute-path? path) path (concat (package-directory) (concat '"/" path))))
 
-(define (source-text [path datum]) -> datum
+(define (source-text [path datum]) -> datum (file-text (package-file path)))
+
+(define (file-text [file datum]) -> datum
   (let* ([why string] [b (slice u8)] [s datum 0])
-    (when (< (fs-read-file (datum->string (package-file path)) (& b) (& why)) 0)
+    (when (< (fs-read-file (datum->string file) (& b) (& why)) 0)
       (fail-at 0 "cannot read the module ~a" (list1 (host-error why))))
     (set! s (string->datum (cast string b)))
     (free (-> b items))
     s))
+
+;; ---- packages ----
+
+;; A manifest is package.sub at a package's root, or a program's first form: (package name clause ...), with the
+;; clauses (version "v"), (requires (name (path "dir")) ...) and (wasm "file"). As read, it is (root text requires),
+;; requires pairing each dependency's name with its directory. manifests holds what each directory's package has.
+(define manifests hash-table)
+(define inline-manifests hash-table)
+
+(define (manifest-root [m datum]) -> datum (car m))
+(define (manifest-text [m datum]) -> datum (cadr m))
+(define (manifest-requires [m datum]) -> datum (caddr m))
+
+(define (absolute-of [path datum]) -> datum (resolve-segments (package-file path)))
+
+(define (directory-path [path datum]) -> datum
+  (let ([slash (last-byte-index path #\/)])
+    (cond [(> slash 0) (substring path 0 (cast u32 slash))]
+          [(== slash 0) '"/"]
+          [else '""])))
+
+(define (file-in [dir datum] [name datum]) -> datum
+  (cond [(== (-> (datum->string dir) length) 0) name]
+        [(equal? dir '"/") (concat dir name)]
+        [else (concat dir (concat '"/" name))]))
+
+(define (kind-of [path datum]) -> i32
+  (let ([info fs-info])
+    (if (< (fs-stat (datum->string path) (& info) 0) 0) 0 (-> info kind))))
+
+;; manifest-at gives the manifest of the package holding dir, an absolute directory, or 0.
+(define (manifest-at [dir datum]) -> datum
+  (let* ([key (cast u64 (symbol-of dir))] [known (cast datum (hash-ref (& manifests) key))]
+         [file (file-in dir '"package.sub")] [m datum 0])
+    (when (!= known 0) (return (if (equal? known 'none) 0 known)))
+    (cond [(== (kind-of file) fs-file) (set! m (read-manifest file dir))]
+          [(or (equal? dir '"/") (== (-> (datum->string dir) length) 0)) (begin)]
+          [else (set! m (manifest-at (directory-path dir)))])
+    (hash-set! (& manifests) key (cast u32 (if (== m 0) 'none m)))
+    m))
+
+(define (read-manifest [file datum] [root datum]) -> datum
+  (let* ([text (file-text file)] [forms (read-text text (symbol-of file))])
+    (unless (and (pair? forms) (null? (cdr forms))) (fail-at 0 "~a holds one form, (package name ...)" (list1 file)))
+    (manifest-from (car forms) root text)))
+
+(define (manifest-from [form datum] [root datum] [text datum]) -> datum
+  (let ([d (syntax->datum form)] [requires nil] [cs datum 0])
+    (unless (and (pair? d) (equal? (car d) 'package) (pair? (cdr d)) (symbol? (cadr d)))
+      (fail-at form "expected (package name clause ...)" nil))
+    (set! cs (cddr d))
+    (while (pair? cs)
+      (let ([c (car cs)])
+        (cond [(and (pair? c) (or (equal? (car c) 'version) (equal? (car c) 'wasm)) (pair? (cdr c)) (string? (cadr c))
+                    (null? (cddr c)))
+               (begin)]
+              [(and (pair? c) (equal? (car c) 'requires))
+               (let ([rs (cdr c)])
+                 (while (pair? rs)
+                   (set! requires (cons (dependency (car rs) root form) requires))
+                   (set! rs (cdr rs))))]
+              [else (fail-at form "a package's clauses are (version \"v\"), (requires ...) and (wasm \"file\"), not ~s"
+                             (list1 c))]))
+      (set! cs (cdr cs)))
+    (keep `(,root ,text ,(reverse requires)))))
+
+(define (dependency [r datum] [root datum] [form datum]) -> datum
+  (unless (and (pair? r) (symbol? (car r)) (pair? (cdr r)) (null? (cddr r)) (pair? (cadr r))
+               (equal? (car (cadr r)) 'path) (pair? (cdr (cadr r))) (string? (cadr (cadr r))) (null? (cddr (cadr r))))
+    (fail-at form "a dependency is (name (path \"dir\")), not ~s" (list1 r)))
+  (let ([dir (cadr (cadr r))])
+    (cons (car r) (resolve-segments (if (absolute-path? dir) dir (file-in root dir))))))
+
+;; program-forms gives a module's forms without a first (package ...) form, which becomes its own manifest.
+(define (program-forms [path datum] [forms datum]) -> datum
+  (let ([d (if (pair? forms) (syntax->datum (car forms)) 0)])
+    (if (and (pair? d) (equal? (car d) 'package))
+        (begin
+          (hash-set! (& inline-manifests) (cast u64 (symbol-of path))
+                     (cast u32 (manifest-from (car forms) (directory-path (absolute-of path)) '"")))
+          (cdr forms))
+        forms)))
+
+;; The manifest names in the module at path resolve through: its own, or its package's.
+(define (module-manifest [path datum]) -> datum
+  (let ([own (hash-ref (& inline-manifests) (cast u64 (symbol-of path)))])
+    (if (!= own 0) (cast datum own) (manifest-at (directory-path (absolute-of path))))))
+
+(define (clean-name? [s string]) -> bool
+  (let ([start u32 0])
+    (for ([i u32 0]) (<= i (-> s length)) (+= i 1)
+      (when (or (== i (-> s length)) (== (@ s i) #\/))
+        (let ([part (slice s start i)])
+          (when (or (== (-> part length) 0) (== part ".") (== part "..")) (return #f)))
+        (set! start (+ i 1))))
+    #t))
+
+;; name-path gives the file a name means in the module at path. Its first part is a dependency in the module's
+;; manifest, or else host or a directory of lib; name/rest is rest.sub there, and name alone name.sub.
+(define (name-path [id datum] [path datum]) -> datum
+  (let* ([s (symbol->string (syntax-e id))] [n (-> s length)] [slash u32 0] [m (module-manifest path)]
+         [head datum 0] [dep datum 0] [dir datum 0])
+    (unless (clean-name? s) (fail-at id "~a is not a module name: its parts may not be empty, . or .." (list1 (syntax-e id))))
+    (while (and (< slash n) (!= (@ s slash) #\/)) (+= slash 1))
+    (set! head (string->datum (slice s 0 slash)))
+    (set! dep (if (== m 0) 0 (assoc (string->symbol (slice s 0 slash)) (manifest-requires m))))
+    (set! dir (cond [(!= dep 0) (cdr dep)]
+                    [(equal? head '"host") (file-in repository-root '"host")]
+                    [(== (kind-of (file-in repository-root (concat '"lib/" head))) fs-directory)
+                     (file-in repository-root (concat '"lib/" head))]
+                    [else (fail-at id "no package provides ~a: it is neither a dependency nor in the standard library"
+                                   (list1 head))]))
+    (file-in dir (concat (if (== slash n) head (string->datum (slice s (+ slash 1) n))) '".sub"))))
+
+;; inside-package! refuses a path that leaves the root of the package the module at from belongs to.
+(define (inside-package! [spec datum] [from datum] [path datum])
+  (let* ([m (manifest-at (directory-path (absolute-of from)))] [root (if (== m 0) '"" (manifest-root m))]
+         [to (datum->string (absolute-of path))] [r (datum->string root)])
+    (unless (or (== m 0) (== r "/")
+                (and (> (-> to length) (-> r length)) (== (slice to 0 (-> r length)) r) (== (@ to (-> r length)) #\/)))
+      (fail-at spec "~a leaves the root of its package, ~a" `(,(syntax-e spec) ,root)))))
 
 (define (compile-module-file [source datum]) -> datum
   (let* ([path (canonical-path source)] [key (cast u64 (symbol-of path))]
@@ -652,7 +777,8 @@
              (set! compiling (keep-cons (symbol-of path) compiling))
              (begin-module-arena)
              (set! current (new-comp m))
-             (try (set! (-> (unit-of m) code) (expand-module-body (read-text text (symbol-of path)) #f))
+             (try (set! (-> (unit-of m) code)
+                        (expand-module-body (program-forms path (read-text text (symbol-of path))) #f))
                   (finish-module! text)
                   [catch-all
                    (hash-set! (& registry) key 0)
@@ -673,7 +799,7 @@
       (hash-set! (& registry) (cast u64 (symbol-of path)) (cast u32 m))
       (begin-module-arena)
       (set! current (new-comp m))
-      (let ([forms (expand-module-body (read-text text (symbol-of path)) #t)])
+      (let ([forms (expand-module-body (program-forms path (read-text text (symbol-of path))) #t)])
         (while (pair? forms)
           (f (car forms))
           (set! forms (cdr forms))))
@@ -1588,7 +1714,7 @@
             (for-each (lambda ([p datum]) (bind-import! (car names) phase (cdr p))) ps))
           (set! items (cdr items)))))))
 
-(define (module-source? [s datum]) -> bool (string-literal? s))
+(define (module-source? [s datum]) -> bool (or (string-literal? s) (identifier? s)))
 
 (define (qualified [name datum] [sym datum]) -> datum
   (datum->syntax name (string->symbol (format-message "~a:~a" `(,(syntax-e name) ,sym))) name))
@@ -1600,11 +1726,17 @@
 
 (define (symbol<? [a datum] [b datum]) -> bool (< (symbol->string a) (symbol->string b)))
 
+;; module-path-of gives the file a require's source names: a name through the manifest where it was written, or a path
+;; from that file's directory, which must not leave its package's root.
 (define (module-path-of [f datum] [spec datum]) -> datum
   (let* ([loc (if (!= (syntax-srcloc spec) 0) (syntax-srcloc spec) (syntax-srcloc f))]
-         [dir (if (!= loc 0) (directory-of (string->datum (symbol->string (-> loc source)))) '"")]
-         [given (syntax-e spec)])
-    (if (absolute-path? given) given (concat dir given))))
+         [from (if (!= loc 0) (string->datum (symbol->string (-> loc source))) 0)]
+         [dir (if (!= from 0) (directory-of from) '"")]
+         [given (syntax-e spec)] [path datum 0])
+    (when (identifier? spec) (return (name-path spec (if (!= from 0) from (-> (the-module) path)))))
+    (set! path (if (absolute-path? given) given (concat dir given)))
+    (unless (== (syntax-srcloc spec) 0) (inside-package! spec from path))
+    path))
 
 (define (require-module! [f datum] [name datum] [spec datum] [phase i32]) -> datum
   (let ([path (canonical-path (module-path-of f spec))])
@@ -2230,7 +2362,7 @@
 
 (define (session-eval-file! [source datum] [report (closure (datum))])
   (let* ([path (canonical-path source)] [text (source-text path)]
-         [forms (read-text text (symbol-of path))])
+         [forms (program-forms path (read-text text (symbol-of path)))])
     (while (pair? forms)
       (unless (session-eval! (list1 (car forms))) (report (session-error)))
       (set! forms (cdr forms)))))
