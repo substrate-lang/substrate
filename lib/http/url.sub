@@ -1,0 +1,131 @@
+;; The parts of a request's target: its path and query, percent-decoding and encoding, a path's segments, and the
+;; application/x-www-form-urlencoded format of queries and form bodies, after the WHATWG URL Standard.
+(provide url-pair url-path url-query url-unescape url-segments url-add-clean! url-add-segment! url-add-form-value!
+         url-form-parse url-form-value)
+
+(struct url-pair [name string] [value string])
+
+(define (url-path [target string]) -> string
+  (let ([i u32 0])
+    (while (and (< i (-> target length)) (!= (@ target i) #\?)) (+= i 1))
+    (slice target 0 i)))
+
+(define (url-query [target string]) -> string
+  (let ([i u32 0])
+    (while (and (< i (-> target length)) (!= (@ target i) #\?)) (+= i 1))
+    (if (< i (-> target length)) (slice target (+ i 1)) "")))
+
+(define (escape? [s string] [i u32]) -> bool
+  (and (== (@ s i) #\%) (< (+ i 2) (-> s length))
+       (>= (digit-value (@ s (+ i 1)) 16) 0) (>= (digit-value (@ s (+ i 2)) 16) 0)))
+
+;; url-unescape decodes s's percent-escapes, and its pluses as spaces when plus is set, into the arena; s itself when
+;; it has none. A % without two hex digits after it stays as it is.
+(define (url-unescape [a (ptr arena)] [s string] [plus bool]) -> string
+  (let ([n (-> s length)] [plain #t])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (or (escape? s i) (and plus (== (@ s i) #\+))) (set! plain #f)))
+    (when plain (return s))
+    (let ([p (cast (ptr u8) (arena-alloc a n))] [i u32 0] [k u32 0])
+      (while (< i n)
+        (cond [(escape? s i)
+               (set! (@ p k) (+ (* 16 (digit-value (@ s (+ i 1)) 16)) (digit-value (@ s (+ i 2)) 16)))
+               (+= i 3)]
+              [(and plus (== (@ s i) #\+))
+               (set! (@ p k) 32)
+               (+= i 1)]
+              [else
+               (set! (@ p k) (@ s i))
+               (+= i 1)])
+        (+= k 1))
+      (cast string (slice p k)))))
+
+;; url-segments splits a path into its segments after the first slash, each decoded, into the arena: "/" has none, and
+;; a path that ends in a slash ends with an empty segment. It returns 1 when an empty segment comes before the end or a
+;; segment is . or .., which url-add-clean! resolves, and -1 when the path does not start with a slash.
+(define (url-segments [a (ptr arena)] [path string] [to (ptr (slice string))]) -> i32
+  (let ([n (-> path length)] [count u32 1] [k u32 0] [start u32 1] [unclean #f])
+    (set! (@ to) 0)
+    (when (or (== n 0) (!= (@ path 0) #\/)) (return -1))
+    (when (== n 1) (return 0))
+    (for ([i u32 1]) (< i n) (+= i 1) (when (== (@ path i) #\/) (+= count 1)))
+    (let ([items (cast (ptr string) (arena-alloc a (* count (sizeof string))))])
+      (for ([i u32 1]) (<= i n) (+= i 1)
+        (when (or (== i n) (== (@ path i) #\/))
+          (let ([s (url-unescape a (slice path start i) #f)])
+            (when (or (== s ".") (== s "..") (and (== (-> s length) 0) (< i n))) (set! unclean #t))
+            (set! (@ items k) s)
+            (+= k 1)
+            (set! start (+ i 1)))))
+      (set! (@ to) (slice items k))
+      (if unclean 1 0))))
+
+;; url-add-clean! adds the path the segments name once empty, . and .. segments are resolved, as Go's path.Clean does,
+;; ending in a slash when the segments end in an empty, . or .. segment.
+(define (url-add-clean! [b (ptr buffer)] [segments (slice string)])
+  (let* ([n (-> segments length)] [kept (cast (ptr u32) (malloc (* 4 (+ n 1))))] [k u32 0]
+         [last (if (> n 0) (@ segments (- n 1)) "x")] [slash (or (== last "") (== last ".") (== last ".."))])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let ([s (@ segments i)])
+        (cond [(or (== s "") (== s ".")) (begin)]
+              [(== s "..") (when (> k 0) (-= k 1))]
+              [else
+               (set! (@ kept k) i)
+               (+= k 1)])))
+    (when (== k 0) (buffer-add-byte! b #\/))
+    (for ([j u32 0]) (< j k) (+= j 1)
+      (buffer-add-byte! b #\/)
+      (url-add-segment! b (@ segments (@ kept j))))
+    (when (and slash (> k 0)) (buffer-add-byte! b #\/))
+    (free kept)))
+
+(define hex-digits string "0123456789ABCDEF")
+
+(define (add-escape! [b (ptr buffer)] [c u8])
+  (buffer-add-byte! b #\%)
+  (buffer-add-byte! b (@ hex-digits (cast u32 (>> c 4))))
+  (buffer-add-byte! b (@ hex-digits (cast u32 (bit-and c 15)))))
+
+(define (alphanumeric? [c u8]) -> bool
+  (or (and (>= c #\a) (<= c #\z)) (and (>= c #\A) (<= c #\Z)) (and (>= c #\0) (<= c #\9))))
+
+;; url-add-segment! adds s as one path segment, escaping what Go's PathEscape escapes.
+(define (url-add-segment! [b (ptr buffer)] [s string])
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (let ([c (@ s i)])
+      (if (or (alphanumeric? c)
+              (case c [(#\- #\. #\_ #\~ #\! #\$ #\& #\' #\( #\) #\* #\+ #\, #\; #\= #\: #\@) #t] [else #f]))
+          (buffer-add-byte! b c)
+          (add-escape! b c)))))
+
+;; url-add-form-value! adds s as a name or value of the urlencoded format.
+(define (url-add-form-value! [b (ptr buffer)] [s string])
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (let ([c (@ s i)])
+      (cond [(or (alphanumeric? c) (== c #\*) (== c #\-) (== c #\.) (== c #\_)) (buffer-add-byte! b c)]
+            [(== c 32) (buffer-add-byte! b #\+)]
+            [else (add-escape! b c)]))))
+
+;; url-form-parse reads an application/x-www-form-urlencoded string into its pairs, decoded into the arena.
+(define (url-form-parse [a (ptr arena)] [s string]) -> (slice url-pair)
+  (let ([n (-> s length)] [count u32 1] [k u32 0] [start u32 0])
+    (for ([i u32 0]) (< i n) (+= i 1) (when (== (@ s i) #\&) (+= count 1)))
+    (let ([pairs (cast (ptr url-pair) (arena-alloc a (* count (sizeof url-pair))))])
+      (for ([i u32 0]) (<= i n) (+= i 1)
+        (when (or (== i n) (== (@ s i) #\&))
+          (when (> i start)
+            (let ([part (slice s start i)] [e u32 0])
+              (while (and (< e (-> part length)) (!= (@ part e) #\=)) (+= e 1))
+              (set! (-> (+ pairs k) name) (url-unescape a (slice part 0 e) #t))
+              (set! (-> (+ pairs k) value) (url-unescape a (if (< e (-> part length)) (slice part (+ e 1)) "") #t))
+              (+= k 1)))
+          (set! start (+ i 1))))
+      (slice pairs k))))
+
+;; url-form-value finds the first pair with the name.
+(define (url-form-value [pairs (slice url-pair)] [name string] [to (ptr string)]) -> bool
+  (for ([i u32 0]) (< i (-> pairs length)) (+= i 1)
+    (when (== (-> (+ (-> pairs items) i) name) name)
+      (set! (@ to) (-> (+ (-> pairs items) i) value))
+      (return #t)))
+  #f)
