@@ -1,0 +1,78 @@
+;; Conditional requests, RFC 9110's preconditions checked in its order, as Go's ServeContent checks them.
+;; http-conditional! gives the answer the validators etag, unless empty, and modified, the time of the last change in
+;; milliseconds since 1970, unless 0; then it answers 412 when If-Match or If-Unmodified-Since fails, or 304 to GET or
+;; HEAD when If-None-Match or If-Modified-Since finds nothing new, and returns #t when it has answered. Headers added
+;; to the answer before, such as its Cache-Control, go with a 304 too. http-if-range? tells whether a Range header
+;; holds: when there is no If-Range, or it names the same strong ETag or the same date.
+(require-unqualified http "http.sub")
+(require-unqualified server "server.sub")
+
+(provide http-conditional! http-if-range?)
+
+;; The entity tag at the start of s, W/"..." or "...", with the rest of s after it; "" when there is none.
+(define (etag-at [s string] [rest (ptr string)]) -> string
+  (let* ([t (http-trimmed s)] [start (if (and (>= (-> t length) 2) (== (slice t 0 2) "W/")) 2 0)])
+    (when (or (< (- (-> t length) start) 2) (!= (@ t start) 34)) (return ""))
+    (for ([i u32 (+ start 1)]) (< i (-> t length)) (+= i 1)
+      (let ([c (@ t i)])
+        (when (== c 34)
+          (set! (@ rest) (slice t (+ i 1)))
+          (return (slice t 0 (+ i 1))))
+        (unless (or (== c 33) (and (>= c 35) (<= c 126)) (>= c 128)) (return ""))))
+    ""))
+
+(define (weak? [tag string]) -> bool (and (>= (-> tag length) 2) (== (slice tag 0 2) "W/")))
+
+(define (opaque [tag string]) -> string (if (weak? tag) (slice tag 2) tag))
+
+;; matches? tells whether a list of entity tags, or *, names etag: by strong comparison, or else by weak.
+(define (matches? [list string] [etag string] [strong bool]) -> bool
+  (let ([s list])
+    (while #t
+      (set! s (http-trimmed s))
+      (when (== (-> s length) 0) (return #f))
+      (cond [(== (@ s 0) 44) (set! s (slice s 1))]
+            [(== (@ s 0) 42) (return #t)]
+            [else
+             (let* ([rest string] [tag (etag-at s (& rest))])
+               (when (== (-> tag length) 0) (return #f))
+               (when (and (> (-> etag length) 0)
+                          (if strong
+                              (and (not (weak? tag)) (not (weak? etag)) (== tag etag))
+                              (== (opaque tag) (opaque etag))))
+                 (return #t))
+               (set! s rest))]))
+    #f))
+
+;; The time a date header names, in milliseconds since 1970, or -1 when there is none or it is not a date.
+(define (date-of [r (ptr http-request)] [name string]) -> f64
+  (let ([ms f64 0.0])
+    (if (http-date (http-request-header r name) (& ms)) ms -1.0)))
+
+;; Dates in headers count whole seconds.
+(define (second-of [ms f64]) -> f64 (* (floor (/ ms 1000.0)) 1000.0))
+
+(define (http-conditional! [r (ptr http-request)] [etag string] [modified f64]) -> bool
+  (let* ([a (& (-> r arena))] [copy (cast (ptr u8) (arena-alloc a (-> etag length)))]
+         [read? (or (== (-> r method) "GET") (== (-> r method) "HEAD"))]
+         [if-match (http-request-header r "if-match")] [if-none-match (http-request-header r "if-none-match")]
+         [unmodified (date-of r "if-unmodified-since")] [since (date-of r "if-modified-since")]
+         [changed (second-of modified)] [status i32 0])
+    (memcpy copy (-> etag bytes) (-> etag length))
+    (set! (-> r etag) (cast string (slice copy (-> etag length))))
+    (set! (-> r modified) modified)
+    (cond [(> (-> if-match length) 0) (unless (matches? if-match etag #t) (set! status 412))]
+          [(and (>= unmodified 0.0) (> modified 0.0) (> changed unmodified)) (set! status 412)])
+    (when (== status 0)
+      (cond [(> (-> if-none-match length) 0) (when (matches? if-none-match etag #f) (set! status (if read? 304 412)))]
+            [(and read? (>= since 0.0) (> modified 0.0) (<= changed since)) (set! status 304)]))
+    (when (== status 0) (return #f))
+    (http-respond! r status)
+    (http-finish! r)
+    #t))
+
+(define (http-if-range? [r (ptr http-request)] [etag string] [modified f64]) -> bool
+  (let* ([v (http-request-header r "if-range")] [rest string] [tag (etag-at v (& rest))] [ms f64 0.0])
+    (cond [(== (-> v length) 0) #t]
+          [(> (-> tag length) 0) (and (not (weak? tag)) (not (weak? etag)) (== tag etag))]
+          [else (and (> modified 0.0) (http-date (http-trimmed v) (& ms)) (== ms (second-of modified)))])))

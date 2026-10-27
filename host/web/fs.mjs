@@ -115,9 +115,9 @@ export function pageFiles(files, cwd, grants) {
       throw new Error(`too many temporary ${file ? 'files' : 'directories'} exist`);
     },
     cwd: () => cwd,
-    open(p, mode) {
+    open(p, mode, start = 0) {
       if (mode === 0) {
-        const bytes = read(p);
+        const bytes = read(p).subarray(start);
         let given = false;
         return { pull: async () => (given ? null : ((given = true), bytes)), close() {} };
       }
