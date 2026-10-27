@@ -1,7 +1,7 @@
 // run.mjs OUT REPS: each phase in a fresh server (OUT/server), its connections left open while the heap's growth and
-// the process's resident memory are read: idle keep-alive connections, event streams, WebSockets, connections after a
-// 1 MB answer, and a burst of small requests on 50 connections with its rate. Then the compiler building itself, the
-// best of REPS.
+// the process's resident memory are read: idle keep-alive connections, event streams, as they are and gzipped,
+// WebSockets, connections after a 1 MB answer, and a burst of small requests on 50 connections with its rate. Then the
+// compiler building itself, the best of REPS.
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
@@ -95,6 +95,8 @@ const burst = async (port) => {
 const phases = [
   ['idle keep-alive', 10000, (port) => many(10000, () => open(port, get('/'), answered))],
   ['event streams', 10000, (port) => many(10000, () => open(port, get('/events'), (t) => t.includes('data: open')))],
+  ['gzipped streams', 10000, (port) => many(10000, () => open(port, get('/events', 'accept-encoding: gzip\r\n'),
+    (t) => t.includes('\x1f\x8b')))],
   ['websockets', 1000, (port) => many(1000, () => open(port, upgrade, (t) => t.includes('\r\n\r\n')))],
   ['after 1 MB', 20, (port) => many(20, () => open(port, get('/large'), large))],
   ['burst', 20000, burst],
