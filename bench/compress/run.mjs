@@ -1,5 +1,5 @@
-// run.mjs OUT REPS FILE...: ours (OUT/ours), zlib as wasm (OUT/zlib.wasm, run here) and native (OUT/zlib.native) on each
-// file: deflate at levels 1, 6 and 9 and inflate of level 6 in MB/s, the sizes, and the round trips both ways.
+// run.mjs OUT REPS FILE...: ours (OUT/ours), zlib as wasm (OUT/zlib.wasm, run here) and native (OUT/zlib.native) on
+// each file: deflate at levels 1, 6 and 9 and inflate of level 6 in MB/s, the sizes, and the round trips both ways.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,8 +30,9 @@ const run = (command, args) => {
 for (const f of fs.readdirSync(out)) if (f.endsWith('.deflate')) fs.rmSync(path.join(out, f));
 const dirs = [...new Set(files.map((f) => path.dirname(f)))];
 const native = parse(run(`${out}/zlib.native`, [reps, out, ...files]));
-const ours = parse(run(process.execPath, [...process.execArgv, `${root}/host/subhost.mjs`, ...dirs.map((d) => `-R=${d}`),
-  `-R=${out}`, `-W=${out}`, `${out}/ours`, reps, out, ...files]));
+const grants = [...dirs.map((d) => `-R=${d}`), `-R=${out}`, `-W=${out}`];
+const ours = parse(run(process.execPath, [...process.execArgv, `${root}/host/subhost.mjs`, ...grants, `${out}/ours`, reps,
+  out, ...files]));
 const checked = parse(run(`${out}/zlib.native`, ['0', out, ...files]));
 const wasi = new WASI({
   version: 'preview1',
@@ -59,7 +60,8 @@ for (const phase of phases) {
 }
 console.log('\nper file: deflate 6 MB/s ours, zlib wasm, zlib; size ours, zlib');
 for (const n of names) {
-  console.log(`${n.replace(/^[0-9a-z]{32}-/, '').padEnd(18)}${[ours, wasm, native].map((s) => mbs(s[n].size, s[n].d6.ms).padStart(8)).join('')}`
+  const speeds = [ours, wasm, native].map((s) => mbs(s[n].size, s[n].d6.ms).padStart(8)).join('');
+  console.log(`${n.replace(/^[0-9a-z]{32}-/, '').padEnd(18)}${speeds}`
     + `${String(ours[n].d6.bytes).padStart(11)}${String(native[n].d6.bytes).padStart(11)}`);
 }
 const fails = [];

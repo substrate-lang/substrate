@@ -741,6 +741,14 @@ const checks = {
     check('events: the browser\'s EventSource reads the same', native,
       'open | message 1 first | named 2 a\nb | lost | open | message 3 resumed after 2 | lost | closed');
     const fetched = (js) => page.evaluate(`(async () => { ${js} })()`);
+    check('events: a script and the event stream come gzipped, and the browser reads them', await fetched(
+      `const r = await fetch("/host/web/subhost-web.mjs");
+       const script = await r.text();
+       const e = await fetch("/events");
+       const stream = await e.text();
+       return [r.headers.get("content-encoding"), script.startsWith("// The host for a web page"),
+               e.headers.get("content-encoding"), stream.includes("data: first")].join(" ");`),
+    'gzip true gzip true');
     check('events: a POST from the same origin passes cross-origin protection', await fetched(
       'const r = await fetch("/guarded", { method: "POST", body: "x" }); return r.status + " " + await r.text();'),
     '200 posted');

@@ -1,8 +1,8 @@
 // run.mjs OUT: Caddy, then nginx, over TLS with OUT/cert.pem, in front of a server (OUT/server) started fresh for
 // each: the client's address and scheme as the server sees them, the client having sent an X-Forwarded-For of its
-// own; two events that come half a second apart rather than together; a WebSocket from a page's origin that the
-// server's pings keep open past nginx's read timeout and that still echoes; and a request in hand, answered as the
-// server shuts down at SIGTERM, after which it exits 0.
+// own; two events that come half a second apart rather than together, as they are and gzipped; a WebSocket from a
+// page's origin that the server's pings keep open past nginx's read timeout and that still echoes; and a request in
+// hand, answered as the server shuts down at SIGTERM, after which it exits 0.
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
@@ -10,6 +10,7 @@ import https from 'node:https';
 import net from 'node:net';
 import path from 'node:path';
 import tls from 'node:tls';
+import zlib from 'node:zlib';
 
 const [out] = process.argv.slice(2);
 const here = path.dirname(new URL(import.meta.url).pathname);
@@ -89,18 +90,21 @@ const get = (port, target, headers) => new Promise((resolve, reject) => {
   }).on('error', reject).end();
 });
 
-// events gives when each event came, in milliseconds from the request.
-const events = (port) => new Promise((resolve, reject) => {
+// events gives when each event came, in milliseconds from the request, and the stream's encoding; asked for gzip, it
+// inflates the stream as it comes.
+const events = (port, zipped) => new Promise((resolve, reject) => {
   const start = performance.now();
   const times = {};
-  https.request(options(port, '/events', { accept: 'text/event-stream' }), (res) => {
+  const headers = zipped ? { accept: 'text/event-stream', 'accept-encoding': 'gzip' } : { accept: 'text/event-stream' };
+  https.request(options(port, '/events', headers), (res) => {
+    const body = zipped ? res.pipe(zlib.createGunzip()) : res;
     let text = '';
-    res.setEncoding('utf8');
-    res.on('data', (d) => {
+    body.setEncoding('utf8');
+    body.on('data', (d) => {
       text += d;
       for (const name of ['one', 'two']) if (!(name in times) && text.includes(`data: ${name}`)) times[name] = performance.now() - start;
     });
-    res.on('end', () => resolve(times));
+    body.on('end', () => resolve({ ...times, encoding: res.headers['content-encoding'] ?? 'none' }));
   }).on('error', reject).end();
 });
 
@@ -169,8 +173,11 @@ for (const [name, start] of Object.entries(proxies)) {
     await ready(port);
     check(`${name}: the client's address and scheme`, await get(port, '/address', { 'x-forwarded-for': '1.2.3.4' }),
       '200 127.0.0.1 https');
-    const times = await events(port);
+    const times = await events(port, false);
     check(`${name}: an event comes before the next is sent`, times.one < 400 && times.two >= 450, true);
+    const zipped = await events(port, true);
+    check(`${name}: a gzipped event comes before the next is sent`,
+      `${zipped.encoding} ${zipped.one < 400 && zipped.two >= 450}`, 'gzip true');
     check(`${name}: a WebSocket kept open by pings`, await websocket(port), 'echoed after 4 s');
     const slow = get(port, '/slow');
     await pause(300);

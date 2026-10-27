@@ -4,8 +4,11 @@
 ;; 127.0.0.1 when empty; secure for TLS; most to the most connections at once, no limit when 0; and the timeouts, in
 ;; milliseconds, Node's when 0 and none when below 0: idle-timeout for the next request on a connection, 5 s, or 130 s
 ;; behind proxies; head-timeout for a whole head, 60 s; request-timeout for a whole request, 300 s; and send-timeout
-;; for an answer that cannot be sent, 60 s. body-limit bounds http-read-body!, 1 MiB when 0. proxies is how many
-;; proxies stand in front of the server, whose X-Forwarded headers it believes, and checks run in order before handle.
+;; for an answer that cannot be sent, 60 s. body-limit bounds http-read-body!, 1 MiB when 0. compress, a level from 1
+;; to 9, has answers gzipped for clients that take gzip, as Express's compression does it: those of a type that
+;; compresses and 1 KB or more, whole or as they are written, and an event stream one event at a time. proxies is how
+;; many proxies stand in front of the server, whose X-Forwarded headers it believes, and checks run in order before
+;; handle.
 ;; When listening fails, problem holds the reason. A request lasts until it is answered and its body has ended, and
 ;; while its own code runs; on-done is called as it ends, and must not trap. A trap in that code answers it with 500, or
 ;; ends its connection once its answer has begun, and on-trap is told, or else the log at the error level, or else
@@ -17,8 +20,11 @@
 (require-unqualified signal "../../host/node/signal.sub")
 (require-unqualified timer "../../host/modules/timer.sub")
 (require-unqualified clock "../../host/modules/clock.sub")
+(require-unqualified random "../../host/modules/random.sub")
 (require-unqualified http "http.sub")
 (require-unqualified log "../log/log.sub")
+(require-unqualified deflate "../compress/deflate.sub")
+(require-unqualified gzip "../compress/gzip.sub")
 
 (provide http-server http-request http-check http-hook http-serve! http-server-close! http-server-shutdown!
          http-stop-on-signals! http-hook! http-unhook! http-log-access http-request-header http-request-server
@@ -42,7 +48,8 @@
   [on-end (fn ((ptr http-request)))]
   [on-gone (fn ((ptr http-request)))] [on-drained (fn ((ptr http-request)))] [body buffer] [limit u32]
   [taken (fn ((ptr http-request) (slice u8)))] [added buffer] [own-head http-head] [etag string] [modified f64]
-  [ranges bool])
+  [ranges bool] [compressible bool] [events bool] [encoded bool] [gzip i32] [deflater (ptr deflater)] [crc u32]
+  [size u32])
 
 ;; A check runs before the handler with its settings, and returns #t when it has answered the request.
 (struct http-check [run (fn ((ptr http-request) (ptr void)) -> bool)] [settings (ptr void)])
@@ -70,7 +77,7 @@
   [previous (ptr http-hook)])
 
 (struct http-server [head event-head] [listener u32] [port u32] [host string] [secure bool] [most u32]
-  [idle-timeout f64] [head-timeout f64] [request-timeout f64] [send-timeout f64] [body-limit u32]
+  [idle-timeout f64] [head-timeout f64] [request-timeout f64] [send-timeout f64] [body-limit u32] [compress i32]
   [proxies u32] [checks (slice http-check)] [problem string] [user (ptr void)] [connections (ptr http-connection)]
   [hooks (ptr http-hook)] [stopping bool] [stop-timer u32] [stopped (fn ((ptr http-server)))] [log (ptr logger)]
   [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))] [on-trap (fn ((ptr http-request) string))]
@@ -180,6 +187,7 @@
 (define (release! [r (ptr http-request)])
   (let ([done (-> (http-request-server r) on-done)]) (unless (== done 0) (done r)))
   (arena-free (& (-> r arena)))
+  (unzip! r)
   (buffer-free! (& (-> r body)))
   (buffer-free! (& (-> r added)))
   (http-head-free! (& (-> r own-head)))
@@ -620,6 +628,114 @@
     (read-more! c)
     (time! c)))
 
+;; ---- compression ----
+
+;; How an answer is compressed: not, whole by http-send!, as each piece is written, or each event alone.
+(const zip-none i32 0)
+(const zip-whole i32 1)
+(const zip-pieces i32 2)
+(const zip-events i32 3)
+
+;; Bodies shorter than this are sent as they are, as Express's compression leaves them.
+(const zip-least i64 1024)
+
+;; compressible? tells whether a content type compresses: text, JSON, JavaScript, XML, SVG, wasm and two kinds of font.
+(define (compressible? [value string]) -> bool
+  (let* ([t (http-media-type value)] [n (-> t length)])
+    (or (and (>= n 5) (http-same? (slice t 0 5) "text/")) (http-same? t "application/json")
+        (http-same? t "application/javascript") (http-same? t "application/xml") (http-same? t "application/wasm")
+        (http-same? t "image/svg+xml") (http-same? t "font/ttf") (http-same? t "font/otf")
+        (and (>= n 5) (http-same? (slice t (- n 5)) "+json")) (and (>= n 4) (http-same? (slice t (- n 4)) "+xml")))))
+
+;; weightless? tells whether the value of a q parameter is 0.
+(define (weightless? [q string]) -> bool
+  (when (or (== (-> q length) 0) (!= (@ q 0) #\0)) (return #f))
+  (for ([i u32 1]) (< i (-> q length)) (+= i 1)
+    (unless (or (== (@ q i) #\.) (== (@ q i) #\0)) (return #f)))
+  #t)
+
+;; accepts-gzip? reads Accept-Encoding: gzip, or else *, with a weight above 0.
+(define (accepts-gzip? [r (ptr http-request)]) -> bool
+  (let ([v (http-request-header r "accept-encoding")] [i u32 0] [gzip i32 -1] [any i32 -1])
+    (while (< i (-> v length))
+      (let ([end i] [k i])
+        (while (and (< end (-> v length)) (!= (@ v end) 44)) (+= end 1))
+        (while (and (< k end) (!= (@ v k) #\;)) (+= k 1))
+        (let ([coding (http-trimmed (slice v i k))] [taken i32 1])
+          (while (< k end)
+            (let ([start (+ k 1)])
+              (set! k start)
+              (while (and (< k end) (!= (@ v k) #\;)) (+= k 1))
+              (let ([p (http-trimmed (slice v start k))])
+                (when (and (>= (-> p length) 2) (http-same? (slice p 0 2) "q=")
+                           (weightless? (http-trimmed (slice p 2))))
+                  (set! taken 0)))))
+          (cond [(or (http-same? coding "gzip") (http-same? coding "x-gzip")) (set! gzip taken)]
+                [(== coding "*") (set! any taken)]))
+        (set! i (+ end 1))))
+    (if (>= gzip 0) (== gzip 1) (== any 1))))
+
+;; zip? tells whether to compress the answer: compression is on, the body's type compresses, nothing has encoded it
+;; or forbids that, it is not a range, and the client takes gzip.
+(define (zip? [r (ptr http-request)]) -> bool
+  (and (> (-> (http-request-server r) compress) 0) (-> r compressible) (not (-> r encoded)) (has-body? r)
+       (!= (-> r status) 206) (accepts-gzip? r)))
+
+;; One deflater compresses every whole answer and event, each in turn, since each is done before the next begins; zipped
+;; holds what it gives.
+(define shared deflater)
+(define shared-level i32 0)
+(define zipped buffer)
+
+(define (shared-at [level i32]) -> (ptr deflater)
+  (unless (== shared-level level)
+    (unless (== shared-level 0) (deflater-free! (& shared)))
+    (deflater-init! (& shared) level)
+    (set! shared-level level))
+  (& shared))
+
+;; padded-start! begins a gzip member named by 1 to 100 random letters, so that the sizes of answers vary, as Django's
+;; GZipMiddleware does against BREACH.
+(define (padded-start! [b (ptr buffer)])
+  (let ([name (array u8 101)])
+    (random-fill (slice (& (@ name 0)) 101))
+    (let ([n (+ 1 (% (cast u32 (@ name 0)) 100))])
+      (for ([i u32 1]) (<= i n) (+= i 1) (set! (@ name i) (cast u8 (+ 97 (% (cast u32 (@ name i)) 26)))))
+      (gzip-start! b (cast string (slice (& (@ name 1)) n))))))
+
+;; zip-piece! sends a piece of the body compressed: an event alone, or else after what came before, ending at a whole
+;; byte so that the client can read all of it.
+(define (zip-piece! [r (ptr http-request)] [c (ptr http-connection)] [b (slice u8)])
+  (set! (-> zipped length) 0)
+  (set! (-> r crc) (crc32 (-> r crc) b))
+  (+= (-> r size) (-> b length))
+  (if (== (-> r gzip) zip-events)
+      (deflate-alone! (shared-at (-> (http-request-server r) compress)) (& zipped) b)
+      (deflate! (-> r deflater) (& zipped) b deflate-sync))
+  (piece! r c (buffer-bytes (& zipped)))
+  (set! (-> zipped length) 0)
+  (buffer-trim! (& zipped) 65536))
+
+;; zip-end! ends the compressed body and its gzip member.
+(define (zip-end! [r (ptr http-request)] [c (ptr http-connection)])
+  (set! (-> zipped length) 0)
+  (if (== (-> r gzip) zip-events)
+      (begin
+        (buffer-add-byte! (& zipped) 3)
+        (buffer-add-byte! (& zipped) 0))
+      (deflate! (-> r deflater) (& zipped) (cast (slice u8) "") deflate-finish))
+  (gzip-end! (& zipped) (-> r crc) (-> r size))
+  (piece! r c (buffer-bytes (& zipped)))
+  (set! (-> zipped length) 0)
+  (unzip! r))
+
+;; unzip! frees the deflater of an answer compressed as it is written.
+(define (unzip! [r (ptr http-request)])
+  (unless (== (-> r deflater) 0)
+    (deflater-free! (-> r deflater))
+    (free (-> r deflater))
+    (set! (-> r deflater) 0)))
+
 ;; ---- answering ----
 
 (define (http-respond! [r (ptr http-request)] [status i32])
@@ -636,41 +752,67 @@
 
 (define (http-header! [r (ptr http-request)] [name string] [value string])
   (let ([c (connection-of r)])
+    (cond [(http-same? name "content-type")
+           (set! (-> r compressible) (compressible? value))
+           (set! (-> r events) (http-media-type? value "text/event-stream"))]
+          [(http-same? name "content-encoding") (set! (-> r encoded) #t)]
+          [(and (http-same? name "cache-control") (http-has-token? value "no-transform")) (set! (-> r encoded) #t)])
     (unless (== c 0) (http-write-header! (& (-> c out)) name value))))
 
-(define (http-length! [r (ptr http-request)] [n i64])
-  (let ([c (connection-of r)])
-    (set! (-> r length) n)
-    (unless (== c 0) (http-write-number! (& (-> c out)) "content-length" n))))
+;; http-length! declares the length of the body, which the head gives as it ends.
+(define (http-length! [r (ptr http-request)] [n i64]) (set! (-> r length) n))
 
 (define (has-length? [r (ptr http-request)]) -> bool
   (not (or (< (-> r status) 200) (== (-> r status) 204) (== (-> r status) 304))))
 
 (define (has-body? [r (ptr http-request)]) -> bool (and (has-length? r) (!= (-> r method) "HEAD")))
 
-;; validators! writes the answer's validators: Last-Modified only without an ETag on a 304, as Go writes them.
+;; validators! writes the answer's validators: Last-Modified only without an ETag on a 304, as Go writes them, and the
+;; ETag made weak on an answer compressed here, as nginx makes it, which takes no ranges.
 (define (validators! [r (ptr http-request)] [b (ptr buffer)])
-  (let ([status (-> r status)])
+  (let ([status (-> r status)] [etag (-> r etag)])
     (when (or (and (>= status 200) (< status 300)) (== status 304))
-      (unless (== (-> r etag length) 0) (http-write-header! b "etag" (-> r etag)))
-      (when (and (> (-> r modified) 0.0) (not (and (== status 304) (> (-> r etag length) 0))))
+      (cond [(== (-> etag length) 0) (begin)]
+            [(and (!= (-> r gzip) zip-none) (not (and (>= (-> etag length) 2) (== (slice etag 0 2) "W/"))))
+             (buffer-add-string! b "etag: W/")
+             (buffer-add-string! b etag)
+             (buffer-add-string! b "\r\n")]
+            [else (http-write-header! b "etag" etag)])
+      (when (and (> (-> r modified) 0.0) (not (and (== status 304) (> (-> etag length) 0))))
         (buffer-add-string! b "last-modified: ")
         (http-add-date! b (-> r modified))
         (buffer-add-string! b "\r\n"))
-      (when (and (-> r ranges) (!= status 304)) (http-write-header! b "accept-ranges" "bytes")))))
+      (when (and (-> r ranges) (!= status 304) (== (-> r gzip) zip-none))
+        (http-write-header! b "accept-ranges" "bytes")))))
 
 ;; head! ends the head, framing the body by its declared length, in chunks for HTTP/1.1, or else by closing the
-;; connection.
+;; connection. A body that it compresses as it is written goes in chunks too, after a gzip header.
 (define (head! [r (ptr http-request)] [c (ptr http-connection)])
-  (validators! r (& (-> c out)))
-  (set! (-> r sent) #t)
-  (when (and (has-body? r) (< (-> r length) 0))
-    (if (== (-> r head version) "HTTP/1.0")
-        (set! (-> c closing) #t)
-        (begin
-          (set! (-> r chunked) #t)
-          (http-write-header! (& (-> c out)) "transfer-encoding" "chunked"))))
-  (http-write-end! (& (-> c out))))
+  (let ([s (http-request-server r)] [b (& (-> c out))])
+    (when (and (== (-> r gzip) zip-none) (or (< (-> r length) 0) (>= (-> r length) zip-least)) (zip? r))
+      (set! (-> r gzip) (if (-> r events) zip-events zip-pieces))
+      (when (== (-> r gzip) zip-pieces)
+        (set! (-> r deflater) (cast (ptr deflater) (malloc (sizeof deflater))))
+        (deflater-init! (-> r deflater) (-> s compress))))
+    (when (and (has-length? r) (>= (-> r length) 0) (< (-> r gzip) zip-pieces))
+      (http-write-number! b "content-length" (-> r length)))
+    (unless (== (-> r gzip) zip-none) (http-write-header! b "content-encoding" "gzip"))
+    (when (and (> (-> s compress) 0) (not (-> r encoded)) (or (-> r compressible) (== (-> r status) 304)))
+      (http-write-header! b "vary" "accept-encoding"))
+    (validators! r b)
+    (set! (-> r sent) #t)
+    (when (and (has-body? r) (or (< (-> r length) 0) (>= (-> r gzip) zip-pieces)))
+      (if (== (-> r head version) "HTTP/1.0")
+          (set! (-> c closing) #t)
+          (begin
+            (set! (-> r chunked) #t)
+            (http-write-header! b "transfer-encoding" "chunked"))))
+    (http-write-end! b)
+    (when (>= (-> r gzip) zip-pieces)
+      (set! (-> zipped length) 0)
+      (padded-start! (& zipped))
+      (piece! r c (buffer-bytes (& zipped)))
+      (set! (-> zipped length) 0))))
 
 (define (flush! [c (ptr http-connection)]) -> bool
   (let ([full (== (out! c (buffer-bytes (& (-> c out)))) 1)])
@@ -706,13 +848,19 @@
     (unless (-> r sent) (head! r c))
     (when (and (has-body? r) (> n 0))
       (+= (-> r written) (cast i64 n))
-      (cond [(<= n 1024) (if (-> r chunked) (http-write-chunk! (& (-> c out)) b) (buffer-add! (& (-> c out)) b))]
-            [else
-             (when (-> r chunked) (http-write-chunk-size! (& (-> c out)) n))
-             (when (> (-> c out length) 0) (flush! c))
-             (when (== (out! c b) 1) (set! (-> c full) #t))
-             (when (-> r chunked) (http-write-end! (& (-> c out))))]))
+      (if (>= (-> r gzip) zip-pieces) (zip-piece! r c b) (piece! r c b)))
     (if (> (-> c out length) 0) (flush! c) (not (-> c full)))))
+
+;; piece! sends bytes of the body as they go out: in a chunk when chunked, and from where they are when over 1 KB.
+(define (piece! [r (ptr http-request)] [c (ptr http-connection)] [b (slice u8)])
+  (let ([n (-> b length)])
+    (cond [(== n 0) (begin)]
+          [(<= n 1024) (if (-> r chunked) (http-write-chunk! (& (-> c out)) b) (buffer-add! (& (-> c out)) b))]
+          [else
+           (when (-> r chunked) (http-write-chunk-size! (& (-> c out)) n))
+           (when (> (-> c out length) 0) (flush! c))
+           (when (== (out! c b) 1) (set! (-> c full) #t))
+           (when (-> r chunked) (http-write-end! (& (-> c out))))])))
 
 ;; http-finish! ends the answer, with no body when nothing was written. A body shorter than its declared length closes
 ;; the connection.
@@ -722,15 +870,29 @@
       (unless (-> r sent)
         (when (and (has-body? r) (< (-> r length) 0)) (http-length! r 0))
         (head! r c))
+      (when (>= (-> r gzip) zip-pieces) (zip-end! r c))
       (cond [(-> r chunked) (http-write-last-chunk! (& (-> c out)))]
-            [(and (has-body? r) (< (-> r written) (-> r length))) (set! (-> c closing) #t)])
+            [(and (has-body? r) (< (-> r written) (-> r length)) (< (-> r gzip) zip-pieces)) (set! (-> c closing) #t)])
       (when (> (-> c out length) 0) (flush! c))))
   (answered! r))
 
+;; http-send! sends the body whole, compressed at once when it compresses, with its length either way.
 (define (http-send! [r (ptr http-request)] [b (slice u8)])
-  (when (and (has-length? r) (< (-> r length) 0)) (http-length! r (cast i64 (-> b length))))
-  (http-write! r b)
-  (http-finish! r))
+  (if (and (!= (-> r connection) 0) (not (-> r sent)) (>= (-> b length) zip-least) (zip? r))
+      (let ([d (shared-at (-> (http-request-server r) compress))] [z (make-buffer)])
+        (padded-start! (& z))
+        (deflater-reset! d)
+        (deflate! d (& z) b deflate-finish)
+        (gzip-end! (& z) (crc32 0 b) (-> b length))
+        (set! (-> r gzip) zip-whole)
+        (set! (-> r length) (cast i64 (-> z length)))
+        (http-write! r (buffer-bytes (& z)))
+        (http-finish! r)
+        (buffer-free! (& z)))
+      (begin
+        (when (and (has-length? r) (< (-> r length) 0)) (http-length! r (cast i64 (-> b length))))
+        (http-write! r b)
+        (http-finish! r))))
 
 (define (http-send-text! [r (ptr http-request)] [text string]) (http-send! r (cast (slice u8) text)))
 

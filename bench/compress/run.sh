@@ -15,4 +15,5 @@ flags=(-O2 -I"$out/zlib")
 NIX_HARDENING_ENABLE= clang "${flags[@]}" -o "$out/zlib.native" "$here/zlib.c" "${sources[@]}"
 NIX_HARDENING_ENABLE= wasm32-unknown-wasi-clang "${flags[@]}" -o "$out/zlib.wasm" "$here/zlib.c" "${sources[@]}"
 
-node --experimental-wasm-exnref --no-liftoff --no-warnings "$here/run.mjs" "$out" "$reps" "$SILESIA"/* "$JSON_BENCH_FILES"/*
+node --experimental-wasm-exnref --no-liftoff --no-warnings "$here/run.mjs" "$out" "$reps" "$SILESIA"/* \
+  "$JSON_BENCH_FILES"/*
