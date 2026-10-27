@@ -5,6 +5,7 @@
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified timer "../../host/modules/timer.sub")
+(require-unqualified clock "../../host/modules/clock.sub")
 (require-unqualified http "http.sub")
 (require-unqualified server "server.sub")
 (require-unqualified sha1 "../crypto/sha1.sub")
@@ -26,7 +27,8 @@
 
 (struct ws-connection [head event-head] [stream u32] [user (ptr void)] [server (ptr http-server)] [ping f64]
   [hook http-hook] [frames buffer] [message buffer] [out buffer]
-  [kind i32] [state i32] [code i32] [reading bool] [full bool] [timer u32] [pinged bool] [any-origin bool]
+  [kind i32] [state i32] [code i32] [reading bool] [full bool] [timer u32] [timer-at f64] [heard f64] [pinged bool]
+  [any-origin bool]
   [on-message (fn ((ptr ws-connection) (slice u8) i32))]
   [on-closed (fn ((ptr ws-connection) i32))]
   [on-drained (fn ((ptr ws-connection)))])
@@ -195,27 +197,34 @@
         (buffer-add! (& (-> w frames)) b)
         (unframe! w))))
 
-(define (arm! [w (ptr ws-connection)])
+(define (interval [w (ptr ws-connection)]) -> f64 (if (== (-> w ping) 0.0) 25000.0 (-> w ping)))
+
+(define (arm! [w (ptr ws-connection)] [ms f64])
   (unless (< (-> w ping) 0.0)
-    (set! (-> w timer) (timer-after (if (== (-> w ping) 0.0) 25000.0 (-> w ping)) (cast (ptr void) w)))))
+    (set! (-> w timer) (timer-after ms (cast (ptr void) w)))
+    (set! (-> w timer-at) (+ (clock-monotonic) ms))))
 
 (define (read-more! [w (ptr ws-connection)])
   (when (< (-> w state) state-closed)
-    (when (== (-> w timer) 0) (arm! w))
+    (when (== (-> w timer) 0) (arm! w (interval w)))
     (unless (or (-> w reading) (-> w full))
       (set! (-> w reading) #t)
       (when (< (stream-take! (-> w stream) 65536) 0) (ended! w 1006)))))
 
 (define (lost! [w (ptr ws-connection)]) (ended! w (if (== (-> w state) state-finishing) (-> w code) 1006)))
 
+;; silent! hears the timer: a peer heard from within the interval is waited on for the rest of it; one silent for it
+;; is pinged, or ended if it was pinged already. The time is at least when the timer was set to fire.
 (define (silent! [w (ptr ws-connection)])
-  (set! (-> w timer) 0)
-  (if (or (-> w pinged) (!= (-> w state) state-open))
-      (lost! w)
-      (begin
-        (set! (-> w pinged) #t)
-        (write-frame! w 9 0)
-        (arm! w))))
+  (let* ([t (clock-monotonic)] [now (if (> (-> w timer-at) t) (-> w timer-at) t)] [quiet (- now (-> w heard))]
+         [ping (interval w)])
+    (set! (-> w timer) 0)
+    (cond [(< quiet ping) (arm! w (- ping quiet))]
+          [(or (-> w pinged) (!= (-> w state) state-open)) (lost! w)]
+          [else
+           (set! (-> w pinged) #t)
+           (write-frame! w 9 0)
+           (arm! w ping)])))
 
 (define (ws-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (let ([w (cast (ptr ws-connection) tag)])
@@ -225,7 +234,7 @@
            (let ([b (events-take)])
              (when (< (-> w state) state-finishing)
                (set! (-> w pinged) #f)
-               (disarm! w)
+               (set! (-> w heard) (clock-monotonic))
                (heard! w b))
              (free (-> b items)))
            (read-more! w)]
@@ -245,6 +254,7 @@
 (define (taken [tag (ptr void)] [stream u32] [b (slice u8)])
   (let ([w (cast (ptr ws-connection) tag)])
     (set! (-> w stream) stream)
+    (set! (-> w heard) (clock-monotonic))
     (stream-tag! stream (cast (ptr void) w))
     (set! (-> w hook run) stopping)
     (set! (-> w hook tag) (cast (ptr void) w))
