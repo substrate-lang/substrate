@@ -23,7 +23,7 @@ make -s repl OUT="${OUT:-build}"
 bin/sub site "$sites/focus" tests/web/focus.sub
 bin/sub site "$sites/floor" tests/web/floor.sub
 bin/sub site "$sites/events" tests/web/events.sub
-bin/sub build tests/web/events-server.sub -o "$sites/events-server"
+bin/sub build tests/web/server.sub -o "$sites/server"
 bin/sub site "$sites/storage" tests/web/storage.sub
 bin/sub site "$sites/location" tests/web/location.sub
 bin/sub site "$sites/clipboard" tests/web/clipboard.sub

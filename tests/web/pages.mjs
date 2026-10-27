@@ -719,7 +719,8 @@ const checks = {
     check('files: bytes saved as a download', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file', 'saved bytes');
   },
 
-  // The page's client and then the browser's own EventSource read the same stream from tests/web/events-server.sub.
+  // The page's client and then the browser's own EventSource read the same stream from tests/web/server.sub; then
+  // requests to it and to the other origin meet cross-origin protection and CORS.
   async events(page) {
     const log = () => page.evaluate('document.getElementById("log").textContent');
     await page.waitFor('document.getElementById("log").textContent.endsWith("refused 204")', 10000);
@@ -739,6 +740,18 @@ const checks = {
     })`);
     check('events: the browser\'s EventSource reads the same', native,
       'open | message 1 first | named 2 a\nb | lost | open | message 3 resumed after 2 | lost | closed');
+    const fetched = (js) => page.evaluate(`(async () => { ${js} })()`);
+    check('events: a POST from the same origin passes cross-origin protection', await fetched(
+      'const r = await fetch("/guarded", { method: "POST", body: "x" }); return r.status + " " + await r.text();'),
+    '200 posted');
+    check('events: a POST from another origin is refused', await fetched(
+      `await fetch("${otherUrl}guarded", { method: "POST", body: "x", mode: "no-cors" });
+       return await (await fetch("${otherUrl}refused")).text();`),
+    '1');
+    check('events: CORS lets a PUT with credentials and a header through', await fetched(
+      `const r = await fetch("${otherUrl}api", { method: "PUT", credentials: "include", headers: { "x-key": "1" } });
+       return r.status + " " + await r.text();`),
+    '200 put');
     check('events: nothing is written to the console', page.log.join('\n'), '');
   },
 
@@ -770,12 +783,19 @@ const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 // Port 0: any free port.
 const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
-// The events page comes from its own server, which answers /events as well.
+// The events page comes from tests/web/server.sub, and a second one on another port is another origin, which lets the
+// first's through CORS.
 const site = path.join(sites, 'events');
-const eventsServer = spawn(path.join(here, '../../bin/sub'),
-  ['run', '-N=127.0.0.1', `-R=${site}`, path.join(sites, 'events-server'), site],
-  { stdio: ['ignore', 'pipe', 'inherit'] });
-const eventsUrl = await new Promise((resolve) => eventsServer.stdout.once('data', (d) => resolve(String(d).trim())));
+const started = (...args) => {
+  const p = spawn(path.join(here, '../../bin/sub'),
+    ['run', '-N=127.0.0.1', `-R=${site}`, path.join(sites, 'server'), site, ...args],
+    { stdio: ['ignore', 'pipe', 'inherit'] });
+  return [p, new Promise((resolve) => p.stdout.once('data', (d) => resolve(String(d).trim())))];
+};
+const [eventsServer, eventsUrlOnce] = started();
+const eventsUrl = await eventsUrlOnce;
+const [otherServer, otherUrlOnce] = started(eventsUrl.slice(0, -1));
+const otherUrl = await otherUrlOnce;
 async function run(group) {
   await withBrowser(async (open) => {
     for (const name of group) {
@@ -802,5 +822,6 @@ try {
 } finally {
   server.kill();
   eventsServer.kill();
+  otherServer.kill();
 }
 process.exit(failed ? 1 : 0);

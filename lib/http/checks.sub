@@ -1,0 +1,154 @@
+;; Checks for a server's list, run before its handler: cross-origin protection, after Go's CrossOriginProtection;
+;; security headers, Helmet's; CORS, after Express's cors; and rate limits, a token bucket for each client's address,
+;; after Go's x/time/rate.
+(require-unqualified clock "../../host/modules/clock.sub")
+(require-unqualified http "http.sub")
+(require-unqualified server "server.sub")
+
+(provide http-cross-origin http-cross-origin-check http-security http-security-check http-cors http-cors-check
+         http-limit http-limit-check)
+
+;; ---- cross-origin protection ----
+
+;; trusted lists origins, such as https://example.com, whose requests pass, as a CORS policy's should.
+(struct http-cross-origin [trusted (slice string)])
+
+(define (listed? [list (slice string)] [s string]) -> bool
+  (for ([i u32 0]) (< i (-> list length)) (+= i 1) (when (== (@ list i) s) (return #t)))
+  #f)
+
+(define (origin-host [origin string]) -> string
+  (let ([i u32 0])
+    (while (and (< (+ i 2) (-> origin length)) (not (== (slice origin i (+ i 3)) "://"))) (+= i 1))
+    (if (< (+ i 2) (-> origin length)) (slice origin (+ i 3)) "")))
+
+;; http-cross-origin-check refuses with 403 a request that a browser sent from another origin, unless its method is GET,
+;; HEAD or OPTIONS: Sec-Fetch-Site says so, or without it, the Origin's host is not the Host. A request with neither
+;; header passes, as one from a program rather than a browser.
+(define (http-cross-origin-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (let* ([o (cast (ptr http-cross-origin) settings)] [m (-> r method)] [site (http-request-header r "sec-fetch-site")]
+         [origin (http-request-header r "origin")]
+         [trusted (and (!= o 0) (listed? (-> o trusted) origin))])
+    (when (or (== m "GET") (== m "HEAD") (== m "OPTIONS") (== site "same-origin") (== site "none") trusted
+              (and (== (-> site length) 0)
+                   (or (== (-> origin length) 0) (http-same? (origin-host origin) (http-request-header r "host")))))
+      (return #f))
+    (http-answer-text! r 403 "cross-origin request refused")
+    #t))
+
+;; ---- security headers ----
+
+;; policy, when not empty, is the Content-Security-Policy, which Helmet sets and this leaves to the program: pages from
+;; lib/web start with an inline module script and compile wasm, and a policy for them must allow both.
+(struct http-security [policy string])
+
+;; http-security-check adds Helmet's headers to every answer, Strict-Transport-Security over https alone.
+(define (http-security-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (let ([s (cast (ptr http-security) settings)])
+    (http-add-header! r "cross-origin-opener-policy" "same-origin")
+    (http-add-header! r "cross-origin-resource-policy" "same-origin")
+    (http-add-header! r "origin-agent-cluster" "?1")
+    (http-add-header! r "referrer-policy" "no-referrer")
+    (when (http-request-https? r)
+      (http-add-header! r "strict-transport-security" "max-age=31536000; includeSubDomains"))
+    (http-add-header! r "x-content-type-options" "nosniff")
+    (http-add-header! r "x-dns-prefetch-control" "off")
+    (http-add-header! r "x-download-options" "noopen")
+    (http-add-header! r "x-frame-options" "SAMEORIGIN")
+    (http-add-header! r "x-permitted-cross-domain-policies" "none")
+    (http-add-header! r "x-xss-protection" "0")
+    (unless (or (== s 0) (== (-> s policy length) 0)) (http-add-header! r "content-security-policy" (-> s policy)))
+    #f))
+
+;; ---- CORS ----
+
+;; origins lists the origins allowed, or holds "*" for any. methods are those a preflight allows, Express's when empty,
+;; and headers those it allows, the ones the preflight asks for when empty. credentials allows cookies, and max-age,
+;; when not 0, is how many seconds a browser may keep a preflight's answer.
+(struct http-cors [origins (slice string)] [methods string] [headers string] [credentials bool] [max-age u32])
+
+;; allowed gives the Access-Control-Allow-Origin for an origin, or "" when it is not allowed.
+(define (allowed [c (ptr http-cors)] [origin string]) -> string
+  (cond [(listed? (-> c origins) origin) origin]
+        [(not (listed? (-> c origins) "*")) ""]
+        [(-> c credentials) origin]
+        [else "*"]))
+
+;; http-cors-check answers a preflight with 204, and adds the CORS headers to the answer of a request from an allowed
+;; origin.
+(define (http-cors-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (let* ([c (cast (ptr http-cors) settings)] [origin (http-request-header r "origin")] [allow (allowed c origin)]
+         [asked (http-request-header r "access-control-request-headers")])
+    (when (== (-> origin length) 0) (return #f))
+    (unless (and (== (-> r method) "OPTIONS") (> (-> (http-request-header r "access-control-request-method") length) 0))
+      (unless (== allow "*") (http-add-header! r "vary" "Origin"))
+      (unless (== (-> allow length) 0)
+        (http-add-header! r "access-control-allow-origin" allow)
+        (when (-> c credentials) (http-add-header! r "access-control-allow-credentials" "true")))
+      (return #f))
+    (http-respond! r 204)
+    (http-header! r "vary" "Origin, Access-Control-Request-Headers")
+    (unless (== (-> allow length) 0)
+      (http-header! r "access-control-allow-origin" allow)
+      (when (-> c credentials) (http-header! r "access-control-allow-credentials" "true"))
+      (http-header! r "access-control-allow-methods"
+                    (if (== (-> c methods length) 0) "GET,HEAD,PUT,PATCH,POST,DELETE" (-> c methods)))
+      (let ([allowed-headers (if (== (-> c headers length) 0) asked (-> c headers))])
+        (unless (== (-> allowed-headers length) 0) (http-header! r "access-control-allow-headers" allowed-headers)))
+      (unless (== (-> c max-age) 0) (http-length-header! r "access-control-max-age" (cast i64 (-> c max-age)))))
+    (http-finish! r)
+    #t))
+
+(define (http-length-header! [r (ptr http-request)] [name string] [n i64])
+  (let ([b (make-buffer)])
+    (http-add-decimal! (& b) n)
+    (http-header! r name (buffer-string (& b)))
+    (buffer-free! (& b))))
+
+;; ---- rate limits ----
+
+(struct bucket [key (array u8 46)] [length u32] [used bool] [tokens f64] [at f64])
+
+;; rate, above 0, is how many requests a client may make each second, and burst how many at once. most bounds the
+;; clients kept, 10000 when 0; a table three quarters full starts again, every client with a full bucket.
+(struct http-limit [rate f64] [burst u32] [most u32] [count u32] [buckets (ptr bucket)])
+
+(define (bucket-of [l (ptr http-limit)] [address string]) -> (ptr bucket)
+  (let* ([n (if (> (-> l most) 0) (-> l most) 10000)] [key (if (> (-> address length) 46) (slice address 0 46) address)]
+         [h u32 2166136261] [i u32 0])
+    (when (== (-> l buckets) 0) (set! (-> l buckets) (cast (ptr bucket) (calloc n (sizeof bucket)))))
+    (when (>= (* (-> l count) 4) (* n 3))
+      (memset (-> l buckets) 0 (* n (sizeof bucket)))
+      (set! (-> l count) 0))
+    (for ([k u32 0]) (< k (-> key length)) (+= k 1) (set! h (* (bit-xor h (cast u32 (@ key k))) 16777619)))
+    (set! i (% h n))
+    (while #t
+      (let ([b (& (@ (-> l buckets) i))])
+        (cond [(not (-> b used))
+               (set! (-> b used) #t)
+               (memcpy (-> b key) (-> key bytes) (-> key length))
+               (set! (-> b length) (-> key length))
+               (set! (-> b tokens) (cast f64 (-> l burst)))
+               (set! (-> b at) (clock-monotonic))
+               (+= (-> l count) 1)
+               (return b)]
+              [(and (== (-> b length) (-> key length)) (== (memcmp (-> b key) (-> key bytes) (-> key length)) 0))
+               (return b)])
+        (set! i (% (+ i 1) n))))
+    0))
+
+;; http-limit-check answers 429, with Retry-After in seconds, a request whose client has no request left.
+(define (http-limit-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (when (<= (-> (cast (ptr http-limit) settings) rate) 0.0) (host-trap "http: a rate limit whose rate is not above 0"))
+  (let* ([l (cast (ptr http-limit) settings)] [b (bucket-of l (http-request-address r))] [now (clock-monotonic)]
+         [tokens (+ (-> b tokens) (/ (* (- now (-> b at)) (-> l rate)) 1000.0))])
+    (set! (-> b tokens) (if (> tokens (cast f64 (-> l burst))) (cast f64 (-> l burst)) tokens))
+    (set! (-> b at) now)
+    (when (>= (-> b tokens) 1.0)
+      (-= (-> b tokens) 1.0)
+      (return #f))
+    (http-respond! r 429)
+    (http-header! r "content-type" "text/plain; charset=utf-8")
+    (http-length-header! r "retry-after" (cast i64 (ceil (/ (- 1.0 (-> b tokens)) (-> l rate)))))
+    (http-send-text! r "too many requests")
+    #t))
