@@ -2,9 +2,10 @@
 ;; nothing, and the server frames the body by its length or in chunks; or the handler takes the connection's stream.
 ;; Each connection's requests are answered one at a time. Before serving, set secure for TLS, idle to the milliseconds a
 ;; connection may wait for bytes or a whole head, and most to the most connections at once; 0 means no limit.
-;; body-limit bounds http-read-body!, 1 MiB when 0. When listening fails, problem holds the reason. A request lasts
-;; until it is answered and its body has ended, and while its own code runs. A trap in that code answers it with 500,
-;; or ends its connection once its answer has begun, and on-trap is told, or else stderr.
+;; body-limit bounds http-read-body!, 1 MiB when 0. proxies is how many proxies stand in front of the server, whose
+;; X-Forwarded headers it believes, and checks run in order before handle. When listening fails, problem holds the
+;; reason. A request lasts until it is answered and its body has ended, and while its own code runs. A trap in that code
+;; answers it with 500, or ends its connection once its answer has begun, and on-trap is told, or else stderr.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
@@ -12,22 +13,26 @@
 (require-unqualified clock "../../host/modules/clock.sub")
 (require-unqualified http "http.sub")
 
-(provide http-server http-request http-serve! http-server-close! http-request-header http-request-server
-         http-request-gone? http-respond! http-header! http-length! http-write! http-send! http-send-text!
-         http-send-stream! http-finish! http-take! http-read-body! http-answer-text! http-redirect! http-trapped
-         http-connect! http-connection-feed! http-connection-close!)
+(provide http-server http-request http-check http-serve! http-server-close! http-request-header http-request-server
+         http-request-gone? http-request-address http-request-https? http-add-header! http-respond! http-header!
+         http-length! http-write! http-send! http-send-text! http-send-stream! http-finish! http-take! http-read-body!
+         http-answer-text! http-redirect! http-trapped http-connect! http-connection-feed! http-connection-close!)
 
 (const default-body-limit u32 1048576)
 
 ;; A request's on-body gets each piece of its body, and its on-end sees failed set when the body was malformed. on-gone
 ;; is called once if its client leaves, or ends its side, before its answer is finished, and on-drained when the
-;; connection has room again after http-write! returned #f. Its arena is freed with it.
+;; connection has room again after http-write! returned #f. peer is the address the connection came from. Its arena
+;; is freed with it.
 (struct http-request [connection (ptr void)] [server (ptr void)] [method string] [target string] [head (ptr http-head)]
-  [arena arena] [user (ptr void)] [route (ptr void)] [ended bool] [failed bool] [answered bool] [sent bool] [done bool]
-  [gone bool] [chunked bool] [depth u32] [outer (ptr http-request)] [status i32] [length i64] [written i64]
-  [on-body (fn ((ptr http-request) (slice u8)))] [on-end (fn ((ptr http-request)))] [on-gone (fn ((ptr http-request)))]
-  [on-drained (fn ((ptr http-request)))] [body buffer] [limit u32] [taken (fn ((ptr http-request) (slice u8)))]
-  [own-head http-head])
+  [arena arena] [user (ptr void)] [route (ptr void)] [peer string] [ended bool] [failed bool] [answered bool]
+  [sent bool] [done bool] [gone bool] [chunked bool] [depth u32] [outer (ptr http-request)] [status i32] [length i64]
+  [written i64] [on-body (fn ((ptr http-request) (slice u8)))] [on-end (fn ((ptr http-request)))]
+  [on-gone (fn ((ptr http-request)))] [on-drained (fn ((ptr http-request)))] [body buffer] [limit u32]
+  [taken (fn ((ptr http-request) (slice u8)))] [added buffer] [own-head http-head])
+
+;; A check runs before the handler with its settings, and returns #t when it has answered the request.
+(struct http-check [run (fn ((ptr http-request) (ptr void)) -> bool)] [settings (ptr void)])
 
 (typedef taker (fn ((ptr void) u32 (slice u8))))
 
@@ -39,11 +44,11 @@
 (struct http-connection [head event-head] [server (ptr void)] [stream u32] [parser http-parser]
   [request (ptr http-request)] [buf (array u8 16384)] [out buffer] [relay (ptr relay)] [reading bool] [busy bool]
   [closing bool] [half-closed bool] [feeding bool] [full bool] [dropped bool] [take taker] [taken (ptr void)]
-  [timer u32] [rest (slice u8)] [next (ptr http-connection)]
+  [timer u32] [rest (slice u8)] [next (ptr http-connection)] [peer string]
   [sink (fn ((ptr void) (slice u8)))] [sink-ended (fn ((ptr void)))] [sink-tag (ptr void)])
 
 (struct http-server [head event-head] [listener u32] [port u32] [secure bool] [idle f64] [most u32] [body-limit u32]
-  [problem string] [user (ptr void)] [connections (ptr http-connection)]
+  [proxies u32] [checks (slice http-check)] [problem string] [user (ptr void)] [connections (ptr http-connection)]
   [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))] [on-trap (fn ((ptr http-request) string))])
 
 ;; ---- requests ----
@@ -61,11 +66,48 @@
 
 (define (http-request-header [r (ptr http-request)] [name string]) -> string (http-header (-> r head) name))
 
+;; ---- the client ----
+
+;; forwarded counts the entries of the X-Forwarded-For headers, or gives the one at index from the left.
+(define (forwarded [r (ptr http-request)] [index i64] [entry (ptr string)]) -> i64
+  (let ([h (-> r head)] [n i64 0])
+    (for ([k u32 0]) (< k (-> h count)) (+= k 1)
+      (when (== (@ (-> h names) k) "x-forwarded-for")
+        (let ([v (@ (-> h values) k)] [start u32 0])
+          (for ([i u32 0]) (<= i (-> v length)) (+= i 1)
+            (when (or (== i (-> v length)) (== (@ v i) 44))
+              (when (== n index) (set! (@ entry) (http-trimmed (slice v start i))))
+              (+= n 1)
+              (set! start (+ i 1)))))))
+    n))
+
+;; http-request-address gives the client's address: the peer's, or behind the server's proxies, that many hops back
+;; along X-Forwarded-For, as Express's trust proxy counts them.
+(define (http-request-address [r (ptr http-request)]) -> string
+  (let* ([hops (cast i64 (-> (http-request-server r) proxies))] [entry (-> r peer)] [n (forwarded r -1 (& entry))])
+    (unless (or (== hops 0) (== n 0)) (forwarded r (if (> hops n) 0 (- n hops)) (& entry)))
+    entry))
+
+;; http-request-https? tells whether the client asked over https: the server's TLS, or behind its proxies, the first
+;; X-Forwarded-Proto.
+(define (http-request-https? [r (ptr http-request)]) -> bool
+  (let ([s (http-request-server r)] [proto (http-request-header r "x-forwarded-proto")] [i u32 0])
+    (when (or (== (-> s proxies) 0) (== (-> proto length) 0)) (return (-> s secure)))
+    (while (and (< i (-> proto length)) (!= (@ proto i) 44)) (+= i 1))
+    (http-same? (http-trimmed (slice proto 0 i)) "https")))
+
+;; http-add-header! adds a header to the request's answer, for a check to add before the handler answers.
+(define (http-add-header! [r (ptr http-request)] [name string] [value string])
+  (http-write-header! (& (-> r added)) name value))
+
 (define (new-request! [c (ptr http-connection)] [h (ptr http-head)]) -> (ptr http-request)
   (let ([r (cast (ptr http-request) (calloc 1 (sizeof http-request)))])
     (set! (-> r connection) (cast (ptr void) c))
     (set! (-> r server) (-> c server))
     (set! (-> r length) -1)
+    (set! (-> r peer) (cast string (slice (cast (ptr u8) (arena-alloc (& (-> r arena)) (-> c peer length)))
+                                           (-> c peer length))))
+    (memcpy (-> r peer bytes) (-> c peer bytes) (-> c peer length))
     (http-head-copy! (& (-> r own-head)) h)
     (set! (-> r head) (& (-> r own-head)))
     (set! (-> r method) (-> r own-head method))
@@ -76,6 +118,7 @@
 (define (release! [r (ptr http-request)])
   (arena-free (& (-> r arena)))
   (buffer-free! (& (-> r body)))
+  (buffer-free! (& (-> r added)))
   (http-head-free! (& (-> r own-head)))
   (free r))
 
@@ -95,8 +138,10 @@
   (when (and (== (-> r depth) 0) (-> r done)) (release! r)))
 
 (define (run-handle! [r (ptr http-request)] [continue bool])
-  (let ([previous (enter! r)])
-    ((-> (http-request-server r) handle) r)
+  (let ([previous (enter! r)] [s (http-request-server r)] [stopped #f])
+    (for ([i u32 0]) (and (not stopped) (< i (-> s checks length))) (+= i 1)
+      (let ([check (& (@ (-> s checks) i))]) (set! stopped ((-> check run) r (-> check settings)))))
+    (unless stopped ((-> s handle) r))
     (when (and continue (not (-> r sent)) (!= (-> r connection) 0))
       (out! (connection-of r) (cast (slice u8) "HTTP/1.1 100 Continue\r\n\r\n")))
     (leave! r previous)))
@@ -234,6 +279,8 @@
     (buffer-free! (& (-> c out)))
     (buffer-free! (& (-> c parser head line)))
     (buffer-free! (& (-> c parser line)))
+    (free (-> c peer bytes))
+    (set! (-> c peer) "")
     (cond [(not (memory? c))
            (stream-close (-> c stream))
            (free c)]
@@ -340,6 +387,7 @@
     (buffer-free! (& (-> c out)))
     (buffer-free! held)
     (buffer-free! (& (-> c parser line)))
+    (free (-> c peer bytes))
     (free c)
     (unless (== r 0)
       (set! (-> r connection) 0)
@@ -404,6 +452,7 @@
 
 (define (accept! [s (ptr http-server)] [stream u32])
   (let ([c (new-connection! s stream)])
+    (set! (-> c peer) (events-take-text))
     (stream-tag! stream (cast (ptr void) c))
     (read-more! c)))
 
@@ -417,7 +466,8 @@
       (set! (-> c out length) 0)
       (http-write-status! (& (-> c out)) status)
       (http-write-date! (& (-> c out)) (clock-now))
-      (when (-> c closing) (http-write-header! (& (-> c out)) "connection" "close")))))
+      (when (-> c closing) (http-write-header! (& (-> c out)) "connection" "close"))
+      (buffer-add! (& (-> c out)) (buffer-bytes (& (-> r added)))))))
 
 (define (http-header! [r (ptr http-request)] [name string] [value string])
   (let ([c (connection-of r)])

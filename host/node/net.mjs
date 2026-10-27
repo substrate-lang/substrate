@@ -60,7 +60,8 @@ export function netModule(grants, certificate) {
         });
         server.on(server instanceof tls.Server ? 'secureConnection' : 'connection', (socket) => {
           socket.setNoDelay(true);
-          caller.event(ACCEPT, id, tag, caller.streams.add(tag, nodeSource(socket)));
+          const peer = utf8.encode(socket.remoteAddress || '');
+          caller.event(ACCEPT, id, tag, caller.streams.add(tag, nodeSource(socket)), peer);
         });
         server.on('error', (e) => {
           if (listeners.get(id) !== server) return;
