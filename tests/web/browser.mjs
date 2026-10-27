@@ -1,8 +1,23 @@
-// Drives a headless Chromium over the DevTools protocol, for the browser tests.
+// Drives a headless Chromium over the DevTools protocol, and starts `sub serve`, for the browser tests.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+
+// served starts `sub serve` on dir at any free port, and gives the server and its URL. Its stderr is passed on but for
+// its log of requests.
+export async function served(dir) {
+  const server = spawn(path.join(here, '../../bin/sub'), ['serve', dir, '0'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  readline.createInterface({ input: server.stderr }).on('line', (line) => {
+    if (!line.includes(' msg=request ')) process.stderr.write(`${line}\n`);
+  });
+  const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
+  return { server, url };
+}
 
 export const webgpuFlags = process.platform === 'darwin' ? ['--enable-unsafe-webgpu'] : [
   '--enable-unsafe-webgpu', '--enable-unsafe-swiftshader', '--enable-features=Vulkan', '--use-vulkan=swiftshader',

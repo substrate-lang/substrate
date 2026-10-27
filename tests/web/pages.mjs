@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withBrowser, webgpuFlags } from './browser.mjs';
+import { served, withBrowser, webgpuFlags } from './browser.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites, ...names] = process.argv.slice(2);
 
@@ -788,9 +788,7 @@ const checks = {
 
 const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 
-// Port 0: any free port.
-const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
-const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
+const { server, url } = await served(sites);
 // The events page comes from tests/web/server.sub, and a second one on another port is another origin, which lets the
 // first's through CORS.
 const site = path.join(sites, 'events');
