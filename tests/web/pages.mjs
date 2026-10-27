@@ -719,8 +719,8 @@ const checks = {
     check('files: bytes saved as a download', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file', 'saved bytes');
   },
 
-  // The page's client and then the browser's own EventSource read the same stream from tests/web/server.sub; then
-  // requests to it and to the other origin meet cross-origin protection and CORS.
+  // Our client, then the browser's own EventSource, read tests/web/server.sub's stream; then cross-origin protection
+  // and CORS.
   async events(page) {
     const log = () => page.evaluate('document.getElementById("log").textContent');
     await page.waitFor('document.getElementById("log").textContent.endsWith("refused 204")', 10000);
@@ -789,8 +789,7 @@ const checks = {
 const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 
 const { server, url } = await served(sites);
-// The events page comes from tests/web/server.sub, and a second one on another port is another origin, which lets the
-// first's through CORS.
+// tests/web/server.sub serves the events page; a second one on another port is the other origin, which its CORS allows.
 const site = path.join(sites, 'events');
 const started = (...args) => {
   const p = spawn(path.join(here, '../../bin/sub'),

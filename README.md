@@ -15,11 +15,13 @@ compiler is written in it, builds itself, and runs in a browser.
 - `lib/`: libraries written in Substrate. `languages/` holds the languages
   built on it, `scheme/`, a Scheme, and `bend/`, a dependently typed
   language, with `nodes.sub`, the run-time nodes they share. `http/` is an
-  HTTP/1.1 server with WebSockets and static files. `meta/` reads types at
+  HTTP/1.1 server toolkit; `crypto/`, `compress/` and `log/` hold hashes and
+  passwords, DEFLATE and gzip, and logs. `meta/` reads types at
   compile time, for code that writes code; `encoding/` holds UTF-8, Base64,
   JSON and wire (postcard). `web/` (experimental) holds programs in a web
   page: a UI library, WebGPU and `shade/` for GPU programs compiled to WGSL,
   a game library, examples and a REPL.
+- `cmd/`: the `sub serve` and `sub pack` commands.
 - `host/`: what runs compiled programs: `subhost.mjs` on Node, and `web/` in a
   browser (experimental).
 - `seed/`: a checked-in build of the compiler, which builds it from source.

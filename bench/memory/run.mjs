@@ -1,7 +1,6 @@
-// run.mjs OUT REPS: each phase in a fresh server (OUT/server), its connections left open while the heap's growth and
-// the process's resident memory are read: idle keep-alive connections, event streams, as they are and gzipped,
-// WebSockets, connections after a 1 MB answer, and a burst of small requests on 50 connections with its rate. Then the
-// compiler building itself, the best of REPS.
+// run.mjs OUT REPS: the heap's growth and resident memory of a fresh server (OUT/server) for each phase, its
+// connections held open: idle, event streams plain and gzipped, WebSockets, after a 1 MB answer, and a burst of small
+// requests on 50 connections. Then the compiler building itself, the best of REPS.
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
@@ -71,7 +70,6 @@ const large = (got) => {
   return end >= 0 && got.length >= end + 4 + 1048576;
 };
 
-// burst answers 400 requests on each of 50 connections, one at a time on each.
 const burst = async (port) => {
   const sockets = await many(50, () => open(port, get('/'), answered));
   await Promise.all(sockets.map((s) => new Promise((resolve) => {

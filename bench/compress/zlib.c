@@ -1,6 +1,5 @@
-// zlib on the phases compress.sub times, reported the same way. With OUT not "-", each level's output is written there
-// as zlib-NAME-LEVEL.deflate, and ours, when compress.sub has written them there, inflated and compared with the file.
-// With REPS 0 it only compares.
+// zlib on the phases compress.sub times, reported the same way. With OUT not "-", each output is written there as
+// zlib-NAME-LEVEL.deflate, and ours there inflated and checked; with REPS 0 it only checks.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

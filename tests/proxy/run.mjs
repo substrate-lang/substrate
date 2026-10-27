@@ -1,8 +1,6 @@
-// run.mjs OUT: Caddy, then nginx, over TLS with OUT/cert.pem, in front of a server (OUT/server) started fresh for
-// each: the client's address and scheme as the server sees them, the client having sent an X-Forwarded-For of its
-// own; two events that come half a second apart rather than together, as they are and gzipped; a WebSocket from a
-// page's origin that the server's pings keep open past nginx's read timeout and that still echoes; and a request in
-// hand, answered as the server shuts down at SIGTERM, after which it exits 0.
+// run.mjs OUT: Caddy, then nginx, over TLS with OUT/cert.pem, in front of a fresh server (OUT/server) each: the
+// client's address and scheme despite its own X-Forwarded-For; events arriving apart, as they are and gzipped; a
+// WebSocket kept open by pings past nginx's read timeout; and a request answered as the server shuts down.
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
@@ -90,8 +88,7 @@ const get = (port, target, headers) => new Promise((resolve, reject) => {
   }).on('error', reject).end();
 });
 
-// events gives when each event came, in milliseconds from the request, and the stream's encoding; asked for gzip, it
-// inflates the stream as it comes.
+// events gives when each event came, in ms from the request, and the stream's encoding.
 const events = (port, zipped) => new Promise((resolve, reject) => {
   const start = performance.now();
   const times = {};
