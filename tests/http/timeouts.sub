@@ -1,0 +1,141 @@
+;; Timeouts and closing over sockets, one client after another: a kept-alive connection closed once idle; a body too
+;; slow, cut off, and one its handler gives longer; a client that reads none of a large answer, dropped; a body left
+;; unread, read past when small and given up when large; a client still sending after a 413, which reads it; and a
+;; body to come once the client is told to continue, which it never is, given up at once.
+(require-unqualified events "../../host/events.sub")
+(require-unqualified stream "../../host/stream.sub")
+(require-unqualified net "../../host/node/net.sub")
+(require-unqualified timer "../../host/modules/timer.sub")
+(require-unqualified clock "../../host/modules/clock.sub")
+(require-unqualified http "../../lib/http/http.sub")
+(require-unqualified server "../../lib/http/server.sub")
+
+(struct side [head event-head] [stream u32] [in (array u8 4096)] [got buffer] [count u64] [said bool])
+
+(const large u32 33554432)
+
+(define server http-server)
+(define c side)
+(define step u32 0)
+(define big (ptr u8) 0)
+(define asked f64 0.0)
+
+;; ---- the server ----
+
+(define (got-body [r (ptr http-request)] [b (slice u8)])
+  (let ([t (make-buffer)])
+    (buffer-add-string! (& t) "got ")
+    (write-digits (& t) (cast u64 (-> b length)) 10)
+    (http-answer-text! r 200 (buffer-string (& t)))
+    (buffer-free! (& t))))
+
+(define (handle [r (ptr http-request)])
+  (let ([path (-> r target)])
+    (cond [(== path "/extended")
+           (http-request-deadline! r 2000.0)
+           (http-read-body! r 0 got-body)]
+          [(== path "/body") (http-read-body! r 0 got-body)]
+          [(== path "/large")
+           (http-respond! r 200)
+           (http-send! r (slice big large))]
+          [(== path "/unread") (http-answer-text! r 200 "unread")]
+          [else (http-answer-text! r 200 "ok")])))
+
+;; ---- the client ----
+
+(define (post! [target string] [length u32] [sent u32])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "POST ")
+    (buffer-add-string! (& b) target)
+    (buffer-add-string! (& b) " HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-length: ")
+    (write-digits (& b) (cast u64 length) 10)
+    (buffer-add-string! (& b) "\r\n\r\n")
+    (stream-write (-> c stream) (buffer-bytes (& b)))
+    (stream-write (-> c stream) (slice big sent))
+    (buffer-free! (& b))))
+
+(define (has? [text string]) -> bool
+  (let ([got (buffer-string (& (-> c got)))] [n (-> text length)])
+    (for ([i u32 0]) (<= (+ i n) (-> got length)) (+= i 1) (when (== (slice got i (+ i n)) text) (return #t)))
+    #f))
+
+(define (read! [s (ptr side)]) (stream-read! (-> s stream) (slice (-> s in))))
+
+(define (next!)
+  (stream-close (-> c stream))
+  (set! (-> c stream) 0)
+  (+= step 1)
+  (set! (-> c got length) 0)
+  (set! (-> c count) 0)
+  (set! (-> c said) #f)
+  (if (< step 8)
+      (net-connect (-> server port) "127.0.0.1" #f (& c) 0)
+      (http-server-close! (& server))))
+
+(define (connected [id u32])
+  (set! (-> c stream) id)
+  (cond [(== step 0) (stream-write-text id "GET / HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")]
+        [(== step 1) (post! "/body" 100 10)]
+        [(== step 2)
+         (post! "/extended" 100 10)
+         (timer-after 500.0 (& c))]
+        [(== step 3)
+         (stream-write-text id "GET /large HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+         (timer-after 700.0 (& c))]
+        [(== step 4) (post! "/unread" 10000 10000)]
+        [(== step 5) (post! "/unread" 1000000 1000000)]
+        [(== step 6) (post! "/body" 100000 100000)]
+        [else
+         (set! asked (clock-monotonic))
+         (stream-write-text id "POST /unread HTTP/1.1\r\nhost: 127.0.0.1\r\n")
+         (stream-write-text id "expect: 100-continue\r\ncontent-length: 10\r\n\r\n")])
+  (unless (== step 3) (read! (& c))))
+
+(define (came)
+  (cond [(and (== step 2) (has? "got 100"))
+         (printf "a body given longer by its handler: got 100\n")
+         (next!)]
+        [(and (== step 4) (not (-> c said)) (has? "unread"))
+         (set! (-> c said) #t)
+         (stream-write-text (-> c stream) "GET / HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")]
+        [(and (== step 4) (has? "ok"))
+         (printf "a small body left unread: read past, and the connection answers again\n")
+         (next!)]))
+
+(define (ended)
+  (cond [(== step 0) (printf "a kept-alive connection: answered ~a, then closed when idle\n" (has? "ok"))]
+        [(== step 1) (printf "a body too slow: cut off, answered ~a\n" (has? "got"))]
+        [(== step 3) (printf "a client reading none of 32 MB: dropped before the end ~a\n" (< (-> c count) large))]
+        [(== step 5) (printf "a large body left unread: answered ~a, then closed\n" (has? "unread"))]
+        [(== step 6) (printf "a client still sending after a 413: read it ~a, then closed\n" (has? " 413 "))]
+        [(== step 7)
+         (printf "a body to come once told to continue: answered ~a, closed before the request's timeout ~a\n"
+                 (has? "unread") (< (- (clock-monotonic) asked) 200.0))]
+        [else (printf "step ~a: closed\n" step)])
+  (next!))
+
+(define (heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (cond [(== source timer-source)
+         (if (== step 2)
+             (stream-write (-> c stream) (slice big 90))
+             (read! (& c)))]
+        [(== kind net-connected) (connected id)]
+        [(and (== kind stream-read) (> value 0))
+         (+= (-> c count) (cast u64 value))
+         (when (< (-> c got length) 4096) (buffer-add! (& (-> c got)) (slice (-> c in) (cast u32 value))))
+         (came)
+         (when (== (-> c stream) id) (read! (& c)))]
+        [(or (== kind stream-read) (== kind stream-failed)) (ended)]))
+
+(define (listening [s (ptr http-server)]) (net-connect (-> s port) "127.0.0.1" #f (& c) 0))
+
+(define (main)
+  (set! big (cast (ptr u8) (calloc large 1)))
+  (set! (-> c head handle) heard)
+  (set! (-> c got) (make-buffer))
+  (set! (-> server idle-timeout) 100.0)
+  (set! (-> server request-timeout) 300.0)
+  (set! (-> server send-timeout) 200.0)
+  (set! (-> server body-limit) 1000)
+  (set! (-> server listening) listening)
+  (http-serve! (& server) 0 handle))
