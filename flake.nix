@@ -37,6 +37,8 @@
           ];
           # bench/json: cJSON's source, and nativejson-benchmark's three files
           CJSON_SOURCE = pkgs.cjson.src;
+          # bench/crypto: mbedTLS's source
+          MBEDTLS_SOURCE = pkgs.mbedtls.src;
           JSON_BENCH_FILES = pkgs.linkFarm "json-bench-files" (map (f: {
             name = "${f.name}.json";
             path = pkgs.fetchurl {
