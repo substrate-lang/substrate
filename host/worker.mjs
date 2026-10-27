@@ -78,7 +78,13 @@ export function workerModule({ spawn }) {
       end() {
         for (const w of [...alive.keys()]) end(w, -1, null);
       },
-      start(np, nl, bp, bl, time, size, heard, tag, gp, gl, err) {
+      // f is the function's index in the table; the thread finds it by its module and export name.
+      start(f, bp, bl, time, size, heard, tag, gp, gl, err) {
+        const entry = caller.named(f >>> 0);
+        if (!entry) {
+          caller.fail(err, 'worker.start: a function of code the program loaded');
+          return 0;
+        }
         const pages = Math.ceil((size >>> 0) / 65536);
         let grants = caller.grants();
         if (gl > 0) {
@@ -89,7 +95,7 @@ export function workerModule({ spawn }) {
             return 0;
           }
         }
-        return start(string(np, nl), bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err, grants);
+        return start(entry, bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err, grants);
       },
       send(w, ptr, len) {
         const worker = alive.get(w);

@@ -59,8 +59,8 @@ self.onmessage = async (e) => {
       delivered: side.delivered,
       active: side.active,
     }, [...wasm.keys()], wasm);
-    if (app.entry && typeof app.entry[m.entry] !== 'function' && !app.ended) {
-      side.report(`worker.start: no function ${m.entry}`);
+    if (app.entry && typeof app.worker !== 'function' && !app.ended) {
+      side.report(`worker.start: no function ${m.entry[1]} in ${m.entry[0]}`);
       side.ended(2, '');
       return;
     }
