@@ -22,10 +22,10 @@
         '';
     in {
       devShells = forAll (pkgs: rec {
-        # tests/proxy: Caddy and nginx in front of a server, apart from the default shell
+        # tests/proxy and bench/http: Caddy and nginx, and wrk to load a server, apart from the default shell
         proxies = pkgs.mkShell {
           inputsFrom = [ default ];
-          packages = [ pkgs.caddy pkgs.nginx ];
+          packages = [ pkgs.caddy pkgs.nginx pkgs.wrk ];
         };
         # bench/compress: the Silesia corpus, apart from the default shell
         silesia = default.overrideAttrs (_: {
