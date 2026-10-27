@@ -21,7 +21,12 @@
           chmod +x "$out/bin/chromium"
         '';
     in {
-      devShells = forAll (pkgs: {
+      devShells = forAll (pkgs: rec {
+        # tests/proxy: Caddy and nginx in front of a server, apart from the default shell
+        proxies = pkgs.mkShell {
+          inputsFrom = [ default ];
+          packages = [ pkgs.caddy pkgs.nginx ];
+        };
         default = pkgs.mkShell {
           packages = [
             pkgs.wasm-tools    # validate / print emitted modules
