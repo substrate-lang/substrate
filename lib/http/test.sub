@@ -1,14 +1,18 @@
-;; Requests to a server through a connection without a socket, after Go's httptest. done is called once the whole
-;; answer has come, or once the server has ended the connection without one, when the status is 0.
+;; Requests to a server through a connection without a socket, after Go's httptest. http-test! and http-test-raw!
+;; return #t when the answer has come by the time they return, as it has from a handler that answers at once.
+;; http-test-later! calls done once the answer comes, or once the server ends the connection without one, when the
+;; status is 0; it is for handlers that answer later or trap, since a trap ends the code that made the request. Each
+;; request frees the one before, and http-test-free! the last.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified timer "../../host/modules/timer.sub")
 (require-unqualified http "http.sub")
 (require-unqualified server "server.sub")
 
-(provide http-test http-test! http-test-raw! http-test-status http-test-header http-test-body http-test-free!)
+(provide http-test http-test! http-test-later! http-test-raw! http-test-status http-test-header http-test-body
+         http-test-free!)
 
 (struct http-test [head event-head] [connection (ptr void)] [parser http-parser] [request buffer] [answer http-head]
-  [body buffer] [status i32] [bodiless bool] [over bool] [user (ptr void)] [done (fn ((ptr http-test)))])
+  [body buffer] [status i32] [bodiless bool] [over bool] [done (fn ((ptr http-test)))])
 
 (define (http-test-status [t (ptr http-test)]) -> i32 (-> t status))
 
@@ -16,12 +20,28 @@
 
 (define (http-test-body [t (ptr http-test)]) -> (slice u8) (buffer-bytes (& (-> t body))))
 
-;; http-test! sends a request with the headers, each name followed by its value, and the body. It adds a host
-;; header when there is none, and a content-length unless the request is a GET or HEAD without a body.
+;; headers are names each followed by its value. A host header is added when there is none, and a content-length
+;; unless the request is a GET or HEAD without a body.
 (define (http-test! [t (ptr http-test)] [s (ptr http-server)] [method string] [target string] [headers (slice string)]
-                    [body (slice u8)] [done (fn ((ptr http-test)))])
+                    [body (slice u8)]) -> bool
+  (written! t method target headers body)
+  (start! t s (== method "HEAD")))
+
+(define (http-test-later! [t (ptr http-test)] [s (ptr http-server)] [method string] [target string]
+                          [headers (slice string)] [body (slice u8)] [done (fn ((ptr http-test)))])
+  (written! t method target headers body)
+  (set! (-> t done) done)
+  (start! t s (== method "HEAD")))
+
+;; bodiless tells that the answer has no body, as for HEAD.
+(define (http-test-raw! [t (ptr http-test)] [s (ptr http-server)] [bytes (slice u8)] [bodiless bool]) -> bool
+  (http-test-free! t)
+  (buffer-add! (& (-> t request)) bytes)
+  (start! t s bodiless))
+
+(define (written! [t (ptr http-test)] [method string] [target string] [headers (slice string)] [body (slice u8)])
   (let ([b (& (-> t request))] [host #f])
-    (set! (@ b) (make-buffer))
+    (http-test-free! t)
     (http-write-request! b method target)
     (for ([i u32 0]) (< (+ i 1) (-> headers length)) (+= i 2)
       (when (http-same? (@ headers i) "host") (set! host #t))
@@ -30,33 +50,21 @@
     (unless (and (== (-> body length) 0) (or (== method "GET") (== method "HEAD")))
       (http-write-number! b "content-length" (cast i64 (-> body length))))
     (http-write-end! b)
-    (buffer-add! b body)
-    (start! t s (== method "HEAD") done)))
+    (buffer-add! b body)))
 
-;; http-test-raw! sends the bytes as they are; bodiless tells that the answer has no body, as for HEAD.
-(define (http-test-raw! [t (ptr http-test)] [s (ptr http-server)] [bytes (slice u8)] [bodiless bool]
-                        [done (fn ((ptr http-test)))])
-  (set! (-> t request) (make-buffer))
-  (buffer-add! (& (-> t request)) bytes)
-  (start! t s bodiless done))
-
-(define (start! [t (ptr http-test)] [s (ptr http-server)] [bodiless bool] [done (fn ((ptr http-test)))])
+(define (start! [t (ptr http-test)] [s (ptr http-server)] [bodiless bool]) -> bool
   (set! (-> t head handle) test-heard)
-  (set! (-> t body) (make-buffer))
-  (set! (-> t answer) (make-head))
-  (set! (-> t status) 0)
   (set! (-> t bodiless) bodiless)
-  (set! (-> t over) #f)
-  (set! (-> t done) done)
   (http-parser-init! (& (-> t parser)) (cast (ptr void) t) answer-head answer-body answer-end)
   (set! (-> t connection) (http-connect! s sink sink-ended (cast (ptr void) t)))
-  (http-connection-feed! (-> t connection) (buffer-bytes (& (-> t request)))))
+  (http-connection-feed! (-> t connection) (buffer-bytes (& (-> t request))))
+  (when (-> t over) (close! t))
+  (-> t over))
 
-(define (make-head) -> http-head
-  (let ([h http-head])
-    (set! (-> h line) (make-buffer))
-    (set! (-> h count) 0)
-    h))
+(define (close! [t (ptr http-test)])
+  (unless (== (-> t connection) 0)
+    (http-connection-close! (-> t connection))
+    (set! (-> t connection) 0)))
 
 (define (sink [tag (ptr void)] [b (slice u8)])
   (let ([t (cast (ptr http-test) tag)])
@@ -68,7 +76,7 @@
       (http-parser-closed! (& (-> t parser)))
       (over! t 0))))
 
-;; An answer of 100 Continue comes before the final one, which is the test's.
+;; A 100 Continue comes before the answer.
 (define (answer-head [p (ptr http-parser)])
   (let ([t (cast (ptr http-test) (-> p user))])
     (when (>= (-> p head status) 200)
@@ -83,22 +91,25 @@
   (let ([t (cast (ptr http-test) (-> p user))])
     (when (>= (-> p head status) 200) (over! t (-> t status)))))
 
-;; over! calls done after the server's code that gave the answer has returned.
 (define (over! [t (ptr http-test)] [status i32])
   (unless (-> t over)
     (set! (-> t over) #t)
     (set! (-> t status) status)
-    (timer-after 0.0 (cast (ptr void) t))))
+    (unless (== (-> t done) 0) (timer-after 0.0 (cast (ptr void) t)))))
 
 (define (test-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
-  (let ([t (cast (ptr http-test) tag)])
-    (http-connection-close! (-> t connection))
-    (set! (-> t connection) 0)
-    ((-> t done) t)))
+  (let ([t (cast (ptr http-test) tag)] [done (-> (cast (ptr http-test) tag) done)])
+    (close! t)
+    (set! (-> t done) 0)
+    (done t)))
 
 (define (http-test-free! [t (ptr http-test)])
+  (close! t)
   (buffer-free! (& (-> t request)))
   (buffer-free! (& (-> t body)))
   (http-head-free! (& (-> t answer)))
   (buffer-free! (& (-> t parser head line)))
-  (buffer-free! (& (-> t parser line))))
+  (buffer-free! (& (-> t parser line)))
+  (set! (-> t status) 0)
+  (set! (-> t over) #f)
+  (set! (-> t done) 0))

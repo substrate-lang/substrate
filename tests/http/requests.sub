@@ -1,16 +1,18 @@
 ;; Requests through the test client: HEAD, a trap answered with 500, bodies read under a limit, a malformed body, a
-;; redirect, the heap after many requests that use their arenas, and a request whose connection ends before its answer.
+;; redirect, the heap after many requests that use their arenas, an answer that comes later, and a request whose
+;; connection ends before its answer.
 (require-unqualified events "../../host/events.sub")
+(require-unqualified timer "../../host/modules/timer.sub")
 (require-unqualified http "../../lib/http/http.sub")
 (require-unqualified server "../../lib/http/server.sub")
 (require-unqualified test "../../lib/http/test.sub")
 
+(struct delay [head event-head] [request (ptr http-request)])
+
 (define server http-server)
 (define t http-test)
-(define step u32 0)
 (define zero i32 0)
-(define rounds u32 0)
-(define heap i32 0)
+(define late delay)
 (define none (slice string) 0)
 
 (define (took [r (ptr http-request)] [body (slice u8)])
@@ -20,9 +22,12 @@
     (http-answer-text! r 200 (buffer-string (& b)))
     (buffer-free! (& b))))
 
-(define (late [r (ptr http-request)])
+(define (gone [r (ptr http-request)])
   (printf "gone: ~a ~a\n" (-> r method) (-> r target))
   (http-answer-text! r 200 "late"))
+
+(define (later [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (http-answer-text! (-> (cast (ptr delay) tag) request) 200 "later"))
 
 (define (handle [r (ptr http-request)])
   (let ([path (-> r target)])
@@ -33,7 +38,10 @@
           [(== path "/arena")
            (for ([i u32 0]) (< i 100) (+= i 1) (arena-alloc (& (-> r arena)) 1000))
            (http-answer-text! r 200 "used")]
-          [(== path "/wait") (set! (-> r on-gone) late)]
+          [(== path "/later")
+           (set! (-> late request) r)
+           (timer-after 1.0 (& late))]
+          [(== path "/wait") (set! (-> r on-gone) gone)]
           [else (http-answer-text! r 404 "not found")])))
 
 (define (trapped [r (ptr http-request)] [why string])
@@ -41,58 +49,55 @@
     (while (and (< i (-> why length)) (!= (@ why i) 10)) (+= i 1))
     (printf "trapped: ~a ~a: ~a\n" (-> r method) (-> r target) (slice why 0 i))))
 
-(define (shown [t (ptr http-test)])
-  (printf "~a: ~a ~a\n" step (http-test-status t) (cast string (http-test-body t)))
-  (http-test-free! t)
-  (next!))
+(define (shown [what string])
+  (printf "~a: ~a ~s" what (http-test-status (& t)) (cast string (http-test-body (& t))))
+  (let ([length (http-test-header (& t) "content-length")] [location (http-test-header (& t) "location")])
+    (when (== (-> (http-test-body (& t)) length) 0) (printf " length ~a" length))
+    (unless (== (-> location length) 0) (printf " location ~a" location)))
+  (printf "\n"))
 
-(define (shown-header [t (ptr http-test)])
-  (printf "~a: ~a length ~a location ~a\n" step (http-test-status t) (http-test-header t "content-length")
-          (http-test-header t "location"))
-  (http-test-free! t)
-  (next!))
+(define (sent [method string] [target string] [body string])
+  (unless (http-test! (& t) (& server) method target none (cast (slice u8) body)) (printf "no answer yet: "))
+  (shown target))
 
-(define (used [t (ptr http-test)])
-  (http-test-free! t)
-  (+= rounds 1)
-  (when (== rounds 10) (set! heap (sbrk 0)))
-  (if (< rounds 200)
-      (http-test! t (& server) "GET" "/arena" none 0 used)
-      (begin
-        (printf "~a: the heap grew after ten rounds: ~a\n" step (!= (sbrk 0) heap))
-        (next!))))
-
-(define (chunked! [body string] [done (fn ((ptr http-test)))])
+(define (chunked [body string])
   (let ([b (make-buffer)])
     (buffer-add-string! (& b) "POST /body HTTP/1.1\r\nhost: x\r\ntransfer-encoding: chunked\r\n\r\n")
     (buffer-add-string! (& b) body)
-    (http-test-raw! (& t) (& server) (buffer-bytes (& b)) #f done)
+    (http-test-raw! (& t) (& server) (buffer-bytes (& b)) #f)
+    (shown "chunked")
     (buffer-free! (& b))))
 
 (define (ignored [tag (ptr void)] [b (slice u8)]) (begin))
 (define (ended [tag (ptr void)]) (printf "ended\n"))
 
-(define (next!)
-  (+= step 1)
-  (case step
-    [(1) (http-test! (& t) (& server) "GET" "/hello" none 0 shown)]
-    [(2) (http-test! (& t) (& server) "HEAD" "/hello" none 0 shown-header)]
-    [(3) (http-test! (& t) (& server) "GET" "/trap" none 0 shown)]
-    [(4) (http-test! (& t) (& server) "GET" "/hello" none 0 shown)]
-    [(5) (http-test! (& t) (& server) "POST" "/body" none (cast (slice u8) "0123456789") shown)]
-    [(6) (http-test! (& t) (& server) "POST" "/body" none (cast (slice u8) "0123456789abcdefg") shown)]
-    [(7) (chunked! "8\r\n01234567\r\n8\r\n01234567\r\n8\r\n01234567\r\n0\r\n\r\n" shown)]
-    [(8) (chunked! "zz\r\n" shown)]
-    [(9) (http-test! (& t) (& server) "GET" "/away" none 0 shown-header)]
-    [(10) (http-test! (& t) (& server) "GET" "/arena" none 0 used)]
-    [(11)
-     (let ([c (http-connect! (& server) ignored ended 0)])
-       (http-connection-feed! c (cast (slice u8) "GET /wait HTTP/1.1\r\nhost: x\r\n\r\n"))
-       (http-connection-close! c)
-       (printf "11: closed\n"))]
-    [else (begin)]))
+(define (answered [t (ptr http-test)])
+  (shown "/trap")
+  (sent "GET" "/hello" "")
+  (http-test-later! t (& server) "GET" "/later" none 0 came))
+
+(define (came [t (ptr http-test)])
+  (shown "/later")
+  (http-test-free! t)
+  (let ([c (http-connect! (& server) ignored ended 0)])
+    (http-connection-feed! c (cast (slice u8) "GET /wait HTTP/1.1\r\nhost: x\r\n\r\n"))
+    (http-connection-close! c)
+    (printf "/wait: closed\n")))
 
 (define (main)
-  (set! (-> server handle) handle)
-  (set! (-> server on-trap) trapped)
-  (next!))
+  (let ([heap i32 0])
+    (set! (-> late head handle) later)
+    (set! (-> server handle) handle)
+    (set! (-> server on-trap) trapped)
+    (sent "GET" "/hello" "")
+    (sent "HEAD" "/hello" "")
+    (sent "POST" "/body" "0123456789")
+    (sent "POST" "/body" "0123456789abcdefg")
+    (chunked "8\r\n01234567\r\n8\r\n01234567\r\n8\r\n01234567\r\n0\r\n\r\n")
+    (chunked "zz\r\n")
+    (sent "GET" "/away" "")
+    (for ([i u32 0]) (< i 200) (+= i 1)
+      (http-test! (& t) (& server) "GET" "/arena" none 0)
+      (when (== i 9) (set! heap (sbrk 0))))
+    (printf "the heap grew after ten rounds: ~a\n" (!= (sbrk 0) heap))
+    (http-test-later! (& t) (& server) "GET" "/trap" none 0 answered)))
