@@ -7,9 +7,10 @@
 ;; for an answer that cannot be sent, 60 s. body-limit bounds http-read-body!, 1 MiB when 0. proxies is how many
 ;; proxies stand in front of the server, whose X-Forwarded headers it believes, and checks run in order before handle.
 ;; When listening fails, problem holds the reason. A request lasts until it is answered and its body has ended, and
-;; while its own code runs. A trap in that code answers it with 500, or ends its connection once its answer has begun,
-;; and on-trap is told, or else stderr. A body left unread is read and dropped, up to 256 KB, as Go does, and a closing
-;; connection reads on for a while, as nginx's do, so that the client sees its answer.
+;; while its own code runs; on-done is called as it ends, and must not trap. A trap in that code answers it with 500, or
+;; ends its connection once its answer has begun, and on-trap is told, or else the log at the error level, or else
+;; stderr. A body left unread is read and dropped, up to 256 KB, as Go does, and a closing connection reads on for a
+;; while, as nginx's do, so that the client sees its answer.
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
@@ -17,9 +18,10 @@
 (require-unqualified timer "../../host/modules/timer.sub")
 (require-unqualified clock "../../host/modules/clock.sub")
 (require-unqualified http "http.sub")
+(require-unqualified log "../log/log.sub")
 
 (provide http-server http-request http-check http-hook http-serve! http-server-close! http-server-shutdown!
-         http-stop-on-signals! http-hook! http-unhook! http-request-header http-request-server
+         http-stop-on-signals! http-hook! http-unhook! http-log-access http-request-header http-request-server
          http-request-gone? http-request-address http-request-https? http-request-deadline! http-add-header!
          http-respond! http-header! http-length! http-write! http-send! http-send-text! http-send-stream! http-finish!
          http-take! http-read-body! http-answer-text! http-redirect! http-trapped http-connect! http-connection-feed!
@@ -35,7 +37,8 @@
 (struct http-request [connection (ptr void)] [server (ptr void)] [method string] [target string] [head (ptr http-head)]
   [arena arena] [user (ptr void)] [route (ptr void)] [peer string] [ended bool] [failed bool] [answered bool]
   [sent bool] [done bool] [gone bool] [chunked bool] [depth u32] [outer (ptr http-request)] [status i32] [length i64]
-  [written i64] [deadline f64] [on-body (fn ((ptr http-request) (slice u8)))] [on-end (fn ((ptr http-request)))]
+  [written i64] [began f64] [deadline f64] [on-body (fn ((ptr http-request) (slice u8)))]
+  [on-end (fn ((ptr http-request)))]
   [on-gone (fn ((ptr http-request)))] [on-drained (fn ((ptr http-request)))] [body buffer] [limit u32]
   [taken (fn ((ptr http-request) (slice u8)))] [added buffer] [own-head http-head])
 
@@ -66,8 +69,9 @@
 (struct http-server [head event-head] [listener u32] [port u32] [host string] [secure bool] [most u32]
   [idle-timeout f64] [head-timeout f64] [request-timeout f64] [send-timeout f64] [body-limit u32]
   [proxies u32] [checks (slice http-check)] [problem string] [user (ptr void)] [connections (ptr http-connection)]
-  [hooks (ptr http-hook)] [stopping bool] [stop-timer u32] [stopped (fn ((ptr http-server)))]
-  [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))] [on-trap (fn ((ptr http-request) string))])
+  [hooks (ptr http-hook)] [stopping bool] [stop-timer u32] [stopped (fn ((ptr http-server)))] [log (ptr logger)]
+  [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))] [on-trap (fn ((ptr http-request) string))]
+  [on-done (fn ((ptr http-request)))])
 
 ;; ---- requests ----
 
@@ -114,6 +118,20 @@
     (while (and (< i (-> proto length)) (!= (@ proto i) 44)) (+= i 1))
     (http-same? (http-trimmed (slice proto 0 i)) "https")))
 
+;; http-log-access, as a server's on-done, logs each request at the info level to the server's log, or log-default: its
+;; method and target; its status, or 499 when its client left before any answer, as nginx logs it; its body's bytes;
+;; the milliseconds it took; and its client's address.
+(define (http-log-access [r (ptr http-request)])
+  (let ([s (http-request-server r)] [e log-entry] [ms (- (clock-monotonic) (-> r began))])
+    (log-begin! (& e) (if (== (-> s log) 0) (& log-default) (-> s log)) log-info "request")
+    (log-string! (& e) "method" (-> r method))
+    (log-string! (& e) "target" (-> r target))
+    (log-int! (& e) "status" (cast i64 (if (and (-> r gone) (not (-> r sent))) 499 (-> r status))))
+    (log-int! (& e) "bytes" (-> r written))
+    (log-float! (& e) "ms" (/ (nearbyint (* ms 1000.0)) 1000.0))
+    (log-string! (& e) "address" (http-request-address r))
+    (log-end! (& e))))
+
 ;; http-add-header! adds a header to the request's answer, for a check to add before the handler answers.
 (define (http-add-header! [r (ptr http-request)] [name string] [value string])
   (http-write-header! (& (-> r added)) name value))
@@ -130,8 +148,9 @@
     (set! (-> r head) (& (-> r own-head)))
     (set! (-> r method) (-> r own-head method))
     (set! (-> r target) (-> r own-head target))
+    (set! (-> r began) (if (> (-> c started) 0.0) (-> c started) (clock-monotonic)))
     (let ([t (timeout (-> (server-of c) request-timeout) 300000.0)])
-      (set! (-> r deadline) (if (< t 0.0) 0.0 (+ (-> c started) t))))
+      (set! (-> r deadline) (if (< t 0.0) 0.0 (+ (-> r began) t))))
     (set! (-> c request) r)
     r))
 
@@ -142,6 +161,7 @@
   (unless (== (-> r connection) 0) (time! (connection-of r))))
 
 (define (release! [r (ptr http-request)])
+  (let ([done (-> (http-request-server r) on-done)]) (unless (== done 0) (done r)))
   (arena-free (& (-> r arena)))
   (buffer-free! (& (-> r body)))
   (buffer-free! (& (-> r added)))
@@ -217,19 +237,25 @@
         (set! r outer)))))
 
 (define (told! [r (ptr http-request)] [why string])
-  (let ([s (http-request-server r)])
-    (if (== (-> s on-trap) 0)
-        (let ([b (make-buffer)])
-          (buffer-add-string! (& b) "error: ")
-          (buffer-add-string! (& b) (-> r method))
-          (buffer-add-byte! (& b) 32)
-          (buffer-add-string! (& b) (-> r target))
-          (buffer-add-string! (& b) ": ")
-          (buffer-add-string! (& b) why)
-          (buffer-add-byte! (& b) 10)
-          (host-write 2 (buffer-bytes (& b)))
-          (buffer-free! (& b)))
-        ((-> s on-trap) r why))))
+  (let ([s (http-request-server r)] [e log-entry])
+    (cond [(!= (-> s on-trap) 0) ((-> s on-trap) r why)]
+          [(!= (-> s log) 0)
+           (log-begin! (& e) (-> s log) log-error "trap")
+           (log-string! (& e) "method" (-> r method))
+           (log-string! (& e) "target" (-> r target))
+           (log-string! (& e) "reason" why)
+           (log-end! (& e))]
+          [else
+           (let ([b (make-buffer)])
+             (buffer-add-string! (& b) "error: ")
+             (buffer-add-string! (& b) (-> r method))
+             (buffer-add-byte! (& b) 32)
+             (buffer-add-string! (& b) (-> r target))
+             (buffer-add-string! (& b) ": ")
+             (buffer-add-string! (& b) why)
+             (buffer-add-byte! (& b) 10)
+             (host-write 2 (buffer-bytes (& b)))
+             (buffer-free! (& b)))])))
 
 (define (fail! [r (ptr http-request)])
   (let ([c (connection-of r)])
