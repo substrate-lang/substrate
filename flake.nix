@@ -44,6 +44,13 @@
           CJSON_SOURCE = pkgs.cjson.src;
           # bench/crypto: mbedTLS's source
           MBEDTLS_SOURCE = pkgs.mbedtls.src;
+          # bench/compress: zlib's source, and the Silesia corpus
+          ZLIB_SOURCE = pkgs.zlib.src;
+          SILESIA = pkgs.fetchzip {
+            url = "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip";
+            stripRoot = false;
+            hash = "sha256-RZsvB/b9XyZEc523xvpGtPA7/mYL99E9X6JgE/D3fvA=";
+          };
           JSON_BENCH_FILES = pkgs.linkFarm "json-bench-files" (map (f: {
             name = "${f.name}.json";
             path = pkgs.fetchurl {
