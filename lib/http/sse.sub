@@ -1,0 +1,125 @@
+;; Server-sent events, the HTML standard's event streams. sse-accept! answers a request with a stream, and sse-send!
+;; sends each event on it. A comment goes out every beat milliseconds, 15 s when 0. on-closed is called if the client
+;; leaves before sse-close! ends the stream, or after the server ends it as it shuts down. Once accepted, the request's
+;; user is the stream. compress, set before sse-accept!, has the events gzipped, each alone, when the server compresses.
+(require-unqualified events "../../host/events.sub")
+(require-unqualified timer "../../host/modules/timer.sub")
+(require-unqualified http "http.sub")
+(require-unqualified server "server.sub")
+
+(provide sse-stream sse-accept! sse-send! sse-retry! sse-close!)
+
+(const default-beat f64 15000.0)
+
+(struct sse-stream [head event-head] [request (ptr http-request)] [user (ptr void)] [beat f64] [compress bool]
+  [timer u32] [out buffer] [hook http-hook] [on-closed (fn ((ptr sse-stream)))] [on-drained (fn ((ptr sse-stream)))])
+
+(define (arm! [s (ptr sse-stream)])
+  (set! (-> s timer) (timer-after (if (> (-> s beat) 0.0) (-> s beat) default-beat) (cast (ptr void) s))))
+
+(define (stop! [s (ptr sse-stream)])
+  (timer-cancel (-> s timer))
+  (set! (-> s request) 0)
+  (http-unhook! (& (-> s hook)))
+  (buffer-free! (& (-> s out))))
+
+(define (stopping [tag (ptr void)] [forced bool])
+  (let* ([s (cast (ptr sse-stream) tag)] [closed (-> s on-closed)])
+    (sse-close! s)
+    (unless (== closed 0) (closed s))))
+
+(define (gone [r (ptr http-request)])
+  (let ([s (cast (ptr sse-stream) (-> r user))])
+    (stop! s)
+    (unless (== (-> s on-closed) 0) ((-> s on-closed) s))
+    (http-finish! r)))
+
+(define (drained [r (ptr http-request)])
+  (let ([s (cast (ptr sse-stream) (-> r user))])
+    (unless (== (-> s on-drained) 0) ((-> s on-drained) s))))
+
+(define (beat-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([s (cast (ptr sse-stream) tag)])
+    (when (and (== id (-> s timer)) (!= (-> s request) 0))
+      (http-write! (-> s request) (cast (slice u8) ":\n"))
+      (arm! s))))
+
+;; sse-accept! answers with an event stream and returns #t, or #f when the request is HEAD or the client is gone.
+;; X-Accel-Buffering: no keeps nginx from holding events back.
+(define (sse-accept! [s (ptr sse-stream)] [r (ptr http-request)]) -> bool
+  (http-respond! r 200)
+  (http-header! r "content-type" "text/event-stream")
+  (when (-> s compress) (set! (-> r compressible) #t))
+  (http-header! r "cache-control" "no-cache")
+  (http-header! r "x-accel-buffering" "no")
+  (when (or (== (-> r method) "HEAD") (http-request-gone? r))
+    (http-finish! r)
+    (return #f))
+  (set! (-> s head handle) beat-heard)
+  (set! (-> s request) r)
+  (set! (-> s out) (make-buffer))
+  (set! (-> r user) (cast (ptr void) s))
+  (set! (-> r on-gone) gone)
+  (set! (-> r on-drained) drained)
+  (set! (-> s hook run) stopping)
+  (set! (-> s hook tag) (cast (ptr void) s))
+  (http-hook! (http-request-server r) (& (-> s hook)))
+  (http-write! r 0)
+  (arm! s)
+  #t)
+
+(define (field? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (when (or (== (@ s i) 10) (== (@ s i) 13) (== (@ s i) 0)) (return #f)))
+  #t)
+
+(define (field! [b (ptr buffer)] [name string] [value string])
+  (buffer-add-string! b name)
+  (buffer-add-string! b value)
+  (buffer-add-byte! b 10))
+
+;; lines! adds a data field for each line of text, split at CR, LF or CRLF as a reader splits them.
+(define (lines! [b (ptr buffer)] [text string])
+  (let ([i u32 0] [start u32 0] [n (-> text length)])
+    (while #t
+      (while (and (< i n) (!= (@ text i) 10) (!= (@ text i) 13)) (+= i 1))
+      (field! b "data: " (slice text start i))
+      (when (== i n) (break))
+      (when (and (== (@ text i) 13) (< (+ i 1) n) (== (@ text (+ i 1)) 10)) (+= i 1))
+      (+= i 1)
+      (set! start i))))
+
+;; sse-send! sends an event of type event, "message" when empty, with id unless empty, and data. It returns what
+;; http-write! does, or #f once the stream is closed. An event or id with a line break or NUL traps.
+(define (sse-send! [s (ptr sse-stream)] [event string] [id string] [data string]) -> bool
+  (let ([b (& (-> s out))])
+    (when (== (-> s request) 0) (return #f))
+    (unless (and (field? event) (field? id)) (host-trap "sse: an event or id with a line break or NUL"))
+    (set! (-> b length) 0)
+    (unless (== (-> event length) 0) (field! b "event: " event))
+    (unless (== (-> id length) 0) (field! b "id: " id))
+    (lines! b data)
+    (buffer-add-byte! b 10)
+    (let ([room (http-write! (-> s request) (buffer-bytes b))])
+      (set! (-> b length) 0)
+      (buffer-trim! b 4096)
+      room)))
+
+;; sse-retry! tells the client how many milliseconds to wait before it reconnects.
+(define (sse-retry! [s (ptr sse-stream)] [ms u32]) -> bool
+  (let ([b (& (-> s out))])
+    (when (== (-> s request) 0) (return #f))
+    (set! (-> b length) 0)
+    (buffer-add-string! b "retry: ")
+    (http-add-decimal! b (cast i64 ms))
+    (buffer-add-byte! b 10)
+    (http-write! (-> s request) (buffer-bytes b))))
+
+;; sse-close! ends the stream without calling on-closed.
+(define (sse-close! [s (ptr sse-stream)])
+  (let ([r (-> s request)])
+    (unless (== r 0)
+      (stop! s)
+      (set! (-> r on-gone) 0)
+      (set! (-> r on-drained) 0)
+      (http-finish! r))))

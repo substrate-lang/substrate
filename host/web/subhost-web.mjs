@@ -109,6 +109,13 @@ export function run(options, names, wasm) {
     report(host.lastError);
     ended(2, '');
   }
-  app.started = app.call(options.entry || 'main');
+  // A worker's function comes as its module and export name.
+  if (options.entry) {
+    const exports = app.entry && host.registry.get(options.entry[0]);
+    app.worker = exports && exports[options.entry[1]];
+    app.started = typeof app.worker === 'function' ? host.call(app.worker, []) : undefined;
+  } else {
+    app.started = app.call('main');
+  }
   return app;
 }

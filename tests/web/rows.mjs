@@ -1,13 +1,8 @@
 // Times the rows example's operations in a browser: a benchmark, not a test.
-import { spawn } from 'node:child_process';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { withBrowser } from './browser.mjs';
+import { served, withBrowser } from './browser.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites] = process.argv.slice(2);
-const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
-const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
+const { server, url } = await served(sites);
 
 try {
   await withBrowser(async (open) => {

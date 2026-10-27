@@ -1,0 +1,170 @@
+;; Forms read into types. (form T ...) defines T.form-read for each struct type T, filling its fields by name from a
+;; query's or urlencoded body's pairs and a multipart body's parts. As with json, a missing field is refused unless it
+;; is a pointer; a missing bool is false, as an unchecked checkbox's, and a slice takes every value of its name. Files
+;; are http-uploads, views of the body.
+(require-unqualified http "http.sub")
+(require-unqualified url "url.sub")
+(require-unqualified multipart "multipart.sub")
+
+(provide form http-upload form-error)
+
+(struct http-upload [filename string] [type string] [bytes (slice u8)])
+
+(struct form-error [message string] [field string])
+
+(define (refuse! [err (ptr form-error)] [message string] [field string]) -> bool
+  (unless (== err 0)
+    (set! (-> err message) message)
+    (set! (-> err field) field))
+  #f)
+
+;; The kth value of the name, from the pairs and then the parts that are not files.
+(define (text [pairs (slice url-pair)] [parts (slice multipart-part)] [name string] [k u32] [to (ptr string)]) -> bool
+  (for ([i u32 0]) (< i (-> pairs length)) (+= i 1)
+    (let ([p (+ (-> pairs items) i)])
+      (when (== (-> p name) name)
+        (when (== k 0)
+          (set! (@ to) (-> p value))
+          (return #t))
+        (-= k 1))))
+  (for ([i u32 0]) (< i (-> parts length)) (+= i 1)
+    (let ([p (+ (-> parts items) i)])
+      (when (and (not (-> p file)) (== (-> p name) name))
+        (when (== k 0)
+          (set! (@ to) (cast string (-> p bytes)))
+          (return #t))
+        (-= k 1))))
+  #f)
+
+(define (texts [pairs (slice url-pair)] [parts (slice multipart-part)] [name string]) -> u32
+  (let ([n u32 0])
+    (for ([i u32 0]) (< i (-> pairs length)) (+= i 1) (when (== (-> (+ (-> pairs items) i) name) name) (+= n 1)))
+    (for ([i u32 0]) (< i (-> parts length)) (+= i 1)
+      (let ([p (+ (-> parts items) i)]) (when (and (not (-> p file)) (== (-> p name) name)) (+= n 1))))
+    n))
+
+(define (file [parts (slice multipart-part)] [name string] [k u32] [to (ptr http-upload)]) -> bool
+  (for ([i u32 0]) (< i (-> parts length)) (+= i 1)
+    (let ([p (+ (-> parts items) i)])
+      (when (and (-> p file) (== (-> p name) name))
+        (when (== k 0)
+          (set! (-> to filename) (-> p filename))
+          (set! (-> to type) (-> p type))
+          (set! (-> to bytes) (-> p bytes))
+          (return #t))
+        (-= k 1))))
+  #f)
+
+(define (files [parts (slice multipart-part)] [name string]) -> u32
+  (let ([n u32 0])
+    (for ([i u32 0]) (< i (-> parts length)) (+= i 1)
+      (let ([p (+ (-> parts items) i)]) (when (and (-> p file) (== (-> p name) name)) (+= n 1))))
+    n))
+
+(define (float! [s string] [to (ptr f64)]) -> bool
+  (let* ([negative (and (> (-> s length) 0) (== (@ s 0) #\-))] [digits (slice s (if negative 1 0))] [k u64 0])
+    (if (and (digits? digits 10) (digits-integer digits 10 #f (& k)))
+        (begin (set! (@ to) (if negative (- 0.0 (cast f64 k)) (cast f64 k))) #t)
+        (read-decimal s to))))
+
+(define (truth! [s string] [to (ptr bool)]) -> bool
+  (cond [(or (http-same? s "on") (http-same? s "true") (== s "1") (http-same? s "yes")) (set! (@ to) #t) #t]
+        [(or (http-same? s "off") (http-same? s "false") (== s "0") (http-same? s "no")) (set! (@ to) #f) #t]
+        [else #f]))
+
+;; ---- the form form ----
+
+(begin-for-syntax
+  (require-unqualified macros "../../compiler/macros.sub")
+  (require-unqualified derive "../meta/derive.sub")
+
+  (define unsigned-limits datum '((u8 255) (u16 65535) (u32 4294967295) (u64 18446744073709551615)))
+  (define signed-limits datum
+    '((i8 -128 127) (i16 -32768 32767) (i32 -2147483648 2147483647) (i64 -9223372036854775808 9223372036854775807)))
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (form-form [s datum]) -> datum (derive s 'form '"form-read" definitions))
+
+  (define (definitions [t datum] [info datum]) -> datum
+    (unless (== (car info) 'struct) (raise-syntax-error 'form "expected a struct type" t))
+    `(,#`(define (#,(derive-name t '"form-read") [a (ptr arena)] [pairs (slice url-pair)]
+                  [parts (slice multipart-part)] [v (ptr #,t)] [err (ptr form-error)]) -> bool
+           #,@(for/list ([f (caddr info)]) (field-code (car f) (cdr f) #`(-> v #,(car f))))
+           #t)))
+
+  (define (upload? [type datum]) -> bool (and (identifier? type) (free-identifier=? type #'http-upload)))
+
+  (define (value? [type datum]) -> bool
+    (and (symbol? type)
+         (or (== type 'string) (== type 'bool) (== type 'f32) (== type 'f64)
+             (!= (assq type unsigned-limits) 0) (!= (assq type signed-limits) 0))))
+
+  (define (check! [type datum] [name datum])
+    (unless (or (upload? type) (value? type)) (raise-syntax-error 'form "this field's type has no form encoding" name)))
+
+  ;; Code filling place p, the field of the name and type.
+  (define (field-code [name datum] [type datum] [p datum]) -> datum
+    (let ([key (literal (string->datum (symbol->string (syntax-e name))))] [s (derive-fresh 's)] [q (derive-fresh 'q)]
+          [n (derive-fresh 'n)] [k (derive-fresh 'k)] [items (derive-fresh 'items)])
+      (cond [(and (pair? type) (== (car type) 'ptr))
+             (check! (cadr type) name)
+             (let ([e (type-syntax (cadr type))])
+               (if (upload? (cadr type))
+                   #`(let ([#,q (cast (ptr http-upload) (arena-alloc a (sizeof http-upload)))])
+                       (set! #,p (if (file parts #,key 0 #,q) #,q 0)))
+                   #`(let ([#,s string])
+                       (if (text pairs parts #,key 0 (& #,s))
+                           (let ([#,q (cast (ptr #,e) (arena-alloc a (sizeof #,e)))])
+                             #,(value-code (cadr type) s #`(@ #,q) key)
+                             (set! #,p #,q))
+                           (set! #,p 0)))))]
+            [(and (pair? type) (== (car type) 'slice))
+             (check! (cadr type) name)
+             (let ([e (type-syntax (cadr type))])
+               (if (upload? (cadr type))
+                   #`(let* ([#,n (files parts #,key)]
+                            [#,items (cast (ptr http-upload) (arena-alloc a (* #,n (sizeof http-upload))))])
+                       (for ([#,k u32 0]) (< #,k #,n) (+= #,k 1) (file parts #,key #,k (+ #,items #,k)))
+                       (set! #,p (slice #,items #,n)))
+                   #`(let* ([#,n (texts pairs parts #,key)]
+                            [#,items (cast (ptr #,e) (arena-alloc a (* #,n (sizeof #,e))))]
+                            [#,s string])
+                       (for ([#,k u32 0]) (< #,k #,n) (+= #,k 1)
+                         (text pairs parts #,key #,k (& #,s))
+                         #,(value-code (cadr type) s #`(@ #,items #,k) key))
+                       (set! #,p (slice #,items #,n)))))]
+            [(== type 'bool)
+             #`(let ([#,s string])
+                 (if (text pairs parts #,key 0 (& #,s))
+                     (unless (truth! #,s (& #,p)) (return (refuse! err "expected true or false" #,key)))
+                     (set! #,p #f)))]
+            [(upload? type) #`(unless (file parts #,key 0 (& #,p)) (return (refuse! err "missing field" #,key)))]
+            [else
+             (check! type name)
+             #`(let ([#,s string])
+                 (unless (text pairs parts #,key 0 (& #,s)) (return (refuse! err "missing field" #,key)))
+                 #,(value-code type s p key))])))
+
+  ;; Code reading the text s into place p, of the type.
+  (define (value-code [type datum] [s datum] [p datum] [key datum]) -> datum
+    (let ([unsigned (assq type unsigned-limits)] [signed (assq type signed-limits)] [n (derive-fresh 'n)])
+      (cond [(== type 'string) #`(set! #,p #,s)]
+            [(== type 'bool) #`(unless (truth! #,s (& #,p)) (return (refuse! err "expected true or false" #,key)))]
+            [(!= unsigned 0)
+             #`(let ([#,n u64 0])
+                 (unless (http-unsigned #,s #,(literal (cadr unsigned)) (& #,n))
+                   (return (refuse! err "expected an integer within the field's type" #,key)))
+                 (set! #,p (cast #,(literal type) #,n)))]
+            [(!= signed 0)
+             #`(let ([#,n i64 0])
+                 (unless (http-signed #,s #,(literal (cadr signed)) #,(literal (caddr signed)) (& #,n))
+                   (return (refuse! err "expected an integer within the field's type" #,key)))
+                 (set! #,p (cast #,(literal type) #,n)))]
+            [(== type 'f64) #`(unless (float! #,s (& #,p)) (return (refuse! err "expected a number" #,key)))]
+            [else
+             #`(let ([#,n f64 0.0])
+                 (unless (float! #,s (& #,n)) (return (refuse! err "expected a number" #,key)))
+                 (set! #,p (cast f32 #,n)))]))))
+
+(define-syntax form form-form)

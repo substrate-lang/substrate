@@ -1,0 +1,305 @@
+;; DEFLATE decoding (RFC 1951) of whole buffers, with lookup tables as zlib and libdeflate decode. inflate! decodes the
+;; data at the start of in, adding at most most bytes to out, sets used to the bytes it took, and returns 0 or a negative
+;; code whose message, zlib's, inflate-message gives.
+(provide inflate! inflate-message)
+
+;; Table entries hold a code's length in bits, an op and a value. Op 0 is a literal, 16 plus a count of extra bits a
+;; base length or distance, 32 the end of a block, 64 plus a width a link to the table of that many bits at the value,
+;; and 128 a code that is not allowed. A code longer than a table's root bits is found through a link.
+(const op-base u32 16)
+(const op-end u32 32)
+(const op-link u32 64)
+(const op-bad u32 128)
+
+(const end-of-data i32 -1)
+(const bad-block-type i32 -2)
+(const bad-stored-lengths i32 -3)
+(const too-many-symbols i32 -4)
+(const bad-code-lengths i32 -5)
+(const bad-repeat i32 -6)
+(const no-end-code i32 -7)
+(const bad-lengths-set i32 -8)
+(const bad-distances-set i32 -9)
+(const bad-length-code i32 -10)
+(const bad-distance-code i32 -11)
+(const too-far-back i32 -12)
+(const too-large i32 -13)
+
+(define (inflate-message [code i32]) -> string
+  (case code
+    [(-1) "unexpected end of data"]
+    [(-2) "invalid block type"]
+    [(-3) "invalid stored block lengths"]
+    [(-4) "too many length or distance symbols"]
+    [(-5) "invalid code lengths set"]
+    [(-6) "invalid bit length repeat"]
+    [(-7) "invalid code -- missing end-of-block"]
+    [(-8) "invalid literal/lengths set"]
+    [(-9) "invalid distances set"]
+    [(-10) "invalid literal/length code"]
+    [(-11) "invalid distance code"]
+    [(-12) "invalid distance too far back"]
+    [(-13) "more data than allowed"]
+    [else "no error"]))
+
+(define length-base (array u32 29)
+  (array-of u32 3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31 35 43 51 59 67 83 99 115 131 163 195 227 258))
+(define length-extra (array u32 29)
+  (array-of u32 0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4 5 5 5 5 0))
+(define distance-base (array u32 30)
+  (array-of u32 1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193 257 385 513 769 1025 1537 2049 3073 4097 6145 8193 12289
+                16385 24577))
+(define distance-extra (array u32 30)
+  (array-of u32 0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13))
+
+;; The order the lengths of the code length code come in.
+(define code-length-order (array u32 19) (array-of u32 16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15))
+
+;; ---- tables ----
+
+;; Kinds of table: code lengths, literals and lengths, and distances.
+(const codes i32 0)
+(const lengths i32 1)
+(const distances i32 2)
+
+(define (entry-of [kind i32] [s u32]) -> u32
+  (cond [(== kind codes) (<< s 16)]
+        [(== kind lengths)
+         (cond [(< s 256) (<< s 16)]
+               [(== s 256) (<< op-end 8)]
+               [(< s 286) (bit-or (<< (@ length-base (- s 257)) 16) (<< (+ op-base (@ length-extra (- s 257))) 8))]
+               [else (<< op-bad 8)])]
+        [(< s 30) (bit-or (<< (@ distance-base s) 16) (<< (+ op-base (@ distance-extra s)) 8))]
+        [else (<< op-bad 8)]))
+
+(define (reversed [code u32] [n u32]) -> u32
+  (let ([r u32 0])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! r (bit-or (<< r 1) (bit-and code 1)))
+      (set! code (>> code 1)))
+    r))
+
+;; The width of the table each root entry links to, and where that table starts.
+(define widths (array u8 1024))
+(define starts (array u32 1024))
+
+;; build! fills table, of room entries, for the codes of the n lengths: an entry for each of the 2^root values of the
+;; next root bits, then the tables longer codes link to. It returns #f when the lengths are too many for a code, or too
+;; few for anything but a lone code of one bit, which zlib allows for distances.
+(define (build! [table (ptr u32)] [room u32] [root u32] [lens (ptr u8)] [n u32] [kind i32]) -> bool
+  (let ([count (array u32 16)] [next (array u32 16)] [first (array u32 16)] [left i32 1] [most u32 0] [code u32 0]
+        [size (<< 1 root)] [end u32 0])
+    (for ([i u32 0]) (< i 16) (+= i 1) (set! (@ count i) 0))
+    (for ([s u32 0]) (< s n) (+= s 1) (+= (@ count (@ lens s)) 1))
+    (for ([i u32 1]) (< i 16) (+= i 1) (when (> (@ count i) 0) (set! most i)))
+    (for ([k u32 0]) (< k size) (+= k 1) (set! (@ table k) (bit-or (<< op-bad 8) 1)))
+    (when (== most 0) (return #t))
+    (for ([i u32 1]) (< i 16) (+= i 1)
+      (set! left (- (* left 2) (cast i32 (@ count i))))
+      (when (< left 0) (return #f)))
+    (when (and (> left 0) (or (== kind codes) (!= most 1))) (return #f))
+    (set! (@ count 0) 0)
+    (for ([i u32 1]) (< i 16) (+= i 1)
+      (set! code (<< (+ code (@ count (- i 1))) 1))
+      (set! (@ first i) code))
+    (for ([k u32 0]) (< k size) (+= k 1) (set! (@ widths k) 0))
+    (for ([i u32 0]) (< i 16) (+= i 1) (set! (@ next i) (@ first i)))
+    (for ([s u32 0]) (< s n) (+= s 1)
+      (let ([len (cast u32 (@ lens s))])
+        (when (> len root)
+          (let* ([c (@ next len)] [at (reversed (>> c (- len root)) root)])
+            (+= (@ next len) 1)
+            (when (> (- len root) (@ widths at)) (set! (@ widths at) (- len root)))))))
+    (set! end size)
+    (for ([k u32 0]) (< k size) (+= k 1)
+      (unless (== (@ widths k) 0)
+        (set! (@ starts k) end)
+        (set! (@ table k) (bit-or (<< end 16) (<< (+ op-link (@ widths k)) 8) root))
+        (+= end (<< 1 (@ widths k)))))
+    (when (> end room) (return #f))
+    (for ([i u32 0]) (< i 16) (+= i 1) (set! (@ next i) (@ first i)))
+    (for ([s u32 0]) (< s n) (+= s 1)
+      (let ([len (cast u32 (@ lens s))])
+        (unless (== len 0)
+          (let ([c (@ next len)] [e (bit-or (entry-of kind s) len)])
+            (+= (@ next len) 1)
+            (if (<= len root)
+                (for ([k (reversed c len)]) (< k size) (+= k (<< 1 len)) (set! (@ table k) e))
+                (let* ([at (reversed (>> c (- len root)) root)] [width (cast u32 (@ widths at))]
+                       [low (reversed (bit-and c (- (<< 1 (- len root)) 1)) (- len root))] [base (@ starts at)])
+                  (for ([k low]) (< k (<< 1 width)) (+= k (<< 1 (- len root)))
+                    (set! (@ table (+ base k)) e))))))))
+    #t))
+
+(define fixed-lengths (array u32 1024))
+(define fixed-distances (array u32 32))
+(define fixed bool #f)
+
+(define (fixed!)
+  (let ([lens (array u8 288)])
+    (for ([s u32 0]) (< s 288) (+= s 1)
+      (set! (@ lens s) (cond [(< s 144) 8] [(< s 256) 9] [(< s 280) 7] [else 8])))
+    (build! (& (@ fixed-lengths 0)) 1024 9 (& (@ lens 0)) 288 lengths)
+    (for ([s u32 0]) (< s 32) (+= s 1) (set! (@ lens s) 5))
+    (build! (& (@ fixed-distances 0)) 32 5 (& (@ lens 0)) 32 distances)
+    (set! fixed #t)))
+
+;; ---- decoding ----
+
+(define code-table (array u32 128))
+(define length-table (array u32 2048))
+(define distance-table (array u32 1024))
+
+;; The bits not yet used, count of them, the bytes still to read, and the output with where this stream's starts and
+;; how far it may go.
+(struct reader [bits u64] [count u32] [at (ptr u8)] [end (ptr u8)] [out (ptr buffer)] [start u32] [most u32])
+
+;; refill! has the reader hold at least 56 bits, or every bit left. With 8 bytes to read it loads them at once, keeping
+;; whole bytes, as libdeflate does: the bits above count are the next bytes' own, so loading them again changes nothing.
+(define (refill! [r (ptr reader)]) #:inline
+  (if (>= (- (-> r end) (-> r at)) 8)
+      (let ([n (-> r count)])
+        (set! (-> r bits) (bit-or (-> r bits) (<< (@ (cast (ptr u64) (-> r at)) 0) (cast u64 n))))
+        (+= (-> r at) (>> (- 63 n) 3))
+        (set! (-> r count) (bit-or n 56)))
+      (while (and (< (-> r count) 56) (< (-> r at) (-> r end)))
+        (set! (-> r bits) (bit-or (-> r bits) (<< (cast u64 (@ (-> r at) 0)) (cast u64 (-> r count)))))
+        (+= (-> r at) 1)
+        (+= (-> r count) 8))))
+
+;; take! uses n bits, which the reader must hold, and gives them.
+(define (take! [r (ptr reader)] [n u32]) #:inline -> u32
+  (let ([v (cast u32 (bit-and (-> r bits) (- (<< (cast u64 1) (cast u64 n)) 1)))])
+    (set! (-> r bits) (>> (-> r bits) (cast u64 n)))
+    (-= (-> r count) n)
+    v))
+
+;; The entry for the code at the start of the bits, through a link if it has one.
+(define (entry [table (ptr u32)] [root u32] [bits u64]) #:inline -> u32
+  (let ([e (@ table (cast u32 (bit-and bits (- (<< (cast u64 1) (cast u64 root)) 1))))])
+    (if (== (bit-and (>> e 8) op-link) 0)
+        e
+        (@ table (+ (>> e 16)
+                    (cast u32 (bit-and (>> bits (cast u64 root))
+                                       (- (<< (cast u64 1) (cast u64 (bit-and (>> e 8) 15))) 1))))))))
+
+;; room! has the output hold n more bytes, and 8 to spare, and returns #f when that passes most.
+(define (room! [r (ptr reader)] [n u32]) #:inline -> bool
+  (let ([out (-> r out)])
+    (when (> (+ (- (-> out length) (-> r start)) n) (-> r most)) (return #f))
+    (when (> (+ (-> out length) n 8) (-> out room)) (buffer-reserve out (+ n 8)))
+    #t))
+
+(define (stored! [r (ptr reader)]) -> i32
+  (take! r (bit-and (-> r count) 7))
+  (-= (-> r at) (>> (-> r count) 3))
+  (set! (-> r bits) 0)
+  (set! (-> r count) 0)
+  (let ([p (-> r at)])
+    (when (< (- (-> r end) p) 4) (return end-of-data))
+    (let ([n (bit-or (cast u32 (@ p 0)) (<< (cast u32 (@ p 1)) 8))]
+          [m (bit-or (cast u32 (@ p 2)) (<< (cast u32 (@ p 3)) 8))])
+      (unless (== n (bit-xor m 65535)) (return bad-stored-lengths))
+      (when (< (cast u32 (- (-> r end) (+ p 4))) n) (return end-of-data))
+      (unless (room! r n) (return too-large))
+      (buffer-add! (-> r out) (slice (+ p 4) n))
+      (set! (-> r at) (+ p 4 n))
+      0)))
+
+;; header! reads a dynamic block's codes into the length and distance tables.
+(define (header! [r (ptr reader)]) -> i32
+  (let ([lens (array u8 320)] [nlen u32 0] [ndist u32 0] [ncode u32 0] [i u32 0])
+    (refill! r)
+    (when (< (-> r count) 14) (return end-of-data))
+    (set! nlen (+ (take! r 5) 257))
+    (set! ndist (+ (take! r 5) 1))
+    (set! ncode (+ (take! r 4) 4))
+    (when (or (> nlen 286) (> ndist 30)) (return too-many-symbols))
+    (for ([k u32 0]) (< k 19) (+= k 1) (set! (@ lens k) 0))
+    (for ([k u32 0]) (< k ncode) (+= k 1)
+      (refill! r)
+      (when (< (-> r count) 3) (return end-of-data))
+      (set! (@ lens (@ code-length-order k)) (take! r 3)))
+    (unless (build! (& (@ code-table 0)) 128 7 (& (@ lens 0)) 19 codes) (return bad-code-lengths))
+    (while (< i (+ nlen ndist))
+      (refill! r)
+      (let* ([e (entry (& (@ code-table 0)) 7 (-> r bits))] [len (bit-and e 255)] [s (>> e 16)])
+        (when (> len (-> r count)) (return end-of-data))
+        (take! r len)
+        (if (< s 16)
+            (begin
+              (set! (@ lens i) s)
+              (+= i 1))
+            (let ([extra (case s [(16) 2] [(17) 3] [else 7])] [value u8 0] [times u32 0])
+              (when (< (-> r count) extra) (return end-of-data))
+              (set! times (+ (take! r extra) (case s [(16) 3] [(17) 3] [else 11])))
+              (when (== s 16)
+                (when (== i 0) (return bad-repeat))
+                (set! value (@ lens (- i 1))))
+              (when (> (+ i times) (+ nlen ndist)) (return bad-repeat))
+              (for ([k u32 0]) (< k times) (+= k 1)
+                (set! (@ lens i) value)
+                (+= i 1))))))
+    (when (== (@ lens 256) 0) (return no-end-code))
+    (unless (build! (& (@ length-table 0)) 2048 10 (& (@ lens 0)) nlen lengths) (return bad-lengths-set))
+    (unless (build! (& (@ distance-table 0)) 1024 8 (& (@ lens nlen)) ndist distances) (return bad-distances-set))
+    0))
+
+(define (codes! [r (ptr reader)] [lt (ptr u32)] [lroot u32] [dt (ptr u32)] [droot u32]) -> i32
+  (let ([out (-> r out)])
+    (while #t
+      (refill! r)
+      (let* ([e (entry lt lroot (-> r bits))] [len (bit-and e 255)] [op (bit-and (>> e 8) 255)])
+        (when (> len (-> r count)) (return end-of-data))
+        (take! r len)
+        (cond [(== op 0)
+               (unless (room! r 1) (return too-large))
+               (set! (@ (-> out bytes) (-> out length)) (cast u8 (>> e 16)))
+               (+= (-> out length) 1)]
+              [(== op op-end) (return 0)]
+              [(>= op op-link) (return bad-length-code)]
+              [else
+               (let ([extra (- op op-base)] [n (>> e 16)])
+                 (when (> extra (-> r count)) (return end-of-data))
+                 (+= n (take! r extra))
+                 (let* ([d (entry dt droot (-> r bits))] [dlen (bit-and d 255)] [dop (bit-and (>> d 8) 255)])
+                   (when (> dlen (-> r count)) (return end-of-data))
+                   (take! r dlen)
+                   (when (or (< dop op-base) (>= dop op-end)) (return bad-distance-code))
+                   (let ([dextra (- dop op-base)] [distance (>> d 16)])
+                     (when (> dextra (-> r count)) (return end-of-data))
+                     (+= distance (take! r dextra))
+                     (when (> distance (- (-> out length) (-> r start))) (return too-far-back))
+                     (unless (room! r n) (return too-large))
+                     (let* ([to (+ (-> out bytes) (-> out length))] [from (- to distance)])
+                       (if (>= distance 8)
+                           (for ([k u32 0]) (< k n) (+= k 8)
+                             (set! (@ (cast (ptr u64) (+ to k)) 0) (@ (cast (ptr u64) (+ from k)) 0)))
+                           (for ([k u32 0]) (< k n) (+= k 1) (set! (@ to k) (@ from k))))
+                       (+= (-> out length) n)))))])))
+    0))
+
+(define (inflate! [out (ptr buffer)] [in (slice u8)] [most u32] [used (ptr u32)]) -> i32
+  (let ([r reader] [last #f] [result i32 0])
+    (unless fixed (fixed!))
+    (set! (-> r bits) 0)
+    (set! (-> r count) 0)
+    (set! (-> r at) (-> in items))
+    (set! (-> r end) (+ (-> in items) (-> in length)))
+    (set! (-> r out) out)
+    (set! (-> r start) (-> out length))
+    (set! (-> r most) most)
+    (while (and (== result 0) (not last))
+      (refill! (& r))
+      (when (< (-> r count) 3) (return end-of-data))
+      (set! last (== (take! (& r) 1) 1))
+      (let ([type (take! (& r) 2)])
+        (set! result
+              (cond [(== type 0) (stored! (& r))]
+                    [(== type 1) (codes! (& r) (& (@ fixed-lengths 0)) 9 (& (@ fixed-distances 0)) 5)]
+                    [(== type 2)
+                     (let ([h (header! (& r))])
+                       (if (== h 0) (codes! (& r) (& (@ length-table 0)) 10 (& (@ distance-table 0)) 8) h))]
+                    [else bad-block-type]))))
+    (set! (@ used) (cast u32 (- (- (-> r at) (-> in items)) (>> (-> r count) 3))))
+    result))

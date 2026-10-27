@@ -1,18 +1,13 @@
 // node sprites.mjs SITES [hardware] times the many-sprites game drawn with the 2D context and with WebGPU.
-import { spawn } from 'node:child_process';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { withBrowser, webgpuFlags, hardwareGpuFlags } from '../../tests/web/browser.mjs';
+import { served, withBrowser, webgpuFlags, hardwareGpuFlags } from '../../tests/web/browser.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites, hardware] = process.argv.slice(2);
 const counts = [1000, 5000, 20000];
 const bigCounts = [100000, 200000];
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const column = (text, width) => String(text).padStart(width);
 
-const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
-const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
+const { server, url } = await served(sites);
 try {
   console.log('renderer                     sprites   frame ms   drawing ms   gpu ms   frames a second');
   const runs = [

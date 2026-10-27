@@ -189,10 +189,10 @@ export function nodeFiles(grants) {
       at('read', from);
       fs.renameSync(at('write', from), at('write', to));
     }),
-    open: plain((p, mode) => {
+    open: plain((p, mode, start = 0) => {
       const flag = modes[mode] ?? O_RDONLY;
       const fd = everything ? fs.openSync(p, flag) : opening(mode === 0 ? 'read' : 'write', p, flag, fs.openSync);
-      return nodeSource(mode === 0 ? fs.createReadStream('', { fd }) : fs.createWriteStream('', { fd }));
+      return nodeSource(mode === 0 ? fs.createReadStream('', { fd, start }) : fs.createWriteStream('', { fd }));
     }),
   };
 }

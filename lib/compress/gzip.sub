@@ -1,0 +1,132 @@
+;; The gzip format (RFC 1952) around DEFLATE data, and its CRC-32. gunzip! decodes whole gzip data, each member in
+;; turn, adding at most most bytes to out, and returns 0 or a negative code whose message gzip-message gives.
+(require-unqualified inflate "inflate.sub")
+(require-unqualified deflate "deflate.sub")
+
+(provide crc32 gunzip! gzip-message gzip-start! gzip-end! gzip!)
+
+;; CRC-32 with eight tables, slicing eight bytes at a time.
+(define tables (array u32 2048))
+(define tabled bool #f)
+
+(define (tables!)
+  (for ([n u32 0]) (< n 256) (+= n 1)
+    (let ([c n])
+      (for ([k u32 0]) (< k 8) (+= k 1)
+        (set! c (if (== (bit-and c 1) 1) (bit-xor #xedb88320 (>> c 1)) (>> c 1))))
+      (set! (@ tables n) c)))
+  (for ([n u32 0]) (< n 256) (+= n 1)
+    (for ([k u32 1]) (< k 8) (+= k 1)
+      (let ([c (@ tables (+ (* (- k 1) 256) n))])
+        (set! (@ tables (+ (* k 256) n)) (bit-xor (>> c 8) (@ tables (bit-and c 255)))))))
+  (set! tabled #t))
+
+;; crc32 continues the CRC-32 crc, 0 at first, over the bytes.
+(define (crc32 [crc u32] [b (slice u8)]) -> u32
+  (let ([c (bit-not crc)] [p (-> b items)] [n (-> b length)] [i u32 0])
+    (unless tabled (tables!))
+    (while (<= (+ i 8) n)
+      (let ([lo (bit-xor c (@ (cast (ptr u32) (+ p i)) 0))] [hi (@ (cast (ptr u32) (+ p i 4)) 0)])
+        (set! c (bit-xor (@ tables (+ 1792 (bit-and lo 255))) (@ tables (+ 1536 (bit-and (>> lo 8) 255)))
+                         (@ tables (+ 1280 (bit-and (>> lo 16) 255))) (@ tables (+ 1024 (>> lo 24)))
+                         (@ tables (+ 768 (bit-and hi 255))) (@ tables (+ 512 (bit-and (>> hi 8) 255)))
+                         (@ tables (+ 256 (bit-and (>> hi 16) 255))) (@ tables (>> hi 24))))
+        (+= i 8)))
+    (while (< i n)
+      (set! c (bit-xor (@ tables (bit-and (bit-xor c (@ p i)) 255)) (>> c 8)))
+      (+= i 1))
+    (bit-not c)))
+
+;; ---- writing ----
+
+;; gzip-start! writes a member's header, with name as its file name unless empty; gzip-end! its trailer, the CRC-32 and
+;; length of what it holds.
+(define (gzip-start! [out (ptr buffer)] [name string])
+  (buffer-add-byte! out #x1f)
+  (buffer-add-byte! out #x8b)
+  (buffer-add-byte! out 8)
+  (buffer-add-byte! out (if (== (-> name length) 0) 0 8))
+  (for ([i u32 0]) (< i 5) (+= i 1) (buffer-add-byte! out 0))
+  (buffer-add-byte! out 255)
+  (unless (== (-> name length) 0)
+    (buffer-add-string! out name)
+    (buffer-add-byte! out 0)))
+
+(define (gzip-end! [out (ptr buffer)] [crc u32] [size u32])
+  (buffer-add-u32! out crc)
+  (buffer-add-u32! out size))
+
+;; gzip! writes in as one member, compressed by d from a fresh start.
+(define (gzip! [d (ptr deflater)] [out (ptr buffer)] [in (slice u8)] [name string])
+  (gzip-start! out name)
+  (deflater-reset! d)
+  (deflate! d out in deflate-finish)
+  (gzip-end! out (crc32 0 in) (-> in length)))
+
+;; ---- reading ----
+
+(const bad-magic i32 -101)
+(const bad-method i32 -102)
+(const bad-flags i32 -103)
+(const bad-header-check i32 -104)
+(const bad-data-check i32 -105)
+(const bad-length-check i32 -106)
+(const short-header i32 -107)
+
+(define (gzip-message [code i32]) -> string
+  (case code
+    [(-101) "incorrect header check"]
+    [(-102) "unknown compression method"]
+    [(-103) "unknown header flags set"]
+    [(-104) "header crc mismatch"]
+    [(-105) "incorrect data check"]
+    [(-106) "incorrect length check"]
+    [(-107) "unexpected end of data"]
+    [else (inflate-message code)]))
+
+(define (le32 [p (ptr u8)]) -> u32
+  (bit-or (cast u32 (@ p 0)) (<< (cast u32 (@ p 1)) 8) (<< (cast u32 (@ p 2)) 16) (<< (cast u32 (@ p 3)) 24)))
+
+;; The length of the member's header at the start of b, or a negative code.
+(define (header-length [b (slice u8)]) -> i32
+  (let ([n (-> b length)] [flags u8 0] [i u32 10])
+    (when (< n 2) (return short-header))
+    (unless (and (== (@ b 0) #x1f) (== (@ b 1) #x8b)) (return bad-magic))
+    (when (< n 3) (return short-header))
+    (unless (== (@ b 2) 8) (return bad-method))
+    (when (< n 4) (return short-header))
+    (set! flags (@ b 3))
+    (unless (== (bit-and flags #xe0) 0) (return bad-flags))
+    (when (< n 10) (return short-header))
+    (unless (== (bit-and flags 4) 0)
+      (when (< n (+ i 2)) (return short-header))
+      (+= i (+ 2 (bit-or (cast u32 (@ b i)) (<< (cast u32 (@ b (+ i 1))) 8))))
+      (when (> i n) (return short-header)))
+    (for ([bit u8 8]) (<= bit 16) (+= bit 8)
+      (unless (== (bit-and flags bit) 0)
+        (while (and (< i n) (!= (@ b i) 0)) (+= i 1))
+        (when (>= i n) (return short-header))
+        (+= i 1)))
+    (unless (== (bit-and flags 2) 0)
+      (when (< n (+ i 2)) (return short-header))
+      (unless (== (bit-and (crc32 0 (slice b 0 i)) 65535) (bit-or (cast u32 (@ b i)) (<< (cast u32 (@ b (+ i 1))) 8)))
+        (return bad-header-check))
+      (+= i 2))
+    (cast i32 i)))
+
+(define (gunzip! [out (ptr buffer)] [in (slice u8)] [most u32]) -> i32
+  (let ([at u32 0] [start (-> out length)])
+    (while #t
+      (let* ([rest (slice in at)] [h (header-length rest)] [used u32 0] [begun (-> out length)])
+        (when (< h 0) (return h))
+        (let ([result (inflate! out (slice rest (cast u32 h)) (- most (- begun start)) (& used))])
+          (unless (== result 0) (return result))
+          (let ([trailer (+ (cast u32 h) used)])
+            (when (< (- (-> rest length) trailer) 4) (return short-header))
+            (unless (== (le32 (+ (-> rest items) trailer)) (crc32 0 (slice (buffer-bytes out) begun)))
+              (return bad-data-check))
+            (when (< (- (-> rest length) trailer) 8) (return short-header))
+            (unless (== (le32 (+ (-> rest items) trailer 4)) (- (-> out length) begun)) (return bad-length-check))
+            (+= at (+ trailer 8))
+            (when (== at (-> in length)) (return 0))))))
+    0))

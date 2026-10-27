@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withBrowser, webgpuFlags } from './browser.mjs';
+import { served, withBrowser, webgpuFlags } from './browser.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const [sites, ...names] = process.argv.slice(2);
 
@@ -719,6 +719,50 @@ const checks = {
     check('files: bytes saved as a download', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file', 'saved bytes');
   },
 
+  // Our client, then the browser's own EventSource, read tests/web/server.sub's stream; then cross-origin protection
+  // and CORS.
+  async events(page) {
+    const log = () => page.evaluate('document.getElementById("log").textContent');
+    await page.waitFor('document.getElementById("log").textContent.endsWith("refused 204")', 10000);
+    check('events: the client reconnects with the last id until 204', await log(), 'open | message 1 first | '
+      + 'named 2 a\nb | closed ended | open | message 3 resumed after 2 | closed ended | closed refused 204');
+    const native = await page.evaluate(`new Promise((resolve) => {
+      const seen = [];
+      const s = new EventSource('/events');
+      const heard = (e) => seen.push(e.type + ' ' + e.lastEventId + ' ' + e.data);
+      s.onopen = () => seen.push('open');
+      s.onmessage = heard;
+      s.addEventListener('named', heard);
+      s.onerror = () => {
+        seen.push(s.readyState === EventSource.CLOSED ? 'closed' : 'lost');
+        if (s.readyState === EventSource.CLOSED) resolve(seen.join(' | '));
+      };
+    })`);
+    check('events: the browser\'s EventSource reads the same', native,
+      'open | message 1 first | named 2 a\nb | lost | open | message 3 resumed after 2 | lost | closed');
+    const fetched = (js) => page.evaluate(`(async () => { ${js} })()`);
+    check('events: a script and the event stream come gzipped, and the browser reads them', await fetched(
+      `const r = await fetch("/host/web/subhost-web.mjs");
+       const script = await r.text();
+       const e = await fetch("/events");
+       const stream = await e.text();
+       return [r.headers.get("content-encoding"), script.startsWith("// The host for a web page"),
+               e.headers.get("content-encoding"), stream.includes("data: first")].join(" ");`),
+    'gzip true gzip true');
+    check('events: a POST from the same origin passes cross-origin protection', await fetched(
+      'const r = await fetch("/guarded", { method: "POST", body: "x" }); return r.status + " " + await r.text();'),
+    '200 posted');
+    check('events: a POST from another origin is refused', await fetched(
+      `await fetch("${otherUrl}guarded", { method: "POST", body: "x", mode: "no-cors" });
+       return await (await fetch("${otherUrl}refused")).text();`),
+    '1');
+    check('events: CORS lets a PUT with credentials and a header through', await fetched(
+      `const r = await fetch("${otherUrl}api", { method: "PUT", credentials: "include", headers: { "x-key": "1" } });
+       return r.status + " " + await r.text();`),
+    '200 put');
+    check('events: nothing is written to the console', page.log.join('\n'), '');
+  },
+
   async floor(page) {
     const shown = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
     await page.waitFor('document.getElementById("fired").textContent === "1" && document.getElementById("text").textContent !== ""', 10000);
@@ -744,14 +788,24 @@ const checks = {
 
 const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 
-// Port 0: any free port.
-const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
-const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
+const { server, url } = await served(sites);
+// tests/web/server.sub serves the events page; a second one on another port is the other origin, which its CORS allows.
+const site = path.join(sites, 'events');
+const started = (...args) => {
+  const p = spawn(path.join(here, '../../bin/sub'),
+    ['run', '-N=127.0.0.1', `-R=${site}`, path.join(sites, 'server'), site, ...args],
+    { stdio: ['ignore', 'pipe', 'inherit'] });
+  return [p, new Promise((resolve) => p.stdout.once('data', (d) => resolve(String(d).trim())))];
+};
+const [eventsServer, eventsUrlOnce] = started();
+const eventsUrl = await eventsUrlOnce;
+const [otherServer, otherUrlOnce] = started(eventsUrl.slice(0, -1));
+const otherUrl = await otherUrlOnce;
 async function run(group) {
   await withBrowser(async (open) => {
     for (const name of group) {
       const before = failed;
-      const page = await open(`${url}${name}/index.html`);
+      const page = await open(name === 'events' ? `${eventsUrl}index.html` : `${url}${name}/index.html`);
       try {
         // Each page sets window.ready once its program has started.
         await page.waitFor('window.ready', 60000);
@@ -772,5 +826,7 @@ try {
   if (gpu.length) await run(gpu);
 } finally {
   server.kill();
+  eventsServer.kill();
+  otherServer.kill();
 }
 process.exit(failed ? 1 : 0);

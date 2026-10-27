@@ -1,0 +1,121 @@
+;; Answers in pieces over sockets: a client leaving while its answer waits, one ending its side, and one slow to read.
+(require-unqualified events "../../host/events.sub")
+(require-unqualified stream "../../host/stream.sub")
+(require-unqualified net "../../host/node/net.sub")
+(require-unqualified timer "../../host/modules/timer.sub")
+(require-unqualified http "../../lib/http/http.sub")
+(require-unqualified server "../../lib/http/server.sub")
+
+(struct delay [head event-head] [request (ptr http-request)])
+
+(struct client [head event-head] [stream u32] [parser http-parser] [in (array u8 65536)] [body buffer] [bytes i64]
+  [target string] [left bool])
+
+(const piece-size u32 65536)
+(const total i64 33554432)
+
+(define server http-server)
+(define tick delay)
+(define c client)
+(define big (ptr u8) 0)
+(define written i64 0)
+(define waits u32 0)
+
+;; ---- the server ----
+
+(define (gone [r (ptr http-request)])
+  (printf "server: the client of ~a left\n" (-> r target))
+  (when (== (-> r target) "/forever")
+    (http-finish! r)
+    (start! "/ticks")))
+
+(define (ticked [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([r (-> (cast (ptr delay) tag) request)])
+    (http-write! r (cast (slice u8) "b"))
+    (http-finish! r)))
+
+(define (more [r (ptr http-request)])
+  (while (< written total)
+    (+= written (cast i64 piece-size))
+    (unless (http-write! r (slice big piece-size))
+      (+= waits 1)
+      (return)))
+  (http-finish! r))
+
+(define (handle [r (ptr http-request)])
+  (http-respond! r 200)
+  (cond [(== (-> r target) "/forever")
+         (set! (-> r on-gone) gone)
+         (http-write! r (cast (slice u8) "a"))]
+        [(== (-> r target) "/ticks")
+         (set! (-> r on-gone) gone)
+         (http-write! r (cast (slice u8) "a"))
+         (set! (-> tick request) r)
+         (timer-after 50.0 (& tick))]
+        [else
+         (set! (-> r on-drained) more)
+         (more r)]))
+
+;; ---- the client ----
+
+(define (start! [target string])
+  (http-parser-init! (& (-> c parser)) 0 head body end)
+  (set! (-> c body length) 0)
+  (set! (-> c bytes) 0)
+  (set! (-> c target) target)
+  (set! (-> c left) #f)
+  (net-connect (-> server port) "127.0.0.1" #f (& c) 0))
+
+(define (head [p (ptr http-parser)]) (begin))
+
+(define (body [p (ptr http-parser)] [b (slice u8)])
+  (+= (-> c bytes) (cast i64 (-> b length)))
+  (when (< (-> c body length) 16) (buffer-add! (& (-> c body)) b))
+  (when (== (-> c target) "/forever")
+    (printf "client: a piece of /forever came, and the client leaves\n")
+    (set! (-> c left) #t)
+    (stream-close (-> c stream))))
+
+(define (end [p (ptr http-parser)])
+  (if (== (-> c target) "/ticks")
+      (printf "client: /ticks: ~a ~s\n" (-> p head status) (buffer-string (& (-> c body))))
+      (printf "client: /big: ~a, ~a bytes\n" (-> p head status) (-> c bytes))))
+
+(define (closed!)
+  (stream-close (-> c stream))
+  (buffer-free! (& (-> c parser head line)))
+  (buffer-free! (& (-> c parser line)))
+  (if (== (-> c target) "/ticks")
+      (start! "/big")
+      (http-server-close! (& server))))
+
+(define (heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (cond [(== source timer-source)
+         (printf "client: nothing read for a while; the server waited for room: ~a, and wrote all: ~a\n" (> waits 0)
+                 (== written total))
+         (stream-read! (-> c stream) (slice (-> c in)))]
+        [(== kind net-connected)
+         (set! (-> c stream) id)
+         (stream-write-text id (if (== (-> c target) "/big") "GET /big HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"
+                                   (if (== (-> c target) "/ticks") "GET /ticks HTTP/1.1\r\nhost: x\r\n\r\n"
+                                       "GET /forever HTTP/1.1\r\nhost: x\r\n\r\n")))
+         (cond [(== (-> c target) "/big") (timer-after 300.0 (& c))]
+               [else
+                (when (== (-> c target) "/ticks") (stream-finish id))
+                (stream-read! id (slice (-> c in)))])]
+        [(and (== kind stream-read) (> value 0))
+         (http-feed! (& (-> c parser)) (slice (-> c in) (cast u32 value)))
+         (unless (-> c left) (stream-read! id (slice (-> c in))))]
+        [(or (== kind stream-read) (== kind stream-failed))
+         (printf "client: ~a closed\n" (-> c target))
+         (closed!)]))
+
+(define (listening [s (ptr http-server)]) (start! "/forever"))
+
+(define (main)
+  (set! big (cast (ptr u8) (calloc 1 piece-size)))
+  (set! (-> c head handle) heard)
+  (set! (-> c body) (make-buffer))
+  (set! (-> tick head handle) ticked)
+  (set! (-> server listening) listening)
+  (http-serve! (& server) 0 handle))

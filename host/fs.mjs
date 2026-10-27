@@ -61,9 +61,9 @@ export function fsModule(files) {
         const to = caller.string(tp, tl);
         return attempt(from, err, () => (files.rename(from, to), 0));
       },
-      open(pp, pl, mode, tag, err) {
+      open(pp, pl, mode, tag, err, start = 0) {
         const path = caller.string(pp, pl);
-        return attempt(path, err, () => caller.streams.add(tag, files.open(path, mode)), 0);
+        return attempt(path, err, () => caller.streams.add(tag, files.open(path, mode, start)), 0);
       },
       read_link(pp, pl, out, err) {
         const path = caller.string(pp, pl);

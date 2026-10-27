@@ -1,0 +1,235 @@
+;; Server-sent events read as the HTML standard's EventSource reads them, over the fetch module, so on a page or a
+;; server alike. sse-client-open! makes a request and gives on-event each event of the answer, after on-open. on-closed
+;; is called when the answer ends, with sse-ended; with sse-lost when the request or its body failed, its error in
+;; error; or with sse-refused when the answer was not a 200 event stream, its status in status. Unless it was refused, a
+;; client with reconnect set makes the request again after retry milliseconds, 3 seconds when 0 or as the server last
+;; set it, with the last event's id, until sse-client-close!. method, url, headers and body must last until then.
+(require-unqualified events "../../host/events.sub")
+(require-unqualified stream "../../host/stream.sub")
+(require-unqualified timer "../../host/modules/timer.sub")
+(require-unqualified fetch "../../host/modules/fetch.sub")
+(require-unqualified http "http.sub")
+
+(provide sse-event sse-parser sse-parser-init! sse-parse! sse-parser-end! sse-parser-free! sse-client
+         sse-client-open! sse-client-close! sse-ended sse-lost sse-refused)
+
+(const sse-ended i32 0)
+(const sse-lost i32 1)
+(const sse-refused i32 2)
+
+(const state-closed i32 0)
+(const state-connecting i32 1)
+(const state-open i32 2)
+(const state-waiting i32 3)
+
+(const default-retry f64 3000.0)
+
+;; An event's strings last until on-event returns.
+(struct sse-event [type string] [data string] [id string])
+
+;; ---- the parser ----
+
+;; A parser gives on-event each event of a stream fed to it in pieces, and sse-parser-end! readies it for the next
+;; stream. id is the last event's id, kept across streams, and retry the last reconnection time a stream set, or -1.
+(struct sse-parser [line buffer] [data buffer] [type buffer] [next-id buffer] [id buffer] [retry i64] [started bool]
+  [after-cr bool] [stopped bool] [user (ptr void)] [on-event (fn ((ptr sse-parser) (ptr sse-event)))])
+
+(define (sse-parser-init! [p (ptr sse-parser)] [user (ptr void)] [on-event (fn ((ptr sse-parser) (ptr sse-event)))])
+  (set! (-> p line) (make-buffer))
+  (set! (-> p data) (make-buffer))
+  (set! (-> p type) (make-buffer))
+  (set! (-> p next-id) (make-buffer))
+  (set! (-> p id) (make-buffer))
+  (set! (-> p retry) -1)
+  (set! (-> p started) #f)
+  (set! (-> p after-cr) #f)
+  (set! (-> p stopped) #f)
+  (set! (-> p user) user)
+  (set! (-> p on-event) on-event))
+
+;; sse-parser-free! may be called from on-event, which stops sse-parse!.
+(define (sse-parser-free! [p (ptr sse-parser)])
+  (set! (-> p stopped) #t)
+  (buffer-free! (& (-> p line)))
+  (buffer-free! (& (-> p data)))
+  (buffer-free! (& (-> p type)))
+  (buffer-free! (& (-> p next-id)))
+  (buffer-free! (& (-> p id))))
+
+(define (copy! [to (ptr buffer)] [s string])
+  (set! (-> to length) 0)
+  (buffer-add-string! to s))
+
+;; An event whose blank line has not come is dropped.
+(define (sse-parser-end! [p (ptr sse-parser)])
+  (set! (-> p line length) 0)
+  (set! (-> p data length) 0)
+  (set! (-> p type length) 0)
+  (copy! (& (-> p next-id)) (buffer-string (& (-> p id))))
+  (set! (-> p started) #f)
+  (set! (-> p after-cr) #f))
+
+(define (dispatch! [p (ptr sse-parser)])
+  (let ([e sse-event] [type (& (-> p type))] [data (& (-> p data))])
+    (copy! (& (-> p id)) (buffer-string (& (-> p next-id))))
+    (if (== (-> data length) 0)
+        (set! (-> type length) 0)
+        (begin
+          (set! (-> e type) (if (== (-> type length) 0) "message" (buffer-string type)))
+          (set! (-> e data) (slice (buffer-string data) 0 (- (-> data length) 1)))
+          (set! (-> e id) (buffer-string (& (-> p id))))
+          (set! (-> data length) 0)
+          (set! (-> type length) 0)
+          ((-> p on-event) p (& e))))))
+
+(define (has-nul? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (when (== (@ s i) 0) (return #t)))
+  #f)
+
+(define (field! [p (ptr sse-parser)] [name string] [value string])
+  (cond [(== name "event") (copy! (& (-> p type)) value)]
+        [(== name "data")
+         (buffer-add-string! (& (-> p data)) value)
+         (buffer-add-byte! (& (-> p data)) 10)]
+        [(== name "id") (unless (has-nul? value) (copy! (& (-> p next-id)) value))]
+        [(== name "retry")
+         (let ([ms u64 0])
+           (when (http-unsigned value 4294967295 (& ms)) (set! (-> p retry) (cast i64 ms))))]))
+
+(define (line! [p (ptr sse-parser)])
+  (let ([l (buffer-string (& (-> p line)))] [i u32 0])
+    (unless (-> p started)
+      (set! (-> p started) #t)
+      (when (and (>= (-> l length) 3) (== (@ l 0) 239) (== (@ l 1) 187) (== (@ l 2) 191)) (set! l (slice l 3))))
+    (cond [(== (-> l length) 0) (dispatch! p)]
+          [(!= (@ l 0) 58)
+           (while (and (< i (-> l length)) (!= (@ l i) 58)) (+= i 1))
+           (let ([value (if (< i (-> l length)) (slice l (+ i 1)) "")])
+             (when (and (> (-> value length) 0) (== (@ value 0) 32)) (set! value (slice value 1)))
+             (field! p (slice l 0 i) value))])))
+
+;; Lines end at CR, LF or CRLF, a CRLF perhaps split between pieces.
+(define (sse-parse! [p (ptr sse-parser)] [b (slice u8)])
+  (let ([i u32 0] [start u32 0] [n (-> b length)] [line (& (-> p line))])
+    (when (and (-> p after-cr) (> n 0) (== (@ b 0) 10))
+      (set! i 1)
+      (set! start 1))
+    (set! (-> p after-cr) #f)
+    (while (< i n)
+      (let ([c (@ b i)])
+        (+= i 1)
+        (when (or (== c 10) (== c 13))
+          (buffer-add! line (slice b start (- i 1)))
+          (when (== c 13)
+            (cond [(== i n) (set! (-> p after-cr) #t)]
+                  [(== (@ b i) 10) (+= i 1)]))
+          (set! start i)
+          (line! p)
+          (when (-> p stopped) (return))
+          (set! (-> line length) 0))))
+    (buffer-add! line (slice b start n))))
+
+;; ---- the client ----
+
+(struct sse-client [head event-head] [user (ptr void)] [reconnect bool] [retry f64] [status i32] [error i32]
+  [method string] [url string] [headers (slice string)] [body (slice u8)] [state i32] [fetch u32] [timer u32]
+  [parser sse-parser] [chunk (array u8 16384)]
+  [on-open (fn ((ptr sse-client)))] [on-event (fn ((ptr sse-client) (ptr sse-event)))]
+  [on-closed (fn ((ptr sse-client) i32))])
+
+(define (parsed [p (ptr sse-parser)] [e (ptr sse-event)])
+  (let ([c (cast (ptr sse-client) (-> p user))])
+    (unless (== (-> c on-event) 0) ((-> c on-event) c e))))
+
+(define (connect! [c (ptr sse-client)])
+  (let* ([n (-> c headers length)] [id (buffer-string (& (-> c parser id)))]
+         [all (cast (ptr string) (malloc (* (+ n 4) (sizeof string))))] [k n])
+    (for ([i u32 0]) (< i n) (+= i 1) (set! (@ all i) (@ (-> c headers) i)))
+    (set! (@ all k) "accept")
+    (set! (@ all (+ k 1)) "text/event-stream")
+    (+= k 2)
+    (unless (== (-> id length) 0)
+      (set! (@ all k) "last-event-id")
+      (set! (@ all (+ k 1)) id)
+      (+= k 2))
+    (set! (-> c state) state-connecting)
+    (set! (-> c fetch) (fetch-start (-> c method) (-> c url) (slice all k) (-> c body) (cast (ptr void) c)))
+    (free all)))
+
+(define (stop! [c (ptr sse-client)])
+  (unless (== (-> c fetch) 0) (stream-close (-> c fetch)))
+  (unless (== (-> c timer) 0) (timer-cancel (-> c timer)))
+  (set! (-> c fetch) 0)
+  (set! (-> c timer) 0)
+  (set! (-> c state) state-closed))
+
+(define (ended! [c (ptr sse-client)] [why i32])
+  (stream-close (-> c fetch))
+  (set! (-> c fetch) 0)
+  (sse-parser-end! (& (-> c parser)))
+  (if (and (-> c reconnect) (!= why sse-refused))
+      (begin
+        (set! (-> c state) state-waiting)
+        (unless (== (-> c on-closed) 0) ((-> c on-closed) c why))
+        (when (== (-> c state) state-waiting)
+          (when (>= (-> c parser retry) 0) (set! (-> c retry) (cast f64 (-> c parser retry))))
+          (set! (-> c timer) (timer-after (-> c retry) (cast (ptr void) c)))))
+      (begin
+        (stop! c)
+        (sse-parser-free! (& (-> c parser)))
+        (unless (== (-> c on-closed) 0) ((-> c on-closed) c why)))))
+
+(define (answered! [c (ptr sse-client)] [status i32])
+  (let ([headers (events-take-strings)] [type ""])
+    (for ([i u32 0]) (< (+ i 1) (-> headers length)) (+= i 2)
+      (when (== (@ headers i) "content-type") (set! type (@ headers (+ i 1)))))
+    (set! (-> c status) status)
+    (if (and (== status 200) (http-media-type? type "text/event-stream"))
+        (begin
+          (set! (-> c state) state-open)
+          (unless (== (-> c on-open) 0) ((-> c on-open) c))
+          (when (== (-> c state) state-open) (stream-read! (-> c fetch) (slice (-> c chunk)))))
+        (ended! c sse-refused))
+    (free (-> headers items))))
+
+(define (client-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([c (cast (ptr sse-client) tag)])
+    (cond [(== source timer-source)
+           (when (and (== id (-> c timer)) (== (-> c state) state-waiting))
+             (set! (-> c timer) 0)
+             (connect! c))]
+          [(or (== (-> c fetch) 0) (!= id (-> c fetch))) (begin)]
+          [(== source fetch-source)
+           (if (== kind fetch-head)
+               (answered! c value)
+               (begin
+                 (set! (-> c error) value)
+                 (ended! c sse-lost)))]
+          [(and (== kind stream-read) (> value 0))
+           (sse-parse! (& (-> c parser)) (slice (-> c chunk) (cast u32 value)))
+           (when (== (-> c state) state-open) (stream-read! id (slice (-> c chunk))))]
+          [(== kind stream-read) (ended! c sse-ended)]
+          [(== kind stream-failed)
+           (set! (-> c error) value)
+           (ended! c sse-lost)])))
+
+(define (sse-client-open! [c (ptr sse-client)] [method string] [url string] [headers (slice string)]
+                          [body (slice u8)])
+  (set! (-> c head handle) client-heard)
+  (set! (-> c method) method)
+  (set! (-> c url) url)
+  (set! (-> c headers) headers)
+  (set! (-> c body) body)
+  (set! (-> c status) 0)
+  (set! (-> c error) 0)
+  (set! (-> c timer) 0)
+  (when (<= (-> c retry) 0.0) (set! (-> c retry) default-retry))
+  (sse-parser-init! (& (-> c parser)) (cast (ptr void) c) parsed)
+  (connect! c))
+
+;; sse-client-close! stops the client without calling on-closed.
+(define (sse-client-close! [c (ptr sse-client)])
+  (unless (== (-> c state) state-closed)
+    (stop! c)
+    (sse-parser-free! (& (-> c parser)))))

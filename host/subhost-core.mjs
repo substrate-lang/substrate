@@ -344,6 +344,17 @@ export function createHost(platform) {
       moduleNames: () => (platform.modules ? [...platform.modules.keys()] : []),
       module: (name) => (platform.modules ? platform.modules.get(name) : undefined),
       program: () => ({ names: programNames, bytes: programBytes }),
+      // named gives the module and the export name of the program's function at the index in the table, or null.
+      named(index) {
+        const table = self.exports.table;
+        const f = table && index < table.length ? table.get(index) : null;
+        if (typeof f !== 'function') return null;
+        for (const name of programNames) {
+          const exports = registry.get(name);
+          for (const key of Object.keys(exports || {})) if (exports[key] === f) return [name, key];
+        }
+        return null;
+      },
       streams: { add: streams.add, tag: streams.tag, drop: streams.drop, close: streams.close, open: streams.open },
     };
   }

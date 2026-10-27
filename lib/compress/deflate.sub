@@ -1,0 +1,512 @@
+;; DEFLATE compression (RFC 1951) as a stream, after zlib: a 32 KB window, hash chains of 3-byte strings, greedy matching
+;; at levels 1 to 3 and lazy at 4 to 9 with zlib's settings, and each block stored, fixed or with its own codes,
+;; whichever is shortest. deflate! adds in's compressed form to out: deflate-none may hold some back, deflate-sync sends
+;; everything and ends at a whole byte, deflate-finish ends the stream. deflater-reset! starts another stream, and
+;; deflate-alone! compresses bytes as if nothing came before, ending as a sync, so one deflater serves many streams.
+(provide deflater deflater-init! deflater-free! deflater-reset! deflate! deflate-alone! deflate-none deflate-sync
+         deflate-finish)
+
+(const deflate-none i32 0)
+(const deflate-sync i32 1)
+(const deflate-finish i32 2)
+
+(const wsize u32 32768)
+(const wmask u32 32767)
+(const hash-bits u32 15)
+(const hash-size u32 32768)
+(const min-match u32 3)
+(const max-match u32 258)
+(const min-lookahead u32 262)
+(const max-dist u32 32506)
+(const too-far u32 4096)
+(const most-symbols u32 16383)
+
+;; zlib's settings for each level: good, past which a search is cut to a quarter; lazy, which ends lazy searching (at
+;; levels 1 to 3, the longest match whose strings are hashed); nice, which ends a search; and chain, the most links.
+(define settings (array u32 40)
+  (array-of u32 0 0 0 0  4 4 8 4  4 5 16 8  4 6 32 32  4 4 16 16  8 16 32 32  8 16 128 128  8 32 128 256
+                32 128 258 1024  32 258 258 4096))
+
+(struct deflater [level i32] [good u32] [lazy u32] [nice u32] [chain u32]
+  [window (ptr u8)] [head (ptr u16)] [prev (ptr u16)] [syms (ptr u32)] [count u32]
+  [strstart u32] [lookahead u32] [block-start i32] [floor u32]
+  [match-length u32] [match-start u32] [prev-length u32] [prev-match u32] [available bool]
+  [bits u64] [nbits u32] [lit-freq (array u32 288)] [dist-freq (array u32 30)])
+
+;; ---- tables ----
+
+(define length-base (array u32 29)
+  (array-of u32 3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31 35 43 51 59 67 83 99 115 131 163 195 227 258))
+(define length-extra (array u32 29)
+  (array-of u32 0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4 5 5 5 5 0))
+(define distance-base (array u32 30)
+  (array-of u32 1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193 257 385 513 769 1025 1537 2049 3073 4097 6145 8193 12289
+                16385 24577))
+(define distance-extra (array u32 30)
+  (array-of u32 0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13))
+(define code-length-order (array u32 19) (array-of u32 16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15))
+
+;; The length code of each length less 3, the distance code of each distance less 1 below 256 and then of each 128th,
+;; and the fixed codes, bit-reversed as they are sent, with their lengths.
+(define length-code (array u8 256))
+(define distance-code (array u8 512))
+(define fixed-codes (array u32 288))
+(define fixed-lens (array u8 288))
+(define tabled bool #f)
+
+(define (reversed [code u32] [n u32]) -> u32
+  (let ([r u32 0])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! r (bit-or (<< r 1) (bit-and code 1)))
+      (set! code (>> code 1)))
+    r))
+
+;; codes! gives the n lengths their canonical codes, reversed.
+(define (codes! [lens (ptr u8)] [n u32] [out (ptr u32)])
+  (let ([count (array u32 16)] [next (array u32 16)] [code u32 0])
+    (for ([i u32 0]) (< i 16) (+= i 1) (set! (@ count i) 0))
+    (for ([s u32 0]) (< s n) (+= s 1) (+= (@ count (@ lens s)) 1))
+    (set! (@ count 0) 0)
+    (for ([i u32 1]) (< i 16) (+= i 1)
+      (set! code (<< (+ code (@ count (- i 1))) 1))
+      (set! (@ next i) code))
+    (for ([s u32 0]) (< s n) (+= s 1)
+      (let ([len (cast u32 (@ lens s))])
+        (unless (== len 0)
+          (set! (@ out s) (reversed (@ next len) len))
+          (+= (@ next len) 1))))))
+
+(define (tables!)
+  (for ([c u32 0]) (< c 29) (+= c 1)
+    (for ([k u32 0]) (< k (<< 1 (@ length-extra c))) (+= k 1)
+      (let ([n (+ (- (@ length-base c) 3) k)]) (when (< n 256) (set! (@ length-code n) (cast u8 c))))))
+  (set! (@ length-code 255) 28)
+  (for ([c u32 0]) (< c 30) (+= c 1)
+    (for ([k u32 0]) (< k (<< 1 (@ distance-extra c))) (+= k 1)
+      (let ([d (+ (- (@ distance-base c) 1) k)])
+        (if (< d 256) (set! (@ distance-code d) (cast u8 c)) (set! (@ distance-code (+ 256 (>> d 7))) (cast u8 c))))))
+  (for ([s u32 0]) (< s 288) (+= s 1)
+    (set! (@ fixed-lens s) (cast u8 (cond [(< s 144) 8] [(< s 256) 9] [(< s 280) 7] [else 8]))))
+  (codes! (& (@ fixed-lens 0)) 288 (& (@ fixed-codes 0)))
+  (set! tabled #t))
+
+(define (dcode [d u32]) #:inline -> u32
+  (cast u32 (if (< d 256) (@ distance-code d) (@ distance-code (+ 256 (>> d 7))))))
+
+;; ---- codes ----
+
+;; huffman! gives the n symbols code lengths of at most most bits: a Huffman code from two queues, leaves and joined
+;; nodes; lengths past most are cut and the code made whole again as miniz does; the lengths go out by frequency.
+(define (huffman! [freq (ptr u32)] [n u32] [most u32] [lens (ptr u8)])
+  (let ([keys (array u32 288)] [joined (array u32 288)] [parent (array u32 576)] [depth (array u32 576)]
+        [count (array u32 16)] [k u32 0] [leaf u32 0] [inner u32 0] [total u32 0])
+    (for ([s u32 0]) (< s n) (+= s 1)
+      (set! (@ lens s) 0)
+      (unless (== (@ freq s) 0)
+        (let ([key (bit-or (<< (@ freq s) 16) s)] [i k])
+          (while (and (> i 0) (> (@ keys (- i 1)) key))
+            (set! (@ keys i) (@ keys (- i 1)))
+            (-= i 1))
+          (set! (@ keys i) key)
+          (+= k 1))))
+    (when (== k 0) (return))
+    (when (== k 1)
+      (set! (@ lens (bit-and (@ keys 0) 65535)) 1)
+      (return))
+    (for ([m u32 0]) (< m (- k 1)) (+= m 1)
+      (let ([w u32 0])
+        (for ([pick u32 0]) (< pick 2) (+= pick 1)
+          (if (and (< leaf k) (or (>= inner m) (<= (>> (@ keys leaf) 16) (@ joined inner))))
+              (begin
+                (+= w (>> (@ keys leaf) 16))
+                (set! (@ parent leaf) (+ k m))
+                (+= leaf 1))
+              (begin
+                (+= w (@ joined inner))
+                (set! (@ parent (+ k inner)) (+ k m))
+                (+= inner 1))))
+        (set! (@ joined m) w)))
+    (set! (@ depth (- (* 2 k) 2)) 0)
+    (for ([i (- (* 2 k) 2)]) (> i 0) (-= i 1)
+      (set! (@ depth (- i 1)) (+ (@ depth (@ parent (- i 1))) 1)))
+    (for ([i u32 0]) (< i 16) (+= i 1) (set! (@ count i) 0))
+    (for ([i u32 0]) (< i k) (+= i 1) (+= (@ count (if (> (@ depth i) most) most (@ depth i))) 1))
+    (for ([bits u32 1]) (<= bits most) (+= bits 1) (+= total (<< (@ count bits) (- most bits))))
+    (while (> total (<< 1 most))
+      (-= (@ count most) 1)
+      (let ([bits (- most 1)])
+        (while (== (@ count bits) 0) (-= bits 1))
+        (-= (@ count bits) 1)
+        (+= (@ count (+ bits 1)) 2))
+      (-= total 1))
+    (let ([i k])
+      (for ([bits u32 1]) (<= bits most) (+= bits 1)
+        (for ([c u32 0]) (< c (@ count bits)) (+= c 1)
+          (-= i 1)
+          (set! (@ lens (bit-and (@ keys i) 65535)) (cast u8 bits)))))))
+
+;; ---- the window ----
+
+(define (deflater-init! [d (ptr deflater)] [level i32])
+  (unless tabled (tables!))
+  (let ([l (cond [(< level 1) 6] [(> level 9) 9] [else level])])
+    (set! (-> d level) l)
+    (set! (-> d good) (@ settings (* l 4)))
+    (set! (-> d lazy) (@ settings (+ (* l 4) 1)))
+    (set! (-> d nice) (@ settings (+ (* l 4) 2)))
+    (set! (-> d chain) (@ settings (+ (* l 4) 3))))
+  (set! (-> d window) (cast (ptr u8) (malloc (+ (* 2 wsize) 272))))
+  (set! (-> d head) (cast (ptr u16) (calloc hash-size 2)))
+  (set! (-> d prev) (cast (ptr u16) (calloc wsize 2)))
+  (set! (-> d syms) (cast (ptr u32) (malloc (* (+ most-symbols 1) 4))))
+  (set! (-> d strstart) 1)
+  (deflater-reset! d))
+
+(define (deflater-free! [d (ptr deflater)])
+  (free (-> d window))
+  (free (-> d head))
+  (free (-> d prev))
+  (free (-> d syms))
+  (set! (-> d window) 0))
+
+(define (clear-freqs! [d (ptr deflater)])
+  (for ([i u32 0]) (< i 288) (+= i 1) (set! (@ (-> d lit-freq) i) 0))
+  (for ([i u32 0]) (< i 30) (+= i 1) (set! (@ (-> d dist-freq) i) 0))
+  (set! (-> d count) 0))
+
+;; deflater-reset! starts a stream after whatever the deflater did before, which no match may reach back into: past the
+;; first half of the window it clears the hash heads and starts again at its start, as zlib's deflateReset does.
+(define (deflater-reset! [d (ptr deflater)])
+  (set! (-> d strstart) (+ (-> d strstart) (-> d lookahead)))
+  (set! (-> d lookahead) 0)
+  (when (> (-> d strstart) wsize)
+    (memset (-> d head) 0 (* hash-size 2))
+    (set! (-> d strstart) 1))
+  (set! (-> d floor) (-> d strstart))
+  (set! (-> d block-start) (cast i32 (-> d strstart)))
+  (set! (-> d match-length) 2)
+  (set! (-> d prev-length) 2)
+  (set! (-> d available) #f)
+  (set! (-> d bits) 0)
+  (set! (-> d nbits) 0)
+  (clear-freqs! d))
+
+(define (slide! [d (ptr deflater)])
+  (let ([w (-> d window)])
+    (memcpy w (+ w wsize) (- (+ (-> d strstart) (-> d lookahead)) wsize))
+    (-= (-> d match-start) wsize)
+    (-= (-> d strstart) wsize)
+    (-= (-> d block-start) (cast i32 wsize))
+    (set! (-> d floor) (if (> (-> d floor) wsize) (- (-> d floor) wsize) 0))
+    (for ([i u32 0]) (< i hash-size) (+= i 1)
+      (let ([m (cast u32 (@ (-> d head) i))]) (set! (@ (-> d head) i) (if (>= m wsize) (- m wsize) 0))))
+    (for ([i u32 0]) (< i wsize) (+= i 1)
+      (let ([m (cast u32 (@ (-> d prev) i))]) (set! (@ (-> d prev) i) (if (>= m wsize) (- m wsize) 0))))))
+
+;; fill! moves bytes of in from at into the window until it holds a match's look ahead, sliding it down as it fills.
+(define (fill! [d (ptr deflater)] [in (slice u8)] [at (ptr u32)])
+  (while (and (< (-> d lookahead) min-lookahead) (< (@ at) (-> in length)))
+    (when (>= (-> d strstart) (+ wsize max-dist)) (slide! d))
+    (let* ([room (- (* 2 wsize) (+ (-> d strstart) (-> d lookahead)))] [left (- (-> in length) (@ at))]
+           [n (if (< room left) room left)])
+      (memcpy (+ (-> d window) (-> d strstart) (-> d lookahead)) (+ (-> in items) (@ at)) n)
+      (+= (-> d lookahead) n)
+      (+= (@ at) n))))
+
+;; insert! adds the string at pos to its hash chain and gives the chain's last string before it.
+(define (insert! [d (ptr deflater)] [pos u32]) #:inline -> u32
+  (let* ([h (>> (* (bit-and (@ (cast (ptr u32) (+ (-> d window) pos)) 0) #xffffff) 2654435761) (- 32 hash-bits))]
+         [last (cast u32 (@ (-> d head) h))])
+    (set! (@ (-> d prev) (bit-and pos wmask)) last)
+    (set! (@ (-> d head) h) pos)
+    last))
+
+;; The latest position a match may not start at or before.
+(define (limit [d (ptr deflater)]) #:inline -> u32
+  (let ([far (if (> (-> d strstart) max-dist) (- (-> d strstart) max-dist) 0)] [low (-> d floor)])
+    (if (> low 0) (if (> (- low 1) far) (- low 1) far) far)))
+
+;; longest! follows the chain from cur for the longest match at strstart.
+(define (longest! [d (ptr deflater)] [cur u32]) -> u32
+  (let* ([w (-> d window)] [start (-> d strstart)] [scan (+ w start)] [best (-> d prev-length)]
+         [chain (if (>= best (-> d good)) (>> (-> d chain) 2) (-> d chain))]
+         [nice (if (> (-> d nice) (-> d lookahead)) (-> d lookahead) (-> d nice))] [low (limit d)])
+    (while #t
+      (let ([m (+ w cur)])
+        (when (and (== (@ m best) (@ scan best)) (== (@ m (- best 1)) (@ scan (- best 1))) (== (@ m 0) (@ scan 0))
+                   (== (@ m 1) (@ scan 1)))
+          (let ([len u32 2])
+            (while (< len max-match)
+              (if (== (@ (cast (ptr u64) (+ scan len)) 0) (@ (cast (ptr u64) (+ m len)) 0))
+                  (+= len 8)
+                  (begin
+                    (while (== (@ scan len) (@ m len)) (+= len 1))
+                    (break))))
+            (when (> len max-match) (set! len max-match))
+            (when (> len best)
+              (set! (-> d match-start) cur)
+              (set! best len)
+              (when (>= len nice) (break)))))
+        (set! cur (cast u32 (@ (-> d prev) (bit-and cur wmask))))
+        (-= chain 1)
+        (when (or (<= cur low) (== chain 0)) (break))))
+    (if (<= best (-> d lookahead)) best (-> d lookahead))))
+
+;; ---- blocks ----
+
+(define (literal! [d (ptr deflater)] [c u8]) #:inline -> bool
+  (set! (@ (-> d syms) (-> d count)) (cast u32 c))
+  (+= (-> d count) 1)
+  (+= (@ (-> d lit-freq) c) 1)
+  (== (-> d count) most-symbols))
+
+(define (match! [d (ptr deflater)] [distance u32] [len u32]) #:inline -> bool
+  (set! (@ (-> d syms) (-> d count)) (bit-or (<< distance 16) (- len 3)))
+  (+= (-> d count) 1)
+  (+= (@ (-> d lit-freq) (+ 257 (cast u32 (@ length-code (- len 3))))) 1)
+  (+= (@ (-> d dist-freq) (dcode (- distance 1))) 1)
+  (== (-> d count) most-symbols))
+
+;; put! sends the n low bits of v, n at most 32, into out, which has room for them.
+(define (put! [d (ptr deflater)] [out (ptr buffer)] [v u32] [n u32]) #:inline
+  (set! (-> d bits) (bit-or (-> d bits) (<< (cast u64 v) (cast u64 (-> d nbits)))))
+  (+= (-> d nbits) n)
+  (when (>= (-> d nbits) 32)
+    (set! (@ (cast (ptr u32) (+ (-> out bytes) (-> out length))) 0) (cast u32 (-> d bits)))
+    (+= (-> out length) 4)
+    (set! (-> d bits) (>> (-> d bits) 32))
+    (-= (-> d nbits) 32)))
+
+;; align! sends the bits left, filling the last byte with zeros.
+(define (align! [d (ptr deflater)] [out (ptr buffer)])
+  (buffer-reserve out 8)
+  (while (> (-> d nbits) 0)
+    (set! (@ (-> out bytes) (-> out length)) (cast u8 (-> d bits)))
+    (+= (-> out length) 1)
+    (set! (-> d bits) (>> (-> d bits) 8))
+    (set! (-> d nbits) (if (> (-> d nbits) 8) (- (-> d nbits) 8) 0))))
+
+;; stored! sends bytes as stored blocks, the last of them final when last is set.
+(define (stored! [d (ptr deflater)] [out (ptr buffer)] [bytes (slice u8)] [last bool])
+  (let ([at u32 0])
+    (while #t
+      (let* ([n (if (> (- (-> bytes length) at) 65535) 65535 (- (-> bytes length) at))]
+             [final (and last (== (+ at n) (-> bytes length)))])
+        (buffer-reserve out (+ n 16))
+        (put! d out (if final 1 0) 3)
+        (align! d out)
+        (buffer-add-byte! out (bit-and n 255))
+        (buffer-add-byte! out (>> n 8))
+        (buffer-add-byte! out (bit-and (bit-not n) 255))
+        (buffer-add-byte! out (bit-and (>> (bit-not n) 8) 255))
+        (buffer-add! out (slice bytes at (+ at n)))
+        (+= at n)
+        (when (== at (-> bytes length)) (break))))))
+
+;; The cost in bits of the block's symbols with the codes of these lengths.
+(define (cost [d (ptr deflater)] [llens (ptr u8)] [dlens (ptr u8)]) -> u64
+  (let ([bits u64 0])
+    (for ([s u32 0]) (< s 286) (+= s 1)
+      (let ([f (cast u64 (@ (-> d lit-freq) s))])
+        (unless (== f 0)
+          (+= bits (* f (cast u64 (+ (cast u32 (@ llens s)) (if (> s 256) (@ length-extra (- s 257)) 0))))))))
+    (for ([s u32 0]) (< s 30) (+= s 1)
+      (+= bits (* (cast u64 (@ (-> d dist-freq) s)) (cast u64 (+ (cast u32 (@ dlens s)) (@ distance-extra s))))))
+    bits))
+
+(define (send! [d (ptr deflater)] [out (ptr buffer)] [lcodes (ptr u32)] [llens (ptr u8)] [dcodes (ptr u32)]
+               [dlens (ptr u8)])
+  (for ([i u32 0]) (< i (-> d count)) (+= i 1)
+    (let* ([sym (@ (-> d syms) i)] [distance (>> sym 16)] [v (bit-and sym 65535)])
+      (if (== distance 0)
+          (put! d out (@ lcodes v) (cast u32 (@ llens v)))
+          (let* ([lc (cast u32 (@ length-code v))] [ls (+ 257 lc)] [dc (dcode (- distance 1))]
+                 [ln (cast u32 (@ llens ls))] [dn (cast u32 (@ dlens dc))])
+            (put! d out (bit-or (@ lcodes ls) (<< (- (+ v 3) (@ length-base lc)) ln)) (+ ln (@ length-extra lc)))
+            (put! d out (bit-or (@ dcodes dc) (<< (- distance (@ distance-base dc)) dn))
+                  (+ dn (@ distance-extra dc)))))))
+  (put! d out (@ lcodes 256) (cast u32 (@ llens 256))))
+
+;; at-least-two! gives a code two symbols at least, for decoders that need them.
+(define (at-least-two! [freq (ptr u32)] [n u32])
+  (let ([used u32 0])
+    (for ([s u32 0]) (< s n) (+= s 1) (unless (== (@ freq s) 0) (+= used 1)))
+    (for ([s u32 0]) (and (< used 2) (< s n)) (+= s 1)
+      (when (== (@ freq s) 0)
+        (set! (@ freq s) 1)
+        (+= used 1)))))
+
+;; block! sends the symbols so far as one block, and the window's bytes since the block began when stored.
+(define (block! [d (ptr deflater)] [out (ptr buffer)] [last bool])
+  (let ([llens (array u8 288)] [dlens (array u8 30)] [lcodes (array u32 288)] [dcodes (array u32 30)]
+        [all (array u8 320)] [rle (array u32 320)] [nrle u32 0] [blfreq (array u32 19)] [bllens (array u8 19)]
+        [blcodes (array u32 19)] [nlit u32 286] [ndist u32 30] [nbl u32 19] [dynamic u64 0] [fixed u64 0]
+        [stored-bytes u32 0] [dfreq (array u32 30)])
+    (set! (@ (-> d lit-freq) 256) 1)
+    (at-least-two! (-> d lit-freq) 286)
+    (for ([s u32 0]) (< s 30) (+= s 1) (set! (@ dfreq s) (@ (-> d dist-freq) s)))
+    (at-least-two! (& (@ dfreq 0)) 30)
+    (huffman! (-> d lit-freq) 286 15 (& (@ llens 0)))
+    (huffman! (& (@ dfreq 0)) 30 15 (& (@ dlens 0)))
+    (while (and (> nlit 257) (== (@ llens (- nlit 1)) 0)) (-= nlit 1))
+    (while (and (> ndist 1) (== (@ dlens (- ndist 1)) 0)) (-= ndist 1))
+    (for ([s u32 0]) (< s nlit) (+= s 1) (set! (@ all s) (@ llens s)))
+    (for ([s u32 0]) (< s ndist) (+= s 1) (set! (@ all (+ nlit s)) (@ dlens s)))
+    (for ([s u32 0]) (< s 19) (+= s 1) (set! (@ blfreq s) 0))
+    (let ([i u32 0] [total (+ nlit ndist)])
+      (while (< i total)
+        (let ([cur (@ all i)] [run u32 1])
+          (while (and (< (+ i run) total) (== (@ all (+ i run)) cur)) (+= run 1))
+          (+= i run)
+          (if (== cur 0)
+              (begin
+                (while (>= run 11)
+                  (let ([r (if (> run 138) 138 run)])
+                    (set! (@ rle nrle) (bit-or 18 (<< (- r 11) 8)))
+                    (+= nrle 1)
+                    (-= run r)))
+                (when (>= run 3)
+                  (set! (@ rle nrle) (bit-or 17 (<< (- run 3) 8)))
+                  (+= nrle 1)
+                  (set! run 0)))
+              (begin
+                (set! (@ rle nrle) (cast u32 cur))
+                (+= nrle 1)
+                (-= run 1)
+                (while (>= run 3)
+                  (let ([r (if (> run 6) 6 run)])
+                    (set! (@ rle nrle) (bit-or 16 (<< (- r 3) 8)))
+                    (+= nrle 1)
+                    (-= run r)))))
+          (while (> run 0)
+            (set! (@ rle nrle) (cast u32 cur))
+            (+= nrle 1)
+            (-= run 1)))))
+    (for ([i u32 0]) (< i nrle) (+= i 1) (+= (@ blfreq (bit-and (@ rle i) 255)) 1))
+    (at-least-two! (& (@ blfreq 0)) 19)
+    (huffman! (& (@ blfreq 0)) 19 7 (& (@ bllens 0)))
+    (while (and (> nbl 4) (== (@ bllens (@ code-length-order (- nbl 1))) 0)) (-= nbl 1))
+    (set! dynamic (+ 17 (* 3 (cast u64 nbl)) (cost d (& (@ llens 0)) (& (@ dlens 0)))))
+    (for ([i u32 0]) (< i nrle) (+= i 1)
+      (let ([s (bit-and (@ rle i) 255)])
+        (+= dynamic (cast u64 (+ (cast u32 (@ bllens s)) (case s [(16) 2] [(17) 3] [(18) 7] [else 0]))))))
+    (let ([five (array u8 30)])
+      (for ([s u32 0]) (< s 30) (+= s 1) (set! (@ five s) 5))
+      (set! fixed (+ 3 (cost d (& (@ fixed-lens 0)) (& (@ five 0)))))
+      (when (>= (-> d block-start) 0)
+        (let ([n (- (-> d strstart) (cast u32 (-> d block-start)))])
+          (set! stored-bytes (+ n (* 5 (+ (/ n 65535) 1))))))
+      (if (and (>= (-> d block-start) 0) (<= (* (cast u64 stored-bytes) 8) (if (< fixed dynamic) fixed dynamic)))
+          (stored! d out (slice (+ (-> d window) (cast u32 (-> d block-start)))
+                                (- (-> d strstart) (cast u32 (-> d block-start))))
+                   last)
+          (begin
+            (buffer-reserve out (+ (cast u32 (/ (if (< fixed dynamic) fixed dynamic) 8)) 16))
+            (if (<= fixed dynamic)
+                (let ([fdcodes (array u32 30)])
+                  (for ([s u32 0]) (< s 30) (+= s 1) (set! (@ fdcodes s) (reversed s 5)))
+                  (put! d out (if last 3 2) 3)
+                  (send! d out (& (@ fixed-codes 0)) (& (@ fixed-lens 0)) (& (@ fdcodes 0)) (& (@ five 0))))
+                (begin
+                  (codes! (& (@ llens 0)) 286 (& (@ lcodes 0)))
+                  (codes! (& (@ dlens 0)) 30 (& (@ dcodes 0)))
+                  (codes! (& (@ bllens 0)) 19 (& (@ blcodes 0)))
+                  (put! d out (if last 5 4) 3)
+                  (put! d out (- nlit 257) 5)
+                  (put! d out (- ndist 1) 5)
+                  (put! d out (- nbl 4) 4)
+                  (for ([i u32 0]) (< i nbl) (+= i 1)
+                    (put! d out (cast u32 (@ bllens (@ code-length-order i))) 3))
+                  (for ([i u32 0]) (< i nrle) (+= i 1)
+                    (let* ([r (@ rle i)] [s (bit-and r 255)])
+                      (put! d out (@ blcodes s) (cast u32 (@ bllens s)))
+                      (case s
+                        [(16) (put! d out (>> r 8) 2)]
+                        [(17) (put! d out (>> r 8) 3)]
+                        [(18) (put! d out (>> r 8) 7)]
+                        [else (begin)])))
+                  (send! d out (& (@ lcodes 0)) (& (@ llens 0)) (& (@ dcodes 0)) (& (@ dlens 0))))))))
+    (clear-freqs! d)
+    (set! (-> d block-start) (cast i32 (-> d strstart)))))
+
+;; ---- matching ----
+
+;; greedy! takes a match wherever it finds one, and returns #t when it waits for more of the stream.
+(define (greedy! [d (ptr deflater)] [out (ptr buffer)] [in (slice u8)] [at (ptr u32)] [flush i32]) -> bool
+  (while #t
+    (when (< (-> d lookahead) min-lookahead)
+      (fill! d in at)
+      (when (and (< (-> d lookahead) min-lookahead) (== flush deflate-none)) (return #t))
+      (when (== (-> d lookahead) 0) (break)))
+    (let ([head u32 0] [full #f])
+      (when (>= (-> d lookahead) min-match) (set! head (insert! d (-> d strstart))))
+      (set! (-> d match-length) 0)
+      (when (> head (limit d))
+        (set! (-> d prev-length) 2)
+        (set! (-> d match-length) (longest! d head)))
+      (if (>= (-> d match-length) min-match)
+          (let ([len (-> d match-length)])
+            (set! full (match! d (- (-> d strstart) (-> d match-start)) len))
+            (-= (-> d lookahead) len)
+            (when (and (<= len (-> d lazy)) (>= (-> d lookahead) min-match))
+              (for ([k u32 1]) (< k len) (+= k 1) (insert! d (+ (-> d strstart) k))))
+            (+= (-> d strstart) len))
+          (begin
+            (set! full (literal! d (@ (-> d window) (-> d strstart))))
+            (-= (-> d lookahead) 1)
+            (+= (-> d strstart) 1)))
+      (when full (block! d out #f))))
+  #f)
+
+;; lazy! takes a match only when the next position has none longer.
+(define (lazy! [d (ptr deflater)] [out (ptr buffer)] [in (slice u8)] [at (ptr u32)] [flush i32]) -> bool
+  (while #t
+    (when (< (-> d lookahead) min-lookahead)
+      (fill! d in at)
+      (when (and (< (-> d lookahead) min-lookahead) (== flush deflate-none)) (return #t))
+      (when (== (-> d lookahead) 0) (break)))
+    (let ([head u32 0])
+      (when (>= (-> d lookahead) min-match) (set! head (insert! d (-> d strstart))))
+      (set! (-> d prev-length) (-> d match-length))
+      (set! (-> d prev-match) (-> d match-start))
+      (set! (-> d match-length) 2)
+      (when (and (> head (limit d)) (< (-> d prev-length) (-> d lazy)))
+        (set! (-> d match-length) (longest! d head))
+        (when (and (== (-> d match-length) min-match) (> (- (-> d strstart) (-> d match-start)) too-far))
+          (set! (-> d match-length) 2)))
+      (cond [(and (>= (-> d prev-length) min-match) (<= (-> d match-length) (-> d prev-length)))
+             (let ([most-insert (- (+ (-> d strstart) (-> d lookahead)) min-match)] [len (-> d prev-length)]
+                   [full (match! d (- (- (-> d strstart) 1) (-> d prev-match)) (-> d prev-length))])
+               (-= (-> d lookahead) (- len 1))
+               (for ([k u32 1]) (< k (- len 1)) (+= k 1)
+                 (when (<= (+ (-> d strstart) k) most-insert) (insert! d (+ (-> d strstart) k))))
+               (+= (-> d strstart) (- len 1))
+               (set! (-> d available) #f)
+               (set! (-> d match-length) 2)
+               (when full (block! d out #f)))]
+            [(-> d available)
+             (when (literal! d (@ (-> d window) (- (-> d strstart) 1))) (block! d out #f))
+             (+= (-> d strstart) 1)
+             (-= (-> d lookahead) 1)]
+            [else
+             (set! (-> d available) #t)
+             (+= (-> d strstart) 1)
+             (-= (-> d lookahead) 1)])))
+  (when (-> d available)
+    (literal! d (@ (-> d window) (- (-> d strstart) 1)))
+    (set! (-> d available) #f))
+  #f)
+
+(define (deflate! [d (ptr deflater)] [out (ptr buffer)] [in (slice u8)] [flush i32])
+  (let ([at u32 0])
+    (when (if (>= (-> d level) 4) (lazy! d out in (& at) flush) (greedy! d out in (& at) flush)) (return))
+    (cond [(== flush deflate-finish)
+           (block! d out #t)
+           (align! d out)]
+          [(== flush deflate-sync)
+           (when (> (-> d count) 0) (block! d out #f))
+           (stored! d out (slice (cast (ptr u8) 0) 0) #f)])))
+
+(define (deflate-alone! [d (ptr deflater)] [out (ptr buffer)] [in (slice u8)])
+  (deflater-reset! d)
+  (deflate! d out in deflate-sync))

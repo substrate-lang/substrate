@@ -1,9 +1,12 @@
 ;; HTTP/1.1 messages, parsed and written. The parser calls on-head, then on-body for each piece of the body, then
 ;; on-end, for each message it is fed. Header names are lowercased, and the head's names and values last until on-end.
-(provide http-head http-header http-header-count http-parser http-parser-init! http-feed! http-parser-closed!
-         http-parser-stop! http-parser-resume! http-parser-refuse! http-parser-no-body! http-write-request!
-         http-write-status! http-write-date! http-write-header! http-write-number! http-write-end! http-write-chunk!
-         http-write-last-chunk! http-reason http-decimal http-header-has? http-same? http-add-decimal!)
+(provide http-head http-header http-header-count http-head-copy! http-head-free! http-parser http-parser-init!
+         http-feed! http-parser-closed! http-parser-stop! http-parser-resume! http-parser-refuse! http-parser-no-body!
+         http-write-request! http-write-status! http-write-date! http-add-date! http-date http-write-header!
+         http-write-number! http-write-end!
+         http-write-chunk! http-write-chunk-size! http-write-last-chunk! http-reason http-decimal http-unsigned
+         http-signed http-header-has? http-has-token? http-same? http-origin-host? http-add-decimal! http-trimmed
+         http-media-type http-media-type? http-media-parameter)
 
 ;; Beyond these, a message is malformed.
 (const max-headers u32 100)
@@ -11,7 +14,8 @@
 (const max-line u32 1024)
 (const max-excess i64 16384)
 
-(struct http-head [line buffer] [names (array string 100)] [values (array string 100)] [count u32]
+;; A head's names and values have room for headers that grows as they come, up to max-headers.
+(struct http-head [line buffer] [names (ptr string)] [values (ptr string)] [room u32] [count u32]
   [method string] [target string] [version string] [status i32] [reason string])
 
 (const state-head i32 0)
@@ -42,8 +46,15 @@
     (when (!= (lowered (@ a i)) (lowered (@ b i))) (return #f)))
   #t)
 
-;; has-token? tells whether part is one of the comma-separated tokens in s, ignoring case.
-(define (has-token? [s string] [part string]) -> bool
+;; http-origin-host? tells whether an Origin header's value, scheme://host, names the host in a Host header's value.
+(define (http-origin-host? [origin string] [host string]) -> bool
+  (let ([i u32 0])
+    (while (and (< i (-> origin length)) (!= (@ origin i) 58)) (+= i 1))
+    (and (> (-> host length) 0) (<= (+ i 3) (-> origin length)) (== (slice origin i (+ i 3)) "://")
+         (http-same? (slice origin (+ i 3)) host))))
+
+;; http-has-token? tells whether part is one of the comma-separated tokens in s, ignoring case.
+(define (http-has-token? [s string] [part string]) -> bool
   (let ([n (-> s length)] [i u32 0] [start u32 0] [end u32 0])
     (while #t
       (while (and (< i n) (or (== (@ s i) 32) (== (@ s i) 9))) (+= i 1))
@@ -59,8 +70,53 @@
 ;; http-header-has? tells whether any header of that name has part among its tokens.
 (define (http-header-has? [h (ptr http-head)] [name string] [part string]) -> bool
   (for ([i u32 0]) (< i (-> h count)) (+= i 1)
-    (when (and (== (@ (-> h names) i) name) (has-token? (@ (-> h values) i) part)) (return #t)))
+    (when (and (== (@ (-> h names) i) name) (http-has-token? (@ (-> h values) i) part)) (return #t)))
   #f)
+
+(define (blank? [c u8]) -> bool (or (== c 32) (== c 9)))
+
+(define (http-trimmed [s string]) -> string
+  (let ([start u32 0] [end (-> s length)])
+    (while (and (< start end) (blank? (@ s start))) (+= start 1))
+    (while (and (> end start) (blank? (@ s (- end 1)))) (-= end 1))
+    (slice s start end)))
+
+;; A content type's media type, before its parameters.
+(define (http-media-type [value string]) -> string
+  (let ([end u32 0])
+    (while (and (< end (-> value length)) (!= (@ value end) #\;)) (+= end 1))
+    (http-trimmed (slice value 0 end))))
+
+(define (http-media-type? [value string] [type string]) -> bool (http-same? (http-media-type value) type))
+
+;; A content type's parameter, ignoring case, its quotes and escapes removed into the arena; "" when it has none.
+(define (http-media-parameter [a (ptr arena)] [value string] [name string]) -> string
+  (let ([n (-> value length)] [i u32 0] [start u32 0] [found string])
+    (while (and (< i n) (!= (@ value i) #\;)) (+= i 1))
+    (while (< i n)
+      (+= i 1)
+      (set! start i)
+      (set! found "")
+      (while (and (< i n) (!= (@ value i) #\=) (!= (@ value i) #\;)) (+= i 1))
+      (let ([key (http-trimmed (slice value start i))])
+        (when (and (< i n) (== (@ value i) #\=))
+          (+= i 1)
+          (if (and (< i n) (== (@ value i) #\"))
+              (let ([p (cast (ptr u8) (arena-alloc a (- n i)))] [k u32 0])
+                (+= i 1)
+                (while (and (< i n) (!= (@ value i) #\"))
+                  (when (and (== (@ value i) #\\) (< (+ i 1) n)) (+= i 1))
+                  (set! (@ p k) (@ value i))
+                  (+= k 1)
+                  (+= i 1))
+                (set! found (cast string (slice p k))))
+              (begin
+                (set! start i)
+                (while (and (< i n) (!= (@ value i) #\;)) (+= i 1))
+                (set! found (http-trimmed (slice value start i))))))
+        (when (http-same? key name) (return found)))
+      (while (and (< i n) (!= (@ value i) #\;)) (+= i 1)))
+    ""))
 
 (define (http-header-count [h (ptr http-head)] [name string]) -> u32
   (let ([n u32 0])
@@ -107,11 +163,15 @@
       (+= i 1))
     (if (or (== i 0) (> i 18) (< i (-> s length))) -1 n)))
 
-(define (hex-digit [c u8]) -> i32
-  (cond [(and (>= c 48) (<= c 57)) (- c 48)]
-        [(and (>= c 97) (<= c 102)) (+ (- c 97) 10)]
-        [(and (>= c 65) (<= c 70)) (+ (- c 65) 10)]
-        [else -1]))
+;; Integers written in decimal, within least and most.
+(define (http-unsigned [s string] [most u64] [to (ptr u64)]) -> bool
+  (and (digits? s 10) (digits-integer s 10 #f to) (<= (@ to) most)))
+
+(define (http-signed [s string] [least i64] [most i64] [to (ptr i64)]) -> bool
+  (let* ([negative (and (> (-> s length) 0) (== (@ s 0) #\-))] [digits (slice s (if negative 1 0))] [k u64 0])
+    (and (digits? digits 10) (digits-integer digits 10 negative (& k))
+         (if negative (>= (cast i64 k) least) (<= k (cast u64 most)))
+         (begin (set! (@ to) (cast i64 k)) #t))))
 
 ;; The index of the first space in s from i, or s's length.
 (define (space-from [s string] [i u32]) -> u32
@@ -138,6 +198,45 @@
   (for ([i u32 0]) (< i (-> h count)) (+= i 1)
     (when (== (@ (-> h names) i) name) (return (@ (-> h values) i))))
   "")
+
+;; to becomes a copy of from with its own text and room for just its headers, which http-head-free! frees.
+(define (http-head-copy! [to (ptr http-head)] [from (ptr http-head)])
+  (let ([old (-> from line bytes)] [new (ptr u8) 0] [n (-> from count)])
+    (set! (-> to line) (make-buffer))
+    (buffer-add! (& (-> to line)) (buffer-bytes (& (-> from line))))
+    (set! new (-> to line bytes))
+    (set! (-> to names) (cast (ptr string) (malloc (* n (sizeof string)))))
+    (set! (-> to values) (cast (ptr string) (malloc (* n (sizeof string)))))
+    (set! (-> to room) n)
+    (for ([i u32 0]) (< i (-> from count)) (+= i 1)
+      (set! (@ (-> to names) i) (moved (@ (-> from names) i) old new))
+      (set! (@ (-> to values) i) (moved (@ (-> from values) i) old new)))
+    (set! (-> to count) (-> from count))
+    (set! (-> to method) (moved (-> from method) old new))
+    (set! (-> to target) (moved (-> from target) old new))
+    (set! (-> to version) (moved (-> from version) old new))
+    (set! (-> to status) (-> from status))
+    (set! (-> to reason) (moved (-> from reason) old new))))
+
+(define (moved [s string] [old (ptr u8)] [new (ptr u8)]) -> string
+  (if (== (-> s length) 0) "" (cast string (slice (+ new (- (cast u32 (-> s bytes)) (cast u32 old))) (-> s length)))))
+
+(define (http-head-free! [h (ptr http-head)])
+  (buffer-free! (& (-> h line)))
+  (free (-> h names))
+  (free (-> h values))
+  (set! (-> h names) 0)
+  (set! (-> h values) 0)
+  (set! (-> h room) 0)
+  (set! (-> h count) 0))
+
+(define (more-room! [h (ptr http-head)])
+  (let ([room (cond [(== (-> h room) 0) 16]
+                    [(< (* (-> h room) 2) max-headers) (* (-> h room) 2)]
+                    [else max-headers])])
+    (set! (-> h names) (cast (ptr string) (realloc (-> h names) (* room (sizeof string)))))
+    (set! (-> h values) (cast (ptr string) (realloc (-> h values) (* room (sizeof string)))))
+    (set! (-> h room) room)))
 
 (define (parse-first-line! [h (ptr http-head)] [line string]) -> bool
   (let* ([n (-> line length)] [e1 (space-from line 0)] [s2 (word-from line e1)] [e2 (space-from line s2)]
@@ -171,6 +270,7 @@
       (while (and (< start end) (or (== (@ value start) 32) (== (@ value start) 9))) (+= start 1))
       (while (and (> end start) (or (== (@ value (- end 1)) 32) (== (@ value (- end 1)) 9))) (-= end 1))
       (lower! (cast (slice u8) name))
+      (when (== (-> h count) (-> h room)) (more-room! h))
       (set! (@ (-> h names) (-> h count)) name)
       (set! (@ (-> h values) (-> h count)) (slice value start end))
       (+= (-> h count) 1)
@@ -202,6 +302,9 @@
 (define (http-parser-init! [p (ptr http-parser)] [user (ptr void)] [on-head (fn ((ptr http-parser)))]
                            [on-body (fn ((ptr http-parser) (slice u8)))] [on-end (fn ((ptr http-parser)))])
   (set! (-> p head line) (make-buffer))
+  (set! (-> p head names) 0)
+  (set! (-> p head values) 0)
+  (set! (-> p head room) 0)
   (set! (-> p head count) 0)
   (set! (-> p line) (make-buffer))
   (set! (-> p state) state-head)
@@ -261,8 +364,8 @@
 (define (chunk-size [b (ptr buffer)]) -> i64
   (let ([n i64 0] [i u32 0] [s (-> b bytes)] [digits u32 0])
     (unless (crlf-line? b) (return -1))
-    (while (>= (hex-digit (@ s i)) 0)
-      (set! n (+ (* n 16) (hex-digit (@ s i))))
+    (while (>= (digit-value (@ s i) 16) 0)
+      (set! n (+ (* n 16) (digit-value (@ s i) 16)))
       (+= i 1))
     (set! digits i)
     (while (or (== (@ s i) 32) (== (@ s i) 9)) (+= i 1))
@@ -287,6 +390,7 @@
       (let ([c (@ bytes i)] [state (-> p state)])
         (cond
           [(== state state-head)
+           (when (== (-> p head line room) 0) (buffer-reserve (& (-> p head line)) 512))
            (buffer-add-byte! (& (-> p head line)) c)
            (when (> (-> p head line length) max-head) (return -1))
            (+= i 1)
@@ -439,16 +543,23 @@
   (buffer-add-byte! b (cast i32 (+ 48 (/ n 10))))
   (buffer-add-byte! b (cast i32 (+ 48 (% n 10)))))
 
-;; http-write-date! writes the date header for ms milliseconds since 1970, as in Tue, 14 Nov 2023 22:13:20 GMT.
+;; http-write-date! writes the date header for ms milliseconds since 1970.
 (define (http-write-date! [b (ptr buffer)] [ms f64])
-  (let* ([seconds (cast i64 (/ ms 1000.0))] [days (/ seconds 86400)] [rest (% seconds 86400)]
-         [z (+ days 719468)] [era (/ z 146097)] [doe (- z (* era 146097))]
+  (buffer-add-string! b "date: ")
+  (http-add-date! b ms)
+  (buffer-add-string! b "\r\n"))
+
+;; ---- dates ----
+
+;; http-add-date! adds the date ms milliseconds since 1970, as in Tue, 14 Nov 2023 22:13:20 GMT.
+(define (http-add-date! [b (ptr buffer)] [ms f64])
+  (let* ([seconds (cast i64 (floor (/ ms 1000.0)))] [days (cast i64 (floor (/ (cast f64 seconds) 86400.0)))]
+         [rest (- seconds (* days 86400))] [z (+ days 719468)] [era (/ z 146097)] [doe (- z (* era 146097))]
          [yoe (/ (- (+ (- doe (/ doe 1460)) (/ doe 36524)) (/ doe 146096)) 365)]
          [doy (- doe (- (+ (* 365 yoe) (/ yoe 4)) (/ yoe 100)))] [mp (/ (+ (* 5 doy) 2) 153)]
          [day (+ (- doy (/ (+ (* 153 mp) 2) 5)) 1)] [month (if (< mp 10) (+ mp 3) (- mp 9))]
          [year (+ yoe (* era 400) (if (<= month 2) 1 0))]
-         [weekday (cast u32 (* 3 (% (+ days 4) 7)))] [month-name (cast u32 (* 3 (- month 1)))])
-    (buffer-add-string! b "date: ")
+         [weekday (cast u32 (* 3 (% (+ (% (+ days 4) 7) 7) 7)))] [month-name (cast u32 (* 3 (- month 1)))])
     (buffer-add-string! b (slice "SunMonTueWedThuFriSat" weekday (+ weekday 3)))
     (buffer-add-string! b ", ")
     (two-digits! b day)
@@ -462,16 +573,86 @@
     (two-digits! b (% (/ rest 60) 60))
     (buffer-add-byte! b 58)
     (two-digits! b (% rest 60))
-    (buffer-add-string! b " GMT\r\n")))
+    (buffer-add-string! b " GMT")))
+
+;; The value of n digits of s from i, or -1.
+(define (digits-at [s string] [i u32] [n u32]) -> i64
+  (let ([v i64 0])
+    (when (> (+ i n) (-> s length)) (return -1))
+    (for ([k u32 i]) (< k (+ i n)) (+= k 1)
+      (unless (and (>= (@ s k) 48) (<= (@ s k) 57)) (return -1))
+      (set! v (+ (* v 10) (- (@ s k) 48))))
+    v))
+
+;; The month named by the three letters of s from i, 1 to 12, or 0.
+(define (month-at [s string] [i u32]) -> i64
+  (when (> (+ i 3) (-> s length)) (return 0))
+  (for ([m u32 0]) (< m 12) (+= m 1)
+    (when (== (slice s i (+ i 3)) (slice "JanFebMarAprMayJunJulAugSepOctNovDec" (* m 3) (+ (* m 3) 3)))
+      (return (cast i64 (+ m 1)))))
+  0)
+
+(define (weekday? [s string]) -> bool
+  (for ([i u32 0]) (< i 21) (+= i 3)
+    (when (== s (slice "MonTueWedThuFriSatSun" i (+ i 3))) (return #t)))
+  #f)
+
+(define (long-weekday? [s string]) -> bool
+  (or (== s "Monday") (== s "Tuesday") (== s "Wednesday") (== s "Thursday") (== s "Friday") (== s "Saturday")
+      (== s "Sunday")))
+
+;; The seconds into the day of HH:MM:SS in s from i, or -1.
+(define (clock-at [s string] [i u32]) -> i64
+  (let ([h (digits-at s i 2)] [m (digits-at s (+ i 3) 2)] [sec (digits-at s (+ i 6) 2)])
+    (if (or (< h 0) (> h 23) (< m 0) (> m 59) (< sec 0) (> sec 60) (!= (@ s (+ i 2)) 58) (!= (@ s (+ i 5)) 58))
+        -1
+        (+ (* h 3600) (* m 60) sec))))
+
+;; moment! gives the milliseconds since 1970 of a day and a time of day, and returns #f when there is no such day.
+(define (moment! [year i64] [month i64] [day i64] [seconds i64] [ms (ptr f64)]) -> bool
+  (when (or (< year 0) (< month 1) (> month 12) (< day 1) (< seconds 0)) (return #f))
+  (let* ([leap (and (== (% year 4) 0) (or (!= (% year 100) 0) (== (% year 400) 0)))]
+         [last (case month [(4 6 9 11) 30] [(2) (if leap 29 28)] [else 31])]
+         [y (if (<= month 2) (- year 1) year)] [era (/ (if (>= y 0) y (- y 399)) 400)] [yoe (- y (* era 400))]
+         [doy (+ (/ (+ (* 153 (if (> month 2) (- month 3) (+ month 9))) 2) 5) (- day 1))]
+         [days (- (+ (* era 146097) (* yoe 365) (/ yoe 4) (- 0 (/ yoe 100)) doy) 719468)])
+    (when (> day last) (return #f))
+    (set! (@ ms) (* (cast f64 (+ (* days 86400) seconds)) 1000.0))
+    #t))
+
+;; http-date reads a date in any of HTTP's three forms, as in Sun, 06 Nov 1994 08:49:37 GMT, Sunday, 06-Nov-94
+;; 08:49:37 GMT and Sun Nov  6 08:49:37 1994, into ms milliseconds since 1970, and returns #f for anything else. A
+;; two-digit year from 69 on is in the 1900s.
+(define (http-date [s string] [ms (ptr f64)]) -> bool
+  (let ([n (-> s length)] [comma u32 0])
+    (while (and (< comma n) (!= (@ s comma) 44)) (+= comma 1))
+    (cond [(and (== n 29) (== comma 3) (weekday? (slice s 0 3)) (== (slice s 3 5) ", ") (== (@ s 7) 32)
+                (== (@ s 11) 32) (== (@ s 16) 32) (== (slice s 25) " GMT"))
+           (moment! (digits-at s 12 4) (month-at s 8) (digits-at s 5 2) (clock-at s 17) ms)]
+          [(and (< comma n) (== (+ comma 24) n) (long-weekday? (slice s 0 comma)) (== (@ s (+ comma 1)) 32)
+                (== (@ s (+ comma 4)) 45) (== (@ s (+ comma 8)) 45) (== (@ s (+ comma 11)) 32)
+                (== (slice s (+ comma 20)) " GMT"))
+           (let ([yy (digits-at s (+ comma 9) 2)])
+             (and (>= yy 0)
+                  (moment! (+ yy (if (>= yy 69) 1900 2000)) (month-at s (+ comma 5)) (digits-at s (+ comma 2) 2)
+                           (clock-at s (+ comma 12)) ms)))]
+          [(and (== n 24) (weekday? (slice s 0 3)) (== (@ s 3) 32) (== (@ s 7) 32) (== (@ s 10) 32) (== (@ s 19) 32))
+           (moment! (digits-at s 20 4) (month-at s 4) (if (== (@ s 8) 32) (digits-at s 9 1) (digits-at s 8 2))
+                    (clock-at s 11) ms)]
+          [else #f])))
 
 (define (http-write-end! [b (ptr buffer)]) (buffer-add-string! b "\r\n"))
 
-;; http-write-chunk! writes nothing for an empty chunk, and http-write-last-chunk! ends the body.
+;; http-write-chunk! writes nothing for an empty chunk, and http-write-last-chunk! ends the body. http-write-chunk-size!
+;; writes the line before a chunk's bytes, which a line end follows.
 (define (http-write-chunk! [b (ptr buffer)] [bytes (slice u8)])
   (when (> (-> bytes length) 0)
-    (add-hex! b (-> bytes length))
-    (buffer-add-string! b "\r\n")
+    (http-write-chunk-size! b (-> bytes length))
     (buffer-add! b bytes)
     (buffer-add-string! b "\r\n")))
+
+(define (http-write-chunk-size! [b (ptr buffer)] [n u32])
+  (add-hex! b n)
+  (buffer-add-string! b "\r\n"))
 
 (define (http-write-last-chunk! [b (ptr buffer)]) (buffer-add-string! b "0\r\n\r\n"))

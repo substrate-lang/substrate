@@ -1,0 +1,118 @@
+;; The event stream client over sockets: reconnecting with the last id until a 204, a POST, answers that are not event
+;; streams, a body cut off, and a client closing itself.
+(require-unqualified events "../../host/events.sub")
+(require-unqualified http "../../lib/http/http.sub")
+(require-unqualified server "../../lib/http/server.sub")
+(require-unqualified sse "../../lib/http/sse.sub")
+(require-unqualified client "../../lib/http/sse-client.sub")
+
+(define server http-server)
+(define out sse-stream)
+(define c sse-client)
+(define url buffer)
+(define zero i32 0)
+(define step u32 0)
+(define steps (array string 6))
+(define headers (array string 2))
+
+;; ---- the server ----
+
+(define (left [s (ptr sse-stream)])
+  (printf "server: the client left\n")
+  (http-server-close! (& server)))
+
+(define (posted [r (ptr http-request)] [body (slice u8)])
+  (let ([b (make-buffer)])
+    (sse-accept! (& out) r)
+    (buffer-add! (& b) body)
+    (buffer-add-byte! (& b) 32)
+    (buffer-add-string! (& b) (http-request-header r "x-key"))
+    (sse-send! (& out) "" "" (buffer-string (& b)))
+    (sse-close! (& out))
+    (buffer-free! (& b))))
+
+(define (handle [r (ptr http-request)])
+  (let ([path (-> r target)] [last (http-request-header r "last-event-id")])
+    (set! (-> out on-closed) 0)
+    (cond [(and (== path "/events") (== last ""))
+           (sse-accept! (& out) r)
+           (sse-retry! (& out) 50)
+           (sse-send! (& out) "" "1" "first")
+           (sse-send! (& out) "named" "2" "a\nb")
+           (sse-close! (& out))]
+          [(and (== path "/events") (== last "2"))
+           (sse-accept! (& out) r)
+           (sse-send! (& out) "" "3" "resumed after 2")
+           (sse-close! (& out))]
+          [(== path "/events")
+           (http-respond! r 204)
+           (http-finish! r)]
+          [(== path "/post") (http-read-body! r 0 posted)]
+          [(== path "/plain") (http-answer-text! r 200 "plain")]
+          [(== path "/cut")
+           (sse-accept! (& out) r)
+           (sse-send! (& out) "" "" "whole")
+           (http-write! r (cast (slice u8) "data: cut off\n"))
+           (http-write! r (cast (slice u8) (if (== (/ 1 zero) 0) "" "")))]
+          [(== path "/stop")
+           (sse-accept! (& out) r)
+           (set! (-> out on-closed) left)
+           (sse-send! (& out) "" "1" "one")
+           (sse-send! (& out) "" "2" "two")]
+          [else (http-answer-text! r 404 "not found")])))
+
+(define (trapped [r (ptr http-request)] [why string]) (printf "server: a trap answering ~a\n" (-> r target)))
+
+;; ---- the client ----
+
+(define (opened [c (ptr sse-client)]) (printf "open ~a\n" (-> c status)))
+
+(define (heard [c (ptr sse-client)] [e (ptr sse-event)])
+  (printf "event ~a ~s ~s\n" (-> e type) (-> e id) (-> e data))
+  (when (== (@ steps step) "/stop")
+    (sse-client-close! c)
+    (printf "the client closed itself\n")))
+
+(define (closed [c (ptr sse-client)] [why i32])
+  (cond [(== why sse-ended) (printf "closed: ended\n")]
+        [(== why sse-lost) (printf "closed: lost\n")]
+        [else (printf "closed: refused, ~a\n" (-> c status))])
+  (unless (and (-> c reconnect) (!= why sse-refused)) (next!)))
+
+(define (next!)
+  (+= step 1)
+  (let ([path (@ steps step)] [post (== (@ steps step) "/post")])
+    (printf "-- ~a\n" path)
+    (set! (-> url length) 0)
+    (buffer-add-string! (& url) "http://127.0.0.1:")
+    (http-add-decimal! (& url) (cast i64 (-> server port)))
+    (buffer-add-string! (& url) path)
+    (set! (-> c reconnect) #f)
+    (sse-client-open! (& c) (if post "POST" "GET") (buffer-string (& url)) (if post (slice headers) (slice headers 0))
+                      (cast (slice u8) (if post "{\"q\":1}" "")))))
+
+(define (listening [s (ptr http-server)])
+  (set! (-> url length) 0)
+  (buffer-add-string! (& url) "http://127.0.0.1:")
+  (http-add-decimal! (& url) (cast i64 (-> server port)))
+  (buffer-add-string! (& url) "/events")
+  (printf "-- /events\n")
+  (set! (-> c reconnect) #t)
+  (sse-client-open! (& c) "GET" (buffer-string (& url)) (slice headers 0) 0))
+
+(define (main)
+  (set! (@ steps 0) "/events")
+  (set! (@ steps 1) "/post")
+  (set! (@ steps 2) "/missing")
+  (set! (@ steps 3) "/plain")
+  (set! (@ steps 4) "/cut")
+  (set! (@ steps 5) "/stop")
+  (set! (@ headers 0) "x-key")
+  (set! (@ headers 1) "k")
+  (set! url (make-buffer))
+  (set! (-> c on-open) opened)
+  (set! (-> c on-event) heard)
+  (set! (-> c on-closed) closed)
+  (set! (-> server on-trap) trapped)
+  (set! (-> server listening) listening)
+  (http-serve! (& server) 0 handle))

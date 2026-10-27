@@ -35,9 +35,10 @@ parentPort.on('message', (m) => {
       side.ended(2, '');
       return;
     }
-    const f = entry[m.entry];
+    const exports = host.registry.get(m.entry[0]);
+    const f = exports && exports[m.entry[1]];
     if (typeof f !== 'function') {
-      side.report(`worker.start: no function ${m.entry}`);
+      side.report(`worker.start: no function ${m.entry[1]} in ${m.entry[0]}`);
       side.ended(2, '');
       return;
     }
