@@ -54,6 +54,15 @@
           MBEDTLS_SOURCE = pkgs.mbedtls.src;
           # bench/compress: zlib's source
           ZLIB_SOURCE = pkgs.zlib.src;
+          # lib/sqlite/build.sh and bench/sqlite: SQLite's amalgamation, and its speedtest1.c
+          SQLITE_AMALGAMATION = pkgs.fetchzip {
+            url = "https://sqlite.org/2026/sqlite-amalgamation-3510200.zip";
+            hash = "sha256-WUH/22OMthEsDTGrpZ8dLCts6890wSLGMmPWt725Gss=";
+          };
+          SQLITE_SPEEDTEST1 = pkgs.fetchurl {
+            url = "https://raw.githubusercontent.com/sqlite/sqlite/version-3.51.2/test/speedtest1.c";
+            hash = "sha256-ter0u8uzIP2Os/PmxM1fUaZN0M1w7+lpY00XheNBlnU=";
+          };
           JSON_BENCH_FILES = pkgs.linkFarm "json-bench-files" (map (f: {
             name = "${f.name}.json";
             path = pkgs.fetchurl {

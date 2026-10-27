@@ -6,13 +6,13 @@ import { nodeSource } from '../streams.mjs';
 import { allowsAll, mayPath, mayTree, notGranted, pathDenied, under, unlimited } from '../grants.mjs';
 import { sameFile, tempName } from '../fs.mjs';
 
-const { O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
+const { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
 const modes = { 0: O_RDONLY, 1: O_WRONLY | O_CREAT | O_TRUNC, 2: O_WRONLY | O_CREAT | O_APPEND };
 
-// plainMessage gives an error's message, a system error's without its code and path.
+// plainMessage gives an error's message, a system error's without its code, call and path.
 export function plainMessage(e) {
   if (typeof e.errno !== 'number') return e.message;
-  const m = e.message.replace(/^[A-Z]+: /, '').replace(/, [a-z]+ '.*$/, '');
+  const m = e.message.replace(/^[A-Z]+: /, '').replace(/, [a-z]+( '.*)?$/, '');
   return m.charAt(0).toUpperCase() + m.slice(1);
 }
 
@@ -140,7 +140,10 @@ export function nodeFiles(grants) {
       ? fs.writeFileSync(p, bytes)
       : opening('write', p, modes[1], (where, flag) => fs.writeFileSync(where, bytes, { flag })))),
     makeDir: plain((p) => fs.mkdirSync(at('write', p), { recursive: true })),
-    info: plain((p, follow) => infoOf((follow ? fs.statSync : fs.lstatSync)(at('read', p)))),
+    info: plain((p, follow) => {
+      const s = (follow ? fs.statSync : fs.lstatSync)(at('read', p), { throwIfNoEntry: false });
+      return s === undefined ? null : infoOf(s);
+    }),
     list: plain((p) => fs.readdirSync(at('read', p)).sort()),
     remove: plain((p, recursive) => {
       const where = everything ? p : allowed('write', p, recursive);
@@ -193,6 +196,30 @@ export function nodeFiles(grants) {
       const flag = modes[mode] ?? O_RDONLY;
       const fd = everything ? fs.openSync(p, flag) : opening(mode === 0 ? 'read' : 'write', p, flag, fs.openSync);
       return nodeSource(mode === 0 ? fs.createReadStream('', { fd, start }) : fs.createWriteStream('', { fd }));
+    }),
+    openFile: plain((p, write, create, createNew) => {
+      const flag = (write ? O_RDWR : O_RDONLY) | (create || createNew ? O_CREAT : 0) | (createNew ? O_EXCL : 0);
+      if (write && !everything) allowed('read', p);
+      const fd = everything ? fs.openSync(p, flag) : opening(write ? 'write' : 'read', p, flag, fs.openSync);
+      return {
+        read: plain((bytes, at) => {
+          let n = 0;
+          while (n < bytes.length) {
+            const got = fs.readSync(fd, bytes, n, bytes.length - n, at + n);
+            if (got === 0) break;
+            n += got;
+          }
+          return n;
+        }),
+        write: plain((bytes, at) => {
+          let n = 0;
+          while (n < bytes.length) n += fs.writeSync(fd, bytes, n, bytes.length - n, at + n);
+        }),
+        setSize: plain((n) => fs.ftruncateSync(fd, n)),
+        sync: plain(() => fs.fsyncSync(fd)),
+        size: plain(() => fs.fstatSync(fd).size),
+        close: plain(() => fs.closeSync(fd)),
+      };
     }),
   };
 }

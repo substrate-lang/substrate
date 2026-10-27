@@ -26,6 +26,15 @@ export function fsModule(files) {
         return failed;
       }
     };
+    const handles = new Map();
+    let next = 1;
+    const using = (h, err, f, failed = -1) => {
+      const open = handles.get(h);
+      if (open) return attempt(open.path, err, () => f(open.file), failed);
+      caller.fail(err, `file ${h}: Bad file descriptor`);
+      return failed;
+    };
+    const bytesAt = (ptr, len) => caller.memory().subarray(caller.u(ptr), caller.u(ptr) + len);
     return {
       read_file(pp, pl, out, err) {
         const path = caller.string(pp, pl);
@@ -42,7 +51,10 @@ export function fsModule(files) {
       },
       info(pp, pl, follow, err) {
         const path = caller.string(pp, pl);
-        return attempt(path, err, () => files.info(path, follow !== 0), [0, 0, 0, 0]);
+        const r = attempt(path, err, () => files.info(path, follow !== 0), [0, 0, 0, 0]);
+        if (r !== null) return r;
+        caller.fail(err, `${path}: No such file or directory`);
+        return [0, 0, 0, 0];
       },
       list(pp, pl, out, err) {
         const path = caller.string(pp, pl);
@@ -64,6 +76,24 @@ export function fsModule(files) {
       open(pp, pl, mode, tag, err, start = 0) {
         const path = caller.string(pp, pl);
         return attempt(path, err, () => caller.streams.add(tag, files.open(path, mode, start)), 0);
+      },
+      open_file(pp, pl, flags, err) {
+        const path = caller.string(pp, pl);
+        return attempt(path, err, () => {
+          const file = files.openFile(path, (flags & 1) !== 0, (flags & 2) !== 0, (flags & 4) !== 0);
+          handles.set(next, { path, file });
+          return next++;
+        }, 0);
+      },
+      read_at: (h, ptr, len, at, err) => using(h, err, (file) => file.read(bytesAt(ptr, len), at)),
+      write_at: (h, ptr, len, at, err) => using(h, err, (file) => (file.write(bytesAt(ptr, len), at), 0)),
+      set_file_size: (h, size, err) => using(h, err, (file) => (file.setSize(size), 0)),
+      sync_file: (h, err) => using(h, err, (file) => (file.sync(), 0)),
+      file_size: (h, err) => using(h, err, (file) => file.size()),
+      close_file(h, err) {
+        const r = using(h, err, (file) => (file.close(), 0));
+        handles.delete(h);
+        return r;
       },
       read_link(pp, pl, out, err) {
         const path = caller.string(pp, pl);

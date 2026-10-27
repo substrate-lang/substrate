@@ -667,6 +667,8 @@ const checks = {
     check('assets: and so is one in a folder, with "#" and a space in its name', await text('nested'), 'An asset in a folder.');
     check('assets: a file that is not among the assets cannot be read', await text('missing'), 'no such file');
     check('assets: a file the program wrote is read back', await text('written'), 'written and read back');
+    check('assets: a file open by handle is written and read at offsets, and an asset only read',
+      await text('opened'), 'hello.....wo, asset, r, refused');
     await page.waitFor(`(() => {
       const d = document.getElementById("board").getContext("2d").getImageData(8, 8, 1, 1).data;
       return d[0] === 255 && d[1] === 0;
@@ -690,6 +692,15 @@ const checks = {
     check('location: the URL', await text('first'), first);
     check('location: after a push', await text('pushed'), `${first}?page=2`);
     check('location: back again, as an event', await text('back'), first);
+  },
+
+  async sqlite(page) {
+    const text = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    await page.waitFor('document.getElementById("rows") !== null', 10000);
+    check('sqlite: SQLite runs in a page', await text('version'), '3.51.2');
+    check("sqlite: a database in the page's files, written and read again", await text('rows'), '3 one two three');
+    check('sqlite: with no error', await text('error'), '');
+    check('sqlite: nothing is written to the console', page.log.join('\n'), '');
   },
 
   async clipboard(page) {
