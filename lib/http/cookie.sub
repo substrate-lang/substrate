@@ -1,0 +1,100 @@
+;; Cookies (RFC 6265, with SameSite and the name prefixes of its revision), after Go's net/http. http-request-cookie
+;; gives a cookie's value from the request, skipping malformed pairs as Go does, and http-set-cookie! sets one.
+(require-unqualified http "http.sub")
+(require-unqualified server "server.sub")
+
+(provide http-cookie http-request-cookie http-set-cookie! http-same-site-lax http-same-site-strict
+         http-same-site-none)
+
+(const http-same-site-lax i32 1)
+(const http-same-site-strict i32 2)
+(const http-same-site-none i32 3)
+
+;; max-age is in seconds: 0 leaves it out, and below 0 ends the cookie now. same-site 0 leaves it out.
+(struct http-cookie [name string] [value string] [path string] [domain string] [max-age i64] [secure bool]
+  [http-only bool] [same-site i32])
+
+(define separators string "()<>@,;:\\\"/[]?={}")
+
+(define (name-byte? [c u8]) -> bool
+  (when (or (<= c 32) (>= c 127)) (return #f))
+  (for ([i u32 0]) (< i (-> separators length)) (+= i 1) (when (== c (@ separators i)) (return #f)))
+  #t)
+
+(define (name? [s string]) -> bool
+  (when (== (-> s length) 0) (return #f))
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (unless (name-byte? (@ s i)) (return #f)))
+  #t)
+
+;; Reading allows a space or comma in a value, as Go does; writing does not.
+(define (value? [s string] [reading bool]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (let ([c (@ s i)])
+      (unless (and (>= c 32) (< c 127) (!= c 34) (!= c 59) (!= c 92) (or reading (and (!= c 32) (!= c 44))))
+        (return #f))))
+  #t)
+
+(define (unquoted [s string]) -> string
+  (if (and (>= (-> s length) 2) (== (@ s 0) 34) (== (@ s (- (-> s length) 1)) 34)) (slice s 1 (- (-> s length) 1)) s))
+
+;; http-request-cookie gives the value of the first cookie of that name, or "".
+(define (http-request-cookie [r (ptr http-request)] [name string]) -> string
+  (let ([h (-> r head)])
+    (for ([k u32 0]) (< k (-> h count)) (+= k 1)
+      (when (== (@ (-> h names) k) "cookie")
+        (let ([line (@ (-> h values) k)] [start u32 0])
+          (for ([i u32 0]) (<= i (-> line length)) (+= i 1)
+            (when (or (== i (-> line length)) (== (@ line i) 59))
+              (let* ([pair (http-trimmed (slice line start i))] [e u32 0])
+                (while (and (< e (-> pair length)) (!= (@ pair e) 61)) (+= e 1))
+                (when (< e (-> pair length))
+                  (let ([n (http-trimmed (slice pair 0 e))] [v (unquoted (http-trimmed (slice pair (+ e 1))))])
+                    (when (and (== n name) (name? n) (value? v #t)) (return v)))))
+              (set! start (+ i 1)))))))
+    ""))
+
+(define (path? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (let ([c (@ s i)]) (unless (and (>= c 32) (< c 127) (!= c 59)) (return #f))))
+  #t)
+
+(define (domain? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (let ([c (@ s i)])
+      (unless (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90)) (and (>= c 48) (<= c 57)) (== c 45) (== c 46))
+        (return #f))))
+  #t)
+
+(define (prefixed? [s string] [prefix string]) -> bool
+  (and (>= (-> s length) (-> prefix length)) (== (slice s 0 (-> prefix length)) prefix)))
+
+;; http-set-cookie! traps on a cookie that browsers would refuse: a bad name, value, path or domain; SameSite=None
+;; without Secure; a __Secure- name without Secure; or a __Host- name without Secure, without the path / or with a
+;; domain.
+(define (http-set-cookie! [r (ptr http-request)] [c (ptr http-cookie)])
+  (let ([b (make-buffer)] [name (-> c name)])
+    (unless (and (name? name) (value? (-> c value) #f) (path? (-> c path)) (domain? (-> c domain)))
+      (host-trap "http: a cookie whose name, value, path or domain RFC 6265 does not allow"))
+    (when (or (and (== (-> c same-site) http-same-site-none) (not (-> c secure)))
+              (and (prefixed? name "__Secure-") (not (-> c secure)))
+              (and (prefixed? name "__Host-") (or (not (-> c secure)) (!= (-> c path) "/") (> (-> c domain length) 0))))
+      (host-trap "http: a cookie that browsers would refuse for its prefix or SameSite=None"))
+    (buffer-add-string! (& b) name)
+    (buffer-add-byte! (& b) 61)
+    (buffer-add-string! (& b) (-> c value))
+    (unless (== (-> c path length) 0)
+      (buffer-add-string! (& b) "; Path=")
+      (buffer-add-string! (& b) (-> c path)))
+    (unless (== (-> c domain length) 0)
+      (buffer-add-string! (& b) "; Domain=")
+      (buffer-add-string! (& b) (-> c domain)))
+    (unless (== (-> c max-age) 0)
+      (buffer-add-string! (& b) "; Max-Age=")
+      (http-add-decimal! (& b) (if (< (-> c max-age) 0) 0 (-> c max-age))))
+    (when (-> c secure) (buffer-add-string! (& b) "; Secure"))
+    (when (-> c http-only) (buffer-add-string! (& b) "; HttpOnly"))
+    (cond [(== (-> c same-site) http-same-site-lax) (buffer-add-string! (& b) "; SameSite=Lax")]
+          [(== (-> c same-site) http-same-site-strict) (buffer-add-string! (& b) "; SameSite=Strict")]
+          [(== (-> c same-site) http-same-site-none) (buffer-add-string! (& b) "; SameSite=None")])
+    (http-header! r "set-cookie" (buffer-string (& b)))
+    (buffer-free! (& b))))
