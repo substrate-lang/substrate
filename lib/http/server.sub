@@ -13,11 +13,13 @@
 (require-unqualified events "../../host/events.sub")
 (require-unqualified stream "../../host/stream.sub")
 (require-unqualified net "../../host/node/net.sub")
+(require-unqualified signal "../../host/node/signal.sub")
 (require-unqualified timer "../../host/modules/timer.sub")
 (require-unqualified clock "../../host/modules/clock.sub")
 (require-unqualified http "http.sub")
 
-(provide http-server http-request http-check http-serve! http-server-close! http-request-header http-request-server
+(provide http-server http-request http-check http-hook http-serve! http-server-close! http-server-shutdown!
+         http-stop-on-signals! http-hook! http-unhook! http-request-header http-request-server
          http-request-gone? http-request-address http-request-https? http-request-deadline! http-add-header!
          http-respond! http-header! http-length! http-write! http-send! http-send-text! http-send-stream! http-finish!
          http-take! http-read-body! http-answer-text! http-redirect! http-trapped http-connect! http-connection-feed!
@@ -56,9 +58,15 @@
   [lingering bool] [linger-end f64]
   [sink (fn ((ptr void) (slice u8)))] [sink-ended (fn ((ptr void)))] [sink-tag (ptr void)])
 
+;; A hook's run is called with its tag when its server shuts down, and again, forced, once the time to finish is up, as
+;; Go's RegisterOnShutdown functions are; event streams and WebSockets end with one.
+(struct http-hook [run (fn ((ptr void) bool))] [tag (ptr void)] [server (ptr void)] [next (ptr http-hook)]
+  [previous (ptr http-hook)])
+
 (struct http-server [head event-head] [listener u32] [port u32] [host string] [secure bool] [most u32]
   [idle-timeout f64] [head-timeout f64] [request-timeout f64] [send-timeout f64] [body-limit u32]
   [proxies u32] [checks (slice http-check)] [problem string] [user (ptr void)] [connections (ptr http-connection)]
+  [hooks (ptr http-hook)] [stopping bool] [stop-timer u32] [stopped (fn ((ptr http-server)))]
   [handle (fn ((ptr http-request)))] [listening (fn ((ptr http-server)))] [on-trap (fn ((ptr http-request) string))])
 
 ;; ---- requests ----
@@ -314,7 +322,7 @@
           (when (!= before 0) (set! (-> before next) (-> c next)))))))
 
 (define (drop! [c (ptr http-connection)])
-  (let ([r (-> c request)] [relaying (!= (-> c relay) 0)])
+  (let ([r (-> c request)] [relaying (!= (-> c relay) 0)] [s (server-of c)])
     (set! (-> c request) 0)
     (when relaying
       (stream-close (-> c relay from))
@@ -335,7 +343,8 @@
     (unless (== r 0)
       (set! (-> r connection) 0)
       (when relaying (set! (-> r answered) #t))
-      (if (-> r answered) (finished! r) (gone! r)))))
+      (if (-> r answered) (finished! r) (gone! r)))
+    (stopped? s)))
 
 (define (settle! [c (ptr http-connection)])
   (let ([r (-> c request)])
@@ -436,7 +445,7 @@
 
 ;; hand-over! gives the connection's stream to its taker, with the bytes read beyond the request.
 (define (hand-over! [c (ptr http-connection)] [b (slice u8)])
-  (let ([take (-> c take)] [held (& (-> c parser head line))] [r (-> c request)])
+  (let ([take (-> c take)] [held (& (-> c parser head line))] [r (-> c request)] [s (server-of c)])
     (set! (-> c take) 0)
     (set! (-> c request) 0)
     (unless (and (!= r 0) (-> r ended)) (set! (-> held length) 0))
@@ -453,7 +462,8 @@
     (unless (== r 0)
       (set! (-> r connection) 0)
       (set! (-> r answered) #t)
-      (finished! r))))
+      (finished! r))
+    (stopped? s)))
 
 (define (feed! [c (ptr http-connection)] [b (slice u8)])
   (set! (-> c rest) 0)
@@ -766,10 +776,11 @@
 
 (define (server-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (let ([s (cast (ptr http-server) tag)])
-    (cond [(== kind net-listening)
+    (cond [(== source timer-source) (when (== id (-> s stop-timer)) (stop-now! s))]
+          [(== kind net-listening)
            (set! (-> s port) (cast u32 value))
            (when (!= (-> s listening) 0) ((-> s listening) s))]
-          [(== kind net-accept) (accept! s (cast u32 value))]
+          [(== kind net-accept) (if (-> s stopping) (stream-close (cast u32 value)) (accept! s (cast u32 value)))]
           [(== kind net-failed)
            (set! (-> s port) 0)
            (set! (-> s problem) (events-take-text))
@@ -785,9 +796,102 @@
   (set! (-> s listener) (net-listen port (-> s host) (-> s secure) (-> s most) (cast (ptr void) s) (& (-> s problem))))
   (-> s listener))
 
+;; http-server-close! stops listening and drops every connection at once, and runs the hooks forced.
 (define (http-server-close! [s (ptr http-server)])
   (unless (== (-> s listener) 0) (net-close (-> s listener)))
-  (while (!= (-> s connections) 0) (drop! (-> s connections))))
+  (set! (-> s listener) 0)
+  (while (!= (-> s connections) 0) (drop! (-> s connections)))
+  (run-hooks! s #t))
+
+;; ---- shutting down ----
+
+;; http-hook! has the hook run when the server shuts down; http-unhook! takes it back as its owner ends.
+(define (http-hook! [s (ptr http-server)] [h (ptr http-hook)])
+  (set! (-> h server) (cast (ptr void) s))
+  (set! (-> h previous) 0)
+  (set! (-> h next) (-> s hooks))
+  (unless (== (-> s hooks) 0) (set! (-> s hooks previous) h))
+  (set! (-> s hooks) h))
+
+(define (http-unhook! [h (ptr http-hook)])
+  (let ([s (cast (ptr http-server) (-> h server))])
+    (unless (== s 0)
+      (if (== (-> h previous) 0) (set! (-> s hooks) (-> h next)) (set! (-> h previous next) (-> h next)))
+      (unless (== (-> h next) 0) (set! (-> h next previous) (-> h previous)))
+      (set! (-> h server) 0)
+      (stopped? s))))
+
+(define (run-hooks! [s (ptr http-server)] [forced bool])
+  (let ([h (-> s hooks)])
+    (while (!= h 0)
+      (let ([next (-> h next)])
+        ((-> h run) (-> h tag) forced)
+        (set! h next)))))
+
+(define (stopped! [s (ptr http-server)])
+  (let ([done (-> s stopped)])
+    (timer-cancel (-> s stop-timer))
+    (set! (-> s stop-timer) 0)
+    (set! (-> s stopped) 0)
+    (unless (== done 0) (done s))))
+
+(define (stopped? [s (ptr http-server)])
+  (when (and (-> s stopping) (!= (-> s stop-timer) 0) (== (-> s connections) 0) (== (-> s hooks) 0)) (stopped! s)))
+
+;; stop-now! ends what remains once the time to finish is up.
+(define (stop-now! [s (ptr http-server)])
+  (set! (-> s stop-timer) 0)
+  (while (!= (-> s connections) 0) (drop! (-> s connections)))
+  (run-hooks! s #t)
+  (while (!= (-> s hooks) 0) (http-unhook! (-> s hooks)))
+  (stopped! s))
+
+;; http-server-shutdown! stops listening, drops idle connections, has the others close once their answers are done, and
+;; runs the hooks; after ms milliseconds it drops what remains and runs the hooks forced. done is called once nothing
+;; remains, as Go's Server.Shutdown returns.
+(define (http-server-shutdown! [s (ptr http-server)] [ms f64] [done (fn ((ptr http-server)))])
+  (unless (-> s stopping)
+    (set! (-> s stopping) #t)
+    (set! (-> s stopped) done)
+    (unless (== (-> s listener) 0) (net-close (-> s listener)))
+    (set! (-> s listener) 0)
+    (set! (-> s stop-timer) (timer-after ms (cast (ptr void) s)))
+    (let ([c (-> s connections)])
+      (while (!= c 0)
+        (let ([next (-> c next)])
+          (set! (-> c closing) #t)
+          (when (and (not (-> c busy)) (not (-> c lingering)) (== (-> c parser head line length) 0)
+                     (== (-> c rest length) 0))
+            (drop! c))
+          (set! c next))))
+    (run-hooks! s #f)
+    (stopped? s)))
+
+;; ---- signals ----
+
+(struct signals [head event-head] [server (ptr http-server)] [ms f64] [done (fn ((ptr http-server)))] [count u32]
+  [term u32])
+
+(define stopper signals)
+
+(define (exit-once-stopped [s (ptr http-server)]) (host-exit 0))
+
+(define (signalled [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (+= (-> stopper count) 1)
+  (if (> (-> stopper count) 1)
+      (host-exit (if (== id (-> stopper term)) 143 130))
+      (http-server-shutdown! (-> stopper server) (-> stopper ms)
+                             (if (== (-> stopper done) 0) exit-once-stopped (-> stopper done)))))
+
+;; http-stop-on-signals! shuts the server down at SIGTERM or SIGINT, with ms milliseconds to finish, then calls done,
+;; or exits when done is 0; a second signal exits at once.
+(define (http-stop-on-signals! [s (ptr http-server)] [ms f64] [done (fn ((ptr http-server)))])
+  (set! (-> stopper head handle) signalled)
+  (set! (-> stopper server) s)
+  (set! (-> stopper ms) ms)
+  (set! (-> stopper done) done)
+  (set! (-> stopper term) (signal-listen "SIGTERM" (cast (ptr void) (& stopper)) 0))
+  (signal-listen "SIGINT" (cast (ptr void) (& stopper)) 0))
 
 ;; ---- connections without streams ----
 
