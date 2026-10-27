@@ -1,7 +1,8 @@
 // The host module "stream" (stream.sub): byte streams other modules make from sources. A source that can be read
 // has pull(), which gives a promise of the next bytes, or of null at the end. One that can be written has
 // write(bytes), which gives false when full, and finish(). Each has close(), and may have errorOf(e) to give its
-// failures' codes. The streams set its drained(), finished() and failed(e).
+// failures' codes. The streams set its drained(), finished() and failed(e). A read into address 0 gives its bytes
+// with its event.
 import { errorOf, reasonOf } from './errors.mjs';
 
 const utf8 = new TextEncoder();
@@ -70,13 +71,15 @@ export function createStreams(host) {
         }
       }
       let n = 0;
+      let bytes;
       if (s.chunk && s.at < s.chunk.length) {
         n = Math.min(cap, s.chunk.length - s.at);
-        memory().set(s.chunk.subarray(s.at, s.at + n), at);
+        if (at === 0) bytes = s.chunk.subarray(s.at, s.at + n);
+        else memory().set(s.chunk.subarray(s.at, s.at + n), at);
         s.at += n;
       }
       s.reading = false;
-      host.raise(READ, id, s.tag, n);
+      host.raise(READ, id, s.tag, n, bytes);
     } catch (e) {
       if (!s.closed) fail(id, s, e);
     }

@@ -23,7 +23,7 @@
 (const state-closed i32 3)
 
 (struct ws-connection [head event-head] [stream u32] [user (ptr void)] [server (ptr http-server)]
-  [in (array u8 16384)] [frames buffer] [message buffer] [out buffer]
+  [frames buffer] [message buffer] [out buffer]
   [kind i32] [state i32] [code i32] [reading bool] [full bool] [timer u32] [pinged bool] [any-origin bool]
   [on-message (fn ((ptr ws-connection) (slice u8) i32))]
   [on-closed (fn ((ptr ws-connection) i32))]
@@ -48,8 +48,9 @@
 
 ;; ---- frames out ----
 
+;; write-frame! writes a payload over 1 KB from where it is, after the frame's head.
 (define (write-frame! [w (ptr ws-connection)] [opcode i32] [payload (slice u8)]) -> i32
-  (let ([out (& (-> w out))] [n (-> payload length)])
+  (let ([out (& (-> w out))] [n (-> payload length)] [written i32 0])
     (set! (-> out length) 0)
     (buffer-add-byte! out (bit-or 128 opcode))
     (cond [(< n 126) (buffer-add-byte! out (cast i32 n))]
@@ -61,10 +62,13 @@
            (buffer-add-byte! out 127)
            (for ([i u32 0]) (< i 8) (+= i 1)
              (buffer-add-byte! out (cast i32 (bit-and (>> (cast u64 n) (* 8 (- 7 i))) 255))))])
-    (buffer-add! out payload)
-    (let ([written (stream-write (-> w stream) (buffer-bytes out))])
-      (when (== written 1) (set! (-> w full) #t))
-      written)))
+    (when (<= n 1024) (buffer-add! out payload))
+    (set! written (stream-write (-> w stream) (buffer-bytes out)))
+    (when (and (> n 1024) (>= written 0)) (set! written (bit-or written (stream-write (-> w stream) payload))))
+    (set! (-> out length) 0)
+    (buffer-trim! out 2048)
+    (when (== written 1) (set! (-> w full) #t))
+    written))
 
 (define (write-close! [w (ptr ws-connection)] [code i32])
   (let ([pair (array u8 2)])
@@ -130,7 +134,9 @@
                   (when fin
                     (let ([kind (-> w kind)])
                       (set! (-> w kind) 0)
-                      (deliver! w (buffer-bytes (& (-> w message))) kind)))])]
+                      (deliver! w (buffer-bytes (& (-> w message))) kind)
+                      (set! (-> w message length) 0)
+                      (buffer-trim! (& (-> w message)) 4096)))])]
           [else (fail! w 1002)])))
 
 ;; next-frame! handles the frame at p and returns its size, or returns 0 when the frame is not complete.
@@ -163,14 +169,28 @@
                (frame! w (!= fin 0) opcode (slice payload n))
                (+ head n))]))))
 
-(define (unframe! [w (ptr ws-connection)])
-  (let* ([b (& (-> w frames))] [at u32 0] [size (next-frame! w (buffer-bytes b))])
+;; frames! handles the whole frames at the front of the bytes, and returns how many bytes they took.
+(define (frames! [w (ptr ws-connection)] [b (slice u8)]) -> u32
+  (let ([at u32 0] [size (next-frame! w b)])
     (while (> size 0)
       (+= at size)
-      (set! size (next-frame! w (slice (buffer-bytes b) at))))
+      (set! size (next-frame! w (slice b at))))
+    at))
+
+(define (unframe! [w (ptr ws-connection)])
+  (let* ([b (& (-> w frames))] [at (frames! w (buffer-bytes b))])
     (when (> at 0)
       (memcpy (-> b bytes) (+ (-> b bytes) at) (- (-> b length) at))
-      (-= (-> b length) at))))
+      (-= (-> b length) at))
+    (buffer-trim! b 4096)))
+
+;; heard! handles bytes read: whole frames from where they are, and the rest once frames holds them whole.
+(define (heard! [w (ptr ws-connection)] [b (slice u8)])
+  (if (== (-> w frames length) 0)
+      (buffer-add! (& (-> w frames)) (slice b (frames! w b)))
+      (begin
+        (buffer-add! (& (-> w frames)) b)
+        (unframe! w))))
 
 (define (arm! [w (ptr ws-connection)])
   (when (> (-> w server idle) 0.0) (set! (-> w timer) (timer-after (-> w server idle) (cast (ptr void) w)))))
@@ -180,7 +200,7 @@
     (when (== (-> w timer) 0) (arm! w))
     (unless (or (-> w reading) (-> w full))
       (set! (-> w reading) #t)
-      (when (< (stream-read! (-> w stream) (slice (-> w in))) 0) (ended! w 1006)))))
+      (when (< (stream-take! (-> w stream) 65536) 0) (ended! w 1006)))))
 
 (define (lost! [w (ptr ws-connection)]) (ended! w (if (== (-> w state) state-finishing) (-> w code) 1006)))
 
@@ -198,11 +218,12 @@
     (cond [(== source timer-source) (when (== id (-> w timer)) (silent! w))]
           [(and (== kind stream-read) (> value 0))
            (set! (-> w reading) #f)
-           (when (< (-> w state) state-finishing)
-             (set! (-> w pinged) #f)
-             (disarm! w)
-             (buffer-add! (& (-> w frames)) (slice (-> w in) (cast u32 value)))
-             (unframe! w))
+           (let ([b (events-take)])
+             (when (< (-> w state) state-finishing)
+               (set! (-> w pinged) #f)
+               (disarm! w)
+               (heard! w b))
+             (free (-> b items)))
            (read-more! w)]
           [(or (== kind stream-read) (== kind stream-failed)) (lost! w)]
           [(== kind stream-finished) (ended! w (-> w code))]
