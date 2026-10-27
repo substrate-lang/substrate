@@ -719,6 +719,29 @@ const checks = {
     check('files: bytes saved as a download', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file', 'saved bytes');
   },
 
+  // The page's client and then the browser's own EventSource read the same stream from tests/web/events-server.sub.
+  async events(page) {
+    const log = () => page.evaluate('document.getElementById("log").textContent');
+    await page.waitFor('document.getElementById("log").textContent.endsWith("refused 204")', 10000);
+    check('events: the client reconnects with the last id until 204', await log(), 'open | message 1 first | '
+      + 'named 2 a\nb | closed ended | open | message 3 resumed after 2 | closed ended | closed refused 204');
+    const native = await page.evaluate(`new Promise((resolve) => {
+      const seen = [];
+      const s = new EventSource('/events');
+      const heard = (e) => seen.push(e.type + ' ' + e.lastEventId + ' ' + e.data);
+      s.onopen = () => seen.push('open');
+      s.onmessage = heard;
+      s.addEventListener('named', heard);
+      s.onerror = () => {
+        seen.push(s.readyState === EventSource.CLOSED ? 'closed' : 'lost');
+        if (s.readyState === EventSource.CLOSED) resolve(seen.join(' | '));
+      };
+    })`);
+    check('events: the browser\'s EventSource reads the same', native,
+      'open | message 1 first | named 2 a\nb | lost | open | message 3 resumed after 2 | lost | closed');
+    check('events: nothing is written to the console', page.log.join('\n'), '');
+  },
+
   async floor(page) {
     const shown = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
     await page.waitFor('document.getElementById("fired").textContent === "1" && document.getElementById("text").textContent !== ""', 10000);
@@ -747,11 +770,17 @@ const needsGpu = new Set(['gpu', 'sprites', 'platformer', 'blocks', 'valley']);
 // Port 0: any free port.
 const server = spawn(path.join(here, '../../bin/sub'), ['serve', sites, '0'], { stdio: ['ignore', 'pipe', 'inherit'] });
 const url = await new Promise((resolve) => server.stdout.once('data', (d) => resolve(String(d).trim())));
+// The events page comes from its own server, which answers /events as well.
+const site = path.join(sites, 'events');
+const eventsServer = spawn(path.join(here, '../../bin/sub'),
+  ['run', '-N=127.0.0.1', `-R=${site}`, path.join(sites, 'events-server'), site],
+  { stdio: ['ignore', 'pipe', 'inherit'] });
+const eventsUrl = await new Promise((resolve) => eventsServer.stdout.once('data', (d) => resolve(String(d).trim())));
 async function run(group) {
   await withBrowser(async (open) => {
     for (const name of group) {
       const before = failed;
-      const page = await open(`${url}${name}/index.html`);
+      const page = await open(name === 'events' ? `${eventsUrl}index.html` : `${url}${name}/index.html`);
       try {
         // Each page sets window.ready once its program has started.
         await page.waitFor('window.ready', 60000);
@@ -772,5 +801,6 @@ try {
   if (gpu.length) await run(gpu);
 } finally {
   server.kill();
+  eventsServer.kill();
 }
 process.exit(failed ? 1 : 0);
