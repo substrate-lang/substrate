@@ -1,0 +1,117 @@
+;; multipart/form-data bodies (RFC 7578), after Go's mime/multipart: each part's name, and for a file its file name,
+;; without any directories, and media type, and its bytes, which are views of the body.
+(require-unqualified http "http.sub")
+(require-unqualified url "url.sub")
+
+(provide multipart-part multipart-boundary multipart-parse)
+
+(struct multipart-part [name string] [filename string] [type string] [bytes (slice u8)] [file bool])
+
+;; multipart-boundary is a multipart/form-data content-type's boundary, or "" for another type or none.
+(define (multipart-boundary [a (ptr arena)] [content-type string]) -> string
+  (if (http-media-type? content-type "multipart/form-data") (http-media-parameter a content-type "boundary") ""))
+
+(define (refused [why (ptr string)] [message string]) -> bool
+  (set! (@ why) message)
+  #f)
+
+(define (at? [body (slice u8)] [i u32] [s string]) -> bool
+  (and (<= (+ i (-> s length)) (-> body length)) (== (cast string (slice body i (+ i (-> s length)))) s)))
+
+;; find is where s next starts in body from i, or -1.
+(define (find [body (slice u8)] [s string] [i u32]) -> i64
+  (let ([n (-> body length)] [m (-> s length)] [first (@ s 0)])
+    (while (<= (+ i m) n)
+      (when (and (== (@ body i) first) (at? body i s)) (return (cast i64 i)))
+      (+= i 1))
+    -1))
+
+(define (joined [a (ptr arena)] [front string] [back string]) -> string
+  (let ([p (cast (ptr u8) (arena-alloc a (+ (-> front length) (-> back length))))])
+    (memcpy p (-> front bytes) (-> front length))
+    (memcpy (+ p (-> front length)) (-> back bytes) (-> back length))
+    (cast string (slice p (+ (-> front length) (-> back length))))))
+
+(define (trimmed [s string]) -> string
+  (let ([start u32 0] [end (-> s length)])
+    (while (and (< start end) (or (== (@ s start) 32) (== (@ s start) 9))) (+= start 1))
+    (while (and (> end start) (or (== (@ s (- end 1)) 32) (== (@ s (- end 1)) 9))) (-= end 1))
+    (slice s start end)))
+
+;; base-name drops a file name's directories, as Go's FileName does.
+(define (base-name [s string]) -> string
+  (let ([i (-> s length)])
+    (while (and (> i 0) (!= (@ s (- i 1)) #\/) (!= (@ s (- i 1)) #\\)) (-= i 1))
+    (slice s i)))
+
+;; extended is a parameter value of RFC 5987's form, charset'language'escaped, decoded, or "" when its charset is not
+;; UTF-8 or US-ASCII.
+(define (extended [a (ptr arena)] [s string]) -> string
+  (let ([first u32 0] [second u32 0])
+    (while (and (< first (-> s length)) (!= (@ s first) #\')) (+= first 1))
+    (set! second (+ first 1))
+    (while (and (< second (-> s length)) (!= (@ s second) #\')) (+= second 1))
+    (if (and (< second (-> s length))
+             (or (http-same? (slice s 0 first) "utf-8") (http-same? (slice s 0 first) "us-ascii")))
+        (url-unescape a (slice s (+ second 1)) #f)
+        "")))
+
+;; head! reads a part's head, its lines ended by CRLF, into the part.
+(define (head! [a (ptr arena)] [text string] [part (ptr multipart-part)])
+  (let ([n (-> text length)] [start u32 0])
+    (for ([i u32 0]) (<= i n) (+= i 1)
+      (when (or (== i n) (and (== (@ text i) 10) (> i 0) (== (@ text (- i 1)) 13)))
+        (let* ([line (slice text start (if (== i n) n (- i 1)))] [colon u32 0])
+          (while (and (< colon (-> line length)) (!= (@ line colon) #\:)) (+= colon 1))
+          (when (< colon (-> line length))
+            (let ([name (slice line 0 colon)] [value (slice line (+ colon 1))])
+              (cond [(http-same? name "content-disposition")
+                     (when (http-media-type? value "form-data")
+                       (let ([plain (http-media-parameter a value "filename")]
+                             [encoded (http-media-parameter a value "filename*")])
+                         (set! (-> part name) (http-media-parameter a value "name"))
+                         (set! (-> part filename)
+                               (base-name (if (> (-> encoded length) 0) (extended a encoded) plain)))))]
+                    [(http-same? name "content-type") (set! (-> part type) (trimmed value))])))
+          (set! start (+ i 1)))))))
+
+;; multipart-parse reads a body's parts with a name into the arena. It returns #f, with the reason in why, when the body
+;; is malformed.
+(define (multipart-parse [a (ptr arena)] [body (slice u8)] [boundary string] [to (ptr (slice multipart-part))]
+                         [why (ptr string)]) -> bool
+  (set! (@ to) 0)
+  (when (or (== (-> boundary length) 0) (> (-> boundary length) 70))
+    (return (refused why "the boundary is missing or longer than 70 bytes")))
+  (let* ([dash (joined a "--" boundary)] [delimiter (joined a "\r\n" dash)] [n (-> body length)]
+         [first (if (at? body 0 dash) 0 (find body delimiter 0))]
+         [at u32 0] [items (ptr multipart-part) 0] [count u32 0] [room u32 0])
+    (when (< first 0) (return (refused why "the body has no boundary")))
+    (set! at (+ (cast u32 first) (if (at? body 0 dash) 0 2) (-> dash length)))
+    (while #t
+      (when (at? body at "--") (break))
+      (while (and (< at n) (or (== (@ body at) 32) (== (@ body at) 9))) (+= at 1))
+      (unless (at? body at "\r\n") (return (refused why "a boundary's line goes on past it")))
+      (+= at 2)
+      (let* ([empty (at? body at "\r\n")] [end (if empty (cast i64 at) (find body "\r\n\r\n" at))]
+             [part multipart-part] [start u32 0] [next i64 0])
+        (when (< end 0) (return (refused why "a part's head does not end")))
+        (set! start (+ (cast u32 end) (if empty 2 4)))
+        (set! next (find body delimiter start))
+        (when (< next 0) (return (refused why "the body ends inside a part")))
+        (set! (-> part name) "")
+        (set! (-> part filename) "")
+        (set! (-> part type) "")
+        (head! a (cast string (slice body at (cast u32 end))) (& part))
+        (set! (-> part bytes) (slice body start (cast u32 next)))
+        (set! (-> part file) (> (-> part filename length) 0))
+        (when (> (-> part name length) 0)
+          (when (== count room)
+            (set! room (if (== room 0) 4 (* 2 room)))
+            (let ([more (cast (ptr multipart-part) (arena-alloc a (* room (sizeof multipart-part))))])
+              (when (> count 0) (memcpy more items (* count (sizeof multipart-part))))
+              (set! items more)))
+          (set! (@ items count) part)
+          (+= count 1))
+        (set! at (+ (cast u32 next) (-> delimiter length)))))
+    (set! (@ to) (slice items count))
+    #t))
