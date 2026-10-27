@@ -1,0 +1,14 @@
+extern void *malloc(unsigned long);
+extern void free(void *);
+int counter = 5;
+static const char *greeting = "hello";
+const char *messages[] = {"one", "two"};
+int zeros[100];
+int add(int a, int b) { counter += a; return a + b + counter; }
+int (*pick(void))(int, int) { return add; }
+int *counter_address(void) { return &counter; }
+char *copy(void) { char *p = malloc(6); for (int i = 0; i < 6; i++) p[i] = greeting[i]; return p; }
+const char *message(int i) { return messages[i]; }
+int call_back(int (*f)(int), int x) { return f(x) + 1; }
+int stack_sum(int n) { volatile int a[64]; for (int i = 0; i < 64; i++) a[i] = i * n; int s = 0; for (int i = 0; i < 64; i++) s += a[i]; return s; }
+int zero_sum(void) { int s = 0; for (int i = 0; i < 100; i++) s += zeros[i]; return s; }

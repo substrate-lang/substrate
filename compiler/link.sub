@@ -1,0 +1,482 @@
+;; Wasm packages: a dynamic-linking side module (clang -shared, Emscripten's side modules) made into two modules that a
+;; program instantiates in turn. The placer takes the module's memory from malloc and its table slots, and holds its
+;; bases and GOT entries as globals. The module takes memory, table, stack, malloc, free and realloc from the prelude
+;; and the rest from the placer; its segments become passive, and a start function copies them in, fills the slots of
+;; its GOT functions, and runs its relocations and constructors.
+(require-unqualified macros "macros.sub")
+(require-unqualified leb "leb128.sub")
+(require-unqualified running "running.sub")
+
+(provide link-side-module)
+
+(define start-name datum '"__subhost_start")
+
+(define (fail [what string] [args datum]) (raise-compile-error 0 (format-message what args)))
+
+(define (put! [q (ptr buffer)] [s (slice u8)]) (buffer-add! q s))
+
+(define (put-name! [q (ptr buffer)] [s datum])
+  (let ([t (datum->string s)])
+    (write-uleb q (cast u64 (-> t length)))
+    (buffer-add-string! q t)))
+
+(define (put-section! [out (ptr buffer)] [id u32] [payload (slice u8)])
+  (buffer-add-byte! out id)
+  (write-uleb out (cast u64 (-> payload length)))
+  (buffer-add! out payload))
+
+(define (sleb) -> i64
+  (let ([n i64 0] [shift u32 0] [b u32 128])
+    (while (!= (bit-and b 128) 0)
+      (set! b (byte))
+      (set! n (bit-or n (<< (cast i64 (bit-and b 127)) shift)))
+      (+= shift 7))
+    (if (and (< shift 64) (!= (bit-and b 64) 0)) (bit-or n (<< -1 shift)) n)))
+
+;; offset-expr reads a segment's offset, (global.get g) with (i32.const k) (i32.add) after it or not, as k.
+(define (offset-expr [what datum]) -> i64
+  (let ([op (byte)] [k i64 0])
+    (unless (== op #x23) (fail "~a: a segment is not placed by its base global" (cons what nil)))
+    (uleb)
+    (set! op (byte))
+    (when (== op #x41)
+      (set! k (sleb))
+      (unless (== (byte) #x6A) (fail "~a: a segment's offset is not its base plus a constant" (cons what nil)))
+      (set! op (byte)))
+    (unless (== op #x0B) (fail "~a: a segment's offset is not its base plus a constant" (cons what nil)))
+    k))
+
+(define (lookup [l datum] [key datum]) -> datum
+  (while (pair? l)
+    (when (equal? (car (car l)) key) (return (cdr (car l))))
+    (set! l (cdr l)))
+  0)
+
+(define (at [n u32]) -> datum (make-integer (cast i64 n)))
+(define (int [d datum]) -> u32 (cast u32 (integer-value d)))
+
+;; A side module as read. An import is (module field kind from to global), its description at from to to and global its
+;; index among globals; a data segment is (placed offset from length); an element segment (placed offset items from to).
+(struct side [bytes (slice u8)] [sections datum] [imports datum] [exports datum] [globals datum] [datas datum]
+  [elems datum] [ntypes u32] [nfuncs u32] [nfimports u32] [nglobal-imports u32] [mem-size u32] [mem-align u32]
+  [table-size u32] [has-count bool] [start i64])
+
+(define (read-side! [s (ptr side)] [what datum])
+  (let ([b (-> s bytes)] [ss nil])
+    (unless (and (>= (-> b length) 8) (== (@ (-> b items) 0) 0) (== (@ (-> b items) 1) #x61)
+                 (== (@ (-> b items) 4) 1))
+      (fail "~a is not a wasm module" (cons what nil)))
+    (read-from! b 8)
+    (while (< (position) (-> b length))
+      (let* ([id (byte)] [size (uleb)] [start (position)])
+        (set! ss (cons `(,(at id) ,(at start) ,(at (+ start size))) ss))
+        (cond [(== id 0) (custom! s start size)]
+              [(== id 1) (set! (-> s ntypes) (uleb))]
+              [(== id 2) (imports-in! s what)]
+              [(== id 3) (set! (-> s nfuncs) (uleb))]
+              [(== id 6) (globals-in! s)]
+              [(== id 7) (exports-in! s)]
+              [(== id 8) (set! (-> s start) (cast i64 (uleb)))]
+              [(== id 9) (elems-in! s what)]
+              [(== id 11) (datas-in! s what)]
+              [(== id 12) (set! (-> s has-count) #t)])
+        (read-from! b (+ start size))))
+    (set! (-> s sections) (reverse ss))))
+
+(define (custom! [s (ptr side)] [start u32] [size u32])
+  (when (equal? (name) '"dylink.0")
+    (while (< (position) (+ start size))
+      (let* ([sub (byte)] [len (uleb)] [from (position)])
+        (when (== sub 1)
+          (set! (-> s mem-size) (uleb))
+          (set! (-> s mem-align) (uleb))
+          (set! (-> s table-size) (uleb)))
+        (read-from! (-> s bytes) (+ from len))))))
+
+(define (imports-in! [s (ptr side)] [what datum])
+  (let ([n (uleb)] [out nil])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let* ([m (name)] [f (name)] [kind (byte)] [from (position)] [g u32 0])
+        (cond [(== kind 0) (uleb) (+= (-> s nfimports) 1)]
+              [(== kind 1) (byte) (limits)]
+              [(== kind 2) (limits)]
+              [(== kind 3) (byte) (byte) (set! g (-> s nglobal-imports)) (+= (-> s nglobal-imports) 1)]
+              [else (fail "~a imports ~a.~a, a kind of import a program cannot give" `(,what ,m ,f))])
+        (set! out (cons `(,m ,f ,(at kind) ,(at from) ,(at (position)) ,(at g)) out))))
+    (set! (-> s imports) (reverse out))))
+
+(define (globals-in! [s (ptr side)])
+  (let ([n (uleb)] [out nil])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (byte)
+      (byte)
+      (let ([op (byte)] [v i64 0])
+        (when (== op #x41)
+          (set! v (sleb))
+          (set! op (byte)))
+        (while (!= op #x0B) (set! op (byte)))
+        (set! out (cons (make-integer v) out))))
+    (set! (-> s globals) (reverse out))))
+
+(define (exports-in! [s (ptr side)])
+  (let ([n (uleb)] [out nil])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let* ([f (name)] [kind (byte)] [index (uleb)]) (set! out (cons `(,f ,(at kind) ,(at index)) out))))
+    (set! (-> s exports) (reverse out))))
+
+(define (elems-in! [s (ptr side)] [what datum])
+  (let ([n (uleb)] [out nil])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let ([from (position)] [flags (uleb)] [placed #f] [k i64 0] [items nil])
+        (cond [(or (== flags 0) (== flags 2))
+               (when (== flags 2) (unless (== (uleb) 0) (fail "~a fills a second table" (cons what nil))))
+               (set! placed #t)
+               (set! k (offset-expr what))
+               (when (== flags 2) (byte))
+               (let ([count (uleb)]) (for ([j u32 0]) (< j count) (+= j 1) (set! items (cons (at (uleb)) items))))]
+              [(or (== flags 1) (== flags 3))
+               (byte)
+               (let ([count (uleb)]) (for ([j u32 0]) (< j count) (+= j 1) (uleb)))]
+              [else (fail "~a has a kind of element segment that cannot be placed" (cons what nil))])
+        (set! out (cons `(,(boolean placed) ,(make-integer k) ,(reverse items) ,(at from) ,(at (position))) out))))
+    (set! (-> s elems) (reverse out))))
+
+(define (datas-in! [s (ptr side)] [what datum])
+  (let ([n (uleb)] [out nil])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let ([flags (uleb)] [placed #f] [k i64 0] [len u32 0])
+        (cond [(or (== flags 0) (== flags 2))
+               (when (== flags 2) (unless (== (uleb) 0) (fail "~a fills a second memory" (cons what nil))))
+               (set! placed #t)
+               (set! k (offset-expr what))]
+              [(== flags 1) (begin)]
+              [else (fail "~a has a kind of data segment that cannot be placed" (cons what nil))])
+        (set! len (uleb))
+        (set! out (cons `(,(boolean placed) ,(make-integer k) ,(at (position)) ,(at len)) out))
+        (skip len)))
+    (set! (-> s datas) (reverse out))))
+
+;; link-side-module gives (placer module kept): the placer's bytes, the module's, and the prelude's exports they import,
+;; as (prelude . name) pairs. own names the module in the program, placer the placer, and prelude the prelude.
+(define (link-side-module [what datum] [bytes datum] [placer datum] [prelude datum]) -> datum
+  (let ([s side] [got nil] [kept nil] [mb i64 -1] [tb i64 -1])
+    (memset (& s) 0 (sizeof side))
+    (set! (-> (& s) start) -1)
+    (set! (-> (& s) bytes) (datum->bytes bytes))
+    (read-side! (& s) what)
+    (let ([l (-> (& s) imports)])
+      (while (pair? l)
+        (let* ([imp (car l)] [m (car imp)] [f (cadr imp)] [kind (int (caddr imp))] [g (list-ref imp 5)])
+          (cond [(and (equal? m '"env") (equal? f '"memory")) (set! kept (cons (cons prelude '"memory") kept))]
+                [(and (equal? m '"env") (equal? f '"__indirect_function_table"))
+                 (set! kept (cons (cons prelude '"table") kept))]
+                [(and (equal? m '"env") (equal? f '"__stack_pointer")) (set! kept (cons (cons prelude '"sp") kept))]
+                [(and (equal? m '"env") (equal? f '"__memory_base")) (set! mb (integer-value g))]
+                [(and (equal? m '"env") (equal? f '"__table_base")) (set! tb (integer-value g))]
+                [(and (equal? m '"env") (== kind 0) (or (equal? f '"malloc") (equal? f '"free") (equal? f '"realloc")))
+                 (set! kept (cons (cons prelude f) kept))]
+                [(and (equal? m '"GOT.mem") (== kind 3)) (set! got (cons (got-mem (& s) what f g) got))]
+                [(and (equal? m '"GOT.func") (== kind 3)) (set! got (cons (got-func (& s) what f g) got))]
+                [else (fail "~a imports ~a.~a, which a program does not give" `(,what ,m ,f))]))
+        (set! l (cdr l))))
+    (set! got (reverse got))
+    `(,(placer-bytes (& s) got prelude) ,(module-bytes (& s) got placer prelude mb tb) ,kept)))
+
+;; A GOT entry is (field global kind value): the global the module reads, and for mem the data's offset from the memory
+;; base, for func the function's index.
+(define (got-mem [s (ptr side)] [what datum] [f datum] [g datum]) -> datum
+  (let ([e (lookup (-> s exports) f)])
+    (unless (and (!= e 0) (== (int (car e)) 3))
+      (fail "~a takes the address of ~a, which it does not define" `(,what ,f)))
+    `(,f ,g mem ,(list-ref (-> s globals) (- (int (cadr e)) (-> s nglobal-imports))))))
+
+(define (got-func [s (ptr side)] [what datum] [f datum] [g datum]) -> datum
+  (let ([e (lookup (-> s exports) f)] [index i64 -1] [l (-> s imports)] [i i64 0])
+    (if (and (!= e 0) (== (int (car e)) 0))
+        (set! index (integer-value (cadr e)))
+        (while (pair? l)
+          (when (== (int (caddr (car l))) 0)
+            (when (and (equal? (car (car l)) '"env") (equal? (cadr (car l)) f)) (set! index i))
+            (+= i 1))
+          (set! l (cdr l))))
+    (when (< index 0)
+      (fail "~a takes the address of the function ~a, which it neither defines nor imports" `(,what ,f)))
+    `(,f ,g func ,(make-integer index))))
+
+(define (got-field [d datum]) -> datum (format "GOT.~a.~a" `(,(caddr d) ,(car d))))
+
+;; ---- the placer ----
+
+(define (placer-bytes [s (ptr side)] [got datum] [prelude datum]) -> datum
+  (let ([out (make-buffer)] [q (make-buffer)] [body (make-buffer)] [align (<< 1 (-> s mem-align))]
+        [n u32 (+ 2 (length got))] [l got] [g u32 2] [d datum 0] [size (-> s mem-size)])
+    (when (< align 8) (set! align 8))
+    (put! (& out) (slice (array-of u8 0 #x61 #x73 #x6d 1 0 0 0)))
+    (put! (& q) (slice (array-of u8 2 #x60 0 0 #x60 1 #x7f 1 #x7f)))
+    (put-section! (& out) 1 (buffer-bytes (& q)))
+    (set! (-> q length) 0)
+    (write-uleb (& q) 3)
+    (put-name! (& q) prelude)
+    (put-name! (& q) '"malloc")
+    (put! (& q) (slice (array-of u8 0 1)))
+    (put-name! (& q) prelude)
+    (put-name! (& q) '"memory")
+    (put! (& q) (slice (array-of u8 2 0 0)))
+    (put-name! (& q) prelude)
+    (put-name! (& q) '"table")
+    (put! (& q) (slice (array-of u8 1 #x70 0 0)))
+    (put-section! (& out) 2 (buffer-bytes (& q)))
+    (put-section! (& out) 3 (slice (array-of u8 1 0)))
+    (set! (-> q length) 0)
+    (write-uleb (& q) (cast u64 n))
+    (for ([i u32 0]) (< i n) (+= i 1) (put! (& q) (slice (array-of u8 #x7f 1 #x41 0 #x0b))))
+    (put-section! (& out) 6 (buffer-bytes (& q)))
+    (set! (-> q length) 0)
+    (write-uleb (& q) (cast u64 (+ n 1)))
+    (put-name! (& q) '"__memory_base")
+    (put! (& q) (slice (array-of u8 3 0)))
+    (put-name! (& q) '"__table_base")
+    (put! (& q) (slice (array-of u8 3 1)))
+    (while (pair? l)
+      (put-name! (& q) (got-field (car l)))
+      (buffer-add-byte! (& q) 3)
+      (write-uleb (& q) (cast u64 g))
+      (+= g 1)
+      (set! l (cdr l)))
+    (put-name! (& q) start-name)
+    (put! (& q) (slice (array-of u8 0 1)))
+    (put-section! (& out) 7 (buffer-bytes (& q)))
+    (when (> size 0)
+      (buffer-add-byte! (& body) #x41)
+      (write-sleb (& body) (cast i64 (+ size (- align 1))))
+      (put! (& body) (slice (array-of u8 #x10 0 #x41)))
+      (write-sleb (& body) (cast i64 (- align 1)))
+      (put! (& body) (slice (array-of u8 #x6a #x41)))
+      (write-sleb (& body) (- 0 (cast i64 align)))
+      (put! (& body) (slice (array-of u8 #x71 #x24 0 #x23 0 #x41 0 #x41)))
+      (write-sleb (& body) (cast i64 size))
+      (put! (& body) (slice (array-of u8 #xfc #x0b 0))))
+    (when (> (-> s table-size) 0)
+      (put! (& body) (slice (array-of u8 #xd0 #x70 #x41)))
+      (write-sleb (& body) (cast i64 (-> s table-size)))
+      (put! (& body) (slice (array-of u8 #xfc #x0f 0 #x24 1))))
+    (set! l got)
+    (set! g 2)
+    (while (pair? l)
+      (set! d (car l))
+      (if (equal? (caddr d) 'mem)
+          (begin
+            (put! (& body) (slice (array-of u8 #x23 0 #x41)))
+            (write-sleb (& body) (integer-value (cadddr d)))
+            (buffer-add-byte! (& body) #x6a))
+          (put! (& body) (slice (array-of u8 #xd0 #x70 #x41 1 #xfc #x0f 0))))
+      (buffer-add-byte! (& body) #x24)
+      (write-uleb (& body) (cast u64 g))
+      (+= g 1)
+      (set! l (cdr l)))
+    (buffer-add-byte! (& body) #x0b)
+    (set! (-> q length) 0)
+    (write-uleb (& q) 1)
+    (write-uleb (& q) (cast u64 (+ (-> body length) 1)))
+    (buffer-add-byte! (& q) 0)
+    (buffer-add! (& q) (buffer-bytes (& body)))
+    (put-section! (& out) 10 (buffer-bytes (& q)))
+    (set! d (bytes->datum (buffer-bytes (& out))))
+    (buffer-free! (& out))
+    (buffer-free! (& q))
+    (buffer-free! (& body))
+    d))
+
+;; ---- the module ----
+
+(define (module-bytes [s (ptr side)] [got datum] [placer datum] [prelude datum] [mb i64] [tb i64]) -> datum
+  (let ([out (make-buffer)] [q (make-buffer)] [body (make-buffer)] [b (-> s bytes)] [l (-> s sections)]
+        [start-index u32 (+ (-> s nfimports) (-> s nfuncs))] [has-elems #f] [d datum 0])
+    (put! (& out) (slice b 0 8))
+    (while (pair? l)
+      (let ([id (int (car (car l)))] [from (int (cadr (car l)))] [to (int (caddr (car l)))])
+        (set! (-> q length) 0)
+        (read-from! b from)
+        (cond [(== id 0) (unless (equal? (name) '"dylink.0") (put-section! (& out) 0 (slice b from to)))]
+              [(== id 1)
+               (write-uleb (& q) (cast u64 (+ (uleb) 1)))
+               (buffer-add! (& q) (slice b (position) to))
+               (put! (& q) (slice (array-of u8 #x60 0 0)))
+               (put-section! (& out) 1 (buffer-bytes (& q)))]
+              [(== id 2)
+               (imports! (& q) s placer prelude)
+               (put-section! (& out) 2 (buffer-bytes (& q)))]
+              [(== id 3)
+               (write-uleb (& q) (cast u64 (+ (uleb) 1)))
+               (buffer-add! (& q) (slice b (position) to))
+               (write-uleb (& q) (cast u64 (-> s ntypes)))
+               (put-section! (& out) 3 (buffer-bytes (& q)))]
+              [(== id 7)
+               (write-uleb (& q) (cast u64 (+ (uleb) 1)))
+               (buffer-add! (& q) (slice b (position) to))
+               (put-name! (& q) start-name)
+               (buffer-add-byte! (& q) 0)
+               (write-uleb (& q) (cast u64 start-index))
+               (put-section! (& out) 7 (buffer-bytes (& q)))]
+              [(== id 9)
+               (set! has-elems #t)
+               (elements! (& q) s got)
+               (put-section! (& out) 9 (buffer-bytes (& q)))]
+              [(== id 8) (begin)]
+              [(== id 12) (put-section! (& out) 12 (slice b from to))]
+              [(== id 10)
+               (unless has-elems
+                 (elements! (& q) s got)
+                 (put-section! (& out) 9 (buffer-bytes (& q)))
+                 (set! (-> q length) 0))
+               (when (and (not (-> s has-count)) (pair? (-> s datas)))
+                 (write-uleb (& q) (cast u64 (length (-> s datas))))
+                 (put-section! (& out) 12 (buffer-bytes (& q)))
+                 (set! (-> q length) 0))
+               (start-body! (& body) s got mb tb)
+               (read-from! b from)
+               (write-uleb (& q) (cast u64 (+ (uleb) 1)))
+               (buffer-add! (& q) (slice b (position) to))
+               (write-uleb (& q) (cast u64 (+ (-> body length) 1)))
+               (buffer-add-byte! (& q) 0)
+               (buffer-add! (& q) (buffer-bytes (& body)))
+               (put-section! (& out) 10 (buffer-bytes (& q)))]
+              [(== id 11)
+               (datas! (& q) s)
+               (put-section! (& out) 11 (buffer-bytes (& q)))]
+              [else (put-section! (& out) id (slice b from to))]))
+      (set! l (cdr l)))
+    (set! d (bytes->datum (buffer-bytes (& out))))
+    (buffer-free! (& out))
+    (buffer-free! (& q))
+    (buffer-free! (& body))
+    d))
+
+(define (imports! [q (ptr buffer)] [s (ptr side)] [placer datum] [prelude datum])
+  (let ([l (-> s imports)] [b (-> s bytes)])
+    (write-uleb q (cast u64 (length l)))
+    (while (pair? l)
+      (let* ([imp (car l)] [m (car imp)] [f (cadr imp)] [kind (int (caddr imp))]
+             [desc (slice b (int (cadddr imp)) (int (list-ref imp 4)))])
+        (cond [(and (equal? m '"env") (equal? f '"memory"))
+               (put-name! q prelude)
+               (put-name! q '"memory")
+               (put! q (slice (array-of u8 2 0 0)))]
+              [(and (equal? m '"env") (equal? f '"__indirect_function_table"))
+               (put-name! q prelude)
+               (put-name! q '"table")
+               (put! q (slice (array-of u8 1 #x70 0 0)))]
+              [(and (equal? m '"env") (equal? f '"__stack_pointer"))
+               (put-name! q prelude)
+               (put-name! q '"sp")
+               (buffer-add-byte! q 3)
+               (buffer-add! q desc)]
+              [(and (equal? m '"env") (or (equal? f '"__memory_base") (equal? f '"__table_base")))
+               (put-name! q placer)
+               (put-name! q f)
+               (put! q (slice (array-of u8 3 #x7f 1)))]
+              [(or (equal? m '"GOT.mem") (equal? m '"GOT.func"))
+               (put-name! q placer)
+               (put-name! q (format "~a.~a" `(,m ,f)))
+               (buffer-add-byte! q 3)
+               (buffer-add! q desc)]
+              [else
+               (put-name! q prelude)
+               (put-name! q f)
+               (buffer-add-byte! q kind)
+               (buffer-add! q desc)]))
+      (set! l (cdr l)))))
+
+(define (elements! [q (ptr buffer)] [s (ptr side)] [got datum])
+  (let ([funcs nil] [l got] [es (-> s elems)] [b (-> s bytes)])
+    (while (pair? l)
+      (when (equal? (caddr (car l)) 'func) (set! funcs (cons (cadddr (car l)) funcs)))
+      (set! l (cdr l)))
+    (write-uleb q (cast u64 (+ (length es) (if (pair? funcs) 1 0))))
+    (while (pair? es)
+      (let ([e (car es)])
+        (if (equal? (car e) '#f)
+            (buffer-add! q (slice b (int (cadddr e)) (int (list-ref e 4))))
+            (begin
+              (put! q (slice (array-of u8 1 0)))
+              (write-uleb q (cast u64 (length (caddr e))))
+              (let ([items (caddr e)])
+                (while (pair? items)
+                  (write-uleb q (cast u64 (int (car items))))
+                  (set! items (cdr items)))))))
+      (set! es (cdr es)))
+    (when (pair? funcs)
+      (put! q (slice (array-of u8 3 0)))
+      (write-uleb q (cast u64 (length funcs)))
+      (while (pair? funcs)
+        (write-uleb q (cast u64 (int (car funcs))))
+        (set! funcs (cdr funcs))))))
+
+(define (datas! [q (ptr buffer)] [s (ptr side)])
+  (let ([l (-> s datas)] [b (-> s bytes)])
+    (write-uleb q (cast u64 (length l)))
+    (while (pair? l)
+      (let ([from (int (caddr (car l)))] [len (int (cadddr (car l)))])
+        (buffer-add-byte! q 1)
+        (write-uleb q (cast u64 len))
+        (buffer-add! q (slice b from (+ from len))))
+      (set! l (cdr l)))))
+
+(define (start-body! [body (ptr buffer)] [s (ptr side)] [got datum] [mb i64] [tb i64])
+  (let ([i u32 0] [l (-> s datas)] [d datum 0])
+    (while (pair? l)
+      (set! d (car l))
+      (unless (equal? (car d) '#f)
+        (when (< mb 0) (raise-compile-error 0 "internal: a placed data segment without a memory base"))
+        (buffer-add-byte! body #x23)
+        (write-uleb body (cast u64 mb))
+        (buffer-add-byte! body #x41)
+        (write-sleb body (integer-value (cadr d)))
+        (put! body (slice (array-of u8 #x6a #x41 0 #x41)))
+        (write-sleb body (cast i64 (int (cadddr d))))
+        (put! body (slice (array-of u8 #xfc 8)))
+        (write-uleb body (cast u64 i))
+        (put! body (slice (array-of u8 0 #xfc 9)))
+        (write-uleb body (cast u64 i)))
+      (+= i 1)
+      (set! l (cdr l)))
+    (set! i 0)
+    (set! l (-> s elems))
+    (while (pair? l)
+      (set! d (car l))
+      (unless (equal? (car d) '#f)
+        (when (< tb 0) (raise-compile-error 0 "internal: a placed element segment without a table base"))
+        (buffer-add-byte! body #x23)
+        (write-uleb body (cast u64 tb))
+        (buffer-add-byte! body #x41)
+        (write-sleb body (integer-value (cadr d)))
+        (put! body (slice (array-of u8 #x6a #x41 0 #x41)))
+        (write-sleb body (cast i64 (length (caddr d))))
+        (put! body (slice (array-of u8 #xfc 12)))
+        (write-uleb body (cast u64 i))
+        (put! body (slice (array-of u8 0 #xfc 13)))
+        (write-uleb body (cast u64 i)))
+      (+= i 1)
+      (set! l (cdr l)))
+    (set! l got)
+    (while (pair? l)
+      (set! d (car l))
+      (when (equal? (caddr d) 'func)
+        (buffer-add-byte! body #x23)
+        (write-uleb body (cast u64 (int (cadr d))))
+        (buffer-add-byte! body #xd2)
+        (write-uleb body (cast u64 (int (cadddr d))))
+        (put! body (slice (array-of u8 #x26 0))))
+      (set! l (cdr l)))
+    (when (>= (-> s start) 0)
+      (buffer-add-byte! body #x10)
+      (write-uleb body (cast u64 (-> s start))))
+    (call-export! body s '"__wasm_apply_data_relocs")
+    (call-export! body s '"__wasm_call_ctors")
+    (buffer-add-byte! body #x0b)))
+
+(define (call-export! [body (ptr buffer)] [s (ptr side)] [f datum])
+  (let ([e (lookup (-> s exports) f)])
+    (when (and (!= e 0) (== (int (car e)) 0))
+      (buffer-add-byte! body #x10)
+      (write-uleb body (cast u64 (int (cadr e)))))))

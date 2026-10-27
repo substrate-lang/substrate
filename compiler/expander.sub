@@ -9,9 +9,11 @@
 (require-unqualified ser "serialize.sub")
 (require-unqualified leb "leb128.sub")
 (require-unqualified checker "checker.sub")
+(require-unqualified link "link.sub")
 
 (provide set-repository-root! set-package-root! install-core! compile-module-file expand-module-file
-         content-hash wasm-module program-wasm-modules trap-report host-error set-cache-directory!
+         content-hash wasm-module program-wasm-modules package-module-names package-kept trap-report host-error
+         set-cache-directory!
          session-open! session-eval! session-eval-text! session-eval-file! session-error session-recover!)
 
 (define core-forms datum
@@ -622,10 +624,13 @@
         (set! (@ digits k) (if (< d 10) (+ 48 d) (+ 87 d)))))
     (string->datum (cast string (slice digits)))))
 
-;; A manifest with dependencies is part of the hash of its package's modules, since it gives their names meaning.
+;; A manifest with dependencies or a wasm module is part of the hash of its package's modules, with the wasm module's
+;; own hash, since it gives their names and imports meaning.
 (define (module-hash [path datum] [text datum] [requires datum]) -> datum
   (let* ([m (manifest-at (directory-path (absolute-of path)))]
-         [parts (if (or (== m 0) (null? (manifest-requires m))) `(,path ,text) `(,path ,text ,(manifest-text m)))])
+         [parts (cond [(or (== m 0) (and (null? (manifest-requires m)) (== (manifest-wasm m) 0))) `(,path ,text)]
+                      [(== (manifest-wasm m) 0) `(,path ,text ,(manifest-text m))]
+                      [else `(,path ,text ,(manifest-text m) ,(manifest-wasm-hash m))])])
     (while (pair? requires)
       (set! parts (append parts `(,(car (car requires)) ,(format "~a" (list1 (cadr (car requires)))))))
       (set! requires (cdr requires)))
@@ -647,14 +652,18 @@
 ;; ---- packages ----
 
 ;; A manifest is package.sub at a package's root, or a program's first form: (package name clause ...), with the
-;; clauses (version "v"), (requires (name (path "dir")) ...) and (wasm "file"). As read, it is (root text requires),
-;; requires pairing each dependency's name with its directory. manifests holds what each directory's package has.
+;; clauses (version "v"), (requires (name (path "dir")) ...) and (wasm "file"). As read, it is
+;; (root text requires name wasm hash), requires pairing each dependency's name with its directory, and wasm the file
+;; with hash its content hash, or 0. manifests holds what each directory's package has.
 (define manifests hash-table)
 (define inline-manifests hash-table)
 
 (define (manifest-root [m datum]) -> datum (car m))
 (define (manifest-text [m datum]) -> datum (cadr m))
 (define (manifest-requires [m datum]) -> datum (caddr m))
+(define (manifest-name [m datum]) -> datum (cadddr m))
+(define (manifest-wasm [m datum]) -> datum (list-ref m 4))
+(define (manifest-wasm-hash [m datum]) -> datum (list-ref m 5))
 
 (define (absolute-of [path datum]) -> datum (resolve-segments (package-file path)))
 
@@ -690,7 +699,7 @@
     (manifest-from (car forms) root text)))
 
 (define (manifest-from [form datum] [root datum] [text datum]) -> datum
-  (let ([d (syntax->datum form)] [requires nil] [cs datum 0])
+  (let ([d (syntax->datum form)] [requires nil] [cs datum 0] [wasm datum 0] [hash datum 0])
     (unless (and (pair? d) (equal? (car d) 'package) (pair? (cdr d)) (symbol? (cadr d)))
       (fail-at form "expected (package name clause ...)" nil))
     (set! cs (cddr d))
@@ -698,7 +707,11 @@
       (let ([c (car cs)])
         (cond [(and (pair? c) (or (equal? (car c) 'version) (equal? (car c) 'wasm)) (pair? (cdr c)) (string? (cadr c))
                     (null? (cddr c)))
-               (begin)]
+               (when (equal? (car c) 'wasm)
+                 (set! wasm (resolve-segments (if (absolute-path? (cadr c)) (cadr c) (file-in root (cadr c)))))
+                 (let ([bytes (file-bytes wasm)])
+                   (when (equal? bytes '#f) (fail-at form "cannot read the package's wasm module ~a" (list1 wasm)))
+                   (set! hash (content-hash (list1 (string->datum (cast string (datum->bytes bytes))))))))]
               [(and (pair? c) (equal? (car c) 'requires))
                (let ([rs (cdr c)])
                  (while (pair? rs)
@@ -707,7 +720,7 @@
               [else (fail-at form "a package's clauses are (version \"v\"), (requires ...) and (wasm \"file\"), not ~s"
                              (list1 c))]))
       (set! cs (cdr cs)))
-    (keep `(,root ,text ,(reverse requires)))))
+    (keep `(,root ,text ,(reverse requires) ,(cadr d) ,wasm ,hash))))
 
 (define (dependency [r datum] [root datum] [form datum]) -> datum
   (unless (and (pair? r) (symbol? (car r)) (pair? (cdr r)) (null? (cddr r)) (pair? (cadr r))
@@ -730,6 +743,44 @@
 (define (module-manifest [path datum]) -> datum
   (let ([own (hash-ref (& inline-manifests) (cast u64 (symbol-of path)))])
     (if (!= own 0) (cast datum own) (manifest-at (directory-path (absolute-of path))))))
+
+;; package-modules lists the wasm modules of packages linked so far, as (module placer placer-bytes module-bytes kept).
+(define package-modules datum nil)
+
+(define (prelude-name) -> datum
+  (let ([u (cast datum (hash-ref (& registry) (cast u64 (symbol-of (canonical-path (language-path))))))])
+    (when (== u 0) (fail-at 0 "internal: no prelude to link a package's wasm module to" nil))
+    (wasm-module-name u 0 0)))
+
+;; package-import gives the module an import names: the wasm module of the importing module's package, as the program
+;; names it, when module is that package's name and its manifest names a wasm file; else module itself.
+(define (package-import [module datum]) -> datum
+  (let ([m (module-manifest (-> (the-module) path))])
+    (if (and (!= m 0) (!= (manifest-wasm m) 0) (equal? (string->datum (symbol->string (manifest-name m))) module))
+        (linked-package m)
+        module)))
+
+(define (linked-package [m datum]) -> datum
+  (let* ([stem (format "~a.~a" `(,(manifest-name m) ,(manifest-wasm-hash m)))] [side (concat stem '".side")]
+         [placer (concat stem '".place")] [r datum 0])
+    (when (== (assoc side package-modules) 0)
+      (set! r (link-side-module (manifest-wasm m) (file-bytes (manifest-wasm m)) placer (prelude-name)))
+      (set! package-modules (keep-cons (keep `(,side ,placer ,(car r) ,(cadr r) ,(caddr r))) package-modules)))
+    side))
+
+(define (package-module-names) -> datum
+  (let ([l package-modules] [out nil])
+    (while (pair? l)
+      (set! out (cons (car (car l)) (cons (cadr (car l)) out)))
+      (set! l (cdr l)))
+    out))
+
+(define (package-kept) -> datum
+  (let ([l package-modules] [out nil])
+    (while (pair? l)
+      (set! out (append (list-ref (car l) 4) out))
+      (set! l (cdr l)))
+    out))
 
 (define (clean-name? [s string]) -> bool
   (let ([start u32 0])
@@ -1008,8 +1059,13 @@
       (cons (cons name (-> p bytes)) out))))
 
 (define (visit-import [imp datum] [seen (ptr hash-table)] [out datum]) -> datum
-  (let ([l (wasm-module-ref imp)])
-    (cond [(!= l 0)
+  (let ([l (wasm-module-ref imp)] [p (assoc imp package-modules)])
+    (cond [(!= p 0)
+           (when (!= (datum-get seen (car p)) 0) (return out))
+           (datum-put! seen (car p) (boolean #t))
+           (set! out (visit-import (prelude-name) seen out))
+           (cons (cons (car p) (cadddr p)) (cons (cons (cadr p) (caddr p)) out))]
+          [(!= l 0)
            (unless (and (== (integer-value (cadr l)) 0) (== (integer-value (caddr l)) 0))
              (fail-at 0 "internal: a program imports from ~a" (list1 imp)))
            (visit-wasm-modules (car l) seen out)]
@@ -1097,6 +1153,8 @@
           (hash-set! (& registry) key 0)
           (return 0)))
       (set! requires (cdr requires)))
+    (let ([pm (manifest-at (directory-path (absolute-of path)))])
+      (when (and (!= pm 0) (!= (manifest-wasm pm) 0)) (linked-package pm)))
     (set! known (cast datum (hash-ref (& units-by-hash) (cast u64 (symbol-of hash)))))
     (set! m (if (!= known 0) known (load-compiled-module d path)))
     (hash-set! (& registry) key (cast u32 m))
@@ -1668,7 +1726,9 @@
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 5) (identifier? (cadr l)) (string-literal? (caddr l)) (string-literal? (cadddr l)))
       (no-match f "(import name module field signature)"))
-    (let* ([name (cadr l)] [module (caddr l)] [field (cadddr l)] [sig (list-ref l 4)] [pr (parse-signature sig)])
+    (let* ([name (cadr l)] [given (caddr l)] [field (cadddr l)] [sig (list-ref l 4)] [pr (parse-signature sig)]
+           [from (package-import (syntax-e given))]
+           [module (if (equal? from (syntax-e given)) given (datum->syntax given from given))])
       (bind-definition! name phase `(func ,(func-info (syntax-e name) (car pr) (cdr pr) (syntax-e module) (syntax-e field))))
       `(plain ,(out f 'import `(,name ,module ,field ,sig)) ()))))
 
