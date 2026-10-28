@@ -13,9 +13,10 @@ compiler is written in it, builds itself, and runs in a browser.
   `wasm.sub` gives wasm's forms as `wasm:name`, and `syntax.sub` and
   `macros.sub` hold the data and tools macros work with. `link.sub` makes
   a C side module a module of the program. The compiler builds a program
-  from one file and a module map, which gives roots, each a label and a
-  directory, and the names each root uses; it knows host, compiler and std
-  itself. A command may give it a check for each module it reads.
+  from one file and the label of its root, with a module map of roots,
+  each a label and a directory, and the names each root uses; it knows
+  host, compiler and std itself. A command may also give it a check for
+  each module it reads.
 - `std/`: the standard library, written in Substrate. `languages/` holds
   the languages built on it, `scheme/`, a Scheme, and `bend/`, a
   dependently typed language, with `nodes.sub`, the run-time nodes they
