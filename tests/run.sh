@@ -30,9 +30,10 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 
 tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
        tests/crypto/*.sub tests/encoding/*.sub tests/meta/*.sub tests/log/*.sub tests/compress/*.sub tests/cmd/*.sub
-       tests/packages/*.sub tests/sqlite/*.sub)
+       tests/packages/*.sub tests/packages/cside/tests/*.sub tests/sqlite/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
+  [ "$name" = package ] && continue
   dir="$(dirname "$t")"
   base="$dir/$name"
   program="$builds/${dir#tests}/$name"
@@ -68,7 +69,8 @@ for t in "${tests[@]}"; do
   fi
 done
 # Each module in cmd, std, packages, bench, host, tests/web and tests/proxy builds, except the pieces in bench/bend/compile.
-mapfile -t modules < <(find cmd std packages bench host tests/web tests/proxy -name '*.sub' -not -path 'bench/bend/compile/*' | sort)
+mapfile -t modules < <(find cmd std packages bench host tests/web tests/proxy -name '*.sub' -not -name package.sub \
+                         -not -path 'bench/bend/compile/*' | sort)
 for m in "${modules[@]}"; do
   actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
@@ -176,6 +178,54 @@ if (cd tests && "$root/bin/sub" build err-macro-trap.sub -o "$root/$builds/trapp
   echo "FAIL tests/err-macro-trap: the build traps and exits 0"
 else
   pass=$((pass + 1))
+fi
+# A package built from two directories gives the same program.
+moved="$builds/moved"
+rm -rf "${moved:?}"
+mkdir -p "$moved/one" "$moved/two"
+cp -r tests/packages/names.sub tests/packages/tools tests/packages/app "$moved/one/"
+cp -r tests/packages/names.sub tests/packages/tools tests/packages/app "$moved/two/"
+bin/sub build "$moved/one/names.sub" -o "$moved/one-built" -c "$cache" > /dev/null 2>&1
+bin/sub build "$moved/two/names.sub" -o "$moved/two-built" -c "$cache" > /dev/null 2>&1
+if [ -f "$moved/one-built/program" ] && same_program "$moved/one-built" "$moved/two-built"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a package built from two directories: the programs differ"
+fi
+# An edit compiles again only the module edited and those that require it.
+edited="$builds/edited"
+rm -rf "${edited:?}"
+mkdir -p "$edited"
+printf '(provide b)\n(define (b) -> i32 1)\n' > "$edited/b.sub"
+printf '(require b "b.sub")\n(provide a)\n(define (a) -> i32 (b:b))\n' > "$edited/a.sub"
+printf '(provide c)\n(define (c) -> i32 3)\n' > "$edited/c.sub"
+printf '(require a "a.sub")\n(require c "c.sub")\n(define (main) (printf "~a~n" (+ (a:a) (c:c))))\n' > "$edited/main.sub"
+bin/sub build "$edited/main.sub" -o "$edited/built" -c "$edited/cache" > /dev/null 2>&1
+touch "$edited/marker"
+printf '(provide b)\n(define (b) -> i32 2)\n' > "$edited/b.sub"
+total="$(bin/sub build "$edited/main.sub" -o "$edited/built" -c "$edited/cache" 2>&1 && "$host" "$root/$edited/built" 2>&1)"
+compiled="$(find "$edited/cache" -name '*.subc' -newer "$edited/marker" | wc -l)"
+if [ "$total" = 5 ] && [ "$compiled" = 3 ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL an edit: got $total, with $compiled modules compiled again, not 3"
+fi
+# sub builds a program into build/ of its package, or of its directory outside packages, and runs it with its
+# arguments and exit code.
+ran="$builds/ran"
+rm -rf "${ran:?}"
+mkdir -p "$ran"
+printf '(define (main) (printf "~a~n" (-> (host-args) length)) (host-exit 4))\n' > "$ran/count.sub"
+counted="$(cd "$ran" && "$root/bin/sub" run count.sub a b c 2>&1)"
+code=$?
+bin/sub build "$moved/one/app/app.sub" -c "$cache" > /dev/null 2>&1
+if [ "$counted" = 3 ] && [ $code -eq 4 ] && [ -f "$ran/build/count/program" ] && [ -f "$moved/one/app/build/app/program" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub run: got $counted and exit $code, or a program not in build/"
 fi
 # A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
