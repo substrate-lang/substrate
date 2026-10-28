@@ -1,0 +1,702 @@
+;; Scheme's run-time values: reference-counted nodes in the program's memory.
+(require-unqualified writer compiler/writer)
+(require nodes "../nodes.sub" node-alloc node-free nodes-live node-lists)
+(require wasm compiler/wasm)
+
+(provide datum node
+         nil true-node permanent! dup drop live-nodes node-tag node? tagged?
+         alloc-node alloc-bytes free-bytes free-node! set-layout! set-dropper! node-size
+         pair-cell? null-cell? true-value null-value literal-value pair-car pair-cdr cons-inline dup-inline drop-inline
+         unique-cell? free-pair-shell! node-tagged? node-datum? alloc-inline
+         boolean-datum? integer-datum? fixnum-datum? char-datum?
+         pair? cons car cdr cadr cddr caddr cdddr cadddr set-car! set-cdr! null? list? length reverse append last list-ref
+         boolean boolean?
+         symbol? symbol-hash symbol->string string->symbol symbol-append
+         keyword? keyword->string string->keyword
+         string? string-length string-append string=? string-byte datum->string string->datum
+         fixnum? fixnum fixnum-value integer? make-integer make-unsigned-integer integer-value integer-negative?
+         flonum? make-flonum flonum-value char? integer->char char->integer
+         equal? datum-hash
+         write-to write-datum
+         quote quasiquote lit)
+
+(struct node [w u32])
+(typedef datum (ptr node))
+
+;; ---- the header ----
+
+;; permanent-count << 8, with tag 0: the header of a permanent node.
+(const permanent-base u32 4294967040)
+
+(const tag-pair u32 0)
+(const tag-nil u32 1)
+(const tag-true u32 2)
+(const tag-symbol u32 3)
+(const tag-keyword u32 4)
+(const tag-string u32 5)
+(const tag-integer u32 6)
+(const tag-flonum u32 7)
+
+(define (node-datum? [d datum]) #:inline -> bool (if (wasm:i32.and d 3) #f (wasm:i32.ne d 0)))
+(#%fact node-datum? '(foreign raw))
+(define (fixnum-datum? [d datum]) #:inline -> bool (wasm:i32.and d 1))
+(#%fact fixnum-datum? '(foreign raw))
+(define (char-datum? [d datum]) #:inline -> bool (wasm:i32.eq (wasm:i32.and d 3) 2))
+(#%fact char-datum? '(foreign raw))
+(define (node-tagged? [d datum] [tag i32]) #:inline -> bool
+  (if (wasm:i32.and d 3) #f (if d (wasm:i32.eq (wasm:i32.and (wasm:i32.load d) 255) tag) #f)))
+(#%fact node-tagged? '(foreign raw))
+
+(define (node-tag [d datum]) -> u32 (bit-and (-> d w) 255))
+
+;; ---- nodes ----
+
+;; nodes.sub's free lists link through a block's second word; pairs (12 bytes) are on
+;; its list of 3 words.
+(define permanent-total u32 0)
+
+(define (alloc-bytes [n u32]) -> (ptr void) (node-alloc n))
+(define (free-bytes [p (ptr void)] [n u32]) (node-free p n))
+
+(define (alloc-node [n u32] [tag u32]) -> datum
+  (let ([d (cast datum (node-alloc n))])
+    (set! (-> d w) (bit-or 256 tag))
+    d))
+(#%fact alloc-node '(foreign owned))
+
+(define (alloc-inline [n i32] [tag i32]) #:inline -> datum
+  (let ([d (node-alloc n)])
+    (wasm:i32.store d (wasm:i32.or 256 tag))
+    (cast datum d)))
+(#%fact alloc-inline '(foreign owned))
+
+(define (live-nodes) -> i32 (cast i32 (- (nodes-live) permanent-total)))
+(#%fact live-nodes '(foreign raw))
+
+;; ---- layouts and droppers ----
+(struct layout [set i32] [fields u32] [datums-at i32] [datums u32] [extra i32] [size-at i32] [base u32] [per u32]
+               [dropper (fn (datum))])
+(struct layout-table [l (array layout 32)])
+(define layouts layout-table)
+
+(define (layout-of [tag u32]) -> (ptr layout) (& (@ (-> (& layouts) l) tag)))
+
+(define (set-layout! [tag u32] [fields u32] [datums-at i32] [datums u32] [extra i32] [size-at i32] [base u32] [per u32])
+  (let ([l (layout-of tag)])
+    (set! (-> l set) 1)
+    (set! (-> l fields) fields)
+    (set! (-> l datums-at) datums-at)
+    (set! (-> l datums) datums)
+    (set! (-> l extra) extra)
+    (set! (-> l size-at) size-at)
+    (set! (-> l base) base)
+    (set! (-> l per) per)))
+
+(define (set-dropper! [tag u32] [f (fn (datum))])
+  (let ([l (layout-of tag)])
+    (set! (-> l set) 2)
+    (set! (-> l dropper) f)))
+
+(define (word-at [d datum] [offset u32]) -> u32 (@ (cast (ptr u32) (+ (cast (ptr u8) d) offset)) 0))
+
+(define (layout-size [l (ptr layout)] [d datum]) -> u32
+  (+ (-> l base) (* (-> l per) (if (< (-> l size-at) 0) 1 (word-at d (-> l size-at))))))
+
+(define (node-size [d datum]) -> u32
+  (let ([p (cast (ptr u32) d)] [tag (node-tag d)])
+    (cond [(== tag tag-pair) 12]
+          [(== tag tag-string) (+ 8 (@ p 1))]
+          [(or (== tag tag-symbol) (== tag tag-keyword)) (+ 12 (@ p 2))]
+          [(== tag tag-integer) 16]
+          [(== tag tag-flonum) 12]
+          [(or (== tag tag-nil) (== tag tag-true)) 4]
+          [else (let ([l (layout-of tag)]) (if (== (-> l set) 1) (layout-size l d) 0))])))
+
+;; ---- owners ----
+
+(define (make-permanent [tag u32]) -> datum
+  (let ([d (alloc-node 8 tag)])
+    (set! (-> d w) (bit-or permanent-base tag))
+    (+= permanent-total 1)
+    d))
+
+(define nil datum (make-permanent tag-nil))
+(define true-node datum (make-permanent tag-true))
+(wasm:global %nil (mut i32) (cast i32 nil))
+(wasm:global %true (mut i32) (cast i32 true-node))
+
+(define (dup-inline [d datum]) #:inline -> datum
+  (if (wasm:i32.and d 3)
+      d
+      (if (wasm:i32.eqz d)
+          d
+          (let ([w (wasm:i32.load d)])
+            (if (wasm:i32.lt_u w 4294967040) (begin (wasm:i32.store d (wasm:i32.add w 256)) d) d)))))
+(#%fact dup-inline '(foreign owned))
+(define (dup [d datum]) -> datum
+  (when (node? d)
+    (let ([w (-> d w)])
+      (when (< w permanent-base) (set! (-> d w) (+ w 256)))))
+  d)
+(#%fact dup '(foreign owned))
+
+(define (drop-inline [d datum])
+  #:inline
+  (if (wasm:i32.eqz (wasm:i32.and d 3))
+      (if d
+          (let ([w (wasm:i32.load d)])
+            (if (wasm:i32.lt_u w 4294967040)
+                (if (wasm:i32.lt_u w 512)
+                    (if (wasm:i32.and w 255) (free-node! d) (free-pair! d))
+                    (wasm:i32.store d (wasm:i32.sub w 256))))))))
+(#%fact drop-inline '(foreign void 0))
+(define (drop [d datum])
+  (when (node? d)
+    (let ([w (-> d w)])
+      (when (< w permanent-base)
+        (if (< w 512) (free-node! d) (set! (-> d w) (- w 256)))))))
+(#%fact drop '(foreign void 0))
+
+(define (unique-cell? [d datum]) #:inline -> bool (wasm:i32.lt_u (wasm:i32.load d) 512))
+(#%fact unique-cell? '(foreign raw))
+
+(define (free-pair-shell! [d datum]) #:inline
+  (wasm:i32.store d (wasm:i32.load node-lists 12) 4)
+  (wasm:i32.store node-lists d 12))
+(#%fact free-pair-shell! '(foreign void))
+
+(define drop-stack (ptr datum) 0)
+(define drop-room u32 0)
+(define drop-top u32 0)
+(define dropping bool #f)
+
+(define (push-drop! [d datum])
+  (when (>= drop-top drop-room)
+    (set! drop-room (if (== drop-room 0) 64 (* drop-room 2)))
+    (set! drop-stack (cast (ptr datum) (realloc drop-stack (* drop-room 4)))))
+  (set! (@ drop-stack drop-top) d)
+  (+= drop-top 1))
+
+(define (push-held! [d datum])
+  (when (and (node? d) (< (-> d w) permanent-base)) (push-drop! d)))
+
+(define (free-node! [d datum])
+  (if dropping
+      (push-drop! d)
+      (let ([u d] [more #t] [heads (cast (ptr u32) (& node-lists))])
+        (set! dropping #t)
+        (while more
+          (while (!= u 0)
+            (let ([p (cast (ptr u32) u)] [w (@ (cast (ptr u32) u) 0)])
+              (cond [(>= w 512) (set! (@ p 0) (- w 256)) (set! u 0)]
+                    [(== (bit-and w 255) 0)
+                     (let ([a (@ p 1)] [b (@ p 2)])
+                       (when (and (== (bit-and a 3) 0) (!= a 0) (< (@ (cast (ptr u32) a) 0) permanent-base))
+                         (push-drop! (cast datum a)))
+                       (set! (@ p 1) (@ heads 3))
+                       (set! (@ heads 3) (cast u32 p))
+                       (set! u (if (and (== (bit-and b 3) 0) (!= b 0) (< (@ (cast (ptr u32) b) 0) permanent-base)) (cast datum b) 0)))]
+                    [else (free-other! u w) (set! u 0)])))
+          (if (> drop-top 0)
+              (begin (-= drop-top 1) (set! u (@ drop-stack drop-top)))
+              (set! more #f)))
+        (set! dropping #f))))
+(#%fact free-node! '(foreign void 0))
+
+(define (free-pair! [d datum])
+  (let ([u (cast (ptr u32) d)] [heads (cast (ptr u32) (& node-lists))])
+    (while (!= u 0)
+      (let ([a (@ u 1)] [b (@ u 2)])
+        (set! (@ u 1) (@ heads 3))
+        (set! (@ heads 3) (cast u32 u))
+        (set! u 0)
+        (when (and (== (bit-and a 3) 0) (!= a 0))
+          (let ([wa (@ (cast (ptr u32) a) 0)])
+            (when (< wa permanent-base)
+              (if (< wa 512) (free-node! (cast datum a)) (set! (@ (cast (ptr u32) a) 0) (- wa 256))))))
+        (when (and (== (bit-and b 3) 0) (!= b 0))
+          (let ([wb (@ (cast (ptr u32) b) 0)])
+            (when (< wb permanent-base)
+              (cond [(>= wb 512) (set! (@ (cast (ptr u32) b) 0) (- wb 256))]
+                    [(== (bit-and wb 255) 0) (set! u (cast (ptr u32) b))]
+                    [else (free-node! (cast datum b))]))))))))
+(#%fact free-pair! '(foreign void 0))
+
+(define (free-other! [u datum] [w u32])
+  (let ([tag (bit-and w 255)] [p (cast (ptr u32) u)])
+    (cond [(== tag tag-string) (free-bytes p (+ 8 (@ p 1)))]
+          [(== tag tag-integer) (free-bytes p 16)]
+          [(== tag tag-flonum) (free-bytes p 12)]
+          [else
+           (let ([l (layout-of tag)])
+             (cond [(== (-> l set) 1)
+                    (let* ([n (if (< (-> l datums-at) 0) (-> l datums) (word-at u (-> l datums-at)))]
+                           [f (cast (ptr u32) (+ (cast (ptr u8) u) (-> l fields)))]
+                           [size (layout-size l u)])
+                      (for ([i u32 0]) (< i n) (+= i 1) (push-held! (cast datum (@ f i))))
+                      (when (>= (-> l extra) 0) (push-held! (cast datum (word-at u (-> l extra)))))
+                      (free-bytes p size))]
+                   [(== (-> l set) 2) ((-> l dropper) u)]
+                   [else (drop (fail "freeing a node of an unknown kind"))]))])))
+
+(define (permanent! [d datum]) -> datum
+  (when (and (node? d) (< (-> d w) permanent-base))
+    (let ([p (cast (ptr u32) d)] [tag (node-tag d)])
+      (set! (@ p 0) (bit-or permanent-base tag))
+      (+= permanent-total 1)
+      (when (== tag tag-pair)
+        (drop (permanent! (cast datum (@ p 1))))
+        (drop (permanent! (cast datum (@ p 2)))))))
+  d)
+(#%fact permanent! '(foreign borrowed))
+
+(define (fail [message string]) -> datum
+  (host-trap message)
+  0)
+
+;; ---- pairs and lists ----
+
+(define (pair-cell? [d datum]) #:inline -> bool
+  (if (wasm:i32.and d 3) #f (if d (wasm:i32.eqz (wasm:i32.and (wasm:i32.load d) 255)) #f)))
+(#%fact pair-cell? '(foreign raw))
+(define (null-cell? [d datum]) #:inline -> bool (wasm:i32.eq d %nil))
+(#%fact null-cell? '(foreign raw))
+(define (true-value) #:inline -> datum (cast datum %true))
+(#%fact true-value '(foreign free))
+(define (null-value) #:inline -> datum (cast datum %nil))
+(#%fact null-value '(foreign free))
+(define (literal-value [g datum]) #:inline -> datum g)
+(#%fact literal-value '(foreign free))
+(define (pair-car [d datum]) #:inline -> datum (cast datum (wasm:i32.load d 4)))
+(#%fact pair-car '(foreign borrowed))
+(define (pair-cdr [d datum]) #:inline -> datum (cast datum (wasm:i32.load d 8)))
+(#%fact pair-cdr '(foreign borrowed))
+
+(define (cons-inline [a datum] [d datum]) #:inline -> datum
+  (let ([h (wasm:i32.load node-lists 12)])
+    (if h
+        (begin
+          (wasm:i32.store node-lists (wasm:i32.load h 4) 12)
+          (wasm:i32.store h 256)
+          (wasm:i32.store h a 4)
+          (wasm:i32.store h d 8)
+          (cast datum h))
+        (cons a d))))
+(#%fact cons-inline '(foreign owned 0 1))
+
+(define (cons [a datum] [d datum]) -> datum
+  (let ([p (alloc-node 12 tag-pair)])
+    (set! (@ (cast (ptr u32) p) 1) (cast u32 a))
+    (set! (@ (cast (ptr u32) p) 2) (cast u32 d))
+    p))
+(#%fact cons '(foreign owned 0 1))
+
+(define (car [p datum]) -> datum (if (pair? p) (cast datum (@ (cast (ptr u32) p) 1)) (fail "expected a pair")))
+(#%fact car '(foreign borrowed))
+(define (cdr [p datum]) -> datum (if (pair? p) (cast datum (@ (cast (ptr u32) p) 2)) (fail "expected a pair")))
+(#%fact cdr '(foreign borrowed))
+(define (cadr [p datum]) -> datum (car (cdr p)))
+(#%fact cadr '(foreign borrowed))
+(define (cddr [p datum]) -> datum (cdr (cdr p)))
+(#%fact cddr '(foreign borrowed))
+(define (caddr [p datum]) -> datum (car (cddr p)))
+(#%fact caddr '(foreign borrowed))
+(define (cdddr [p datum]) -> datum (cdr (cddr p)))
+(#%fact cdddr '(foreign borrowed))
+(define (cadddr [p datum]) -> datum (car (cdddr p)))
+(#%fact cadddr '(foreign borrowed))
+(define (set-car! [p datum] [d datum]) (if (pair? p) (set! (@ (cast (ptr u32) p) 1) (cast u32 d)) (drop (fail "expected a pair"))))
+(#%fact set-car! '(foreign void 1))
+(define (set-cdr! [p datum] [d datum]) (if (pair? p) (set! (@ (cast (ptr u32) p) 2) (cast u32 d)) (drop (fail "expected a pair"))))
+(#%fact set-cdr! '(foreign void 1))
+
+(define (list? [d datum]) -> bool
+  (while (pair? d) (set! d (cdr d)))
+  (null? d))
+
+(define (length [l datum]) -> u32
+  (let ([n u32 0])
+    (while (pair? l) (+= n 1) (set! l (cdr l)))
+    n))
+
+(define (reverse [l datum]) -> datum
+  (let ([r nil])
+    (while (pair? l) (set! r (cons (dup (car l)) r)) (set! l (cdr l)))
+    r))
+(#%fact reverse '(foreign owned))
+
+(define (append [a datum] [b datum]) -> datum
+  (let ([r (reverse a)])
+    (while (pair? r)
+      (let ([next (cdr r)])
+        (set-cdr! r b)
+        (set! b r)
+        (set! r next)))
+    b))
+(#%fact append '(foreign owned 1))
+
+(define (last [l datum]) -> datum
+  (while (pair? (cdr l)) (set! l (cdr l)))
+  (car l))
+(#%fact last '(foreign borrowed))
+
+(define (list-ref [l datum] [n u32]) -> datum
+  (while (> n 0) (set! l (cdr l)) (-= n 1))
+  (car l))
+(#%fact list-ref '(foreign borrowed))
+
+;; ---- booleans ----
+
+(define (boolean [b bool]) -> datum (if b true-node (cast datum 0)))
+(#%fact boolean '(foreign borrowed))
+(define (boolean-datum? [d datum]) #:inline -> bool (wasm:i32.or (wasm:i32.eqz d) (wasm:i32.eq d %true)))
+(#%fact boolean-datum? '(foreign raw))
+(define (integer-datum? [d datum]) #:inline -> bool (wasm:i32.or (wasm:i32.and d 1) (node-tagged? d 6)))
+(#%fact integer-datum? '(foreign raw))
+
+;; ---- symbols, keywords and strings ----
+
+(struct intern-table [entries (ptr u32)] [capacity u32] [count u32])
+(define symbols intern-table)
+(define keywords intern-table)
+
+(define (intern! [t (ptr intern-table)] [tag u32] [text string]) -> datum
+  (when (== (-> t capacity) 0)
+    (set! (-> t capacity) 256)
+    (set! (-> t entries) (cast (ptr u32) (calloc 256 4))))
+  (when (> (* (-> t count) 2) (-> t capacity)) (grow-intern! t))
+  (let* ([h (cast u32 (hash-bytes (cast (slice u8) text)))] [mask (- (-> t capacity) 1)] [i (bit-and h mask)])
+    (while (!= (@ (-> t entries) i) 0)
+      (let ([s (cast datum (@ (-> t entries) i))])
+        (when (and (== (symbol-hash s) h) (== (symbol->string s) text))
+          (return s)))
+      (set! i (bit-and (+ i 1) mask)))
+    (let ([s (alloc-node (+ 12 (-> text length)) tag)])
+      (set! (-> s w) (bit-or permanent-base tag))
+      (+= permanent-total 1)
+      (set! (@ (cast (ptr u32) s) 1) h)
+      (set! (@ (cast (ptr u32) s) 2) (-> text length))
+      (memcpy (+ (cast (ptr u8) s) 12) (-> text bytes) (-> text length))
+      (set! (@ (-> t entries) i) (cast u32 s))
+      (+= (-> t count) 1)
+      s)))
+
+(define (grow-intern! [t (ptr intern-table)])
+  (let* ([old (-> t entries)] [old-capacity (-> t capacity)] [capacity (* old-capacity 2)]
+         [entries (cast (ptr u32) (calloc capacity 4))] [mask (- capacity 1)])
+    (for ([j u32 0]) (< j old-capacity) (+= j 1)
+      (let ([s (@ old j)])
+        (when (!= s 0)
+          (let ([i (bit-and (@ (cast (ptr u32) s) 1) mask)])
+            (while (!= (@ entries i) 0) (set! i (bit-and (+ i 1) mask)))
+            (set! (@ entries i) s)))))
+    (free old)
+    (set! (-> t entries) entries)
+    (set! (-> t capacity) capacity)))
+
+(define (symbol-hash [s datum]) -> u32 (@ (cast (ptr u32) s) 1))
+(define (symbol->string [s datum]) -> string (cast string (slice (+ (cast (ptr u8) s) 12) (@ (cast (ptr u32) s) 2))))
+(define (string->symbol [s string]) -> datum (intern! (& symbols) tag-symbol s))
+(#%fact string->symbol '(foreign borrowed))
+(define (keyword->string [k datum]) -> string (symbol->string k))
+(define (string->keyword [s string]) -> datum (intern! (& keywords) tag-keyword s))
+(#%fact string->keyword '(foreign borrowed))
+(define (symbol-append [a datum] [b datum]) -> datum
+  (let ([out (make-buffer)] [s datum 0])
+    (buffer-add-string! (& out) (symbol->string a))
+    (buffer-add-string! (& out) (symbol->string b))
+    (set! s (string->symbol (buffer-string (& out))))
+    (buffer-free! (& out))
+    s))
+(#%fact symbol-append '(foreign borrowed))
+
+(define (string-length [s datum]) -> u32 (@ (cast (ptr u32) s) 1))
+(define (datum->string [d datum]) -> string (cast string (slice (+ (cast (ptr u8) d) 8) (string-length d))))
+(define (string-byte [s datum] [i u32]) -> u32 (@ (datum->string s) i))
+(define (string->datum [s string]) -> datum
+  (let ([d (alloc-node (+ 8 (-> s length)) tag-string)])
+    (set! (@ (cast (ptr u32) d) 1) (-> s length))
+    (memcpy (+ (cast (ptr u8) d) 8) (-> s bytes) (-> s length))
+    d))
+(#%fact string->datum '(foreign owned))
+(define (string-append [a datum] [b datum]) -> datum
+  (let* ([x (datum->string a)] [y (datum->string b)] [s (alloc-node (+ 8 (+ (-> x length) (-> y length))) tag-string)])
+    (set! (@ (cast (ptr u32) s) 1) (+ (-> x length) (-> y length)))
+    (memcpy (+ (cast (ptr u8) s) 8) (-> x bytes) (-> x length))
+    (memcpy (+ (cast (ptr u8) s) (+ 8 (-> x length))) (-> y bytes) (-> y length))
+    s))
+(#%fact string-append '(foreign owned))
+(define (string=? [a datum] [b datum]) -> bool (== (datum->string a) (datum->string b)))
+
+;; ---- numbers and characters ----
+
+(define (fixnum [n i32]) -> datum (cast datum (bit-or (<< n 1) 1)))
+(#%fact fixnum '(foreign owned))
+(define (fixnum-value [d datum]) -> i32 (>> (cast i32 d) 1))
+
+(define (make-integer [n i64]) -> datum
+  (if (and (>= n -1073741824) (<= n 1073741823))
+      (fixnum (cast i32 n))
+      (integer-node (cast u32 n) (cast u32 (>> n 32)) (< n 0))))
+(#%fact make-integer '(foreign owned))
+(define (make-unsigned-integer [n u64]) -> datum
+  (if (<= n 1073741823)
+      (fixnum (cast i32 n))
+      (integer-node (cast u32 n) (cast u32 (>> n 32)) #f)))
+(#%fact make-unsigned-integer '(foreign owned))
+(define (integer-node [low u32] [high u32] [negative bool]) -> datum
+  (let ([d (alloc-node 16 tag-integer)])
+    (set! (@ (cast (ptr u32) d) 1) low)
+    (set! (@ (cast (ptr u32) d) 2) high)
+    (set! (@ (cast (ptr u32) d) 3) (if negative 1 0))
+    d))
+(define (integer-value [d datum]) -> i64
+  (if (fixnum? d)
+      (cast i64 (fixnum-value d))
+      (bit-or (cast i64 (@ (cast (ptr u32) d) 1)) (<< (cast i64 (@ (cast (ptr u32) d) 2)) 32))))
+(define (integer-negative? [d datum]) -> bool
+  (if (fixnum? d) (< (fixnum-value d) 0) (!= (@ (cast (ptr u32) d) 3) 0)))
+
+(define (make-flonum [x f64]) -> datum
+  (let ([d (alloc-node 12 tag-flonum)] [bits (f64-bits x)])
+    (set! (@ (cast (ptr u32) d) 1) (cast u32 bits))
+    (set! (@ (cast (ptr u32) d) 2) (cast u32 (>> bits 32)))
+    d))
+(#%fact make-flonum '(foreign owned))
+(define (flonum-value [d datum]) -> f64
+  (bits-f64 (bit-or (cast i64 (@ (cast (ptr u32) d) 1)) (<< (cast i64 (@ (cast (ptr u32) d) 2)) 32))))
+
+(define (integer->char [c u32]) -> datum (cast datum (bit-or (<< c 2) 2)))
+(#%fact integer->char '(foreign owned))
+(define (char->integer [d datum]) -> u32 (>> (cast u32 d) 2))
+
+;; ---- equality and hashing ----
+
+(define (equal? [a datum] [b datum]) -> bool
+  (when (== a b) (return #t))
+  (if (not (node? a))
+      #f
+      (let ([tag (node-tag a)])
+        (cond [(== tag tag-pair) (and (pair? b) (equal? (car a) (car b)) (equal? (cdr a) (cdr b)))]
+              [(== tag tag-string) (and (string? b) (string=? a b))]
+              [(== tag tag-integer) (and (tagged? b tag-integer) (== (integer-value a) (integer-value b))
+                                         (== (integer-negative? a) (integer-negative? b)))]
+              [(== tag tag-flonum) (and (flonum? b) (== (f64-bits (flonum-value a)) (f64-bits (flonum-value b))))]
+              [else #f]))))
+
+(define (mix [h u64] [x u64]) -> u64 (* (bit-xor h x) 1099511628211))
+
+(define (datum-hash [d datum]) -> u64 (bit-or (hash-into 14695981039346656037 d) 1))
+
+(define (hash-into [h u64] [d datum]) -> u64
+  (if (not (node? d))
+      (mix h (cast u64 (cast u32 d)))
+      (let ([tag (node-tag d)])
+        (cond [(== tag tag-pair) (hash-into (hash-into (mix h 2) (car d)) (cdr d))]
+              [(== tag tag-string) (mix h (hash-bytes (cast (slice u8) (datum->string d))))]
+              [(== tag tag-integer) (mix h (cast u64 (integer-value d)))]
+              [(== tag tag-flonum) (mix h (cast u64 (f64-bits (flonum-value d))))]
+              [else (mix h (cast u64 (cast u32 d)))]))))
+
+;; ---- writing ----
+
+(define (write-datum [d datum])
+  (let ([b (make-buffer)])
+    (write-to (& b) d #f)
+    (host-write 1 (buffer-bytes (& b)))
+    (buffer-free! (& b))))
+
+(define (write-to [b (ptr buffer)] [d datum] [display bool])
+  (cond [(== d 0) (buffer-add-string! b "#f")]
+        [(fixnum? d)
+         (let ([n (fixnum-value d)])
+           (when (< n 0) (buffer-add-byte! b 45))
+           (write-digits b (cast u64 (if (< n 0) (- 0 n) n)) 10))]
+        [(char? d) (if display (buffer-add-utf-8! b (char->integer d)) (write-char b (char->integer d)))]
+        [(== d nil) (buffer-add-string! b "()")]
+        [(== d true-node) (buffer-add-string! b "#t")]
+        [else
+         (let ([tag (node-tag d)])
+           (cond [(== tag tag-pair) (write-pair b d display)]
+                 [(== tag tag-symbol) (buffer-add-string! b (symbol->string d))]
+                 [(== tag tag-keyword) (buffer-add-string! b "#:") (buffer-add-string! b (keyword->string d))]
+                 [(== tag tag-string)
+                  (if display (buffer-add-string! b (datum->string d)) (write-string b (datum->string d)))]
+                 [(== tag tag-integer)
+                  (when (integer-negative? d) (buffer-add-byte! b 45))
+                  (write-digits b (cast u64 (if (integer-negative? d) (- 0 (integer-value d)) (integer-value d))) 10)]
+                 [(== tag tag-flonum) (write-flonum b (flonum-value d))]
+                 [else (buffer-add-string! b "#<node ") (write-digits b tag 10) (buffer-add-byte! b 62)]))]))
+
+(define (write-pair [b (ptr buffer)] [d datum] [display bool])
+  (buffer-add-byte! b 40)
+  (write-to b (car d) display)
+  (set! d (cdr d))
+  (while (pair? d)
+    (buffer-add-byte! b 32)
+    (write-to b (car d) display)
+    (set! d (cdr d)))
+  (unless (null? d)
+    (buffer-add-string! b " . ")
+    (write-to b d display))
+  (buffer-add-byte! b 41))
+
+;; ---- quoted data ----
+
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+
+  (define literal-table (ptr hash-table) 0)
+  (define literal-count i32 0)
+
+  (define (syn [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (fixnum-range? [d datum]) -> bool
+    (and (integer? d) (== (integer-negative? d) (< (integer-value d) 0))
+         (>= (integer-value d) -1073741824) (<= (integer-value d) 1073741823)))
+
+  (define (fixnum-word [d datum]) -> datum (make-integer (bit-or (<< (integer-value d) 1) 1)))
+  (define (char-word [d datum]) -> datum (make-integer (bit-or (<< (cast i64 (char->integer d)) 2) 2)))
+
+  (define (literal-globals [d datum]) -> datum
+    (when (== literal-table 0) (set! literal-table (make-table)))
+    (let ([known (datum-get literal-table d)])
+      (if (and known (identifier-binding-kind (syntax-local-introduce (cdr known))))
+          (cons (syntax-local-introduce (car known)) (syntax-local-introduce (cdr known)))
+          (let* ([n (begin (+= literal-count 1) (make-integer literal-count))]
+                 [g (syn (string->symbol (format-message "literal~a" `(,n))))]
+                 [k (syn (string->symbol (format-message "literal~a.k" `(,n))))])
+            (syntax-local-lift-definition #`(define #,g datum (permanent! #,(construction d))))
+            (syntax-local-lift-definition #`(wasm:global #,k (mut i32) (cast i32 #,g)))
+            (datum-put! literal-table d (cons (syntax-local-introduce g) (syntax-local-introduce k)))
+            (cons g k)))))
+
+  (define (construction [d datum]) -> datum
+    (cond [(== d 0) #'(cast datum 0)]
+          [(null? d) #'nil]
+          [(boolean? d) #'true-node]
+          [(symbol? d) #`(string->symbol #,(syn (string->datum (symbol->string d))))]
+          [(keyword? d) #`(string->keyword #,(syn (string->datum (keyword->string d))))]
+          [(string? d) #`(string->datum #,(syn d))]
+          [(fixnum-range? d) #`(cast datum #,(syn (fixnum-word d)))]
+          ;; An integer up to 2^63 is its i64; one above, its magnitude.
+          [(integer? d) (if (or (integer-negative? d) (>= (integer-value d) 0))
+                            #`(make-integer (cast i64 #,(syn d)))
+                            #`(make-unsigned-integer (cast u64 #,(syn d))))]
+          [(flonum? d) #`(make-flonum #,(syn d))]
+          [(char? d) #`(cast datum #,(syn (char-word d)))]
+          [(pair? d) #`(cons #,(construction (car d)) #,(construction (cdr d)))]
+          [else (raise-syntax-error 'quote "this datum is not one of Scheme's" (syn d))]))
+
+  (define (literal [d datum]) -> datum
+    (cond [(== d 0) #'(cast datum 0)]
+          [(null? d) #'(null-value)]
+          [(boolean? d) #'(true-value)]
+          [(fixnum-range? d) #`(cast datum #,(syn (fixnum-word d)))]
+          [(char? d) #`(cast datum #,(syn (char-word d)))]
+          [else #`(literal-value (cast datum #,(cdr (literal-globals d))))]))
+
+  (define (substrate-literal [d datum]) -> datum
+    (cond [(== d 0) #'(cast datum 0)]
+          [(null? d) #'nil]
+          [(boolean? d) #'true-node]
+          [(fixnum-range? d) #`(cast datum #,(syn (fixnum-word d)))]
+          [(char? d) #`(cast datum #,(syn (char-word d)))]
+          [else (car (literal-globals d))]))
+
+  (define (quote-form [s datum]) -> datum
+    (syntax-match s
+      [(_ d) (literal (syntax->datum d))]
+      [_ (raise-syntax-error 'quote "expected (quote datum)" s)]))
+
+  (define (lit-form [s datum]) -> datum
+    (syntax-match s
+      [(_ d) (substrate-literal (syntax->datum d))]
+      [_ (raise-syntax-error 'lit "expected (lit datum)" s)]))
+
+  ;; ---- quasiquote ----
+
+  (define (named? [x datum] [name datum]) -> bool (and (identifier? x) (== (syntax-e x) name)))
+
+  (define (tagged? [x datum] [name datum]) -> bool
+    (let ([l (syntax->list x)]) (and l (== (length l) 2) (named? (car l) name))))
+
+  (define (changes? [x datum] [depth i32]) -> bool
+    (cond [(or (tagged? x 'unquote) (tagged? x 'unquote-splicing))
+           (or (== depth 0) (changes? (cadr (syntax->list x)) (- depth 1)))]
+          [(tagged? x 'quasiquote) (changes? (cadr (syntax->list x)) (+ depth 1))]
+          [(syntax? x) (let ([e (syntax-e x)]) (and (pair? e) (chain-changes? e depth)))]
+          [else #f]))
+
+  (define (chain-changes? [l datum] [depth i32]) -> bool
+    (cond [(syntax? l) (changes? l depth)]
+          [(not (pair? l)) #f]
+          ;; (a . ,e) is (a unquote e).
+          [(and (== depth 0) (named? (car l) 'unquote)) #t]
+          [else (or (changes? (car l) depth) (chain-changes? (cdr l) depth))]))
+
+  (define (template [x datum] [depth i32]) -> datum
+    (cond [(not (changes? x depth)) #`(quote #,x)]
+          [(and (== depth 0) (tagged? x 'unquote)) (cadr (syntax->list x))]
+          [(or (tagged? x 'unquote) (tagged? x 'unquote-splicing))
+           #`(cons (quote #,(car (syntax-e x))) #,(template-list (cdr (syntax-e x)) (- depth 1)))]
+          [(tagged? x 'quasiquote)
+           #`(cons (quote #,(car (syntax-e x))) #,(template-list (cdr (syntax-e x)) (+ depth 1)))]
+          [else (template-list (syntax-e x) depth)]))
+
+  (define (template-list [l datum] [depth i32]) -> datum
+    (cond [(syntax? l) (template l depth)]
+          [(null? l) #''()]
+          [(and (== depth 0) (named? (car l) 'unquote)) (cadr l)]
+          [(and (== depth 0) (tagged? (car l) 'unquote-splicing))
+           #`(append #,(cadr (syntax->list (car l))) #,(template-list (cdr l) depth))]
+          [else #`(cons #,(template (car l) depth) #,(template-list (cdr l) depth))]))
+
+  (define (quasiquote-form [s datum]) -> datum
+    (syntax-match s
+      [(_ t) (template t 0)]
+      [_ (raise-syntax-error 'quasiquote "expected (quasiquote template)" s)])))
+
+(define-syntax quote quote-form)
+(define-syntax quasiquote quasiquote-form)
+(define-syntax lit lit-form)
+
+;; ---- the predicates, for Substrate code ----
+
+(begin-for-syntax
+  (define (test-form [s datum] [test datum]) -> datum
+    (syntax-match s
+      [(_ d) (datum->syntax #'here `(,test ,d) s)]
+      [_ (raise-syntax-error (syntax-e (car (syntax->list s))) "expected one argument, a datum" s)]))
+  (define (tag-form [s datum] [tag i32]) -> datum
+    (syntax-match s
+      [(_ d) (datum->syntax #'here `(node-tagged? ,d ,(fixnum tag)) s)]
+      [_ (raise-syntax-error (syntax-e (car (syntax->list s))) "expected one argument, a datum" s)]))
+  (define (node?-form [s datum]) -> datum (test-form s 'node-datum?))
+  (define (tagged?-form [s datum]) -> datum
+    (syntax-match s
+      [(_ d tag) (datum->syntax #'here `(node-tagged? ,d (cast i32 ,tag)) s)]
+      [_ (raise-syntax-error 'tagged? "expected (tagged? datum tag)" s)]))
+  (define (pair?-form [s datum]) -> datum (test-form s 'pair-cell?))
+  (define (null?-form [s datum]) -> datum (test-form s 'null-cell?))
+  (define (symbol?-form [s datum]) -> datum (tag-form s 3))
+  (define (keyword?-form [s datum]) -> datum (tag-form s 4))
+  (define (string?-form [s datum]) -> datum (tag-form s 5))
+  (define (flonum?-form [s datum]) -> datum (tag-form s 7))
+  (define (integer?-form [s datum]) -> datum (test-form s 'integer-datum?))
+  (define (fixnum?-form [s datum]) -> datum (test-form s 'fixnum-datum?))
+  (define (char?-form [s datum]) -> datum (test-form s 'char-datum?))
+  (define (boolean?-form [s datum]) -> datum (test-form s 'boolean-datum?)))
+
+(define-syntax node? node?-form)
+(define-syntax tagged? tagged?-form)
+(define-syntax pair? pair?-form)
+(define-syntax null? null?-form)
+(define-syntax symbol? symbol?-form)
+(define-syntax keyword? keyword?-form)
+(define-syntax string? string?-form)
+(define-syntax flonum? flonum?-form)
+(define-syntax integer? integer?-form)
+(define-syntax fixnum? fixnum?-form)
+(define-syntax char? char?-form)
+(define-syntax boolean? boolean?-form)

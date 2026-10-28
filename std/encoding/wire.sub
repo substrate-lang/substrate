@@ -1,0 +1,230 @@
+;; Wire messages, encoded in the postcard 1.x wire format (postcard.jamesmunns.com/wire-format).
+(require-unqualified utf8 "utf8.sub")
+
+(provide wire wire-error)
+
+(struct wire-error [message string] [offset u32])
+
+(struct wire-reader [bytes (slice u8)] [at u32] [error wire-error])
+
+;; ---- writing ----
+
+(define (put-varint! [b (ptr buffer)] [n u64])
+  (while (>= n 128)
+    (buffer-add-byte! b (cast i32 (bit-or (bit-and n 127) 128)))
+    (set! n (>> n 7)))
+  (buffer-add-byte! b (cast i32 n)))
+
+(define (put-zigzag! [b (ptr buffer)] [n i64]) (put-varint! b (cast u64 (bit-xor (<< n 1) (>> n 63)))))
+
+(define (put-f64! [b (ptr buffer)] [x f64]) (buffer-add! b (slice (cast (ptr u8) (array-of f64 x)) 8)))
+
+(define (put-text! [b (ptr buffer)] [s string])
+  (put-varint! b (-> s length))
+  (buffer-add-string! b s))
+
+;; ---- reading ----
+
+(define (start! [r (ptr wire-reader)] [bytes (slice u8)])
+  (set! (-> r bytes) bytes)
+  (set! (-> r at) 0)
+  (set! (-> r error message) "")
+  (set! (-> r error offset) 0))
+
+(define (fail! [r (ptr wire-reader)] [message string]) -> bool
+  (set! (-> r error message) message)
+  (set! (-> r error offset) (-> r at))
+  #f)
+
+(define (refuse! [r (ptr wire-reader)] [at u32] [message string]) -> bool
+  (set! (-> r at) at)
+  (fail! r message))
+
+(define (left [r (ptr wire-reader)]) -> u32 (- (-> r bytes length) (-> r at)))
+
+(define (end! [r (ptr wire-reader)]) -> bool (or (== (left r) 0) (fail! r "bytes follow the message")))
+
+(define (read-failed [r (ptr wire-reader)] [err (ptr wire-error)]) -> bool
+  (when (!= err 0) (set! (@ err) (-> r error)))
+  #f)
+
+(define (take-byte! [r (ptr wire-reader)] [to (ptr u8)]) -> bool
+  (when (== (left r) 0) (return (fail! r "the message ends too soon")))
+  (set! (@ to) (@ (-> r bytes items) (-> r at)))
+  (+= (-> r at) 1)
+  #t)
+
+(define (take-raw! [r (ptr wire-reader)] [to (ptr void)] [n u32]) -> bool
+  (when (< (left r) n) (return (fail! r "the message ends too soon")))
+  (memcpy to (+ (-> r bytes items) (-> r at)) n)
+  (+= (-> r at) n)
+  #t)
+
+(define (take-flag! [r (ptr wire-reader)] [to (ptr bool)] [message string]) -> bool
+  (let ([b u8 0] [start (-> r at)])
+    (unless (take-byte! r (& b)) (return #f))
+    (when (> b 1) (return (refuse! r start message)))
+    (set! (@ to) (== b 1))
+    #t))
+
+;; take-varint! reads a varint no longer and no larger than a type of the given bits allows.
+(define (take-varint! [r (ptr wire-reader)] [bits u32] [to (ptr u64)]) -> bool
+  (let ([n u64 0] [shift u32 0] [b u8 0] [start (-> r at)])
+    (while #t
+      (unless (take-byte! r (& b)) (return #f))
+      (when (and (== shift 63) (> b 1)) (return (refuse! r start "a number is too large for its type")))
+      (set! n (bit-or n (<< (cast u64 (bit-and b 127)) (cast u64 shift))))
+      (when (< b 128) (break))
+      (+= shift 7)
+      (when (>= shift (* 7 (/ (+ bits 6) 7))) (return (refuse! r start "a number is longer than its type allows"))))
+    (when (and (< bits 64) (>= n (<< (cast u64 1) (cast u64 bits))))
+      (return (refuse! r start "a number is too large for its type")))
+    (set! (@ to) n)
+    #t))
+
+(define (unzigzag [n u64]) -> i64 (cast i64 (bit-xor (>> n 1) (- 0 (bit-and n 1)))))
+
+(define (take-count! [r (ptr wire-reader)] [to (ptr u32)]) -> bool
+  (let ([n u64 0] [start (-> r at)])
+    (unless (take-varint! r 32 (& n)) (return #f))
+    (when (> n (left r)) (return (refuse! r start "a length runs past the message")))
+    (set! (@ to) (cast u32 n))
+    #t))
+
+(define (take-text! [r (ptr wire-reader)] [a (ptr arena)] [to (ptr string)]) -> bool
+  (let ([n u32 0] [start (-> r at)])
+    (unless (take-count! r (& n)) (return #f))
+    (let ([s (slice (-> r bytes) (-> r at) (+ (-> r at) n))])
+      (unless (utf-8? s) (return (refuse! r start "a string is not UTF-8")))
+      (let ([p (cast (ptr u8) (arena-alloc a n))])
+        (memcpy p (-> s items) n)
+        (set! (@ to) (cast string (slice p n)))
+        (+= (-> r at) n)
+        #t))))
+
+;; ---- the wire form ----
+
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+  (require-unqualified derive std/meta/derive)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (wire-form [s datum]) -> datum (derive s 'wire '"wire-write!" definitions))
+
+  (define (definitions [t datum] [info datum]) -> datum
+    (if (== (car info) 'struct) (struct-code t (caddr info)) (variant-code t (caddr info))))
+
+  (define (struct-code [t datum] [fields datum]) -> datum
+    `(,#`(define (#,(derive-name t '"wire-write!") [b (ptr buffer)] [v (ptr #,t)])
+           #,@(for/list ([f fields]) (write-code (cdr f) #`(-> v #,(car f)) (car f)))
+           (begin))
+      ,#`(define (#,(derive-name t '"wire-read-from!") [r (ptr wire-reader)] [a (ptr arena)] [v (ptr #,t)]) -> bool
+           #,@(for/list ([f fields]) (read-code (cdr f) #`(-> v #,(car f)) (car f)))
+           #t)
+      ,(entry t)))
+
+  (define (variant-code [t datum] [cases datum]) -> datum
+    (let ([writes nil] [reads nil] [k 0])
+      (for/each ([c cases])
+        (let ([xs (for/list ([f (cdr c)]) (derive-fresh 'f))] [n (literal (make-integer k))])
+          (set! writes (cons #`[(#,(car c) #,@xs)
+                                (put-varint! b #,n)
+                                #,@(for/list ([f (cdr c)] [x xs]) (write-code (cdr f) x (car f)))]
+                             writes))
+          (set! reads (cons #`[(== k #,n)
+                               (let (#,@(for/list ([f (cdr c)] [x xs]) #`[#,x #,(type-syntax (cdr f))]))
+                                 #,@(for/list ([f (cdr c)] [x xs]) (read-code (cdr f) x (car f)))
+                                 (set! (@ v) (#,(car c) #,@xs)))]
+                            reads))
+          (+= k 1)))
+      `(,#`(define (#,(derive-name t '"wire-write!") [b (ptr buffer)] [v (ptr #,t)])
+             (match v #,@(reverse writes)))
+        ,#`(define (#,(derive-name t '"wire-read-from!") [r (ptr wire-reader)] [a (ptr arena)] [v (ptr #,t)]) -> bool
+             (let ([k u64 0] [start (-> r at)])
+               (unless (take-varint! r 32 (& k)) (return #f))
+               (cond #,@(reverse reads)
+                     [else (return (refuse! r start "no case has this number"))])
+               #t))
+        ,(entry t))))
+
+  (define (entry [t datum]) -> datum
+    #`(define (#,(derive-name t '"wire-read") [a (ptr arena)] [bytes (slice u8)] [v (ptr #,t)] [err (ptr wire-error)])
+        -> bool
+        (let ([r wire-reader])
+          (start! (& r) bytes)
+          (or (and (#,(derive-name t '"wire-read-from!") (& r) a v) (end! (& r))) (read-failed (& r) err)))))
+
+  (define (bits [t datum]) -> datum (literal (make-integer (case t [('u16 'i16) 16] [('u32 'i32) 32] [else 64]))))
+
+  ;; Code writing the value at place p, of the field where.
+  (define (write-code [type datum] [p datum] [where datum]) -> datum
+    (cond [(symbol? type)
+           (case type
+             [('u8 'i8) #`(buffer-add-byte! b #,p)]
+             [('u16 'u32 'u64) #`(put-varint! b (cast u64 #,p))]
+             [('i16 'i32 'i64) #`(put-zigzag! b (cast i64 #,p))]
+             [('f32) #`(buffer-add-f32! b (cast f64 #,p))]
+             [('f64) #`(put-f64! b #,p)]
+             [('bool) #`(buffer-add-byte! b (if #,p 1 0))]
+             [else #`(put-text! b #,p)])]
+          [(identifier? type) (derive-want! type) #`(#,(derive-name type '"wire-write!") b (& #,p))]
+          [(== (car type) 'ptr)
+           #`(if (== #,p 0)
+                 (buffer-add-byte! b 0)
+                 (begin (buffer-add-byte! b 1) #,(write-code (cadr type) #`(@ #,p) where)))]
+          [(== (car type) 'slice)
+           (let ([i (derive-fresh 'i)])
+             #`(begin (put-varint! b (-> #,p length))
+                      (for ([#,i u32 0]) (< #,i (-> #,p length)) (+= #,i 1)
+                        #,(write-code (cadr type) #`(@ #,p #,i) where))))]
+          [(== (car type) 'array)
+           (let ([i (derive-fresh 'i)])
+             #`(for ([#,i u32 0]) (< #,i #,(literal (caddr type))) (+= #,i 1)
+                 #,(write-code (cadr type) #`(@ #,p #,i) where)))]
+          [else (raise-syntax-error 'wire "this field's type has no wire encoding" where)]))
+
+  ;; Code reading into place p, of the field where.
+  (define (read-code [type datum] [p datum] [where datum]) -> datum
+    (cond [(symbol? type)
+           (case type
+             [('u8) #`(unless (take-byte! r (& #,p)) (return #f))]
+             [('i8) #`(let ([n u8 0]) (unless (take-byte! r (& n)) (return #f)) (set! #,p (cast i8 n)))]
+             [('u16 'u32 'u64)
+              #`(let ([n u64 0])
+                  (unless (take-varint! r #,(bits type) (& n)) (return #f))
+                  (set! #,p (cast #,(literal type) n)))]
+             [('i16 'i32 'i64)
+              #`(let ([n u64 0])
+                  (unless (take-varint! r #,(bits type) (& n)) (return #f))
+                  (set! #,p (cast #,(literal type) (unzigzag n))))]
+             [('f32) #`(unless (take-raw! r (& #,p) 4) (return #f))]
+             [('f64) #`(unless (take-raw! r (& #,p) 8) (return #f))]
+             [('bool) #`(unless (take-flag! r (& #,p) "a bool is neither 0 nor 1") (return #f))]
+             [else #`(unless (take-text! r a (& #,p)) (return #f))])]
+          [(identifier? type)
+           (derive-want! type)
+           #`(unless (#,(derive-name type '"wire-read-from!") r a (& #,p)) (return #f))]
+          [(== (car type) 'ptr)
+           (let ([present (derive-fresh 'present)] [q (derive-fresh 'q)] [u (type-syntax (cadr type))])
+             #`(let ([#,present #f])
+                 (unless (take-flag! r (& #,present) "an option's tag is neither 0 nor 1") (return #f))
+                 (if #,present
+                     (let ([#,q (cast (ptr #,u) (arena-alloc a (sizeof #,u)))])
+                       #,(read-code (cadr type) #`(@ #,q) where)
+                       (set! #,p #,q))
+                     (set! #,p 0))))]
+          [(== (car type) 'slice)
+           (let ([n (derive-fresh 'n)] [items (derive-fresh 'items)] [i (derive-fresh 'i)] [u (type-syntax (cadr type))])
+             #`(let ([#,n u32 0])
+                 (unless (take-count! r (& #,n)) (return #f))
+                 (let ([#,items (cast (ptr #,u) (arena-alloc a (* #,n (sizeof #,u))))])
+                   (for ([#,i u32 0]) (< #,i #,n) (+= #,i 1) #,(read-code (cadr type) #`(@ #,items #,i) where))
+                   (set! #,p (slice #,items #,n)))))]
+          [(== (car type) 'array)
+           (let ([i (derive-fresh 'i)])
+             #`(for ([#,i u32 0]) (< #,i #,(literal (caddr type))) (+= #,i 1)
+                 #,(read-code (cadr type) #`(@ #,p #,i) where)))]
+          [else (raise-syntax-error 'wire "this field's type has no wire encoding" where)])))
+
+(define-syntax wire wire-form)

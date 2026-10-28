@@ -1,0 +1,291 @@
+;; Files: http-send-file! answers with a file under the root, as Flask's send_from_directory does, and http-static! with
+;; the file at the request's path, a directory's index.html, or a redirect adding a final slash. Answers carry
+;; Last-Modified and an ETag, are 304 or 412 as preconditions require, hold one range when asked, and have Cache-Control
+;; no-cache unless cache gives another value for the path. A part that is . or .., or that starts with a dot other than
+;; .well-known, is not found. An empty root is the current directory.
+(require-unqualified fs host/fs)
+(require-unqualified http "http.sub")
+(require-unqualified server "server.sub")
+(require-unqualified conditional "conditional.sub")
+(require-unqualified url "url.sub")
+
+(provide http-files http-static! http-send-file!)
+
+(struct http-files [root string] [cache (fn (string) -> string)])
+
+;; Files up to this size are read and sent whole; larger ones are piped.
+(const whole i64 262144)
+
+;; The most ranges a Range header may list, and the most parts a path may have.
+(const most-ranges u32 16)
+(const most-parts u32 64)
+
+(define (extension [path string]) -> string
+  (let ([i (-> path length)])
+    (while (and (> i 0) (!= (@ path (- i 1)) 46) (!= (@ path (- i 1)) 47)) (-= i 1))
+    (if (and (> i 0) (== (@ path (- i 1)) 46)) (slice path i) "")))
+
+(define (content-type [path string]) -> string
+  (let ([e (extension path)])
+    (cond [(or (== e "html") (== e "htm")) "text/html; charset=utf-8"]
+          [(or (== e "mjs") (== e "js")) "text/javascript; charset=utf-8"]
+          [(== e "css") "text/css; charset=utf-8"]
+          [(or (== e "txt") (== e "sub")) "text/plain; charset=utf-8"]
+          [(== e "md") "text/markdown; charset=utf-8"]
+          [(== e "csv") "text/csv; charset=utf-8"]
+          [(or (== e "json") (== e "map")) "application/json"]
+          [(== e "xml") "application/xml"]
+          [(== e "wasm") "application/wasm"]
+          [(== e "pdf") "application/pdf"]
+          [(== e "zip") "application/zip"]
+          [(== e "gz") "application/gzip"]
+          [(== e "tar") "application/x-tar"]
+          [(== e "svg") "image/svg+xml"]
+          [(== e "png") "image/png"]
+          [(or (== e "jpg") (== e "jpeg")) "image/jpeg"]
+          [(== e "gif") "image/gif"]
+          [(== e "webp") "image/webp"]
+          [(== e "avif") "image/avif"]
+          [(== e "ico") "image/x-icon"]
+          [(== e "wav") "audio/wav"]
+          [(== e "mp3") "audio/mpeg"]
+          [(== e "ogg") "audio/ogg"]
+          [(== e "mp4") "video/mp4"]
+          [(== e "webm") "video/webm"]
+          [(== e "woff") "font/woff"]
+          [(== e "woff2") "font/woff2"]
+          [(== e "ttf") "font/ttf"]
+          [(== e "otf") "font/otf"]
+          [else "application/octet-stream"])))
+
+;; ---- paths ----
+
+(define (hidden? [part string]) -> bool
+  (and (> (-> part length) 0) (== (@ part 0) 46) (!= part ".well-known")))
+
+;; refusal gives the status for a path's parts: 400 when one holds a slash or NUL, 404 when one is hidden, else 0.
+(define (refusal [parts (slice string)]) -> i32
+  (for ([i u32 0]) (< i (-> parts length)) (+= i 1)
+    (let ([s (@ parts i)])
+      (for ([k u32 0]) (< k (-> s length)) (+= k 1)
+        (when (or (== (@ s k) #\/) (== (@ s k) 0)) (return 400)))
+      (when (hidden? s) (return 404))))
+  0)
+
+;; rooted! adds the root to b and returns its length.
+(define (rooted! [b (ptr buffer)] [files (ptr http-files)]) -> u32
+  (buffer-add-string! b (if (== (-> files root length) 0) "." (-> files root)))
+  (-> b length))
+
+(define (joined! [b (ptr buffer)] [parts (slice string)])
+  (for ([i u32 0]) (< i (-> parts length)) (+= i 1)
+    (buffer-add-byte! b #\/)
+    (buffer-add-string! b (@ parts i))))
+
+(define (moved! [r (ptr http-request)])
+  (let ([t (-> r target)] [i u32 0] [last u32 0] [to (make-buffer)])
+    (while (and (< i (-> t length)) (!= (@ t i) 63))
+      (when (== (@ t i) 47) (set! last (+ i 1)))
+      (+= i 1))
+    (buffer-add-string! (& to) "./")
+    (buffer-add-string! (& to) (slice t last i))
+    (buffer-add-byte! (& to) 47)
+    (buffer-add-string! (& to) (slice t i))
+    (http-respond! r 301)
+    (http-header! r "location" (buffer-string (& to)))
+    (http-finish! r)
+    (buffer-free! (& to))))
+
+;; ---- ranges ----
+
+(struct span [start i64] [end i64])
+
+(define (span! [s (ptr span)] [start i64] [end i64])
+  (set! (-> s start) start)
+  (set! (-> s end) end))
+
+;; The number s is, or -1 when it is not all digits.
+(define (position [s string]) -> i64
+  (let ([n u64 0]) (if (http-unsigned s 4611686018427387903 (& n)) (cast i64 n) -1)))
+
+;; gapless? tells whether the spans cover every byte from low up to high.
+(define (gapless? [spans (ptr span)] [n u32] [low i64] [high i64]) -> bool
+  (let ([reached low] [grew #t])
+    (while grew
+      (set! grew #f)
+      (for ([k u32 0]) (< k n) (+= k 1)
+        (let ([s (& (@ spans k))])
+          (when (and (<= (-> s start) reached) (> (-> s end) reached))
+            (set! reached (-> s end))
+            (set! grew #t)))))
+    (>= reached high)))
+
+;; ranges! reads a GET's Range header for size bytes into one span: 0 for the whole file, as with no header, one that
+;; does not parse, or ranges that do not join into one; 1 for a span; -1 when no range falls within the file.
+(define (ranges! [r (ptr http-request)] [size i64] [etag string] [modified f64] [to (ptr span)]) -> i32
+  (let ([v (http-request-header r "range")] [spans (array span 16)] [n u32 0] [i u32 6])
+    (unless (and (== (-> r method) "GET") (> size 0) (>= (-> v length) 6) (http-same? (slice v 0 6) "bytes=")
+                 (http-if-range? r etag modified))
+      (return 0))
+    (while (< i (-> v length))
+      (let ([end i])
+        (while (and (< end (-> v length)) (!= (@ v end) 44)) (+= end 1))
+        (let ([part (http-trimmed (slice v i end))] [dash u32 0])
+          (set! i (+ end 1))
+          (unless (== (-> part length) 0)
+            (while (and (< dash (-> part length)) (!= (@ part dash) 45)) (+= dash 1))
+            (when (== dash (-> part length)) (return 0))
+            (let ([first (if (== dash 0) -1 (position (slice part 0 dash)))]
+                  [last (if (== (+ dash 1) (-> part length)) -1 (position (slice part (+ dash 1))))])
+              (cond [(== dash 0)
+                     (when (< last 0) (return 0))
+                     (when (> last 0)
+                       (when (== n most-ranges) (return 0))
+                       (span! (& (@ spans n)) (if (> last size) 0 (- size last)) size)
+                       (+= n 1))]
+                    [(or (< first 0) (and (> (-> part length) (+ dash 1)) (or (< last 0) (< last first)))) (return 0)]
+                    [(< first size)
+                     (when (== n most-ranges) (return 0))
+                     (span! (& (@ spans n)) first (if (or (< last 0) (>= last size)) size (+ last 1)))
+                     (+= n 1)]))))))
+    (when (== n 0) (return -1))
+    (let ([low (-> (& (@ spans 0)) start)] [high (-> (& (@ spans 0)) end)])
+      (for ([k u32 1]) (< k n) (+= k 1)
+        (let ([s (& (@ spans k))])
+          (when (< (-> s start) low) (set! low (-> s start)))
+          (when (> (-> s end) high) (set! high (-> s end)))))
+      (unless (gapless? (& (@ spans 0)) n low high) (return 0))
+      (span! to low high)
+      1)))
+
+(define (content-range! [r (ptr http-request)] [s (ptr span)] [size i64])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "bytes ")
+    (if (< (-> s start) 0)
+        (buffer-add-byte! (& b) #\*)
+        (begin
+          (http-add-decimal! (& b) (-> s start))
+          (buffer-add-byte! (& b) #\-)
+          (http-add-decimal! (& b) (- (-> s end) 1))))
+    (buffer-add-byte! (& b) #\/)
+    (http-add-decimal! (& b) size)
+    (http-header! r "content-range" (buffer-string (& b)))
+    (buffer-free! (& b))))
+
+;; ---- answers ----
+
+(define (etag! [b (ptr buffer)] [info (ptr fs-info)])
+  (buffer-add-byte! b 34)
+  (write-digits b (cast u64 (-> info modified)) 16)
+  (buffer-add-byte! b #\-)
+  (write-digits b (cast u64 (-> info size)) 16)
+  (buffer-add-byte! b 34))
+
+(define (cache-of [files (ptr http-files)] [path string]) -> string
+  (let ([value (if (== (-> files cache) 0) "" ((-> files cache) path))])
+    (if (== (-> value length) 0) "no-cache" value)))
+
+(define (head-of! [r (ptr http-request)] [name string] [partial bool] [s (ptr span)] [size i64])
+  (http-respond! r (if partial 206 200))
+  (when partial (content-range! r s size))
+  (http-header! r "content-type" (content-type name)))
+
+(define (failed! [r (ptr http-request)]) (http-answer-text! r 500 "cannot read the file"))
+
+(define (body! [r (ptr http-request)] [name string] [partial bool] [s (ptr span)] [size i64])
+  (let ([n (- (-> s end) (-> s start))])
+    (cond [(== (-> r method) "HEAD")
+           (head-of! r name partial s size)
+           (http-length! r n)
+           (http-finish! r)]
+          [(<= size whole)
+           (let ([f (slice u8)])
+             (if (< (fs-read-file name (& f) 0) 0)
+                 (failed! r)
+                 (begin
+                   (head-of! r name partial s size)
+                   (http-send! r (slice f (cast u32 (-> s start)) (cast u32 (-> s end))))
+                   (free (-> f items)))))]
+          [else
+           (let ([file (fs-open-at name (-> s start) 0 0)])
+             (if (== file 0)
+                 (failed! r)
+                 (begin
+                   (head-of! r name partial s size)
+                   (http-send-stream! r file n))))])))
+
+;; send! answers with the file at name, whose path under the root is path.
+(define (send! [r (ptr http-request)] [files (ptr http-files)] [name string] [path string] [info (ptr fs-info)])
+  (let ([size (-> info size)] [tag (make-buffer)] [s span] [partial i32 0])
+    (span! (& s) 0 size)
+    (etag! (& tag) info)
+    (http-add-header! r "cache-control" (cache-of files path))
+    (unless (http-conditional! r (buffer-string (& tag)) (-> info modified))
+      (set! partial (ranges! r size (buffer-string (& tag)) (-> info modified) (& s)))
+      (if (< partial 0)
+          (let ([all span])
+            (span! (& all) -1 0)
+            (http-respond! r 416)
+            (content-range! r (& all) size)
+            (http-header! r "content-type" "text/plain; charset=utf-8")
+            (http-send-text! r "range not satisfiable"))
+          (begin
+            (set! (-> r ranges) #t)
+            (body! r name (> partial 0) (& s) size))))
+    (buffer-free! (& tag))))
+
+(define (not-found! [r (ptr http-request)]) (http-answer-text! r 404 "not found"))
+
+;; read? tells whether the request may read files, and answers 405 when it may not.
+(define (read? [r (ptr http-request)]) -> bool
+  (when (or (== (-> r method) "GET") (== (-> r method) "HEAD")) (return #t))
+  (http-respond! r 405)
+  (http-header! r "allow" "GET, HEAD")
+  (http-header! r "content-type" "text/plain; charset=utf-8")
+  (http-send-text! r "method not allowed")
+  #f)
+
+;; http-send-file! sends the file at path, relative to the root, its parts separated by slashes.
+(define (http-send-file! [r (ptr http-request)] [files (ptr http-files)] [path string])
+  (let ([name (make-buffer)] [parts (array string 64)] [n u32 0] [start u32 0] [info fs-info] [ok #t])
+    (when (read? r)
+      (let ([prefix (rooted! (& name) files)])
+        (for ([i u32 0]) (and ok (<= i (-> path length))) (+= i 1)
+          (when (or (== i (-> path length)) (== (@ path i) #\/))
+            (let ([part (slice path start i)])
+              (cond [(or (== part ".") (== part "..") (and (== (-> part length) 0) (== i 0)) (== n most-parts))
+                     (set! ok #f)]
+                    [(> (-> part length) 0)
+                     (set! (@ parts n) part)
+                     (+= n 1)]))
+            (set! start (+ i 1))))
+        (if (and ok (> n 0) (== (refusal (slice parts n)) 0))
+            (begin
+              (joined! (& name) (slice parts n))
+              (if (and (>= (fs-stat (buffer-string (& name)) (& info) 0) 0) (== (-> info kind) fs-file))
+                  (send! r files (buffer-string (& name)) (slice (buffer-string (& name)) (+ prefix 1)) (& info))
+                  (not-found! r)))
+            (not-found! r))))
+    (buffer-free! (& name))))
+
+(define (http-static! [r (ptr http-request)] [files (ptr http-files)])
+  (let ([name (make-buffer)] [parts (slice string)] [info fs-info])
+    (when (read? r)
+      (let ([prefix (rooted! (& name) files)])
+        (if (!= (url-segments (& (-> r arena)) (url-path (-> r target)) (& parts)) 0)
+            (http-answer-text! r 400 "bad request")
+            (let ([refused (refusal parts)])
+              (cond [(== refused 400) (http-answer-text! r 400 "bad request")]
+                    [(== refused 404) (not-found! r)]
+                    [else
+                     (let ([slash (or (== (-> parts length) 0) (== (@ parts (- (-> parts length) 1)) ""))])
+                       (joined! (& name) parts)
+                       (when (== (-> parts length) 0) (buffer-add-byte! (& name) #\/))
+                       (when slash (buffer-add-string! (& name) "index.html"))
+                       (let ([found (>= (fs-stat (buffer-string (& name)) (& info) 0) 0)])
+                         (cond [(and found (== (-> info kind) fs-directory) (not slash)) (moved! r)]
+                               [(or (not found) (!= (-> info kind) fs-file)) (not-found! r)]
+                               [else
+                                (send! r files (buffer-string (& name)) (slice (buffer-string (& name)) (+ prefix 1))
+                                       (& info))])))])))))
+    (buffer-free! (& name))))

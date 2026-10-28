@@ -54,7 +54,7 @@
           MBEDTLS_SOURCE = pkgs.mbedtls.src;
           # bench/compress: zlib's source
           ZLIB_SOURCE = pkgs.zlib.src;
-          # lib/sqlite/build.sh and bench/sqlite: SQLite's amalgamation, and its speedtest1.c
+          # packages/sqlite/build.sh and bench/sqlite: SQLite's amalgamation, and its speedtest1.c
           SQLITE_AMALGAMATION = pkgs.fetchzip {
             url = "https://sqlite.org/2026/sqlite-amalgamation-3510200.zip";
             hash = "sha256-WUH/22OMthEsDTGrpZ8dLCts6890wSLGMmPWt725Gss=";

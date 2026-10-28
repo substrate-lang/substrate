@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib/encoding/json.sub against cJSON, as wasm on V8 and native, and V8's own JSON, on nativejson-benchmark's files.
+# std/encoding/json.sub against cJSON, as wasm on V8 and native, and V8's own JSON, on nativejson-benchmark's files.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"

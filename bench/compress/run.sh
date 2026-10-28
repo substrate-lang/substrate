@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib/compress against zlib, as wasm on V8 and native, on the Silesia corpus and the JSON benchmark's files: deflate at
+# std/compress against zlib, as wasm on V8 and native, on the Silesia corpus and the JSON benchmark's files: deflate at
 # levels 1, 6 and 9, inflate, and round trips through both. In the flake's silesia shell:
 # nix develop .#silesia -c bench/compress/run.sh
 set -euo pipefail

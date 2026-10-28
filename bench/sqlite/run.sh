@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib/sqlite against SQLite built natively, on the SQL of speedtest1's tests (its mix but rtree and app, which a script
+# packages/sqlite against SQLite built natively, on the SQL of speedtest1's tests (its mix but rtree and app, which a script
 # cannot hold), with the database in a file and in memory. In the dev shell: nix develop -c bench/sqlite/run.sh [SIZE
 # [REPS]]
 set -euo pipefail
@@ -10,7 +10,7 @@ size="${1:-100}"
 reps="${2:-1}"
 mkdir -p "$out"
 
-# lib/sqlite/build.sh's options, but with SQLite's own files
+# packages/sqlite/build.sh's options, but with SQLite's own files
 flags=(-O2 -DSQLITE_THREADSAFE=0 -DSQLITE_TEMP_STORE=2 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_LOCALTIME
        -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_OMIT_DEPRECATED -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_DQS=0
        -DSQLITE_LIKE_DOESNT_MATCH_BLOBS -I"$SQLITE_AMALGAMATION")

@@ -13,16 +13,17 @@ compiler is written in it, builds itself, and runs in a browser.
   `wasm.sub` gives wasm's forms as `wasm:name`, and `syntax.sub` and
   `macros.sub` hold the data and tools macros work with. `link.sub` links
   a package's wasm module into a program.
-- `lib/`: libraries written in Substrate. `languages/` holds the languages
-  built on it, `scheme/`, a Scheme, and `bend/`, a dependently typed
-  language, with `nodes.sub`, the run-time nodes they share. `http/` is an
-  HTTP/1.1 server toolkit; `crypto/`, `compress/` and `log/` hold hashes and
-  passwords, DEFLATE and gzip, and logs. `meta/` reads types at
-  compile time, for code that writes code; `encoding/` holds UTF-8, Base64,
-  JSON and wire (postcard). `sqlite/` is SQLite, a package of C compiled
-  to wasm. `web/` (experimental) holds programs in a web page: a UI
-  library, WebGPU and `shade/` for GPU programs compiled to WGSL, a game
-  library, examples and a REPL.
+- `std/`: the standard library, written in Substrate. `languages/` holds
+  the languages built on it, `scheme/`, a Scheme, and `bend/`, a
+  dependently typed language, with `nodes.sub`, the run-time nodes they
+  share. `http/` is an HTTP/1.1 server toolkit; `crypto/`, `compress/` and
+  `log/` hold hashes and passwords, DEFLATE and gzip, and logs. `meta/`
+  reads types at compile time, for code that writes code; `encoding/`
+  holds UTF-8, Base64, JSON and wire (postcard). `web/` (experimental)
+  holds programs in a web page: a UI library, WebGPU and `shade/` for GPU
+  programs compiled to WGSL, a game library, examples and a REPL.
+- `packages/`: packages outside the standard library. `sqlite/` is SQLite,
+  C compiled to wasm.
 - `cmd/`: the `sub serve` and `sub pack` commands.
 - `host/`: what runs compiled programs: `subhost.mjs` on Node, and `web/` in a
   browser (experimental).

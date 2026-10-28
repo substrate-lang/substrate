@@ -50,7 +50,7 @@ const checks = {
     };
     const fieldText = () => page.evaluate('document.querySelector("textarea").value');
 
-    const scheme = '(language scheme "lib/languages/scheme/scheme.sub") => ';
+    const scheme = '(language scheme std/languages/scheme) => ';
     await idle();
     check('repl: the page starts a Scheme session', await shown(), scheme);
     check('repl: the text box has the focus', await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
@@ -125,7 +125,7 @@ const checks = {
     await say('(+ (fib 20) 0.5)');
     await say('(sq 2)');
     check('repl: a session in Substrate', await shown(), [
-      '(language substrate "compiler/substrate.sub") => ',
+      '(language substrate compiler/substrate) => ',
       '(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) => ',
       '(+ (fib 20) 0.5) => 6765.5',
       '! (sq 2) => input-20:1:2: error: unbound identifier sq',
@@ -147,9 +147,9 @@ const checks = {
     check('repl: Clear empties the page', await shown(), '');
     await say('(fib 11)');
     check('repl: Clear keeps the session', await shown(), '(fib 11) => 89');
-    await say('(begin-for-syntax (require-unqualified macros "compiler/macros.sub"))');
+    await say('(begin-for-syntax (require-unqualified macros compiler/macros))');
     check('repl: code run while compiling can require the compiler\'s macros', await last(),
-      '(begin-for-syntax (require-unqualified macros "compiler/macros.sub")) => ');
+      '(begin-for-syntax (require-unqualified macros compiler/macros)) => ');
 
     await page.click('nav button:nth-of-type(3)');
     await idle();
@@ -157,7 +157,7 @@ const checks = {
     await page.evaluate('location.href = location.pathname + "?language=substrate"');
     await page.waitFor('window.ready && location.search === "?language=substrate"', 20000);
     await idle();
-    check('repl: a language in the URL opens that session', await shown(), '(language substrate "compiler/substrate.sub") => ');
+    check('repl: a language in the URL opens that session', await shown(), '(language substrate compiler/substrate) => ');
 
     await say('(define (sq [x i32]) -> i32 (* x x))');
     await say('(sq 4)');
@@ -169,7 +169,7 @@ const checks = {
     const saved = path.join(downloads, 'session.sub');
     for (let i = 0; i < 100 && !fs.existsSync(saved); i++) await new Promise((resolve) => setTimeout(resolve, 50));
     check('repl: Save downloads the inputs as a session file', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file',
-      '(language substrate "compiler/substrate.sub")\n\n(define (sq [x i32]) -> i32 (* x x))\n\n(sq 4)\n');
+      '(language substrate compiler/substrate)\n\n(define (sq [x i32]) -> i32 (* x x))\n\n(sq 4)\n');
 
     const forms = path.join(downloads, 'forms.sub');
     fs.writeFileSync(forms, '(define (cube [x i32]) -> i32\n  (* x x x))\n\n(cube 3)\n');
@@ -198,7 +198,7 @@ const checks = {
     await page.waitFor('window.ready', 20000);
     await idle();
     check('repl: the draft survives a reload', await fieldText(), '(sq 1');
-    check('repl: and the language is the URL\'s', await shown(), '(language substrate "compiler/substrate.sub") => ');
+    check('repl: and the language is the URL\'s', await shown(), '(language substrate compiler/substrate) => ');
   },
 
   async rows(page) {

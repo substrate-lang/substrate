@@ -14,9 +14,9 @@ seed:
 	bin/bootstrap seed
 
 repl:
-	bin/sub site $(OUT)/web/repl lib/web/repl/repl.sub -p lib/web/repl/page.html \
+	bin/sub site $(OUT)/web/repl std/web/repl/repl.sub -p std/web/repl/page.html \
 	  -f files $(addprefix compiler/,macros.sub substrate.sub syntax.sub wasm.sub writer.sub) \
-	  $(shell find host lib/languages/scheme lib/languages/bend -name '*.sub' | sort) lib/languages/nodes.sub lib/encoding/utf8.sub
+	  $(shell find host std/languages/scheme std/languages/bend -name '*.sub' | sort) std/languages/nodes.sub std/encoding/utf8.sub
 
 clean:
 	rm -rf build

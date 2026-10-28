@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lib/crypto against mbedTLS, as wasm on V8 and native: SHA-256, HMAC and PBKDF2.
+# std/crypto against mbedTLS, as wasm on V8 and native: SHA-256, HMAC and PBKDF2.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"

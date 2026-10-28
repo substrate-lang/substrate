@@ -67,8 +67,8 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
-# Each module in cmd, lib, bench, host, tests/web and tests/proxy builds, except the pieces in bench/bend/compile.
-mapfile -t modules < <(find cmd lib bench host tests/web tests/proxy -name '*.sub' -not -path 'bench/bend/compile/*' | sort)
+# Each module in cmd, std, packages, bench, host, tests/web and tests/proxy builds, except the pieces in bench/bend/compile.
+mapfile -t modules < <(find cmd std packages bench host tests/web tests/proxy -name '*.sub' -not -path 'bench/bend/compile/*' | sort)
 for m in "${modules[@]}"; do
   actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
