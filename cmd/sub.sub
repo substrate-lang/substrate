@@ -1,0 +1,321 @@
+;; sub, the command for programs. bin/sub builds it and runs it with every grant, the toolchain's directory first in its
+;; arguments. A program in a package is built with the module map of its package and the packages its dependencies
+;; reach; run and serve become the program they run, with the grants given.
+(require-unqualified macros compiler/macros)
+(require-unqualified ex compiler/expander)
+(require-unqualified main compiler/main)
+(require-unqualified fs host/fs)
+(require-unqualified env host/node/env)
+(require-unqualified process host/node/process)
+(require-unqualified manifest std/package/manifest)
+(require-unqualified map std/package/map)
+(require-unqualified hash std/package/hash)
+(require-unqualified pack std/web/pack)
+
+(define root string)
+(define cwd string)
+(define a arena)
+
+(define (say [fd i32] [s string]) (host-write fd (cast (slice u8) s)))
+
+(define (usage)
+  (say 2 "usage: sub build FILE [-o DIR] [-s] | run [GRANT ...] FILE|DIR [ARG ...] | eval FILE | expand FILE\n")
+  (say 2 "         | site OUT FILE [-p PAGE] [-f NAME PATH ...] | serve [-l ADDRESS] [-t CERT KEY] [-z LEVEL] [DIR]\n")
+  (say 2 "         | pack -o OUT [-C DIR] PATH ...\n")
+  (host-exit 64))
+
+(define (failed! [message string])
+  (say 2 "sub: ")
+  (say 2 message)
+  (say 2 "\n")
+  (host-exit 1))
+
+(define (starts? [s string] [prefix string]) -> bool
+  (and (>= (-> s length) (-> prefix length)) (== (slice s 0 (-> prefix length)) prefix)))
+
+(define (ends? [s string] [suffix string]) -> bool
+  (and (>= (-> s length) (-> suffix length)) (== (slice s (- (-> s length) (-> suffix length))) suffix)))
+
+(define (absolute [p string]) -> string (normal-path (& a) (if (starts? p "/") p (joined-path cwd p))))
+
+(define (parent-of [p string]) -> string
+  (let ([i (-> p length)])
+    (while (and (> i 1) (!= (@ p (- i 1)) #\/)) (-= i 1))
+    (if (<= i 1) "/" (slice p 0 (- i 1)))))
+
+(define (base-of [p string]) -> string
+  (let ([i (-> p length)])
+    (while (and (> i 0) (!= (@ p (- i 1)) #\/)) (-= i 1))
+    (slice p i)))
+
+(define (stem-of [p string]) -> string (let ([b (base-of p)]) (if (ends? b ".sub") (slice b 0 (- (-> b length) 4)) b)))
+
+;; option gives the value after flag in args, or "", and removing takes args without it.
+(define (option [args (slice string)] [flag string]) -> string
+  (for ([i u32 0]) (< (+ i 1) (-> args length)) (+= i 1) (when (== (@ args i) flag) (return (@ args (+ i 1)))))
+  "")
+
+(define (without [args (slice string)] [flag string] [valued bool]) -> (slice string)
+  (let ([out (cast (ptr string) (arena-alloc (& a) (* (-> args length) (sizeof string))))] [n u32 0] [i u32 0])
+    (while (< i (-> args length))
+      (if (== (@ args i) flag)
+          (+= i (if valued 2 1))
+          (begin
+            (set! (@ out n) (@ args i))
+            (+= n 1)
+            (+= i 1))))
+    (slice out n)))
+
+;; ---- building ----
+
+;; prepare! gives the compiler the module map for the program in file, from /, and gives where its programs are built
+;; when no -o says: build/ in its package, or in its own directory outside packages.
+(define (prepare! [file string]) -> string
+  (let ([m manifest] [dir (make-buffer)] [err (make-buffer)] [text (make-buffer)] [found i32 0] [package string])
+    (when (toolchain-file? file) (return (joined-path (parent-of file) "build")))
+    (set! found (manifest-find (& a) file (& m) (& dir) (& err)))
+    (when (< found 0) (failed! (buffer-string (& err))))
+    (when (== found 0) (return (joined-path (parent-of file) "build")))
+    (set! package (if (== found 1) (parent-of file) (buffer-string (& dir))))
+    (unless (package-map (& a) package (if (== found 1) (base-of file) "") (& m) (& text) (& err))
+      (failed! (buffer-string (& err))))
+    (set-module-map-text! (string->datum (buffer-string (& text))) '"the module map")
+    (joined-path package "build")))
+
+;; toolchain-file? is whether file is in one of the toolchain's packages, which the compiler knows.
+(define (toolchain-file? [file string]) -> bool
+  (or (starts? file (joined-path root "host/")) (starts? file (joined-path root "compiler/"))
+      (starts? file (joined-path root "std/"))))
+
+(define (flag? [args (slice string)] [flag string]) -> bool
+  (for ([i u32 0]) (< i (-> args length)) (+= i 1) (when (== (@ args i) flag) (return #t)))
+  #f)
+
+(define (cache! [args (slice string)])
+  (let ([given (option args "-c")] [from-env string] [dir string])
+    (set! dir (cond [(> (-> given length) 0) (absolute given)]
+                    [(env-get "SUBSTRATE_CACHE" (& from-env) 0) (absolute from-env)]
+                    [else (joined-path root "build/cache")]))
+    (make-dir (string->datum dir))
+    (set-cache-directory! (string->datum dir))))
+
+;; build! builds the program in file into out, or, when out is "", into build/ as prepare! says, and gives where.
+(define (build! [file string] [out string] [strip bool]) -> string
+  (let* ([full (absolute file)] [base (prepare! full)] [dir (if (> (-> out length) 0) (absolute out) (joined-path base (stem-of full)))])
+    (write-program! (string->datum full) (string->datum dir) strip)
+    dir))
+
+(define (build-command! [args (slice string)])
+  (let ([plain (without (without (without args "-o" #t) "-c" #t) "-s" #f)])
+    (unless (== (-> plain length) 1) (usage))
+    (cache! args)
+    (build! (@ plain 0) (option args "-o") (flag? (without (without args "-o" #t) "-c" #t) "-s"))))
+
+;; ---- running ----
+
+;; become! makes this process the host running a program, given its arguments: the grants, the program and its own.
+(define (become! [args (slice string)])
+  (let ([argv (cast (ptr string) (arena-alloc (& a) (* (+ (-> args length) 1) (sizeof string))))] [why string])
+    (set! (@ argv 0) (joined-path root "host/subhost.mjs"))
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (set! (@ argv (+ i 1)) (@ args i)))
+    (process-exec "node" (slice argv (+ (-> args length) 1)) (& why))
+    (failed! why)))
+
+;; run! builds a program from its file when given one, then becomes it with the grants given before it.
+(define (run! [args (slice string)])
+  (let ([i u32 0] [copy (cast (ptr string) (arena-alloc (& a) (* (-> args length) (sizeof string))))])
+    (while (and (< i (-> args length)) (starts? (@ args i) "-")) (+= i 1))
+    (when (>= i (-> args length)) (usage))
+    (for ([k u32 0]) (< k (-> args length)) (+= k 1) (set! (@ copy k) (@ args k)))
+    (when (ends? (@ args i) ".sub")
+      (cache! (slice args 0 0))
+      (set! (@ copy i) (build! (@ args i) "" #f)))
+    (become! (slice copy (-> args length)))))
+
+;; serve! builds cmd/serve.sub and becomes it, granted reading its directory and listening at its address.
+(define (serve! [args (slice string)])
+  (let* ([address "127.0.0.1"] [dir "."] [k u32 0] [n (-> args length)] [granted (make-buffer)] [listen (make-buffer)]
+         [argv (cast (ptr string) (arena-alloc (& a) (* (+ (* n 2) 5) (sizeof string))))] [m u32 0])
+    (while (< k n)
+      (let ([x (@ args k)])
+        (cond [(== x "-l") (+= k 1) (when (< k n) (set! address (@ args k)))]
+              [(== x "-t") (+= k 2)]
+              [(== x "-z") (+= k 1)]
+              [else (break)]))
+      (+= k 1))
+    (when (< k n) (set! dir (@ args k)))
+    (buffer-add-string! (& granted) "-R=")
+    (for ([i u32 0]) (< i (-> dir length)) (+= i 1)
+      (when (== (@ dir i) #\,) (buffer-add-byte! (& granted) #\,))
+      (buffer-add-byte! (& granted) (cast i32 (@ dir i))))
+    (buffer-add-string! (& listen) "-N=")
+    (if (and (> (-> address length) 0) (has-colon? address))
+        (begin
+          (buffer-add-byte! (& listen) #\[)
+          (buffer-add-string! (& listen) (unbracketed address))
+          (buffer-add-byte! (& listen) #\]))
+        (buffer-add-string! (& listen) address))
+    (set! (@ argv m) (buffer-string (& granted)))
+    (set! (@ argv (+ m 1)) (buffer-string (& listen)))
+    (+= m 2)
+    (let ([t (option args "-t")] [key-at u32 0])
+      (when (> (-> t length) 0)
+        (for ([i u32 0]) (< i n) (+= i 1) (when (== (@ args i) "-t") (set! key-at (+ i 2))))
+        (set! (@ argv m) (joined "--tls-cert=" t))
+        (set! (@ argv (+ m 1)) (joined "--tls-key=" (if (< key-at n) (@ args key-at) "")))
+        (+= m 2)))
+    (cache! (slice args 0 0))
+    (set! (@ argv m) (build! (joined-path root "cmd/serve.sub") (joined-path root "build/serve") #f))
+    (+= m 1)
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (set! (@ argv m) (@ args i))
+      (+= m 1))
+    (become! (slice argv m))))
+
+(define (joined [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+(define (has-colon? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) #\:) (return #t)))
+  #f)
+
+(define (unbracketed [s string]) -> string
+  (let ([from (if (starts? s "[") 1 0)] [to (if (ends? s "]") (- (-> s length) 1) (-> s length))]) (slice s from to)))
+
+;; ---- packing and sites ----
+
+(define (pack! [args (slice string)])
+  (let ([to (option args "-o")] [from (option args "-C")] [paths (without (without args "-o" #t) "-C" #t)]
+        [err (make-buffer)])
+    (when (or (== (-> to length) 0) (== (-> paths length) 0)) (usage))
+    (unless (pack-files (if (== (-> from length) 0) "." from) paths to (& err)) (failed! (buffer-string (& err))))))
+
+(define (kind-of [path string]) -> i32
+  (let ([info fs-info]) (if (< (fs-stat path (& info) 0) 0) 0 (-> info kind))))
+
+(define (made! [path string])
+  (let ([why string]) (when (< (fs-make-dir path (& why)) 0) (failed! why))))
+
+(define (copied! [from string] [to string])
+  (let ([why string]) (when (< (fs-copy from to (& why)) 0) (failed! why))))
+
+(define (names-in [dir string]) -> (slice string)
+  (let ([names (slice string)] [why string])
+    (when (< (fs-list dir (& names) (& why)) 0) (failed! why))
+    names))
+
+;; copy-tree! copies the directory from into to, following links, and adds each file's path, from base, to files.
+(define (copy-tree! [from string] [to string] [base string] [files (ptr buffer)])
+  (let ([names (names-in from)])
+    (made! to)
+    (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+      (let* ([name (@ names i)] [f (joined-path from name)] [t (joined-path to name)] [b (joined-path base name)])
+        (if (== (kind-of f) fs-directory)
+            (copy-tree! f t b files)
+            (begin
+              (copied! f t)
+              (buffer-add! files (slice (cast (ptr u8) (& b)) (sizeof string)))))))))
+
+(define (copy-modules! [from string] [to string])
+  (let ([names (names-in from)])
+    (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+      (let ([name (@ names i)])
+        (when (and (ends? name ".mjs") (== (kind-of (joined-path from name)) fs-file))
+          (copied! (joined-path from name) (joined-path to name)))))))
+
+(define (written! [path string] [b (slice u8)])
+  (let ([why string]) (when (< (fs-write-file path b (& why)) 0) (failed! why))))
+
+;; site! builds a web site into out from a program's file, or from a directory build wrote: the program, the host's
+;; page modules, the page, the files -f packs from the toolchain's directory, and the assets next to the file. It
+;; replaces out only when out holds a .site file.
+(define (site! [args (slice string)])
+  (when (< (-> args length) 2) (usage))
+  (let ([out (@ args 0)] [file (@ args 1)] [page (joined-path root "host/web/page.html")] [k u32 2]
+        [files (make-buffer)] [list (make-buffer)] [err (make-buffer)] [why string])
+    (when (and (!= (kind-of out) 0)
+               (or (!= (kind-of out) fs-directory)
+                   (and (> (-> (names-in out) length) 0) (!= (kind-of (joined-path out ".site")) fs-file))))
+      (failed! (joined (joined "site: " out) " is not a site, so it is not replaced")))
+    (when (and (!= (kind-of out) 0) (< (fs-remove out #t (& why)) 0)) (failed! why))
+    (made! (joined-path out "host/modules"))
+    (made! (joined-path out "host/web"))
+    (written! (joined-path out ".site") (cast (slice u8) (joined file "\n")))
+    (if (== (kind-of file) fs-directory)
+        (copy-tree! file (joined-path out "program") "" (& files))
+        (build! file (joined-path out "program") #f))
+    (while (< k (-> args length))
+      (let ([x (@ args k)])
+        (cond [(and (== x "-p") (< (+ k 1) (-> args length)))
+               (set! page (@ args (+ k 1)))
+               (+= k 2)]
+              [(and (== x "-f") (< (+ k 2) (-> args length)))
+               (let ([name (@ args (+ k 1))] [start (+ k 2)])
+                 (set! k start)
+                 (while (and (< k (-> args length)) (not (starts? (@ args k) "-"))) (+= k 1))
+                 (unless (pack-files root (slice args start k) (joined-path out (joined name ".pack")) (& err))
+                   (failed! (buffer-string (& err)))))]
+              [else (usage)])))
+    (let ([assets (joined-path (parent-of (absolute file)) "assets")] [found (make-buffer)])
+      (when (== (kind-of assets) fs-directory)
+        (copy-tree! assets (joined-path out "assets") "assets" (& found))
+        (let ([ps (cast (ptr string) (-> found bytes))] [n (/ (-> found length) (sizeof string))])
+          (for ([i u32 1]) (< i n) (+= i 1)
+            (let ([s (@ ps i)] [j i])
+              (while (and (> j 0) (< s (@ ps (- j 1))))
+                (set! (@ ps j) (@ ps (- j 1)))
+                (-= j 1))
+              (set! (@ ps j) s)))
+          (for ([i u32 0]) (< i n) (+= i 1)
+            (buffer-add-string! (& list) (@ ps i))
+            (buffer-add-byte! (& list) 10))))
+      (written! (joined-path out "assets.list") (buffer-bytes (& list))))
+    (copy-modules! (joined-path root "host") (joined-path out "host"))
+    (copy-modules! (joined-path root "host/modules") (joined-path out "host/modules"))
+    (copy-modules! (joined-path root "host/web") (joined-path out "host/web"))
+    (copied! page (joined-path out "index.html"))))
+
+;; ---- the commands ----
+
+(define (run [args (slice string)])
+  (when (< (-> args length) 2) (usage))
+  (set! root (@ args 0))
+  (set! a (make-arena))
+  (fs-cwd (& cwd) 0)
+  (set-repository-root! (string->datum root))
+  (install-core!)
+  (set-display-directory! (string->datum cwd))
+  (let ([command (@ args 1)] [rest (slice args 2 (-> args length))])
+    (cond [(== command "build") (build-command! rest)]
+          [(== command "run") (run! rest)]
+          [(and (or (== command "eval") (== command "expand")) (== (-> (without rest "-c" #t) length) 1))
+           (let ([file (absolute (@ (without rest "-c" #t) 0))])
+             (cache! rest)
+             (prepare! file)
+             (if (== command "eval")
+                 (begin
+                   (session-open! '"session")
+                   (session-eval-file! (string->datum file) (lambda ([e datum]) (host-write 2 (cast (slice u8) (datum->string e))))))
+                 (expand-module-file (string->datum file) (lambda ([f datum]) (print-expanded f)))))]
+          [(== command "site") (cache! (slice rest 0 0)) (site! rest)]
+          [(== command "serve") (serve! rest)]
+          [(== command "pack") (pack! rest)]
+          [else (usage)])))
+
+(define (main)
+  (try (run (host-args))
+       [catch compile-error (message blamed loc)
+        (let ([b (make-buffer)])
+          (write-error (& b) message blamed loc)
+          (host-write 2 (buffer-bytes (& b)))
+          (host-exit 1))]))
+
+;; The host calls on-trap with a trap's message.
+(define (on-trap [why (ptr u8)] [n u32]) -> bool
+  (host-write 2 (cast (slice u8) (datum->string (trap-report (cast string (slice why n))))))
+  (free why)
+  (host-exit 1)
+  #t)

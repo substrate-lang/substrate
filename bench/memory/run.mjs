@@ -124,8 +124,8 @@ let best = Infinity;
 for (let i = 0; i < Number(reps); i++) {
   fs.rmSync(`${out}/compiler`, { recursive: true, force: true });
   const t = performance.now();
-  const p = spawnSync(host, ['-A', `${root}/build/sub`, root, 'build', 'compiler/main.sub', '-o', `${out}/compiler`,
-    '-p', root, '-d', root], { cwd: root, encoding: 'utf8' });
+  const p = spawnSync(host, ['-A', `${root}/build/compiler`, root, 'build', 'compiler/main.sub', '-o', `${out}/compiler`,
+    '-d', root], { cwd: root, encoding: 'utf8' });
   if (p.status !== 0) throw new Error(`the compiler's build failed: ${p.stderr}`);
   best = Math.min(best, performance.now() - t);
 }

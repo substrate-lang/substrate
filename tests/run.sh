@@ -186,7 +186,7 @@ mkdir -p "$changed/host"
 cp host/fs.sub "$changed/host/"
 cp tests/substrate/forms.sub "$changed/tests/substrate/"
 from_changed() {
-  "$host" -R -W "$root/build/sub" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
+  "$host" -R -W "$root/build/compiler" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
     -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
 }
 echo ';; changed' >> "$changed/compiler/substrate.sub"

@@ -74,6 +74,18 @@ export function processes(grants, loader) {
         });
         return id;
       },
+      exec(pp, pl, ap, al, err) {
+        try {
+          const program = caller.string(pp, pl);
+          const env = globalThis.process.env;
+          const file = programFile(program, undefined, env.PATH ?? '/usr/bin:/bin');
+          if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
+          globalThis.process.execve(file ?? program, [program, ...entries(caller.string(ap, al))], env);
+        } catch (e) {
+          caller.fail(err, e.message);
+        }
+        return -1;
+      },
       stdin(id) {
         const c = children.get(id);
         return c ? c.stdin : 0;

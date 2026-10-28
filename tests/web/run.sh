@@ -11,7 +11,7 @@ rm -rf "${sites:?}"
 bin/sub expand build/empty.sub > /dev/null
 
 site="$sites/session"
-bin/sub site "$site" build/sub -p tests/web/session.html \
+bin/sub site "$site" build/compiler -p tests/web/session.html \
   -f files $(find compiler host std/languages/scheme std/languages/bend tests/session -name '*.sub' | sort) std/languages/nodes.sub \
   std/encoding/utf8.sub
 status=0
