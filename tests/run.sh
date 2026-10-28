@@ -212,16 +212,17 @@ else
   fail=$((fail + 1))
   echo "FAIL an edit: got $total, with $compiled modules compiled again, not 3"
 fi
-# sub builds a program into build/ of its package, or of its directory outside packages, and runs it with its
-# arguments and exit code.
+# sub builds a program into build/ of its package, or of its directory outside packages, and runs it as the host does,
+# with the host's stack, its arguments and its exit code.
 ran="$builds/ran"
 rm -rf "${ran:?}"
 mkdir -p "$ran"
-printf '(define (main) (printf "~a~n" (-> (host-args) length)) (host-exit 4))\n' > "$ran/count.sub"
+printf '(define (depth [n i32]) -> i32 (if (== n 0) 0 (+ 1 (depth (- n 1)))))\n' > "$ran/count.sub"
+printf '(define (main) (printf "~a ~a~n" (-> (host-args) length) (depth 25000)) (host-exit 4))\n' >> "$ran/count.sub"
 counted="$(cd "$ran" && "$root/bin/sub" run count.sub a b c 2>&1)"
 code=$?
 bin/sub build "$moved/one/app/app.sub" -c "$cache" > /dev/null 2>&1
-if [ "$counted" = 3 ] && [ $code -eq 4 ] && [ -f "$ran/build/count/program" ] && [ -f "$moved/one/app/build/app/program" ]; then
+if [ "$counted" = "3 25000" ] && [ $code -eq 4 ] && [ -f "$ran/build/count/program" ] && [ -f "$moved/one/app/build/app/program" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
