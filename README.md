@@ -13,8 +13,9 @@ compiler is written in it, builds itself, and runs in a browser.
   `wasm.sub` gives wasm's forms as `wasm:name`, and `syntax.sub` and
   `macros.sub` hold the data and tools macros work with. `link.sub` makes
   a C side module a module of the program. The compiler builds a program
-  from one file and a module map, which gives the packages its modules are
-  in and the names each uses; it knows host, compiler and std itself.
+  from one file and a module map, which gives roots, each a label and a
+  directory, and the names each root uses; it knows host, compiler and std
+  itself. A command may give it a check for each module it reads.
 - `std/`: the standard library, written in Substrate. `languages/` holds
   the languages built on it, `scheme/`, a Scheme, and `bend/`, a
   dependently typed language, with `nodes.sub`, the run-time nodes they
@@ -50,7 +51,13 @@ and `sqlite` and `sqlite/vfs` a dependency's, its main module and another.
 A dependency may pin its package's hash, `(hash "sha256:...")`, which sub
 checks. A program may start with a `(package ...)` form of its own, which
 makes it a package of one file. Code under no manifest uses the
-toolchain's names and files by path.
+toolchain's names and its own files by path.
+
+A package builds only from its files, the ones its hash covers: not from
+dot-files, its build/, links, or the directories of packages inside it.
+A package with C gives other packages typed functions in a binding
+module, as `packages/sqlite/sqlite.sub` does, rather than the C functions
+themselves.
 
 A module is known by its package's name and its path there, so a package
 builds into the same program wherever it is.
@@ -66,6 +73,8 @@ In the dev shell (`nix develop`):
     bin/sub site OUT FILE                       # a web site for a page program
     bin/sub serve OUT                           # serve it locally
     bin/sub pack -o OUT PATH ...                # files packed for a page
+    bin/sub hash [DIR]                          # the hash of DIR's package, to pin it
+    bin/sub map FILE                            # the module map FILE's program is built with
     make check                                  # the tests
     tests/web/run.sh                            # the browser tests
     make bootstrap                              # the compiler builds itself into the same bytes

@@ -30,7 +30,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 
 tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
        tests/crypto/*.sub tests/encoding/*.sub tests/meta/*.sub tests/log/*.sub tests/compress/*.sub tests/cmd/*.sub
-       tests/packages/*.sub tests/packages/cside/tests/*.sub tests/sqlite/*.sub)
+       tests/packages/*.sub tests/packages/cside/tests/*.sub tests/packages/bounds/*.sub tests/sqlite/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   [ "$name" = package ] && continue
@@ -227,6 +227,35 @@ if [ "$counted" = "3 25000" ] && [ $code -eq 4 ] && [ -f "$ran/build/count/progr
 else
   fail=$((fail + 1))
   echo "FAIL sub run: got $counted and exit $code, or a program not in build/"
+fi
+# A package builds only from the files its hash covers: not from its build/, nor through a link.
+own="$builds/own"
+rm -rf "${own:?}"
+mkdir -p "$own/p/build"
+printf '(package p (version "0.1.0"))\n' > "$own/p/package.sub"
+printf '(provide y)\n(define (y) -> i32 1)\n' > "$own/p/build/y.sub"
+printf '(provide z)\n(define (z) -> i32 1)\n' > "$own/z.sub"
+ln -s ../z.sub "$own/p/z.sub"
+printf '(require y "build/y.sub")\n(define (main) (printf "~a~n" (y:y)))\n' > "$own/p/built.sub"
+printf '(require z "z.sub")\n(define (main) (printf "~a~n" (z:z)))\n' > "$own/p/linked.sub"
+from_build="$(bin/sub build "$own/p/built.sub" -c "$cache" 2>&1)"
+from_link="$(bin/sub build "$own/p/linked.sub" -c "$cache" 2>&1)"
+if [[ "$from_build" == *'"build/y.sub" is not one of the files of p'* ]] &&
+   [[ "$from_link" == *'"z.sub" is not one of the files of p'* ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a package's own files: got $from_build and $from_link"
+fi
+# sub hash prints the hash a dependency pins, and sub map the module map a program is built with.
+hashed="$(bin/sub hash tests/packages/maps/lib 2>&1)"
+mapped="$(bin/sub map tests/packages/names.sub 2>&1)"
+if [ "$hashed" = "$(grep -o 'sha256:[0-9a-f]\{64\}' tests/packages/package-library.out | head -1)" ] &&
+   [[ "$mapped" == *'(root names "'*'(uses (tools tools) (app app)))'* ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub hash and map: got $hashed and $mapped"
 fi
 # A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
