@@ -36,15 +36,6 @@ export function fsModule(files) {
     };
     const bytesAt = (ptr, len) => caller.memory().subarray(caller.u(ptr), caller.u(ptr) + len);
     return {
-      read_file(pp, pl, out, err) {
-        const path = caller.string(pp, pl);
-        return attempt(path, err, () => caller.give(files.read(path), out), 0);
-      },
-      write_file(pp, pl, ptr, len, err) {
-        const path = caller.string(pp, pl);
-        const bytes = caller.memory().slice(caller.u(ptr), caller.u(ptr) + len);
-        return attempt(path, err, () => (files.write(path, bytes), 0));
-      },
       make_dir(pp, pl, err) {
         const path = caller.string(pp, pl);
         return attempt(path, err, () => (files.makeDir(path), 0));
@@ -53,7 +44,7 @@ export function fsModule(files) {
         const path = caller.string(pp, pl);
         const r = attempt(path, err, () => files.info(path, follow !== 0), [0, 0, 0, 0]);
         if (r !== null) return r;
-        caller.fail(err, `${path}: No such file or directory`);
+        if (err !== 0) attempt(path, err, () => files.info(path, follow !== 0, true));
         return [0, 0, 0, 0];
       },
       list(pp, pl, out, err) {
@@ -73,17 +64,35 @@ export function fsModule(files) {
         const to = caller.string(tp, tl);
         return attempt(from, err, () => (files.rename(from, to), 0));
       },
-      open(pp, pl, mode, tag, err, start = 0) {
-        const path = caller.string(pp, pl);
-        return attempt(path, err, () => caller.streams.add(tag, files.open(path, mode, start)), 0);
-      },
       open_file(pp, pl, flags, err) {
         const path = caller.string(pp, pl);
+        const write = (flags & 2) !== 0;
+        const append = (flags & 4) !== 0;
+        const how = {
+          read: (flags & 1) !== 0 || !(write || append), write, append, truncate: (flags & 8) !== 0,
+          create: (flags & 16) !== 0, createNew: (flags & 32) !== 0,
+        };
         return attempt(path, err, () => {
-          const file = files.openFile(path, (flags & 1) !== 0, (flags & 2) !== 0, (flags & 4) !== 0);
+          const file = files.openFile(path, how);
           handles.set(next, { path, file });
           return next++;
         }, 0);
+      },
+      file_stream(h, write, start, tag, err) {
+        const open = handles.get(h);
+        if (!open) {
+          caller.fail(err, `file ${h}: Bad file descriptor`);
+          return 0;
+        }
+        handles.delete(h);
+        try {
+          return caller.streams.add(tag, open.file.stream(start, write !== 0));
+        } catch (e) {
+          if (e instanceof WebAssembly.RuntimeError) throw e;
+          attempt(open.path, 0, () => open.file.close());
+          caller.fail(err, `${open.path}: ${e.message}`);
+          return 0;
+        }
       },
       read_at: (h, ptr, len, at, err) => using(h, err, (file) => file.read(bytesAt(ptr, len), at)),
       write_at: (h, ptr, len, at, err) => using(h, err, (file) => (file.write(bytesAt(ptr, len), at), 0)),

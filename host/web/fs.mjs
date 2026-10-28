@@ -17,16 +17,6 @@ const missing = () => new Error('No such file or directory');
 const unsupported = () => new Error('Operation not supported');
 const under = (dir) => (dir === '/' ? '/' : `${dir}/`);
 
-function concat(chunks) {
-  const bytes = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
-  let at = 0;
-  for (const c of chunks) {
-    bytes.set(c, at);
-    at += c.length;
-  }
-  return bytes;
-}
-
 export function pageFiles(files, cwd, grants) {
   const times = new Map();
   const at = (k, p, tree = false) => {
@@ -71,15 +61,63 @@ export function pageFiles(files, cwd, grants) {
     if (r === null) throw missing();
     return r;
   };
+  const opened = (key, how) => {
+    const writes = how.write || how.append;
+    const readable = () => {
+      if (!how.read) throw new Error('Bad file descriptor');
+    };
+    const writable = () => {
+      if (!writes) throw new Error('Bad file descriptor');
+    };
+    const file = {
+      read(bytes, from) {
+        readable();
+        const all = content(key);
+        const n = Math.max(0, Math.min(bytes.length, all.length - from));
+        bytes.set(all.subarray(from, from + n));
+        return n;
+      },
+      write(bytes, from) {
+        writable();
+        const at = how.append ? content(key).length : from;
+        resized(key, Math.max(at + bytes.length, content(key).length)).set(bytes, at);
+      },
+      setSize(n) {
+        writable();
+        resized(key, n);
+      },
+      sync() {},
+      size: () => content(key).length,
+      close() {},
+      stream(start, write) {
+        if (!write) {
+          readable();
+          let given = false;
+          return { pull: async () => (given ? null : ((given = true), content(key).slice(start))), close() {} };
+        }
+        writable();
+        let at = start;
+        const source = {
+          write(bytes) {
+            file.write(bytes, at);
+            at += bytes.length;
+            return true;
+          },
+          finish() {
+            source.finished();
+          },
+          close() {},
+        };
+        return source;
+      },
+    };
+    return file;
+  };
   return {
-    read,
-    write(p, bytes) {
-      keep(at('write', p), bytes);
-    },
     makeDir(p) {
       at('write', p);
     },
-    info: (p) => found(at('read', p)),
+    info: (p, follow, why) => (why === true ? info(at('read', p)) : found(at('read', p))),
     list(p) {
       const prefix = under(at('read', p));
       const names = new Set();
@@ -137,62 +175,21 @@ export function pageFiles(files, cwd, grants) {
       throw new Error(`too many temporary ${file ? 'files' : 'directories'} exist`);
     },
     cwd: () => cwd,
-    open(p, mode, start = 0) {
-      if (mode === 0) {
-        const bytes = read(p).slice(start);
-        let given = false;
-        return { pull: async () => (given ? null : ((given = true), bytes)), close() {} };
-      }
-      const key = at('write', p);
-      const chunks = mode === 2 && files.has(key) ? [files.get(key)] : [];
-      const save = () => keep(key, concat(chunks));
-      const source = {
-        write(bytes) {
-          chunks.push(bytes);
-          return true;
-        },
-        finish() {
-          save();
-          source.finished();
-        },
-        close: save,
-      };
-      return source;
-    },
-    openFile(p, write, create, createNew) {
-      const key = at(write ? 'write' : 'read', p);
-      if (write) at('read', p);
+    openFile(p, how) {
+      const changes = how.write || how.append || how.truncate || how.create || how.createNew;
+      const key = at(changes ? 'write' : 'read', p);
+      if (how.read && changes) at('read', p);
       if (files.has(key)) {
-        if (createNew) throw new Error('File already exists');
+        if (how.createNew) throw new Error('File already exists');
       } else if (inside(key).length > 0) {
         throw new Error('Illegal operation on a directory');
-      } else if (create || createNew) {
+      } else if (how.create || how.createNew) {
         keep(key, new Uint8Array(0));
       } else {
         throw missing();
       }
-      const writable = () => {
-        if (!write) throw new Error('Bad file descriptor');
-      };
-      return {
-        read(bytes, from) {
-          const all = content(key);
-          const n = Math.max(0, Math.min(bytes.length, all.length - from));
-          bytes.set(all.subarray(from, from + n));
-          return n;
-        },
-        write(bytes, from) {
-          writable();
-          resized(key, Math.max(from + bytes.length, content(key).length)).set(bytes, from);
-        },
-        setSize(n) {
-          writable();
-          resized(key, n);
-        },
-        sync() {},
-        size: () => content(key).length,
-        close() {},
-      };
+      if (how.truncate) resized(key, 0);
+      return opened(key, how);
     },
   };
 }
