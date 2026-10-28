@@ -12,7 +12,7 @@
 (require-unqualified link "link.sub")
 
 (provide set-repository-root! set-package-root! install-core! compile-module-file expand-module-file
-         content-hash wasm-module program-wasm-modules check-supplied! trap-report host-error
+         content-hash wasm-module program-wasm-modules trap-report host-error
          set-cache-directory!
          session-open! session-eval! session-eval-text! session-eval-file! session-error session-recover!)
 
@@ -754,8 +754,8 @@
     (and (> (-> s length) 5) (== (slice s (- (-> s length) 5) (-> s length)) ".wasm"))))
 
 ;; wasm-file-unit makes the side module at path a module: it requires the prelude, which it is linked against, and
-;; provides its functions with their own types, and the global supply:name of each it imports by name, which supply
-;; sets.
+;; provides its functions with their own types; it also defines the global supply:name of each function it imports by
+;; name, which supply sets.
 (define (wasm-file-unit [path datum] [key u64]) -> datum
   (let* ([bytes (file-bytes (package-file path))] [prelude datum 0] [m datum 0] [u (ptr unit) 0] [instance datum 0]
          [linked datum 0] [provides nil] [infos nil] [info datum 0])
@@ -781,9 +781,7 @@
               (wasm-module-exports (datum->bytes (car linked))))
     (for-each (lambda ([h datum])
                 (let ([export (format "supply:~a" (list1 h))])
-                  (set! info (global-info (symbol-of export) 'i32 (boolean #t) instance export))
-                  (set! infos (cons info infos))
-                  (set! provides (cons (cons (symbol-of export) `(global ,info)) provides))))
+                  (set! infos (cons (global-info (symbol-of export) 'i32 (boolean #t) instance export) infos))))
               (cadr linked))
     (set! (-> u infos) (keep infos))
     (set! (-> u provides) (keep (sort provides (lambda ([a datum] [b datum]) -> bool (symbol<? (car a) (car b))))))
@@ -900,7 +898,21 @@
     (set! (-> l imports) (keep (cadr compiled)))
     (set! (-> l scopes) (keep (caddr compiled)))
     (set! (-> l next) (-> u wasm-modules))
-    (set! (-> u wasm-modules) l)))
+    (set! (-> u wasm-modules) l)
+    (when (== phase 0) (note-supplies! m (car compiled)))))
+
+;; suppliers pairs each (module . supply:name) global a module imports, the slot of a function it supplies, with the
+;; module.
+(define suppliers datum nil)
+
+(define (note-supplies! [m datum] [bytes datum])
+  (let ([l (wasm-module-import-fields (datum->bytes bytes))])
+    (while (pair? l)
+      (when (supply-field? (cdr (car l))) (set! suppliers (keep-cons (keep (cons (car l) m)) suppliers)))
+      (set! l (cdr l)))))
+
+(define (supply-field? [f datum]) -> bool
+  (let ([s (datum->string f)]) (and (> (-> s length) 7) (== (slice s 0 7) "supply:"))))
 
 (define (wasm-module-of [m datum] [phase i32]) -> (ptr wasm-module)
   (let ([l (-> (unit-of m) wasm-modules)])
@@ -995,25 +1007,6 @@
     (set! out (visit-wasm-modules m seen out))
     (reverse out)))
 
-;; check-supplied! refuses a program in which a function a C module calls by name is supplied by none of its modules.
-(define (check-supplied! [modules datum])
-  (let ([imported nil] [l modules])
-    (while (pair? l)
-      (set! imported (append (wasm-module-import-fields (datum->bytes (cdr (car l)))) imported))
-      (set! l (cdr l)))
-    (set! l modules)
-    (while (pair? l)
-      (let* ([name (car (car l))] [owner (instance-unit name)]
-             [ps (if (and (!= owner 0) (wasm-file? (-> (unit-of owner) path))) (-> (unit-of owner) provides) nil)])
-        (while (pair? ps)
-          (let ([v (cdr (car ps))])
-            (when (and (== (car v) 'global) (== (member (cons name (global-info-export (cadr v))) imported) 0))
-              (fail-at 0 "~a calls ~a by name, and no module in the program supplies it"
-                       `(,(-> (unit-of owner) path) ,(substring (global-info-export (cadr v)) 7
-                                                               (-> (datum->string (global-info-export (cadr v))) length))))))
-          (set! ps (cdr ps))))
-      (set! l (cdr l)))))
-
 (define (visit-wasm-modules [m datum] [seen (ptr hash-table)] [out datum]) -> datum
   (let ([name (wasm-module-name m 0 0)])
     (when (!= (datum-get seen name) 0) (return out))
@@ -1022,7 +1015,35 @@
       (while (pair? imports)
         (set! out (visit-import (car imports) seen out))
         (set! imports (cdr imports)))
-      (cons (cons name (-> p bytes)) out))))
+      (visit-suppliers m name seen (cons (cons name (-> p bytes)) out)))))
+
+;; visit-suppliers adds the module that supplies each function the C module m calls by name, as a linker adds the
+;; object that defines a symbol another needs.
+(define (visit-suppliers [m datum] [name datum] [seen (ptr hash-table)] [out datum]) -> datum
+  (let ([l (if (wasm-file? (-> (unit-of m) path)) (-> (unit-of m) infos) nil)] [found nil] [export datum 0])
+    (while (pair? l)
+      (when (global-info? (car l))
+        (set! export (global-info-export (car l)))
+        (set! found (supplying name export))
+        (cond [(null? found)
+               (fail-at 0 "~a calls ~a by name, and no module supplies it" `(,(-> (unit-of m) path) ,(supplied-name export)))]
+              [(pair? (cdr found))
+               (fail-at 0 "~a calls ~a by name, and both ~a and ~a supply it"
+                        `(,(-> (unit-of m) path) ,(supplied-name export) ,(-> (unit-of (car found)) path)
+                          ,(-> (unit-of (cadr found)) path)))]
+              [else (set! out (visit-wasm-modules (car found) seen out))]))
+      (set! l (cdr l)))
+    out))
+
+(define (supplying [name datum] [export datum]) -> datum
+  (let ([l suppliers] [out nil])
+    (while (pair? l)
+      (when (and (equal? (car (car (car l))) name) (equal? (cdr (car (car l))) export) (== (memq (cdr (car l)) out) 0))
+        (set! out (cons (cdr (car l)) out)))
+      (set! l (cdr l)))
+    out))
+
+(define (supplied-name [export datum]) -> datum (substring export 7 (-> (datum->string export) length)))
 
 (define (visit-import [imp datum] [seen (ptr hash-table)] [out datum]) -> datum
   (let ([l (wasm-module-ref imp)])
@@ -1715,10 +1736,9 @@
 (define (supply-slot [info datum]) -> datum
   (let* ([instance (func-info-instance info)] [owner (if (string? instance) (instance-unit instance) 0)]
          [export (format "supply:~a" (list1 (func-info-export info)))]
-         [l (if (== owner 0) nil (-> (unit-of owner) provides))])
+         [l (if (== owner 0) nil (-> (unit-of owner) infos))])
     (while (pair? l)
-      (let ([v (cdr (car l))])
-        (when (and (== (car v) 'global) (equal? (global-info-export (cadr v)) export)) (return (cadr v))))
+      (when (and (global-info? (car l)) (equal? (global-info-export (car l)) export)) (return (car l)))
       (set! l (cdr l)))
     0))
 
