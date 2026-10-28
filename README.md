@@ -11,8 +11,8 @@ compiler is written in it, builds itself, and runs in a browser.
   phases and macros that run at compile time. `checker.sub` checks and
   lowers Substrate's other forms. `substrate.sub` is the default language,
   `wasm.sub` gives wasm's forms as `wasm:name`, and `syntax.sub` and
-  `macros.sub` hold the data and tools macros work with. `link.sub` links
-  a package's wasm module into a program.
+  `macros.sub` hold the data and tools macros work with. `link.sub` makes
+  a C side module a module of the program.
 - `std/`: the standard library, written in Substrate. `languages/` holds
   the languages built on it, `scheme/`, a Scheme, and `bend/`, a
   dependently typed language, with `nodes.sub`, the run-time nodes they

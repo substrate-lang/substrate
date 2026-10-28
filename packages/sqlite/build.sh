@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# sqlite3.wasm, a side module, from SQLite's amalgamation, os.c and the C library's string functions, in the dev
-# shell: nix develop -c packages/sqlite/build.sh
+# sqlite3.wasm, a side module, from SQLite's amalgamation and the C library's string functions, in the dev shell:
+# nix develop -c packages/sqlite/build.sh
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 pieces="$root/build/sqlite-libc"
@@ -13,4 +13,4 @@ wasm32-unknown-wasi-clang -O2 -fPIC -fvisibility=default -nostdlib -shared -Wl,-
   -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=0 -DSQLITE_TEMP_STORE=2 -DSQLITE_OMIT_LOAD_EXTENSION \
   -DSQLITE_OMIT_LOCALTIME -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_OMIT_DEPRECATED -DSQLITE_DEFAULT_MEMSTATUS=0 \
   -DSQLITE_DQS=0 -DSQLITE_LIKE_DOESNT_MATCH_BLOBS \
-  -I"$SQLITE_AMALGAMATION" -o sqlite3.wasm "$SQLITE_AMALGAMATION/sqlite3.c" os.c "$pieces"/*.o
+  -o sqlite3.wasm "$SQLITE_AMALGAMATION/sqlite3.c" "$pieces"/*.o

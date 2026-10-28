@@ -12,12 +12,12 @@
 (require-unqualified link "link.sub")
 
 (provide set-repository-root! set-package-root! install-core! compile-module-file expand-module-file
-         content-hash wasm-module program-wasm-modules package-module-names package-kept trap-report host-error
+         content-hash wasm-module program-wasm-modules check-supplied! trap-report host-error
          set-cache-directory!
          session-open! session-eval! session-eval-text! session-eval-file! session-error session-recover!)
 
 (define core-forms datum
-  '(func global import memory table tag define-syntax begin-for-syntax
+  '(func global import supply memory table tag define-syntax begin-for-syntax
            begin require require-unqualified language provide set! let let* if block loop br br-if br-table
            return
            call-indirect func-index select drop values unreachable nop
@@ -624,13 +624,8 @@
         (set! (@ digits k) (if (< d 10) (+ 48 d) (+ 87 d)))))
     (string->datum (cast string (slice digits)))))
 
-;; A manifest with a wasm module is part of the hash of its package's modules, with the wasm module's own hash, since it
-;; gives their imports meaning.
 (define (module-hash [path datum] [text datum] [requires datum]) -> datum
-  (let* ([m (manifest-at (directory-path (absolute-of path)))]
-         [parts (if (or (== m 0) (== (manifest-wasm m) 0))
-                    `(,path ,text)
-                    `(,path ,text ,(manifest-text m) ,(manifest-wasm-hash m)))])
+  (let ([parts `(,path ,text)])
     (while (pair? requires)
       (set! parts (append parts `(,(car (car requires)) ,(format "~a" (list1 (cadr (car requires)))))))
       (set! requires (cdr requires)))
@@ -651,24 +646,27 @@
 
 ;; ---- packages ----
 
-;; A manifest is package.sub at a package's root, or a program's first form: (package name clause ...), with the
-;; clauses (version "v") and (wasm "file"). As read, it is (text name wasm hash), wasm the file with hash its content
-;; hash, or 0. manifests holds what each directory's package has.
-(define manifests hash-table)
-(define inline-manifests hash-table)
+;; A manifest is package.sub at a package's root, or a program's first form: (package name clause ...), with the clause
+;; (version "v"). It declares a package; the compiler checks only a program's own, which it leaves out of the code.
+(define (check-manifest! [form datum])
+  (let ([d (syntax->datum form)] [cs datum 0])
+    (unless (and (pair? d) (equal? (car d) 'package) (pair? (cdr d)) (symbol? (cadr d)))
+      (fail-at form "expected (package name clause ...)" nil))
+    (set! cs (cddr d))
+    (while (pair? cs)
+      (let ([c (car cs)])
+        (unless (and (pair? c) (equal? (car c) 'version) (pair? (cdr c)) (string? (cadr c)) (null? (cddr c)))
+          (fail-at form "a package's clause is (version \"v\"), not ~s" (list1 c))))
+      (set! cs (cdr cs)))))
 
-(define (manifest-text [m datum]) -> datum (car m))
-(define (manifest-name [m datum]) -> datum (cadr m))
-(define (manifest-wasm [m datum]) -> datum (caddr m))
-(define (manifest-wasm-hash [m datum]) -> datum (cadddr m))
-
-(define (absolute-of [path datum]) -> datum (resolve-segments (package-file path)))
-
-(define (directory-path [path datum]) -> datum
-  (let ([slash (last-byte-index path #\/)])
-    (cond [(> slash 0) (substring path 0 (cast u32 slash))]
-          [(== slash 0) '"/"]
-          [else '""])))
+;; program-forms gives a module's forms without a first (package ...) form.
+(define (program-forms [forms datum]) -> datum
+  (let ([d (if (pair? forms) (syntax->datum (car forms)) 0)])
+    (if (and (pair? d) (equal? (car d) 'package))
+        (begin
+          (check-manifest! (car forms))
+          (cdr forms))
+        forms)))
 
 (define (file-in [dir datum] [name datum]) -> datum
   (cond [(== (-> (datum->string dir) length) 0) name]
@@ -678,93 +676,6 @@
 (define (kind-of [path datum]) -> i32
   (let ([info fs-info])
     (if (< (fs-stat (datum->string path) (& info) 0) 0) 0 (-> info kind))))
-
-;; manifest-at gives the manifest of the package holding dir, an absolute directory, or 0.
-(define (manifest-at [dir datum]) -> datum
-  (let* ([key (cast u64 (symbol-of dir))] [known (cast datum (hash-ref (& manifests) key))]
-         [file (file-in dir '"package.sub")] [m datum 0])
-    (when (!= known 0) (return (if (equal? known 'none) 0 known)))
-    (cond [(== (kind-of file) fs-file) (set! m (read-manifest file dir))]
-          [(or (equal? dir '"/") (== (-> (datum->string dir) length) 0)) (begin)]
-          [else (set! m (manifest-at (directory-path dir)))])
-    (hash-set! (& manifests) key (cast u32 (if (== m 0) 'none m)))
-    m))
-
-(define (read-manifest [file datum] [root datum]) -> datum
-  (let* ([text (file-text file)] [forms (read-text text (symbol-of file))])
-    (unless (and (pair? forms) (null? (cdr forms))) (fail-at 0 "~a holds one form, (package name ...)" (list1 file)))
-    (manifest-from (car forms) root text)))
-
-(define (manifest-from [form datum] [root datum] [text datum]) -> datum
-  (let ([d (syntax->datum form)] [cs datum 0] [wasm datum 0] [hash datum 0])
-    (unless (and (pair? d) (equal? (car d) 'package) (pair? (cdr d)) (symbol? (cadr d)))
-      (fail-at form "expected (package name clause ...)" nil))
-    (set! cs (cddr d))
-    (while (pair? cs)
-      (let ([c (car cs)])
-        (cond [(and (pair? c) (or (equal? (car c) 'version) (equal? (car c) 'wasm)) (pair? (cdr c)) (string? (cadr c))
-                    (null? (cddr c)))
-               (when (equal? (car c) 'wasm)
-                 (set! wasm (resolve-segments (if (absolute-path? (cadr c)) (cadr c) (file-in root (cadr c)))))
-                 (let ([bytes (file-bytes wasm)])
-                   (when (equal? bytes '#f) (fail-at form "cannot read the package's wasm module ~a" (list1 wasm)))
-                   (set! hash (content-hash (list1 (string->datum (cast string (datum->bytes bytes))))))))]
-              [else (fail-at form "a package's clauses are (version \"v\") and (wasm \"file\"), not ~s" (list1 c))]))
-      (set! cs (cdr cs)))
-    (keep `(,text ,(cadr d) ,wasm ,hash))))
-
-;; program-forms gives a module's forms without a first (package ...) form, which becomes its own manifest.
-(define (program-forms [path datum] [forms datum]) -> datum
-  (let ([d (if (pair? forms) (syntax->datum (car forms)) 0)])
-    (if (and (pair? d) (equal? (car d) 'package))
-        (begin
-          (hash-set! (& inline-manifests) (cast u64 (symbol-of path))
-                     (cast u32 (manifest-from (car forms) (directory-path (absolute-of path)) '"")))
-          (cdr forms))
-        forms)))
-
-;; module-manifest gives the manifest of the module at path: its own, or its package's.
-(define (module-manifest [path datum]) -> datum
-  (let ([own (hash-ref (& inline-manifests) (cast u64 (symbol-of path)))])
-    (if (!= own 0) (cast datum own) (manifest-at (directory-path (absolute-of path))))))
-
-;; package-modules lists the wasm modules of packages linked so far, as (module placer placer-bytes module-bytes kept).
-(define package-modules datum nil)
-
-(define (prelude-name) -> datum
-  (let ([u (cast datum (hash-ref (& registry) (cast u64 (symbol-of (canonical-path (language-path))))))])
-    (when (== u 0) (fail-at 0 "internal: no prelude to link a package's wasm module to" nil))
-    (wasm-module-name u 0 0)))
-
-;; package-import gives the module an import names: the wasm module of the importing module's package, as the program
-;; names it, when module is that package's name and its manifest names a wasm file; else module itself.
-(define (package-import [module datum]) -> datum
-  (let ([m (module-manifest (-> (the-module) path))])
-    (if (and (!= m 0) (!= (manifest-wasm m) 0) (equal? (string->datum (symbol->string (manifest-name m))) module))
-        (linked-package m)
-        module)))
-
-(define (linked-package [m datum]) -> datum
-  (let* ([stem (format "~a.~a" `(,(manifest-name m) ,(manifest-wasm-hash m)))] [side (concat stem '".side")]
-         [placer (concat stem '".place")] [r datum 0])
-    (when (== (assoc side package-modules) 0)
-      (set! r (link-side-module (manifest-wasm m) (file-bytes (manifest-wasm m)) placer (prelude-name)))
-      (set! package-modules (keep-cons (keep `(,side ,placer ,(car r) ,(cadr r) ,(caddr r))) package-modules)))
-    side))
-
-(define (package-module-names) -> datum
-  (let ([l package-modules] [out nil])
-    (while (pair? l)
-      (set! out (cons (car (car l)) (cons (cadr (car l)) out)))
-      (set! l (cdr l)))
-    out))
-
-(define (package-kept) -> datum
-  (let ([l package-modules] [out nil])
-    (while (pair? l)
-      (set! out (append (list-ref (car l) 4) out))
-      (set! l (cdr l)))
-    out))
 
 (define (clean-name? [s string]) -> bool
   (let ([start u32 0])
@@ -815,6 +726,7 @@
     (cond [(and (!= known 0) (== (-> (unit-of known) state) 'done)) known]
           [(!= known 0) (fail-at 0 "cyclic require: ~a requires itself" (list1 path))]
           [(begin (set! cached (load-cached path)) (!= cached 0)) cached]
+          [(wasm-file? path) (wasm-file-unit path key)]
           [else
            (let* ([text (source-text path)] [m (new-unit path (provisional-name path))] [saved current])
              (hash-set! (& registry) key (cast u32 m))
@@ -822,7 +734,7 @@
              (begin-module-arena)
              (set! current (new-comp m))
              (try (set! (-> (unit-of m) code)
-                        (expand-module-body (program-forms path (read-text text (symbol-of path))) #f))
+                        (expand-module-body (program-forms (read-text text (symbol-of path))) #f))
                   (finish-module! text)
                   [catch-all
                    (hash-set! (& registry) key 0)
@@ -837,13 +749,55 @@
 
 (define compiling datum nil)
 
+(define (wasm-file? [path datum]) -> bool
+  (let ([s (datum->string path)])
+    (and (> (-> s length) 5) (== (slice s (- (-> s length) 5) (-> s length)) ".wasm"))))
+
+;; wasm-file-unit makes the side module at path a module: it requires the prelude, which it is linked against, and
+;; provides its functions with their own types, and the global supply:name of each it imports by name, which supply
+;; sets.
+(define (wasm-file-unit [path datum] [key u64]) -> datum
+  (let* ([bytes (file-bytes (package-file path))] [prelude datum 0] [m datum 0] [u (ptr unit) 0] [instance datum 0]
+         [linked datum 0] [provides nil] [infos nil] [info datum 0])
+    (when (equal? bytes '#f) (fail-at 0 "cannot read the module ~a" (list1 path)))
+    (set! prelude (compile-module-file (language-path)))
+    (set! m (new-unit path (provisional-name path)))
+    (set! u (unit-of m))
+    (hash-set! (& registry) key (cast u32 m))
+    (set! (-> u requires) (keep (list1 (cons prelude (make-integer 0)))))
+    (set! (-> u hash) (keep (module-hash path (string->datum (cast string (datum->bytes bytes)))
+                                         (list1 `(,(-> (unit-of prelude) hash) ,(make-integer 0))))))
+    (set! (-> u name) (keep (format "~a.~a" `(,(file-stem path) ,(-> u hash)))))
+    (when (== (hash-ref (& units-by-hash) (cast u64 (symbol-of (-> u hash)))) 0)
+      (hash-set! (& units-by-hash) (cast u64 (symbol-of (-> u hash))) (cast u32 m)))
+    (set! instance (wasm-module-name m 0 0))
+    (set! linked (link-side-module path bytes (wasm-module-name prelude 0 0)))
+    (add-wasm-module! m 0 `(,(car linked) ,(list1 (wasm-module-name prelude 0 0)) ()))
+    (for-each (lambda ([e datum])
+                (when (== (car e) 'func)
+                  (set! info (func-info (symbol-of (cadr e)) (caddr e) (cadddr e) instance (cadr e)))
+                  (set! infos (cons info infos))
+                  (set! provides (cons (cons (symbol-of (cadr e)) `(func ,info)) provides))))
+              (wasm-module-exports (datum->bytes (car linked))))
+    (for-each (lambda ([h datum])
+                (let ([export (format "supply:~a" (list1 h))])
+                  (set! info (global-info (symbol-of export) 'i32 (boolean #t) instance export))
+                  (set! infos (cons info infos))
+                  (set! provides (cons (cons (symbol-of export) `(global ,info)) provides))))
+              (cadr linked))
+    (set! (-> u infos) (keep infos))
+    (set! (-> u provides) (keep (sort provides (lambda ([a datum] [b datum]) -> bool (symbol<? (car a) (car b))))))
+    (set! (-> u state) 'done)
+    (store-cached! m)
+    m))
+
 (define (expand-module-file [source datum] [f (closure (datum))])
   (let ([path (canonical-path source)])
     (let* ([text (source-text path)] [m (new-unit path (provisional-name path))])
       (hash-set! (& registry) (cast u64 (symbol-of path)) (cast u32 m))
       (begin-module-arena)
       (set! current (new-comp m))
-      (let ([forms (expand-module-body (program-forms path (read-text text (symbol-of path))) #t)])
+      (let ([forms (expand-module-body (program-forms (read-text text (symbol-of path))) #t)])
         (while (pair? forms)
           (f (car forms))
           (set! forms (cdr forms))))
@@ -1041,6 +995,25 @@
     (set! out (visit-wasm-modules m seen out))
     (reverse out)))
 
+;; check-supplied! refuses a program in which a function a C module calls by name is supplied by none of its modules.
+(define (check-supplied! [modules datum])
+  (let ([imported nil] [l modules])
+    (while (pair? l)
+      (set! imported (append (wasm-module-import-fields (datum->bytes (cdr (car l)))) imported))
+      (set! l (cdr l)))
+    (set! l modules)
+    (while (pair? l)
+      (let* ([name (car (car l))] [owner (instance-unit name)]
+             [ps (if (and (!= owner 0) (wasm-file? (-> (unit-of owner) path))) (-> (unit-of owner) provides) nil)])
+        (while (pair? ps)
+          (let ([v (cdr (car ps))])
+            (when (and (== (car v) 'global) (== (member (cons name (global-info-export (cadr v))) imported) 0))
+              (fail-at 0 "~a calls ~a by name, and no module in the program supplies it"
+                       `(,(-> (unit-of owner) path) ,(substring (global-info-export (cadr v)) 7
+                                                               (-> (datum->string (global-info-export (cadr v))) length))))))
+          (set! ps (cdr ps))))
+      (set! l (cdr l)))))
+
 (define (visit-wasm-modules [m datum] [seen (ptr hash-table)] [out datum]) -> datum
   (let ([name (wasm-module-name m 0 0)])
     (when (!= (datum-get seen name) 0) (return out))
@@ -1052,13 +1025,8 @@
       (cons (cons name (-> p bytes)) out))))
 
 (define (visit-import [imp datum] [seen (ptr hash-table)] [out datum]) -> datum
-  (let ([l (wasm-module-ref imp)] [p (assoc imp package-modules)])
-    (cond [(!= p 0)
-           (when (!= (datum-get seen (car p)) 0) (return out))
-           (datum-put! seen (car p) (boolean #t))
-           (set! out (visit-import (prelude-name) seen out))
-           (cons (cons (car p) (cadddr p)) (cons (cons (cadr p) (caddr p)) out))]
-          [(!= l 0)
+  (let ([l (wasm-module-ref imp)])
+    (cond [(!= l 0)
            (unless (and (== (integer-value (cadr l)) 0) (== (integer-value (caddr l)) 0))
              (fail-at 0 "internal: a program imports from ~a" (list1 imp)))
            (visit-wasm-modules (car l) seen out)]
@@ -1146,8 +1114,6 @@
           (hash-set! (& registry) key 0)
           (return 0)))
       (set! requires (cdr requires)))
-    (let ([pm (manifest-at (directory-path (absolute-of path)))])
-      (when (and (!= pm 0) (!= (manifest-wasm pm) 0)) (linked-package pm)))
     (set! known (cast datum (hash-ref (& units-by-hash) (cast u64 (symbol-of hash)))))
     (set! m (if (!= known 0) known (load-compiled-module d path)))
     (hash-set! (& registry) key (cast u32 m))
@@ -1563,6 +1529,7 @@
       [('func) (item! b (declare-func f phase))]
       [('global) (item! b (declare-global f phase))]
       [('import) (item! b (declare-import f phase))]
+      [('supply) (item! b `(supply ,f))]
       [('memory 'table) (declare-storage! f kind phase)]
       [('tag) (item! b (declare-tag f phase))]
       [('define-syntax) (define-syntax! f phase)]
@@ -1601,6 +1568,7 @@
     [('func) (expand-func item phase)]
     [('global) (expand-global item phase)]
     [('plain 'done) (if to-syntax (list1 (cadr item)) (caddr item))]
+    [('supply) (expand-supply (cadr item) phase)]
     [else
      (let* ([e (cadr item)]
             [r (if (or to-syntax (== (core-head e phase) '#%checked)) (expand-expr e phase) (core-expression e phase))])
@@ -1719,11 +1687,40 @@
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 5) (identifier? (cadr l)) (string-literal? (caddr l)) (string-literal? (cadddr l)))
       (no-match f "(import name module field signature)"))
-    (let* ([name (cadr l)] [given (caddr l)] [field (cadddr l)] [sig (list-ref l 4)] [pr (parse-signature sig)]
-           [from (package-import (syntax-e given))]
-           [module (if (equal? from (syntax-e given)) given (datum->syntax given from given))])
+    (let* ([name (cadr l)] [module (caddr l)] [field (cadddr l)] [sig (list-ref l 4)] [pr (parse-signature sig)])
       (bind-definition! name phase `(func ,(func-info (syntax-e name) (car pr) (cdr pr) (syntax-e module) (syntax-e field))))
       `(plain ,(out f 'import `(,name ,module ,field ,sig)) ()))))
+
+;; (supply c-function f): c-function, which its C module calls by name, calls f, through the slot in the module's
+;; global supply:name, set when this module starts.
+(define (expand-supply [f datum] [phase i32]) -> datum
+  (let* ([l (syntax->list f)] [c datum 0] [g datum 0] [slot datum 0])
+    (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l)) (identifier? (caddr l)))
+      (no-match f "(supply c-function function)"))
+    (set! c (meaning-of (cadr l) phase))
+    (set! g (meaning-of (caddr l) phase))
+    (unless (and (!= c 0) (== (car c) 'func)) (fail-at (cadr l) "~a is not a function" (list1 (syntax-e (cadr l)))))
+    (unless (and (!= g 0) (== (car g) 'func)) (fail-at (caddr l) "~a is not a function" (list1 (syntax-e (caddr l)))))
+    (set! slot (supply-slot (cadr c)))
+    (when (== slot 0)
+      (fail-at (cadr l) "~a is not a function its module calls by name" (list1 (syntax-e (cadr l)))))
+    (unless (equal? (signature-of (cadr c)) (signature-of (cadr g)))
+      (fail-at f "~a is ~s, but ~a is ~s"
+               `(,(syntax-e (cadr l)) ,(signature-of (cadr c)) ,(syntax-e (caddr l)) ,(signature-of (cadr g)))))
+    (if to-syntax (list1 f) (list1 `(expr (gset ,slot (func-index ,(cadr g))))))))
+
+(define (signature-of [info datum]) -> datum (append (func-info-params info) (cons '-> (func-info-results info))))
+
+;; supply-slot gives the global supply:name of the module providing the function info, when it calls it by name.
+(define (supply-slot [info datum]) -> datum
+  (let* ([instance (func-info-instance info)] [owner (if (string? instance) (instance-unit instance) 0)]
+         [export (format "supply:~a" (list1 (func-info-export info)))]
+         [l (if (== owner 0) nil (-> (unit-of owner) provides))])
+    (while (pair? l)
+      (let ([v (cdr (car l))])
+        (when (and (== (car v) 'global) (equal? (global-info-export (cadr v)) export)) (return (cadr v))))
+      (set! l (cdr l)))
+    0))
 
 (define (declare-tag [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
@@ -2413,7 +2410,7 @@
 
 (define (session-eval-file! [source datum] [report (closure (datum))])
   (let* ([path (canonical-path source)] [text (source-text path)]
-         [forms (program-forms path (read-text text (symbol-of path)))])
+         [forms (program-forms (read-text text (symbol-of path)))])
     (while (pair? forms)
       (unless (session-eval! (list1 (car forms))) (report (session-error)))
       (set! forms (cdr forms)))))
