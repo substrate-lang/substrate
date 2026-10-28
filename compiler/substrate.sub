@@ -194,88 +194,208 @@
 
 ;; ---- the allocator, memory functions, arenas, buffers, hash tables ----
 
-(struct header [next (ptr header)] [size u32])
+;; A block is a word of its size, a multiple of 16, with 1 set while it is used, 2 while the block before it is, and 4
+;; while it is in a quick list, then what malloc gives, at a multiple of 16. A free block also holds the next and
+;; previous blocks in its list, and its size again in its last word; no two free blocks are neighbours. Each region from
+;; sbrk ends in a used block of size 0, the last region's at heap-end.
+(struct heap-block [head u32] [next (ptr heap-block)] [prev (ptr heap-block)])
 
-(define base header)
-(define freep (ptr header) 0)
+;; The free lists: one for each size under 1 KB, then four from each power of two to the next. free-map has the bit of
+;; each list that holds a block.
+(define free-lists (array (ptr heap-block) 152))
+(define free-map (array u32 5))
+(define heap-end (ptr heap-block) 0)
+(define heap-limit u32 0)
 
-(define small u32 512)
-(define smalls (array (ptr header) 513))
+;; The quick lists: a freed block of up to 4 KB waits in the list of its size, still used, for malloc to give it again;
+;; before the heap grows, they are all freed.
+(define quick-lists (array (ptr heap-block) 257))
+
+(func (leading-zeros-32 [x i32]) #:inline -> i32 (i32.clz x))
+(func (trailing-zeros-32 [x i32]) #:inline -> i32 (i32.ctz x))
+
+(define (block-size-for [n u32]) #:inline -> u32 (bit-and (+ n 19) -16))
+(define (block-size [b (ptr heap-block)]) #:inline -> u32 (bit-and (-> b head) -16))
+(define (block-after [b (ptr heap-block)] [n u32]) #:inline -> (ptr heap-block)
+  (cast (ptr heap-block) (+ (cast (ptr u8) b) n)))
+(define (block-before [b (ptr heap-block)]) #:inline -> (ptr heap-block)
+  (cast (ptr heap-block) (- (cast (ptr u8) b) (@ (cast (ptr u32) (- (cast (ptr u8) b) 4)) 0))))
+(define (set-footer! [b (ptr heap-block)] [size u32]) #:inline
+  (set! (@ (cast (ptr u32) (+ (cast (ptr u8) b) (- size 4))) 0) size))
+
+(define (size-class [size u32]) #:inline -> u32
+  (if (< size 1024)
+      (>> size 4)
+      (let ([top (- 31 (cast u32 (leading-zeros-32 (cast i32 size))))])
+        (+ 64 (* (- top 10) 4) (bit-and (>> size (- top 2)) 3)))))
+
+(define (list-block! [b (ptr heap-block)] [size u32])
+  (let* ([c (size-class size)] [first (@ free-lists c)])
+    (set! (-> b next) first)
+    (set! (-> b prev) 0)
+    (when (!= first 0) (set! (-> first prev) b))
+    (set! (@ free-lists c) b)
+    (bit-or= (@ free-map (>> c 5)) (<< (cast u32 1) (bit-and c 31)))))
+
+(define (unlist-block! [b (ptr heap-block)])
+  (let ([next (-> b next)] [prev (-> b prev)])
+    (when (!= next 0) (set! (-> next prev) prev))
+    (if (!= prev 0)
+        (set! (-> prev next) next)
+        (let ([c (size-class (block-size b))])
+          (set! (@ free-lists c) next)
+          (when (== next 0) (bit-and= (@ free-map (>> c 5)) (bit-not (<< (cast u32 1) (bit-and c 31)))))))))
+
+;; next-class gives the first list from c that holds a block, or 160.
+(define (next-class [c u32]) -> u32
+  (let ([w (>> c 5)] [bits u32 0])
+    (when (>= w 5) (return 160))
+    (set! bits (bit-and (@ free-map w) (<< (cast u32 4294967295) (bit-and c 31))))
+    (while (== bits 0)
+      (+= w 1)
+      (when (>= w 5) (return 160))
+      (set! bits (@ free-map w)))
+    (+ (<< w 5) (cast u32 (trailing-zeros-32 (cast i32 bits))))))
 
 (define (malloc [n u32]) -> (ptr void)
-  (let ([units (+ (/ (+ n (sizeof header) -1) (sizeof header)) 1)] [prev freep])
-    (when (and (<= units small) (!= (@ smalls units) 0))
-      (let ([b (@ smalls units)])
-        (set! (@ smalls units) (-> b next))
-        (return (+ b 1))))
-    (when (== prev 0)
-      (set! (-> base next) (& base))
-      (set! freep (& base))
-      (set! prev freep))
-    (let ([p (-> prev next)])
-      (while #t
-        (when (>= (-> p size) units)
-          (if (== (-> p size) units)
-              (set! (-> prev next) (-> p next))
-              (begin
-                (-= (-> p size) units)
-                (+= p (-> p size))
-                (set! (-> p size) units)))
-          (set! freep prev)
-          (return (+ p 1)))
-        (when (== p freep)
-          (set! p (more-memory units))
-          (when (== p 0) (return 0)))
-        (set! prev p)
-        (set! p (-> p next))))
-    0))
+  (when (>= n 2147483584) (return 0))
+  (let* ([size (block-size-for n)] [b (ptr heap-block) 0])
+    (when (<= size 4096)
+      (set! b (@ quick-lists (>> size 4)))
+      (when (!= b 0)
+        (set! (@ quick-lists (>> size 4)) (-> b next))
+        (bit-and= (-> b head) -5)
+        (return (cast (ptr void) (+ (cast (ptr u8) b) 4)))))
+    (set! b (fitting-block size))
+    (when (and (== b 0) (free-quick-blocks!)) (set! b (fitting-block size)))
+    (when (== b 0) (set! b (grow-heap size)))
+    (when (== b 0) (return 0))
+    (unlist-block! b)
+    (take-block! b size)))
 
-(define (more-memory [units u32]) -> (ptr header)
-  (let* ([n (if (< units 1024) 1024 units)] [p (cast (ptr header) (sbrk (* n (sizeof header))))])
-    (if (== p 0)
-        0
-        (begin (set! (-> p size) n) (free-block p) freep))))
+;; fitting-block gives a block from the free lists of at least size bytes, or 0.
+(define (fitting-block [size u32]) -> (ptr heap-block)
+  (let* ([c (size-class size)] [b (@ free-lists c)] [k 0] [d u32 0])
+    (when (>= c 64)
+      (while (and (!= b 0) (< (block-size b) size) (< k 16))
+        (set! b (-> b next))
+        (+= k 1))
+      (when (and (!= b 0) (< (block-size b) size)) (set! b 0)))
+    (when (!= b 0) (return b))
+    (set! d (next-class (+ c 1)))
+    (if (< d 152) (@ free-lists d) 0)))
+
+;; free-quick-blocks! frees the blocks in the quick lists, giving whether there were any.
+(define (free-quick-blocks!) -> bool
+  (let ([any #f] [b (ptr heap-block) 0])
+    (for ([i u32 1]) (<= i 256) (+= i 1)
+      (while (!= (@ quick-lists i) 0)
+        (set! b (@ quick-lists i))
+        (set! (@ quick-lists i) (-> b next))
+        (bit-and= (-> b head) -5)
+        (release-block! b)
+        (set! any #t)))
+    any))
+
+;; take-block! uses size bytes of the free block b, out of its list, and frees the rest.
+(define (take-block! [b (ptr heap-block)] [size u32]) -> (ptr void)
+  (let ([rest (- (block-size b) size)])
+    (if (>= rest 16)
+        (let ([r (block-after b size)])
+          (set! (-> r head) (bit-or rest 2))
+          (set-footer! r rest)
+          (list-block! r rest)
+          (set! (-> b head) (bit-or size 3)))
+        (begin
+          (bit-or= (-> (block-after b (block-size b)) head) 2)
+          (bit-or= (-> b head) 1)))
+    (cast (ptr void) (+ (cast (ptr u8) b) 4))))
+
+;; grow-heap adds a free block of at least size bytes from sbrk, which joins the last region when sbrk gives the memory
+;; after it.
+(define (grow-heap [size u32]) -> (ptr heap-block)
+  (let* ([n (bit-and (+ (if (< size 8192) 8192 size) 47) -16)] [r (cast u32 (sbrk (cast i32 n)))] [b (ptr heap-block) 0]
+         [s u32 0])
+    (when (== r 0) (return 0))
+    (if (and (!= heap-end 0) (== r heap-limit))
+        (set! b heap-end)
+        (begin
+          (set! b (cast (ptr heap-block) (- (bit-and (+ r 19) -16) 4)))
+          (set! (-> b head) 2)))
+    (set! s (bit-and (- (+ r n) (+ (cast u32 b) 4)) -16))
+    (set! (-> b head) (bit-or s (bit-and (-> b head) 2)))
+    (set! heap-end (block-after b s))
+    (set! (-> heap-end head) 1)
+    (set! heap-limit (+ r n))
+    (when (== (bit-and (-> b head) 2) 0)
+      (set! b (block-before b))
+      (unlist-block! b)
+      (set! s (+ s (block-size b)))
+      (set! (-> b head) (bit-or s 2)))
+    (set-footer! b s)
+    (list-block! b s)
+    b))
 
 (define (free [block (ptr void)])
   (when (!= block 0)
-    (let ([b (- (cast (ptr header) block) 1)])
-      (if (<= (-> b size) small)
+    (let* ([b (cast (ptr heap-block) (- (cast (ptr u8) block) 4))] [size (block-size b)])
+      (when (!= (bit-and (-> b head) 5) 1) (host-trap "free of a block that is free"))
+      (if (<= size 4096)
           (begin
-            (set! (-> b next) (@ smalls (-> b size)))
-            (set! (@ smalls (-> b size)) b))
-          (free-block b)))))
+            (bit-or= (-> b head) 4)
+            (set! (-> b next) (@ quick-lists (>> size 4)))
+            (set! (@ quick-lists (>> size 4)) b))
+          (release-block! b)))))
 
-(define (free-block [b (ptr header)])
-  (let ([p freep])
-    (while (not (and (> b p) (< b (-> p next))))
-      (when (and (>= p (-> p next)) (or (> b p) (< b (-> p next))))
-        (break))
-      (set! p (-> p next)))
-    (if (== (+ b (-> b size)) (-> p next))
-        (begin
-          (+= (-> b size) (-> p next size))
-          (set! (-> b next) (-> p next next)))
-        (set! (-> b next) (-> p next)))
-    (if (== (+ p (-> p size)) b)
-        (begin
-          (+= (-> p size) (-> b size))
-          (set! (-> p next) (-> b next)))
-        (set! (-> p next) b))
-    (set! freep p)))
+;; release-block! puts the used block b in the free lists, joined with its free neighbours.
+(define (release-block! [b (ptr heap-block)])
+  (let* ([size (block-size b)] [next (block-after b size)])
+    (when (== (bit-and (-> next head) 1) 0)
+      (unlist-block! next)
+      (+= size (block-size next)))
+    (when (== (bit-and (-> b head) 2) 0)
+      (set! b (block-before b))
+      (unlist-block! b)
+      (+= size (block-size b)))
+    (set! (-> b head) (bit-or size 2))
+    (set-footer! b size)
+    (bit-and= (-> (block-after b size) head) -3)
+    (list-block! b size)))
 
 (define (calloc [count u32] [size u32]) -> (ptr void)
+  (when (and (!= size 0) (> count (/ 4294967295 size))) (return 0))
   (let ([p (malloc (* count size))])
     (when (!= p 0) (memset p 0 (* count size)))
     p))
 
+;; realloc keeps the block where it is when it shrinks, and when it grows into a free block after it or into new memory
+;; at the end of the last region.
 (define (realloc [block (ptr void)] [n u32]) -> (ptr void)
-  (if (== block 0)
-      (malloc n)
-      (let ([old (* (- (-> (- (cast (ptr header) block) 1) size) 1) (sizeof header))] [p (malloc n)])
-        (when (!= p 0)
-          (memcpy p block (if (< n old) n old))
-          (free block))
-        p)))
+  (when (== block 0) (return (malloc n)))
+  (when (>= n 2147483584) (return 0))
+  (let* ([b (cast (ptr heap-block) (- (cast (ptr u8) block) 4))] [size (block-size b)] [want (block-size-for n)]
+         [next (block-after b size)] [room (if (== (bit-and (-> next head) 1) 0) (+ size (block-size next)) size)]
+         [p (ptr void) 0])
+    (when (!= (bit-and (-> b head) 5) 1) (host-trap "realloc of a block that is free"))
+    (when (and (> want room) (== (block-after b room) heap-end) (== (cast u32 (sbrk 0)) heap-limit))
+      (grow-heap (- want room)))
+    (when (and (> want size) (== (bit-and (-> next head) 1) 0) (>= (+ size (block-size next)) want))
+      (unlist-block! next)
+      (+= size (block-size next))
+      (set! (-> b head) (bit-or size (bit-and (-> b head) 3)))
+      (bit-or= (-> (block-after b size) head) 2))
+    (when (<= want size)
+      (when (>= (- size want) 16)
+        (let ([rest (block-after b want)])
+          (set! (-> b head) (bit-or want (bit-and (-> b head) 3)))
+          (set! (-> rest head) (bit-or (- size want) 3))
+          (release-block! rest)))
+      (return block))
+    (set! p (malloc n))
+    (when (!= p 0)
+      (memcpy p block (- size 4))
+      (free block))
+    p))
 
 (define (memcpy [to (ptr void)] [from (ptr void)] [n u32]) -> (ptr void)
   (memory.copy to from n)
