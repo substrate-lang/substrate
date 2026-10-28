@@ -170,7 +170,7 @@
 (define repository-root datum 0)
 (define (set-repository-root! [root datum])
   (set! repository-root (keep (absolute root)))
-  (set! roots (keep (map (lambda ([l datum]) -> datum `(,l ,(file-in repository-root l) ())) '("host" "compiler" "std")))))
+  (set! roots (keep (map (lambda ([l datum]) -> datum `(,l ,(file-in repository-root l) () #t)) '("host" "compiler" "std")))))
 
 (define running-syntax datum 0)
 (define syntax-instance datum 0)
@@ -647,7 +647,8 @@
 
 ;; A module lives in a root: host, compiler or std, the toolchain's, or one the module map gives; or, outside them, in
 ;; the directory of the first file. Its identity is label/path in its root, or ./path and ../path from that directory.
-;; A root is (label directory uses), uses being ((name label) ...).
+;; A root is (label directory uses shared): uses ((name label) ...), and shared whether its compile-time code runs in the
+;; compiler's memory, as the toolchain's does, rather than a memory of its own.
 (define roots datum nil)
 (define loose-directory datum 0)
 (define display-directory datum 0)
@@ -655,7 +656,8 @@
 (define (toolchain-root? [label datum]) -> bool
   (or (equal? label '"host") (equal? label '"compiler") (equal? label '"std")))
 
-;; set-module-map! adds the roots of a module map: (root label "directory" (uses (name label) ...)), uses being optional.
+;; set-module-map! adds the roots of a module map: (root label "directory" (uses (name label) ...) (compiler-memory)),
+;; each clause optional.
 (define (set-module-map! [forms datum])
   (for-each (lambda ([f datum]) (add-root! f)) forms)
   (for-each (lambda ([r datum])
@@ -666,23 +668,26 @@
             roots))
 
 (define (add-root! [f datum])
-  (let ([label datum 0] [uses nil] [cs datum 0])
+  (let ([label datum 0] [uses nil] [cs datum 0] [shared datum '#f])
     (unless (and (pair? f) (equal? (car f) 'root) (pair? (cdr f)) (symbol? (cadr f)) (pair? (cddr f)) (string? (caddr f)))
-      (fail-at 0 "expected (root label \"directory\" (uses (name label) ...)), not ~s" (list1 f)))
+      (fail-at 0 "expected (root label \"directory\" (uses (name label) ...) (compiler-memory)), not ~s" (list1 f)))
     (set! label (string->datum (symbol->string (cadr f))))
     (when (or (toolchain-root? label) (!= (assoc label roots) 0))
       (fail-at 0 "the module map gives ~a twice, or as host, compiler or std" (list1 label)))
     (set! cs (cdddr f))
     (while (pair? cs)
       (let ([c (car cs)])
-        (unless (and (pair? c) (equal? (car c) 'uses)) (fail-at 0 "a root's clause is (uses (name label) ...), not ~s" (list1 c)))
-        (for-each (lambda ([u datum])
-                    (unless (and (pair? u) (symbol? (car u)) (pair? (cdr u)) (symbol? (cadr u)) (null? (cddr u)))
-                      (fail-at 0 "a root's uses are (name label), not ~s" (list1 u)))
-                    (set! uses (cons `(,(string->datum (symbol->string (car u))) ,(string->datum (symbol->string (cadr u)))) uses)))
-                  (cdr c)))
+        (cond [(and (pair? c) (equal? (car c) 'uses))
+               (for-each (lambda ([u datum])
+                           (unless (and (pair? u) (symbol? (car u)) (pair? (cdr u)) (symbol? (cadr u)) (null? (cddr u)))
+                             (fail-at 0 "a root's uses are (name label), not ~s" (list1 u)))
+                           (set! uses (cons `(,(string->datum (symbol->string (car u))) ,(string->datum (symbol->string (cadr u))))
+                                            uses)))
+                         (cdr c))]
+              [(equal? c '(compiler-memory)) (set! shared (boolean #t))]
+              [else (fail-at 0 "a root's clauses are (uses (name label) ...) and (compiler-memory), not ~s" (list1 c))]))
       (set! cs (cdr cs)))
-    (set! roots (keep (cons `(,label ,(absolute (caddr f)) ,uses) roots)))))
+    (set! roots (keep (cons `(,label ,(absolute (caddr f)) ,uses ,shared) roots)))))
 
 ;; set-module-map-text! reads a module map from text.
 (define (set-module-map-text! [text datum] [source datum])
@@ -2136,6 +2141,154 @@
           [(syntax-instance? name) running-syntax]
           [else (running-copy-of name)])))
 
+;; ---- worlds ----
+
+;; A root whose compile-time code runs in a memory of its own has a world there: the compiler's own syntax module and the
+;; running modules it requires, made again, so with a prelude and a memory of their own, and the instances of the root's
+;; compile-time code and of what that code requires. compiler/copier.sub copies data between the compiler's memory and
+;; the world's, and compiler/world.sub is the world's entry for its macros. world is the root whose world instances are
+;; made in now, or 0 for the compiler's memory.
+(define world datum 0)
+
+;; A world as made, with the indices in the compiler's table of the functions the compiler calls in it.
+(struct world-entry [label datum] [copy-in i32] [copy-back i32] [call i32] [failed i32] [message i32] [blamed i32]
+        [transformer i32] [scope-map i32] [words-in i32] [words-free i32] [scope-words i32] [next (ptr world-entry)])
+
+(define worlds (ptr world-entry) 0)
+
+;; world-of gives the label of the root of module m when its compile-time code runs in a memory of its own, or 0.
+(define (world-of [m datum]) -> datum
+  (let* ([label (if (== m 0) 0 (identity-label (-> (unit-of m) path)))] [r (if (== label 0) 0 (assoc label roots))])
+    (if (and (!= r 0) (equal? (cadddr r) '#f)) label 0)))
+
+(define (world-name [label datum] [name datum]) -> datum (format "~a!~a" `(,label ,name)))
+
+(define (in-world [name datum]) -> datum (if (== world 0) name (world-name world name)))
+
+;; enter-world! makes the world of the root label the one instances are made in, making it first if need be, and gives
+;; the one before, for the caller to restore.
+(define (enter-world! [label datum]) -> datum
+  (let ([saved world])
+    (unless (== label 0) (world-entry-of label))
+    (set! world label)
+    saved))
+
+(define (world-entry-of [label datum]) -> (ptr world-entry)
+  (let ([w worlds])
+    (while (!= w 0)
+      (when (equal? (-> w label) label) (return w))
+      (set! w (-> w next)))
+    (make-world! label)))
+
+(define (make-world! [label datum]) -> (ptr world-entry)
+  (let ([made nil] [w (cast (ptr world-entry) (calloc 1 (sizeof world-entry)))]
+        [prelude (running-module-named running-names "substrate.")] [place datum 0] [copier datum 0] [entry datum 0])
+    (for-each (lambda ([g datum]) (set! made (world-runtime! label g made))) running-group)
+    (set! place (wasm-module-name (module-at (compiler-file '"world-memory.sub") 0) 0 0))
+    (set! copier (world-module! label '"copier.sub" #f
+                                (cons (cons place (world-name label prelude))
+                                      (cons (cons '"world" (world-name label syntax-instance))
+                                            (list1 (cons '"world-prelude" (world-name label prelude)))))))
+    (set! entry (world-module! label '"world.sub" #t nil))
+    (set! (-> w label) (keep label))
+    (set! (-> w copy-in) (world-function copier '"copy-in"))
+    (set! (-> w copy-back) (world-function copier '"copy-back"))
+    (set! (-> w words-in) (world-function copier '"words-in"))
+    (set! (-> w words-free) (world-function copier '"words-free"))
+    (set! (-> w call) (world-function entry '"world-call"))
+    (set! (-> w failed) (world-function entry '"world-failed?"))
+    (set! (-> w message) (world-function entry '"world-message"))
+    (set! (-> w blamed) (world-function entry '"world-blamed"))
+    (set! (-> w transformer) (world-function entry '"world-transformer?"))
+    (set! (-> w scope-map) (world-function (world-name label syntax-instance) '"set-scope-map!"))
+    (set! (-> w next) worlds)
+    (set! worlds w)
+    w))
+
+(define (world-function [instance datum] [field datum]) -> i32
+  (let ([i (host-export-index (datum->string instance) (datum->string field))])
+    (when (< i 0) (fail-at 0 "internal: no function ~a in ~a" `(,field ,instance)))
+    i))
+
+;; world-runtime! makes the running module g in the world of the root label, after the running modules it imports, unless
+;; made lists it, and gives made with what it made added.
+(define (world-runtime! [label datum] [g datum] [made datum]) -> datum
+  (if (!= (member g made) 0)
+      made
+      (let ([bytes (running-bytes g)] [imports datum 0] [pairs nil] [now (cons g made)])
+        (set! imports (wasm-module-imports (datum->bytes bytes)))
+        (for-each (lambda ([i datum])
+                    (when (running-wasm-module? i)
+                      (set! now (world-runtime! label i now))
+                      (set! pairs (cons (cons i (world-name label i)) pairs))))
+                  imports)
+        (instantiate-pairs! (world-name label g) bytes pairs)
+        now)))
+
+;; world-module! makes file, a module of the compiler, an instance in the world of the root label, taking its running
+;; imports from the world's runtime when own is set and from the compiler's otherwise, and those extra names; it gives
+;; the instance's name.
+(define (world-module! [label datum] [file datum] [own bool] [extra datum]) -> datum
+  (let* ([m (module-at (compiler-file file) 0)] [p (wasm-module-of m 0)] [name (world-name label (wasm-module-name m 0 0))]
+         [pairs extra])
+    (for-each (lambda ([i datum])
+                (when (and (running-wasm-module? i) (== (assoc i extra) 0))
+                  (set! pairs (cons (cons i (if own (world-name label i) i)) pairs))))
+              (-> p imports))
+    (instantiate-pairs! name (-> p bytes) pairs)
+    name))
+
+(define (instantiate-pairs! [name datum] [bytes datum] [pairs datum])
+  (let ([strings (cast (ptr string) (malloc (* (+ (* 2 (length pairs)) 1) 8)))] [i u32 0] [ok #f] [why string])
+    (for-each (lambda ([p datum])
+                (set! (@ strings i) (datum->string (car p)))
+                (set! (@ strings (+ i 1)) (datum->string (cdr p)))
+                (+= i 2))
+              pairs)
+    (set! ok (instantiate-bytes (datum->string name) (datum->bytes bytes) (slice strings i) #t (& why)))
+    (free strings)
+    (unless ok (fail-at 0 "internal: a package's compile-time memory could not be made: ~a" (list1 (host-error why))))))
+
+;; scope-map-for! gives the instance made next the scope map of n entries at map, in the world instances are made in.
+(define (scope-map-for! [map (ptr u32)] [n u32])
+  (if (== world 0)
+      (set-scope-map! (slice map n))
+      (let ([w (world-entry-of world)])
+        (unless (== (-> w scope-words) 0) ((cast (fn (i32)) (-> w words-free)) (-> w scope-words)))
+        (set! (-> w scope-words) (if (== n 0) 0 ((cast (fn ((ptr u32) u32) -> i32) (-> w words-in)) map n)))
+        ((cast (fn (i64)) (-> w scope-map))
+         (bit-or (cast i64 (cast u32 (-> w scope-words))) (<< (cast i64 n) 32))))))
+
+;; A macro a world keeps, which the compiler holds as a record of the world and the macro there.
+(const world-handle-kind u32 21)
+
+(struct world-handle [label datum] [value u32])
+
+(define (world-handle? [d datum]) -> bool (record? d world-handle-kind))
+
+;; world-value gives the value v the world of the root label gave, as the compiler keeps it: a macro as a handle, and data
+;; copied back.
+(define (world-value [label datum] [v datum]) -> datum
+  (let ([w (world-entry-of label)] [h (ptr world-handle) 0])
+    (if ((cast (fn (datum) -> bool) (-> w transformer)) v)
+        (begin
+          (set! h (cast (ptr world-handle) (malloc (sizeof world-handle))))
+          (set! (-> h label) (keep label))
+          (set! (-> h value) (cast u32 v))
+          (make-record-in (& run-arena) world-handle-kind (cast (ptr void) h)))
+        ((cast (fn (datum) -> datum) (-> w copy-back)) v))))
+
+;; world-expansion runs t, a macro a world keeps, on the syntax s: s goes in as a copy, and the result, or the macro's
+;; error, comes back as one.
+(define (world-expansion [t datum] [s datum]) -> datum
+  (let* ([h (cast (ptr world-handle) (record-pointer t))] [w (world-entry-of (-> h label))]
+         [back (cast (fn (i32) -> datum) (-> w copy-back))]
+         [in ((cast (fn (datum) -> i32) (-> w copy-in)) s)]
+         [out ((cast (fn (i32 i32) -> i32) (-> w call)) (cast i32 (-> h value)) in)])
+    (when ((cast (fn () -> bool) (-> w failed)))
+      (throw compile-error (back ((cast (fn () -> i32) (-> w message)))) (back ((cast (fn () -> i32) (-> w blamed)))) 0))
+    (back out)))
+
 ;; ---- compile-time evaluation ----
 
 (define (next-wasm-module-name! [m datum] [q i32]) -> datum
@@ -2144,7 +2297,7 @@
     (hash-set! (& instance-refs) (cast u64 (symbol-of name)) (cast u32 (keep `(,m ,(make-integer q)))))
     name))
 
-(define (ns-name [name datum]) -> datum (format "~a/~a" `(,(-> current ns) ,name)))
+(define (ns-name [name datum]) -> datum (format "~a/~a" `(,(-> current ns) ,(in-world name))))
 
 (define (namespaced? [name datum]) -> bool
   (and (== (group-instance name) 0) (!= (hash-ref (& instance-refs) (cast u64 (symbol-of name))) 0)))
@@ -2156,7 +2309,7 @@
     (while (pair? imports)
       (set! g (group-instance (car imports)))
       (set! r (if (!= g 0) 0 (cast datum (hash-ref (& instance-refs) (cast u64 (symbol-of (car imports)))))))
-      (cond [(!= g 0) (set! out (cons (cons (car imports) g) out))]
+      (cond [(!= g 0) (set! out (cons (cons (car imports) (in-world g)) out))]
             [(== r 0) 0]
             [(pair? (cddr r))
              (set! out (cons (cons (car imports) (ns-name (wasm-module-name (car r) (integer-at r 1) (+ (integer-at r 2) (cast i32 t))))) out))]
@@ -2194,14 +2347,14 @@
       (set! (@ pairs (+ i 1)) (datum->string (cdr (car map))))
       (+= i 2)
       (set! map (cdr map)))
-    (set-scope-map! (slice (scope-map-of scopes t) (length scopes)))
+    (scope-map-for! (scope-map-of scopes t) (length scopes))
     (try (set! ok (instantiate-bytes (datum->string name) (datum->bytes bytes) (slice pairs n) compile-time
                                      (& why)))
          [catch compile-error (message blamed loc)
-          (set-scope-map! 0)
+          (scope-map-for! 0 0)
           (free pairs)
           (throw compile-error message blamed loc)])
-    (set-scope-map! 0)
+    (scope-map-for! 0 0)
     (free pairs)
     (unless ok
       (if session-running
@@ -2232,8 +2385,10 @@
 
 (define (run-compile-time-wasm-module! [forms datum] [phase i32] [where datum])
   (add-phase-forms! phase forms)
-  (let ([name (next-wasm-module-name! (-> current module) phase)])
-    (instantiate-wasm-module! name (append (wasm-module-storage-forms phase name) forms) where)))
+  (let ([name (next-wasm-module-name! (-> current module) phase)] [saved (enter-world! (world-of (-> current module)))])
+    (try (instantiate-wasm-module! name (append (wasm-module-storage-forms phase name) forms) where)
+         [catch-all (set! world saved) (rethrow)])
+    (set! world saved)))
 
 (define (add-phase-forms! [phase i32] [forms datum])
   (unless (in-session?)
@@ -2259,23 +2414,35 @@
 (define (function-index [info datum]) -> i32
   (let* ([instance (func-info-instance info)] [export (func-info-export info)] [target datum 0] [i i32 -1])
     (ensure-import! instance 0)
-    (set! target (let ([g (group-instance instance)]) (cond [(!= g 0) g] [(namespaced? instance) (ns-name instance)] [else instance])))
+    (set! target (let ([g (group-instance instance)])
+                   (cond [(!= g 0) (in-world g)] [(namespaced? instance) (ns-name instance)] [else instance])))
     (set! i (host-export-index (datum->string target) (datum->string export)))
     (when (< i 0) (fail-at 0 "internal: no function ~a in ~a" `(,export ,instance)))
     i))
 
 (define (compile-time-value [getter datum]) -> datum
-  (let ([cached (cast datum (hash-ref (-> current values) (cast u64 getter)))] [v datum 0])
+  (let ([cached (cast datum (hash-ref (-> current values) (cast u64 getter)))] [v datum 0] [label datum 0]
+        [saved datum 0])
     (if (!= cached 0)
         (car cached)
-        (let ([f (cast (fn () -> datum) (function-index getter))])
-          (set! v (f))
+        (begin
+          (set! label (getter-world getter))
+          (set! saved (enter-world! label))
+          (try (set! v ((cast (fn () -> datum) (function-index getter))))
+               [catch-all (set! world saved) (rethrow)])
+          (set! world saved)
+          (unless (== label 0) (set! v (world-value label v)))
           (hash-set! (-> current values) (cast u64 getter) (cast u32 (cons v nil)))
           v))))
 
+;; getter-world gives the world of the module that defines getter, or 0.
+(define (getter-world [getter datum]) -> datum
+  (let ([m (cast datum (hash-ref (& macro-modules) (cast u64 getter)))])
+    (world-of (if (!= m 0) m (instance-unit (func-info-instance getter))))))
+
 (define (transformer-of [m datum]) -> datum
   (if (and (!= m 0) (== (car m) 'compile-time-value))
-      (let ([v (compile-time-value (cadr m))]) (if (or (transformer? v) (form-value? v)) v 0))
+      (let ([v (compile-time-value (cadr m))]) (if (or (transformer? v) (form-value? v) (world-handle? v)) v 0))
       0))
 
 ;; A form the compiler implements has the value (#%form kind [env]).
@@ -2427,7 +2594,8 @@
       (set! global (global-info name 'i32 (boolean #t) 0 0))
       (set! getter (func-info name nil '(i32) 0 0))
       (set! forms `((global ,global ,init) (func ,getter () (gref ,global))))
-      (cond [(and (!= function 0) (callable? function arity) (or (== env 0) (plain? env-code)))
+      (cond [(and (!= function 0) (callable? function arity) (or (== env 0) (plain? env-code))
+                  (== (world-of (-> current module)) 0))
              (add-phase-forms! (+ phase 1) forms)
              (made-value! getter (if (!= env 0)
                                      (make-transformer (cast u32 (function-index function)) (plain-value env-code env))
@@ -2770,7 +2938,9 @@
     (set! api-phase phase)
     (set! api-where s)
     (set! api-intro intro)
-    (try (set! result (if (form-value? t) (form-expansion t s phase) (call-transformer t s)))
+    (try (set! result (cond [(form-value? t) (form-expansion t s phase)]
+                            [(world-handle? t) (world-expansion t s)]
+                            [else (call-transformer t s)]))
          [catch compile-error (message blamed loc)
           (set! api-phase saved-phase)
           (set! api-where saved-where)
