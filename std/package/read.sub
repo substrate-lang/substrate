@@ -1,0 +1,125 @@
+;; Data in Substrate's syntax, as package.sub holds it: lists in ( ) or [ ], symbols and strings, with ; comments, read
+;; into an arena.
+(provide data data-list data-symbol data-string data-error data-read)
+
+(variant data
+  [data-list [items (slice data)] [line u32] [column u32]]
+  [data-symbol [text string] [line u32] [column u32]]
+  [data-string [text string] [line u32] [column u32]])
+
+(struct data-error [message string] [line u32] [column u32])
+
+(struct data-reader [text string] [at u32] [line u32] [column u32] [arena (ptr arena)] [error (ptr data-error)])
+
+;; data-read reads the forms of text into a, or only its first form when first is set; when it fails, err says why and
+;; where.
+(define (data-read [a (ptr arena)] [text string] [first bool] [into (ptr (slice data))] [err (ptr data-error)]) -> bool
+  (let ([r data-reader] [forms (make-buffer)] [d data (data-symbol "" 0 0)])
+    (set! (-> r text) text)
+    (set! (-> r at) 0)
+    (set! (-> r line) 1)
+    (set! (-> r column) 1)
+    (set! (-> r arena) a)
+    (set! (-> r error) err)
+    (while #t
+      (skip-space! (& r))
+      (when (>= (-> r at) (-> text length)) (break))
+      (unless (read-one! (& r) (& d))
+        (buffer-free! (& forms))
+        (return #f))
+      (buffer-add! (& forms) (slice (cast (ptr u8) (& d)) (sizeof data)))
+      (when first (break)))
+    (set! (@ into) (slice (cast (ptr data) (copied a (buffer-bytes (& forms)))) (/ (-> forms length) (sizeof data))))
+    (buffer-free! (& forms))
+    #t))
+
+(define (copied [a (ptr arena)] [b (slice u8)]) -> (ptr u8)
+  (let ([p (cast (ptr u8) (arena-alloc a (-> b length)))])
+    (memcpy p (-> b items) (-> b length))
+    p))
+
+(define (here [r (ptr data-reader)]) -> u32 (@ (-> r text) (-> r at)))
+
+(define (more? [r (ptr data-reader)]) -> bool (< (-> r at) (-> r text length)))
+
+(define (advance! [r (ptr data-reader)])
+  (let ([c (here r)])
+    (cond [(== c 10) (+= (-> r line) 1) (set! (-> r column) 1)]
+          [(!= (bit-and c 192) 128) (+= (-> r column) 1)])
+    (+= (-> r at) 1)))
+
+(define (skip-space! [r (ptr data-reader)])
+  (while (more? r)
+    (let ([c (here r)])
+      (cond [(== c 59) (while (and (more? r) (!= (here r) 10)) (advance! r))]
+            [(or (== c 32) (== c 9) (== c 10) (== c 13)) (advance! r)]
+            [else (break)]))))
+
+(define (delimiter? [c u32]) -> bool
+  (or (== c 32) (== c 9) (== c 10) (== c 13) (== c #\() (== c #\)) (== c #\[) (== c #\]) (== c #\") (== c 59)))
+
+(define (failed! [r (ptr data-reader)] [message string] [line u32] [column u32]) -> bool
+  (set! (-> r error message) message)
+  (set! (-> r error line) line)
+  (set! (-> r error column) column)
+  #f)
+
+(define (read-one! [r (ptr data-reader)] [into (ptr data)]) -> bool
+  (let ([line (-> r line)] [column (-> r column)] [c (here r)])
+    (cond [(== c #\() (read-list! r #\) line column into)]
+          [(== c #\[) (read-list! r #\] line column into)]
+          [(or (== c #\)) (== c #\])) (failed! r "this closes no list" line column)]
+          [(== c #\") (read-string! r line column into)]
+          [else
+           (let ([start (-> r at)])
+             (while (and (more? r) (not (delimiter? (here r)))) (advance! r))
+             (set! (@ into) (data-symbol (cast string (slice (copied (-> r arena) (cast (slice u8) (slice (-> r text) start (-> r at))))
+                                                             (- (-> r at) start)))
+                                         line column))
+             #t)])))
+
+(define (read-list! [r (ptr data-reader)] [close u32] [line u32] [column u32] [into (ptr data)]) -> bool
+  (let ([items (make-buffer)] [d data (data-symbol "" 0 0)])
+    (advance! r)
+    (while #t
+      (skip-space! r)
+      (unless (more? r)
+        (buffer-free! (& items))
+        (return (failed! r "this list is not closed" line column)))
+      (when (== (here r) close)
+        (advance! r)
+        (break))
+      (unless (read-one! r (& d))
+        (buffer-free! (& items))
+        (return #f))
+      (buffer-add! (& items) (slice (cast (ptr u8) (& d)) (sizeof data))))
+    (set! (@ into) (data-list (slice (cast (ptr data) (copied (-> r arena) (buffer-bytes (& items))))
+                                     (/ (-> items length) (sizeof data)))
+                              line column))
+    (buffer-free! (& items))
+    #t))
+
+(define (read-string! [r (ptr data-reader)] [line u32] [column u32] [into (ptr data)]) -> bool
+  (let ([b (make-buffer)] [c u32 0])
+    (advance! r)
+    (while #t
+      (unless (more? r)
+        (buffer-free! (& b))
+        (return (failed! r "this string is not closed" line column)))
+      (set! c (here r))
+      (cond [(== c #\") (advance! r) (break)]
+            [(== c #\\)
+             (let ([l (-> r line)] [k (-> r column)])
+               (advance! r)
+               (set! c (if (more? r) (here r) 0))
+               (cond [(== c #\n) (buffer-add-byte! (& b) 10)]
+                     [(== c #\t) (buffer-add-byte! (& b) 9)]
+                     [(or (== c #\") (== c #\\)) (buffer-add-byte! (& b) (cast i32 c))]
+                     [else
+                      (buffer-free! (& b))
+                      (return (failed! r "a string's escapes are \\\", \\\\, \\n and \\t" l k))])
+               (advance! r))]
+            [else (buffer-add-byte! (& b) (cast i32 c)) (advance! r)]))
+    (set! (@ into) (data-string (cast string (slice (copied (-> r arena) (buffer-bytes (& b))) (-> b length))) line column))
+    (buffer-free! (& b))
+    #t))
