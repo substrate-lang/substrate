@@ -9,7 +9,7 @@ mkdir -p "$pieces"
   memchr.o memcmp.o memrchr.o strchr.o strchrnul.o strcmp.o strcspn.o strlen.o strncmp.o strrchr.o strspn.o)
 cd "$root/packages/sqlite"
 wasm32-unknown-wasi-clang -O2 -fPIC -fvisibility=default -nostdlib -shared -Wl,--experimental-pic -Wl,--no-entry \
-  -Wl,--unresolved-symbols=import-dynamic \
+  -Wl,--unresolved-symbols=import-dynamic -Wl,--export=__wasm_call_ctors \
   -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=0 -DSQLITE_TEMP_STORE=2 -DSQLITE_OMIT_LOAD_EXTENSION \
   -DSQLITE_OMIT_LOCALTIME -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_OMIT_DEPRECATED -DSQLITE_DEFAULT_MEMSTATUS=0 \
   -DSQLITE_DQS=0 -DSQLITE_LIKE_DOESNT_MATCH_BLOBS \

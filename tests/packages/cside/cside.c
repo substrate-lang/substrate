@@ -16,6 +16,9 @@ int call_back(int (*f)(int), int x) { return f(x) + 1; }
 int stack_sum(int n) { volatile int a[64]; for (int i = 0; i < 64; i++) a[i] = i * n; int s = 0; for (int i = 0; i < 64; i++) s += a[i]; return s; }
 int zero_sum(void) { int s = 0; for (int i = 0; i < 100; i++) s += zeros[i]; return s; }
 int by_name(int x) { return twice(x) + 1; }
+int constructed = -1;
+__attribute__((constructor)) static void construct(void) { constructed = twice(21); }
+int constructed_value(void) { return constructed; }
 void *volatile last;
 int null_when_too_big(void) {
   char *p = malloc(16);

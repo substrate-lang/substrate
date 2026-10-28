@@ -1,9 +1,10 @@
 ;; Wasm modules from C: a dynamic-linking side module (clang -shared, Emscripten's side modules) rewritten into the form
 ;; of a program's modules. Memory, table, stack, sbrk and free come from the prelude, and malloc, calloc and realloc as
 ;; its try-malloc, try-calloc and try-realloc; the bases and GOT entries become the module's own globals, and its start
-;; takes its data block and table slots, copies in its segments, fills its GOT and runs its own start, relocations and
-;; constructors. A function it imports by name becomes one that calls through the table at a slot, held in a global
-;; exported as supply:name, which the code supplying it sets.
+;; takes its data block and table slots, copies in its segments, fills its GOT and runs its own start and relocations. A
+;; function it imports by name becomes one that calls through the table at a slot, held in a global exported as
+;; supply:name, which the code supplying it sets. Its constructors, which it exports as __wasm_call_ctors, run once each
+;; slot is set, from supplied!, which the code supplying it calls after each; with no slots, they run in its start.
 (require-unqualified macros "macros.sub")
 (require-unqualified leb "leb128.sub")
 (require-unqualified binary "binary.sub")
@@ -338,6 +339,9 @@
     (set! (-> (& s) start) -1)
     (set! (-> (& s) bytes) (datum->bytes bytes))
     (read-side! (& s) what)
+    (when (< (exported-function (& s) '"__wasm_call_ctors") 0)
+      (fail "~a does not export __wasm_call_ctors, which runs its constructors: build it with -Wl,--export=__wasm_call_ctors"
+            (cons what nil)))
     (indices! (& k) (& s) what)
     (set! d `(,(module-bytes (& s) (& k) what prelude) ,(map (lambda ([h datum]) -> datum (cadr (car h))) (-> (& k) hooks))))
     (free (cast (ptr void) (-> (& k) fmap)))
@@ -356,10 +360,11 @@
     (put-section! (& out) 1 (& q))
     (imports! (& q) s k prelude (+ ntypes 1))
     (put-section! (& out) 2 (& q))
-    (write-uleb (& q) (cast u64 (+ (-> k ndefined) nhooks 1)))
+    (write-uleb (& q) (cast u64 (+ (-> k ndefined) nhooks (if (> nhooks 0) 2 1))))
     (for-each (lambda ([t datum]) (write-uleb (& q) (cast u64 (int t)))) (-> s ftypes))
     (for-each (lambda ([h datum]) (write-uleb (& q) (cast u64 (int (list-ref (car h) 5))))) (-> k hooks))
     (write-uleb (& q) (cast u64 ntypes))
+    (when (> nhooks 0) (write-uleb (& q) (cast u64 ntypes)))
     (put-section! (& out) 3 (& q))
     (globals! (& q) s k)
     (put-section! (& out) 6 (& q))
@@ -413,13 +418,14 @@
 
 (define (globals! [q (ptr buffer)] [s (ptr side)] [k (ptr link)])
   (let ([nhooks (length (-> k hooks))] [b (-> s bytes)])
-    (write-uleb q (cast u64 (+ 2 (length (-> k got)) (length (-> s globals)) nhooks)))
+    (write-uleb q (cast u64 (+ 2 (length (-> k got)) (length (-> s globals)) nhooks (if (> nhooks 0) 1 0))))
     (for ([i u32 0]) (< i (+ 2 (length (-> k got)))) (+= i 1) (put! q (slice (array-of u8 #x7f 1 #x41 0 #x0b))))
     (for-each (lambda ([g datum])
                 (put! q (slice b (int (car g)) (int (cadr g))))
                 (init! q s k (int (cadr g))))
               (-> s globals))
-    (for ([i u32 0]) (< i nhooks) (+= i 1) (put! q (slice (array-of u8 #x7f 1 #x41 #x7f #x0b))))))
+    (for ([i u32 0]) (< i nhooks) (+= i 1) (put! q (slice (array-of u8 #x7f 1 #x41 #x7f #x0b))))
+    (when (> nhooks 0) (put! q (slice (array-of u8 #x7f 1 #x41 0 #x0b))))))
 
 ;; init! copies the constant expression at from, with its global and function indices mapped.
 (define (init! [q (ptr buffer)] [s (ptr side)] [k (ptr link)] [from u32])
@@ -440,7 +446,7 @@
 (define (exports! [q (ptr buffer)] [s (ptr side)] [k (ptr link)])
   (let ([functions (filter (lambda ([e datum]) -> bool (and (== (int (cadr e)) 0) (not (linker-name? (car e))))) (-> s exports))]
         [h u32 0] [l datum 0])
-    (write-uleb q (cast u64 (+ (length functions) (* 2 (length (-> k hooks))))))
+    (write-uleb q (cast u64 (+ (length functions) (* 2 (length (-> k hooks))) (if (pair? (-> k hooks)) 1 0))))
     (for-each (lambda ([e datum])
                 (put-name! q (car e))
                 (op-u! q 0 (fmapped k (int (caddr e)))))
@@ -452,7 +458,10 @@
       (put-name! q (format "supply:~a" (cons (cadr (car (car l))) nil)))
       (op-u! q 3 (+ (-> k first-slot) h))
       (+= h 1)
-      (set! l (cdr l)))))
+      (set! l (cdr l)))
+    (when (pair? (-> k hooks))
+      (put-name! q '"supplied!")
+      (op-u! q 0 (+ (-> k start) 1)))))
 
 (define (elements! [q (ptr buffer)] [s (ptr side)] [k (ptr link)])
   (let ([funcs (filter (lambda ([g datum]) -> bool (equal? (car g) 'func)) (-> k got))] [es (-> s elems)] [l datum 0])
@@ -482,14 +491,34 @@
 
 (define (code! [q (ptr buffer)] [s (ptr side)] [k (ptr link)] [what datum])
   (let ([h u32 0] [l (-> k hooks)] [type u32 0])
-    (write-uleb q (cast u64 (+ (-> k ndefined) (length (-> k hooks)) 1)))
+    (write-uleb q (cast u64 (+ (-> k ndefined) (length (-> k hooks)) (if (pair? (-> k hooks)) 2 1))))
     (for-each (lambda ([body datum]) (body! q s k (int (car body)) (int (cdr body)) what)) (-> s bodies))
     (while (pair? l)
       (set! type (int (list-ref (car (car l)) 5)))
       (stub! q (int (list-ref (-> s types) type)) (+ (-> k first-slot) h) type)
       (+= h 1)
       (set! l (cdr l)))
-    (start! q s k)))
+    (start! q s k)
+    (when (pair? (-> k hooks)) (supplied! q s k))))
+
+;; supplied! writes the function that runs the constructors the first time every slot is set.
+(define (supplied! [q (ptr buffer)] [s (ptr side)] [k (ptr link)])
+  (let ([t (make-buffer)] [nhooks (length (-> k hooks))] [ran (+ (-> k first-slot) (length (-> k hooks)))])
+    (op! (& t) 0)
+    (op-u! (& t) #x23 ran)
+    (put! (& t) (slice (array-of u8 #x04 #x40 #x0f #x0b)))
+    (for ([h u32 0]) (< h nhooks) (+= h 1)
+      (op-u! (& t) #x23 (+ (-> k first-slot) h))
+      (i32-const! (& t) -1)
+      (op! (& t) #x46)
+      (put! (& t) (slice (array-of u8 #x04 #x40 #x0f #x0b))))
+    (i32-const! (& t) 1)
+    (op-u! (& t) #x24 ran)
+    (op-u! (& t) #x10 (fmapped k (cast u32 (exported-function s '"__wasm_call_ctors"))))
+    (op! (& t) #x0b)
+    (write-uleb q (cast u64 (-> t length)))
+    (put! q (buffer-bytes (& t)))
+    (buffer-free! (& t))))
 
 ;; body! copies the body from from to to with its function and global indices mapped.
 (define (body! [q (ptr buffer)] [s (ptr side)] [k (ptr link)] [from u32] [to u32] [what datum])
@@ -608,7 +637,7 @@
     (for-each (lambda ([f datum])
                 (let ([index (exported-function s f)])
                   (when (>= index 0) (op-u! (& t) #x10 (fmapped k (cast u32 index))))))
-              '("__wasm_apply_data_relocs" "__wasm_call_ctors"))
+              (if (pair? (-> k hooks)) '("__wasm_apply_data_relocs") '("__wasm_apply_data_relocs" "__wasm_call_ctors")))
     (op! (& t) #x0b)
     (write-uleb q (cast u64 (-> t length)))
     (put! q (buffer-bytes (& t)))

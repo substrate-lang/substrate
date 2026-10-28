@@ -247,6 +247,21 @@ else
   fail=$((fail + 1))
   echo "FAIL a package's own files: got $from_build and $from_link"
 fi
+# A C module that does not export __wasm_call_ctors, which runs its constructors, is refused.
+unexported="$builds/unexported"
+rm -rf "${unexported:?}"
+mkdir -p "$unexported"
+printf 'int one(void) { return 1; }\n' > "$unexported/c.c"
+wasm32-unknown-wasi-clang -O2 -fPIC -fvisibility=default -nostdlib -shared -Wl,--experimental-pic -Wl,--no-entry \
+  -o "$unexported/c.wasm" "$unexported/c.c"
+printf '(require c "c.wasm")\n(define (main) (printf "~a~n" (c:one)))\n' > "$unexported/main.sub"
+refused="$(bin/sub build "$unexported/main.sub" -c "$cache" 2>&1)"
+if [[ "$refused" == *"c.wasm does not export __wasm_call_ctors"* ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a C module without its constructors: got $refused"
+fi
 # sub hash prints the hash a dependency pins, and sub map the module map a program is built with.
 hashed="$(bin/sub hash tests/packages/maps/lib 2>&1)"
 mapped="$(bin/sub map tests/packages/names.sub 2>&1)"
