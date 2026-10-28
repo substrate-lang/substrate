@@ -156,6 +156,27 @@ else
   fail=$((fail + 1))
   echo "FAIL the stale cache entry: got $first, then $second"
 fi
+# Cache entries cut short are built again.
+cut="$builds/cut"
+rm -rf "${cut:?}"
+mkdir -p "$cut/cache"
+printf '(define (main) (printf "~a~n" 3))\n' > "$cut/c.sub"
+bin/sub build "$cut/c.sub" -o "$cut/c" -c "$cut/cache" > /dev/null 2>&1
+for f in "$cut"/cache/*.subc; do truncate -s 100 "$f"; done
+whole="$(bin/sub build "$cut/c.sub" -o "$cut/c" -c "$cut/cache" 2>&1 && "$host" "$root/$cut/c" 2>&1)"
+if [ "$whole" = 3 ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL the cache entries cut short: got $whole"
+fi
+# A build that traps fails.
+if (cd tests && "$root/bin/sub" build err-macro-trap.sub -o "$root/$builds/trapped" -c "$cache" > /dev/null 2>&1); then
+  fail=$((fail + 1))
+  echo "FAIL tests/err-macro-trap: the build traps and exits 0"
+else
+  pass=$((pass + 1))
+fi
 # A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
 rm -rf "${changed:?}"
