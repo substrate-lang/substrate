@@ -4,8 +4,8 @@ import os from 'node:os';
 import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
 import { entries } from '../entries.mjs';
-import { isLoaderVariable, mayRun, notGranted, unlimited } from '../grants.mjs';
-import { comparable, programFile } from './fs.mjs';
+import { grantsOf, isLoaderVariable, mayRun, notGranted, unlimited, within } from '../grants.mjs';
+import { comparable, programFile, resolveGrant } from './fs.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -28,7 +28,7 @@ function refuse(grant, file, program, env, loader) {
   }
 }
 
-export function processes(grants, loader) {
+export function processes(grants, loader, setup = {}) {
   const children = new Map();
   let next = 1;
   return (caller) => {
@@ -85,6 +85,30 @@ export function processes(grants, loader) {
           caller.fail(err, e.message);
         }
         return -1;
+      },
+      // exec_at_end keeps exec's program for subhost.mjs.
+      exec_at_end(pp, pl, ap, al, err) {
+        try {
+          const program = caller.string(pp, pl);
+          const env = { ...globalThis.process.env };
+          const file = programFile(program, undefined, env.PATH ?? '/usr/bin:/bin');
+          if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
+          setup.atEnd = { file: file ?? program, argv: [program, ...entries(caller.string(ap, al))], env };
+        } catch (e) {
+          caller.fail(err, e.message);
+          return -1;
+        }
+        return 0;
+      },
+      restrict(gp, gl, err) {
+        try {
+          const narrowed = within(grantsOf(entries(caller.string(gp, gl)), resolveGrant), grants);
+          for (const k of Object.keys(narrowed)) grants[k] = narrowed[k];
+        } catch (e) {
+          caller.fail(err, e.message);
+          return -1;
+        }
+        return 0;
       },
       stdin(id) {
         const c = children.get(id);

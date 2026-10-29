@@ -95,7 +95,7 @@ export function literalPath(grants, k, p) {
 
 // A path as given is kept with its absolute form and the form the grants compare (key).
 export function nodeFiles(grants) {
-  const everything = allowsAll(grants);
+  const everything = () => allowsAll(grants);
   const known = new Map();
   let last = { p: null };
   const allowed = (k, p, tree = false) => {
@@ -115,7 +115,7 @@ export function nodeFiles(grants) {
     return p;
   };
   // at gives the path a call that does not follow links works on, checked as Deno checks it.
-  const at = (k, p) => (everything ? p : checked(k, allowed(k, p)));
+  const at = (k, p) => (everything() ? p : checked(k, allowed(k, p)));
   // opening gives open(where, flag) for where the links of p lead now, checked and opened without following a link
   // at its end, which is reported as missing, as Deno opens a path; on Linux, Deno leaves /proc and /dev unresolved.
   const opening = (k, p, flag, open) => {
@@ -140,7 +140,7 @@ export function nodeFiles(grants) {
     }),
     list: plain((p) => fs.readdirSync(at('read', p)).sort()),
     remove: plain((p, recursive) => {
-      const where = everything ? p : allowed('write', p, recursive);
+      const where = everything() ? p : allowed('write', p, recursive);
       if (!fs.lstatSync(where).isDirectory()) fs.unlinkSync(where);
       else if (recursive) fs.rmSync(where, { recursive: true });
       else fs.rmdirSync(where);
@@ -154,7 +154,7 @@ export function nodeFiles(grants) {
       fs.symlinkSync(target, p);
     }),
     copy: plain((from, to) => {
-      const source = everything ? from : resolved('read', from);
+      const source = everything() ? from : resolved('read', from);
       const target = at('write', to);
       try {
         const [a, b] = [fs.statSync(source), fs.statSync(target)];
@@ -167,7 +167,7 @@ export function nodeFiles(grants) {
     chmod: plain((p, mode) => fs.chmodSync(at('write', p), mode)),
     makeTemp: plain((dir, prefix, suffix, file) => {
       const base = dir ?? os.tmpdir();
-      if (!everything) checked('write', allowed('write', base));
+      if (!everything()) checked('write', allowed('write', base));
       for (let tries = 0; tries < 10; tries++) {
         const name = tempName(prefix, suffix);
         const made = path.join(base, name);
@@ -192,8 +192,8 @@ export function nodeFiles(grants) {
       const changes = writes || how.truncate || how.create || how.createNew;
       const flag = (how.read ? (writes ? O_RDWR : O_RDONLY) : O_WRONLY) | (how.append ? O_APPEND : 0)
         | (how.truncate ? O_TRUNC : 0) | (how.create || how.createNew ? O_CREAT : 0) | (how.createNew ? O_EXCL : 0);
-      if (how.read && changes && !everything) allowed('read', p);
-      const fd = everything ? fs.openSync(p, flag) : opening(changes ? 'write' : 'read', p, flag, fs.openSync);
+      if (how.read && changes && !everything()) allowed('read', p);
+      const fd = everything() ? fs.openSync(p, flag) : opening(changes ? 'write' : 'read', p, flag, fs.openSync);
       const kind = fs.fstatSync(fd);
       const seekable = kind.isFile() || kind.isBlockDevice();
       return {

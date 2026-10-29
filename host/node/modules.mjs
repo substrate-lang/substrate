@@ -18,7 +18,7 @@ const loaders = {
     : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants), true)),
   worker: (s) => require('./worker.mjs').workers(s),
   net: (s) => require('./net.mjs').netModule(s.grants, s.tls),
-  process: (s) => require('./process.mjs').processes(s.grants, s.loader),
+  process: (s) => require('./process.mjs').processes(s.grants, s.loader, s),
   stdin: () => require('./stdin.mjs').stdin(),
   env: (s) => require('./env.mjs').env(s.grants),
   fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants)),

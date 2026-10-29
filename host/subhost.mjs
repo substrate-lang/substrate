@@ -55,6 +55,13 @@ function read(file) {
 const names = read(`${dir}/program`).toString().split('\n').filter((n) => n !== '');
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
 
+// The program process.exec_at_end kept (node/process.mjs).
+const atEnd = () => {
+  const kept = setup.atEnd;
+  if (kept) process.execve(kept.file, kept.argv, kept.env);
+};
+process.on('beforeExit', atEnd);
+
 const host = createHost({
   args: programArgs,
   write(fd, bytes) {
@@ -72,6 +79,7 @@ const host = createHost({
     process.stderr.write(`error: ${message}\n`);
   },
   ended(code) {
+    if (code === 0) atEnd();
     process.exit(code < 0 ? 2 : code);
   },
   modules: hostModules(setup),
