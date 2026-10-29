@@ -15,11 +15,8 @@ compiler is written in it, builds itself, and runs in a browser.
   a C side module a module of the program. The compiler builds a program
   from one file and the label of its root, with a module map of roots,
   each a label and a directory, and the names each root uses; it knows
-  host, compiler and std itself, whose compile-time code runs in the
-  compiler's memory. Another root's runs in a memory of its own, unless
-  the map gives the root `(compiler-memory)`: `world.sub` runs the root's
-  macros there, and `copier.sub` copies what they take and give. A
-  command may also give it a check for each module it reads.
+  host, compiler and std itself. A command may also give it a check for
+  each module it reads.
 - `std/`: the standard library, written in Substrate. `languages/` holds
   the languages built on it, `scheme/`, a Scheme, and `bend/`, a
   dependently typed language, with `nodes.sub`, the run-time nodes they
@@ -62,15 +59,6 @@ dot-files, its build/, links, or the directories of packages inside it.
 A package with C gives other packages typed functions in a binding
 module, as `packages/sqlite/sqlite.sub` does, rather than the C functions
 themselves.
-
-A package's macros and other compile-time code run in a memory of their
-own: what they take from the compiler and give it is copied, so they
-cannot change the compiler or what it holds. A dependency the program's
-own manifest marks `(trusted)`, as `(sqlite (path "../sqlite") (trusted))`,
-runs in the compiler's memory instead, with the packages it depends on,
-which saves the copying. A `(trusted)` in another package's manifest
-marks nothing, and the program's own package is not trusted. The
-toolchain, and code under no manifest, run in the compiler's memory.
 
 A module is known by its package's name and its path there, so a package
 builds into the same program wherever it is.
