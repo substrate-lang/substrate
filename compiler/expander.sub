@@ -2152,8 +2152,8 @@
 
 ;; A world as made, with the indices in the compiler's table of the functions the compiler calls in it.
 (struct world-entry [label datum] [copy-in i32] [copy-back i32] [loc-in i32] [loc-back i32] [call i32] [failed i32]
-        [message i32] [blamed i32] [loc i32] [transformer i32] [scope-map i32] [words-in i32] [words-free i32]
-        [scope-words i32] [begin-arena i32] [end-arena i32] [next (ptr world-entry)])
+        [message i32] [blamed i32] [loc i32] [transformer i32] [stand-in i32] [scope-map i32] [words-in i32]
+        [words-free i32] [scope-words i32] [begin-arena i32] [end-arena i32] [next (ptr world-entry)])
 
 (define worlds (ptr world-entry) 0)
 
@@ -2171,6 +2171,7 @@
 (define (end-arena! [abandon bool])
   (if abandon (abandon-module-arena) (end-module-arena))
   (-= arena-depth 1)
+  (stand-ins-to! arena-depth)
   (worlds-arena! #f))
 
 ;; end-arenas-to! ends the module arenas begun after mark, which leaves depth of them, and those abandoned.
@@ -2178,7 +2179,8 @@
   (end-module-arenas-to! mark)
   (while (> arena-depth depth)
     (-= arena-depth 1)
-    (worlds-arena! #f)))
+    (worlds-arena! #f))
+  (stand-ins-to! arena-depth))
 
 (define (worlds-arena! [begun bool])
   (let ([w worlds])
@@ -2234,6 +2236,7 @@
     (set! (-> w blamed) (world-function entry '"world-blamed"))
     (set! (-> w loc) (world-function entry '"world-loc"))
     (set! (-> w transformer) (world-function entry '"world-transformer?"))
+    (set! (-> w stand-in) (world-function entry '"world-stand-in"))
     (set! (-> w scope-map) (world-function (world-name label syntax-instance) '"set-scope-map!"))
     (set! (-> w begin-arena) (world-function (world-name label syntax-instance) '"begin-module-arena"))
     (set! (-> w end-arena) (world-function (world-name label syntax-instance) '"end-module-arena"))
@@ -2296,30 +2299,37 @@
         ((cast (fn (i64)) (-> w scope-map))
          (bit-or (cast i64 (cast u32 (-> w scope-words))) (<< (cast i64 n) 32))))))
 
-;; A macro a world keeps, which the compiler holds as a record of the world and the macro there.
+;; A macro a world keeps is a transformer in the compiler's memory, with world-macro as its code and a handle, a record
+;; of the world and the macro there, as its environment.
 (const world-handle-kind u32 21)
 
 (struct world-handle [label datum] [value u32])
 
 (define (world-handle? [d datum]) -> bool (record? d world-handle-kind))
 
-;; world-value gives the value v the world of the root label gave, as the compiler keeps it: a macro as a handle, and data
-;; copied back.
+;; world-value gives the value v the world of the root label gave, as the compiler keeps it: a macro as a transformer
+;; that runs it there, and data copied back.
 (define (world-value [label datum] [v datum]) -> datum
   (let ([w (world-entry-of label)] [h (ptr world-handle) 0])
     (if ((cast (fn (datum) -> bool) (-> w transformer)) v)
         (begin
-          (set! h (cast (ptr world-handle) (malloc (sizeof world-handle))))
-          (set! (-> h label) (keep label))
+          (set! h (cast (ptr world-handle) (arena-alloc (current-arena) (sizeof world-handle))))
+          (set! (-> h label) (-> w label))
           (set! (-> h value) (cast u32 v))
-          (make-record-in (& run-arena) world-handle-kind (cast (ptr void) h)))
+          (make-transformer (cast u32 world-macro) (make-record-in (current-arena) world-handle-kind (cast (ptr void) h))))
         ((cast (fn (datum) -> datum) (-> w copy-back)) v))))
 
-;; world-expansion runs t, a macro a world keeps, on the syntax s: s goes in as a copy, and the result, or the macro's
-;; error, comes back as one. An error the compiler raised for a request of the macro's, which the macro let pass, is
-;; raised as it was.
-(define (world-expansion [t datum] [s datum]) -> datum
-  (let* ([h (cast (ptr world-handle) (record-pointer t))] [w (world-entry-of (-> h label))]
+(define (world-macro [handle datum] [s datum]) -> datum (world-expansion handle s))
+
+;; world-handle-of gives the handle of t, a transformer, when t is a macro a world keeps, or 0.
+(define (world-handle-of [t datum]) -> (ptr world-handle)
+  (let ([e (transformer-env t)]) (if (world-handle? e) (cast (ptr world-handle) (record-pointer e)) 0)))
+
+;; world-expansion runs the macro a world keeps that handle holds on the syntax s: s goes in as a copy, and the result,
+;; or the macro's error, comes back as one. An error the compiler raised for a request of the macro's, which the macro
+;; let pass, is raised as it was.
+(define (world-expansion [handle datum] [s datum]) -> datum
+  (let* ([h (cast (ptr world-handle) (record-pointer handle))] [w (world-entry-of (-> h label))]
          [back (cast (fn (i32) -> datum) (-> w copy-back))]
          [in ((cast (fn (datum) -> i32) (-> w copy-in)) s)] [saved calling] [out i32 0] [m i32 0] [b i32 0])
     (set! calling w)
@@ -2341,9 +2351,8 @@
 (define calling (ptr world-entry) 0)
 
 ;; A world's macros make the compiler's queries through these, which compiler/world.sub gives its world as its queries:
-;; each copies its arguments back from the world whose macro runs, asks, and copies the answer in. A macro the compiler
-;; or another world keeps does not cross, and is answered as #f. An error the compiler raises for a request is refused:
-;; kept, with the world that asked, and copied in for compiler/world.sub to raise there.
+;; each copies its arguments back from the world whose macro runs, asks, and copies the answer in. An error the compiler
+;; raises for a request is refused: kept, with the world that asked, and copied in for compiler/world.sub to raise there.
 (define (asked [w i32]) -> datum ((cast (fn (i32) -> datum) (-> calling copy-back)) w))
 
 (define refusal-message datum 0)
@@ -2379,12 +2388,47 @@
 
 (define (world-refused-loc) -> i32 refused-loc)
 
+;; answered gives v, the compiler's answer, as the world whose macro runs has it: data as a copy, a macro the world keeps
+;; as itself, and any other macro as a stand-in there.
 (define (answered [v datum]) -> i32
-  (cond [(world-handle? v)
-         (let ([h (cast (ptr world-handle) (record-pointer v))])
-           (if (equal? (-> h label) (-> calling label)) (cast i32 (-> h value)) 0))]
-        [(transformer? v) 0]
-        [else ((cast (fn (datum) -> i32) (-> calling copy-in)) v)]))
+  (if (transformer? v)
+      (let ([h (world-handle-of v)])
+        (if (and (!= h 0) (equal? (-> h label) (-> calling label))) (cast i32 (-> h value)) (stand-in-for v)))
+      ((cast (fn (datum) -> i32) (-> calling copy-in)) v)))
+
+;; A macro a world was given and does not keep is a stand-in there, a transformer whose code asks the compiler to run
+;; it. stand-ins holds them by serial, each with the world it was given to and the depth of the module arenas when it
+;; was; one goes when the arena at that depth ends, so a stand-in is run only for its world and while what its macro is
+;; made of lasts.
+(struct stand-in [serial i32] [world (ptr world-entry)] [depth u32] [macro datum])
+
+(define stand-ins buffer)
+(define stand-in-serial i32 0)
+
+(define (stand-in-for [v datum]) -> i32
+  (let ([s stand-in])
+    (+= stand-in-serial 1)
+    (set! (-> s serial) stand-in-serial)
+    (set! (-> s world) calling)
+    (set! (-> s depth) arena-depth)
+    (set! (-> s macro) v)
+    (buffer-add! (& stand-ins) (slice (cast (ptr u8) (& s)) (sizeof stand-in)))
+    ((cast (fn (i32) -> i32) (-> calling stand-in)) stand-in-serial)))
+
+;; stand-ins-to! drops the stand-ins given at a depth beyond depth.
+(define (stand-ins-to! [depth u32])
+  (let ([all (cast (ptr stand-in) (-> stand-ins bytes))] [n (/ (-> stand-ins length) (sizeof stand-in))])
+    (while (and (> n 0) (> (-> (@ all (- n 1)) depth) depth)) (-= n 1))
+    (set! (-> stand-ins length) (* n (sizeof stand-in)))))
+
+(define (world-stand-in-call [serial i32] [s i32]) -> i32
+  (try (let ([all (cast (ptr stand-in) (-> stand-ins bytes))] [n (/ (-> stand-ins length) (sizeof stand-in))] [i u32 0])
+         (set! i n)
+         (while (and (> i 0) (!= (-> (@ all (- i 1)) serial) serial)) (-= i 1))
+         (when (or (== i 0) (!= (-> (@ all (- i 1)) world) calling))
+           (fail-at 0 "a package's macro ran a macro it was not given, or was given while a module since compiled" nil))
+         (answered (call-transformer (-> (@ all (- i 1)) macro) (asked s))))
+       [catch compile-error (m b l) (refuse! m b l)]))
 
 (define (world-local-value [id i32]) -> i32
   (try (answered (query-local-value (asked id))) [catch compile-error (m b l) (refuse! m b l)]))
@@ -2572,7 +2616,7 @@
 
 (define (transformer-of [m datum]) -> datum
   (if (and (!= m 0) (== (car m) 'compile-time-value))
-      (let ([v (compile-time-value (cadr m))]) (if (or (transformer? v) (form-value? v) (world-handle? v)) v 0))
+      (let ([v (compile-time-value (cadr m))]) (if (or (transformer? v) (form-value? v)) v 0))
       0))
 
 ;; A form the compiler implements has the value (#%form kind [env]).
@@ -3070,9 +3114,7 @@
     (set! api-phase phase)
     (set! api-where s)
     (set! api-intro intro)
-    (try (set! result (cond [(form-value? t) (form-expansion t s phase)]
-                            [(world-handle? t) (world-expansion t s)]
-                            [else (call-transformer t s)]))
+    (try (set! result (if (form-value? t) (form-expansion t s phase) (call-transformer t s)))
          [catch compile-error (message blamed loc)
           (set! api-phase saved-phase)
           (set! api-where saved-where)
