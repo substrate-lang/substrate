@@ -897,7 +897,7 @@
            (let* ([text (source-text path)] [m (new-unit path (provisional-name path))] [saved current])
              (hash-set! (& registry) key (cast u32 m))
              (set! compiling (keep-cons (symbol-of path) compiling))
-             (begin-module-arena)
+             (begin-arena!)
              (set! current (new-comp m))
              (try (set! (-> (unit-of m) code)
                         (expand-module-body (program-forms (read-text text (symbol-of path))) #f))
@@ -905,11 +905,11 @@
                   [catch-all
                    (hash-set! (& registry) key 0)
                    (set! current saved)
-                   (abandon-module-arena)
+                   (end-arena! #t)
                    (set! compiling (cdr compiling))
                    (rethrow)])
              (set! current saved)
-             (end-module-arena)
+             (end-arena! #f)
              (set! compiling (cdr compiling))
              m)])))
 
@@ -961,20 +961,20 @@
     (check-module! path 0)
     (set! text (source-text path))
     (hash-set! (& registry) key (cast u32 m))
-    (begin-module-arena)
+    (begin-arena!)
     (set! current (new-comp m))
     (try (set! forms (expand-module-body (program-forms (read-text text (symbol-of path))) #t))
          [catch-all
           (hash-set! (& registry) key 0)
           (set! current saved)
-          (abandon-module-arena)
+          (end-arena! #t)
           (rethrow)])
     (while (pair? forms)
       (f (car forms))
       (set! forms (cdr forms)))
     (hash-set! (& registry) key 0)
     (set! current saved)
-    (end-module-arena)))
+    (end-arena! #f)))
 
 (define (expand-module-body [forms datum] [syntax bool]) -> datum
   (let ([msc (new-scope!)] [saved to-syntax] [out datum 0])
@@ -1317,9 +1317,9 @@
   (if (== (cache-compiler) 0)
       0
       (begin
-        (begin-module-arena)
-        (let ([m (try (load-cached-in path) [catch-all (abandon-module-arena) (rethrow)])])
-          (end-module-arena)
+        (begin-arena!)
+        (let ([m (try (load-cached-in path) [catch-all (end-arena! #t) (rethrow)])])
+          (end-arena! #f)
           m))))
 
 (define (load-cached-in [path datum]) -> datum
@@ -2151,10 +2151,40 @@
 (define world datum 0)
 
 ;; A world as made, with the indices in the compiler's table of the functions the compiler calls in it.
-(struct world-entry [label datum] [copy-in i32] [copy-back i32] [call i32] [failed i32] [message i32] [blamed i32]
-        [transformer i32] [scope-map i32] [words-in i32] [words-free i32] [scope-words i32] [next (ptr world-entry)])
+(struct world-entry [label datum] [copy-in i32] [copy-back i32] [loc-in i32] [loc-back i32] [call i32] [failed i32]
+        [message i32] [blamed i32] [loc i32] [transformer i32] [scope-map i32] [words-in i32] [words-free i32]
+        [scope-words i32] [begin-arena i32] [end-arena i32] [next (ptr world-entry)])
 
 (define worlds (ptr world-entry) 0)
+
+;; How many module arenas the compiler has begun and not ended. Each world has as many, begun and ended with the
+;; compiler's, so that what a world makes while a module compiles goes when that module's arena does.
+(define arena-depth u32 0)
+
+(define (begin-arena!)
+  (begin-module-arena)
+  (+= arena-depth 1)
+  (worlds-arena! #t))
+
+;; end-arena! ends the innermost module arena, or abandons it when abandon is set, keeping it for the error being raised;
+;; a world's ends either way, since an error leaves a world as a copy.
+(define (end-arena! [abandon bool])
+  (if abandon (abandon-module-arena) (end-module-arena))
+  (-= arena-depth 1)
+  (worlds-arena! #f))
+
+;; end-arenas-to! ends the module arenas begun after mark, which leaves depth of them, and those abandoned.
+(define (end-arenas-to! [mark (ptr void)] [depth u32])
+  (end-module-arenas-to! mark)
+  (while (> arena-depth depth)
+    (-= arena-depth 1)
+    (worlds-arena! #f)))
+
+(define (worlds-arena! [begun bool])
+  (let ([w worlds])
+    (while (!= w 0)
+      ((cast (fn ()) (if begun (-> w begin-arena) (-> w end-arena))))
+      (set! w (-> w next)))))
 
 ;; world-of gives the label of the root of module m when its compile-time code runs in a memory of its own, or 0.
 (define (world-of [m datum]) -> datum
@@ -2194,14 +2224,20 @@
     (set! (-> w label) (keep label))
     (set! (-> w copy-in) (world-function copier '"copy-in"))
     (set! (-> w copy-back) (world-function copier '"copy-back"))
+    (set! (-> w loc-in) (world-function copier '"loc-in"))
+    (set! (-> w loc-back) (world-function copier '"loc-back"))
     (set! (-> w words-in) (world-function copier '"words-in"))
     (set! (-> w words-free) (world-function copier '"words-free"))
     (set! (-> w call) (world-function entry '"world-call"))
     (set! (-> w failed) (world-function entry '"world-failed?"))
     (set! (-> w message) (world-function entry '"world-message"))
     (set! (-> w blamed) (world-function entry '"world-blamed"))
+    (set! (-> w loc) (world-function entry '"world-loc"))
     (set! (-> w transformer) (world-function entry '"world-transformer?"))
     (set! (-> w scope-map) (world-function (world-name label syntax-instance) '"set-scope-map!"))
+    (set! (-> w begin-arena) (world-function (world-name label syntax-instance) '"begin-module-arena"))
+    (set! (-> w end-arena) (world-function (world-name label syntax-instance) '"end-module-arena"))
+    (for ([i u32 0]) (< i arena-depth) (+= i 1) ((cast (fn ()) (-> w begin-arena))))
     (set! (-> w next) worlds)
     (set! worlds w)
     w))
@@ -2280,17 +2316,23 @@
         ((cast (fn (datum) -> datum) (-> w copy-back)) v))))
 
 ;; world-expansion runs t, a macro a world keeps, on the syntax s: s goes in as a copy, and the result, or the macro's
-;; error, comes back as one.
+;; error, comes back as one. An error the compiler raised for a request of the macro's, which the macro let pass, is
+;; raised as it was.
 (define (world-expansion [t datum] [s datum]) -> datum
   (let* ([h (cast (ptr world-handle) (record-pointer t))] [w (world-entry-of (-> h label))]
          [back (cast (fn (i32) -> datum) (-> w copy-back))]
-         [in ((cast (fn (datum) -> i32) (-> w copy-in)) s)] [saved calling] [out i32 0])
+         [in ((cast (fn (datum) -> i32) (-> w copy-in)) s)] [saved calling] [out i32 0] [m i32 0] [b i32 0])
     (set! calling w)
+    (set! refusal-world 0)
     (try (set! out ((cast (fn (i32 i32) -> i32) (-> w call)) (cast i32 (-> h value)) in))
          [catch-all (set! calling saved) (rethrow)])
     (set! calling saved)
     (when ((cast (fn () -> bool) (-> w failed)))
-      (throw compile-error (back ((cast (fn () -> i32) (-> w message)))) (back ((cast (fn () -> i32) (-> w blamed)))) 0))
+      (set! m ((cast (fn () -> i32) (-> w message))))
+      (set! b ((cast (fn () -> i32) (-> w blamed))))
+      (when (and (== refusal-world w) (== m refused-message) (== b refused-blamed))
+        (throw compile-error refusal-message refusal-blamed refusal-loc))
+      (throw compile-error (back m) (back b) ((cast (fn (i32) -> (ptr srcloc)) (-> w loc-back)) ((cast (fn () -> i32) (-> w loc))))))
     (back out)))
 
 ;; ---- requests from worlds ----
@@ -2300,8 +2342,42 @@
 
 ;; A world's macros make the compiler's queries through these, which compiler/world.sub gives its world as its queries:
 ;; each copies its arguments back from the world whose macro runs, asks, and copies the answer in. A macro the compiler
-;; or another world keeps does not cross, and is answered as #f.
+;; or another world keeps does not cross, and is answered as #f. An error the compiler raises for a request is refused:
+;; kept, with the world that asked, and copied in for compiler/world.sub to raise there.
 (define (asked [w i32]) -> datum ((cast (fn (i32) -> datum) (-> calling copy-back)) w))
+
+(define refusal-message datum 0)
+(define refusal-blamed datum 0)
+(define refusal-loc (ptr srcloc) 0)
+(define refusal-world (ptr world-entry) 0)
+(define refused bool #f)
+(define refused-message i32 0)
+(define refused-blamed i32 0)
+(define refused-loc i32 0)
+
+(define (refuse! [m datum] [b datum] [l (ptr srcloc)]) -> i32
+  (let ([in (cast (fn (datum) -> i32) (-> calling copy-in))])
+    (set! refusal-message m)
+    (set! refusal-blamed b)
+    (set! refusal-loc l)
+    (set! refusal-world calling)
+    (set! refused-message (in m))
+    (set! refused-blamed (in b))
+    (set! refused-loc ((cast (fn ((ptr srcloc)) -> i32) (-> calling loc-in)) l))
+    (set! refused #t)
+    0))
+
+;; world-refused gives 1 once after a request the compiler refused, and 0 otherwise.
+(define (world-refused) -> i32
+  (let ([r refused])
+    (set! refused #f)
+    (if r 1 0)))
+
+(define (world-refused-message) -> i32 refused-message)
+
+(define (world-refused-blamed) -> i32 refused-blamed)
+
+(define (world-refused-loc) -> i32 refused-loc)
 
 (define (answered [v datum]) -> i32
   (cond [(world-handle? v)
@@ -2310,28 +2386,38 @@
         [(transformer? v) 0]
         [else ((cast (fn (datum) -> i32) (-> calling copy-in)) v)]))
 
-(define (world-local-value [id i32]) -> i32 (answered (query-local-value (asked id))))
+(define (world-local-value [id i32]) -> i32
+  (try (answered (query-local-value (asked id))) [catch compile-error (m b l) (refuse! m b l)]))
 
 (define (world-free-identifier=? [x i32] [y i32]) -> i32
-  (let ([a (asked x)]) (answered (query-free-identifier=? a (asked y)))))
+  (try (let ([a (asked x)]) (answered (query-free-identifier=? a (asked y)))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-binding-kind [id i32]) -> i32 (answered (query-binding-kind (asked id))))
+(define (world-binding-kind [id i32]) -> i32
+  (try (answered (query-binding-kind (asked id))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-local-expand [s i32]) -> i32 (answered (query-local-expand (asked s))))
+(define (world-local-expand [s i32]) -> i32
+  (try (answered (query-local-expand (asked s))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-lift [form i32]) -> i32 (answered (query-lift (asked form))))
+(define (world-lift [form i32]) -> i32
+  (try (answered (query-lift (asked form))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-function-signature [id i32]) -> i32 (answered (query-function-signature (asked id))))
+(define (world-function-signature [id i32]) -> i32
+  (try (answered (query-function-signature (asked id))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-introduce [s i32]) -> i32 (answered (query-introduce (asked s))))
+(define (world-introduce [s i32]) -> i32
+  (try (answered (query-introduce (asked s))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-local-facts [id i32]) -> i32 (answered (query-local-facts (asked id))))
+(define (world-local-facts [id i32]) -> i32
+  (try (answered (query-local-facts (asked id))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-identifier-name [id i32]) -> i32 (answered (query-identifier-name (asked id))))
+(define (world-identifier-name [id i32]) -> i32
+  (try (answered (query-identifier-name (asked id))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-name-identifier [name i32]) -> i32 (answered (query-name-identifier (asked name))))
+(define (world-name-identifier [name i32]) -> i32
+  (try (answered (query-name-identifier (asked name))) [catch compile-error (m b l) (refuse! m b l)]))
 
-(define (world-shape [s i32]) -> i32 (answered (query-shape (asked s))))
+(define (world-shape [s i32]) -> i32
+  (try (answered (query-shape (asked s))) [catch compile-error (m b l) (refuse! m b l)]))
 
 ;; ---- compile-time evaluation ----
 
@@ -2790,6 +2876,7 @@
 
 (define session (ptr comp) 0)
 (define session-mark (ptr void) 0)
+(define session-depth u32 0)
 (define session-set (ptr scope-set) 0)
 (define session-scope u32 0)
 (define session-scope-kept bool #f)
@@ -2805,8 +2892,9 @@
 
 (define (session-open! [name datum])
   (let ([m (new-unit (identity 0 name) (provisional-name name))])
-    (begin-module-arena)
+    (begin-arena!)
     (set! session-mark (module-arena-mark))
+    (set! session-depth arena-depth)
     (set! current (new-comp m))
     (set! session current)
     (let ([msc (new-scope!)])
@@ -2911,7 +2999,7 @@
     (buffer-free! (& b))))
 
 (define (session-recover!)
-  (end-module-arenas-to! session-mark)
+  (end-arenas-to! session-mark session-depth)
   (while (pair? compiling)
     (hash-set! (& registry) (cast u64 (car compiling)) 0)
     (set! compiling (cdr compiling)))
