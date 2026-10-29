@@ -1,6 +1,7 @@
 // The host module "process" (process.sub).
 import child from 'node:child_process';
 import os from 'node:os';
+import { isMainThread } from 'node:worker_threads';
 import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
 import { entries } from '../entries.mjs';
@@ -27,6 +28,10 @@ function refuse(grant, file, program, env, loader) {
     throw notGranted(`process.spawn: changing ${changed.sort().join(', ')} for a program is not granted (--allow-run)`);
   }
 }
+
+const mainOnly = (call) => {
+  if (!isMainThread) throw new Error(`process.${call} is not available in a worker`);
+};
 
 export function processes(grants, loader, setup = {}) {
   const children = new Map();
@@ -76,6 +81,7 @@ export function processes(grants, loader, setup = {}) {
       },
       exec(pp, pl, ap, al, err) {
         try {
+          mainOnly('exec');
           const program = caller.string(pp, pl);
           const env = globalThis.process.env;
           const file = programFile(program, undefined, env.PATH ?? '/usr/bin:/bin');
@@ -89,6 +95,7 @@ export function processes(grants, loader, setup = {}) {
       // exec_at_end keeps exec's program for subhost.mjs.
       exec_at_end(pp, pl, ap, al, err) {
         try {
+          mainOnly('exec_at_end');
           const program = caller.string(pp, pl);
           const env = { ...globalThis.process.env };
           const file = programFile(program, undefined, env.PATH ?? '/usr/bin:/bin');
