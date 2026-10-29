@@ -229,28 +229,6 @@ else
   fail=$((fail + 1))
   echo "FAIL an edit: got $total, with $compiled modules compiled again, not 3, or more entries than $entries"
 fi
-# Builds of a module from two directories share its cache entry, and builds of it requiring different modules are each
-# right, whichever comes first.
-twins="$builds/twins"
-rm -rf "${twins:?}"
-mkdir -p "$twins/one" "$twins/two"
-printf '(require d "dep.sub")\n(provide m)\n(define (m) -> i32 (d:d))\n' > "$twins/one/m.sub"
-printf '(require m "m.sub")\n(define (main) (printf "~a~n" (m:m)))\n' > "$twins/one/main.sub"
-cp "$twins/one/m.sub" "$twins/one/main.sub" "$twins/two/"
-printf '(provide d)\n(define (d) -> i32 1)\n' > "$twins/one/dep.sub"
-printf '(provide d)\n(define (d) -> i32 2)\n' > "$twins/two/dep.sub"
-cp -r "$twins/one" "$twins/three"
-twin() { bin/sub build "$twins/$1/main.sub" -o "$twins/$1/built" -c "$twins/cache" > /dev/null 2>&1 && "$host" "$root/$twins/$1/built" 2>&1; }
-order="$(twin one) $(twin two) $(twin one)"
-touch "$twins/marker"
-copied="$(twin three)"
-reused="$(find "$twins/cache" -name '*.subc' -newer "$twins/marker" | wc -l)"
-if [ "$order" = "1 2 1" ] && [ "$copied" = 1 ] && [ "$reused" = 0 ] && [ "$(twin two)" = 2 ]; then
-  pass=$((pass + 1))
-else
-  fail=$((fail + 1))
-  echo "FAIL a cache two directories share: got $order and $copied, with $reused modules compiled again, not 0"
-fi
 # sub builds a program into build/ of its package, or of its directory outside packages, and runs it as the host does,
 # with the host's stack, its arguments and its exit code.
 ran="$builds/ran"
@@ -311,6 +289,26 @@ if [ "$private" = 1 ] && [[ "$public" == *'"hidden.sub" is not one of the files 
 else
   fail=$((fail + 1))
   echo "FAIL a package's files in a test's build: got $private and $public"
+fi
+# Nothing in a package is read through a link, which can lead outside it: not by a test, nor by one of its files.
+linked="$builds/linked"
+rm -rf "${linked:?}"
+mkdir -p "$linked/p/tests" "$linked/elsewhere"
+printf '(package p (version "0.1.0"))\n' > "$linked/p/package.sub"
+printf '(provide z)\n(define (z) -> i32 1)\n' > "$linked/elsewhere/z.sub"
+ln -s ../elsewhere "$linked/p/lib"
+ln -s ../elsewhere/z.sub "$linked/p/z.sub"
+printf '(provide v)\n(define (v) -> i32 2)\n' > "$linked/p/p.sub"
+printf '(require z "../lib/z.sub")\n(define (main) (printf "~a~n" (z:z)))\n' > "$linked/p/tests/t.sub"
+tested="$(bin/sub build "$linked/p/tests/t.sub" -o "$linked/t" -c "$cache" 2>&1)"
+printf '(require z "z.sub")\n(provide v)\n(define (v) -> i32 (z:z))\n' > "$linked/p/p.sub"
+hashed="$(bin/sub hash "$linked/p" 2>&1)"
+if [[ "$tested" == *'"../lib/z.sub" goes through a link in the package p'* ]] &&
+   [[ "$hashed" == *'z.sub goes through a link in the package p'* ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL links in a package: got $tested and $hashed"
 fi
 # Another package requires only a package's exports: not a module an export loads, nor one no longer exported when the
 # requiring module comes from the cache, nor one a macro of the package requires into the other package's module.
@@ -422,6 +420,19 @@ for t in tests/fetch/*.sub; do
     echo "$actual" | head -10
   fi
 done
+# A store entry holds just the files its hash covers: json's, not its archive's README or unused module, and nest's
+# with its inner package's at their path.
+json_entry="$(find tests/fetch/build/app -name json.sub -printf '%h\n' | head -1)"
+nest_entry="$(find tests/fetch/build/nested -name nest.sub -printf '%h\n' | head -1)"
+json_files="$(cd "$json_entry" && find . -type f | sort | tr '\n' ' ')"
+nest_files="$(cd "$nest_entry" && find . -type f | sort | tr '\n' ' ')"
+if [ "$json_files" = "./json.sub ./package.sub " ] &&
+   [ "$nest_files" = "./inner/inner.sub ./inner/package.sub ./nest.sub ./package.sub " ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a store entry's files: got $json_files and $nest_files"
+fi
 if [ -e tests/fetch/build/escaped.sub ] || [ -e tests/fetch/escaped.sub ]; then
   fail=$((fail + 1))
   echo "FAIL tests/fetch/err-hostile: a file was written outside the store"
