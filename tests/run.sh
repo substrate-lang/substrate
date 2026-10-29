@@ -28,9 +28,25 @@ mkdir -p "$builds/tls"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
 
+# Archives for tests/archive/tar.sub, made by GNU tar in each of its formats.
+tarred="$builds/tar"
+deep="pkg/a-directory-whose-name-is-long-enough-that/a-path-through-it-is-longer-than-the-hundred-bytes-of-a-name"
+mkdir -p "$tarred/tree/$deep"
+printf 'hello\n' > "$tarred/tree/pkg/hello.txt"
+printf 'deep\n' > "$tarred/tree/$deep/deep.txt"
+: > "$tarred/tree/pkg/empty"
+ln -s hello.txt "$tarred/tree/pkg/link"
+for format in ustar gnu pax; do
+  tar --sort=name --format="$format" -cf "$tarred/$format.tar" -C "$tarred/tree" pkg
+done
+tar --sort=name --format=pax --pax-option=comment=a-global-header -cf "$tarred/global.tar" -C "$tarred/tree" pkg
+head -c 600 /dev/zero | tr '\0' x > "$tarred/not.tar"
+head -c 1000 "$tarred/ustar.tar" > "$tarred/short.tar"
+
 tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
        tests/crypto/*.sub tests/encoding/*.sub tests/meta/*.sub tests/log/*.sub tests/compress/*.sub tests/cmd/*.sub
-       tests/packages/*.sub tests/packages/cside/tests/*.sub tests/packages/bounds/*.sub tests/sqlite/*.sub)
+       tests/packages/*.sub tests/packages/cside/tests/*.sub tests/packages/bounds/*.sub tests/sqlite/*.sub
+       tests/archive/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   [ "$name" = package ] && continue
@@ -298,6 +314,52 @@ if grep -qF "whose srcloc differs" <<< "$(from_changed)"; then
 else
   fail=$((fail + 1))
   echo "FAIL changed sources: a changed srcloc is not refused"
+fi
+# Url dependencies: the packages in tests/fetch/archives, made into archives here by GNU tar and answered by the fake
+# fetch, and each test with a store of its own in tests/fetch/build.
+served="$root/$builds/fetch/served"
+mkdir -p "$served"
+for p in tests/fetch/archives/*/; do
+  p="$(basename "$p")"
+  tar --sort=name --format=pax -czf "$served/$p.tar.gz" -C tests/fetch/archives "$p"
+done
+printf 'this is not an archive\n' > "$served/junk.tar.gz"
+tar -P --sort=name --format=pax --transform 's,^json/json.sub,json/../../escaped.sub,' -czf "$served/hostile.tar.gz" \
+  -C tests/fetch/archives json
+rm -rf tests/fetch/build
+fetched() {
+  (cd tests/fetch && "$host" -A --fake=fetch:"$served" "$root/build/sub" "$root" "$@" -c "$cache" 2>&1)
+}
+for t in tests/fetch/*.sub; do
+  name="$(basename "$t" .sub)"
+  base="tests/fetch/$name"
+  program="$builds/fetch/$name"
+  actual="$(fetched build "$name.sub" -o "$root/$program" -P "build/$name" && timeout 60 "$host" "$root/$program" 2>&1)"
+  code=$?
+  if [ -f "$base.out" ] && [ $code -eq 0 ] && [ "$actual" = "$(cat "$base.out")" ]; then
+    pass=$((pass + 1))
+  elif [ -f "$base.err" ] && [ $code -ne 0 ] && grep -qF -- "$(cat "$base.err")" <<< "$actual"; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL $base: got"
+    echo "$actual" | head -10
+  fi
+done
+if [ -e tests/fetch/build/escaped.sub ] || [ -e tests/fetch/escaped.sub ]; then
+  fail=$((fail + 1))
+  echo "FAIL tests/fetch/err-hostile: a file was written outside the store"
+fi
+# A package already in the store is not fetched again, and sub fetch URL prints the dependency that pins a package,
+# then fetches the packages it needs.
+stored="$(fetched build app.sub -o "$root/$builds/fetch/again" -P build/app && "$host" "$root/$builds/fetch/again" 2>&1)"
+fetched_url="$(fetched fetch http://fake/outer.tar.gz -P build/fetch-url)"
+if [ "$stored" = 42 ] && [ "$fetched_url" = "$(cat tests/fetch/fetch-url.out)" ] &&
+   [ -d "tests/fetch/build/fetch-url/$(grep -o 'sha256:[0-9a-f]*' tests/fetch/fetch-url.out | cut -c8-)" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL fetching again and sub fetch URL: got $stored, then $fetched_url"
 fi
 echo "$built modules built, $unbuilt failed"
 echo "$pass passed, $fail failed; $again built again from the cache"

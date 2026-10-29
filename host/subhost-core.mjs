@@ -411,6 +411,34 @@ export function createHost(platform) {
     };
   }
 
+  // later gives a function of the host module from, making the module for self when one of its functions is first
+  // called.
+  function later(self, made, from, fname) {
+    let f = null;
+    return (...args) => {
+      if (f === null) {
+        if (!made.has(from)) {
+          const info = {};
+          let factory;
+          try {
+            factory = platform.modules.get(from);
+          } catch (e) {
+            hostTrap(`${from}: ${e.message}`);
+          }
+          const { source, end: close, ...given } = factory(callerOf(self, from, info));
+          info.source = source;
+          const functions = {};
+          for (const [n, g] of Object.entries(given)) functions[n] = guarded(from, n, g);
+          if (close) closers.push(close);
+          made.set(from, functions);
+        }
+        f = made.get(from)[fname];
+        if (f === undefined) hostTrap(`${from}.${fname} is not a host function`);
+      }
+      return f(...args);
+    };
+  }
+
   function instantiate(name, bytes, map, compileTime = false) {
     let module;
     try {
@@ -440,27 +468,7 @@ export function createHost(platform) {
       } else if (platform.absent && platform.absent.has(from)) {
         value = refused(`${from}.${imp.name}`, 'in a worker');
       } else if (platform.modules && platform.modules.has(from)) {
-        if (compileTime) {
-          value = refused(`${from}.${imp.name}`);
-        } else {
-          if (!made.has(from)) {
-            const info = {};
-            let factory;
-            try {
-              factory = platform.modules.get(from);
-            } catch (e) {
-              lastError = `instantiate ${name}: ${from}: ${e.message}`;
-              return false;
-            }
-            const { source, end: close, ...given } = factory(callerOf(self, from, info));
-            info.source = source;
-            const functions = {};
-            for (const [name, f] of Object.entries(given)) functions[name] = guarded(from, name, f);
-            if (close) closers.push(close);
-            made.set(from, functions);
-          }
-          value = made.get(from)[imp.name];
-        }
+        value = compileTime ? refused(`${from}.${imp.name}`) : later(self, made, from, imp.name);
       } else {
         const exports = registry.get(from);
         value = exports && exports[imp.name];
