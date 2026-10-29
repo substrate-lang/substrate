@@ -1,0 +1,112 @@
+;; The store: the packages url dependencies pin, each in a directory named by its hash, holding just the files the hash
+;; covers.
+(require-unqualified manifest "manifest.sub")
+(require-unqualified hash "hash.sub")
+(require-unqualified files "files.sub")
+(require-unqualified paths "path.sub")
+(require-unqualified fs host/fs)
+
+(provide store-entry wanted store-wants! store-install!)
+
+(struct wanted [name string] [url string] [pin string])
+
+(define (store-entry [a (ptr arena)] [store string] [hash string]) -> string
+  (let* ([full (joined-path store (slice hash 7))] [entry (normal-path a full)])
+    (free (-> full bytes))
+    entry))
+
+(define (store-wants! [a (ptr arena)] [store string] [dir string] [m (ptr manifest)] [wants (ptr buffer)]
+                      [seen (ptr buffer)])
+  (let ([deps (-> m dependencies)] [ss (cast (ptr string) (-> seen bytes))])
+    (for ([i u32 0]) (< i (/ (-> seen length) (sizeof string))) (+= i 1) (when (== (@ ss i) dir) (return)))
+    (buffer-add! seen (slice (cast (ptr u8) (& dir)) (sizeof string)))
+    (for ([i u32 0]) (< i (-> deps length)) (+= i 1)
+      (let* ([d (& (@ deps i))] [url (> (-> d url length) 0)] [dm manifest] [err (make-buffer)] [info fs-info]
+             [next (if url (store-entry a store (-> d hash)) (dependency-dir a dir (-> d path)))]
+             [file (joined-path next "package.sub")])
+        (if (and url (or (!= (fs-stat next (& info) 0) 0) (!= (-> info kind) fs-directory)))
+            (let ([w wanted])
+              (set! (-> w name) (-> d name))
+              (set! (-> w url) (-> d url))
+              (set! (-> w pin) (-> d hash))
+              (buffer-add! wants (slice (cast (ptr u8) (& w)) (sizeof wanted))))
+            (when (manifest-read a file (& dm) (& err)) (store-wants! a store next (& dm) wants seen)))
+        (free (-> file bytes))
+        (buffer-free! (& err))))))
+
+(define (dependency-dir [a (ptr arena)] [dir string] [path string]) -> string
+  (if (starts? path "/")
+      (normal-path a path)
+      (let* ([full (joined-path dir path)] [d (normal-path a full)])
+        (free (-> full bytes))
+        d)))
+
+;; store-install! removes staging whether or not it installs it; a pin of "" is not checked.
+(define (store-install! [a (ptr arena)] [store string] [staging string] [pin string] [m (ptr manifest)]
+                        [into (ptr buffer)] [err (ptr buffer)]) -> bool
+  (let ([file (joined-path staging "package.sub")] [info fs-info] [h (make-buffer)] [hash string] [entry string]
+        [kept string] [why string])
+    (unless (and (== (fs-stat file (& info) 0) 0) (== (-> info kind) fs-file))
+      (return (not-installed! staging err "it has no package.sub at its top")))
+    (unless (manifest-read a file m err) (return (not-installed! staging err "")))
+    (let ([deps (-> m dependencies)])
+      (for ([i u32 0]) (< i (-> deps length)) (+= i 1)
+        (let ([d (& (@ deps i))])
+          (when (and (== (-> d url length) 0) (not (within? (dependency-dir a staging (-> d path)) staging)))
+            (buffer-add-string! err "it depends on ")
+            (buffer-add-string! err (-> d path))
+            (return (not-installed! staging err ", outside it"))))))
+    (unless (package-hash staging (& h) err) (return (not-installed! staging err "")))
+    (set! hash (buffer-string (& h)))
+    (when (and (> (-> pin length) 0) (!= hash pin))
+      (buffer-add-string! err "it has the hash ")
+      (buffer-add-string! err hash)
+      (buffer-add-string! err ", not the one its dependency pins, ")
+      (return (not-installed! staging err pin)))
+    (set! entry (store-entry a store hash))
+    (when (< (fs-make-temp-dir store ".staging-" "" (& kept) (& why)) 0)
+      (buffer-add-string! err why)
+      (return (not-installed! staging err "")))
+    (unless (copied! a staging staging kept err)
+      (fs-remove kept #t 0)
+      (return (not-installed! staging err "")))
+    (fs-remove staging #t 0)
+    (when (< (fs-rename kept entry (& why)) 0)
+      (fs-remove kept #t 0)
+      (unless (and (== (fs-stat entry (& info) 0) 0) (== (-> info kind) fs-directory))
+        (buffer-add-string! err why)
+        (return #f)))
+    (buffer-add-string! into hash)
+    #t))
+
+(define (copied! [a (ptr arena)] [top string] [dir string] [to string] [err (ptr buffer)]) -> bool
+  (let ([m manifest] [fs (make-buffer)] [es (make-buffer)] [own "package.sub"] [ok #f]
+        [file (joined-path dir "package.sub")])
+    (set! ok (manifest-read a file (& m) err))
+    (free (-> file bytes))
+    (buffer-add! (& fs) (slice (cast (ptr u8) (& own)) (sizeof string)))
+    (when ok (set! ok (package-files a dir (& m) (& fs) (& es) err)))
+    (let ([ps (cast (ptr string) (-> fs bytes))])
+      (for ([i u32 0]) (and ok (< i (/ (-> fs length) (sizeof string)))) (+= i 1)
+        (set! ok (copied-file! top dir (@ ps i) to err))))
+    (let ([deps (-> m dependencies)])
+      (for ([i u32 0]) (and ok (< i (-> deps length))) (+= i 1)
+        (let ([sub (dependency-dir a dir (-> (@ deps i) path))])
+          (when (and (== (-> (@ deps i) url length) 0) (within? sub top)) (set! ok (copied! a top sub to err))))))
+    (buffer-free! (& fs))
+    (buffer-free! (& es))
+    ok))
+
+(define (copied-file! [top string] [dir string] [p string] [to string] [err (ptr buffer)]) -> bool
+  (let* ([from (joined-path dir p)] [dest (joined-path to (slice from (+ (-> top length) 1)))] [why string] [ok #t])
+    (when (or (< (fs-make-dir (parent-of dest) (& why)) 0) (< (fs-copy from dest (& why)) 0))
+      (buffer-add-string! err why)
+      (set! ok #f))
+    (free (-> from bytes))
+    (free (-> dest bytes))
+    ok))
+
+(define (not-installed! [staging string] [err (ptr buffer)] [rest string]) -> bool
+  (buffer-add-string! err rest)
+  (fs-remove staging #t 0)
+  #f)

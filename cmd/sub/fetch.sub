@@ -1,0 +1,184 @@
+;; Fetching the packages url dependencies pin into the store, one at a time, each unpacked by a worker that may read and
+;; write only its staging directory.
+(require-unqualified fs host/fs)
+(require-unqualified events host/events)
+(require-unqualified stream host/stream)
+(require-unqualified worker host/worker)
+(require-unqualified fetch host/modules/fetch)
+(require-unqualified manifest std/package/manifest)
+(require-unqualified stores std/package/store)
+(require-unqualified paths std/package/path)
+(require-unqualified tar std/archive/tar)
+(require-unqualified gzip std/compress/gzip)
+(require-unqualified common cmd/sub/common)
+(require-unqualified build cmd/sub/build)
+
+(provide fetch-then! fetch-command!)
+
+(define then (fn ()))
+(define carrying bool)
+
+(define start bool)
+(define start-dir string)
+(define start-manifest manifest)
+
+(define (fetch-then! [next (fn ())])
+  (set! then next)
+  (set! carrying #t)
+  (set! start (> program-found 0))
+  (set! start-dir program-dir)
+  (set! start-manifest program-manifest)
+  (fetch-more!))
+
+(define (fetch-command! [rest (slice string)])
+  (unless (== (-> rest length) 1) (usage))
+  (set! carrying #f)
+  (if (or (starts? (@ rest 0) "http://") (starts? (@ rest 0) "https://"))
+      (let ([holder (package-holding (& a) cwd)] [w wanted])
+        (locations! (if (> (-> holder length) 0) holder cwd))
+        (set! start #f)
+        (set! (-> w name) "")
+        (set! (-> w url) (@ rest 0))
+        (set! (-> w pin) "")
+        (fetch! (& w)))
+      (begin
+        (locations! (find-package! (absolute (@ rest 0))))
+        (set! start (> program-found 0))
+        (set! start-dir program-dir)
+        (set! start-manifest program-manifest)
+        (fetch-more!))))
+
+(define (fetch-more!)
+  (let ([wants (make-buffer)] [seen (make-buffer)])
+    (when start (store-wants! (& a) store-dir start-dir (& start-manifest) (& wants) (& seen)))
+    (cond [(> (-> wants length) 0) (fetch! (cast (ptr wanted) (-> wants bytes)))]
+          [carrying (then)])))
+
+(define fetching wanted)
+(define answer event-head)
+(struct body-reader [head event-head] [bytes buffer] [chunk (array u8 65536)])
+(define body body-reader)
+(define unpacker event-head)
+(define staging string)
+(define unpack-error string)
+(const most-fetched u32 67108864)
+
+(define (fetch! [w (ptr wanted)])
+  (set! fetching (@ w))
+  (say 2 (joined (joined "sub: fetching " (-> w url)) "\n"))
+  (set! (-> answer handle) answered)
+  (fetch-get (-> w url) (& answer)))
+
+(define (answered [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (cond [(and (== kind fetch-head) (!= value 200))
+         (stream-close id)
+         (fetch-failed! (joined "the server answered " (number-text value)))]
+        [(== kind fetch-head)
+         (set! (-> body head handle) body-heard)
+         (set! (-> body bytes) (make-buffer))
+         (stream-tag! id (cast (ptr void) (& body)))
+         (stream-read! id (slice (-> body chunk)))]
+        [(== kind fetch-failed) (fetch-failed! (events-take-text))]))
+
+(define (body-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (cond [(and (== kind stream-read) (> value 0))
+         (buffer-add! (& (-> body bytes)) (slice (-> body chunk) (cast u32 value)))
+         (when (> (-> body bytes length) most-fetched)
+           (stream-close id)
+           (fetch-failed! "it is larger than 64 MB"))
+         (stream-read! id (slice (-> body chunk)))]
+        [(== kind stream-read) (unpack!)]
+        [(== kind stream-failed) (fetch-failed! (events-take-text))]))
+
+(define (unpack!)
+  (let ([why string] [arg (make-buffer)] [o worker-options] [w u32 0]
+        [grants (cast (ptr string) (arena-alloc (& a) (* 2 (sizeof string))))])
+    (made! store-dir)
+    (when (< (fs-make-temp-dir store-dir ".staging-" "" (& staging) (& why)) 0) (fetch-failed! why))
+    (buffer-add-string! (& arg) staging)
+    (buffer-add-byte! (& arg) 0)
+    (buffer-add! (& arg) (buffer-bytes (& (-> body bytes))))
+    (buffer-free! (& (-> body bytes)))
+    (set! (@ grants 0) (grant-flag "-R=" staging))
+    (set! (@ grants 1) (grant-flag "-W=" staging))
+    (worker-options-init! (& o))
+    (set! (-> o time) 60000)
+    (set! (-> o memory) 1073741824)
+    (set! (-> o grants) (slice grants 2))
+    (set! (-> unpacker handle) unpacked)
+    (set! unpack-error "")
+    (set! w (worker-start unpack (buffer-bytes (& arg)) (& o) (& unpacker) (& why)))
+    (buffer-free! (& arg))
+    (when (== w 0) (fetch-failed! why))))
+
+(define (unpacked [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (cond [(== kind worker-message) (set! unpack-error (events-take-text))]
+        [(and (== kind worker-ended) (== value 0)) (install!)]
+        [(== kind worker-ended)
+         (let ([why (events-take-text)])
+           (fs-remove staging #t 0)
+           (fetch-failed! (replaced (if (> (-> unpack-error length) 0) unpack-error why) staging (-> fetching url))))]))
+
+(define (install!)
+  (let ([m manifest] [h (make-buffer)] [err (make-buffer)])
+    (unless (store-install! (& a) store-dir staging (-> fetching pin) (& m) (& h) (& err))
+      (fetch-failed! (replaced (buffer-string (& err)) staging (-> fetching url))))
+    (when (== (-> fetching pin length) 0)
+      (say 1 (joined (joined (joined (joined (joined (joined "(" (-> m name)) " (url \"") (-> fetching url)) "\") (hash \"")
+                             (buffer-string (& h))) "\"))\n"))
+      (set! start #t)
+      (set! start-dir (store-entry (& a) store-dir (buffer-string (& h))))
+      (set! start-manifest m))
+    (fetch-more!)))
+
+(define (fetch-failed! [why string])
+  (failed! (joined (joined (joined "fetching " (-> fetching url)) ": ") why)))
+
+(define (replaced [text string] [from string] [to string]) -> string
+  (let ([b (make-buffer)] [i u32 0] [n (-> from length)])
+    (while (< i (-> text length))
+      (if (and (> n 0) (<= (+ i n) (-> text length)) (== (slice text i (+ i n)) from))
+          (begin
+            (buffer-add-string! (& b) to)
+            (+= i n))
+          (begin
+            (buffer-add-byte! (& b) (cast i32 (@ text i)))
+            (+= i 1))))
+    (buffer-string (& b))))
+
+(define (grant-flag [flag string] [path string]) -> string
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) flag)
+    (granted! (& b) path)
+    (buffer-string (& b))))
+
+(define (number-text [n i32]) -> string
+  (let ([b (make-buffer)])
+    (write-digits (& b) (cast u64 n) 10)
+    (buffer-string (& b))))
+
+;; ---- unpacking ----
+
+(const most-unpacked u32 268435456)
+
+;; The worker unpack! starts.
+(define (unpack)
+  (let* ([arg (cast (slice u8) (@ (host-args) 0))] [z u32 0] [dir string] [data (slice u8)] [tarred (make-buffer)]
+         [ua (make-arena)] [err (make-buffer)] [code i32 0])
+    (while (and (< z (-> arg length)) (!= (@ arg z) 0)) (+= z 1))
+    (when (>= z (-> arg length)) (unpack-failed! "it is empty"))
+    (set! dir (cast string (slice arg 0 z)))
+    (set! data (slice arg (+ z 1)))
+    (when (and (>= (-> data length) 2) (== (@ data 0) 31) (== (@ data 1) 139))
+      (set! code (gunzip! (& tarred) data most-unpacked))
+      (cond [(== code -13) (unpack-failed! "it unpacks to more than 256 MB")]
+            [(< code 0) (unpack-failed! (joined "it is not gzip data: " (gzip-message code)))])
+      (set! data (buffer-bytes (& tarred))))
+    (set! code (tar-unpack! (& ua) data dir (& err)))
+    (cond [(== code -1) (unpack-failed! (joined "it is not a tar archive: " (buffer-string (& err))))]
+          [(< code 0) (unpack-failed! (buffer-string (& err)))])
+    (host-exit 0)))
+
+(define (unpack-failed! [why string])
+  (worker-send-text 0 why)
+  (host-exit 1))

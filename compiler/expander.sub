@@ -3,19 +3,24 @@
 (require-unqualified core "core.sub")
 (require-unqualified ops "ops.sub")
 (require-unqualified rd "reader.sub")
-(require-unqualified fs "../host/fs.sub")
+(require-unqualified fs host/fs)
 (require-unqualified cmp "compile.sub")
 (require-unqualified running "running.sub")
 (require-unqualified ser "serialize.sub")
 (require-unqualified leb "leb128.sub")
 (require-unqualified checker "checker.sub")
+(require-unqualified link "link.sub")
 
-(provide set-repository-root! set-package-root! install-core! compile-module-file expand-module-file
-         content-hash wasm-module program-wasm-modules trap-report host-error set-cache-directory!
+(provide set-repository-root! set-module-map! set-module-map-text! set-display-directory! set-module-check! install-core!
+         toolchain-holding root-directories named-file written-requires
+         compile-module-file
+         expand-module-file
+         content-hash wasm-module program-wasm-modules trap-report host-error write-error
+         set-cache-directory!
          session-open! session-eval! session-eval-text! session-eval-file! session-error session-recover!)
 
 (define core-forms datum
-  '(func global import memory table tag define-syntax begin-for-syntax
+  '(func global import supply memory table tag define-syntax begin-for-syntax
            begin require require-unqualified language provide set! let let* if block loop br br-if br-table
            return
            call-indirect func-index select drop values unreachable nop
@@ -164,7 +169,9 @@
 ;; ---- the syntax module ----
 
 (define repository-root datum 0)
-(define (set-repository-root! [root datum]) (set! repository-root (keep root)))
+(define (set-repository-root! [root datum])
+  (set! repository-root (keep (absolute root)))
+  (set! roots (keep (map (lambda ([l datum]) -> datum `(,l ,(file-in repository-root l) ())) toolchain-labels))))
 
 (define running-syntax datum 0)
 (define syntax-instance datum 0)
@@ -531,22 +538,19 @@
 
 ;; ---- modules ----
 
-(define package-root datum 0)
-(define (set-package-root! [dir datum]) (set! package-root (keep dir)))
-
 (define (substring [s datum] [from u32] [to u32]) -> datum (string->datum (slice (datum->string s) from to)))
 
 (define (absolute-path? [p datum]) -> bool (let ([s (datum->string p)]) (and (> (-> s length) 0) (== (@ s 0) #\/))))
 
-(define (package-directory) -> datum (if (!= package-root 0) package-root repository-root))
-
-(define (canonical-path [p datum]) -> datum
-  (let* ([root (resolve-segments (package-directory))]
-         [full (resolve-segments (if (absolute-path? p) p (concat root (concat '"/" p))))]
-         [r (datum->string root)] [f (datum->string full)] [n (+ (-> r length) 1)])
-    (if (and (> (-> f length) n) (== (slice f 0 (- n 1)) r) (== (@ f (- n 1)) #\/))
-        (string->datum (slice f n))
-        full)))
+(define (absolute [p datum]) -> datum
+  (let ([cwd string] [d datum 0])
+    (if (absolute-path? p)
+        (set! d (resolve-segments p))
+        (begin
+          (when (< (fs-cwd (& cwd) 0) 0) (fail-at 0 "internal: there is no current directory" nil))
+          (set! d (resolve-segments (concat (string->datum cwd) (concat '"/" p))))
+          (free (-> cwd bytes))))
+    (if (== (-> (datum->string d) length) 0) '"/" d)))
 
 (define (resolve-segments [p datum]) -> datum
   (let ([kept nil] [s (datum->string p)] [start u32 0] [out (make-buffer)] [d datum 0] [absolute (absolute-path? p)])
@@ -629,30 +633,290 @@
       (set! requires (cdr requires)))
     (content-hash parts)))
 
-(define (package-file [path datum]) -> datum
-  (if (absolute-path? path) path (concat (package-directory) (concat '"/" path))))
+(define (source-text [id datum]) -> datum (file-text (host-file id)))
 
-(define (source-text [path datum]) -> datum
+(define (file-text [file datum]) -> datum
   (let* ([why string] [b (slice u8)] [s datum 0])
-    (when (< (fs-read-file (datum->string (package-file path)) (& b) (& why)) 0)
+    (when (< (fs-read-file (datum->string file) (& b) (& why)) 0)
       (fail-at 0 "cannot read the module ~a" (list1 (host-error why))))
     (set! s (string->datum (cast string b)))
     (free (-> b items))
     s))
 
-(define (compile-module-file [source datum]) -> datum
-  (let* ([path (canonical-path source)] [key (cast u64 (symbol-of path))]
-         [known (cast datum (hash-ref (& registry) key))] [cached datum 0])
+;; ---- roots ----
+
+;; A module lives in a root: host, compiler, std or cmd, the toolchain's, or one the module map gives; or, outside them,
+;; in the directory of the first file. Its identity is label/path in its root, or ./path and ../path from that
+;; directory. A root is (label directory uses), uses being ((name label) ...).
+(define roots datum nil)
+(define loose-directory datum 0)
+(define display-directory datum 0)
+
+(define toolchain-labels datum '("host" "compiler" "std" "cmd"))
+
+(define (toolchain-root? [label datum]) -> bool (!= (member label toolchain-labels) 0))
+
+(define (root-directories) -> datum (map (lambda ([r datum]) -> datum (cadr r)) roots))
+
+;; set-module-map! adds the roots of a module map: (root label "directory" (uses (name label) ...)), uses being optional.
+(define (set-module-map! [forms datum])
+  (for-each (lambda ([f datum]) (add-root! f)) forms)
+  (for-each (lambda ([r datum])
+              (for-each (lambda ([u datum])
+                          (when (== (assoc (cadr u) roots) 0)
+                            (fail-at 0 "the module map's root ~a uses ~a, which the map does not give" `(,(car r) ,(cadr u)))))
+                        (caddr r)))
+            roots))
+
+(define (add-root! [f datum])
+  (let ([label datum 0] [uses nil] [cs datum 0])
+    (unless (and (pair? f) (equal? (car f) 'root) (pair? (cdr f)) (symbol? (cadr f)) (pair? (cddr f)) (string? (caddr f)))
+      (fail-at 0 "expected (root label \"directory\" (uses (name label) ...)), not ~s" (list1 f)))
+    (set! label (string->datum (symbol->string (cadr f))))
+    (when (or (toolchain-root? label) (!= (assoc label roots) 0))
+      (fail-at 0 "the module map gives ~a twice, or as host, compiler, std or cmd" (list1 label)))
+    (set! cs (cdddr f))
+    (while (pair? cs)
+      (let ([c (car cs)])
+        (unless (and (pair? c) (equal? (car c) 'uses)) (fail-at 0 "a root's clause is (uses (name label) ...), not ~s" (list1 c)))
+        (for-each (lambda ([u datum])
+                    (unless (and (pair? u) (symbol? (car u)) (pair? (cdr u)) (symbol? (cadr u)) (null? (cddr u)))
+                      (fail-at 0 "a root's uses are (name label), not ~s" (list1 u)))
+                    (set! uses (cons `(,(string->datum (symbol->string (car u))) ,(string->datum (symbol->string (cadr u)))) uses)))
+                  (cdr c)))
+      (set! cs (cdr cs)))
+    (set! roots (keep (cons `(,label ,(absolute (caddr f)) ,uses) roots)))))
+
+(define (set-module-map-text! [text datum] [source datum])
+  (set-module-map! (map (lambda ([f datum]) -> datum (syntax->datum f)) (read-text text (symbol-of source)))))
+
+(define (set-display-directory! [dir datum]) (set! display-directory (keep (absolute dir))))
+
+(define (root-of [label datum]) -> datum
+  (let ([r (assoc label roots)])
+    (when (== r 0) (fail-at 0 "internal: there is no root ~a" (list1 label)))
+    r))
+
+(define (loose-root) -> datum
+  (when (== loose-directory 0) (set! loose-directory (keep (absolute '"."))))
+  loose-directory)
+
+(define (dotted? [path datum]) -> bool (let ([s (datum->string path)]) (and (> (-> s length) 0) (== (@ s 0) #\.))))
+
+(define (leaving? [path datum]) -> bool
+  (let ([s (datum->string path)]) (or (== s "..") (and (>= (-> s length) 3) (== (slice s 0 3) "../")))))
+
+(define (identity [label datum] [path datum]) -> datum
+  (cond [(!= label 0) (concat label (concat '"/" path))]
+        [(leaving? path) path]
+        [else (concat '"./" path)]))
+
+(define (identity-label [id datum]) -> datum
+  (let ([s (datum->string id)] [i u32 0])
+    (when (dotted? id) (return 0))
+    (while (and (< i (-> s length)) (!= (@ s i) #\/)) (+= i 1))
+    (string->datum (slice s 0 i))))
+
+(define (identity-path [id datum]) -> datum
+  (let ([s (datum->string id)] [label (identity-label id)])
+    (cond [(!= label 0) (string->datum (slice s (+ (-> (datum->string label) length) 1) (-> s length)))]
+          [(and (>= (-> s length) 2) (== (slice s 0 2) "./")) (string->datum (slice s 2 (-> s length)))]
+          [else id])))
+
+(define (host-file [id datum]) -> datum
+  (let ([label (identity-label id)])
+    (if (== label 0)
+        (resolve-segments (concat (loose-root) (concat '"/" (identity-path id))))
+        (file-in (cadr (root-of label)) (identity-path id)))))
+
+(define (inside? [file datum] [dir datum]) -> bool
+  (let ([f (datum->string file)] [d (datum->string dir)])
+    (and (> (-> f length) (+ (-> d length) 1)) (== (slice f 0 (-> d length)) d) (== (@ f (-> d length)) #\/))))
+
+(define (toolchain-holding [file datum]) -> datum
+  (let ([l roots] [found datum 0])
+    (while (pair? l)
+      (when (and (toolchain-root? (car (car l))) (inside? file (cadr (car l)))) (set! found (car l)))
+      (set! l (cdr l)))
+    found))
+
+(define (entry-identity [root datum] [source datum]) -> datum
+  (let* ([file (absolute source)] [r (if (!= root 0) (root-of root) (toolchain-holding file))])
+    (cond [(and (!= root 0) (not (inside? file (cadr r)))) (fail-at 0 "internal: ~a is not in the root ~a" `(,file ,root))]
+          [(!= r 0) (identity (car r) (relative-path (cadr r) file))]
+          [else
+           (when (== loose-directory 0) (set! loose-directory (keep (resolve-segments (directory-of file)))))
+           (identity 0 (relative-path loose-directory file))])))
+
+(define (path-parts [p datum]) -> datum
+  (let ([s (datum->string p)] [start u32 0] [out nil])
+    (for ([i u32 0]) (<= i (-> s length)) (+= i 1)
+      (when (or (== i (-> s length)) (== (@ s i) #\/))
+        (when (> i start) (set! out (cons (string->datum (slice s start i)) out)))
+        (set! start (+ i 1))))
+    (reverse out)))
+
+(define (joined-parts [parts datum]) -> datum
+  (let ([b (make-buffer)] [d datum 0])
+    (while (pair? parts)
+      (buffer-add-string! (& b) (datum->string (car parts)))
+      (when (pair? (cdr parts)) (buffer-add-byte! (& b) #\/))
+      (set! parts (cdr parts)))
+    (set! d (string->datum (buffer-string (& b))))
+    (buffer-free! (& b))
+    d))
+
+(define (relative-path [dir datum] [file datum]) -> datum
+  (let ([ds (path-parts dir)] [fs (path-parts file)] [up nil])
+    (while (and (pair? ds) (pair? fs) (equal? (car ds) (car fs)))
+      (set! ds (cdr ds))
+      (set! fs (cdr fs)))
+    (while (pair? ds)
+      (set! up (cons '".." up))
+      (set! ds (cdr ds)))
+    (joined-parts (append up fs))))
+
+(define (path-identity [spec datum] [from datum] [given datum]) -> datum
+  (let ([label (identity-label from)] [path datum 0])
+    (when (and (!= label 0) (absolute-path? given)) (fail-at spec "~s leaves ~a" `(,given ,label)))
+    (when (absolute-path? given) (return (entry-identity 0 given)))
+    (set! path (resolve-segments (concat (directory-of (identity-path from)) given)))
+    (when (and (!= label 0) (leaving? path)) (fail-at spec "~s leaves ~a" `(,given ,label)))
+    (identity label path)))
+
+;; A first (package ...) form is a manifest, which sub reads.
+(define (program-forms [forms datum]) -> datum
+  (let ([d (if (pair? forms) (syntax->datum (car forms)) 0)])
+    (if (and (pair? d) (equal? (car d) 'package)) (cdr forms) forms)))
+
+(define (write-error [b (ptr buffer)] [message datum] [blamed datum] [loc (ptr srcloc)])
+  (let ([at (if (and (== loc 0) (syntax? blamed)) (syntax-srcloc blamed) loc)])
+    (write-compile-error b message blamed
+                         (if (== at 0)
+                             0
+                             (make-srcloc (symbol-of (displayed (string->datum (symbol->string (-> at source)))))
+                                          (-> at line) (-> at col) (-> at pos) (-> at span))))))
+
+(define (displayed [source datum]) -> datum
+  (let ([label (identity-label source)])
+    (cond [(and (!= label 0) (== (assoc label roots) 0)) source]
+          [(!= display-directory 0) (relative-path display-directory (host-file source))]
+          [(== label 0) (identity-path source)]
+          [else source])))
+
+(define (file-in [dir datum] [name datum]) -> datum
+  (cond [(== (-> (datum->string dir) length) 0) name]
+        [(equal? dir '"/") (concat dir name)]
+        [else (concat dir (concat '"/" name))]))
+
+(define (kind-of [path datum]) -> i32
+  (let ([info fs-info])
+    (if (< (fs-stat (datum->string path) (& info) 0) 0) 0 (-> info kind))))
+
+(define (clean-name? [s string]) -> bool
+  (let ([start u32 0])
+    (for ([i u32 0]) (<= i (-> s length)) (+= i 1)
+      (when (or (== i (-> s length)) (== (@ s i) #\/))
+        (let ([part (slice s start i)])
+          (when (or (== (-> part length) 0) (== part ".") (== part "..")) (return #f)))
+        (set! start (+ i 1))))
+    #t))
+
+(define (last-part [d datum]) -> datum
+  (let* ([s (datum->string d)] [i (-> s length)])
+    (while (and (> i 0) (!= (@ s (- i 1)) #\/)) (-= i 1))
+    (string->datum (slice s i (-> s length)))))
+
+(define (name-identity [id datum] [from datum]) -> datum
+  (let* ([s (symbol->string (syntax-e id))] [n (-> s length)] [slash u32 0] [label datum 0])
+    (unless (clean-name? s) (fail-at id "~a is not a module name: its parts may not be empty, . or .." (list1 (syntax-e id))))
+    (while (and (< slash n) (!= (@ s slash) #\/)) (+= slash 1))
+    (set! label (named-root id (string->datum (slice s 0 slash)) (if (== from 0) 0 (identity-label from))))
+    (when (== slash n) (return (identity label (concat label '".sub"))))
+    (identity label (named-file (cadr (root-of label)) (string->datum (slice s (+ slash 1) n))))))
+
+(define (named-file [dir datum] [rest datum]) -> datum
+  (let ([file (concat rest '".sub")])
+    (if (and (!= (kind-of (file-in dir file)) fs-file) (== (kind-of (file-in dir rest)) fs-directory))
+        (file-in rest (concat (last-part rest) '".sub"))
+        file)))
+
+(define (written-requires [dir datum] [label datum] [path datum]) -> datum
+  (let ([out nil])
+    (for-each (lambda ([f datum]) (set! out (written-in f dir label path out)))
+              (program-forms (read-text (file-text (file-in dir path)) (symbol-of (identity label path)))))
+    (reverse out)))
+
+(define (written-in [f datum] [dir datum] [label datum] [path datum] [out datum]) -> datum
+  (let ([l (syntax->list f)] [head (form-name f)] [p datum 0])
+    (cond [(or (== l 0) (not (pair? l))) out]
+          [(or (equal? head 'begin) (equal? head 'begin-for-syntax))
+           (for-each (lambda ([g datum]) (set! out (written-in g dir label path out))) (cdr l))
+           out]
+          [(and (!= (memq head '(require require-unqualified language)) 0) (pair? (cdr l)) (pair? (cddr l)))
+           (set! p (written-path (caddr l) dir label path))
+           (if (== p 0) out (cons p out))]
+          [else out])))
+
+(define (written-path [spec datum] [dir datum] [label datum] [from datum]) -> datum
+  (let ([given (syntax-e spec)] [s string] [slash u32 0] [p datum 0])
+    (cond [(string? given)
+           (set! p (resolve-segments (concat (directory-of from) given)))
+           (if (or (absolute-path? given) (leaving? p)) 0 p)]
+          [(symbol? given)
+           (set! s (symbol->string given))
+           (while (and (< slash (-> s length)) (!= (@ s slash) #\/)) (+= slash 1))
+           (cond [(or (not (clean-name? s)) (not (equal? (string->datum (slice s 0 slash)) label))) 0]
+                 [(== slash (-> s length)) (concat label '".sub")]
+                 [else (named-file dir (string->datum (slice s (+ slash 1) (-> s length))))])]
+          [else 0])))
+
+(define (named-root [id datum] [head datum] [from datum]) -> datum
+  (let ([r (if (or (== from 0) (toolchain-root? from)) 0 (root-of from))] [u datum 0])
+    (cond [(toolchain-root? head) head]
+          [(== r 0) (fail-at id "this module has no name ~a: its names start with host, compiler, std or cmd" (list1 head))]
+          [(begin (set! u (assoc head (caddr r))) (!= u 0)) (cadr u)]
+          [(equal? head from) from]
+          [else (fail-at id "~a does not use ~a" `(,from ,head))])))
+
+(define (compile-module-file [root datum] [source datum]) -> datum
+  (let ([path (entry-identity root source)])
+    (check-module! 0 path 0)
+    (module-at path 0)))
+
+;; The module check, which set-module-check! gives, sees every require, also of a module already read and in a module
+;; from the cache: the requiring module's root label and file, both 0 for the first file and a session; the required
+;; module's root label, or 0 outside the roots, and its file; and how to name it. It gives 0, or why the require is
+;; refused.
+(typedef module-check (fn (datum datum datum datum datum) -> datum))
+
+(define checker i32 0)
+
+(define (set-module-check! [f module-check]) (set! checker (cast i32 f)))
+
+(define (refusal [from datum] [id datum] [where datum]) -> datum
+  (if (== checker 0)
+      0
+      ((cast module-check checker) (if (== from 0) 0 (identity-label from)) (if (== from 0) 0 (host-file from))
+       (identity-label id) (host-file id) (if (syntax? where) (format "~s" (list1 (syntax-e where))) (displayed id)))))
+
+(define (check-module! [from datum] [id datum] [where datum])
+  (let ([why (refusal from id where)]) (unless (== why 0) (fail-at where "~a" (list1 why)))))
+
+(define (module-at [path datum] [where datum]) -> datum
+  (let* ([key (cast u64 (symbol-of path))] [known (cast datum (hash-ref (& registry) key))] [cached datum 0])
     (cond [(and (!= known 0) (== (-> (unit-of known) state) 'done)) known]
           [(!= known 0) (fail-at 0 "cyclic require: ~a requires itself" (list1 path))]
           [(begin (set! cached (load-cached path)) (!= cached 0)) cached]
+          [(wasm-file? path) (wasm-file-unit path key)]
           [else
            (let* ([text (source-text path)] [m (new-unit path (provisional-name path))] [saved current])
              (hash-set! (& registry) key (cast u32 m))
              (set! compiling (keep-cons (symbol-of path) compiling))
              (begin-module-arena)
              (set! current (new-comp m))
-             (try (set! (-> (unit-of m) code) (expand-module-body (read-text text (symbol-of path)) #f))
+             (try (set! (-> (unit-of m) code)
+                        (expand-module-body (program-forms (read-text text (symbol-of path))) #f))
                   (finish-module! text)
                   [catch-all
                    (hash-set! (& registry) key 0)
@@ -667,17 +931,63 @@
 
 (define compiling datum nil)
 
-(define (expand-module-file [source datum] [f (closure (datum))])
-  (let ([path (canonical-path source)])
-    (let* ([text (source-text path)] [m (new-unit path (provisional-name path))])
-      (hash-set! (& registry) (cast u64 (symbol-of path)) (cast u32 m))
-      (begin-module-arena)
-      (set! current (new-comp m))
-      (let ([forms (expand-module-body (read-text text (symbol-of path)) #t)])
-        (while (pair? forms)
-          (f (car forms))
-          (set! forms (cdr forms))))
-      (end-module-arena))))
+(define (wasm-file? [path datum]) -> bool
+  (let ([s (datum->string path)])
+    (and (> (-> s length) 5) (== (slice s (- (-> s length) 5) (-> s length)) ".wasm"))))
+
+(define (wasm-file-unit [path datum] [key u64]) -> datum
+  (let* ([bytes (file-bytes (host-file path))] [prelude datum 0] [m datum 0] [u (ptr unit) 0] [instance datum 0]
+         [linked datum 0] [provides nil] [infos nil] [info datum 0])
+    (when (equal? bytes '#f) (fail-at 0 "cannot read the module ~a" (list1 path)))
+    (set! prelude (module-at (language-path) 0))
+    (set! m (new-unit path (provisional-name path)))
+    (set! u (unit-of m))
+    (hash-set! (& registry) key (cast u32 m))
+    (set! (-> u requires) (keep (list1 (cons prelude (make-integer 0)))))
+    (set! (-> u hash) (keep (module-hash path (string->datum (cast string (datum->bytes bytes)))
+                                         (list1 `(,(-> (unit-of prelude) hash) ,(make-integer 0))))))
+    (set! (-> u name) (keep (format "~a.~a" `(,(file-stem path) ,(-> u hash)))))
+    (note-hash! m)
+    (set! instance (wasm-module-name m 0 0))
+    (set! linked (link-side-module path bytes (wasm-module-name prelude 0 0)))
+    (add-wasm-module! m 0 `(,(car linked) ,(list1 (wasm-module-name prelude 0 0)) ()))
+    (for-each (lambda ([e datum])
+                (when (== (car e) 'func)
+                  (set! info (func-info (symbol-of (cadr e)) (caddr e) (cadddr e) instance (cadr e)))
+                  (set! infos (cons info infos))
+                  (unless (equal? (cadr e) '"supplied!")
+                    (set! provides (cons (cons (symbol-of (cadr e)) `(func ,info)) provides)))))
+              (wasm-module-exports (datum->bytes (car linked))))
+    (for-each (lambda ([h datum])
+                (let ([export (format "supply:~a" (list1 h))])
+                  (set! infos (cons (global-info (symbol-of export) 'i32 (boolean #t) instance export) infos))))
+              (cadr linked))
+    (set! (-> u infos) (keep infos))
+    (set! (-> u provides) (keep (sort provides (lambda ([a datum] [b datum]) -> bool (symbol<? (car a) (car b))))))
+    (set! (-> u state) 'done)
+    (store-cached! m)
+    m))
+
+(define (expand-module-file [root datum] [source datum] [f (closure (datum))])
+  (let* ([path (entry-identity root source)] [key (cast u64 (symbol-of path))] [text datum 0]
+         [m (new-unit path (provisional-name path))] [saved current] [forms datum 0])
+    (check-module! 0 path 0)
+    (set! text (source-text path))
+    (hash-set! (& registry) key (cast u32 m))
+    (begin-module-arena)
+    (set! current (new-comp m))
+    (try (set! forms (expand-module-body (program-forms (read-text text (symbol-of path))) #t))
+         [catch-all
+          (hash-set! (& registry) key 0)
+          (set! current saved)
+          (abandon-module-arena)
+          (rethrow)])
+    (while (pair? forms)
+      (f (car forms))
+      (set! forms (cdr forms)))
+    (hash-set! (& registry) key 0)
+    (set! current saved)
+    (end-module-arena)))
 
 (define (expand-module-body [forms datum] [syntax bool]) -> datum
   (let ([msc (new-scope!)] [saved to-syntax] [out datum 0])
@@ -700,7 +1010,7 @@
       (default-body forms)))
 
 (define (default-body [forms datum]) -> datum
-  (if (not (equal? (canonical-path (language-path)) (-> (the-module) path)))
+  (if (not (equal? (language-path) (-> (the-module) path)))
       (let ([id (make-syntax '%substrate:#%module-begin (module-base-scopes) 0 nil)])
         (set! (-> current language) nil)
         (use-language! 0)
@@ -709,8 +1019,7 @@
             forms))
       (map (lambda ([f datum]) -> datum (add-scope f wasm-scope)) forms)))
 
-(define (compiler-file [name datum]) -> datum
-  (if (== package-root 0) (concat '"compiler/" name) (concat repository-root (concat '"/compiler/" name))))
+(define (compiler-file [name datum]) -> datum (identity '"compiler" name))
 
 (define (language-path) -> datum (compiler-file '"substrate.sub"))
 
@@ -739,8 +1048,7 @@
                                          (map (lambda ([r datum]) -> datum `(,(-> (unit-of (car r)) hash) ,(cdr r)))
                                               (-> m requires)))))
     (set! (-> m name) (keep (format "~a.~a" `(,(file-stem (-> m path)) ,(-> m hash)))))
-    (when (== (hash-ref (& units-by-hash) (cast u64 (symbol-of (-> m hash)))) 0)
-      (hash-set! (& units-by-hash) (cast u64 (symbol-of (-> m hash))) (cast u32 (-> m self))))
+    (note-hash! (-> m self))
     (compile-wasm-modules!)))
 
 ;; ---- wasm modules ----
@@ -776,7 +1084,21 @@
     (set! (-> l imports) (keep (cadr compiled)))
     (set! (-> l scopes) (keep (caddr compiled)))
     (set! (-> l next) (-> u wasm-modules))
-    (set! (-> u wasm-modules) l)))
+    (set! (-> u wasm-modules) l)
+    (when (== phase 0) (note-supplies! m (car compiled)))))
+
+;; suppliers pairs each (module . supply:name) global a module imports, the slot of a function it supplies, with the
+;; module.
+(define suppliers datum nil)
+
+(define (note-supplies! [m datum] [bytes datum])
+  (let ([l (wasm-module-import-fields (datum->bytes bytes))])
+    (while (pair? l)
+      (when (supply-field? (cdr (car l))) (set! suppliers (keep-cons (keep (cons (car l) m)) suppliers)))
+      (set! l (cdr l)))))
+
+(define (supply-field? [f datum]) -> bool
+  (let ([s (datum->string f)]) (and (> (-> s length) 7) (== (slice s 0 7) "supply:"))))
 
 (define (wasm-module-of [m datum] [phase i32]) -> (ptr wasm-module)
   (let ([l (-> (unit-of m) wasm-modules)])
@@ -872,14 +1194,46 @@
     (reverse out)))
 
 (define (visit-wasm-modules [m datum] [seen (ptr hash-table)] [out datum]) -> datum
-  (let ([name (wasm-module-name m 0 0)])
+  (let ([name (wasm-module-name m 0 0)] [l nil])
     (when (!= (datum-get seen name) 0) (return out))
     (datum-put! seen name (boolean #t))
     (let* ([p (wasm-module-of m 0)] [imports (-> p imports)])
       (while (pair? imports)
         (set! out (visit-import (car imports) seen out))
         (set! imports (cdr imports)))
-      (cons (cons name (-> p bytes)) out))))
+      (set! out (cons (cons name (-> p bytes)) out))
+      (set! l (suppliers-of m))
+      (while (pair? l)
+        (set! out (visit-wasm-modules (car l) seen out))
+        (set! l (cdr l)))
+      out)))
+
+(define (suppliers-of [m datum]) -> datum
+  (let ([l (if (wasm-file? (-> (unit-of m) path)) (-> (unit-of m) infos) nil)] [name (wasm-module-name m 0 0)] [found nil]
+        [export datum 0] [out nil])
+    (while (pair? l)
+      (when (global-info? (car l))
+        (set! export (global-info-export (car l)))
+        (set! found (supplying name export))
+        (cond [(null? found)
+               (fail-at 0 "~a calls ~a by name, and no module supplies it" `(,(-> (unit-of m) path) ,(supplied-name export)))]
+              [(pair? (cdr found))
+               (fail-at 0 "~a calls ~a by name, and both ~a and ~a supply it"
+                        `(,(-> (unit-of m) path) ,(supplied-name export) ,(-> (unit-of (car found)) path)
+                          ,(-> (unit-of (cadr found)) path)))]
+              [(== (memq (car found) out) 0) (set! out (cons (car found) out))]))
+      (set! l (cdr l)))
+    (reverse out)))
+
+(define (supplying [name datum] [export datum]) -> datum
+  (let ([l suppliers] [out nil])
+    (while (pair? l)
+      (when (and (equal? (car (car (car l))) name) (equal? (cdr (car (car l))) export) (== (memq (cdr (car l)) out) 0))
+        (set! out (cons (cdr (car l)) out)))
+      (set! l (cdr l)))
+    out))
+
+(define (supplied-name [export datum]) -> datum (substring export 7 (-> (datum->string export) length)))
 
 (define (visit-import [imp datum] [seen (ptr hash-table)] [out datum]) -> datum
   (let ([l (wasm-module-ref imp)])
@@ -917,7 +1271,30 @@
     (serialize! s d)
     (serializer-bytes s)))
 
-(define (read-data [path datum]) -> datum (data-of (file-bytes path)))
+(define (read-data [path datum]) -> datum
+  (let ([d (file-bytes path)])
+    (if (and (!= d 0) (sealed? (datum->bytes d))) (data-of d) 0)))
+
+(define (sealed? [s (slice u8)]) -> bool
+  (let ([n (-> s length)])
+    (and (>= n 8) (== (@ (cast (ptr u64) (+ (-> s items) (- n 8))) 0) (data-hash (slice (-> s items) (- n 8)))))))
+
+(define (data-hash [s (slice u8)]) -> u64
+  (let ([h u64 14695981039346656037] [p (-> s items)])
+    (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+      (set! h (* (bit-xor h (@ p i)) 1099511628211)))
+    h))
+
+(define (write-data [path datum] [d datum]) -> bool
+  (let* ([data (datum->bytes (data-bytes d))] [h (data-hash data)] [b (make-buffer)] [temp string] [ok #f])
+    (buffer-add! (& b) data)
+    (for ([i u64 0]) (< i 64) (+= i 8) (buffer-add-byte! (& b) (cast i32 (bit-and (>> h i) 255))))
+    (when (>= (fs-make-temp-file (datum->string cache-directory) "" ".tmp" (& temp) 0) 0)
+      (set! ok (and (>= (fs-write-file temp (buffer-bytes (& b)) 0) 0) (>= (fs-rename temp (datum->string path) 0) 0)))
+      (unless ok (fs-remove temp #f 0))
+      (free (-> temp bytes)))
+    (buffer-free! (& b))
+    ok))
 
 (define (data-of [d datum]) -> datum
   (if (== d 0)
@@ -930,9 +1307,6 @@
           (set! count (bit-or count (<< (cast u64 (bit-and b 127)) shift)))
           (+= shift 7))
         (if (== count 0) 0 (@ (deserialize p (-> s length)) (cast u32 (- count 1)))))))
-
-(define (write-data [path datum] [d datum]) -> bool
-  (>= (fs-write-file (datum->string path) (datum->bytes (data-bytes d)) 0) 0))
 
 (define (section [d datum] [key datum]) -> datum (cdr (assq key d)))
 
@@ -965,8 +1339,11 @@
       (return 0))
     (hash-set! (& registry) key (cast u32 (new-unit path path)))
     (while (pair? requires)
-      (let* ([r (car requires)]
-             [u (if (and (equal? (car r) path) (> (integer-value (caddr r)) 0)) (running-copy path) (compile-module-file (car r)))])
+      (let* ([r (car requires)] [self (and (equal? (car r) path) (> (integer-value (caddr r)) 0))] [u datum 0])
+        (unless (or self (== (refusal path (car r) 0) 0))
+          (hash-set! (& registry) key 0)
+          (return 0))
+        (set! u (if self (running-copy path) (module-at (car r) 0)))
         (unless (equal? (-> (unit-of u) hash) (cadr r))
           (hash-set! (& registry) key 0)
           (return 0)))
@@ -981,7 +1358,13 @@
     (let ([u (unit-of m)])
       (write-data (cache-file (cache-name (-> u path))) (list1 (cache-form m))))))
 
-(define (cache-name [path datum]) -> datum (concat (content-hash (list1 path)) '".subc"))
+(define (cache-name [path datum]) -> datum (concat (content-hash (list1 (host-file path))) '".subc"))
+
+(define (note-hash! [m datum])
+  (let* ([u (unit-of m)] [key (cast u64 (symbol-of (-> u hash)))] [known (cast datum (hash-ref (& units-by-hash) key))])
+    (cond [(== known 0) (hash-set! (& units-by-hash) key (cast u32 m))]
+          [(not (equal? (-> (unit-of known) path) (-> u path)))
+           (fail-at 0 "~a and ~a have the same hash, ~a" `(,(-> (unit-of known) path) ,(-> u path) ,(-> u hash)))])))
 
 (define (load-compiled-module [d datum] [path datum]) -> datum
   (let ([m (new-unit path (section d 'name))])
@@ -1386,6 +1769,7 @@
       [('func) (item! b (declare-func f phase))]
       [('global) (item! b (declare-global f phase))]
       [('import) (item! b (declare-import f phase))]
+      [('supply) (item! b `(supply ,f))]
       [('memory 'table) (declare-storage! f kind phase)]
       [('tag) (item! b (declare-tag f phase))]
       [('define-syntax) (define-syntax! f phase)]
@@ -1424,6 +1808,7 @@
     [('func) (expand-func item phase)]
     [('global) (expand-global item phase)]
     [('plain 'done) (if to-syntax (list1 (cadr item)) (caddr item))]
+    [('supply) (expand-supply (cadr item) phase)]
     [else
      (let* ([e (cadr item)]
             [r (if (or to-syntax (== (core-head e phase) '#%checked)) (expand-expr e phase) (core-expression e phase))])
@@ -1546,6 +1931,48 @@
       (bind-definition! name phase `(func ,(func-info (syntax-e name) (car pr) (cdr pr) (syntax-e module) (syntax-e field))))
       `(plain ,(out f 'import `(,name ,module ,field ,sig)) ()))))
 
+;; (supply c-function f): c-function, which its C module calls by name, calls f, through the slot in the module's
+;; global supply:name.
+(define (expand-supply [f datum] [phase i32]) -> datum
+  (let* ([l (syntax->list f)] [c datum 0] [g datum 0] [slot datum 0])
+    (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l)) (identifier? (caddr l)))
+      (no-match f "(supply c-function function)"))
+    (set! c (meaning-of (cadr l) phase))
+    (set! g (meaning-of (caddr l) phase))
+    (unless (and (!= c 0) (== (car c) 'func)) (fail-at (cadr l) "~a is not a function" (list1 (syntax-e (cadr l)))))
+    (unless (and (!= g 0) (== (car g) 'func)) (fail-at (caddr l) "~a is not a function" (list1 (syntax-e (caddr l)))))
+    (set! slot (supply-slot (cadr c)))
+    (when (== slot 0)
+      (fail-at (cadr l) "~a is not a function its module calls by name" (list1 (syntax-e (cadr l)))))
+    (let ([owner (identity-label (-> (unit-of (instance-unit (func-info-instance (cadr c)))) path))])
+      (unless (equal? owner (identity-label (-> (the-module) path)))
+        (fail-at (cadr l) "~a is supplied only in ~a" `(,(syntax-e (cadr l)) ,owner))))
+    (unless (equal? (signature-of (cadr c)) (signature-of (cadr g)))
+      (fail-at f "~a is ~s, but ~a is ~s"
+               `(,(syntax-e (cadr l)) ,(signature-of (cadr c)) ,(syntax-e (caddr l)) ,(signature-of (cadr g)))))
+    (if to-syntax
+        (list1 f)
+        (cons `(expr (gset ,slot (func-index ,(cadr g)))) (list1 `(expr (call ,(supplied-of (cadr c)) ())))))))
+
+(define (signature-of [info datum]) -> datum (append (func-info-params info) (cons '-> (func-info-results info))))
+
+(define (supply-slot [info datum]) -> datum
+  (let* ([instance (func-info-instance info)] [owner (if (string? instance) (instance-unit instance) 0)]
+         [export (format "supply:~a" (list1 (func-info-export info)))]
+         [l (if (== owner 0) nil (-> (unit-of owner) infos))])
+    (while (pair? l)
+      (when (and (global-info? (car l)) (equal? (global-info-export (car l)) export)) (return (car l)))
+      (set! l (cdr l)))
+    0))
+
+(define (supplied-of [info datum]) -> datum
+  (let ([l (-> (unit-of (instance-unit (func-info-instance info))) infos)])
+    (while (pair? l)
+      (when (and (func-info? (car l)) (equal? (func-info-export (car l)) '"supplied!")) (return (car l)))
+      (set! l (cdr l)))
+    (fail-at 0 "internal: no supplied! in the module of ~a" (list1 (func-info-export info)))
+    0))
+
 (define (declare-tag [f datum] [phase i32]) -> datum
   (let ([l (syntax->list f)])
     (unless (and (!= l 0) (== (length l) 3) (identifier? (cadr l)) (syntax? (caddr l)) (!= (syntax->list (caddr l)) 0))
@@ -1588,7 +2015,7 @@
             (for-each (lambda ([p datum]) (bind-import! (car names) phase (cdr p))) ps))
           (set! items (cdr items)))))))
 
-(define (module-source? [s datum]) -> bool (string-literal? s))
+(define (module-source? [s datum]) -> bool (or (string-literal? s) (identifier? s)))
 
 (define (qualified [name datum] [sym datum]) -> datum
   (datum->syntax name (string->symbol (format-message "~a:~a" `(,(syntax-e name) ,sym))) name))
@@ -1602,16 +2029,21 @@
 
 (define (module-path-of [f datum] [spec datum]) -> datum
   (let* ([loc (if (!= (syntax-srcloc spec) 0) (syntax-srcloc spec) (syntax-srcloc f))]
-         [dir (if (!= loc 0) (directory-of (string->datum (symbol->string (-> loc source)))) '"")]
+         [from (if (!= loc 0) (string->datum (symbol->string (-> loc source))) 0)]
          [given (syntax-e spec)])
-    (if (absolute-path? given) given (concat dir given))))
+    (cond [(identifier? spec) (name-identity spec from)]
+          [(!= from 0) (path-identity spec from given)]
+          [(absolute-path? given) (entry-identity 0 given)]
+          [else (resolve-segments given)])))
 
 (define (require-module! [f datum] [name datum] [spec datum] [phase i32]) -> datum
-  (let ([path (canonical-path (module-path-of f spec))])
+  (let ([path (module-path-of f spec)])
     (require-unit! name
                    (if (and (> phase 0) (not (in-session?)) (equal? path (-> (the-module) path)))
                        (running-copy path)
-                       (compile-module-file path))
+                       (begin
+                         (check-module! (if (in-session?) 0 (-> (the-module) path)) path spec)
+                         (module-at path spec)))
                    phase)))
 
 (define (require-unit! [name datum] [m datum] [phase i32]) -> datum
@@ -1737,13 +2169,18 @@
     (when (!= r 0) (ensure-wasm-module! (car r) (integer-at r 1) (+ (cast u32 (integer-at r 2)) shift)))))
 
 (define (ensure-wasm-module! [m datum] [q i32] [t u32])
-  (let* ([name (ns-name (wasm-module-name m q (cast i32 t)))] [key (cast u64 (symbol-of name))] [p (ptr wasm-module) 0])
+  (let* ([name (ns-name (wasm-module-name m q (cast i32 t)))] [key (cast u64 (symbol-of name))] [p (ptr wasm-module) 0]
+         [l nil])
     (when (== (hash-ref (-> current instances) key) 0)
       (set! p (wasm-module-of m q))
       (when (== p 0) (fail-at 0 "internal: ~a has no phase ~a wasm module" `(,(-> (unit-of m) name) ,(make-integer q))))
+      (set! l (suppliers-of m))
       (for-each (lambda ([imp datum]) (ensure-import! imp t)) (-> p imports))
       (instantiate! name (-> p bytes) (-> p imports) (-> p scopes) t 0 (>= (+ q (cast i32 t)) 1))
-      (hash-set! (-> current instances) key 1))))
+      (hash-set! (-> current instances) key 1)
+      (while (pair? l)
+        (ensure-wasm-module! (car l) 0 t)
+        (set! l (cdr l))))))
 
 (define (instantiate-bytes [name string] [code (slice u8)] [imports (slice string)] [compile-time bool] [err (ptr string)])
   -> bool
@@ -1917,14 +2354,14 @@
   (let* ([id (make-syntax '%substrate:#%module-begin (module-base-scopes) 0 nil)]
          [t (transformer-of (meaning-of id phase))])
     (cond [(and (!= t 0) (form-value? t)) t]
-          [(equal? (canonical-path (language-path)) (-> (the-module) path))
+          [(equal? (language-path) (-> (the-module) path))
            (make-syntax 'here (scopes-change (module-base-scopes) wasm-scope 0) 0 nil)]
           [else (substrate-form-value)])))
 
 (define substrate-form-value-cache datum 0)
 (define (substrate-form-value) -> datum
   (when (== substrate-form-value-cache 0)
-    (let* ([m (cast datum (hash-ref (& registry) (cast u64 (symbol-of (canonical-path (language-path))))))]
+    (let* ([m (cast datum (hash-ref (& registry) (cast u64 (symbol-of (language-path)))))]
            [p (if (and (!= m 0) (== (-> (unit-of m) state) 'done)) (assq '#%module-begin (-> (unit-of m) provides)) 0)]
            [t (if (!= p 0) (transformer-of (cdr p)) 0)])
       (when (and (!= t 0) (form-value? t)) (set! substrate-form-value-cache (keep t)))))
@@ -2078,8 +2515,9 @@
   (let ([msg (string->datum why)] [loc (if (syntax? api-where) (syntax-srcloc api-where) 0)])
     (cond [(!= loc 0)
            (format "~a:~a:~a: error: ~a\n"
-                   `(,(-> loc source) ,(make-integer (-> loc line)) ,(make-integer (+ (-> loc col) 1)) ,msg))]
-          [(!= current 0) (format "~a: error: ~a\n" `(,(-> (the-module) path) ,msg))]
+                   `(,(displayed (string->datum (symbol->string (-> loc source)))) ,(make-integer (-> loc line))
+                     ,(make-integer (+ (-> loc col) 1)) ,msg))]
+          [(!= current 0) (format "~a: error: ~a\n" `(,(displayed (-> (the-module) path)) ,msg))]
           [else (format "error: ~a\n" (list1 msg))])))
 
 ;; ---- facts ----
@@ -2154,7 +2592,7 @@
 (define (module-source) -> datum (if (in-session?) session-source (symbol-of (-> (the-module) path))))
 
 (define (session-open! [name datum])
-  (let ([m (new-unit name (provisional-name name))])
+  (let ([m (new-unit (identity 0 name) (provisional-name name))])
     (begin-module-arena)
     (set! session-mark (module-arena-mark))
     (set! current (new-comp m))
@@ -2223,14 +2661,15 @@
 (define (session-eval-text! [text datum] [source datum]) -> bool
   (let ([forms datum 0] [ok #f])
     (try
-      (set! forms (read-text text (symbol-of source)))
+      (set! forms (read-text text (symbol-of (identity 0 source))))
       (set! ok #t)
       [catch compile-error (message blamed loc) (session-fail! message blamed loc)])
     (and ok (session-eval! forms))))
 
-(define (session-eval-file! [source datum] [report (closure (datum))])
-  (let* ([path (canonical-path source)] [text (source-text path)]
-         [forms (read-text text (symbol-of path))])
+(define (session-eval-file! [root datum] [source datum] [report (closure (datum))])
+  (let ([path (entry-identity root source)] [forms datum 0])
+    (check-module! 0 path 0)
+    (set! forms (program-forms (read-text (source-text path) (symbol-of path))))
     (while (pair? forms)
       (unless (session-eval! (list1 (car forms))) (report (session-error)))
       (set! forms (cdr forms)))))
@@ -2254,7 +2693,7 @@
           (buffer-add-string! (& b) "error: ")
           (write-to (& b) message 1)
           (buffer-add-byte! (& b) 10))
-        (write-compile-error (& b) message blamed loc))
+        (write-error (& b) message blamed loc))
     (session-recover!)
     (set! session-message (string->datum (buffer-string (& b))))
     (buffer-free! (& b))))
@@ -2607,7 +3046,7 @@
     (fail-at api-where "name-identifier: ~a names no definition of this module, or of one it requires, at this phase" (list1 name))))
 
 (define (query-datum-type) -> datum
-  `(ptr (struct ,(string->symbol (format-message "~a:cell" (list1 (canonical-path (compiler-file '"syntax.sub"))))) cell)))
+  `(ptr (struct ,(string->symbol (format-message "~a:cell" (list1 (compiler-file '"syntax.sub")))) cell)))
 
 ;; ---- fully expanded code ----
 

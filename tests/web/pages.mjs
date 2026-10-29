@@ -50,7 +50,7 @@ const checks = {
     };
     const fieldText = () => page.evaluate('document.querySelector("textarea").value');
 
-    const scheme = '(language scheme "lib/languages/scheme/scheme.sub") => ';
+    const scheme = '(language scheme std/languages/scheme) => ';
     await idle();
     check('repl: the page starts a Scheme session', await shown(), scheme);
     check('repl: the text box has the focus', await page.evaluate('document.activeElement.tagName'), 'TEXTAREA');
@@ -125,7 +125,7 @@ const checks = {
     await say('(+ (fib 20) 0.5)');
     await say('(sq 2)');
     check('repl: a session in Substrate', await shown(), [
-      '(language substrate "compiler/substrate.sub") => ',
+      '(language substrate compiler/substrate) => ',
       '(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) => ',
       '(+ (fib 20) 0.5) => 6765.5',
       '! (sq 2) => input-20:1:2: error: unbound identifier sq',
@@ -147,9 +147,9 @@ const checks = {
     check('repl: Clear empties the page', await shown(), '');
     await say('(fib 11)');
     check('repl: Clear keeps the session', await shown(), '(fib 11) => 89');
-    await say('(begin-for-syntax (require-unqualified macros "compiler/macros.sub"))');
+    await say('(begin-for-syntax (require-unqualified macros compiler/macros))');
     check('repl: code run while compiling can require the compiler\'s macros', await last(),
-      '(begin-for-syntax (require-unqualified macros "compiler/macros.sub")) => ');
+      '(begin-for-syntax (require-unqualified macros compiler/macros)) => ');
 
     await page.click('nav button:nth-of-type(3)');
     await idle();
@@ -157,7 +157,7 @@ const checks = {
     await page.evaluate('location.href = location.pathname + "?language=substrate"');
     await page.waitFor('window.ready && location.search === "?language=substrate"', 20000);
     await idle();
-    check('repl: a language in the URL opens that session', await shown(), '(language substrate "compiler/substrate.sub") => ');
+    check('repl: a language in the URL opens that session', await shown(), '(language substrate compiler/substrate) => ');
 
     await say('(define (sq [x i32]) -> i32 (* x x))');
     await say('(sq 4)');
@@ -169,7 +169,7 @@ const checks = {
     const saved = path.join(downloads, 'session.sub');
     for (let i = 0; i < 100 && !fs.existsSync(saved); i++) await new Promise((resolve) => setTimeout(resolve, 50));
     check('repl: Save downloads the inputs as a session file', fs.existsSync(saved) ? fs.readFileSync(saved, 'utf8') : 'no file',
-      '(language substrate "compiler/substrate.sub")\n\n(define (sq [x i32]) -> i32 (* x x))\n\n(sq 4)\n');
+      '(language substrate compiler/substrate)\n\n(define (sq [x i32]) -> i32 (* x x))\n\n(sq 4)\n');
 
     const forms = path.join(downloads, 'forms.sub');
     fs.writeFileSync(forms, '(define (cube [x i32]) -> i32\n  (* x x x))\n\n(cube 3)\n');
@@ -198,7 +198,7 @@ const checks = {
     await page.waitFor('window.ready', 20000);
     await idle();
     check('repl: the draft survives a reload', await fieldText(), '(sq 1');
-    check('repl: and the language is the URL\'s', await shown(), '(language substrate "compiler/substrate.sub") => ');
+    check('repl: and the language is the URL\'s', await shown(), '(language substrate compiler/substrate) => ');
   },
 
   async rows(page) {
@@ -642,7 +642,7 @@ const checks = {
     check('stopped: the report starts with the message of the trap',
       report.split('\n')[0], 'trap: vector-at: there is no item 5: the vector holds 1');
     check('stopped: the report lists the game function that was running, and where it is',
-      /step! .*tests\/web\/stopped\.sub:13:/.test(report), true);
+      /step! \.\/stopped\.sub:13:/.test(report), true);
     check('stopped: the screen keeps what was drawn before the trap', await page.evaluate(
       '[...document.querySelector("canvas").getContext("2d").getImageData(10, 10, 1, 1).data].join(",")'), '46,125,50,255');
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -667,6 +667,8 @@ const checks = {
     check('assets: and so is one in a folder, with "#" and a space in its name', await text('nested'), 'An asset in a folder.');
     check('assets: a file that is not among the assets cannot be read', await text('missing'), 'no such file');
     check('assets: a file the program wrote is read back', await text('written'), 'written and read back');
+    check('assets: a file open by handle is written and read at offsets, and an asset only read',
+      await text('opened'), 'hello.....wo, asset, r, refused');
     await page.waitFor(`(() => {
       const d = document.getElementById("board").getContext("2d").getImageData(8, 8, 1, 1).data;
       return d[0] === 255 && d[1] === 0;
@@ -690,6 +692,15 @@ const checks = {
     check('location: the URL', await text('first'), first);
     check('location: after a push', await text('pushed'), `${first}?page=2`);
     check('location: back again, as an event', await text('back'), first);
+  },
+
+  async sqlite(page) {
+    const text = (id) => page.evaluate(`document.getElementById("${id}").textContent`);
+    await page.waitFor('document.getElementById("rows") !== null', 10000);
+    check('sqlite: SQLite runs in a page', await text('version'), '3.51.2');
+    check("sqlite: a database in the page's files, written and read again", await text('rows'), '3 one two three');
+    check('sqlite: with no error', await text('error'), '');
+    check('sqlite: nothing is written to the console', page.log.join('\n'), '');
   },
 
   async clipboard(page) {

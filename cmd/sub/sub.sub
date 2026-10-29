@@ -1,0 +1,188 @@
+;; sub, the command for programs, which bin/sub runs with every grant and the toolchain's directory first in its
+;; arguments.
+(require-unqualified macros compiler/macros)
+(require-unqualified ex compiler/expander)
+(require-unqualified main compiler/main)
+(require-unqualified fs host/fs)
+(require-unqualified process host/node/process)
+(require-unqualified hash std/package/hash)
+(require-unqualified paths std/package/path)
+(require-unqualified common cmd/sub/common)
+(require-unqualified build cmd/sub/build)
+(require-unqualified fetching cmd/sub/fetch)
+(require-unqualified site cmd/sub/site)
+
+;; ---- running ----
+
+(define (become! [args (slice string)])
+  (let ([why string])
+    (process-exec (joined-path root "host/subhost.mjs") args (& why))
+    (failed! why)))
+
+(define (later! [args (slice string)])
+  (let ([why string])
+    (when (< (process-exec-at-end (joined-path root "host/subhost.mjs") args (& why)) 0) (failed! why))))
+
+(define (run! [args (slice string)])
+  (let ([i u32 0] [copy (cast (ptr string) (arena-alloc (& a) (* (-> args length) (sizeof string))))])
+    (while (and (< i (-> args length)) (starts? (@ args i) "-")) (+= i 1))
+    (when (>= i (-> args length)) (usage))
+    (for ([k u32 0]) (< k (-> args length)) (+= k 1) (set! (@ copy k) (@ args k)))
+    (if (ends? (@ args i) ".sub")
+        (let ([full (absolute (@ args i))] [dir string])
+          (cache!)
+          (set! dir (target! full ""))
+          (set! (@ copy i) dir)
+          (later! (slice copy (-> args length)))
+          (narrow! full dir)
+          (write-program! (program-root) (string->datum full) (string->datum dir) #f))
+        (become! (slice copy (-> args length))))))
+
+(define (serve! [args (slice string)])
+  (let* ([address "127.0.0.1"] [dir "."] [k u32 0] [n (-> args length)] [granted (make-buffer)] [listen (make-buffer)]
+         [argv (cast (ptr string) (arena-alloc (& a) (* (+ (* n 2) 5) (sizeof string))))] [m u32 0])
+    (while (< k n)
+      (let ([x (@ args k)])
+        (cond [(== x "-l") (+= k 1) (when (< k n) (set! address (@ args k)))]
+              [(== x "-t") (+= k 2)]
+              [(== x "-z") (+= k 1)]
+              [else (break)]))
+      (+= k 1))
+    (when (< k n) (set! dir (@ args k)))
+    (buffer-add-string! (& granted) "-R=")
+    (for ([i u32 0]) (< i (-> dir length)) (+= i 1)
+      (when (== (@ dir i) #\,) (buffer-add-byte! (& granted) #\,))
+      (buffer-add-byte! (& granted) (cast i32 (@ dir i))))
+    (buffer-add-string! (& listen) "-N=")
+    (if (and (> (-> address length) 0) (has-colon? address))
+        (begin
+          (buffer-add-byte! (& listen) #\[)
+          (buffer-add-string! (& listen) (unbracketed address))
+          (buffer-add-byte! (& listen) #\]))
+        (buffer-add-string! (& listen) address))
+    (set! (@ argv m) (buffer-string (& granted)))
+    (set! (@ argv (+ m 1)) (buffer-string (& listen)))
+    (+= m 2)
+    (let ([t (option args "-t")] [key-at u32 0])
+      (when (> (-> t length) 0)
+        (for ([i u32 0]) (< i n) (+= i 1) (when (== (@ args i) "-t") (set! key-at (+ i 2))))
+        (set! (@ argv m) (joined "--tls-cert=" t))
+        (set! (@ argv (+ m 1)) (joined "--tls-key=" (if (< key-at n) (@ args key-at) "")))
+        (+= m 2)))
+    (cache!)
+    (let* ([full (joined-path root "cmd/serve.sub")] [out (target! full (joined-path root "build/serve"))])
+      (set! (@ argv m) out)
+      (+= m 1)
+      (for ([i u32 0]) (< i n) (+= i 1)
+        (set! (@ argv m) (@ args i))
+        (+= m 1))
+      (later! (slice argv m))
+      (narrow! full out)
+      (write-program! (program-root) (string->datum full) (string->datum out) #f))))
+
+(define (has-colon? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) #\:) (return #t)))
+  #f)
+
+(define (unbracketed [s string]) -> string
+  (let ([from (if (starts? s "[") 1 0)] [to (if (ends? s "]") (- (-> s length) 1) (-> s length))]) (slice s from to)))
+
+;; ---- packages ----
+
+(define (print-hash! [args (slice string)])
+  (let* ([given (if (== (-> args length) 1) (@ args 0) ".")] [dir (absolute given)] [h (make-buffer)] [err (make-buffer)])
+    (when (> (-> args length) 1) (usage))
+    (unless (== (kind-of (joined-path dir "package.sub")) fs-file) (failed! (joined given " has no package.sub")))
+    (unless (package-hash dir (& h) (& err)) (failed! (local (buffer-string (& err)))))
+    (buffer-add-byte! (& h) 10)
+    (host-write 1 (buffer-bytes (& h)))))
+
+(define (print-map! [args (slice string)])
+  (let ([text (make-buffer)])
+    (unless (== (-> args length) 1) (usage))
+    (find-package! (absolute (@ args 0)))
+    (module-map! (& text))
+    (host-write 1 (buffer-bytes (& text)))))
+
+(define (build-command! [args (slice string)])
+  (let ([plain (without (without args "-o" #t) "-s" #f)])
+    (unless (== (-> plain length) 1) (usage))
+    (cache!)
+    (build! (@ plain 0) (option args "-o") (flag? (without args "-o" #t) "-s"))))
+
+;; ---- the commands ----
+
+(define next-command string)
+(define next-args (slice string))
+
+(define (carry-on!)
+  (try (dispatch! next-command next-args)
+       [catch compile-error (message blamed loc) (compile-failed! message blamed loc)]))
+
+(define (program-of [command string] [rest (slice string)]) -> string
+  (cond [(or (== command "build") (== command "eval") (== command "expand") (== command "map"))
+         (let ([plain (without (without rest "-o" #t) "-s" #f)])
+           (if (== (-> plain length) 1) (absolute (@ plain 0)) ""))]
+        [(== command "run")
+         (let ([i u32 0])
+           (while (and (< i (-> rest length)) (starts? (@ rest i) "-")) (+= i 1))
+           (if (and (< i (-> rest length)) (ends? (@ rest i) ".sub")) (absolute (@ rest i)) ""))]
+        [(and (== command "site") (>= (-> rest length) 2) (!= (kind-of (@ rest 1)) fs-directory)) (absolute (@ rest 1))]
+        [(== command "serve") (joined-path root "cmd/serve.sub")]
+        [else ""]))
+
+(define (run [args (slice string)])
+  (when (< (-> args length) 2) (usage))
+  (set! root (@ args 0))
+  (set! a (make-arena))
+  (fs-cwd (& cwd) 0)
+  (set-repository-root! (string->datum root))
+  (install-core!)
+  (set-display-directory! (string->datum cwd))
+  (set! next-command (@ args 1))
+  (set! next-args (located (slice args 2 (-> args length)) (== next-command "run")))
+  (let ([file (program-of next-command next-args)])
+    (cond [(== next-command "fetch") (fetch-command! next-args)]
+          [(== (-> file length) 0) (carry-on!)]
+          [else
+           (locations! (find-package! file))
+           (fetch-then! carry-on!)])))
+
+(define (dispatch! [command string] [rest (slice string)])
+  (cond [(== command "build") (build-command! rest)]
+        [(== command "run") (run! rest)]
+        [(and (or (== command "eval") (== command "expand")) (== (-> rest length) 1))
+         (let ([file (absolute (@ rest 0))])
+           (prepare! file)
+           (cache!)
+           (if (== command "eval")
+               (begin
+                 (session-open! '"session")
+                 (session-eval-file! (program-root) (string->datum file)
+                                     (lambda ([e datum]) (host-write 2 (cast (slice u8) (datum->string e))))))
+               (begin
+                 (narrow! file "")
+                 (expand-module-file (program-root) (string->datum file) (lambda ([f datum]) (print-expanded f))))))]
+        [(== command "site") (site! rest)]
+        [(== command "serve") (serve! rest)]
+        [(== command "pack") (pack! rest)]
+        [(== command "hash") (print-hash! rest)]
+        [(== command "map") (print-map! rest)]
+        [else (usage)]))
+
+(define (compile-failed! [message datum] [blamed datum] [loc (ptr srcloc)])
+  (let ([b (make-buffer)])
+    (write-error (& b) message blamed loc)
+    (host-write 2 (buffer-bytes (& b)))
+    (host-exit 1)))
+
+(define (main)
+  (try (run (host-args))
+       [catch compile-error (message blamed loc) (compile-failed! message blamed loc)]))
+
+;; The host calls on-trap with a trap's message.
+(define (on-trap [why (ptr u8)] [n u32]) -> bool
+  (host-write 2 (cast (slice u8) (datum->string (trap-report (cast string (slice why n))))))
+  (free why)
+  (host-exit 1)
+  #t)

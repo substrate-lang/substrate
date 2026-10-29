@@ -1,0 +1,219 @@
+;; Manifests: a package's package.sub, or a program's first form, (package name (version "major.minor.patch")
+;; (exports module ...) (dependencies (name (path "directory") (hash "sha256:hex")) (name (url "address") (hash
+;; "sha256:hex")) ...)), the exports, the dependencies and a path's hash being optional.
+(require-unqualified read "read.sub")
+(require-unqualified fs host/fs)
+(require-unqualified paths "path.sub")
+
+(provide manifest dependency manifest-read manifest-of-program manifest-find package-holding package-name? full-hash?)
+
+(struct dependency [name string] [path string] [url string] [hash string] [line u32] [column u32])
+(struct manifest [name string] [version string] [major u32] [exports (slice string)] [dependencies (slice dependency)])
+
+(define (manifest-read [a (ptr arena)] [file string] [m (ptr manifest)] [err (ptr buffer)]) -> bool
+  (let ([forms (slice data)] [e data-error])
+    (cond [(not (read-forms a file #f (& forms) (& e) err)) #f]
+          [(!= (-> e line) 0) (failed! err file (-> e line) (-> e column) (-> e message))]
+          [(!= (-> forms length) 1) (failed! err file 1 1 "a package.sub holds one form, (package ...)")]
+          [else (manifest-of file (& (@ forms 0)) a m err)])))
+
+(define (manifest-of-program [a (ptr arena)] [file string] [m (ptr manifest)] [err (ptr buffer)]) -> i32
+  (let ([text (slice u8)] [why string] [forms (slice data)] [e data-error] [found i32 -1])
+    (when (< (fs-read-file file (& text) (& why)) 0)
+      (buffer-add-string! err "cannot read ")
+      (buffer-add-string! err why)
+      (free (-> why bytes))
+      (return -1))
+    (cond [(!= (data-head a (cast string text)) "package") (set! found 0)]
+          [(not (data-read a (cast string text) #t (& forms) (& e))) (failed! err file (-> e line) (-> e column) (-> e message))]
+          [(manifest-of file (& (@ forms 0)) a m err) (set! found 1)])
+    (free (-> text items))
+    found))
+
+;; manifest-find finds the manifest of the package that holds the program in file, given from /: the program's own,
+;; giving 1, or the nearest package.sub above it, giving 2, with the package's directory added to dir. It gives 0 when
+;; there is none, and -1 with err saying why when the manifest is wrong.
+(define (manifest-find [a (ptr arena)] [file string] [m (ptr manifest)] [dir (ptr buffer)] [err (ptr buffer)]) -> i32
+  (let ([own (manifest-of-program a file m err)] [d string] [b (make-buffer)] [found i32 0])
+    (when (!= own 0) (return own))
+    (set! d (package-holding a (parent-of file)))
+    (when (> (-> d length) 0)
+      (buffer-add-string! (& b) d)
+      (buffer-add-string! (& b) (if (== d "/") "package.sub" "/package.sub"))
+      (set! found (if (manifest-read a (buffer-string (& b)) m err) 2 -1))
+      (when (== found 2) (buffer-add-string! dir d)))
+    (buffer-free! (& b))
+    found))
+
+(define (package-holding [a (ptr arena)] [dir string]) -> string
+  (let ([d dir] [b (make-buffer)] [info fs-info] [found ""])
+    (while (> (-> d length) 0)
+      (set! (-> b length) 0)
+      (buffer-add-string! (& b) d)
+      (buffer-add-string! (& b) (if (== d "/") "package.sub" "/package.sub"))
+      (when (and (== (fs-stat (buffer-string (& b)) (& info) 0) 0) (== (-> info kind) fs-file))
+        (set! found (cast string (slice (cast (ptr u8) (arena-alloc a (-> d length))) (-> d length))))
+        (memcpy (-> found bytes) (-> d bytes) (-> d length))
+        (break))
+      (set! d (if (== d "/") "" (parent-of d))))
+    (buffer-free! (& b))
+    found))
+
+(define (read-forms [a (ptr arena)] [file string] [first bool] [into (ptr (slice data))] [e (ptr data-error)]
+                    [err (ptr buffer)]) -> bool
+  (let ([text (slice u8)] [why string])
+    (set! (-> e line) 0)
+    (when (< (fs-read-file file (& text) (& why)) 0)
+      (buffer-add-string! err "cannot read ")
+      (buffer-add-string! err why)
+      (free (-> why bytes))
+      (return #f))
+    (unless (data-read a (cast string text) first into e)
+      (when (== (-> e line) 0) (set! (-> e line) 1)))
+    (free (-> text items))
+    #t))
+
+(define (failed! [err (ptr buffer)] [file string] [line u32] [column u32] [message string]) -> bool
+  (buffer-add-string! err file)
+  (buffer-add-byte! err #\:)
+  (write-digits err (cast u64 line) 10)
+  (buffer-add-byte! err #\:)
+  (write-digits err (cast u64 column) 10)
+  (buffer-add-string! err ": ")
+  (buffer-add-string! err message)
+  #f)
+
+(define (failed-at! [err (ptr buffer)] [file string] [d (ptr data)] [message string]) -> bool
+  (match d
+    [(data-list items line column) (failed! err file line column message)]
+    [(data-symbol text line column) (failed! err file line column message)]
+    [(data-string text line column) (failed! err file line column message)]))
+
+(define (symbol-of [d (ptr data)]) -> string (match d [(data-symbol text line column) text] [_ ""]))
+
+(define (string-of [d (ptr data)] [into (ptr string)]) -> bool
+  (match d
+    [(data-string text line column) (set! (@ into) text) #t]
+    [_ #f]))
+
+(define (items-of [d (ptr data)]) -> (slice data) (match d [(data-list items line column) items] [_ (slice (cast (ptr data) 0) 0)]))
+
+(define (list-of? [d (ptr data)] [head string] [n u32]) -> bool
+  (let ([items (items-of d)])
+    (and (== (-> items length) n) (== (symbol-of (& (@ items 0))) head))))
+
+(define (package-name? [s string]) -> bool
+  (when (or (== (-> s length) 0) (< (@ s 0) #\a) (> (@ s 0) #\z) (== s "host") (== s "compiler") (== s "std") (== s "cmd")) (return #f))
+  (for ([i u32 1]) (< i (-> s length)) (+= i 1)
+    (let ([c (@ s i)])
+      (unless (or (and (>= c #\a) (<= c #\z)) (and (>= c #\0) (<= c #\9)) (== c #\-)) (return #f))))
+  #t)
+
+(define (version-major [s string]) -> i64
+  (let ([parts u32 0] [digits u32 0] [major i64 0] [n i64 0])
+    (for ([i u32 0]) (<= i (-> s length)) (+= i 1)
+      (if (or (== i (-> s length)) (== (@ s i) #\.))
+          (begin
+            (when (== digits 0) (return -1))
+            (when (== parts 0) (set! major n))
+            (+= parts 1)
+            (set! digits 0)
+            (set! n 0))
+          (let ([c (@ s i)])
+            (when (or (< c #\0) (> c #\9) (and (== digits 1) (== n 0)) (> digits 8)) (return -1))
+            (set! n (+ (* n 10) (cast i64 (- c #\0))))
+            (+= digits 1))))
+    (if (== parts 3) major -1)))
+
+(define (manifest-of [file string] [f (ptr data)] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
+  (let ([items (items-of f)] [versioned #f] [exported #f] [listed #f] [major i64 0])
+    (set! (-> m exports) (slice (cast (ptr string) 0) 0))
+    (set! (-> m dependencies) (slice (cast (ptr dependency) 0) 0))
+    (unless (and (>= (-> items length) 2) (== (symbol-of (& (@ items 0))) "package"))
+      (return (failed-at! err file f "expected (package name (version \"major.minor.patch\") (dependencies ...))")))
+    (set! (-> m name) (symbol-of (& (@ items 1))))
+    (unless (package-name? (-> m name))
+      (return (failed-at! err file (& (@ items 1))
+                          "a package's name is lowercase letters, digits and -, from a letter, and not host, compiler, std or cmd")))
+    (for ([i u32 2]) (< i (-> items length)) (+= i 1)
+      (let ([c (& (@ items i))])
+        (cond [(and (list-of? c "version" 2) (not versioned))
+               (unless (string-of (& (@ (items-of c) 1)) (& (-> m version)))
+                 (return (failed-at! err file c "a version is a string, as (version \"1.2.0\")")))
+               (set! major (version-major (-> m version)))
+               (when (< major 0) (return (failed-at! err file c "a version is major.minor.patch, as (version \"1.2.0\")")))
+               (set! (-> m major) (cast u32 major))
+               (set! versioned #t)]
+              [(and (> (-> (items-of c) length) 0) (== (symbol-of (& (@ (items-of c) 0))) "exports") (not exported))
+               (unless (exports-of file c a m err) (return #f))
+               (set! exported #t)]
+              [(and (> (-> (items-of c) length) 0) (== (symbol-of (& (@ (items-of c) 0))) "dependencies") (not listed))
+               (unless (dependencies-of file c a m err) (return #f))
+               (set! listed #t)]
+              [else
+               (return (failed-at! err file c "a package's clauses are (version ...), (exports ...) and (dependencies ...), each once"))])))
+    (if versioned #t (failed-at! err file f "the package has no (version \"major.minor.patch\")"))))
+
+(define (exports-of [file string] [c (ptr data)] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
+  (let* ([items (items-of c)] [n (- (-> items length) 1)] [es (cast (ptr string) (arena-alloc a (* n (sizeof string))))])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let ([d (& (@ items (+ i 1)))])
+        (set! (@ es i) (symbol-of d))
+        (unless (module-name? (@ es i))
+          (return (failed-at! err file d "an export is the name of a module in the package, as text or lib/value")))
+        (for ([k u32 0]) (< k i) (+= k 1)
+          (when (== (@ es k) (@ es i)) (return (failed-at! err file d "this export is given twice"))))))
+    (set! (-> m exports) (slice es n))
+    #t))
+
+(define (module-name? [s string]) -> bool
+  (let ([start u32 0])
+    (for ([i u32 0]) (<= i (-> s length)) (+= i 1)
+      (when (or (== i (-> s length)) (== (@ s i) #\/))
+        (when (or (== i start) (== (slice s start i) ".") (== (slice s start i) "..")) (return #f))
+        (set! start (+ i 1))))
+    #t))
+
+(define (dependencies-of [file string] [c (ptr data)] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
+  (let* ([items (items-of c)] [n (- (-> items length) 1)]
+         [ds (cast (ptr dependency) (arena-alloc a (* n (sizeof dependency))))])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let* ([d (& (@ items (+ i 1)))] [parts (items-of d)] [dep (& (@ ds i))])
+        (set! (-> dep path) "")
+        (set! (-> dep url) "")
+        (set! (-> dep hash) "")
+        (match d [(data-list p line column) (set! (-> dep line) line) (set! (-> dep column) column)] [_ (begin)])
+        (set! (-> dep name) (if (> (-> parts length) 0) (symbol-of (& (@ parts 0))) ""))
+        (unless (package-name? (-> dep name)) (return (failed-at! err file d dependency-form)))
+        (for ([k u32 0]) (< k i) (+= k 1)
+          (when (== (-> (@ ds k) name) (-> dep name)) (return (failed-at! err file d "this dependency's name is given twice"))))
+        (for ([k u32 1]) (< k (-> parts length)) (+= k 1)
+          (let ([p (& (@ parts k))])
+            (cond [(and (list-of? p "path" 2) (== (-> dep path length) 0) (string-of (& (@ (items-of p) 1)) (& (-> dep path)))
+                        (> (-> dep path length) 0))
+                   (begin)]
+                  [(and (list-of? p "url" 2) (== (-> dep url length) 0) (string-of (& (@ (items-of p) 1)) (& (-> dep url)))
+                        (> (-> dep url length) 0))
+                   (begin)]
+                  [(and (list-of? p "hash" 2) (== (-> dep hash length) 0) (string-of (& (@ (items-of p) 1)) (& (-> dep hash)))
+                        (> (-> dep hash length) 0))
+                   (begin)]
+                  [else (return (failed-at! err file p dependency-form))])))
+        (when (or (== (> (-> dep path length) 0) (> (-> dep url length) 0))
+                  (and (> (-> dep url length) 0) (== (-> dep hash length) 0)))
+          (return (failed-at! err file d dependency-form)))
+        (when (and (> (-> dep url length) 0) (not (or (starts? (-> dep url) "http://") (starts? (-> dep url) "https://"))))
+          (return (failed-at! err file d "a dependency's url starts with http:// or https://")))
+        (when (and (> (-> dep url length) 0) (not (full-hash? (-> dep hash))))
+          (return (failed-at! err file d "a url's hash is sha256: and 64 hex digits, as sub hash prints it")))))
+    (set! (-> m dependencies) (slice ds n))
+    #t))
+
+(define dependency-form string
+  "a dependency is (name (path \"directory\") (hash \"sha256:hex\")), the hash optional, or (name (url \"address\") (hash \"sha256:hex\"))")
+
+(define (full-hash? [s string]) -> bool
+  (unless (and (== (-> s length) 71) (starts? s "sha256:")) (return #f))
+  (for ([i u32 7]) (< i 71) (+= i 1)
+    (let ([c (@ s i)]) (unless (or (and (>= c #\0) (<= c #\9)) (and (>= c #\a) (<= c #\f))) (return #f))))
+  #t)

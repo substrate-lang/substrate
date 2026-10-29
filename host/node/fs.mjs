@@ -6,13 +6,11 @@ import { nodeSource } from '../streams.mjs';
 import { allowsAll, mayPath, mayTree, notGranted, pathDenied, under, unlimited } from '../grants.mjs';
 import { sameFile, tempName } from '../fs.mjs';
 
-const { O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
-const modes = { 0: O_RDONLY, 1: O_WRONLY | O_CREAT | O_TRUNC, 2: O_WRONLY | O_CREAT | O_APPEND };
+const { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
 
-// plainMessage gives an error's message, a system error's without its code and path.
 export function plainMessage(e) {
   if (typeof e.errno !== 'number') return e.message;
-  const m = e.message.replace(/^[A-Z]+: /, '').replace(/, [a-z]+ '.*$/, '');
+  const m = e.message.replace(/^[A-Z]+: /, '').replace(/, [a-z]+( '.*)?$/, '');
   return m.charAt(0).toUpperCase() + m.slice(1);
 }
 
@@ -83,7 +81,6 @@ const pipe = (p) => {
 const usable = (p, k) => devices.has(p) || (p === '/dev/tty' && k === 'read') || under(p, '/proc/pressure') || pipe(p);
 const unresolved = process.platform === 'linux' ? (p) => under(p, '/proc') || under(p, '/dev') : () => false;
 const missing = () => Object.assign(new Error('ENOENT: no such file or directory'), { errno: -2, code: 'ENOENT' });
-const readFile = (p, flag) => fs.readFileSync(p, { flag });
 const infoOf = (s) => [s.isFile() ? 1 : s.isDirectory() ? 2 : s.isSymbolicLink() ? 3 : 4, s.size, s.mtimeMs, s.mode];
 
 // literalPath gives p absolute, checked as a call that does not follow its links is.
@@ -97,7 +94,7 @@ export function literalPath(grants, k, p) {
 
 // A path as given is kept with its absolute form and the form the grants compare (key).
 export function nodeFiles(grants) {
-  const everything = allowsAll(grants);
+  const everything = () => allowsAll(grants);
   const known = new Map();
   let last = { p: null };
   const allowed = (k, p, tree = false) => {
@@ -117,7 +114,7 @@ export function nodeFiles(grants) {
     return p;
   };
   // at gives the path a call that does not follow links works on, checked as Deno checks it.
-  const at = (k, p) => (everything ? p : checked(k, allowed(k, p)));
+  const at = (k, p) => (everything() ? p : checked(k, allowed(k, p)));
   // opening gives open(where, flag) for where the links of p lead now, checked and opened without following a link
   // at its end, which is reported as missing, as Deno opens a path; on Linux, Deno leaves /proc and /dev unresolved.
   const opening = (k, p, flag, open) => {
@@ -135,15 +132,14 @@ export function nodeFiles(grants) {
     return checked(k, unresolved(abs) ? abs : realPath(abs));
   };
   return {
-    read: plain((p) => (everything ? fs.readFileSync(p) : opening('read', p, O_RDONLY, readFile))),
-    write: plain((p, bytes) => (everything
-      ? fs.writeFileSync(p, bytes)
-      : opening('write', p, modes[1], (where, flag) => fs.writeFileSync(where, bytes, { flag })))),
     makeDir: plain((p) => fs.mkdirSync(at('write', p), { recursive: true })),
-    info: plain((p, follow) => infoOf((follow ? fs.statSync : fs.lstatSync)(at('read', p)))),
+    info: plain((p, follow, why) => {
+      const s = (follow ? fs.statSync : fs.lstatSync)(at('read', p), { throwIfNoEntry: why === true });
+      return s === undefined ? null : infoOf(s);
+    }),
     list: plain((p) => fs.readdirSync(at('read', p)).sort()),
     remove: plain((p, recursive) => {
-      const where = everything ? p : allowed('write', p, recursive);
+      const where = everything() ? p : allowed('write', p, recursive);
       if (!fs.lstatSync(where).isDirectory()) fs.unlinkSync(where);
       else if (recursive) fs.rmSync(where, { recursive: true });
       else fs.rmdirSync(where);
@@ -157,7 +153,7 @@ export function nodeFiles(grants) {
       fs.symlinkSync(target, p);
     }),
     copy: plain((from, to) => {
-      const source = everything ? from : resolved('read', from);
+      const source = everything() ? from : resolved('read', from);
       const target = at('write', to);
       try {
         const [a, b] = [fs.statSync(source), fs.statSync(target)];
@@ -170,7 +166,7 @@ export function nodeFiles(grants) {
     chmod: plain((p, mode) => fs.chmodSync(at('write', p), mode)),
     makeTemp: plain((dir, prefix, suffix, file) => {
       const base = dir ?? os.tmpdir();
-      if (!everything) checked('write', allowed('write', base));
+      if (!everything()) checked('write', allowed('write', base));
       for (let tries = 0; tries < 10; tries++) {
         const name = tempName(prefix, suffix);
         const made = path.join(base, name);
@@ -189,10 +185,39 @@ export function nodeFiles(grants) {
       at('read', from);
       fs.renameSync(at('write', from), at('write', to));
     }),
-    open: plain((p, mode, start = 0) => {
-      const flag = modes[mode] ?? O_RDONLY;
-      const fd = everything ? fs.openSync(p, flag) : opening(mode === 0 ? 'read' : 'write', p, flag, fs.openSync);
-      return nodeSource(mode === 0 ? fs.createReadStream('', { fd, start }) : fs.createWriteStream('', { fd }));
+    openFile: plain((p, how) => {
+      const writes = how.write || how.append;
+      const changes = writes || how.truncate || how.create || how.createNew;
+      const flag = (how.read ? (writes ? O_RDWR : O_RDONLY) : O_WRONLY) | (how.append ? O_APPEND : 0)
+        | (how.truncate ? O_TRUNC : 0) | (how.create || how.createNew ? O_CREAT : 0) | (how.createNew ? O_EXCL : 0);
+      if (how.read && changes && !everything()) allowed('read', p);
+      const fd = everything() ? fs.openSync(p, flag) : opening(changes ? 'write' : 'read', p, flag, fs.openSync);
+      const kind = fs.fstatSync(fd);
+      const seekable = kind.isFile() || kind.isBlockDevice();
+      return {
+        read: plain((bytes, at) => {
+          let n = 0;
+          while (n < bytes.length) {
+            const got = fs.readSync(fd, bytes, n, bytes.length - n, seekable ? at + n : null);
+            if (got === 0) break;
+            n += got;
+          }
+          return n;
+        }),
+        write: plain((bytes, at) => {
+          let n = 0;
+          while (n < bytes.length) {
+            n += fs.writeSync(fd, bytes, n, bytes.length - n, seekable && !how.append ? at + n : null);
+          }
+        }),
+        setSize: plain((n) => fs.ftruncateSync(fd, n)),
+        sync: plain(() => fs.fsyncSync(fd)),
+        size: plain(() => fs.fstatSync(fd).size),
+        close: plain(() => fs.closeSync(fd)),
+        stream: (start, write) => nodeSource(write
+          ? fs.createWriteStream('', { fd, start: seekable && !how.append ? start : undefined })
+          : fs.createReadStream('', { fd, start: seekable ? start : undefined })),
+      };
     }),
   };
 }

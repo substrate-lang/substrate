@@ -1,0 +1,289 @@
+;; Checks for a server's list, run before its handler: cross-origin protection, after Go's CrossOriginProtection;
+;; security headers, Helmet's; CORS, after Express's cors; rate limits, a token bucket for each client's address,
+;; after Go's x/time/rate; and allowed hosts, after Django's ALLOWED_HOSTS.
+(require-unqualified clock host/modules/clock)
+(require-unqualified http "http.sub")
+(require-unqualified server "server.sub")
+
+(provide http-cross-origin http-cross-origin-check http-security http-security-check http-cors http-cors-check
+         http-limit http-limit-check http-hosts http-hosts-check)
+
+;; ---- cross-origin protection ----
+
+;; trusted lists origins, as https://example.com, whose requests pass.
+(struct http-cross-origin [trusted (slice string)])
+
+(define (listed? [list (slice string)] [s string]) -> bool
+  (for ([i u32 0]) (< i (-> list length)) (+= i 1) (when (== (@ list i) s) (return #t)))
+  #f)
+
+;; http-cross-origin-check answers 403 to a browser's request from another origin, unless it is GET, HEAD or OPTIONS: by
+;; Sec-Fetch-Site, or else by Origin against Host. A request with neither header passes.
+(define (http-cross-origin-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (let* ([o (cast (ptr http-cross-origin) settings)] [m (-> r method)] [site (http-request-header r "sec-fetch-site")]
+         [origin (http-request-header r "origin")]
+         [trusted (and (!= o 0) (listed? (-> o trusted) origin))])
+    (when (or (== m "GET") (== m "HEAD") (== m "OPTIONS") (== site "same-origin") (== site "none") trusted
+              (and (== (-> site length) 0)
+                   (or (== (-> origin length) 0) (http-origin-host? origin (http-request-header r "host")))))
+      (return #f))
+    (http-answer-text! r 403 "cross-origin request refused")
+    #t))
+
+;; ---- security headers ----
+
+;; policy, when not empty, is the Content-Security-Policy, left to the program.
+(struct http-security [policy string])
+
+;; http-security-check adds Helmet's headers to every answer, Strict-Transport-Security over https alone.
+(define (http-security-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (let ([s (cast (ptr http-security) settings)])
+    (http-add-header! r "cross-origin-opener-policy" "same-origin")
+    (http-add-header! r "cross-origin-resource-policy" "same-origin")
+    (http-add-header! r "origin-agent-cluster" "?1")
+    (http-add-header! r "referrer-policy" "no-referrer")
+    (when (http-request-https? r)
+      (http-add-header! r "strict-transport-security" "max-age=31536000; includeSubDomains"))
+    (http-add-header! r "x-content-type-options" "nosniff")
+    (http-add-header! r "x-dns-prefetch-control" "off")
+    (http-add-header! r "x-download-options" "noopen")
+    (http-add-header! r "x-frame-options" "SAMEORIGIN")
+    (http-add-header! r "x-permitted-cross-domain-policies" "none")
+    (http-add-header! r "x-xss-protection" "0")
+    (unless (or (== s 0) (== (-> s policy length) 0)) (http-add-header! r "content-security-policy" (-> s policy)))
+    #f))
+
+;; ---- CORS ----
+
+;; origins lists the origins allowed, or "*" for any, which cannot go with credentials. methods and headers are what a
+;; preflight allows: when empty, Express's methods and the headers asked for. expose lists headers a page may read, and
+;; max-age, when not 0, is how many seconds a preflight's answer may be kept.
+(struct http-cors [origins (slice string)] [methods string] [headers string] [expose string] [credentials bool]
+  [max-age u32])
+
+;; http-cors-check answers a preflight with 204, and adds the CORS headers to every other answer, with Vary: Origin
+;; unless any origin is allowed.
+(define (http-cors-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (let* ([c (cast (ptr http-cors) settings)] [any (listed? (-> c origins) "*")]
+         [origin (http-request-header r "origin")]
+         [allow (cond [any "*"] [(and (> (-> origin length) 0) (listed? (-> c origins) origin)) origin] [else ""])]
+         [asked (http-request-header r "access-control-request-headers")])
+    (when (and any (-> c credentials)) (host-trap "http: CORS with credentials needs its origins listed, not *"))
+    (unless (and (== (-> r method) "OPTIONS") (> (-> origin length) 0)
+                 (> (-> (http-request-header r "access-control-request-method") length) 0))
+      (unless any (http-add-header! r "vary" "Origin"))
+      (unless (== (-> allow length) 0)
+        (http-add-header! r "access-control-allow-origin" allow)
+        (when (-> c credentials) (http-add-header! r "access-control-allow-credentials" "true"))
+        (unless (== (-> c expose length) 0) (http-add-header! r "access-control-expose-headers" (-> c expose))))
+      (return #f))
+    (http-respond! r 204)
+    (http-header! r "vary" "Origin, Access-Control-Request-Headers")
+    (unless (== (-> allow length) 0)
+      (http-header! r "access-control-allow-origin" allow)
+      (when (-> c credentials) (http-header! r "access-control-allow-credentials" "true"))
+      (http-header! r "access-control-allow-methods"
+                    (if (== (-> c methods length) 0) "GET,HEAD,PUT,PATCH,POST,DELETE" (-> c methods)))
+      (let ([allowed-headers (if (== (-> c headers length) 0) asked (-> c headers))])
+        (unless (== (-> allowed-headers length) 0) (http-header! r "access-control-allow-headers" allowed-headers)))
+      (unless (== (-> c max-age) 0) (http-length-header! r "access-control-max-age" (cast i64 (-> c max-age)))))
+    (http-finish! r)
+    #t))
+
+(define (http-length-header! [r (ptr http-request)] [name string] [n i64])
+  (let ([b (make-buffer)])
+    (http-add-decimal! (& b) n)
+    (http-header! r name (buffer-string (& b)))
+    (buffer-free! (& b))))
+
+;; ---- rate limits ----
+
+(struct bucket [key (array u8 46)] [length u32] [used bool] [tokens f64] [at f64])
+
+;; rate is the requests a client may make each second and burst how many at once, both above 0; an IPv6 client is known
+;; by its first 56 bits. most bounds the clients kept, 10000 at 0; a table three quarters full starts again.
+(struct http-limit [rate f64] [burst u32] [most u32] [size u32] [count u32] [buckets (ptr bucket)])
+
+;; The first 12 bytes of an IPv4 address mapped into IPv6.
+(define mapped (array u8 12) (array-of u8 0 0 0 0 0 0 0 0 0 0 255 255))
+
+;; ipv4! reads a dotted IPv4 address into 4 bytes, or returns #f.
+(define (ipv4! [s string] [out (ptr u8)]) -> bool
+  (let ([n u32 0] [v u32 0] [digits u32 0])
+    (for ([i u32 0]) (<= i (-> s length)) (+= i 1)
+      (cond [(or (== i (-> s length)) (== (@ s i) 46))
+             (when (or (== digits 0) (> v 255) (== n 4)) (return #f))
+             (set! (@ out n) (cast u8 v))
+             (+= n 1)
+             (set! v 0)
+             (set! digits 0)]
+            [(and (>= (@ s i) 48) (<= (@ s i) 57) (< digits 3))
+             (set! v (+ (* v 10) (cast u32 (- (@ s i) 48))))
+             (+= digits 1)]
+            [else (return #f)]))
+    (== n 4)))
+
+;; ipv6! reads an IPv6 address (RFC 4291) into 16 bytes, ignoring a zone after %, or returns #f.
+(define (ipv6! [s string] [out (ptr u8)]) -> bool
+  (let ([words (array u16 8)] [n u32 0] [gap i32 -1] [i u32 0] [end u32 0])
+    (while (and (< end (-> s length)) (!= (@ s end) 37)) (+= end 1))
+    (when (and (>= end 2) (== (@ s 0) 58) (== (@ s 1) 58))
+      (set! gap 0)
+      (set! i 2))
+    (while (< i end)
+      (let ([start i] [v u32 0])
+        (while (and (< i end) (< (- i start) 4) (>= (digit-value (@ s i) 16) 0))
+          (set! v (+ (* v 16) (cast u32 (digit-value (@ s i) 16))))
+          (+= i 1))
+        (when (or (== i start) (== n 8)) (return #f))
+        (if (and (< i end) (== (@ s i) 46))
+            (let ([four (array u8 4)])
+              (unless (and (<= n 6) (ipv4! (slice s start end) four)) (return #f))
+              (set! (@ words n) (bit-or (<< (cast u16 (@ four 0)) 8) (cast u16 (@ four 1))))
+              (set! (@ words (+ n 1)) (bit-or (<< (cast u16 (@ four 2)) 8) (cast u16 (@ four 3))))
+              (+= n 2)
+              (set! i end))
+            (begin
+              (set! (@ words n) (cast u16 v))
+              (+= n 1)
+              (when (< i end)
+                (unless (and (== (@ s i) 58) (< (+ i 1) end)) (return #f))
+                (+= i 1)
+                (when (== (@ s i) 58)
+                  (when (>= gap 0) (return #f))
+                  (set! gap (cast i32 n))
+                  (+= i 1)))))))
+    (cond [(< gap 0) (unless (== n 8) (return #f))]
+          [(== n 8) (return #f)]
+          [else
+           (let ([moved (- n (cast u32 gap))])
+             (for ([k u32 0]) (< k moved) (+= k 1) (set! (@ words (- 7 k)) (@ words (- (- n 1) k))))
+             (for ([k u32 (cast u32 gap)]) (< k (- 8 moved)) (+= k 1) (set! (@ words k) 0)))])
+    (for ([k u32 0]) (< k 8) (+= k 1)
+      (set! (@ out (* k 2)) (cast u8 (>> (@ words k) 8)))
+      (set! (@ out (+ (* k 2) 1)) (cast u8 (@ words k))))
+    #t))
+
+;; key! writes the client's key and returns its length: an IPv4 address, also one mapped into IPv6, or a colon and the
+;; first 56 bits of an IPv6 address.
+(define (key! [address string] [key (ptr u8)]) -> u32
+  (let ([bytes (array u8 16)] [colon #f] [b (make-buffer)] [n u32 0])
+    (for ([i u32 0]) (< i (-> address length)) (+= i 1) (when (== (@ address i) 58) (set! colon #t)))
+    (cond [(not (and colon (ipv6! address bytes)))
+           (set! n (if (> (-> address length) 46) 46 (-> address length)))
+           (memcpy key (-> address bytes) n)]
+          [(== (memcmp bytes mapped 12) 0)
+           (for ([i u32 12]) (< i 16) (+= i 1)
+             (unless (== i 12) (buffer-add-byte! (& b) 46))
+             (write-digits (& b) (cast u64 (@ bytes i)) 10))
+           (set! n (-> b length))
+           (memcpy key (-> b bytes) n)
+           (buffer-free! (& b))]
+          [else
+           (set! (@ key 0) 58)
+           (memcpy (+ key 1) bytes 7)
+           (set! n 8)])
+    n))
+
+;; slot gives the key's bucket in the table, or the empty one where it would go.
+(define (slot [buckets (ptr bucket)] [size u32] [key (slice u8)]) -> (ptr bucket)
+  (let ([h u32 2166136261] [i u32 0])
+    (for ([k u32 0]) (< k (-> key length)) (+= k 1) (set! h (* (bit-xor h (cast u32 (@ key k))) 16777619)))
+    (set! i (% h size))
+    (while #t
+      (let ([b (& (@ buckets i))])
+        (when (or (not (-> b used))
+                  (and (== (-> b length) (-> key length)) (== (memcmp (-> b key) (-> key items) (-> key length)) 0)))
+          (return b))
+        (set! i (% (+ i 1) size))))
+    0))
+
+;; The table starts with 64 buckets and doubles, up to most, when three quarters full.
+(define (grow! [l (ptr http-limit)] [size u32])
+  (let ([old (-> l buckets)] [n (-> l size)] [new (cast (ptr bucket) (calloc size (sizeof bucket)))])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let ([b (& (@ old i))])
+        (when (-> b used) (memcpy (slot new size (slice (cast (ptr u8) (-> b key)) (-> b length))) b (sizeof bucket)))))
+    (free old)
+    (set! (-> l buckets) new)
+    (set! (-> l size) size)))
+
+(define (bucket-of [l (ptr http-limit)] [key (slice u8)]) -> (ptr bucket)
+  (let ([most (if (> (-> l most) 0) (-> l most) 10000)] [b (ptr bucket) 0])
+    (when (== (-> l buckets) 0)
+      (set! (-> l size) 0)
+      (grow! l (if (< most 64) most 64)))
+    (when (>= (* (-> l count) 4) (* (-> l size) 3))
+      (if (< (-> l size) most)
+          (grow! l (if (< (* (-> l size) 2) most) (* (-> l size) 2) most))
+          (begin
+            (memset (-> l buckets) 0 (* (-> l size) (sizeof bucket)))
+            (set! (-> l count) 0))))
+    (set! b (slot (-> l buckets) (-> l size) key))
+    (unless (-> b used)
+      (set! (-> b used) #t)
+      (memcpy (-> b key) (-> key items) (-> key length))
+      (set! (-> b length) (-> key length))
+      (set! (-> b tokens) (cast f64 (-> l burst)))
+      (set! (-> b at) (clock-monotonic))
+      (+= (-> l count) 1))
+    b))
+
+;; http-limit-check answers 429, with Retry-After in seconds, a request whose client has no request left.
+(define (http-limit-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (let ([l (cast (ptr http-limit) settings)] [key (array u8 46)])
+    (when (or (<= (-> l rate) 0.0) (== (-> l burst) 0))
+      (host-trap "http: a rate limit whose rate or burst is not above 0"))
+    (let* ([b (bucket-of l (slice key (key! (http-request-address r) key)))] [now (clock-monotonic)]
+           [tokens (+ (-> b tokens) (/ (* (- now (-> b at)) (-> l rate)) 1000.0))])
+      (set! (-> b tokens) (if (> tokens (cast f64 (-> l burst))) (cast f64 (-> l burst)) tokens))
+      (set! (-> b at) now)
+      (when (>= (-> b tokens) 1.0)
+        (-= (-> b tokens) 1.0)
+        (return #f))
+      (http-respond! r 429)
+      (http-header! r "content-type" "text/plain; charset=utf-8")
+      (http-length-header! r "retry-after" (cast i64 (ceil (/ (- 1.0 (-> b tokens)) (-> l rate)))))
+      (http-send-text! r "too many requests")
+      #t)))
+
+;; ---- allowed hosts ----
+
+;; names lists the hosts requests may name: a name, in any case; a name after a dot, for it and the names under it; or
+;; "*" for any. addresses lets any IP address pass.
+(struct http-hosts [names (slice string)] [addresses bool])
+
+;; host-of gives the host a Host header's value names, without its port and a final dot, or "" when it is malformed.
+(define (host-of [value string]) -> string
+  (let ([n (-> value length)] [end u32 0])
+    (if (and (> n 0) (== (@ value 0) 91))
+        (begin
+          (while (and (< end n) (!= (@ value end) 93)) (+= end 1))
+          (when (== end n) (return ""))
+          (+= end 1))
+        (while (and (< end n) (!= (@ value end) 58)) (+= end 1)))
+    (unless (or (== end n)
+                (and (== (@ value end) 58) (or (== (+ end 1) n) (digits? (slice value (+ end 1)) 10))))
+      (return ""))
+    (when (and (> end 0) (== (@ value (- end 1)) 46)) (-= end 1))
+    (slice value 0 end)))
+
+(define (allowed? [entry string] [host string]) -> bool
+  (let ([n (-> entry length)] [h (-> host length)])
+    (cond [(== entry "*") #t]
+          [(and (> n 0) (== (@ entry 0) 46))
+           (or (http-same? host (slice entry 1)) (and (> h n) (http-same? (slice host (- h n)) entry)))]
+          [else (http-same? host entry)])))
+
+;; http-hosts-check answers 403 to a request whose Host is not allowed, against DNS rebinding; one without a Host passes.
+(define (http-hosts-check [r (ptr http-request)] [settings (ptr void)]) -> bool
+  (let* ([o (cast (ptr http-hosts) settings)] [value (http-request-header r "host")] [host (host-of value)]
+         [n (-> host length)] [bytes (array u8 16)])
+    (when (== (-> value length) 0) (return #f))
+    (when (and (> n 0) (-> o addresses)
+               (if (== (@ host 0) 91) (ipv6! (slice host 1 (- n 1)) bytes) (ipv4! host bytes)))
+      (return #f))
+    (for ([i u32 0]) (and (> n 0) (< i (-> o names length))) (+= i 1)
+      (when (allowed? (@ (-> o names) i) host) (return #f)))
+    (http-answer-text! r 403 "this host is not allowed")
+    #t))

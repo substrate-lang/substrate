@@ -27,7 +27,8 @@ function readOnly(files) {
     copy: refused,
     chmod: refused,
     makeTemp: refused,
-    open: (p, mode, start) => (mode === 0 ? files.open(p, mode, start) : refused()),
+    openFile: (p, how) => (how.write || how.append || how.truncate || how.create || how.createNew
+      ? refused() : files.openFile(p, how)),
   };
 }
 

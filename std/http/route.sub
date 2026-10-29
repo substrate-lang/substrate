@@ -1,0 +1,550 @@
+;; Routes after Go's ServeMux, written as s-expressions with typed parameters. (routes name [METHOD (segment ...)
+;; handler option ...] ...) defines name, a handler for http-serve!. A segment is a string; [name type], of type string
+;; or an integer type; or, last, [name string ...], the rest of the path. "" last is the empty segment after a final
+;; slash. The handler gets the request, the parameters, then a pointer to what (query T) reads, then a pointer to what
+;; (json T) or (form T) reads or the bytes (body) reads; (limit n) bounds the body. The most specific route wins, and
+;; routes that overlap with neither more specific are refused. A handler's first route defines handler.url!.
+(require-unqualified http "http.sub")
+(require-unqualified server "server.sub")
+(require-unqualified url "url.sub")
+(require-unqualified multipart "multipart.sub")
+(require-unqualified form "form.sub")
+(require-unqualified json std/encoding/json)
+
+(provide routes)
+
+(define no-parts (slice multipart-part) 0)
+
+(define (route-rest [a (ptr arena)] [segments (slice string)] [i u32]) -> string
+  (let ([n u32 0] [at u32 0])
+    (for ([k u32 i]) (< k (-> segments length)) (+= k 1) (+= n (+ (-> (@ segments k) length) 1)))
+    (let ([p (cast (ptr u8) (arena-alloc a n))])
+      (for ([k u32 i]) (< k (-> segments length)) (+= k 1)
+        (when (> k i)
+          (set! (@ p at) #\/)
+          (+= at 1))
+        (memcpy (+ p at) (-> (@ segments k) bytes) (-> (@ segments k) length))
+        (+= at (-> (@ segments k) length)))
+      (cast string (slice p at)))))
+
+(define (route-slashed [a (ptr arena)] [segments (slice string)]) -> (slice string)
+  (let* ([n (-> segments length)] [items (cast (ptr string) (arena-alloc a (* (+ n 1) (sizeof string))))])
+    (for ([i u32 0]) (< i n) (+= i 1) (set! (@ items i) (@ segments i)))
+    (set! (@ items n) "")
+    (slice items (+ n 1))))
+
+(define (route-moved! [r (ptr http-request)] [path string])
+  (let ([b (make-buffer)] [target (-> r target)])
+    (buffer-add-string! (& b) path)
+    (when (< (-> (url-path target) length) (-> target length))
+      (buffer-add-byte! (& b) #\?)
+      (buffer-add-string! (& b) (url-query target)))
+    (http-redirect! r (if (or (== (-> r method) "GET") (== (-> r method) "HEAD")) 301 308) (buffer-string (& b)))
+    (buffer-free! (& b))))
+
+(define (route-clean! [r (ptr http-request)] [segments (slice string)])
+  (let ([b (make-buffer)])
+    (url-add-clean! (& b) segments)
+    (route-moved! r (buffer-string (& b)))
+    (buffer-free! (& b))))
+
+(define (route-slash! [r (ptr http-request)])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) (url-path (-> r target)))
+    (buffer-add-byte! (& b) #\/)
+    (route-moved! r (buffer-string (& b)))
+    (buffer-free! (& b))))
+
+;; allowed holds the methods of the routes matching the path.
+(define (route-miss! [r (ptr http-request)] [allowed u32] [methods (slice string)] [get u32] [head u32])
+  (when (== allowed 0)
+    (http-answer-text! r 404 "not found")
+    (return))
+  (let ([b (make-buffer)] [all (if (!= (bit-and allowed get) 0) (bit-or allowed head) allowed)])
+    (for ([i u32 0]) (< i (-> methods length)) (+= i 1)
+      (when (!= (bit-and all (<< 1 i)) 0)
+        (when (> (-> b length) 0) (buffer-add-string! (& b) ", "))
+        (buffer-add-string! (& b) (@ methods i))))
+    (http-respond! r 405)
+    (http-header! r "allow" (buffer-string (& b)))
+    (http-header! r "content-type" "text/plain; charset=utf-8")
+    (http-send-text! r "method not allowed")
+    (buffer-free! (& b))))
+
+(define (route-refused! [r (ptr http-request)] [err (ptr form-error)])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "field ")
+    (buffer-add-string! (& b) (-> err field))
+    (buffer-add-string! (& b) ": ")
+    (buffer-add-string! (& b) (-> err message))
+    (http-answer-text! r 400 (buffer-string (& b)))
+    (buffer-free! (& b))))
+
+(define (route-json-refused! [r (ptr http-request)] [err (ptr json-error)])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "json at ")
+    (write-digits (& b) (-> err line) 10)
+    (buffer-add-byte! (& b) #\:)
+    (write-digits (& b) (-> err column) 10)
+    (buffer-add-string! (& b) ": ")
+    (buffer-add-string! (& b) (-> err message))
+    (http-answer-text! r 400 (buffer-string (& b)))
+    (buffer-free! (& b))))
+
+(define (route-typed? [r (ptr http-request)] [json bool]) -> bool
+  (let* ([type (http-media-type (http-request-header r "content-type"))] [n (-> type length)]
+         [ok (if json
+                 (or (http-same? type "application/json")
+                     (and (> n 17) (http-same? (slice type 0 12) "application/")
+                          (http-same? (slice type (- n 5)) "+json")))
+                 (or (http-same? type "application/x-www-form-urlencoded") (http-same? type "multipart/form-data")))])
+    (unless ok (http-answer-text! r 415 "unsupported media type"))
+    ok))
+
+(define (route-form-fields [r (ptr http-request)] [body (slice u8)] [pairs (ptr (slice url-pair))]
+                           [parts (ptr (slice multipart-part))]) -> bool
+  (let* ([a (& (-> r arena))] [t (http-request-header r "content-type")] [why string])
+    (set! (@ pairs) 0)
+    (set! (@ parts) 0)
+    (if (http-media-type? t "multipart/form-data")
+        (or (multipart-parse a body (multipart-boundary a t) parts (& why))
+            (begin (http-answer-text! r 400 why) #f))
+        (begin (set! (@ pairs) (url-form-parse a (cast string body))) #t))))
+
+(define (route-add-text! [b (ptr buffer)] [s string])
+  (buffer-add-byte! b #\/)
+  (url-add-segment! b s))
+
+(define (route-add-unsigned! [b (ptr buffer)] [n u64])
+  (buffer-add-byte! b #\/)
+  (write-digits b n 10))
+
+(define (route-add-signed! [b (ptr buffer)] [n i64])
+  (buffer-add-byte! b #\/)
+  (if (< n 0)
+      (begin (buffer-add-byte! b #\-) (write-digits b (- 0 (cast u64 n)) 10))
+      (write-digits b (cast u64 n) 10)))
+
+(define (route-add-rest! [b (ptr buffer)] [s string])
+  (let ([start u32 0])
+    (buffer-add-byte! b #\/)
+    (for ([i u32 0]) (<= i (-> s length)) (+= i 1)
+      (when (or (== i (-> s length)) (== (@ s i) #\/))
+        (url-add-segment! b (slice s start i))
+        (when (< i (-> s length)) (buffer-add-byte! b #\/))
+        (set! start (+ i 1))))))
+
+;; ---- the routes form ----
+
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+
+  ;; (name width signedness least-or-most most)
+  (define integer-types datum
+    '((u8 8 unsigned 255) (u16 16 unsigned 65535) (u32 32 unsigned 4294967295) (u64 64 unsigned 18446744073709551615)
+      (i8 8 signed -128 127) (i16 16 signed -32768 32767) (i32 32 signed -2147483648 2147483647)
+      (i64 64 signed -9223372036854775808 9223372036854775807)))
+
+  (define context datum 0)
+  (define methods datum nil)
+  (define starts datum nil)
+  (define counter u32 0)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+  (define (number [n i64]) -> datum (literal (make-integer n)))
+  (define (fail [where datum] [message string]) -> datum (raise-syntax-error 'routes message where))
+
+  (define (fresh [base datum]) -> datum
+    (+= counter 1)
+    (datum->syntax #'here (string->symbol (format-message "~a~a" `(,base ,(make-integer counter)))) 0))
+
+  ;; A name in the form's scope, after the identifier x.
+  (define (named [x datum] [suffix datum]) -> datum
+    (datum->syntax context (string->symbol (format-message "~a~a" `(,(syntax-e x) ,suffix))) context))
+
+  ;; ---- reading the table ----
+
+  ;; A route is (route index method segments handler options syntax); a segment is (text "s" syntax), (int name type
+  ;; syntax), (string name syntax) or (rest name syntax).
+  (define (route-index [r datum]) -> datum (list-ref r 1))
+  (define (route-method [r datum]) -> datum (list-ref r 2))
+  (define (route-segments [r datum]) -> datum (list-ref r 3))
+  (define (route-handler [r datum]) -> datum (list-ref r 4))
+  (define (route-options [r datum]) -> datum (list-ref r 5))
+  (define (route-syntax [r datum]) -> datum (list-ref r 6))
+  (define (option [r datum] [word datum]) -> datum
+    (let ([o (assq word (route-options r))]) (if (== o 0) 0 (cdr o))))
+
+  (define (has-slash? [s string]) -> bool
+    (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) #\/) (return #t)))
+    #f)
+
+  (define (parse-route [e datum] [k u32]) -> datum
+    (let ([l (syntax->list e)])
+      (unless (and (!= l 0) (>= (length l) 3) (identifier? (car l)) (!= (syntax->list (cadr l)) 0)
+                   (identifier? (caddr l)))
+        (fail e "expected [METHOD (segment ...) handler option ...]"))
+      `(route ,(make-integer k) ,(syntax-e (car l)) ,(parse-segments (cadr l)) ,(caddr l)
+              ,(parse-options (cdddr l) e) ,e)))
+
+  (define (parse-segments [segments datum]) -> datum
+    (let ([l (syntax->list segments)] [out nil] [names nil])
+      (while (pair? l)
+        (let* ([x (car l)] [last (null? (cdr l))] [d (syntax-e x)] [parts (syntax->list x)])
+          (cond [(string? d)
+                 (when (and (== (-> (datum->string d) length) 0) (not last))
+                   (fail x "only the last segment can be \"\", the empty one after a final slash"))
+                 (when (has-slash? (datum->string d)) (fail x "a segment cannot contain a slash"))
+                 (set! out (cons `(text ,d ,x) out))]
+                [(and (!= parts 0) (or (== (length parts) 2) (== (length parts) 3)) (identifier? (car parts))
+                      (identifier? (cadr parts)))
+                 (let ([name (car parts)] [type (syntax-e (cadr parts))])
+                   (when (!= (memq (syntax-e name) names) 0) (fail name "two parameters of a route have the same name"))
+                   (set! names (cons (syntax-e name) names))
+                   (cond [(== (length parts) 3)
+                          (unless (and (== type 'string) (identifier? (caddr parts)) (== (syntax-e (caddr parts)) '...))
+                            (fail x "expected [name string ...], the rest of the path"))
+                          (unless last (fail x "the rest of the path, [name string ...], can only be last"))
+                          (set! out (cons `(rest ,name ,x) out))]
+                         [(== type 'string) (set! out (cons `(string ,name ,x) out))]
+                         [(!= (assq type integer-types) 0) (set! out (cons `(int ,name ,type ,x) out))]
+                         [else (fail (cadr parts) "a parameter's type is string or an integer type")]))]
+                [else (fail x "expected a segment: a string, [name type] or [name string ...]")]))
+        (set! l (cdr l)))
+      (reverse out)))
+
+  (define (parse-options [l datum] [where datum]) -> datum
+    (let ([out nil] [bodies 0])
+      (for/each ([o l])
+        (let ([parts (syntax->list o)])
+          (unless (and (!= parts 0) (pair? parts) (identifier? (car parts)))
+            (fail o "expected an option: (query T), (json T), (form T), (body) or (limit n)"))
+          (let ([word (syntax-e (car parts))])
+            (when (!= (assq word out) 0) (fail o "a route can have each option once"))
+            (cond [(and (or (== word 'query) (== word 'json) (== word 'form)) (== (length parts) 2)
+                        (identifier? (cadr parts)))
+                   (unless (== word 'query) (+= bodies 1))
+                   (set! out (cons (cons word (cadr parts)) out))]
+                  [(and (== word 'body) (== (length parts) 1))
+                   (+= bodies 1)
+                   (set! out (cons (cons word o) out))]
+                  [(and (== word 'limit) (== (length parts) 2) (integer? (syntax-e (cadr parts)))
+                        (> (integer-value (syntax-e (cadr parts))) 0)
+                        (<= (integer-value (syntax-e (cadr parts))) 4294967295))
+                   (set! out (cons (cons word (cadr parts)) out))]
+                  [else (fail o "expected an option: (query T), (json T), (form T), (body) or (limit n)")]))))
+      (when (> bodies 1) (fail where "a route reads its body one way: with (json T), (form T) or (body)"))
+      (when (and (!= (assq 'limit out) 0) (== bodies 0))
+        (fail where "(limit n) bounds a body, which (json T), (form T) or (body) reads"))
+      out))
+
+  ;; ---- conflicts ----
+
+  (define (integer-like? [s string] [signed bool]) -> bool
+    (let ([i u32 (if (and signed (> (-> s length) 1) (== (@ s 0) #\-)) 1 0)])
+      (when (>= i (-> s length)) (return #f))
+      (while (< i (-> s length))
+        (unless (and (>= (@ s i) #\0) (<= (@ s i) #\9)) (return #f))
+        (+= i 1))
+      #t))
+
+  (define (signed? [type datum]) -> bool (== (caddr (assq type integer-types)) 'signed))
+  (define (width [type datum]) -> i64 (integer-value (cadr (assq type integer-types))))
+
+  ;; Whether b matches every segment a matches.
+  (define (within? [a datum] [b datum]) -> bool
+    (let ([ka (car a)] [kb (car b)])
+      (cond [(== kb 'rest) #t]
+            [(== ka 'text)
+             (let ([s (datum->string (cadr a))])
+               (cond [(== kb 'text) (equal? (cadr a) (cadr b))]
+                     [(== kb 'int) (integer-like? s (signed? (caddr b)))]
+                     [else (> (-> s length) 0)]))]
+            [(== ka 'int)
+             (cond [(== kb 'string) #t]
+                   [(== kb 'int)
+                    (let ([sa (signed? (caddr a))] [sb (signed? (caddr b))]
+                          [wa (width (caddr a))] [wb (width (caddr b))])
+                      (or (and (== sa sb) (<= wa wb)) (and (not sa) sb (< wa wb))))]
+                   [else #f])]
+            [(== ka 'string) (== kb 'string)]
+            [else #f])))
+
+  (define (overlap? [a datum] [b datum]) -> bool
+    (or (within? a b) (within? b a) (and (== (car a) 'int) (== (car b) 'int))))
+
+  (define (paths-overlap? [a datum] [b datum]) -> bool
+    (cond [(or (null? a) (null? b)) (and (null? a) (null? b))]
+          [(or (== (car (car a)) 'rest) (== (car (car b)) 'rest)) #t]
+          [else (and (overlap? (car a) (car b)) (paths-overlap? (cdr a) (cdr b)))]))
+
+  (define (paths-within? [a datum] [b datum]) -> bool
+    (cond [(null? a) (null? b)]
+          [(null? b) #f]
+          [(== (car (car b)) 'rest) #t]
+          [(== (car (car a)) 'rest) #f]
+          [else (and (within? (car a) (car b)) (paths-within? (cdr a) (cdr b)))]))
+
+  ;; The route as Go writes its patterns, with each parameter's type.
+  (define (route-text [r datum]) -> string
+    (let ([b (make-buffer)])
+      (buffer-add-string! (& b) (symbol->string (route-method r)))
+      (buffer-add-byte! (& b) 32)
+      (when (null? (route-segments r)) (buffer-add-byte! (& b) #\/))
+      (for/each ([s (route-segments r)])
+        (buffer-add-byte! (& b) #\/)
+        (cond [(== (car s) 'text) (buffer-add-string! (& b) (datum->string (cadr s)))]
+              [(== (car s) 'int)
+               (buffer-add-string! (& b) (format-message "{~a:~a}" `(,(syntax-e (cadr s)) ,(caddr s))))]
+              [(== (car s) 'string) (buffer-add-string! (& b) (format-message "{~a}" `(,(syntax-e (cadr s)))))]
+              [else (buffer-add-string! (& b) (format-message "{~a...}" `(,(syntax-e (cadr s)))))]))
+      (buffer-string (& b))))
+
+  (define (check-conflicts! [rs datum])
+    (let ([l rs])
+      (while (pair? l)
+        (for/each ([other (cdr l)])
+          (let ([a (car l)])
+            (when (and (== (route-method a) (route-method other))
+                       (paths-overlap? (route-segments a) (route-segments other)))
+              (let ([ab (paths-within? (route-segments a) (route-segments other))]
+                    [ba (paths-within? (route-segments other) (route-segments a))]
+                    [texts `(,(string->datum (route-text other)) ,(string->datum (route-text a)))])
+                (cond [(and ab ba)
+                       (fail (route-syntax other) (format-message "~a matches the same requests as ~a" texts))]
+                      [(not (or ab ba))
+                       (fail (route-syntax other)
+                             (format-message "~a and ~a overlap, and neither is more specific" texts))])))))
+        (set! l (cdr l)))))
+
+  ;; ---- the tree of segments ----
+
+  ;; A node is (node routes children): the routes whose segments end there, and (segment . node) for each next segment.
+  (define (key [s datum]) -> datum
+    (cond [(== (car s) 'text) `(text ,(cadr s))]
+          [(== (car s) 'int) `(int ,(caddr s))]
+          [else `(,(car s))]))
+
+  (define (insert [n datum] [segments datum] [r datum]) -> datum
+    (if (null? segments)
+        `(node ,(append (cadr n) (cons r nil)) ,(caddr n))
+        (let ([k (key (car segments))] [out nil] [found #f])
+          (for/each ([c (caddr n)])
+            (if (and (not found) (equal? (key (car c)) k))
+                (begin
+                  (set! found #t)
+                  (set! out (cons (cons (car c) (insert (cdr c) (cdr segments) r)) out)))
+                (set! out (cons c out))))
+          (unless found (set! out (cons (cons (car segments) (insert '(node () ()) (cdr segments) r)) out)))
+          `(node ,(cadr n) ,(reverse out)))))
+
+  ;; The order a node's children are tried in: strings, integer types narrowest first, string, the rest.
+  (define (rank [s datum]) -> i64
+    (cond [(== (car s) 'text) 0]
+          [(== (car s) 'int) (+ (width (caddr s)) (if (signed? (caddr s)) 1 0))]
+          [(== (car s) 'string) 100]
+          [else 200]))
+
+  (define (ordered [children datum]) -> datum
+    (sort children (lambda ([a datum] [b datum]) -> bool (< (rank (car a)) (rank (car b))))))
+
+  ;; ---- code ----
+
+  (define (bit [m datum]) -> datum
+    (let ([i i64 0] [l methods])
+      (while (!= (car l) m)
+        (set! l (cdr l))
+        (+= i 1))
+      (number (<< 1 i))))
+
+  (define (start-of [r datum]) -> datum (list-ref starts (cast u32 (integer-value (route-index r)))))
+
+  ;; values are (variable . type).
+  (define (arguments [values datum]) -> datum
+    (for/list ([v values]) (if (== (cdr v) 'string) (car v) #`(cast #,(literal (cdr v)) #,(car v)))))
+
+  (define (leaf-code [rs datum] [values datum]) -> datum
+    (let ([arms nil] [mask i64 0] [head #f] [get datum 0])
+      (for/each ([r rs])
+        (set! arms
+              (cons #`[(== method #,(bit (route-method r))) (#,(start-of r) r #,@(arguments values)) (return #t)] arms))
+        (set! mask (bit-or mask (integer-value (syntax-e (bit (route-method r))))))
+        (when (== (route-method r) 'HEAD) (set! head #t))
+        (when (== (route-method r) 'GET) (set! get r)))
+      (when (and (not head) (!= get 0))
+        (set! arms (cons #`[(== method #,(bit 'HEAD)) (#,(start-of get) r #,@(arguments values)) (return #t)] arms)))
+      #`(begin
+          (when probe (return #t))
+          (cond #,@(reverse arms) [else (begin)])
+          (set! (@ allowed) (bit-or (@ allowed) #,(number mask))))))
+
+  ;; Code matching the segments from i at the node.
+  (define (node-code [n datum] [i i64] [values datum]) -> datum
+    (let ([parts nil])
+      (unless (null? (cadr n)) (set! parts (cons #`(when (== count #,(number i)) #,(leaf-code (cadr n) values)) parts)))
+      (for/each ([c (ordered (caddr n))]) (set! parts (cons (child-code (car c) (cdr c) i values) parts)))
+      #`(begin #,@(reverse parts))))
+
+  (define (child-code [s datum] [n datum] [i i64] [values datum]) -> datum
+    (let ([at (number i)] [v (fresh 'v)])
+      (cond [(== (car s) 'text)
+             #`(when (and (> count #,at) (== (@ segments #,at) #,(literal (cadr s)))) #,(node-code n (+ i 1) values))]
+            [(== (car s) 'string)
+             #`(when (and (> count #,at) (> (-> (@ segments #,at) length) 0))
+                 (let ([#,v (@ segments #,at)])
+                   #,(node-code n (+ i 1) (append values (cons (cons v 'string) nil)))))]
+            [(== (car s) 'int)
+             (let* ([type (caddr s)] [info (assq type integer-types)] [more (append values (cons (cons v type) nil))])
+               (if (signed? type)
+                   #`(let ([#,v i64 0])
+                       (when (and (> count #,at)
+                                  (http-signed (@ segments #,at) #,(literal (cadddr info)) #,(literal (list-ref info 4))
+                                               (& #,v)))
+                         #,(node-code n (+ i 1) more)))
+                   #`(let ([#,v u64 0])
+                       (when (and (> count #,at) (http-unsigned (@ segments #,at) #,(literal (cadddr info)) (& #,v)))
+                         #,(node-code n (+ i 1) more)))))]
+            [else
+             #`(when (> count #,at)
+                 (let ([#,v (route-rest (& (-> r arena)) segments #,at)])
+                   #,(leaf-code (cadr n) (append values (cons (cons v 'string) nil)))))])))
+
+  (define (params [r datum]) -> datum
+    (let ([out nil])
+      (for/each ([s (route-segments r)])
+        (cond [(== (car s) 'int) (set! out (cons (cons (cadr s) (caddr s)) out))]
+              [(!= (car s) 'text) (set! out (cons (cons (cadr s) 'string) out))]))
+      (reverse out)))
+
+  (define (formals [ps datum]) -> datum (for/list ([p ps]) #`[#,(car p) #,(literal (cdr p))]))
+
+  ;; t.what, which must be bound before the routes.
+  (define (derived [t datum] [what datum] [form datum] [where datum]) -> datum
+    (let ([d (datum->syntax t (string->symbol (format-message "~a.~a" `(,(syntax-e t) ,what))) t)])
+      (unless (== (identifier-binding-kind d) 'function)
+        (fail where (format-message "this route needs ~a, which (~a ~a) defines: write it before the routes"
+                                    `(,(syntax-e d) ,form ,(syntax-e t)))))
+      d))
+
+  (define (handler-call [handler datum] [values datum] [last datum]) -> datum #`(#,handler r #,@values #,@last))
+
+  ;; A route's start and, when it reads a body, the struct its values wait in and the function given the body.
+  (define (route-definitions [r datum]) -> datum
+    (let* ([ps (params r)] [handler (route-handler r)] [query (option r 'query)] [json (option r 'json)]
+           [form (option r 'form)] [body (option r 'body)] [limit (option r 'limit)] [where (route-syntax r)]
+           [q (fresh 'q)] [e (fresh 'e)] [args (fresh 'args)] [given (fresh 'given)] [read (fresh 'read)]
+           [value (fresh 'value)] [values (append (for/list ([p ps]) (car p)) (if (== query 0) nil `(,q)))]
+           [reads (or (!= json 0) (!= form 0) (!= body 0))]
+           [ending (if reads
+                       #`(begin
+                           #,@(if (== body 0)
+                                  `(,#`(unless (route-typed? r #,(literal (boolean (!= json 0)))) (return)))
+                                  nil)
+                           (let ([#,args (cast (ptr #,given) (arena-alloc (& (-> r arena)) (sizeof #,given)))])
+                             #,@(for/list ([x values]) #`(set! (-> #,args #,x) #,x))
+                             (set! (-> r route) (cast (ptr void) #,args))
+                             (http-read-body! r #,(if (== limit 0) (number 0) limit) #,read)))
+                       (handler-call handler values nil))]
+           [start #`(define (#,(start-of r) [r (ptr http-request)] #,@(formals ps))
+                      #,(if (== query 0)
+                            ending
+                            #`(let ([#,q (cast (ptr #,query) (arena-alloc (& (-> r arena)) (sizeof #,query)))]
+                                    [#,e form-error])
+                                (unless (#,(derived query '"form-read" 'form where) (& (-> r arena))
+                                         (url-form-parse (& (-> r arena)) (url-query (-> r target))) no-parts #,q
+                                         (& #,e))
+                                  (return (route-refused! r (& #,e))))
+                                #,ending)))])
+      (if (not reads)
+          `(,start)
+          `(,#`(struct #,given #,@(formals ps) #,@(if (== query 0) nil `(,#`[#,q (ptr #,query)])))
+            ,#`(define (#,read [r (ptr http-request)] [bytes (slice u8)])
+                 (let* ([#,args (cast (ptr #,given) (-> r route))] #,@(for/list ([x values]) #`[#,x (-> #,args #,x)]))
+                   #,(cond [(!= body 0) (handler-call handler values `(,#'bytes))]
+                           [(!= json 0)
+                            #`(let ([#,value (cast (ptr #,json) (arena-alloc (& (-> r arena)) (sizeof #,json)))]
+                                    [#,e json-error])
+                                (unless (#,(derived json '"json-read" 'json where) (& (-> r arena)) (cast string bytes)
+                                         #,value (& #,e))
+                                  (return (route-json-refused! r (& #,e))))
+                                #,(handler-call handler values `(,value)))]
+                           [else
+                            #`(let ([#,value (cast (ptr #,form) (arena-alloc (& (-> r arena)) (sizeof #,form)))]
+                                    [#,e form-error] [pairs (slice url-pair)] [parts (slice multipart-part)])
+                                (unless (route-form-fields r bytes (& pairs) (& parts)) (return))
+                                (unless (#,(derived form '"form-read" 'form where) (& (-> r arena)) pairs parts #,value
+                                         (& #,e))
+                                  (return (route-refused! r (& #,e))))
+                                #,(handler-call handler values `(,value)))])))
+            ,start))))
+
+  (define (builder-code [r datum]) -> datum
+    #`(define (#,(named (route-handler r) '".url!") [b (ptr buffer)] #,@(formals (params r)))
+        #,@(if (null? (route-segments r))
+               `(,#'(buffer-add-byte! b #\/))
+               (for/list ([s (route-segments r)])
+                 (cond [(== (car s) 'text) #`(route-add-text! b #,(literal (cadr s)))]
+                       [(== (car s) 'string) #`(route-add-text! b #,(cadr s))]
+                       [(== (car s) 'int)
+                        (if (signed? (caddr s))
+                            #`(route-add-signed! b (cast i64 #,(cadr s)))
+                            #`(route-add-unsigned! b (cast u64 #,(cadr s))))]
+                       [else #`(route-add-rest! b #,(cadr s))])))))
+
+  (define (routes-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? identifier? name) entry ...)
+       (set! context s)
+       (let ([rs nil] [k u32 0] [trie datum '(node () ())] [matcher (fresh 'match)] [built nil] [builders nil])
+         (for/each ([e entry])
+           (set! rs (cons (parse-route e k) rs))
+           (+= k 1))
+         (set! rs (reverse rs))
+         (check-conflicts! rs)
+         (set! methods nil)
+         (for/each ([r rs])
+           (when (== (memq (route-method r) methods) 0) (set! methods (append methods `(,(route-method r))))))
+         (when (== (memq 'HEAD methods) 0) (set! methods (append methods '(HEAD))))
+         (when (> (length methods) 31) (fail s "a table of routes can have at most 31 methods"))
+         (set! starts (for/list ([r rs]) (fresh 'start)))
+         (for/each ([r rs]) (set! trie (insert trie (route-segments r) r)))
+         (for/each ([r rs])
+           (unless (!= (memq (syntax-e (route-handler r)) built) 0)
+             (set! built (cons (syntax-e (route-handler r)) built))
+             (set! builders (cons (builder-code r) builders))))
+         #`(begin
+             #,@(apply-append (for/list ([r rs]) (route-definitions r)))
+             (define (#,matcher [r (ptr http-request)] [segments (slice string)] [method u32] [allowed (ptr u32)]
+                                [probe bool]) -> bool
+               (let ([count (-> segments length)])
+                 #,(node-code trie 0 nil)
+                 #f))
+             (define (#,name [r (ptr http-request)])
+               (let ([segments (slice string)] [allowed u32 0]
+                     [method u32 (cond #,@(for/list ([m methods])
+                                            #`[(== (-> r method) #,(literal (string->datum (symbol->string m))))
+                                               #,(bit m)])
+                                       [else 0])])
+                 (case (url-segments (& (-> r arena)) (url-path (-> r target)) (& segments))
+                   [(-1) (http-answer-text! r 400 "bad request")]
+                   [(1) (route-clean! r segments)]
+                   [else
+                    (cond [(#,matcher r segments method (& allowed) #f) (begin)]
+                          [(!= allowed 0)
+                           (route-miss! r allowed
+                                        (slice (array-of string #,@(for/list ([m methods])
+                                                                     (literal (string->datum (symbol->string m))))))
+                                        #,(if (!= (memq 'GET methods) 0) (bit 'GET) (number 0)) #,(bit 'HEAD))]
+                          [(and (> (-> segments length) 0) (!= (@ segments (- (-> segments length) 1)) "")
+                                (#,matcher r (route-slashed (& (-> r arena)) segments) 0 (& allowed) #t))
+                           (route-slash! r)]
+                          [else (http-answer-text! r 404 "not found")])])))
+             #,@(reverse builders)))]
+      [_ (fail s "expected (routes name [METHOD (segment ...) handler option ...] ...)")]))
+
+  (define (apply-append [ls datum]) -> datum
+    (let ([out nil])
+      (for/each ([l ls]) (set! out (append out l)))
+      out)))
+
+(define-syntax routes routes-form)
