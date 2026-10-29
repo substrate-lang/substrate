@@ -34,7 +34,7 @@ export function pageFiles(files, cwd, grants) {
     times.set(key, Date.now());
   };
   const inside = (key) => [...files.keys()].filter((k) => k.startsWith(under(key)));
-  // An open file's writes go into a buffer with room to grow, which no other file shares, and which past its end is 0.
+  // The buffers open files write into, one each.
   const owned = new WeakSet();
   const content = (key) => files.get(key) ?? new Uint8Array(0);
   const resized = (key, n) => {
