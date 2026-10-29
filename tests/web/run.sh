@@ -3,7 +3,6 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
-# Every build here shares one cache.
 export SUBSTRATE_CACHE="$root/build/cache"
 sites="${OUT:-build}/web"
 

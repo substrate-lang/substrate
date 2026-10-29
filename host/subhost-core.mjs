@@ -411,8 +411,6 @@ export function createHost(platform) {
     };
   }
 
-  // later gives a function of the host module from, making the module for self when one of its functions is first
-  // called.
   function later(self, made, from, fname) {
     let f = null;
     return (...args) => {

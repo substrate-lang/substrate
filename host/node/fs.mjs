@@ -8,7 +8,6 @@ import { sameFile, tempName } from '../fs.mjs';
 
 const { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
 
-// plainMessage gives an error's message, a system error's without its code, call and path.
 export function plainMessage(e) {
   if (typeof e.errno !== 'number') return e.message;
   const m = e.message.replace(/^[A-Z]+: /, '').replace(/, [a-z]+( '.*)?$/, '');
@@ -186,7 +185,6 @@ export function nodeFiles(grants) {
       at('read', from);
       fs.renameSync(at('write', from), at('write', to));
     }),
-    // openFile reads and writes at a position when the file can seek, and in order when it is a pipe or a device.
     openFile: plain((p, how) => {
       const writes = how.write || how.append;
       const changes = writes || how.truncate || how.create || how.createNew;
