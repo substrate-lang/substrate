@@ -15,7 +15,7 @@ compiler is written in it, builds itself, and runs in a browser.
   a C side module a module of the program. The compiler builds a program
   from one file and the label of its root, with a module map of roots,
   each a label and a directory, and the names each root uses; it knows
-  host, compiler and std itself. A command may also give it a check for
+  host, compiler, std and cmd itself. A command may also give it a check for
   each module it reads.
 - `std/`: the standard library, written in Substrate. `languages/` holds
   the languages built on it, `scheme/`, a Scheme, and `bend/`, a
