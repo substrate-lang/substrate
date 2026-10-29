@@ -1,12 +1,14 @@
-;; A package's hash: the SHA-256 of a line for each of its files, in path order, of the file's SHA-256 in hex, two
-;; spaces and its path, then a line for each of its dependencies, in its manifest's order, of the dependency's hash, two
-;; spaces and its name; written sha256:hex. A url dependency's hash is the one its manifest pins.
+;; A package's hash: the SHA-256 of a line for each of its files (files.sub) and package.sub, in path order, of the
+;; file's SHA-256 in hex, two spaces and its path, then a line for each of its dependencies, in its manifest's order, of
+;; the dependency's hash, two spaces and its name; written sha256:hex. A url dependency's hash is the one its manifest
+;; pins.
 (require-unqualified sha256 std/crypto/sha256)
 (require-unqualified fs host/fs)
 (require-unqualified manifest "manifest.sub")
+(require-unqualified files "files.sub")
 (require-unqualified paths "path.sub")
 
-(provide package-hash package-file?)
+(provide package-hash)
 
 (struct waiting [name string] [dir string] [next (ptr waiting)])
 
@@ -17,8 +19,8 @@
     ok))
 
 (define (hash! [a (ptr arena)] [given string] [w (ptr waiting)] [into (ptr buffer)] [err (ptr buffer)]) -> bool
-  (let ([dir string] [why string] [o w] [m manifest] [listed #f] [paths (make-buffer)] [lines (make-buffer)]
-        [digest (array u8 32)] [ok #t] [me (cast (ptr waiting) (arena-alloc a (sizeof waiting)))])
+  (let ([dir string] [why string] [o w] [m manifest] [paths (make-buffer)] [exports (make-buffer)] [lines (make-buffer)]
+        [digest (array u8 32)] [ok #t] [me (cast (ptr waiting) (arena-alloc a (sizeof waiting)))] [own "package.sub"])
     (when (< (fs-real-path given (& dir) (& why)) 0) (return (cannot! err why)))
     (while (and (!= o 0) (!= (-> o dir) dir)) (set! o (-> o next)))
     (when (!= o 0)
@@ -27,15 +29,15 @@
       (buffer-add-string! err " depends on itself")
       (free (-> dir bytes))
       (return #f))
-    (set! listed (holds-package? dir))
-    (when listed
-      (let ([file (joined-path dir "package.sub")])
-        (set! ok (manifest-read a file (& m) err))
-        (free (-> file bytes))))
-    (set! (-> me name) (if (and ok listed) (-> m name) ""))
+    (let ([file (joined-path dir "package.sub")])
+      (set! ok (manifest-read a file (& m) err))
+      (free (-> file bytes)))
+    (set! (-> me name) (if ok (-> m name) ""))
     (set! (-> me dir) dir)
     (set! (-> me next) w)
-    (when ok (set! ok (files! dir "" (& paths) err)))
+    (when ok
+      (buffer-add! (& paths) (slice (cast (ptr u8) (& own)) (sizeof string)))
+      (set! ok (package-files a dir (& m) (& paths) (& exports) err)))
     (let ([n (/ (-> paths length) (sizeof string))] [ps (cast (ptr string) (-> paths bytes))])
       (when ok
         (sorted! ps n)
@@ -50,9 +52,8 @@
                   (buffer-add-string! (& lines) (@ ps i))
                   (buffer-add-byte! (& lines) 10)
                   (free (-> bytes items))))
-            (free (-> full bytes)))))
-      (for ([i u32 0]) (< i n) (+= i 1) (free (-> (@ ps i) bytes))))
-    (when (and ok listed)
+            (free (-> full bytes))))))
+    (when ok
       (let ([deps (-> m dependencies)])
         (for ([i u32 0]) (and ok (< i (-> deps length))) (+= i 1)
           (let* ([d (& (@ deps i))] [path (-> d path)]
@@ -70,6 +71,7 @@
       (buffer-add-string! into "sha256:")
       (add-hex! into (slice digest)))
     (buffer-free! (& paths))
+    (buffer-free! (& exports))
     (buffer-free! (& lines))
     (free (-> dir bytes))
     ok))
@@ -84,52 +86,6 @@
   (for ([i u32 0]) (< i (-> bytes length)) (+= i 1)
     (buffer-add-byte! b (cast i32 (@ "0123456789abcdef" (>> (@ bytes i) 4))))
     (buffer-add-byte! b (cast i32 (@ "0123456789abcdef" (bit-and (@ bytes i) 15))))))
-
-(define (files! [dir string] [path string] [into (ptr buffer)] [err (ptr buffer)]) -> bool
-  (let ([here (if (== (-> path length) 0) (string-copy dir) (joined-path dir path))] [names (slice string)] [why string]
-        [ok #t])
-    (when (< (fs-list here (& names) (& why)) 0)
-      (cannot! err why)
-      (free (-> here bytes))
-      (return #f))
-    (for ([i u32 0]) (and ok (< i (-> names length))) (+= i 1)
-      (let* ([name (@ names i)] [rel (if (== (-> path length) 0) (string-copy name) (joined-path path name))]
-             [full (joined-path dir rel)] [info fs-info] [kept #f])
-        (cond [(not (named-in? name (== (-> path length) 0))) (begin)]
-              [(< (fs-lstat full (& info) (& why)) 0) (set! ok (cannot! err why))]
-              [(not (kept? (-> info kind) full)) (begin)]
-              [(== (-> info kind) fs-file)
-               (buffer-add! into (slice (cast (ptr u8) (& rel)) (sizeof string)))
-               (set! kept #t)]
-              [else (set! ok (files! dir rel into err))])
-        (unless kept (free (-> rel bytes)))
-        (free (-> full bytes))))
-    (free (-> names items))
-    (free (-> here bytes))
-    ok))
-
-;; A package's files leave out dot-files, build/ at its top, links, and the directories of packages inside it.
-(define (named-in? [name string] [top bool]) -> bool (not (or (== (@ name 0) #\.) (and top (== name "build")))))
-
-(define (kept? [kind i32] [full string]) -> bool
-  (or (== kind fs-file) (and (== kind fs-directory) (not (holds-package? full)))))
-
-(define (package-file? [dir string] [path string]) -> bool
-  (let ([start u32 0] [ok #t] [info fs-info])
-    (for ([i u32 0]) (and ok (<= i (-> path length))) (+= i 1)
-      (when (or (== i (-> path length)) (== (@ path i) #\/))
-        (let ([full (joined-path dir (slice path 0 i))] [last (== i (-> path length))])
-          (set! ok (and (> i start) (named-in? (slice path start i) (== start 0)) (== (fs-lstat full (& info) 0) 0)
-                        (kept? (-> info kind) full) (== (== (-> info kind) fs-file) last)))
-          (free (-> full bytes)))
-        (set! start (+ i 1))))
-    ok))
-
-(define (holds-package? [dir string]) -> bool
-  (let ([p (joined-path dir "package.sub")] [info fs-info] [found #f])
-    (set! found (and (== (fs-lstat p (& info) 0) 0) (== (-> info kind) fs-file)))
-    (free (-> p bytes))
-    found))
 
 (define (sorted! [ps (ptr string)] [n u32])
   (for ([i u32 1]) (< i n) (+= i 1)

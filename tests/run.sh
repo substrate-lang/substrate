@@ -209,7 +209,7 @@ else
   fail=$((fail + 1))
   echo "FAIL a package built from two directories: the programs differ"
 fi
-# An edit compiles again only the module edited and those that require it.
+# An edit compiles again only the module edited and those that require it, and its entry replaces the old one.
 edited="$builds/edited"
 rm -rf "${edited:?}"
 mkdir -p "$edited"
@@ -218,15 +218,38 @@ printf '(require b "b.sub")\n(provide a)\n(define (a) -> i32 (b:b))\n' > "$edite
 printf '(provide c)\n(define (c) -> i32 3)\n' > "$edited/c.sub"
 printf '(require a "a.sub")\n(require c "c.sub")\n(define (main) (printf "~a~n" (+ (a:a) (c:c))))\n' > "$edited/main.sub"
 bin/sub build "$edited/main.sub" -o "$edited/built" -c "$edited/cache" > /dev/null 2>&1
+entries="$(find "$edited/cache" -name '*.subc' | wc -l)"
 touch "$edited/marker"
 printf '(provide b)\n(define (b) -> i32 2)\n' > "$edited/b.sub"
 total="$(bin/sub build "$edited/main.sub" -o "$edited/built" -c "$edited/cache" 2>&1 && "$host" "$root/$edited/built" 2>&1)"
 compiled="$(find "$edited/cache" -name '*.subc' -newer "$edited/marker" | wc -l)"
-if [ "$total" = 5 ] && [ "$compiled" = 3 ]; then
+if [ "$total" = 5 ] && [ "$compiled" = 3 ] && [ "$(find "$edited/cache" -name '*.subc' | wc -l)" = "$entries" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL an edit: got $total, with $compiled modules compiled again, not 3"
+  echo "FAIL an edit: got $total, with $compiled modules compiled again, not 3, or more entries than $entries"
+fi
+# Builds of a module from two directories share its cache entry, and builds of it requiring different modules are each
+# right, whichever comes first.
+twins="$builds/twins"
+rm -rf "${twins:?}"
+mkdir -p "$twins/one" "$twins/two"
+printf '(require d "dep.sub")\n(provide m)\n(define (m) -> i32 (d:d))\n' > "$twins/one/m.sub"
+printf '(require m "m.sub")\n(define (main) (printf "~a~n" (m:m)))\n' > "$twins/one/main.sub"
+cp "$twins/one/m.sub" "$twins/one/main.sub" "$twins/two/"
+printf '(provide d)\n(define (d) -> i32 1)\n' > "$twins/one/dep.sub"
+printf '(provide d)\n(define (d) -> i32 2)\n' > "$twins/two/dep.sub"
+cp -r "$twins/one" "$twins/three"
+twin() { bin/sub build "$twins/$1/main.sub" -o "$twins/$1/built" -c "$twins/cache" > /dev/null 2>&1 && "$host" "$root/$twins/$1/built" 2>&1; }
+order="$(twin one) $(twin two) $(twin one)"
+touch "$twins/marker"
+copied="$(twin three)"
+reused="$(find "$twins/cache" -name '*.subc' -newer "$twins/marker" | wc -l)"
+if [ "$order" = "1 2 1" ] && [ "$copied" = 1 ] && [ "$reused" = 0 ] && [ "$(twin two)" = 2 ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a cache two directories share: got $order and $copied, with $reused modules compiled again, not 0"
 fi
 # sub builds a program into build/ of its package, or of its directory outside packages, and runs it as the host does,
 # with the host's stack, its arguments and its exit code.
@@ -244,24 +267,77 @@ else
   fail=$((fail + 1))
   echo "FAIL sub run: got $counted and exit $code, or a program not in build/"
 fi
-# A package builds only from the files its hash covers: not from its build/, nor through a link.
-own="$builds/own"
-rm -rf "${own:?}"
-mkdir -p "$own/p/build"
-printf '(package p (version "0.1.0"))\n' > "$own/p/package.sub"
-printf '(provide y)\n(define (y) -> i32 1)\n' > "$own/p/build/y.sub"
-printf '(provide z)\n(define (z) -> i32 1)\n' > "$own/z.sub"
-ln -s ../z.sub "$own/p/z.sub"
-printf '(require y "build/y.sub")\n(define (main) (printf "~a~n" (y:y)))\n' > "$own/p/built.sub"
-printf '(require z "z.sub")\n(define (main) (printf "~a~n" (z:z)))\n' > "$own/p/linked.sub"
-from_build="$(bin/sub build "$own/p/built.sub" -c "$cache" 2>&1)"
-from_link="$(bin/sub build "$own/p/linked.sub" -c "$cache" 2>&1)"
-if [[ "$from_build" == *'"build/y.sub" is not one of the files of p'* ]] &&
-   [[ "$from_link" == *'"z.sub" is not one of the files of p'* ]]; then
+# A package's hash covers its files and nothing else: not a README, build output, tests or a module nothing requires.
+walked="$builds/walked"
+rm -rf "${walked:?}"
+cp -r tests/packages/walked "$walked"
+before="$(bin/sub hash "$walked" 2>&1)"
+mkdir -p "$walked/dist" "$walked/tests"
+printf 'notes\n' > "$walked/README"
+printf 'built\n' > "$walked/dist/program"
+printf '(provide u)\n\n(define (u) -> i32 6)\n' > "$walked/unused.sub"
+printf '(require w walked)\n(define (main) (printf "~a~n" (w:w)))\n' > "$walked/tests/use.sub"
+after="$(bin/sub hash "$walked" 2>&1)"
+printf '(provide d)\n\n(define (d) -> i32 7)\n' > "$walked/lib/deep/deep.sub"
+deeper="$(bin/sub hash "$walked" 2>&1)"
+used="$(bin/sub build "$walked/tests/use.sub" -o "$walked/use" -c "$cache" 2>&1 && "$host" "$root/$walked/use" 2>&1)"
+if [[ "$before" == sha256:* ]] && [ "$after" = "$before" ] && [ "$deeper" != "$before" ] && [ "$used" = 8 ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL a package's own files: got $from_build and $from_link"
+  echo "FAIL a package's hash and its files: got $before, $after, $deeper and $used"
+fi
+# A module among a package's files requires only its files, in any build: a test of the package may require any file
+# in its directory, but not a module of the package whose macro requires another.
+held="$builds/held"
+rm -rf "${held:?}"
+mkdir -p "$held/q/tests"
+printf '(package q (version "0.1.0"))\n' > "$held/q/package.sub"
+cat > "$held/q/pull.sub" <<'EOF'
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+  (define (pull [stx datum]) -> datum #'(require h "hidden.sub")))
+(define-syntax pull pull)
+(provide pull)
+EOF
+printf '(provide h)\n(define (h) -> i32 1)\n' > "$held/q/hidden.sub"
+printf '(require p "pull.sub")\n(p:pull)\n(provide v)\n(define (v) -> i32 2)\n' > "$held/q/q.sub"
+printf '(require h "../hidden.sub")\n(define (main) (printf "~a~n" (h:h)))\n' > "$held/q/tests/private.sub"
+printf '(require q "../q.sub")\n(define (main) (printf "~a~n" (q:v)))\n' > "$held/q/tests/public.sub"
+private="$(bin/sub build "$held/q/tests/private.sub" -o "$held/private" -c "$cache" 2>&1 && "$host" "$root/$held/private" 2>&1)"
+public="$(bin/sub build "$held/q/tests/public.sub" -o "$held/public" -c "$cache" 2>&1)"
+if [ "$private" = 1 ] && [[ "$public" == *'"hidden.sub" is not one of the files of q'* ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a package's files in a test's build: got $private and $public"
+fi
+# Another package requires only a package's exports: not a module an export loads, nor one no longer exported when the
+# requiring module comes from the cache, nor one a macro of the package requires into the other package's module.
+shared="$builds/shared"
+rm -rf "${shared:?}"
+mkdir -p "$shared/r" "$shared/c" "$shared/l" "$shared/u"
+printf '(package r (version "0.1.0") (exports a b))\n' > "$shared/r/package.sub"
+printf '(require b "b.sub")\n(provide a)\n(define (a) -> i32 (+ 1 (b:b)))\n' > "$shared/r/a.sub"
+printf '(provide b)\n(define (b) -> i32 1)\n' > "$shared/r/b.sub"
+printf '(package c (version "0.1.0") (dependencies (r (path "../r"))))\n' > "$shared/c/package.sub"
+printf '(require a r/a)\n(require b r/b)\n(define (main) (printf "~a~n" (+ (a:a) (b:b))))\n' > "$shared/c/both.sub"
+both="$(bin/sub build "$shared/c/both.sub" -o "$shared/both" -c "$cache" 2>&1 && "$host" "$root/$shared/both" 2>&1)"
+printf '(package r (version "0.1.0") (exports a))\n' > "$shared/r/package.sub"
+narrowed="$(bin/sub build "$shared/c/both.sub" -o "$shared/both" -c "$cache" 2>&1)"
+printf '(package l (version "0.1.0") (exports pull))\n' > "$shared/l/package.sub"
+cp "$held/q/pull.sub" "$held/q/hidden.sub" "$shared/l/"
+printf '(package u (version "0.1.0") (dependencies (l (path "../l"))))\n' > "$shared/u/package.sub"
+printf '(require p l/pull)\n(p:pull)\n(define (main) (printf "~a~n" 1))\n' > "$shared/u/use.sub"
+pulled="$(bin/sub build "$shared/u/use.sub" -o "$shared/use" -c "$cache" 2>&1)"
+printf '(package l (version "0.1.0") (exports pull hidden))\n' > "$shared/l/package.sub"
+exported="$(bin/sub build "$shared/u/use.sub" -o "$shared/use" -c "$cache" 2>&1 && "$host" "$root/$shared/use" 2>&1)"
+if [ "$both" = 3 ] && [[ "$narrowed" == *'r/b is not one of the modules r exports'* ]] &&
+   [[ "$pulled" == *'"hidden.sub" is not one of the modules l exports'* ]] && [ "$exported" = 1 ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a package's exports: got $both, $narrowed, $pulled and $exported"
 fi
 # A C module that does not export __wasm_call_ctors, which runs its constructors, is refused.
 unexported="$builds/unexported"
