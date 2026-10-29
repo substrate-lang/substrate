@@ -15,10 +15,10 @@ compiler is written in it, builds itself, and runs in a browser.
   a C side module a module of the program. The compiler builds a program
   from one file and the label of its root, with a module map of roots,
   each a label and a directory, and the names each root uses; it knows
-  host, compiler and std itself, whose compile-time code runs in its own
-  memory. A map's root's compile-time code runs in a memory of its own,
-  unless the map gives the root `(compiler-memory)`: `world.sub` runs the
-  root's macros there, and `copier.sub` copies what they take and give. A
+  host, compiler and std itself, whose compile-time code runs in the
+  compiler's memory. Another root's runs in a memory of its own, unless
+  the map gives the root `(compiler-memory)`: `world.sub` runs the root's
+  macros there, and `copier.sub` copies what they take and give. A
   command may also give it a check for each module it reads.
 - `std/`: the standard library, written in Substrate. `languages/` holds
   the languages built on it, `scheme/`, a Scheme, and `bend/`, a
