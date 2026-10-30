@@ -246,7 +246,7 @@ else
   fail=$((fail + 1))
   echo "FAIL sub run: got $counted and exit $code, or a program not in build/"
 fi
-# A package's hash covers every file in its directory but build/.
+# A package's hash covers every file in its directory except those in build/.
 walked="$builds/walked"
 rm -rf "${walked:?}"
 cp -r tests/packages/walked "$walked"
@@ -265,7 +265,8 @@ else
   fail=$((fail + 1))
   echo "FAIL a package's hash and its files: got $before, $tested, $used, $after_build and $noted"
 fi
-# A package in a git repository is the files git tracks: index versions 2 to 4, SHA-1 and SHA-256, worktrees.
+# In a git repository, a package's hash covers only the files git tracks: with index versions 2 to 4, in SHA-1 and
+# SHA-256 repositories, and in a worktree.
 gitted="$root/$builds/gitted"
 rm -rf "${gitted:?}"
 in_git() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@" > /dev/null 2>&1; }
@@ -298,7 +299,7 @@ else
   fail=$((fail + 1))
   echo "FAIL packages in git: got $committed, $untracked, $intended, $four, $other, $sha and $copied"
 fi
-# A package's modules and tests require any file in its directory, also through a macro.
+# A package's modules and tests may require any file in its directory, even through a macro.
 held="$builds/held"
 rm -rf "${held:?}"
 mkdir -p "$held/q/tests"
@@ -322,7 +323,7 @@ else
   fail=$((fail + 1))
   echo "FAIL a package's files in a test's build: got $private and $public"
 fi
-# Nothing in a package is required through a link; its hash leaves links out.
+# A require through a link in a package is refused, and the package's hash leaves links out.
 linked="$builds/linked"
 rm -rf "${linked:?}"
 mkdir -p "$linked/p/tests" "$linked/elsewhere"
@@ -400,7 +401,8 @@ else
   fail=$((fail + 1))
   echo "FAIL sub hash and map: got $hashed and $mapped"
 fi
-# A package needing a newer substrate is refused; sub version prints this one's, with substrate/'s hash.
+# A package that needs a newer substrate is refused. sub version prints this substrate's version and the hash of
+# substrate/.
 newer="$builds/newer"
 rm -rf "${newer:?}"
 mkdir -p "$newer"
@@ -416,7 +418,7 @@ else
   fail=$((fail + 1))
   echo "FAIL a newer substrate, and sub version: got $refused and $version"
 fi
-# sub doc: a package's modules as text and HTML, a module by name, and the toolchain's.
+# sub doc writes a package's documentation as text and as HTML, prints a module by name, and documents the toolchain.
 documented="$builds/documented"
 rm -rf "${documented:?}"
 bin/sub doc -o "$documented/text" tests/doc/sample > /dev/null 2>&1
@@ -445,7 +447,8 @@ else
   fail=$((fail + 1))
   echo "FAIL sub doc of the toolchain: exit $whole"
 fi
-# sub doc with no arguments writes the current package's and its map's documentation as HTML into its build/doc.
+# sub doc with no arguments writes the documentation of the current package and the packages in its module map into the
+# package's build/doc.
 packaged="$builds/packaged"
 rm -rf "${packaged:?}"
 mkdir -p "$packaged/loose"
@@ -520,7 +523,7 @@ for t in tests/fetch/*.sub; do
     echo "$actual" | head -10
   fi
 done
-# A store entry holds the files its hash covers, and a package's archive hashes as its checkout does.
+# A store entry holds the files its hash covers, and a package's archive and its git checkout have the same hash.
 json_entry="$(find tests/fetch/build/app -name json.sub -printf '%h\n' | head -1)"
 nest_entry="$(find tests/fetch/build/nested -name nest.sub -printf '%h\n' | head -1)"
 json_files="$(cd "$json_entry" && find . -type f | LC_ALL=C sort | tr '\n' ' ')"
