@@ -15,8 +15,8 @@ seed:
 
 repl:
 	bin/sub site -c build/cache $(OUT)/web/repl std/web/repl/repl.sub -p std/web/repl/page.html \
-	  -f files $(addprefix compiler/,macros.sub substrate.sub syntax.sub wasm.sub writer.sub) \
-	  $(shell find host std/languages/scheme std/languages/bend -name '*.sub' | sort) std/languages/nodes.sub std/encoding/utf8.sub
+	  -f files $(addprefix substrate/compiler/,macros.sub substrate.sub syntax.sub wasm.sub writer.sub) \
+	  $(shell find substrate/host std/languages/scheme std/languages/bend -name '*.sub' | sort) std/languages/nodes.sub std/encoding/utf8.sub
 
 docs:
 	rm -rf docs

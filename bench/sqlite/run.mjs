@@ -19,8 +19,8 @@ const run = (command, args) => {
 };
 
 const programs = {
-  ours: (db) => run(process.execPath, [...process.execArgv, `${root}/host/subhost.mjs`, `-R=${out}`, `-W=${out}`,
-    `${out}/ours`, script, db]),
+  ours: (db) => run(process.execPath, [...process.execArgv, `${root}/substrate/host/subhost.mjs`, `-R=${out}`,
+    `-W=${out}`, `${out}/ours`, script, db]),
   native: (db) => run(`${out}/native`, [script, db]),
 };
 

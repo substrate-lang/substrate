@@ -19,7 +19,8 @@ const run = (command, args) => {
   return p.stdout;
 };
 
-const ours = lines(run(process.execPath, [...process.execArgv, `${root}/host/subhost.mjs`, `${out}/ours`, reps]));
+const ours = lines(run(process.execPath, [...process.execArgv, `${root}/substrate/host/subhost.mjs`, `${out}/ours`,
+  reps]));
 const native = lines(run(`${out}/mbedtls.native`, [reps]));
 const wasi = new WASI({
   version: 'preview1', args: ['mbedtls', reps], stdout: fs.openSync(`${out}/mbedtls-wasm.txt`, 'w'),

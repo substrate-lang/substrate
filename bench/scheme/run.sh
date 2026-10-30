@@ -13,7 +13,7 @@ for name in "${names[@]}"; do
   (cd "$here" && "$root/bin/sub" build "$name.sub" -o "$out/$name" -c "$root/build/bench/cache" > /dev/null)
 done
 
-node=(node --stack-size=4000 --experimental-wasm-exnref --no-liftoff "$root/host/subhost.mjs")
+node=(node --stack-size=4000 --experimental-wasm-exnref --no-liftoff "$root/substrate/host/subhost.mjs")
 declare -A best result
 run() { # name
   local start=$EPOCHREALTIME line end us

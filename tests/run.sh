@@ -4,7 +4,7 @@ set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-host="$root/host/subhost.mjs"
+host="$root/substrate/host/subhost.mjs"
 builds="${OUT:-build}/tests"
 rm -rf "${builds:?}"
 mkdir -p "$builds"
@@ -84,9 +84,10 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
-# Each module in cmd, std, packages, bench, host, tests/web and tests/proxy builds, except the pieces in bench/bend/compile.
-mapfile -t modules < <(find cmd std packages bench host tests/web tests/proxy -name '*.sub' -not -name package.sub \
-                         -not -path 'bench/bend/compile/*' | sort)
+# Each module in cmd, std, packages, bench, substrate/host, tests/web and tests/proxy builds, except the pieces in
+# bench/bend/compile.
+mapfile -t modules < <(find cmd std packages bench substrate/host tests/web tests/proxy -name '*.sub' \
+                         -not -name package.sub -not -path 'bench/bend/compile/*' | sort)
 for m in "${modules[@]}"; do
   actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
@@ -396,24 +397,24 @@ fi
 # A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
 rm -rf "${changed:?}"
-mkdir -p "$changed/tests/substrate"
-cp -r compiler "$changed/"
-mkdir -p "$changed/host"
-cp host/fs.sub "$changed/host/"
+mkdir -p "$changed/tests/substrate" "$changed/substrate/host"
+cp -r substrate/compiler "$changed/substrate/"
+cp substrate/host/fs.sub "$changed/substrate/host/"
 cp tests/substrate/forms.sub "$changed/tests/substrate/"
 from_changed() {
-  "$host" -R -W "$root/build/compiler" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
+  "$host" -R -W "$root/build/compiler" "$root/$changed/substrate" build tests/substrate/forms.sub -o "$root/$changed/out" \
     -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
 }
-echo ';; changed' >> "$changed/compiler/substrate.sub"
-sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' "$changed/compiler/syntax.sub"
+echo ';; changed' >> "$changed/substrate/compiler/substrate.sub"
+sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' \
+  "$changed/substrate/compiler/syntax.sub"
 if [ "$(from_changed)" = "$(cat tests/substrate/forms.out)" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
   echo "FAIL changed sources: tests/substrate/forms.sub does not build and run as it does here"
 fi
-sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/compiler/syntax.sub"
+sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/substrate/compiler/syntax.sub"
 if grep -qF "whose srcloc differs" <<< "$(from_changed)"; then
   pass=$((pass + 1))
 else
