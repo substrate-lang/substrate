@@ -1,8 +1,8 @@
 ;; The module map the compiler takes for a program in a package: a root for the package and for each package its
-;; dependencies reach, with the names each uses, and each package's exports and files for sub's module check and the
-;; substrate it needs; and std, a name every module has, the std a package depends on or else the package at std. A
-;; pinned dependency's hash is checked, and two packages with one name, and a package that depends on itself, are
-;; refused.
+;; dependencies reach, with the names each uses and its rules, its exports and files or its one file and the packages
+;; inside its directory, which the compiler enforces; and std, a name every module has, the std a package depends on or
+;; else the package at std. Each package's root also gives the substrate it needs. A pinned dependency's hash is
+;; checked, and two packages with one name, and a package that depends on itself, are refused.
 (require-unqualified manifest "manifest.sub")
 (require-unqualified hash "hash.sub")
 (require-unqualified files "files.sub")
@@ -10,12 +10,12 @@
 (require-unqualified paths "path.sub")
 (require-unqualified stores "store.sub")
 
-(provide package-map package-root package-root-files!)
+(provide package-map package-root)
 
 (struct seen [name string] [dir string] [open bool] [next (ptr seen)])
 
 (struct package-root [name string] [dir string] [file string] [substrate string] [exports (slice string)]
-                     [files (slice string)] [walked bool])
+                     [files (slice string)])
 
 (define (package-map [a (ptr arena)] [dir string] [file string] [m (ptr manifest)] [std string] [store string]
                      [into (ptr buffer)] [roots (ptr buffer)] [err (ptr buffer)]) -> bool
@@ -52,8 +52,7 @@
     (set! (-> r substrate) (-> m substrate))
     (set! (-> r exports) (slice (cast (ptr string) 0) 0))
     (set! (-> r files) (slice (cast (ptr string) 0) 0))
-    (set! (-> r walked) (> (-> file length) 0))
-    (unless (or (> (-> file length) 0) (exports-of! a dir m (& r) err)) (return #f))
+    (unless (or (> (-> file length) 0) (files-of! a dir m (& r) err)) (return #f))
     (buffer-add! roots (slice (cast (ptr u8) (& r)) (sizeof package-root)))
     (buffer-add-string! into "(root ")
     (buffer-add-string! into (-> m name))
@@ -92,7 +91,10 @@
         (buffer-add-byte! into 32)
         (buffer-add-string! into (-> (@ ms i) name))
         (buffer-add-byte! into #\))))
-    (buffer-add-string! into "))\n")
+    (buffer-add-byte! into #\))
+    (rules! into (& r))
+    (unless (> (-> file length) 0) (nested! a into dir))
+    (buffer-add-string! into ")\n")
     (for ([i u32 0]) (< i n) (+= i 1)
       (set! other (@ visited))
       (while (and (!= other 0) (!= (-> other name) (-> (@ ms i) name))) (set! other (-> other next)))
@@ -128,25 +130,13 @@
     (buffer-free! (& h))
     ok))
 
-(define (exports-of! [a (ptr arena)] [dir string] [m (ptr manifest)] [r (ptr package-root)] [err (ptr buffer)]) -> bool
-  (let ([es (make-buffer)] [ok #f])
-    (set! ok (package-exports a dir m (& es) err))
+(define (files-of! [a (ptr arena)] [dir string] [m (ptr manifest)] [r (ptr package-root)] [err (ptr buffer)]) -> bool
+  (let ([fs (make-buffer)] [es (make-buffer)] [ok #f])
+    (set! ok (package-files a dir m (& fs) (& es) err))
+    (set! (-> r files) (under a dir (& fs)))
     (set! (-> r exports) (under a dir (& es)))
-    (buffer-free! (& es))
-    ok))
-
-;; package-root-files! gives a package its files, walked from its exports the first time they are wanted.
-(define (package-root-files! [a (ptr arena)] [r (ptr package-root)] [err (ptr buffer)]) -> bool
-  (let ([starts (make-buffer)] [fs (make-buffer)] [ok #t])
-    (unless (-> r walked)
-      (for ([i u32 0]) (< i (-> r exports length)) (+= i 1)
-        (let ([p (slice (@ (-> r exports) i) (+ (-> r dir length) 1))])
-          (buffer-add! (& starts) (slice (cast (ptr u8) (& p)) (sizeof string)))))
-      (set! ok (files-from a (-> r dir) (-> r name) (& starts) (& fs) err))
-      (set! (-> r files) (under a (-> r dir) (& fs)))
-      (set! (-> r walked) ok))
-    (buffer-free! (& starts))
     (buffer-free! (& fs))
+    (buffer-free! (& es))
     ok))
 
 (define (under [a (ptr arena)] [dir string] [b (ptr buffer)]) -> (slice string)
@@ -157,6 +147,50 @@
         (set! (@ out i) (normal-path a full))
         (free (-> full bytes))))
     (slice out n)))
+
+(define (rules! [b (ptr buffer)] [r (ptr package-root)])
+  (if (> (-> r file length) 0)
+      (begin
+        (buffer-add-string! b " (file ")
+        (add-quoted! b (-> r file))
+        (buffer-add-byte! b #\)))
+      (begin
+        (paths! b " (exports" (-> r dir) (-> r exports))
+        (paths! b " (files" (-> r dir) (-> r files)))))
+
+;; nested! writes the packages inside a package's directory, outside build/, by name and path.
+(define (nested! [a (ptr arena)] [b (ptr buffer)] [dir string])
+  (let ([found (make-buffer)])
+    (packages-under! a dir "" (& found))
+    (when (> (-> found length) 0)
+      (buffer-add-string! b " (packages")
+      (buffer-add! b (buffer-bytes (& found)))
+      (buffer-add-byte! b #\)))
+    (buffer-free! (& found))))
+
+(define (packages-under! [a (ptr arena)] [dir string] [rel string] [out (ptr buffer)])
+  (let ([here (if (== (-> rel length) 0) dir (joined-path dir rel))] [names (slice string)] [why string])
+    (when (< (fs-list here (& names) (& why)) 0) (return))
+    (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+      (let* ([n (@ names i)] [r (if (== (-> rel length) 0) n (joined-path rel n))] [full (joined-path dir r)]
+             [own (joined-path full "package.sub")] [info fs-info] [m manifest] [err (make-buffer)])
+        (when (and (!= n "build") (== (fs-lstat full (& info) 0) 0) (== (-> info kind) fs-directory))
+          (if (and (== (fs-stat own (& info) 0) 0) (== (-> info kind) fs-file))
+              (begin
+                (buffer-add-string! out " (")
+                (buffer-add-string! out (if (manifest-read a own (& m) (& err)) (-> m name) n))
+                (buffer-add-byte! out 32)
+                (add-quoted! out r)
+                (buffer-add-byte! out #\)))
+              (packages-under! a dir r out)))
+        (buffer-free! (& err))))))
+
+(define (paths! [b (ptr buffer)] [head string] [dir string] [ps (slice string)])
+  (buffer-add-string! b head)
+  (for ([i u32 0]) (< i (-> ps length)) (+= i 1)
+    (buffer-add-byte! b 32)
+    (add-quoted! b (slice (@ ps i) (+ (-> dir length) 1))))
+  (buffer-add-byte! b #\)))
 
 (define (add-quoted! [b (ptr buffer)] [s string])
   (buffer-add-byte! b #\")

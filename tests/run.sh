@@ -357,7 +357,7 @@ fi
 hashed="$(bin/sub hash tests/packages/maps/lib 2>&1)"
 mapped="$(bin/sub map tests/packages/names.sub 2>&1)"
 if [ "$hashed" = "$(grep -o 'sha256:[0-9a-f]\{64\}' tests/packages/package-library.out | head -1)" ] &&
-   [[ "$mapped" == *'(root names "'*'(uses (tools tools) (app app)))'* ]]; then
+   [[ "$mapped" == *'(root names "'*'(uses (tools tools) (app app)) (file "names.sub"))'* ]]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
