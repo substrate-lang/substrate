@@ -13,8 +13,8 @@ bin/sub expand build/empty.sub > /dev/null
 
 site="$sites/session"
 bin/sub site "$site" build/compiler -p tests/web/session.html \
-  -f files $(find compiler host std/languages/scheme std/languages/bend tests/session -name '*.sub' | sort) std/languages/nodes.sub \
-  std/encoding/utf8.sub
+  -f files $(find substrate/compiler substrate/host std/languages/scheme std/languages/bend tests/session -name '*.sub' | sort) \
+  std/languages/nodes.sub std/encoding/utf8.sub tests/web/session.map
 status=0
 node tests/web/session.mjs "$site" funcs scheme substrate switch bend || status=1
 
