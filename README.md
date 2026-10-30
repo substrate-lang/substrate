@@ -52,7 +52,7 @@ In the dev shell (`nix develop`):
     bin/sub doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM
     bin/sub doc -o DIR PACKAGE ...         # packages' documentation as text, or with --html as HTML, into DIR
     bin/sub version                        # substrate's version, and the hash of its files
-    make check                             # the tests
+    make check                             # the tests, then make docs when they pass
     tests/web/run.sh                       # the browser tests
     make bootstrap                         # the compiler builds itself into the same bytes
     make seed                              # and becomes the seed, with sub

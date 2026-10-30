@@ -6,6 +6,7 @@ build/sub:
 
 check:
 	tests/run.sh
+	$(MAKE) docs
 
 bootstrap:
 	bin/bootstrap
