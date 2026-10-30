@@ -1,33 +1,33 @@
-;; Building a program: its package, module map and module check, the cache and the store, and the grants it narrows to.
+;; Building a program: finding its package, making its module map, placing the cache and the store, and running the
+;; compiler with the map and the build's grants.
 (require-unqualified macros compiler/macros)
-(require-unqualified ex compiler/expander)
-(require-unqualified main compiler/main)
+(require-unqualified rt compiler/roots)
 (require-unqualified fs host/fs)
 (require-unqualified env host/node/env)
+(require-unqualified events host/events)
 (require-unqualified process host/node/process)
 (require-unqualified manifest std/package/manifest)
 (require-unqualified map std/package/map)
-(require-unqualified files std/package/files)
 (require-unqualified paths std/package/path)
 (require-unqualified common cmd/sub/common)
 
-(provide prepare! program-found program-manifest program-dir program-package program-root find-package! module-map!
-         cache-dir store-dir located locations! cache! target! build! narrow! granted!)
+(provide prepare! program-found program-manifest program-dir program-package find-package! module-map! supported!
+         cache-dir store-dir located locations! cache! target! build! compile! grants every-grant granted!)
 
 (define (prepare! [file string]) -> string
-  (let* ([text (make-buffer)] [project (find-package! file)])
-    (module-map! (& text))
-    (when (> (-> text length) 0) (set-module-map-text! (string->datum (buffer-string (& text))) '"the module map"))
-    (set-module-check! checked)
+  (let ([project (find-package! file)])
+    (set! map-text (make-buffer))
+    (module-map! (& map-text))
+    (set-module-map-text! (string->datum (buffer-string (& map-text))) '"the module map")
     (joined-path project "build")))
+
+(define map-text buffer)
 
 (define program-found i32 0)
 (define program-manifest manifest)
 (define program-dir string)
 (define program-file string)
 (define program-package string)
-
-(define (program-root) -> datum (if (> (-> program-package length) 0) (string->datum program-package) 0))
 
 (define (find-package! [file string]) -> string
   (unless (== file found-for)
@@ -51,12 +51,26 @@
     (set! program-package (-> program-manifest name))
     program-dir))
 
+(define packages (slice package-root))
+
 (define (module-map! [text (ptr buffer)])
-  (let ([err (make-buffer)] [roots (make-buffer)])
-    (when (> program-found 0)
-      (unless (package-map (& a) program-dir program-file (& program-manifest) store-dir text (& roots) (& err))
-        (failed! (local (buffer-string (& err)))))
-      (set! packages (slice (cast (ptr package-root) (-> roots bytes)) (/ (-> roots length) (sizeof package-root)))))))
+  (let ([err (make-buffer)] [roots (make-buffer)] [std (std-dir)] [m manifest])
+    (unless (if (> program-found 0)
+                (package-map (& a) program-dir program-file (& program-manifest) std store-dir text (& roots) (& err))
+                (and (manifest-read (& a) (joined-path std "package.sub") (& m) (& err))
+                     (package-map (& a) std "" (& m) std store-dir text (& roots) (& err))))
+      (failed! (local (buffer-string (& err)))))
+    (set! packages (slice (cast (ptr package-root) (-> roots bytes)) (/ (-> roots length) (sizeof package-root))))
+    (supported! packages)))
+
+(define (supported! [roots (slice package-root)])
+  (let ([v (substrate-version)])
+    (for ([i u32 0]) (< i (-> roots length)) (+= i 1)
+      (let ([r (& (@ roots i))])
+        (when (version-before? v (-> r substrate))
+          (failed! (datum->string (format "the package ~a needs substrate ~a or newer, and this is ~a"
+                                          `(,(string->datum (-> r name)) ,(string->datum (-> r substrate))
+                                            ,(string->datum v))))))))))
 
 (define (toolchain-file? [file string]) -> bool (!= (toolchain-holding (string->datum file)) 0))
 
@@ -94,23 +108,70 @@
           [(and (env-get variable (& from-env) 0) (> (-> from-env length) 0)) (absolute from-env)]
           [else fallback])))
 
-(define (cache!)
-  (make-dir (string->datum cache-dir))
-  (set-cache-directory! (string->datum cache-dir)))
+(define (cache!) (made! cache-dir))
 
 (define (target! [full string] [out string]) -> string
   (let ([base (prepare! full)]) (if (> (-> out length) 0) (absolute out) (joined-path base (stem-of full)))))
 
-(define (build! [file string] [out string] [strip bool]) -> string
+(define (build! [file string] [out string] [strip bool] [next (fn (i32))])
   (let* ([full (absolute file)] [dir (target! full out)])
-    (narrow! full dir)
-    (write-program! (program-root) (string->datum full) (string->datum dir) strip)
-    dir))
+    (compile! "build" full dir (if strip (slice (array-of string "-s")) (slice (cast (ptr string) 0) 0)) (grants full dir)
+              next)))
+
+;; ---- the compiler ----
+
+(struct compiling [head event-head])
+
+(define compiler-run compiling)
+(define compiled-then (fn (i32)))
+(define map-file string)
+
+;; compile! runs the compiler's command on the file full, with the module map prepare! made and the given grants. When
+;; the compiler exits, it calls next with the exit code.
+(define (compile! [command string] [full string] [out string] [args (slice string)] [given (slice string)]
+                  [next (fn (i32))])
+  (let ([argv (make-buffer)] [o process-options] [why string] [id u32 0])
+    (when (< (fs-make-temp-file cache-dir "map-" ".map" (& map-file) (& why)) 0) (failed! why))
+    (when (< (fs-write-file map-file (buffer-bytes (& map-text)) (& why)) 0) (failed! why))
+    (for ([i u32 0]) (< i (-> given length)) (+= i 1) (argument! (& argv) (@ given i)))
+    (argument! (& argv) (joined-path root "build/compiler"))
+    (argument! (& argv) (substrate-dir))
+    (argument! (& argv) "-c")
+    (argument! (& argv) cache-dir)
+    (argument! (& argv) "-d")
+    (argument! (& argv) cwd)
+    (argument! (& argv) "-m")
+    (argument! (& argv) map-file)
+    (argument! (& argv) command)
+    (argument! (& argv) full)
+    (when (> (-> out length) 0)
+      (argument! (& argv) "-o")
+      (argument! (& argv) out))
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (argument! (& argv) (@ args i)))
+    (process-options-init! (& o))
+    (set! (-> o stdin) process-inherit)
+    (set! (-> o stdout) process-inherit)
+    (set! (-> o stderr) process-inherit)
+    (set! (-> compiler-run head handle) compiled)
+    (set! compiled-then next)
+    (set! id (process-spawn (joined-path (substrate-dir) "host/subhost.mjs")
+                            (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string))) (& o)
+                            (& compiler-run) (& why)))
+    (when (== id 0) (failed! why))))
+
+(define (argument! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+(define (compiled [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (== source process-source)
+    (fs-remove map-file #f 0)
+    (if (== kind process-exit) (compiled-then value) (failed! (events-take-text)))))
 
 ;; ---- grants ----
 
-(define (narrow! [full string] [out string])
-  (let ([r (make-buffer)] [w (make-buffer)] [why string] [dirs (root-directories)]
+;; grants gives the compiler's grants: reading the roots, the cache and out, and writing the cache and out. For a program
+;; outside packages, it may read any file.
+(define (grants [full string] [out string]) -> (slice string)
+  (let ([r (make-buffer)] [w (make-buffer)] [dirs (root-directories)]
         [flags (cast (ptr string) (arena-alloc (& a) (* 2 (sizeof string))))])
     (buffer-add-string! (& r) "-R")
     (when (or (> (-> program-package length) 0) (toolchain-file? full))
@@ -125,66 +186,16 @@
     (when (> (-> out length) 0) (granted! (& w) out))
     (set! (@ flags 0) (buffer-string (& r)))
     (set! (@ flags 1) (buffer-string (& w)))
-    (when (< (process-restrict (slice flags 2) (& why)) 0) (failed! why))))
+    (slice flags 2)))
 
-;; Lists in grant flags write a comma as ",," (host/grants.mjs).
+(define (every-grant) -> (slice string)
+  (let ([flags (cast (ptr string) (arena-alloc (& a) (sizeof string)))])
+    (set! (@ flags 0) "-A")
+    (slice flags 1)))
+
+;; In grant flags, a comma in a path is written ",," (substrate/host/grants.mjs).
 (define (granted! [b (ptr buffer)] [path string])
   (when (> (-> b length) 3) (buffer-add-byte! b #\,))
   (for ([i u32 0]) (< i (-> path length)) (+= i 1)
     (when (== (@ path i) #\,) (buffer-add-byte! b #\,))
     (buffer-add-byte! b (cast i32 (@ path i)))))
-
-;; ---- checking modules ----
-
-(define packages (slice package-root))
-
-(define (checked [from-label datum] [from-file datum] [label datum] [file datum] [subject datum]) -> datum
-  (let ([f (datum->string file)] [s (datum->string subject)] [p (package-named label)]
-        [from (package-named (if (== from-file 0) (program-root) from-label))])
-    (cond [(== label 0) (outside s f)]
-          [(== p 0) 0]
-          [(> (-> p file length) 0)
-           (let* ([one (joined-path (-> p dir) (-> p file))] [same (== f one)])
-             (free (-> one bytes))
-             (if same 0 (said s " is not part of " (-> p name) ", a package of one file")))]
-          [else (inside s f p from (if (== from-file 0) "" (datum->string from-file)))])))
-
-(define (package-named [label datum]) -> (ptr package-root)
-  (when (== label 0) (return 0))
-  (for ([i u32 0]) (< i (-> packages length)) (+= i 1)
-    (when (== (-> (@ packages i) name) (datum->string label)) (return (& (@ packages i)))))
-  0)
-
-(define (inside [subject string] [f string] [p (ptr package-root)] [from (ptr package-root)] [requirer string]) -> datum
-  (let ([holder (package-holding (& a) (parent-of f))])
-    (cond [(!= holder (-> p dir)) (elsewhere subject holder)]
-          [(linked? (-> p dir) (slice f (+ (-> p dir length) 1)))
-           (said subject " goes through a link in the package " (-> p name) ", which packages do not allow")]
-          [(!= from p) (if (one-of? (-> p exports) f) 0 (said subject " is not one of the modules " (-> p name) " exports"))]
-          [(and (one-of? (-> p files) requirer) (not (one-of? (-> p files) f)))
-           (said subject " is not one of the files of " (-> p name) ", its exports and what their source requires")]
-          [else 0])))
-
-(define (one-of? [ps (slice string)] [s string]) -> bool
-  (for ([i u32 0]) (< i (-> ps length)) (+= i 1) (when (== (@ ps i) s) (return #t)))
-  #f)
-
-(define (outside [subject string] [f string]) -> datum
-  (let ([holder (package-holding (& a) (parent-of f))]) (if (== (-> holder length) 0) 0 (elsewhere subject holder))))
-
-(define (elsewhere [subject string] [dir string]) -> datum
-  (let ([m manifest] [err (make-buffer)] [file (joined-path dir "package.sub")] [name (base-of dir)])
-    (when (manifest-read (& a) file (& m) (& err)) (set! name (-> m name)))
-    (free (-> file bytes))
-    (buffer-free! (& err))
-    (said subject " is in the package " name ", which is required by name")))
-
-(define (said [w string] [x string] [y string] [z string]) -> datum
-  (let ([out (make-buffer)] [s datum 0])
-    (buffer-add-string! (& out) w)
-    (buffer-add-string! (& out) x)
-    (buffer-add-string! (& out) y)
-    (buffer-add-string! (& out) z)
-    (set! s (string->datum (buffer-string (& out))))
-    (buffer-free! (& out))
-    s))

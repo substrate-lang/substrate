@@ -44,7 +44,7 @@ const ready = async (port) => {
 };
 
 const servers = {};
-const ours = spawn(`${root}/host/subhost.mjs`, ['-N=127.0.0.1', `-R=${www}`, `${out}/server`, www],
+const ours = spawn(`${root}/substrate/host/subhost.mjs`, ['-N=127.0.0.1', `-R=${www}`, `${out}/server`, www],
   { stdio: ['ignore', 'pipe', 'inherit'] });
 servers.ours = { process: ours, port: Number((await new Promise((resolve) => ours.stdout.once('data', resolve)))
   .toString().match(/:(\d+)\//)[1]) };

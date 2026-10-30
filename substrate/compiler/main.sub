@@ -1,0 +1,160 @@
+;; The compiler's command line, which builds the compiler and sub, cmd/sub/sub.sub: build, expand and eval.
+(require-unqualified macros "macros.sub")
+(require-unqualified ex "expander.sub")
+(require-unqualified rt "roots.sub")
+(require-unqualified fs host/fs)
+(require-unqualified prune "prune.sub")
+
+(provide print-expanded write-program! make-dir)
+
+(define (arguments) -> datum
+  (let ([given (host-args)] [args nil])
+    (for ([i u32 0]) (< i (-> given length)) (+= i 1) (set! args (cons (string->datum (@ given i)) args)))
+    (free (-> given items))
+    (reverse args)))
+
+(define (option [args datum] [flag datum]) -> datum
+  (let ([m (member flag args)]) (if (and (!= m 0) (pair? (cdr m))) (cadr m) '#f)))
+
+(define (without-option [args datum] [flag datum]) -> datum
+  (cond [(null? args) nil]
+        [(and (equal? (car args) flag) (pair? (cdr args))) (cddr args)]
+        [else (cons (car args) (without-option (cdr args) flag))]))
+
+(define (absolute? [path datum]) -> bool (let ([s (datum->string path)]) (and (> (-> s length) 0) (== (@ s 0) #\/))))
+
+(define (string-join [a datum] [b datum]) -> datum (format "~a~a" (cons a (cons b nil))))
+
+(define (usage)
+  (printf "usage: compiler ROOT [-c CACHE] [-d DIR] [-m MAP] build FILE [-o DIR] [-s] | expand FILE | eval FILE\n")
+  (host-exit 64))
+
+(define (strip-extension [path datum]) -> datum
+  (let* ([s (datum->string path)] [i (-> s length)])
+    (while (> i 0)
+      (-= i 1)
+      (when (== (@ s i) #\.) (return (string->datum (slice s 0 i))))
+      (when (== (@ s i) #\/) (return path)))
+    path))
+
+(define (write-file [path datum] [b (slice u8)])
+  (let ([why string])
+    (when (< (fs-write-file (datum->string path) b (& why)) 0)
+      (raise-compile-error 0 (format-message "cannot write ~a" (cons (host-error why) nil))))))
+
+(define (read-file [path datum]) -> datum
+  (let ([b (slice u8)] [why string] [s datum 0])
+    (when (< (fs-read-file (datum->string path) (& b) (& why)) 0)
+      (raise-compile-error 0 (format-message "cannot read ~a" (cons (host-error why) nil))))
+    (set! s (string->datum (cast string b)))
+    (free (-> b items))
+    s))
+
+(define (make-dir [path datum])
+  (let ([why string])
+    (when (< (fs-make-dir (datum->string path) (& why)) 0)
+      (raise-compile-error 0 (format-message "cannot make ~a" (cons (host-error why) nil))))))
+
+(define (joined [strings datum]) -> datum
+  (let ([b (make-buffer)] [s datum 0])
+    (while (pair? strings)
+      (buffer-add-string! (& b) (datum->string (car strings)))
+      (set! strings (cdr strings)))
+    (set! s (string->datum (buffer-string (& b))))
+    (buffer-free! (& b))
+    s))
+
+(const line-width u32 80)
+
+(define (layout [b (ptr buffer)] [x datum] [col u32])
+  (let* ([flat (make-buffer)] [prefix (abbreviation-of x)])
+    (write-to (& flat) x 0)
+    (cond [(or (<= (+ col (-> flat length)) line-width) (not (list? x)) (null? x))
+           (buffer-add! b (buffer-bytes (& flat)))]
+          [(!= (-> prefix length) 0)
+           (buffer-add-string! b prefix)
+           (layout b (cadr x) (+ col (-> prefix length)))]
+          [else
+           (let* ([head (car x)] [inline (and (symbol? head) (pair? (cdr x)))] [rest (if inline (cddr x) (cdr x))])
+             (buffer-add-byte! b 40)
+             (layout b head (+ col 1))
+             (when inline
+               (buffer-add-byte! b 32)
+               (layout b (cadr x) (+ col 2 (-> (symbol->string head) length))))
+             (while (pair? rest)
+               (buffer-add-byte! b 10)
+               (for ([i u32 0]) (< i (+ col 2)) (+= i 1) (buffer-add-byte! b 32))
+               (layout b (car rest) (+ col 2))
+               (set! rest (cdr rest)))
+             (buffer-add-byte! b 41))])
+    (buffer-free! (& flat))))
+
+(define (abbreviation-of [x datum]) -> string
+  (if (and (list? x) (== (length x) 2))
+      (let ([head (car x)])
+        (cond [(== head 'quote) "'"] [(== head 'quasiquote) "`"]
+              [(== head 'unquote) ","] [(== head 'unquote-splicing) ",@"]
+              [(== head 'quote-syntax) "#'"] [(== head 'quasisyntax) "#`"]
+              [(== head 'unsyntax) "#,"] [(== head 'unsyntax-splicing) "#,@"]
+              [else ""]))
+      ""))
+
+(define (write-program! [root datum] [file datum] [dir datum] [strip bool])
+  (let* ([m (compile-module-file root file)] [pruned-modules (pruned (program-wasm-modules m))]
+         [ls (if strip (stripped pruned-modules) pruned-modules)] [names nil])
+    (make-dir dir)
+    (while (pair? ls)
+      (write-file (joined `(,dir "/" ,(car (car ls)) ".wasm")) (datum->bytes (cdr (car ls))))
+      (set! names (cons '"\n" (cons (car (car ls)) names)))
+      (set! ls (cdr ls)))
+    (write-file (joined `(,dir "/program")) (cast (slice u8) (datum->string (joined (reverse names)))))))
+
+(define (print-expanded [form datum])
+  (let ([b (make-buffer)])
+    (layout (& b) (syntax->datum form) 0)
+    (buffer-add-byte! (& b) 10)
+    (host-write 1 (buffer-bytes (& b)))
+    (buffer-free! (& b))))
+
+(define (run [args datum])
+  (when (null? args) (usage))
+  (set-toolchain-directory! (car args))
+  (install-core!)
+  (let* ([from (option args '"-d")]
+         [rest (without-option (without-option (without-option (cdr args) '"-c") '"-d") '"-m")]
+         [given (lambda ([path datum]) -> datum
+                  (if (and (!= from 0) (not (absolute? path))) (string-join from (string-join '"/" path)) path))]
+         [command (if (pair? rest) (car rest) '"")]
+         [file (if (and (pair? rest) (pair? (cdr rest))) (given (cadr rest)) '#f)]
+         [out (let ([o (option rest '"-o")]) (if (!= o 0) (given o) '#f))]
+         [cache (option args '"-c")]
+         [map-file (option args '"-m")])
+    (set-display-directory! (if (!= from 0) from '"."))
+    (when (!= map-file 0) (set-module-map-text! (read-file (given map-file)) (given map-file)))
+    (when (!= cache 0)
+      (make-dir (given cache))
+      (set-cache-directory! (given cache)))
+    (cond
+      [(and (!= file 0) (equal? command '"build"))
+       (write-program! 0 file (if (!= out 0) out (strip-extension file)) (!= (member '"-s" rest) 0))]
+      [(and (!= file 0) (null? (cddr rest)) (equal? command '"expand"))
+       (expand-module-file 0 file (lambda ([f datum]) (print-expanded f)))]
+      [(and (!= file 0) (null? (cddr rest)) (equal? command '"eval"))
+       (session-open! '"session")
+       (session-eval-file! 0 file (lambda ([e datum]) (host-write 2 (cast (slice u8) (datum->string e)))))]
+      [else (usage)])))
+
+(define (main)
+  (try (run (arguments))
+       [catch compile-error (message blamed loc)
+        (let ([b (make-buffer)])
+          (write-error (& b) message blamed loc)
+          (host-write 2 (buffer-bytes (& b)))
+          (host-exit 1))]))
+
+;; The host calls on-trap with a trap's message.
+(define (on-trap [why (ptr u8)] [n u32]) -> bool
+  (host-write 2 (cast (slice u8) (datum->string (trap-report (cast string (slice why n))))))
+  (free why)
+  (host-exit 1)
+  #t)

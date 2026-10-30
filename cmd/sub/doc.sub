@@ -1,0 +1,185 @@
+;; sub doc writes the documentation of packages and of the toolchain, substrate/, as text or HTML. With no arguments, it
+;; writes the documentation of the current package and the packages in its module map as HTML into the package's
+;; build/doc. Given a name, it prints that module, directory or item. A package's exports are public and the modules they
+;; require are private; all of the toolchain's modules are public. Like build, it first fetches missing packages.
+(require-unqualified macros compiler/macros)
+(require-unqualified rt compiler/roots)
+(require-unqualified rd compiler/reader)
+(require-unqualified fs host/fs)
+(require-unqualified manifest std/package/manifest)
+(require-unqualified map std/package/map)
+(require-unqualified files std/package/files)
+(require-unqualified paths std/package/path)
+(require-unqualified doc std/doc)
+(require-unqualified root std/doc/root)
+(require-unqualified text std/doc/text)
+(require-unqualified html std/doc/html)
+(require-unqualified common cmd/sub/common)
+(require-unqualified build cmd/sub/build)
+(require-unqualified fetching cmd/sub/fetch)
+
+(provide doc-command! doc-fetch-then!)
+
+(struct target [label string] [dir string] [modules datum] [public datum])
+
+(define (doc-command! [args (slice string)])
+  (let ([out (option args "-o")] [rest (without (without args "-o" #t) "--html" #f)] [roots nil])
+    (cond [(> (-> out length) 0)
+           (when (== (-> rest length) 0) (usage))
+           (for ([i u32 0]) (< i (-> rest length)) (+= i 1) (set! roots (append roots (docs-of (@ rest i)))))
+           (files! (absolute out) (if (flag? args "--html") (html-files roots) (text-files roots)))]
+          [(== (-> rest length) 0) (package-docs!)]
+          [(== (-> rest length) 1) (printed! (@ rest 0) "")]
+          [(== (-> rest length) 2) (printed! (@ rest 0) (@ rest 1))]
+          [else (usage)])))
+
+(define (package-docs!)
+  (let ([project (package-holding (& a) cwd)] [rs (slice package-root)] [roots nil] [out string])
+    (when (== (-> project length) 0) (failed! "there is no package.sub in the current directory or above it"))
+    (set! rs (mapped! project))
+    (for ([i u32 0]) (< i (-> rs length)) (+= i 1)
+      (set! roots (append roots (cons (doc-of (package-target (& (@ rs i)))) nil))))
+    (set! out (joined-path project "build/doc"))
+    (files! out (html-files roots))
+    (say 1 (joined (local (joined-path out "index.html")) "\n"))))
+
+;; docs-of gives the documentation of the package at given, or of each toolchain root when given is substrate/.
+(define (docs-of [given string]) -> datum
+  (if (toolchain-dir? given)
+      (map (lambda ([r datum]) -> datum (doc-of (toolchain-target (datum->string (car r))))) (toolchain-roots))
+      (cons (doc-of (package-target (& (@ (mapped! (absolute given)) 0)))) nil)))
+
+(define (doc-of [t target]) -> datum (root-doc (string->datum (-> t label)) (-> t modules) (-> t public)))
+
+(define (toolchain-dir? [given string]) -> bool (== (absolute given) (substrate-dir)))
+
+;; ---- targets ----
+
+(define (toolchain-target [label string]) -> target
+  (let ([t target])
+    (set! (-> t label) label)
+    (set! (-> t dir) (datum->string (cadr (assoc (string->datum label) (toolchain-roots)))))
+    (set! (-> t modules) (modules-under (-> t dir)))
+    (set! (-> t public) (-> t modules))
+    t))
+
+(define (modules-under [dir string]) -> datum
+  (let ([fs (make-buffer)] [nested (make-buffer)] [out nil])
+    (package-tree (& a) dir (& fs) (& nested))
+    (let ([ps (cast (ptr string) (-> fs bytes))])
+      (for ([i u32 0]) (< i (/ (-> fs length) (sizeof string))) (+= i 1)
+        (when (ends? (@ ps i) ".sub") (set! out (cons (string->datum (@ ps i)) out)))))
+    (buffer-free! (& fs))
+    (buffer-free! (& nested))
+    (sorted out)))
+
+;; mapped! gives the packages in the module map of the package at dir, that package first, and sets that module map.
+(define (mapped! [dir string]) -> (slice package-root)
+  (let ([m manifest] [err (make-buffer)] [text (make-buffer)] [roots (make-buffer)] [rs (slice package-root)])
+    (unless (manifest-read (& a) (joined-path dir "package.sub") (& m) (& err)) (failed! (local (buffer-string (& err)))))
+    (locations! dir)
+    (unless (package-map (& a) dir "" (& m) (std-dir) store-dir (& text) (& roots) (& err))
+      (failed! (local (buffer-string (& err)))))
+    (set! rs (slice (cast (ptr package-root) (-> roots bytes)) (/ (-> roots length) (sizeof package-root))))
+    (supported! rs)
+    (set-module-map-text! (string->datum (buffer-string (& text))) '"the module map")
+    rs))
+
+(define (package-target [r (ptr package-root)]) -> target
+  (let ([t target] [rs datum nil] [modules nil])
+    (set! (-> t label) (-> r name))
+    (set! (-> t dir) (-> r dir))
+    (set! (-> t public) (modules-in (-> r dir) (-> r exports)))
+    (set! rs (reached (string->datum (-> r name)) (-> t public)))
+    (while (pair? rs)
+      (when (== (kind-of (joined-path (-> r dir) (datum->string (car rs)))) fs-file) (set! modules (cons (car rs) modules)))
+      (set! rs (cdr rs)))
+    (set! (-> t modules) (sorted modules))
+    t))
+
+(define (modules-in [dir string] [files (slice string)]) -> datum
+  (let ([out nil])
+    (for ([i u32 0]) (< i (-> files length)) (+= i 1)
+      (let ([f (@ files i)])
+        (when (and (ends? f ".sub") (within? f dir) (== (kind-of f) fs-file))
+          (set! out (cons (string->datum (slice f (+ (-> dir length) 1))) out)))))
+    out))
+
+(define (sorted [l datum]) -> datum (sort l (lambda ([x datum] [y datum]) -> bool (< (datum->string x) (datum->string y)))))
+
+(define (files! [out string] [files datum])
+  (while (pair? files)
+    (file! out (datum->string (car (car files))) (cdr (car files)))
+    (set! files (cdr files))))
+
+(define (file! [out string] [path string] [content datum])
+  (let ([full (joined-path out path)] [why string])
+    (made! (parent-of full))
+    (when (< (fs-write-file full (cast (slice u8) (datum->string content)) (& why)) 0) (failed! why))))
+
+;; ---- fetching ----
+
+(define unfetched datum nil)
+(define after (fn ()))
+
+(define (doc-fetch-then! [args (slice string)] [next (fn ())])
+  (let ([rest (without (without args "-o" #t) "--html" #f)] [project (package-holding (& a) cwd)])
+    (set! after next)
+    (set! unfetched nil)
+    (if (> (-> (option args "-o") length) 0)
+        (for ([i u32 0]) (< i (-> rest length)) (+= i 1)
+          (unless (toolchain-dir? (@ rest i)) (set! unfetched (cons (string->datum (absolute (@ rest i))) unfetched))))
+        (when (> (-> project length) 0) (set! unfetched (cons (string->datum project) nil))))
+    (fetched!)))
+
+(define (fetched!)
+  (if (null? unfetched)
+      (after)
+      (let ([dir (datum->string (car unfetched))] [m manifest] [err (make-buffer)])
+        (set! unfetched (cdr unfetched))
+        (unless (manifest-read (& a) (joined-path dir "package.sub") (& m) (& err)) (failed! (local (buffer-string (& err)))))
+        (locations! dir)
+        (fetch-package-then! dir (& m) fetched!))))
+
+;; ---- printing ----
+
+;; printed! prints the module, directory or item that name means, in the package holding the current directory or else
+;; in std.
+(define (printed! [name string] [item string])
+  (let* ([project (package-holding (& a) cwd)] [held (> (-> project length) 0)]
+         [roots (mapped! (if held project (std-dir)))]
+         [id (identity-named name (if held (string->datum (joined (-> (@ roots 0) name) "/package.sub")) 0))]
+         [label string] [rest string] [path string] [t target])
+    (when (== id 0) (failed! (joined name " is not a module or a directory")))
+    (set! label (head-of (datum->string id)))
+    (set! path (slice (datum->string id) (+ (-> label length) 1)))
+    (set! rest (if (== (head-of name) name) "" (slice name (+ (-> (head-of name) length) 1))))
+    (set! t (if (toolchain-root? (string->datum label)) (toolchain-target label) (package-target (package-in roots label))))
+    (cond [(and (> (-> rest length) 0) (== path (joined rest ".sub")) (== (kind-of (joined-path (-> t dir) path)) fs-file))
+           (let ([d (module-doc id)])
+             (if (== (-> item length) 0)
+                 (say 1 (datum->string (module-text d (owner-of (string->datum label) (-> t public) (string->datum path)))))
+                 (let ([i (filter (lambda ([x datum]) -> bool (equal? (item-name x) (string->datum item))) (doc-items d))])
+                   (when (null? i) (failed! (joined (joined name " has no ") item)))
+                   (say 1 (datum->string (item-text (car i)))))))]
+          [(or (== (-> rest length) 0) (== (kind-of (joined-path (-> t dir) rest)) fs-directory))
+           (let ([i (directory-index (string->datum label) rest (-> t modules) (-> t public))])
+             (say 1 (datum->string (index-text (car i) (cadr i) (caddr i) (cadddr i)))))]
+          [else (failed! (joined name " is not a module or a directory"))])))
+
+(define (identity-named [name string] [from datum]) -> datum
+  (let ([id datum 0])
+    (try (let ([forms (read-all name (string->symbol "the command line"))])
+           (when (and (pair? forms) (null? (cdr forms)) (identifier? (car forms))) (set! id (module-identity (car forms) from))))
+         [catch compile-error (message blamed loc) (set! id 0)])
+    id))
+
+(define (head-of [s string]) -> string
+  (let ([i u32 0])
+    (while (and (< i (-> s length)) (!= (@ s i) #\/)) (+= i 1))
+    (slice s 0 i)))
+
+(define (package-in [roots (slice package-root)] [label string]) -> (ptr package-root)
+  (for ([i u32 0]) (< i (-> roots length)) (+= i 1) (when (== (-> (@ roots i) name) label) (return (& (@ roots i)))))
+  (failed! (joined "internal: there is no package " label))
+  0)

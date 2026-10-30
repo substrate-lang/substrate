@@ -32,7 +32,7 @@ run() {
   local start=$EPOCHREALTIME
   local line
   case $1 in
-    ours) line="$("${node[@]}" "$root/host/subhost.mjs" "$out/$2" 2>/dev/null | head -1)" ;;
+    ours) line="$("${node[@]}" "$root/substrate/host/subhost.mjs" "$out/$2" 2>/dev/null | head -1)" ;;
     native) line="$("$out/$2.native" 2>/dev/null | head -1)" ;;
     wasm | noinline) line="$("${node[@]}" -e "$c_wasm" "$out/$2.$1.wasm" 2>/dev/null | head -1)" ;;
   esac

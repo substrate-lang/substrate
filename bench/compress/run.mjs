@@ -31,7 +31,7 @@ for (const f of fs.readdirSync(out)) if (f.endsWith('.deflate')) fs.rmSync(path.
 const dirs = [...new Set(files.map((f) => path.dirname(f)))];
 const native = parse(run(`${out}/zlib.native`, [reps, out, ...files]));
 const grants = [...dirs.map((d) => `-R=${d}`), `-R=${out}`, `-W=${out}`];
-const ours = parse(run(process.execPath, [...process.execArgv, `${root}/host/subhost.mjs`, ...grants, `${out}/ours`, reps,
+const ours = parse(run(process.execPath, [...process.execArgv, `${root}/substrate/host/subhost.mjs`, ...grants, `${out}/ours`, reps,
   out, ...files]));
 const checked = parse(run(`${out}/zlib.native`, ['0', out, ...files]));
 const wasi = new WASI({

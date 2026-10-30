@@ -1,0 +1,451 @@
+;; The REPL web page: the half the user sees.
+(require-unqualified web "../web.sub")
+(require-unqualified worker host/worker)
+(require-unqualified session "session.sub")
+(require-unqualified stream host/stream)
+(require-unqualified storage host/web/storage)
+(require-unqualified location host/web/location)
+(require-unqualified clipboard host/web/clipboard)
+(require-unqualified files host/web/files)
+
+;; ---- data ----
+
+(struct entry [id u32] [input string] [output buffer] [failed bool] [running bool] [cut bool])
+
+(struct history-item [id u32] [input string])
+
+(struct model
+  [entries (ptr entry)] [count u32] [capacity u32]
+  [draft string]
+  [inputs u32]
+  [focus u32] [scroll u32]
+  [recalled u32]
+  [session u32]
+  [language u32]
+  [started bool]
+  [pending i32]
+  [answered bool]
+  [replaying u32]
+  [failed-starts u32]
+  [history (ptr history-item)] [history-count u32] [history-capacity u32]
+  [queue (ptr string)] [queued u32] [queue-at u32] [queue-capacity u32]
+  [problem string])
+
+(variant message
+  [draft-changed [text string]]
+  [draft-kept [text string]]
+  [key-pressed [key string] [shift bool]]
+  [run] [stop] [clear] [save] [load] [loaded] [copy]
+  [use [language u32]]
+  [worker-event [w u32] [kind u32]])
+(messages message)
+
+(define loading stream-reader)
+
+;; ---- small helpers ----
+
+(define (starts? [s string] [prefix string]) -> bool
+  (and (>= (-> s length) (-> prefix length)) (== (slice s 0 (-> prefix length)) prefix)))
+
+(define (set-draft! [m (ptr model)] [s string])
+  (let ([new (string-copy s)])
+    (free (-> m draft bytes))
+    (set! (-> m draft) new)
+    (storage-set-text "draft" new 0)))
+
+(define (busy? [m (ptr model)]) -> bool (or (>= (-> m pending) 0) (> (-> m replaying) 0)))
+
+;; ---- entries ----
+
+(const max-output u32 200000)
+
+(define (add-output! [e (ptr entry)] [b (slice u8)])
+  (let ([out (& (-> e output))] [n (-> b length)])
+    (cond [(-> e cut) (begin)]
+          [(<= (+ (-> out length) n) max-output) (buffer-add! out b)]
+          [else
+           (set! (-> e cut) #t)
+           (buffer-add! out (slice b 0 (- max-output (-> out length))))
+           (buffer-add-string! out "\n... (more output not shown)")])))
+
+(define (add-line! [e (ptr entry)] [s string])
+  (let ([b (& (-> e output))])
+    (when (and (> (-> b length) 0) (!= (@ (-> b bytes) (- (-> b length) 1)) 10)) (buffer-add-byte! b 10))
+    (buffer-add-string! b s)))
+
+(define (add-entry! [m (ptr model)] [input string]) -> u32
+  (when (== (-> m count) (-> m capacity))
+    (set! (-> m capacity) (if (== (-> m capacity) 0) 16 (* 2 (-> m capacity))))
+    (set! (-> m entries) (cast (ptr entry) (realloc (-> m entries) (* (-> m capacity) (sizeof entry))))))
+  (let ([e (+ (-> m entries) (-> m count))])
+    (+= (-> m inputs) 1)
+    (+= (-> m scroll) 1)
+    (set! (-> e id) (-> m inputs))
+    (set! (-> e input) (string-copy input))
+    (set! (-> e output) (make-buffer))
+    (set! (-> e failed) #f)
+    (set! (-> e running) #f)
+    (set! (-> e cut) #f)
+    (+= (-> m count) 1)
+    (- (-> m count) 1)))
+
+(define (clear! [m (ptr model)])
+  (for ([i u32 0]) (< i (-> m count)) (+= i 1)
+    (free (-> (+ (-> m entries) i) input bytes))
+    (buffer-free! (& (-> (+ (-> m entries) i) output))))
+  (set! (-> m count) 0)
+  (set! (-> m recalled) 0)
+  (+= (-> m focus) 1))
+
+;; ---- the session worker ----
+
+(define (send-input! [m (ptr model)] [id u32] [input string])
+  (let ([b (make-buffer)] [number (array u32 1)])
+    (set! (@ number 0) id)
+    (buffer-add! (& b) (slice (cast (ptr u8) number) 4))
+    (buffer-add-string! (& b) input)
+    (worker-send (-> m session) (buffer-bytes (& b)))
+    (buffer-free! (& b))))
+
+(define (remember! [m (ptr model)] [id u32] [input string])
+  (when (== (-> m history-count) (-> m history-capacity))
+    (set! (-> m history-capacity) (if (== (-> m history-capacity) 0) 16 (* 2 (-> m history-capacity))))
+    (set! (-> m history)
+          (cast (ptr history-item) (realloc (-> m history) (* (-> m history-capacity) (sizeof history-item))))))
+  (let ([item (+ (-> m history) (-> m history-count))])
+    (set! (-> item id) id)
+    (set! (-> item input) (string-copy input))
+    (+= (-> m history-count) 1)))
+
+(define (forget-history! [m (ptr model)])
+  (for ([i u32 0]) (< i (-> m history-count)) (+= i 1)
+    (free (-> (+ (-> m history) i) input bytes)))
+  (set! (-> m history-count) 0))
+
+;; The session runs the compiler half on a worker, with the sources under /src.
+(define (session-main) (session-serve!))
+
+(define (start-worker! [m (ptr model)])
+  (free (-> m problem bytes))
+  (set! (-> m problem) "")
+  (set! (-> m started) #f)
+  (let ([o worker-options] [why string])
+    (worker-options-init! (& o))
+    (set! (-> o output) #t)
+    (set! (-> m session) (worker-start session-main (cast (slice u8) "") (& o) 0 (& why)))
+    (set! (-> m problem) why)))
+
+(define (evaluate! [m (ptr model)] [input string])
+  (let* ([i (add-entry! m input)] [e (+ (-> m entries) i)])
+    (set! (-> e running) #t)
+    (set! (-> m pending) (cast i32 i))
+    (set! (-> m answered) #f)
+    (send-input! m (-> e id) input)))
+
+(define (language-input [language u32]) -> string
+  (case language
+    [(0) "(language scheme scheme)"]
+    [(1) "(language substrate compiler/substrate)"]
+    [(2) "(language bend bend)"]
+    [else ""]))
+
+(define (language-query [language u32]) -> string
+  (case language
+    [(1) "?language=substrate"]
+    [(2) "?language=bend"]
+    [else "?language=scheme"]))
+
+(define (language-in [url string]) -> u32
+  (for ([i u32 0]) (< i (-> url length)) (+= i 1)
+    (when (starts? (slice url i) "language=")
+      (let ([at (slice url (+ i 9))])
+        (return (cond [(starts? at "substrate") 1] [(starts? at "bend") 2] [else 0])))))
+  0)
+
+;; ---- inputs from a file ----
+
+(define (queue! [m (ptr model)] [input string])
+  (when (== (-> m queued) (-> m queue-capacity))
+    (set! (-> m queue-capacity) (if (== (-> m queue-capacity) 0) 16 (* 2 (-> m queue-capacity))))
+    (set! (-> m queue) (cast (ptr string) (realloc (-> m queue) (* (-> m queue-capacity) (sizeof string))))))
+  (set! (@ (-> m queue) (-> m queued)) (string-copy input))
+  (+= (-> m queued) 1))
+
+(define (drop-queue! [m (ptr model)])
+  (for ([i (-> m queue-at)]) (< i (-> m queued)) (+= i 1) (free (-> (@ (-> m queue) i) bytes)))
+  (set! (-> m queued) 0)
+  (set! (-> m queue-at) 0))
+
+(define (evaluate-next! [m (ptr model)])
+  (when (and (< (-> m queue-at) (-> m queued)) (not (busy? m)) (!= (-> m session) 0))
+    (let ([input (@ (-> m queue) (-> m queue-at))])
+      (+= (-> m queue-at) 1)
+      (evaluate! m input)
+      (free (-> input bytes)))
+    (when (== (-> m queue-at) (-> m queued)) (drop-queue! m))))
+
+(define (load-forms! [m (ptr model)] [text string])
+  (let ([form (make-buffer)] [n (-> text length)] [start u32 0])
+    (for ([i u32 0]) (<= i n) (+= i 1)
+      (when (or (== i n) (== (@ text i) 10))
+        (when (> (-> form length) 0) (buffer-add-byte! (& form) 10))
+        (buffer-add-string! (& form) (slice text start i))
+        (when (complete? (buffer-string (& form)))
+          (queue! m (buffer-string (& form)))
+          (set! (-> form length) 0))
+        (set! start (+ i 1))))
+    (buffer-free! (& form))
+    (evaluate-next! m)))
+
+(define (file-read [r (ptr stream-reader)])
+  (let ([e message loaded])
+    (send! (& e))))
+
+(define (files-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (== kind files-file) (stream-read-all! (& loading) (cast u32 value) file-read)))
+
+;; ---- the session as text ----
+
+(define (transcript [m (ptr model)] [outputs bool]) -> buffer
+  (let ([b (make-buffer)])
+    (for ([i u32 0]) (< i (-> m count)) (+= i 1)
+      (let ([e (+ (-> m entries) i)])
+        (when (> i 0) (buffer-add-byte! (& b) 10))
+        (buffer-add-string! (& b) (-> e input))
+        (buffer-add-byte! (& b) 10)
+        (when (and outputs (> (-> e output length) 0))
+          (buffer-add-string! (& b) ";; ")
+          (for ([j u32 0]) (< j (-> e output length)) (+= j 1)
+            (let ([c (@ (-> e output bytes) j)])
+              (buffer-add-byte! (& b) c)
+              (when (and (== c 10) (< (+ j 1) (-> e output length))) (buffer-add-string! (& b) ";; "))))
+          (buffer-add-byte! (& b) 10))))
+    b))
+
+(define (save! [m (ptr model)])
+  (let ([b (transcript m #f)])
+    (files-save "session.sub" (buffer-bytes (& b)))
+    (buffer-free! (& b))))
+
+(define (copy! [m (ptr model)])
+  (let ([b (transcript m #t)])
+    (clipboard-write (buffer-string (& b)) 0 0)
+    (buffer-free! (& b))))
+
+(define (start-session! [m (ptr model)] [language u32])
+  (when (!= (-> m session) 0) (worker-stop (-> m session)))
+  (clear! m)
+  (forget-history! m)
+  (drop-queue! m)
+  (location-replace (language-query language) 0)
+  (set! (-> m language) language)
+  (set! (-> m pending) -1)
+  (set! (-> m replaying) 0)
+  (set! (-> m failed-starts) 0)
+  (start-worker! m)
+  (let ([input (language-input language)])
+    (when (and (!= input "") (!= (-> m session) 0)) (evaluate! m input)))
+  (set! (-> m recalled) (-> m count)))
+
+(define (restore-session! [m (ptr model)] [why string])
+  (when (>= (-> m pending) 0)
+    (unless (-> m answered)
+      (let ([e (+ (-> m entries) (-> m pending))])
+        (add-line! e why)
+        (set! (-> e failed) #t)
+        (set! (-> e running) #f)))
+    (set! (-> m pending) -1)
+    (+= (-> m scroll) 1))
+  (set! (-> m replaying) 0)
+  (+= (-> m failed-starts) 1)
+  (if (> (-> m failed-starts) 2)
+      (begin
+        (set! (-> m session) 0)
+        (free (-> m problem bytes))
+        (set! (-> m problem) (string-copy why)))
+      (begin
+        (start-worker! m)
+        (when (!= (-> m session) 0)
+          (for ([i u32 0]) (< i (-> m history-count)) (+= i 1)
+            (send-input! m (-> (+ (-> m history) i) id) (-> (+ (-> m history) i) input)))
+          (set! (-> m replaying) (-> m history-count))))))
+
+(define (finish-entry! [m (ptr model)])
+  (let* ([e (+ (-> m entries) (-> m pending))] [reply (make-buffer)] [n (events-take! (& reply))] [out (& (-> e output))])
+    (when (> n 1) (add-line! e (cast string (slice (buffer-bytes (& reply)) 1))))
+    (set! (-> e failed) (and (> n 0) (!= (@ (-> reply bytes) 0) 0)))
+    (set! (-> e running) #f)
+    (when (and (> (-> out length) 0) (== (@ (-> out bytes) (- (-> out length) 1)) 10)) (-= (-> out length) 1))
+    (unless (-> e failed) (remember! m (-> e id) (-> e input)))
+    (buffer-free! (& reply))
+    (set! (-> m answered) #t)
+    (set! (-> m failed-starts) 0)
+    (+= (-> m scroll) 1)))
+
+(define (handle-worker-event! [m (ptr model)] [g u32] [kind u32])
+  (when (and (== g (-> m session)) (!= g 0))
+    (cond
+      [(== kind worker-ended)
+       (let* ([reason (events-take-text)]
+              [why (if (== (-> reason length) 0) "The session ended." reason)]
+              [failed (and (>= (-> m pending) 0) (not (-> m answered)))])
+         (when failed (add-line! (+ (-> m entries) (-> m pending)) why))
+         (restore-session! m (if failed "The session crashed while evaluating this input. A new session was started." why))
+         (free (-> reason bytes)))]
+
+      [(== kind worker-done)
+       (cond [(not (-> m started)) (set! (-> m started) #t)]
+             [(> (-> m replaying) 0)
+              (-= (-> m replaying) 1)
+              (when (== (-> m replaying) 0) (set! (-> m failed-starts) 0))]
+             [(< (-> m pending) 0) (begin)]
+             [(-> m answered)
+              (set! (-> m pending) -1)
+              (evaluate-next! m)]
+             [else
+              (worker-stop g)
+              (restore-session! m "The session crashed while evaluating this input. A new session was started.")])]
+
+      [(> (-> m replaying) 0) (begin)]
+
+      [(or (< (-> m pending) 0) (-> m answered)) (begin)]
+
+      [(== kind worker-message) (finish-entry! m)]
+
+      [else
+       (let ([printed (make-buffer)])
+         (events-take! (& printed))
+         (add-output! (+ (-> m entries) (-> m pending)) (buffer-bytes (& printed)))
+         (buffer-free! (& printed))
+         (+= (-> m scroll) 1))])))
+
+;; ---- handling user actions ----
+
+(define (complete? [s string]) -> bool
+  (let ([n (-> s length)] [depth 0] [i u32 0] [some #f])
+    (while (< i n)
+      (let ([c (@ s i)])
+        (cond [(== c #\;) (while (and (< i n) (!= (@ s i) 10)) (+= i 1)) (continue)]
+              [(== c 34)
+               (+= i 1)
+               (while (and (< i n) (!= (@ s i) 34))
+                 (when (and (== (@ s i) 92) (< (+ i 1) n)) (+= i 1))
+                 (+= i 1))
+               (when (>= i n) (return #f))
+               (set! some #t)]
+              [(and (== c #\#) (< (+ i 2) n) (== (@ s (+ i 1)) 92)) (+= i 2) (set! some #t)]
+              [(or (== c #\() (== c #\[)) (+= depth 1) (set! some #t)]
+              [(or (== c #\)) (== c #\])) (-= depth 1)]
+              [(> c 32) (set! some #t)]))
+      (+= i 1))
+    (and some (<= depth 0))))
+
+(define (one-line? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) 10) (return #f)))
+  #t)
+
+(define (submit! [m (ptr model)])
+  (when (and (complete? (-> m draft)) (not (busy? m)) (!= (-> m session) 0))
+    (evaluate! m (-> m draft))
+    (set-draft! m ""))
+  (set! (-> m recalled) (-> m count))
+  (+= (-> m focus) 1))
+
+(define (stop! [m (ptr model)])
+  (drop-queue! m)
+  (cond [(> (-> m replaying) 0) (start-session! m (-> m language))]
+        [(>= (-> m pending) 0)
+         (worker-stop (-> m session))
+         (set! (-> m failed-starts) 0)
+         (restore-session! m "Stopped.")])
+  (+= (-> m focus) 1))
+
+(define (recall! [m (ptr model)] [by i32])
+  (let ([i (+ (cast i32 (-> m recalled)) by)])
+    (when (and (>= i 0) (<= i (cast i32 (-> m count))))
+      (set! (-> m recalled) (cast u32 i))
+      (set-draft! m (if (== (cast u32 i) (-> m count)) "" (-> (+ (-> m entries) i) input))))))
+
+(define (key! [m (ptr model)] [key string] [shift bool])
+  (cond [(and (== key "Enter") (not shift) (complete? (-> m draft)))
+         (prevent-default!)
+         (submit! m)]
+        [(and (== key "ArrowUp") (one-line? (-> m draft)))
+         (prevent-default!)
+         (recall! m -1)]
+        [(and (== key "ArrowDown") (one-line? (-> m draft)))
+         (prevent-default!)
+         (recall! m 1)]))
+
+(define (update [m (ptr model)] [e (ptr message)])
+  (match e
+    [(draft-changed text) (set-draft! m text)]
+    [(draft-kept text) (set-draft! m text)]
+    [(key-pressed key shift) (key! m key shift)]
+    [run (submit! m)]
+    [stop (stop! m)]
+    [clear (unless (busy? m) (clear! m))]
+    [save (save! m)]
+    [load (files-pick #f "" 0 0)]
+    [loaded
+     (load-forms! m (buffer-string (& (-> loading bytes))))
+     (buffer-free! (& (-> loading bytes)))]
+    [copy (copy! m)]
+    [(use language) (start-session! m language)]
+    [(worker-event g kind) (handle-worker-event! m g kind)]))
+
+(define (worker-heard [source u32] [kind u32] [g u32] [tag (ptr void)] [value i32])
+  (let ([e message (worker-event g kind)])
+    (send! (& e))))
+
+(define (trapped [m (ptr model)] [why string]) (+= (-> m focus) 1))
+
+(define (storage-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (and (== kind storage-got) (== value 1))
+    (let* ([text (events-take-text)] [e message (draft-kept text)])
+      (send! (& e))
+      (free (-> text bytes)))))
+
+(define (init [m (ptr model)])
+  (event-handler! worker-source worker-heard)
+  (event-handler! files-source files-heard)
+  (event-handler! storage-source storage-heard)
+  (set! (-> m draft) (string-copy ""))
+  (storage-get "draft" 0)
+  (let ([url (location-get)])
+    (start-session! m (language-in url))
+    (free (-> url bytes))))
+
+;; ---- what the page looks like ----
+
+(view (entry-view [e (ptr entry)])
+  (section ([class (if (-> e running) "entry running" (if (-> e failed) "entry failed" "entry"))])
+    (pre ([class "input"]) (text (-> e input)))
+    (when (> (-> e output length) 0) (pre ([class "output"]) (text (buffer-string (& (-> e output))))))))
+
+(view (repl [m (ptr model)])
+  (header
+    (h1 "substrate")
+    (p "Type an expression or a definition and press Enter. It is compiled and run in your browser, in a sandboxed worker beside this page. Each button below starts a new session in that language.")
+    (nav
+      (button ([on click (use 0)]) "Scheme")
+      (button ([on click (use 1)]) "Substrate")
+      (button ([on click (use 2)]) "Bend")
+      (button ([class "quiet"] [disabled (busy? m)] [on click clear]) "clear")
+      (button ([id "save"] [class "quiet"] [on click save]) "save")
+      (button ([id "load"] [class "quiet"] [disabled (busy? m)] [on click load]) "load")
+      (button ([id "copy"] [class "quiet"] [on click copy]) "copy")))
+  (main ([scroll-end (-> m scroll)])
+    (each [e (-> m entries) (-> m count)] #:key (-> e id) (entry-view e))
+    (when (> (-> m replaying) 0) (p ([class "status"]) "Restoring the session: running the earlier inputs again..."))
+    (when (!= (-> m problem) "") (p ([class "status problem"]) "No session could be started: " (text (-> m problem)))))
+  (footer
+    (textarea ([value (-> m draft)] [rows 3] [spellcheck "false"] [autocapitalize "off"]
+               [placeholder "(define (sq x) (* x x))    Enter to evaluate, Shift+Enter for a new line"]
+               [on input (draft-changed (event value))] [on keydown (key-pressed (event key) (event shift))]
+               [focus (-> m focus)]))
+    (if (busy? m)
+        (button ([class "stop"] [on click stop]) "stop")
+        (button ([on click run]) "run"))))
+
+(app model message init update repl trapped)

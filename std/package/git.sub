@@ -1,0 +1,164 @@
+;; The files git tracks under a directory, read from the index of its repository. It reads index versions 2 to 4, in
+;; repositories that name objects by SHA-1 or SHA-256.
+(require-unqualified fs host/fs)
+(require-unqualified paths "path.sub")
+
+(provide git-tracked)
+
+;; git-tracked adds the paths, relative to dir, of the regular files the index lists under dir. It gives 1 when they
+;; include dir's marker file, 0 when they do not or no repository holds dir, and -1, with err set, when it cannot read
+;; the index.
+(define (git-tracked [a (ptr arena)] [dir string] [marker string] [into (ptr buffer)] [err (ptr buffer)]) -> i32
+  (let ([top string] [git string] [b (slice u8)] [why string] [prefix ""] [index string] [name (make-buffer)]
+        [got i32 0])
+    (unless (repository a dir (& top) (& git)) (return 0))
+    (unless (== dir top)
+      (let ([p (joined-path (slice dir (if (== top "/") 1 (+ (-> top length) 1))) "")])
+        (set! prefix (kept a p))
+        (free (-> p bytes))))
+    (set! index (joined-path git "index"))
+    (if (< (fs-read-file index (& b) (& why)) 0)
+        (free (-> why bytes))
+        (begin
+          (set! got (listed! a b (oid-size git) prefix marker (& name) into))
+          (free (-> b items))
+          (when (< got 0)
+            (buffer-add-string! err "cannot read the git index at ")
+            (buffer-add-string! err index)
+            (buffer-add-string! err ": sub reads index versions 2 to 4, but not a split or sparse index"))))
+    (buffer-free! (& name))
+    (free (-> index bytes))
+    got))
+
+;; repository finds the working tree holding dir, and its git directory: the .git directory, or the directory a .git file
+;; points to.
+(define (repository [a (ptr arena)] [dir string] [top (ptr string)] [git (ptr string)]) -> bool
+  (let ([d dir] [info fs-info] [found i32 0])
+    (while (== found 0)
+      (let ([dot (joined-path d ".git")])
+        (cond [(== (fs-lstat dot (& info) 0) 0)
+               (set! found -1)
+               (cond [(== (-> info kind) fs-directory)
+                      (set! (@ git) (kept a dot))
+                      (set! found 1)]
+                     [(and (== (-> info kind) fs-file) (named-git! a d dot git)) (set! found 1)])]
+              [(== d "/") (set! found -1)])
+        (free (-> dot bytes))
+        (when (== found 0) (set! d (parent-of d)))))
+    (set! (@ top) d)
+    (== found 1)))
+
+(define (named-git! [a (ptr arena)] [d string] [dot string] [git (ptr string)]) -> bool
+  (let ([b (slice u8)] [why string] [s string] [end u32 8] [full string])
+    (when (< (fs-read-file dot (& b) (& why)) 0)
+      (free (-> why bytes))
+      (return #f))
+    (set! s (cast string b))
+    (unless (starts? s "gitdir: ")
+      (free (-> b items))
+      (return #f))
+    (while (and (< end (-> s length)) (!= (@ s end) 10) (!= (@ s end) 13)) (+= end 1))
+    (set! full (if (starts? (slice s 8 end) "/") (string-copy (slice s 8 end)) (joined-path d (slice s 8 end))))
+    (set! (@ git) (normal-path a full))
+    (free (-> full bytes))
+    (free (-> b items))
+    #t))
+
+(define (oid-size [git string]) -> u32
+  (let ([common (common-dir git)] [config string] [b (slice u8)] [why string] [size u32 20])
+    (set! config (joined-path common "config"))
+    (if (< (fs-read-file config (& b) (& why)) 0)
+        (free (-> why bytes))
+        (begin
+          (when (sha256-objects? (cast string b)) (set! size 32))
+          (free (-> b items))))
+    (free (-> config bytes))
+    (free (-> common bytes))
+    size))
+
+;; common-dir gives the main git directory of a worktree, which holds the config.
+(define (common-dir [git string]) -> string
+  (let ([file (joined-path git "commondir")] [b (slice u8)] [why string] [s string] [end u32 0] [out string])
+    (if (< (fs-read-file file (& b) (& why)) 0)
+        (begin
+          (free (-> why bytes))
+          (set! out (string-copy git)))
+        (begin
+          (set! s (cast string b))
+          (while (and (< end (-> s length)) (!= (@ s end) 10) (!= (@ s end) 13)) (+= end 1))
+          (set! out (if (starts? s "/") (string-copy (slice s 0 end)) (joined-path git (slice s 0 end))))
+          (free (-> b items))))
+    (free (-> file bytes))
+    out))
+
+(define (sha256-objects? [config string]) -> bool
+  (let ([line (make-buffer)] [found #f])
+    (for ([i u32 0]) (and (not found) (<= i (-> config length))) (+= i 1)
+      (if (or (== i (-> config length)) (== (@ config i) 10))
+          (begin
+            (set! found (== (buffer-string (& line)) "objectformat=sha256"))
+            (set! (-> line length) 0))
+          (let ([c (@ config i)])
+            (unless (or (== c 32) (== c 9) (== c 13))
+              (buffer-add-byte! (& line) (cast i32 (if (and (>= c 65) (<= c 90)) (+ c 32) c)))))))
+    (buffer-free! (& line))
+    found))
+
+;; listed! adds the paths of the regular files the index in b lists under prefix, with the prefix removed. It gives 1 when
+;; marker is among them, 0 when it is not, and -1 when b is not an index of version 2 to 4, or is split or sparse.
+(define (listed! [a (ptr arena)] [b (slice u8)] [oid u32] [prefix string] [marker string] [name (ptr buffer)]
+                 [into (ptr buffer)]) -> i32
+  (let ([n (-> b length)] [version u32 0] [count u32 0] [at u32 12] [last ""] [found #f])
+    (when (or (< n (+ 12 oid)) (!= (cast string (slice b 0 4)) "DIRC")) (return -1))
+    (set! version (be32 b 4))
+    (set! count (be32 b 8))
+    (when (or (< version 2) (> version 4)) (return -1))
+    (for ([k u32 0]) (< k count) (+= k 1)
+      (let ([p (+ at 42 oid)] [mode u32 0] [flags u32 0] [end u32 0])
+        (when (> p n) (return -1))
+        (set! mode (be32 b (+ at 24)))
+        (set! flags (be16 b (+ at 40 oid)))
+        (when (and (>= version 3) (!= (bit-and flags #x4000) 0)) (+= p 2))
+        (if (== version 4)
+            (let ([strip u32 0] [c u32 128])
+              (when (>= p n) (return -1))
+              (set! c (cast u32 (@ b p)))
+              (+= p 1)
+              (set! strip (bit-and c 127))
+              (while (!= (bit-and c 128) 0)
+                (when (>= p n) (return -1))
+                (set! c (cast u32 (@ b p)))
+                (+= p 1)
+                (set! strip (+ (<< (+ strip 1) 7) (bit-and c 127))))
+              (when (> strip (-> name length)) (return -1))
+              (set! (-> name length) (- (-> name length) strip)))
+            (set! (-> name length) 0))
+        (set! end p)
+        (while (and (< end n) (!= (@ b end) 0)) (+= end 1))
+        (when (>= end n) (return -1))
+        (buffer-add! name (slice b p end))
+        (set! at (if (== version 4) (+ end 1) (+ at (* (/ (+ (- end at) 8) 8) 8))))
+        (when (== (>> mode 12) 4) (return -1))
+        (when (== (>> mode 12) 8)
+          (let ([s (buffer-string name)])
+            (when (and (starts? s prefix) (!= (slice s (-> prefix length)) last))
+              (set! last (kept a (slice s (-> prefix length))))
+              (buffer-add! into (slice (cast (ptr u8) (& last)) (sizeof string)))
+              (when (== last marker) (set! found #t)))))))
+    (while (<= (+ at 8 oid) n)
+      (let ([signature (cast string (slice b at (+ at 4)))] [size (be32 b (+ at 4))])
+        (when (or (== signature "link") (== signature "sdir")) (return -1))
+        (when (> size (- n (+ at 8))) (return -1))
+        (set! at (+ at 8 size))))
+    (if found 1 0)))
+
+(define (be32 [b (slice u8)] [at u32]) -> u32
+  (bit-or (<< (cast u32 (@ b at)) 24) (<< (cast u32 (@ b (+ at 1))) 16) (<< (cast u32 (@ b (+ at 2))) 8)
+          (cast u32 (@ b (+ at 3)))))
+
+(define (be16 [b (slice u8)] [at u32]) -> u32 (bit-or (<< (cast u32 (@ b at)) 8) (cast u32 (@ b (+ at 1)))))
+
+(define (kept [a (ptr arena)] [s string]) -> string
+  (let ([out (cast string (slice (cast (ptr u8) (arena-alloc a (-> s length))) (-> s length)))])
+    (memcpy (-> out bytes) (-> s bytes) (-> s length))
+    out))

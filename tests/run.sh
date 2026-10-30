@@ -4,7 +4,7 @@ set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-host="$root/host/subhost.mjs"
+host="$root/substrate/host/subhost.mjs"
 builds="${OUT:-build}/tests"
 rm -rf "${builds:?}"
 mkdir -p "$builds"
@@ -84,9 +84,9 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
-# Each module in cmd, std, packages, bench, host, tests/web and tests/proxy builds, except the pieces in bench/bend/compile.
-mapfile -t modules < <(find cmd std packages bench host tests/web tests/proxy -name '*.sub' -not -name package.sub \
-                         -not -path 'bench/bend/compile/*' | sort)
+# Each module in cmd, std, packages, bench, substrate/host, tests/web and tests/proxy builds.
+mapfile -t modules < <(find cmd std packages bench substrate/host tests/web tests/proxy -name '*.sub' \
+                         -not -name package.sub -not -path 'bench/bend/compile/*' | sort)
 for m in "${modules[@]}"; do
   actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
@@ -124,6 +124,7 @@ done
 # The session tests.
 for t in tests/session/*.sub; do
   name="$(basename "$t" .sub)"
+  [ "$name" = package ] && continue
   actual="$(cd tests/session && "$root/bin/sub" eval "$name.sub" -c "$cache" 2>&1 | grep -v '^    ')"
   if [ -f "tests/session/$name.out" ] && [ "$actual" = "$(cat "tests/session/$name.out")" ]; then
     pass=$((pass + 1))
@@ -245,28 +246,60 @@ else
   fail=$((fail + 1))
   echo "FAIL sub run: got $counted and exit $code, or a program not in build/"
 fi
-# A package's hash covers its files and nothing else: not a README, build output, tests or a module nothing requires.
+# A package's hash covers every file in its directory except those in build/.
 walked="$builds/walked"
 rm -rf "${walked:?}"
 cp -r tests/packages/walked "$walked"
 before="$(bin/sub hash "$walked" 2>&1)"
-mkdir -p "$walked/dist" "$walked/tests"
-printf 'notes\n' > "$walked/README"
-printf 'built\n' > "$walked/dist/program"
-printf '(provide u)\n\n(define (u) -> i32 6)\n' > "$walked/unused.sub"
+mkdir -p "$walked/tests"
 printf '(require w walked)\n(define (main) (printf "~a~n" (w:w)))\n' > "$walked/tests/use.sub"
-after="$(bin/sub hash "$walked" 2>&1)"
-printf '(provide d)\n\n(define (d) -> i32 7)\n' > "$walked/lib/deep/deep.sub"
-deeper="$(bin/sub hash "$walked" 2>&1)"
-used="$(bin/sub build "$walked/tests/use.sub" -o "$walked/use" -c "$cache" 2>&1 && "$host" "$root/$walked/use" 2>&1)"
-if [[ "$before" == sha256:* ]] && [ "$after" = "$before" ] && [ "$deeper" != "$before" ] && [ "$used" = 8 ]; then
+tested="$(bin/sub hash "$walked" 2>&1)"
+used="$(bin/sub build "$walked/tests/use.sub" -c "$cache" 2>&1 && "$host" "$root/$walked/build/use" 2>&1)"
+after_build="$(bin/sub hash "$walked" 2>&1)"
+printf 'notes\n' > "$walked/README"
+noted="$(bin/sub hash "$walked" 2>&1)"
+if [[ "$before" == sha256:* ]] && [ "$tested" != "$before" ] && [ "$used" = 3 ] && [ "$after_build" = "$tested" ] &&
+   [ "$noted" != "$after_build" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL a package's hash and its files: got $before, $after, $deeper and $used"
+  echo "FAIL a package's hash and its files: got $before, $tested, $used, $after_build and $noted"
 fi
-# A module among a package's files requires only its files, in any build: a test of the package may require any file
-# in its directory, but not a module of the package whose macro requires another.
+# In a git repository, a package's hash covers only the files git tracks. The test uses index versions 2 to 4, SHA-1
+# and SHA-256 repositories, and a worktree.
+gitted="$root/$builds/gitted"
+rm -rf "${gitted:?}"
+in_git() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@" > /dev/null 2>&1; }
+for repo in one two; do
+  mkdir -p "$gitted/$repo/p/inner" "$gitted/$repo/p/build"
+  printf '(package p (version "0.1.0"))\n' > "$gitted/$repo/p/package.sub"
+  printf '(package inner (version "0.1.0"))\n' > "$gitted/$repo/p/inner/package.sub"
+  printf '(provide v)\n(define (v) -> i32 2)\n' > "$gitted/$repo/p/p.sub"
+  printf 'built\n' > "$gitted/$repo/p/build/out"
+  in_git -C "$gitted/$repo" init $([ "$repo" = two ] && echo --object-format=sha256)
+  in_git -C "$gitted/$repo" add p
+  in_git -C "$gitted/$repo" commit -m p
+done
+committed="$(bin/sub hash "$gitted/one/p" 2>&1)"
+printf 'notes\n' > "$gitted/one/p/README"
+untracked="$(bin/sub hash "$gitted/one/p" 2>&1)"
+in_git -C "$gitted/one" add -N p/README
+intended="$(bin/sub hash "$gitted/one/p" 2>&1)"
+in_git -C "$gitted/one" update-index --index-version 4
+four="$(bin/sub hash "$gitted/one/p" 2>&1)"
+in_git -C "$gitted/one" worktree add --detach "$gitted/tree"
+other="$(bin/sub hash "$gitted/tree/p" 2>&1)"
+sha="$(bin/sub hash "$gitted/two/p" 2>&1)"
+cp -r "$gitted/one/p" "$gitted/copy"
+copied="$(bin/sub hash "$gitted/copy" 2>&1)"
+if [[ "$committed" == sha256:* ]] && [ "$untracked" = "$committed" ] && [ "$intended" != "$committed" ] &&
+   [ "$four" = "$intended" ] && [ "$other" = "$committed" ] && [ "$sha" = "$committed" ] && [ "$copied" = "$intended" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL packages in git: got $committed, $untracked, $intended, $four, $other, $sha and $copied"
+fi
+# A package's modules and tests may require any file in its directory, even through a macro.
 held="$builds/held"
 rm -rf "${held:?}"
 mkdir -p "$held/q/tests"
@@ -283,14 +316,14 @@ printf '(require p "pull.sub")\n(p:pull)\n(provide v)\n(define (v) -> i32 2)\n' 
 printf '(require h "../hidden.sub")\n(define (main) (printf "~a~n" (h:h)))\n' > "$held/q/tests/private.sub"
 printf '(require q "../q.sub")\n(define (main) (printf "~a~n" (q:v)))\n' > "$held/q/tests/public.sub"
 private="$(bin/sub build "$held/q/tests/private.sub" -o "$held/private" -c "$cache" 2>&1 && "$host" "$root/$held/private" 2>&1)"
-public="$(bin/sub build "$held/q/tests/public.sub" -o "$held/public" -c "$cache" 2>&1)"
-if [ "$private" = 1 ] && [[ "$public" == *'"hidden.sub" is not one of the files of q'* ]]; then
+public="$(bin/sub build "$held/q/tests/public.sub" -o "$held/public" -c "$cache" 2>&1 && "$host" "$root/$held/public" 2>&1)"
+if [ "$private" = 1 ] && [ "$public" = 2 ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
   echo "FAIL a package's files in a test's build: got $private and $public"
 fi
-# Nothing in a package is read through a link, which can lead outside it: not by a test, nor by one of its files.
+# A require through a link in a package is refused, and the package's hash leaves links out.
 linked="$builds/linked"
 rm -rf "${linked:?}"
 mkdir -p "$linked/p/tests" "$linked/elsewhere"
@@ -302,13 +335,19 @@ printf '(provide v)\n(define (v) -> i32 2)\n' > "$linked/p/p.sub"
 printf '(require z "../lib/z.sub")\n(define (main) (printf "~a~n" (z:z)))\n' > "$linked/p/tests/t.sub"
 tested="$(bin/sub build "$linked/p/tests/t.sub" -o "$linked/t" -c "$cache" 2>&1)"
 printf '(require z "z.sub")\n(provide v)\n(define (v) -> i32 (z:z))\n' > "$linked/p/p.sub"
+compiled="$(bin/sub build "$linked/p/p.sub" -o "$linked/p-built" -c "$cache" 2>&1)"
 hashed="$(bin/sub hash "$linked/p" 2>&1)"
+mkdir -p "$linked/q/tests"
+cp "$linked/p/package.sub" "$linked/p/p.sub" "$linked/q/"
+cp "$linked/p/tests/t.sub" "$linked/q/tests/"
+unlinked="$(bin/sub hash "$linked/q" 2>&1)"
 if [[ "$tested" == *'"../lib/z.sub" goes through a link in the package p'* ]] &&
-   [[ "$hashed" == *'z.sub goes through a link in the package p'* ]]; then
+   [[ "$compiled" == *'"z.sub" goes through a link in the package p'* ]] && [[ "$hashed" == sha256:* ]] &&
+   [ "$unlinked" = "$hashed" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL links in a package: got $tested and $hashed"
+  echo "FAIL links in a package: got $tested, $compiled, $hashed and $unlinked"
 fi
 # Another package requires only a package's exports: not a module an export loads, nor one no longer exported when the
 # requiring module comes from the cache, nor one a macro of the package requires into the other package's module.
@@ -356,33 +395,97 @@ fi
 hashed="$(bin/sub hash tests/packages/maps/lib 2>&1)"
 mapped="$(bin/sub map tests/packages/names.sub 2>&1)"
 if [ "$hashed" = "$(grep -o 'sha256:[0-9a-f]\{64\}' tests/packages/package-library.out | head -1)" ] &&
-   [[ "$mapped" == *'(root names "'*'(uses (tools tools) (app app)))'* ]]; then
+   [[ "$mapped" == *'(root names "'*'(uses (tools tools) (app app)) (file "names.sub"))'* ]]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
   echo "FAIL sub hash and map: got $hashed and $mapped"
 fi
+# A package that needs a newer substrate is refused. sub version prints this substrate's version and the hash of
+# substrate/.
+newer="$builds/newer"
+rm -rf "${newer:?}"
+mkdir -p "$newer"
+printf '(package newer (version "1.0.0") (substrate "99.0.0"))\n' > "$newer/package.sub"
+printf '(define (main) (printf "newer~n"))\n' > "$newer/newer.sub"
+refused="$(bin/sub build "$newer/newer.sub" -c "$cache" 2>&1)"
+version="$(bin/sub version 2>&1)"
+shape="^substrate $(cat substrate/VERSION) sha256:[0-9a-f]{64}\$"
+if [ "$refused" = "sub: the package newer needs substrate 99.0.0 or newer, and this is $(cat substrate/VERSION)" ] &&
+   [[ "$version" =~ $shape ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a newer substrate, and sub version: got $refused and $version"
+fi
+# sub doc writes a package's documentation as text and as HTML, prints a module by name, and documents the toolchain.
+documented="$builds/documented"
+rm -rf "${documented:?}"
+bin/sub doc -o "$documented/text" tests/doc/sample > /dev/null 2>&1
+bin/sub doc --html -o "$documented/html" tests/doc/sample > /dev/null 2>&1
+bin/sub doc -o "$documented/docs" substrate std cmd packages/web packages/scheme packages/bend packages/nodes \
+  packages/sqlite > /dev/null 2>&1
+whole=$?
+printed="$(bin/sub doc std/http/cookie 2>&1)"
+dependency="$(cd tests/packages/app && "$root/bin/sub" doc tools/text 2>&1 | head -1)"
+outside="$(cd tests/doc/sample && "$root/bin/sub" doc sample/unused 2>&1 | head -1)"
+if diff -r tests/doc/expected "$documented/text" > /dev/null &&
+   grep -qF '<a href="#point">point</a>' "$documented/html/sample/sample.html" &&
+   grep -qF '<a href="shapes.html#shape">shape</a>' "$documented/html/sample/sample.html" &&
+   grep -qF '<dt>private to</dt>' "$documented/html/sample/shapes.html" &&
+   [ "$printed" = "$(cat "$documented/docs/std/http/cookie.txt")" ] && [ "$dependency" = ";; tools/text" ] &&
+   [ "$outside" = ";; sample/unused" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub doc: tests/doc/expected differs, or the pages' links, or a module printed by name: got $dependency and $outside"
+  diff -r tests/doc/expected "$documented/text" | head -20
+fi
+if [ "$whole" = 0 ] && [ -f "$documented/docs/index.txt" ] && [ -f "$documented/docs/compiler/roots.txt" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub doc of the toolchain: exit $whole"
+fi
+# sub doc with no arguments writes the documentation of the current package and the packages in its module map into the
+# package's build/doc.
+packaged="$builds/packaged"
+rm -rf "${packaged:?}"
+mkdir -p "$packaged/loose"
+cp -r tests/packages/app tests/packages/tools "$packaged/"
+wrote="$(cd "$packaged/app" && "$root/bin/sub" doc 2>&1)"
+unpackaged="$(cd "$packaged/loose" && "$root/bin/sub" doc 2>&1)"
+if [ "$wrote" = "build/doc/index.html" ] &&
+   grep -qF '<a href="tools/index.html">tools</a></td></tr><tr><td><a href="std/index.html">std</a>' \
+     "$packaged/app/build/doc/index.html" &&
+   grep -qF '<a href="../tools/text.html"><code>tools/text</code></a>' "$packaged/app/build/doc/app/app.html" &&
+   [ "$unpackaged" = "sub: there is no package.sub in the current directory or above it" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub doc with no arguments: got $wrote and $unpackaged"
+fi
 # A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
 rm -rf "${changed:?}"
-mkdir -p "$changed/tests/substrate"
-cp -r compiler "$changed/"
-mkdir -p "$changed/host"
-cp host/fs.sub "$changed/host/"
+mkdir -p "$changed/tests/substrate" "$changed/substrate/host"
+cp -r substrate/compiler "$changed/substrate/"
+cp substrate/host/fs.sub "$changed/substrate/host/"
 cp tests/substrate/forms.sub "$changed/tests/substrate/"
 from_changed() {
-  "$host" -R -W "$root/build/compiler" "$root/$changed" build tests/substrate/forms.sub -o "$root/$changed/out" \
+  "$host" -R -W "$root/build/compiler" "$root/$changed/substrate" build tests/substrate/forms.sub -o "$root/$changed/out" \
     -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
 }
-echo ';; changed' >> "$changed/compiler/substrate.sub"
-sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' "$changed/compiler/syntax.sub"
+echo ';; changed' >> "$changed/substrate/compiler/substrate.sub"
+sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' \
+  "$changed/substrate/compiler/syntax.sub"
 if [ "$(from_changed)" = "$(cat tests/substrate/forms.out)" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
   echo "FAIL changed sources: tests/substrate/forms.sub does not build and run as it does here"
 fi
-sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/compiler/syntax.sub"
+sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/substrate/compiler/syntax.sub"
 if grep -qF "whose srcloc differs" <<< "$(from_changed)"; then
   pass=$((pass + 1))
 else
@@ -420,18 +523,19 @@ for t in tests/fetch/*.sub; do
     echo "$actual" | head -10
   fi
 done
-# A store entry holds just the files its hash covers: json's, not its archive's README or unused module, and nest's
-# with its inner package's at their path.
+# A store entry holds the files its hash covers, and a package's archive and its git checkout have the same hash.
 json_entry="$(find tests/fetch/build/app -name json.sub -printf '%h\n' | head -1)"
 nest_entry="$(find tests/fetch/build/nested -name nest.sub -printf '%h\n' | head -1)"
-json_files="$(cd "$json_entry" && find . -type f | sort | tr '\n' ' ')"
-nest_files="$(cd "$nest_entry" && find . -type f | sort | tr '\n' ' ')"
-if [ "$json_files" = "./json.sub ./package.sub " ] &&
+json_files="$(cd "$json_entry" && find . -type f | LC_ALL=C sort | tr '\n' ' ')"
+nest_files="$(cd "$nest_entry" && find . -type f | LC_ALL=C sort | tr '\n' ' ')"
+checked_out="$(bin/sub hash tests/fetch/archives/json 2>&1)"
+if [ "$json_files" = "./README ./json.sub ./package.sub ./unused.sub " ] &&
+   [[ "$(cat tests/fetch/app.sub)" == *"$checked_out"* ]] &&
    [ "$nest_files" = "./inner/inner.sub ./inner/package.sub ./nest.sub ./package.sub " ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL a store entry's files: got $json_files and $nest_files"
+  echo "FAIL a store entry's files: got $json_files, $nest_files and $checked_out"
 fi
 if [ -e tests/fetch/build/escaped.sub ] || [ -e tests/fetch/escaped.sub ]; then
   fail=$((fail + 1))
@@ -447,6 +551,15 @@ if [ "$stored" = 42 ] && [ "$fetched_url" = "$(cat tests/fetch/fetch-url.out)" ]
 else
   fail=$((fail + 1))
   echo "FAIL fetching again and sub fetch URL: got $stored, then $fetched_url"
+fi
+# sub doc fetches what a package it documents depends on, as build does.
+fetched_doc="$(fetched doc -o "$root/$builds/fetch/doc" archives/outer -P build/doc)"
+if [[ "$fetched_doc" == "sub: fetching http://fake/json.tar.gz" ]] &&
+   grep -qx ';; requires json/json' "$builds/fetch/doc/outer/outer.txt"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub doc fetching: got $fetched_doc"
 fi
 echo "$built modules built, $unbuilt failed"
 echo "$pass passed, $fail failed; $again built again from the cache"

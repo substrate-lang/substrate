@@ -1,0 +1,1152 @@
+;; Substrate in one module: the language, its runtime and its library.
+
+(provide define struct union variant match exception throw try lambda inst typedef const let let* set!
+         if return values import supply
+         #%datum #%top-interaction #%module-begin
+         when unless cond case while for break continue rethrow and or not cast sizeof offsetof array-of slice @ & ->
+         + - * / % == != < <= > >= bit-and bit-or bit-xor bit-not << >>
+         += -= *= /= %= <<= >>= bit-and= bit-or= bit-xor=
+         heap-start sbrk reset-stack!
+         host-write host-trap host-args host-exit host-instantiate host-export-index
+         host-program-modules host-module-bytes handler event-head untagged-handler! trap-handler! printf
+         buffer-add-entries! entry-strings
+         sqrt fabs floor ceil trunc nearbyint copysign sqrtf fabsf floorf ceilf truncf nearbyintf copysignf
+         malloc calloc realloc free try-malloc try-calloc try-realloc memcpy memset memcmp
+         arena make-arena arena-alloc arena-start! arena-free new
+         buffer make-buffer buffer-add! buffer-add-byte! buffer-add-string! buffer-add-utf-8! buffer-add-u32! buffer-add-f32!
+         buffer-bytes buffer-string
+         buffer-reserve buffer-free! buffer-trim! hash-bytes hash-table hash-ref hash-set! hash-clear! hash-free!
+         string-copy
+         f64-bits bits-f64 f32-bits digit-value digits? digits-integer read-decimal decimal-flonum shortest-digits
+         write-digits write-flonum write-string)
+
+;; ---- the forms ----
+
+(define-syntax forms (quote-syntax (#%form forms)))
+(forms #%module-begin #%top-interaction define struct union variant match exception
+       throw try lambda inst substrate-struct-check typedef const let let* #%datum when unless cond case array-of slice
+       while for cast sizeof offsetof -> & set! @ break continue rethrow new printf
+       + - * / % == != < <= > >= and or not bit-and bit-or bit-xor bit-not << >>
+       += -= *= /= %= <<= >>= bit-and= bit-or= bit-xor=)
+
+;; ---- documentation ----
+
+;; doc-forms tells sub doc which of this language's forms define what (std/doc/doc.sub).
+(define-syntax doc-forms
+  (quote-syntax
+   ((function (define (NAME PARAM ...) -> RESULT _ ...))
+    (function (define (NAME PARAM ...) _ ...))
+    (value (define NAME TYPE _))
+    (value (define NAME TYPE))
+    (value (global NAME TYPE _))
+    (constant (const NAME TYPE VALUE))
+    (type (struct NAME FIELD ...))
+    (type (variant NAME CASE ...))
+    (type (typedef NAME TYPE))
+    (exception (exception NAME TYPE ...))
+    (macro (define-syntax NAME _))
+    (macro (define-macro (NAME PARAM ...) _ ...))
+    (import (import NAME MODULE FIELD TYPE))
+    (within (begin FORM ...))
+    (within (begin-for-syntax FORM ...))
+    (requires (require PREFIX MODULE _ ...))
+    (requires (require-unqualified PREFIX MODULE))
+    (exports (provide EXPORT ...))
+    (reexports (all-from-out MODULE))
+    (reexports (except-out _ ...))
+    (reexports (all-wasm-forms))
+    (renamed [AS NAME]))))
+
+;; ---- memory and the stack ----
+
+(memory 1)
+
+;; Table index 0 holds no function: it is the null function pointer.
+(table 1)
+
+(global heap-start i32 1024)
+
+(global brk (mut i32) heap-start)
+
+(func (sbrk [n i32]) -> i32
+  (let* ([p brk] [end (i32.and (i32.add (i32.add brk n) 7) -8)] [size (i32.shl (memory.size) 16)]
+         [need (i32.shr_u (i32.add (i32.sub end size) 65535) 16)])
+    (if (i32.gt_u end size)
+        (if (i32.lt_s (memory.grow (if (i32.gt_u (memory.size) need) (memory.size) need)) 0)
+            (if (i32.lt_s (memory.grow need) 0) (return 0))))
+    (set! brk end)
+    p))
+
+(global stack-base (mut i32) (sbrk 4194304))
+(global sp (mut i32) (i32.add stack-base 4194304))
+
+(func (reset-stack!) (set! sp (i32.add stack-base 4194304)))
+
+;; ---- the host ----
+;; Every program may call these host functions without a grant. A call that gives a string or bytes gives them in a
+;; block from malloc for the caller to free; its pointer is 0 when there are none. A call that can fail stores the
+;; reason at err as such a string, unless err is 0. Lists are slices of strings.
+
+(import write "host" "write" (i32 i32 i32 -> i32))
+(import trap "host" "trap" (i32 i32 ->))
+(import arg "host" "arg" (i32 i32 -> i32))
+(import exit "host" "exit" (i32 ->))
+(import instantiate "host" "instantiate" (i32 i32 i32 i32 i32 i32 i32 i32 -> i32))
+(import export_index "host" "export_index" (i32 i32 i32 i32 -> i32))
+(import program_modules "host" "program_modules" (i32 -> i32))
+(import module_bytes "host" "module_bytes" (i32 i32 i32 -> i32))
+
+(define (host-write [fd i32] [b (slice u8)]) #:inline -> i32 (write fd (cast i32 (-> b items)) (cast i32 (-> b length))))
+(define (host-trap [s string]) #:inline (trap (cast i32 (-> s bytes)) (cast i32 (-> s length))))
+;; The program's arguments, as strings in one block from malloc, which (free (-> l items)) frees.
+(define (host-args) -> (slice string)
+  (let ([count u32 0] [total u32 0])
+    (while #t
+      (let* ([n u32 0] [p (arg (cast i32 count) (cast i32 (& n)))])
+        (when (== p 0) (break))
+        (free (cast (ptr u8) p))
+        (+= count 1)
+        (+= total n)))
+    (let* ([items (cast (ptr string) (malloc (+ (* count 8) total)))] [bytes (cast (ptr u8) (+ items count))]
+           [at u32 0])
+      (for ([i u32 0]) (< i count) (+= i 1)
+        (let* ([n u32 0] [p (cast (ptr u8) (arg (cast i32 i) (cast i32 (& n))))])
+          (memcpy (+ bytes at) p n)
+          (free p)
+          (set! (@ items i) (cast string (slice (+ bytes at) n)))
+          (+= at n)))
+      (slice items count))))
+(define (host-exit [code i32]) #:inline (exit code))
+(define (host-instantiate [name string] [code (slice u8)] [imports (slice string)] [compile-time bool] [err (ptr string)])
+  -> i32
+  (let ([b (make-buffer)] [r 0])
+    (buffer-add-entries! (& b) imports)
+    (set! r (instantiate (cast i32 (-> name bytes)) (cast i32 (-> name length)) (cast i32 (-> code items))
+                         (cast i32 (-> code length)) (cast i32 (-> b bytes)) (cast i32 (-> b length)) compile-time
+                         (cast i32 err)))
+    (buffer-free! (& b))
+    r))
+(define (host-export-index [instance string] [field string]) #:inline -> i32
+  (export_index (cast i32 (-> instance bytes)) (cast i32 (-> instance length)) (cast i32 (-> field bytes))
+                (cast i32 (-> field length))))
+(define (host-program-modules) -> (slice string)
+  (let* ([n u32 0] [p (program_modules (cast i32 (& n)))]) (entry-strings (cast (ptr u8) p) n)))
+(define (host-module-bytes [name string]) -> (slice u8)
+  (let* ([n u32 0] [p (module_bytes (cast i32 (-> name bytes)) (cast i32 (-> name length)) (cast i32 (& n)))])
+    (slice (cast (ptr u8) p) n)))
+
+;; ---- output ----
+
+;; printf prints its pieces with these.
+
+(define (print-bytes [p (ptr u8)] [n u32]) (drop (host-write 1 (slice p n))))
+
+(define (print-byte [b i32])
+  (let ([t (array u8 1)])
+    (set! (@ t 0) b)
+    (print-bytes t 1)))
+
+(define (print-integer [n u64] [signed bool])
+  (let ([t (array u8 24)] [k u32 0])
+    (when (and signed (< (cast i64 n) 0))
+      (set! (@ t 0) 45)
+      (set! n (- 0 n))
+      (set! k 1))
+    (print-bytes t (+ k (digits-text n 10 (+ t k))))))
+
+(define (print-float [x f64] [single bool])
+  (let ([t (array u8 32)]) (print-bytes t (float-text x single t))))
+
+(define (print-bool [b bool]) (print-bytes (if b "#t" "#f") 2))
+
+(define (print-text [s string] [quoted bool])
+  (if quoted
+      (let ([b (make-buffer)])
+        (write-string (& b) s)
+        (print-bytes (-> b bytes) (-> b length))
+        (buffer-free! (& b)))
+      (print-bytes (-> s bytes) (-> s length))))
+
+;; ---- strings and slices ----
+
+(define (string-copy [s string]) -> string
+  (let ([p (cast (ptr u8) (malloc (-> s length)))])
+    (memcpy p (-> s bytes) (-> s length))
+    (cast string (slice p (-> s length)))))
+
+;; The checker's code calls these to compare strings by their bytes, and to trap on an index or a part out of range.
+
+(define (string-same? [a string] [b string]) -> bool
+  (and (== (-> a length) (-> b length)) (== (memcmp (-> a bytes) (-> b bytes) (-> a length)) 0)))
+
+(define (string-order [a string] [b string]) -> i32
+  (let* ([n (-> a length)] [m (-> b length)] [c (memcmp (-> a bytes) (-> b bytes) (if (< n m) n m))])
+    (cond [(!= c 0) c] [(< n m) -1] [(> n m) 1] [else 0])))
+
+(define (index-trap [i u32] [n u32])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "index ")
+    (write-digits (& b) i 10)
+    (buffer-add-string! (& b) " is out of range for length ")
+    (write-digits (& b) n 10)
+    (host-trap (buffer-string (& b)))))
+
+(define (range-trap [from u32] [to u32] [n u32])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "from ")
+    (write-digits (& b) from 10)
+    (buffer-add-string! (& b) " to ")
+    (write-digits (& b) to 10)
+    (buffer-add-string! (& b) " is out of range for length ")
+    (write-digits (& b) n 10)
+    (host-trap (buffer-string (& b)))))
+
+;; ---- math ----
+
+;; C's math functions that a wasm instruction computes exactly as C does.
+
+(func (sqrt [x f64]) #:inline -> f64 (f64.sqrt x))
+(func (fabs [x f64]) #:inline -> f64 (f64.abs x))
+(func (floor [x f64]) #:inline -> f64 (f64.floor x))
+(func (ceil [x f64]) #:inline -> f64 (f64.ceil x))
+(func (trunc [x f64]) #:inline -> f64 (f64.trunc x))
+(func (nearbyint [x f64]) #:inline -> f64 (f64.nearest x))
+(func (copysign [x f64] [y f64]) #:inline -> f64 (f64.copysign x y))
+
+(func (sqrtf [x f32]) #:inline -> f32 (f32.sqrt x))
+(func (fabsf [x f32]) #:inline -> f32 (f32.abs x))
+(func (floorf [x f32]) #:inline -> f32 (f32.floor x))
+(func (ceilf [x f32]) #:inline -> f32 (f32.ceil x))
+(func (truncf [x f32]) #:inline -> f32 (f32.trunc x))
+(func (nearbyintf [x f32]) #:inline -> f32 (f32.nearest x))
+(func (copysignf [x f32] [y f32]) #:inline -> f32 (f32.copysign x y))
+
+;; ---- the allocator, memory functions, arenas, buffers, hash tables ----
+
+;; A block is a word of its size, a multiple of 16, with 1 set while it is used, 2 while the block before it is, and 4
+;; while it is in a quick list, then what malloc gives, at a multiple of 16. A free block also holds the next and
+;; previous blocks in its list, and its size again in its last word; no two free blocks are neighbours. Each region from
+;; sbrk ends in a used block of size 0, the last region's at heap-end.
+(struct heap-block [head u32] [next (ptr heap-block)] [prev (ptr heap-block)])
+
+;; The free lists: one for each size under 1 KB, then four from each power of two to the next. free-map has the bit of
+;; each list that holds a block.
+(define free-lists (array (ptr heap-block) 152))
+(define free-map (array u32 5))
+(define heap-end (ptr heap-block) 0)
+(define heap-limit u32 0)
+
+;; The quick lists: a freed block of up to 4 KB waits in the list of its size, still used, for malloc to give it again;
+;; before the heap grows, they are all freed.
+(define quick-lists (array (ptr heap-block) 257))
+
+(func (leading-zeros-32 [x i32]) #:inline -> i32 (i32.clz x))
+(func (trailing-zeros-32 [x i32]) #:inline -> i32 (i32.ctz x))
+
+(define (block-size-for [n u32]) #:inline -> u32 (bit-and (+ n 19) -16))
+(define (block-size [b (ptr heap-block)]) #:inline -> u32 (bit-and (-> b head) -16))
+(define (block-after [b (ptr heap-block)] [n u32]) #:inline -> (ptr heap-block)
+  (cast (ptr heap-block) (+ (cast (ptr u8) b) n)))
+(define (block-before [b (ptr heap-block)]) #:inline -> (ptr heap-block)
+  (cast (ptr heap-block) (- (cast (ptr u8) b) (@ (cast (ptr u32) (- (cast (ptr u8) b) 4)) 0))))
+(define (set-footer! [b (ptr heap-block)] [size u32]) #:inline
+  (set! (@ (cast (ptr u32) (+ (cast (ptr u8) b) (- size 4))) 0) size))
+
+(define (size-class [size u32]) #:inline -> u32
+  (if (< size 1024)
+      (>> size 4)
+      (let ([top (- 31 (cast u32 (leading-zeros-32 (cast i32 size))))])
+        (+ 64 (* (- top 10) 4) (bit-and (>> size (- top 2)) 3)))))
+
+(define (list-block! [b (ptr heap-block)] [size u32])
+  (let* ([c (size-class size)] [first (@ free-lists c)])
+    (set! (-> b next) first)
+    (set! (-> b prev) 0)
+    (when (!= first 0) (set! (-> first prev) b))
+    (set! (@ free-lists c) b)
+    (bit-or= (@ free-map (>> c 5)) (<< (cast u32 1) (bit-and c 31)))))
+
+(define (unlist-block! [b (ptr heap-block)])
+  (let ([next (-> b next)] [prev (-> b prev)])
+    (when (!= next 0) (set! (-> next prev) prev))
+    (if (!= prev 0)
+        (set! (-> prev next) next)
+        (let ([c (size-class (block-size b))])
+          (set! (@ free-lists c) next)
+          (when (== next 0) (bit-and= (@ free-map (>> c 5)) (bit-not (<< (cast u32 1) (bit-and c 31)))))))))
+
+(define (next-class [c u32]) -> u32
+  (let ([w (>> c 5)] [bits u32 0])
+    (when (>= w 5) (return 160))
+    (set! bits (bit-and (@ free-map w) (<< (cast u32 4294967295) (bit-and c 31))))
+    (while (== bits 0)
+      (+= w 1)
+      (when (>= w 5) (return 160))
+      (set! bits (@ free-map w)))
+    (+ (<< w 5) (cast u32 (trailing-zeros-32 (cast i32 bits))))))
+
+(define (allocate [n u32]) #:inline -> (ptr void)
+  (when (>= n 2147483584) (return 0))
+  (let* ([size (block-size-for n)] [b (ptr heap-block) 0])
+    (when (<= size 4096)
+      (set! b (@ quick-lists (>> size 4)))
+      (when (!= b 0)
+        (set! (@ quick-lists (>> size 4)) (-> b next))
+        (bit-and= (-> b head) -5)
+        (return (cast (ptr void) (+ (cast (ptr u8) b) 4)))))
+    (set! b (fitting-block size))
+    (when (and (== b 0) (free-quick-blocks!)) (set! b (fitting-block size)))
+    (when (== b 0) (set! b (grow-heap size)))
+    (when (== b 0) (return 0))
+    (unlist-block! b)
+    (take-block! b size)))
+
+(define (allocated [p (ptr void)]) #:inline -> (ptr void)
+  (when (== p 0) (host-trap "out of memory"))
+  p)
+
+(define (malloc [n u32]) -> (ptr void) (allocated (allocate n)))
+(define (try-malloc [n u32]) -> (ptr void) (allocate n))
+(define (calloc [count u32] [size u32]) -> (ptr void) (allocated (try-calloc count size)))
+(define (realloc [block (ptr void)] [n u32]) -> (ptr void) (allocated (try-realloc block n)))
+
+(define (fitting-block [size u32]) -> (ptr heap-block)
+  (let* ([c (size-class size)] [b (@ free-lists c)] [k 0] [d u32 0])
+    (when (>= c 64)
+      (while (and (!= b 0) (< (block-size b) size) (< k 16))
+        (set! b (-> b next))
+        (+= k 1))
+      (when (and (!= b 0) (< (block-size b) size)) (set! b 0)))
+    (when (!= b 0) (return b))
+    (set! d (next-class (+ c 1)))
+    (if (< d 152) (@ free-lists d) 0)))
+
+(define (free-quick-blocks!) -> bool
+  (let ([any #f] [b (ptr heap-block) 0])
+    (for ([i u32 1]) (<= i 256) (+= i 1)
+      (while (!= (@ quick-lists i) 0)
+        (set! b (@ quick-lists i))
+        (set! (@ quick-lists i) (-> b next))
+        (bit-and= (-> b head) -5)
+        (release-block! b)
+        (set! any #t)))
+    any))
+
+(define (take-block! [b (ptr heap-block)] [size u32]) -> (ptr void)
+  (let ([rest (- (block-size b) size)])
+    (if (>= rest 16)
+        (let ([r (block-after b size)])
+          (set! (-> r head) (bit-or rest 2))
+          (set-footer! r rest)
+          (list-block! r rest)
+          (set! (-> b head) (bit-or size 3)))
+        (begin
+          (bit-or= (-> (block-after b (block-size b)) head) 2)
+          (bit-or= (-> b head) 1)))
+    (cast (ptr void) (+ (cast (ptr u8) b) 4))))
+
+(define (grow-heap [size u32]) -> (ptr heap-block)
+  (let* ([n (bit-and (+ (if (< size 8192) 8192 size) 47) -16)] [r (cast u32 (sbrk (cast i32 n)))] [b (ptr heap-block) 0]
+         [s u32 0])
+    (when (== r 0) (return 0))
+    (if (and (!= heap-end 0) (== r heap-limit))
+        (set! b heap-end)
+        (begin
+          (set! b (cast (ptr heap-block) (- (bit-and (+ r 19) -16) 4)))
+          (set! (-> b head) 2)))
+    (set! s (bit-and (- (+ r n) (+ (cast u32 b) 4)) -16))
+    (set! (-> b head) (bit-or s (bit-and (-> b head) 2)))
+    (set! heap-end (block-after b s))
+    (set! (-> heap-end head) 1)
+    (set! heap-limit (+ r n))
+    (when (== (bit-and (-> b head) 2) 0)
+      (set! b (block-before b))
+      (unlist-block! b)
+      (set! s (+ s (block-size b)))
+      (set! (-> b head) (bit-or s 2)))
+    (set-footer! b s)
+    (list-block! b s)
+    b))
+
+(define (free [block (ptr void)])
+  (when (!= block 0)
+    (let* ([b (cast (ptr heap-block) (- (cast (ptr u8) block) 4))] [size (block-size b)])
+      (when (!= (bit-and (-> b head) 5) 1) (host-trap "free of a block that is free"))
+      (if (<= size 4096)
+          (begin
+            (bit-or= (-> b head) 4)
+            (set! (-> b next) (@ quick-lists (>> size 4)))
+            (set! (@ quick-lists (>> size 4)) b))
+          (release-block! b)))))
+
+(define (release-block! [b (ptr heap-block)])
+  (let* ([size (block-size b)] [next (block-after b size)])
+    (when (== (bit-and (-> next head) 1) 0)
+      (unlist-block! next)
+      (+= size (block-size next)))
+    (when (== (bit-and (-> b head) 2) 0)
+      (set! b (block-before b))
+      (unlist-block! b)
+      (+= size (block-size b)))
+    (set! (-> b head) (bit-or size 2))
+    (set-footer! b size)
+    (bit-and= (-> (block-after b size) head) -3)
+    (list-block! b size)))
+
+(define (try-calloc [count u32] [size u32]) -> (ptr void)
+  (when (and (!= size 0) (> count (/ 4294967295 size))) (return 0))
+  (let ([p (try-malloc (* count size))])
+    (when (!= p 0) (memset p 0 (* count size)))
+    p))
+
+(define (try-realloc [block (ptr void)] [n u32]) -> (ptr void)
+  (when (== block 0) (return (try-malloc n)))
+  (when (>= n 2147483584) (return 0))
+  (let* ([b (cast (ptr heap-block) (- (cast (ptr u8) block) 4))] [size (block-size b)] [want (block-size-for n)]
+         [next (block-after b size)] [room (if (== (bit-and (-> next head) 1) 0) (+ size (block-size next)) size)]
+         [p (ptr void) 0])
+    (when (!= (bit-and (-> b head) 5) 1) (host-trap "realloc of a block that is free"))
+    (when (and (> want room) (== (block-after b room) heap-end) (== (cast u32 (sbrk 0)) heap-limit))
+      (grow-heap (- want room)))
+    (when (and (> want size) (== (bit-and (-> next head) 1) 0) (>= (+ size (block-size next)) want))
+      (unlist-block! next)
+      (+= size (block-size next))
+      (set! (-> b head) (bit-or size (bit-and (-> b head) 3)))
+      (bit-or= (-> (block-after b size) head) 2))
+    (when (<= want size)
+      (when (>= (- size want) 16)
+        (let ([rest (block-after b want)])
+          (set! (-> b head) (bit-or want (bit-and (-> b head) 3)))
+          (set! (-> rest head) (bit-or (- size want) 3))
+          (release-block! rest)))
+      (return block))
+    (set! p (try-malloc n))
+    (when (!= p 0)
+      (memcpy p block (- size 4))
+      (free block))
+    p))
+
+(define (memcpy [to (ptr void)] [from (ptr void)] [n u32]) -> (ptr void)
+  (memory.copy to from n)
+  to)
+
+(define (memset [to (ptr void)] [byte i32] [n u32]) -> (ptr void)
+  (memory.fill to byte n)
+  to)
+
+(define (memcmp [a (ptr void)] [b (ptr void)] [n u32]) -> i32
+  (let ([x (cast (ptr u8) a)] [y (cast (ptr u8) b)])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (!= (@ x i) (@ y i)) (return (- (@ x i) (@ y i)))))
+    0))
+
+(struct chunk [previous (ptr chunk)] [size u32])
+
+;; Chunks start at 1 KB, or the size arena-start! gives, and double up to 64 KB; an allocation over 8 KB has a chunk
+;; of its own. After PostgreSQL's memory contexts.
+(struct arena [last (ptr chunk)] [next (ptr u8)] [end (ptr u8)])
+
+(define (make-arena) -> arena
+  (let ([a arena])
+    (set! (-> a last) 0)
+    (set! (-> a next) 0)
+    (set! (-> a end) 0)
+    a))
+
+(define (arena-alloc [a (ptr arena)] [n u32]) -> (ptr void)
+  (let ([size (bit-and (+ n 7) -8)])
+    (if (> size (- (-> a end) (-> a next)))
+        (arena-grow a size)
+        (let ([p (-> a next)])
+          (+= (-> a next) size)
+          p))))
+
+;; arena-start! gives the arena a chunk of size bytes to allocate from next: before any allocation, its first.
+(define (arena-start! [a (ptr arena)] [size u32])
+  (let* ([c (cast (ptr chunk) (malloc (+ size (sizeof chunk))))] [p (cast (ptr u8) (+ c 1))])
+    (set! (-> c previous) (-> a last))
+    (set! (-> c size) size)
+    (set! (-> a last) c)
+    (set! (-> a next) p)
+    (set! (-> a end) (+ p size))))
+
+;; arena-grow gives n bytes from a new chunk: one of their own, kept behind the current chunk, or the next chunk.
+(define (arena-grow [a (ptr arena)] [n u32]) -> (ptr void)
+  (let ([last (-> a last)])
+    (if (> n 8192)
+        (let ([c (cast (ptr chunk) (malloc (+ n (sizeof chunk))))])
+          (set! (-> c size) n)
+          (if (== last 0)
+              (begin
+                (set! (-> c previous) 0)
+                (set! (-> a last) c))
+              (begin
+                (set! (-> c previous) (-> last previous))
+                (set! (-> last previous) c)))
+          (cast (ptr void) (+ c 1)))
+        (let* ([want (cond [(== last 0) 1024] [(< (-> last size) 32768) (* (-> last size) 2)] [else 65536])]
+               [p (begin (arena-start! a (if (> n want) n want)) (-> a next))])
+          (+= (-> a next) n)
+          (cast (ptr void) p)))))
+
+(define (arena-free [a (ptr arena)])
+  (let ([c (-> a last)])
+    (while (!= c 0)
+      (let ([previous (-> c previous)])
+        (free c)
+        (set! c previous))))
+  (set! (-> a last) 0)
+  (set! (-> a next) 0)
+  (set! (-> a end) 0))
+
+(struct buffer [bytes (ptr u8)] [length u32] [room u32])
+
+(define (make-buffer) -> buffer
+  (let ([b buffer])
+    (set! (-> b bytes) 0)
+    (set! (-> b length) 0)
+    (set! (-> b room) 0)
+    b))
+
+(define (buffer-reserve [b (ptr buffer)] [n u32])
+  (let ([need (+ (-> b length) n)])
+    (when (> need (-> b room))
+      (set! (-> b room) (if (> need (* 2 (-> b room))) need (* 2 (-> b room))))
+      (set! (-> b bytes) (cast (ptr u8) (realloc (-> b bytes) (-> b room)))))))
+
+(define (buffer-add! [b (ptr buffer)] [part (slice u8)])
+  (buffer-reserve b (-> part length))
+  (memcpy (+ (-> b bytes) (-> b length)) (-> part items) (-> part length))
+  (+= (-> b length) (-> part length)))
+
+(define (buffer-add-byte! [b (ptr buffer)] [byte i32])
+  (buffer-reserve b 1)
+  (set! (@ (-> b bytes) (-> b length)) byte)
+  (+= (-> b length) 1))
+
+(define (buffer-add-string! [b (ptr buffer)] [s string]) (buffer-add! b (cast (slice u8) s)))
+
+(define (buffer-add-utf-8! [b (ptr buffer)] [c u32])
+  (cond [(< c 128) (buffer-add-byte! b c)]
+        [(< c 2048)
+         (buffer-add-byte! b (bit-or 192 (>> c 6)))
+         (buffer-add-byte! b (bit-or 128 (bit-and c 63)))]
+        [(< c 65536)
+         (buffer-add-byte! b (bit-or 224 (>> c 12)))
+         (buffer-add-byte! b (bit-or 128 (bit-and (>> c 6) 63)))
+         (buffer-add-byte! b (bit-or 128 (bit-and c 63)))]
+        [else
+         (buffer-add-byte! b (bit-or 240 (>> c 18)))
+         (buffer-add-byte! b (bit-or 128 (bit-and (>> c 12) 63)))
+         (buffer-add-byte! b (bit-or 128 (bit-and (>> c 6) 63)))
+         (buffer-add-byte! b (bit-or 128 (bit-and c 63)))]))
+
+(define (buffer-add-u32! [b (ptr buffer)] [n u32]) (buffer-add! b (slice (cast (ptr u8) (array-of u32 n)) 4)))
+(define (buffer-add-f32! [b (ptr buffer)] [x f64]) (buffer-add! b (slice (cast (ptr u8) (array-of f32 (cast f32 x))) 4)))
+
+;; A buffer's bytes, until it next changes.
+(define (buffer-bytes [b (ptr buffer)]) -> (slice u8) (slice (-> b bytes) (-> b length)))
+(define (buffer-string [b (ptr buffer)]) -> string (cast string (buffer-bytes b)))
+
+(define (buffer-free! [b (ptr buffer)])
+  (free (-> b bytes))
+  (set! (-> b bytes) 0)
+  (set! (-> b length) 0)
+  (set! (-> b room) 0))
+
+;; buffer-trim! frees an empty buffer's bytes when its room passes most.
+(define (buffer-trim! [b (ptr buffer)] [most u32])
+  (when (and (== (-> b length) 0) (> (-> b room) most)) (buffer-free! b)))
+
+;; FNV-1a.
+(define (hash-bytes [b (slice u8)]) -> u64
+  (let ([h u64 14695981039346656037] [p (-> b items)])
+    (for ([i u32 0]) (< i (-> b length)) (+= i 1)
+      (set! h (* (bit-xor h (@ p i)) 1099511628211)))
+    (bit-or h 1)))
+
+(struct hash-table [keys (ptr u64)] [values (ptr u32)] [count u32] [capacity u32] [shift u32] [arena (ptr arena)])
+
+(define (hash-ref [t (ptr hash-table)] [key u64]) #:inline -> u32
+  (if (== (-> t capacity) 0)
+      0
+      (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)] [i (cast u32 (>> (* key 11400714819323198485) (-> t shift)))])
+        (while (!= (@ keys i) 0)
+          (when (== (@ keys i) key) (return (@ (-> t values) i)))
+          (set! i (bit-and (+ i 1) mask)))
+        0)))
+
+(define (hash-set! [t (ptr hash-table)] [key u64] [value u32])
+  (when (>= (* 2 (+ (-> t count) 1)) (-> t capacity)) (hash-grow t))
+  (let* ([keys (-> t keys)] [mask (- (-> t capacity) 1)] [i (cast u32 (>> (* key 11400714819323198485) (-> t shift)))])
+    (while (!= (@ keys i) 0)
+      (when (== (@ keys i) key)
+        (set! (@ (-> t values) i) value)
+        (return))
+      (set! i (bit-and (+ i 1) mask)))
+    (set! (@ keys i) key)
+    (set! (@ (-> t values) i) value)
+    (+= (-> t count) 1)))
+
+(define (hash-grow [t (ptr hash-table)])
+  (let* ([keys (-> t keys)] [values (-> t values)] [n (-> t capacity)] [a (-> t arena)] [m (if (== n 0) 16 (* 2 n))])
+    (set! (-> t capacity) m)
+    (set! (-> t shift) (if (== n 0) 60 (- (-> t shift) 1)))
+    (set! (-> t keys) (cast (ptr u64) (if (== a 0) (calloc m 8) (memset (arena-alloc a (* m 8)) 0 (* m 8)))))
+    (set! (-> t values) (cast (ptr u32) (if (== a 0) (malloc (* m 4)) (arena-alloc a (* m 4)))))
+    (set! (-> t count) 0)
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (when (!= (@ keys i) 0) (hash-set! t (@ keys i) (@ values i))))
+    (when (== a 0)
+      (free keys)
+      (free values))))
+
+(define (hash-clear! [t (ptr hash-table)])
+  (when (!= (-> t capacity) 0) (memset (-> t keys) 0 (* (-> t capacity) 8)))
+  (set! (-> t count) 0))
+
+(define (hash-free! [t (ptr hash-table)])
+  (free (-> t keys))
+  (free (-> t values))
+  (set! (-> t keys) 0)
+  (set! (-> t values) 0)
+  (set! (-> t count) 0)
+  (set! (-> t capacity) 0)
+  (set! (-> t shift) 0))
+
+;; ---- numbers ----
+
+(func (f64-bits [x f64]) #:inline -> i64 (i64.reinterpret_f64 x))
+(func (bits-f64 [b i64]) #:inline -> f64 (f64.reinterpret_i64 b))
+(func (f32-bits [x f32]) #:inline -> i32 (i32.reinterpret_f32 x))
+(func (leading-zeros [x i64]) #:inline -> i64 (i64.clz x))
+(func (trailing-zeros [x i64]) #:inline -> i64 (i64.ctz x))
+
+(define (digits-text [n u64] [radix u64] [p (ptr u8)]) -> u32
+  (let ([k u32 1])
+    (for ([m (/ n radix)]) (!= m 0) (set! m (/ m radix)) (+= k 1))
+    (for ([i k]) (> i 0) (-= i 1)
+      (let ([d (cast i32 (% n radix))])
+        (set! (@ p (- i 1)) (if (< d 10) (+ 48 d) (+ 87 d)))
+        (set! n (/ n radix))))
+    k))
+
+(define (write-digits [b (ptr buffer)] [n u64] [radix u64])
+  (let ([t (array u8 64)]) (buffer-add! b (slice t (digits-text n radix t)))))
+
+(define (float-text [x f64] [single bool] [p (ptr u8)]) -> u32
+  (cond [(!= x x) (memcpy p "+nan.0" 6) (return 6)]
+        [(== x (/ 1.0 0.0)) (memcpy p "+inf.0" 6) (return 6)]
+        [(== x (/ -1.0 0.0)) (memcpy p "-inf.0" 6) (return 6)])
+  (let ([ds (array u8 24)] [n u32 0] [k 0] [j u32 (if (< (f64-bits x) 0) 1 0)] [y f64 0])
+    (set! (@ p 0) 45)
+    (when (== x 0)
+      (memcpy (+ p j) "0.0" 3)
+      (return (+ j 3)))
+    (let ([(digits dp) (shortest-digits (fabs x) single (slice ds))])
+      (set! k dp)
+      (set! n (-> digits length)))
+    (cond [(or (< k -2) (> k 10))
+           (set! (@ p j) (@ ds 0))
+           (+= j 1)
+           (when (> n 1)
+             (set! (@ p j) 46)
+             (memcpy (+ p j 1) (+ ds 1) (- n 1))
+             (+= j n))
+           (set! (@ p j) 101)
+           (+= j 1)
+           (when (< k 1)
+             (set! (@ p j) 45)
+             (+= j 1))
+           (+= j (digits-text (cast u64 (if (>= k 1) (- k 1) (- 1 k))) 10 (+ p j)))]
+          [(<= k 0)
+           (memcpy (+ p j) "0.00" (- 2 k))
+           (memcpy (+ p j (- 2 k)) ds n)
+           (+= j (+ (- 2 k) n))]
+          [(< k n)
+           (memcpy (+ p j) ds k)
+           (set! (@ p (+ j k)) 46)
+           (memcpy (+ p j k 1) (+ ds k) (- n k))
+           (+= j (+ n 1))]
+          [else
+           (memcpy (+ p j) ds n)
+           (memset (+ p j n) 48 (- k n))
+           (memcpy (+ p j k) ".0" 2)
+           (+= j (+ k 2))])
+    (if (and single (or (not (read-decimal (cast string (slice p j)) (& y))) (!= (cast f32 y) (cast f32 x))))
+        (float-text x #f p)
+        j)))
+
+(define (write-flonum [b (ptr buffer)] [x f64])
+  (let ([t (array u8 32)]) (buffer-add! b (slice t (float-text x #f t)))))
+
+(define (write-string [b (ptr buffer)] [s string])
+  (buffer-add-byte! b 34)
+  (for ([i u32 0] [p (-> s bytes)] [n (-> s length)]) (< i n) (+= i 1)
+    (let ([c (@ p i)])
+      (case c
+        [(34 92) (buffer-add-byte! b 92) (buffer-add-byte! b c)]
+        [(10) (buffer-add-string! b "\\n")]
+        [(9) (buffer-add-string! b "\\t")]
+        [(13) (buffer-add-string! b "\\r")]
+        [else (if (or (< c 32) (== c 127))
+                  (begin (buffer-add-string! b "\\x") (write-digits b c 16) (buffer-add-byte! b 59))
+                  (buffer-add-byte! b c))])))
+  (buffer-add-byte! b 34))
+
+;; Ryū, after Go's strconv (ftoaryu.go).
+
+(struct decimal-slice [d (ptr u8)] [nd i32] [dp i32])
+
+(define (shortest-digits [x f64] [single bool] [into (slice u8)]) -> (values (slice u8) i32)
+  (let* ([width u64 (if single 23 52)]
+         [bits (if single (cast u64 (cast u32 (f32-bits (cast f32 x)))) (cast u64 (f64-bits x)))]
+         [biased (cast i32 (>> bits width))]
+         [one (<< (cast u64 1) width)]
+         [r decimal-slice])
+    (set! (-> r d) (-> into items))
+    (set! (-> r nd) 0)
+    (set! (-> r dp) 0)
+    (ryu-shortest (& r) (if (== biased 0) bits (bit-or (bit-and bits (- one 1)) one))
+                  (- (if (== biased 0) 1 biased) (if single 150 1075)) single)
+    (memcpy (-> into items) (-> r d) (cast u32 (-> r nd)))
+    (values (slice into 0 (cast u32 (-> r nd))) (-> r dp))))
+
+(define (ryu-shortest [r (ptr decimal-slice)] [m u64] [e i32] [single bool])
+  (when (and (<= e 0) (>= (cast i32 (trailing-zeros m)) (- e)))
+    (let ([n (>> m (cast u64 (- e)))]) (ryu-digits r n n n #t #f))
+    (return))
+  (let* ([border (and (== m (<< (cast u64 1) (cast u64 (if single 23 52)))) (!= e (if single -149 -1074)))]
+         [ml (if border (- (* 4 m) 1) (- (* 2 m) 1))]
+         [mc (if border (* 4 m) (* 2 m))]
+         [mu (if border (+ (* 4 m) 2) (+ (* 2 m) 1))]
+         [e2 (if border (- e 2) (- e 1))])
+    (when (== e2 0)
+      (ryu-digits r ml mc mu #t #f)
+      (return))
+    (let* ([q (+ (>> (* (- e2) 78913) 18) 1)]
+           [(dl el dl0) (mult-pow10 ml e2 q single)]
+           [(dc ec dc0) (mult-pow10 mc e2 q single)]
+           [(du eu du0) (mult-pow10 mu e2 q single)]
+           [extra (cast u64 (- eu))]
+           [half (<< (cast u64 1) (- extra 1))]
+           [fl (bit-and dl (- (* 2 half) 1))]
+           [fc (bit-and dc (- (* 2 half) 1))]
+           [fu (bit-and du (- (* 2 half) 1))]
+           [l (>> dl extra)] [c (>> dc extra)] [u (>> du extra)])
+      (when (> q 55)
+        (set! dl0 #f)
+        (set! dc0 #f)
+        (set! du0 #f))
+      (when (and (< q 0) (>= q -24))
+        (when (divisible-by-power-5 ml (- q)) (set! dl0 #t))
+        (when (divisible-by-power-5 mc (- q)) (set! dc0 #t))
+        (when (divisible-by-power-5 mu (- q)) (set! du0 #t)))
+      (unless (if (and du0 (== fu 0)) (== (bit-and m 1) 0) #t) (-= u 1))
+      (unless (and dl0 (== fl 0) (== (bit-and m 1) 0)) (+= l 1))
+      (ryu-digits r l c u (and dc0 (== fc 0))
+                  (if dc0 (or (> fc half) (and (== fc half) (== (bit-and c 1) 1))) (== (>> fc (- extra 1)) 1)))
+      (-= (-> r dp) q))))
+
+(define (mult-pow10 [m u64] [e2 i32] [q i32] [single bool]) -> (values u64 i32 bool)
+  (when (== q 0)
+    (return (values (<< m (cast u64 (if single 6 8))) (- e2 (if single 6 8)) #t)))
+  (let* ([p (power-of-ten q)] [hi (@ p 0)] [lo (@ p 1)] [e (+ e2 (>> (* q 108853) 15))])
+    (when (< q 0) (if single (+= hi 1) (+= lo 1)))
+    (when single
+      (let ([(h l) (mul-128 m hi)])
+        (return (values (bit-and (bit-or (<< h 7) (>> l 57)) 4294967295) (- e 6) (== (<< l 7) 0)))))
+    (let* ([(l1 l0) (mul-128 m lo)] [(h1 h0) (mul-128 m hi)] [mid (+ l1 h0)])
+      (values (bit-or (<< (+ h1 (cast u64 (< mid l1))) 9) (>> mid 55)) (- e 8) (and (== (<< mid 9) 0) (== l0 0))))))
+
+(define (divisible-by-power-5 [m u64] [k i32]) -> bool
+  (for ([i 0]) (< i k) (+= i 1)
+    (when (!= (% m 5) 0) (return #f))
+    (set! m (/ m 5)))
+  #t)
+
+(define (ryu-digits [r (ptr decimal-slice)] [lower u64] [central u64] [upper u64] [c0 bool] [cup bool])
+  (let ([lhi (/ lower 1000000000)] [llo (cast u32 (% lower 1000000000))]
+        [chi (/ central 1000000000)] [clo (cast u32 (% central 1000000000))]
+        [uhi (/ upper 1000000000)] [ulo (cast u32 (% upper 1000000000))])
+    (cond [(== uhi 0) (ryu-digits32 r llo clo ulo c0 cup 8)]
+          [(< lhi uhi)
+           (ryu-digits32 r (cast u32 (if (!= llo 0) (+ lhi 1) lhi)) (cast u32 chi) (cast u32 uhi) (and c0 (== clo 0))
+                         (or (> clo 500000000) (and (== clo 500000000) cup)) 8)
+           (+= (-> r dp) 9)]
+          [else
+           (let ([n 9] [v chi])
+             (while (> v 0)
+               (-= n 1)
+               (set! (@ (-> r d) n) (+ 48 (cast i32 (% v 10))))
+               (set! v (/ v 10)))
+             (+= (-> r d) n)
+             (set! (-> r nd) (- 9 n))
+             (ryu-digits32 r llo clo ulo c0 cup (+ (-> r nd) 8)))])
+    (while (and (> (-> r nd) 0) (== (@ (-> r d) (- (-> r nd) 1)) 48)) (-= (-> r nd) 1))
+    (while (and (> (-> r nd) 0) (== (@ (-> r d) 0) 48))
+      (-= (-> r nd) 1)
+      (-= (-> r dp) 1)
+      (+= (-> r d) 1))))
+
+(define (ryu-digits32 [r (ptr decimal-slice)] [lower u32] [central u32] [upper u32] [c0 bool] [cup bool] [end i32])
+  (when (== upper 0)
+    (set! (-> r dp) (+ end 1))
+    (return))
+  (let ([trimmed 0] [next u32 0])
+    (while (> upper 0)
+      (let ([l (/ (+ lower 9) 10)] [c (/ central 10)] [digit (% central 10)] [u (/ upper 10)])
+        (when (> l u) (break))
+        (when (and (== l (+ c 1)) (< c u))
+          (+= c 1)
+          (set! digit 0)
+          (set! cup #f))
+        (+= trimmed 1)
+        (set! c0 (and c0 (== next 0)))
+        (set! next digit)
+        (set! lower l)
+        (set! central c)
+        (set! upper u)))
+    (when (> trimmed 0)
+      (set! cup (or (> next 5) (and (== next 5) (or (not c0) (== (bit-and central 1) 1))))))
+    (when (and (< central upper) cup) (+= central 1))
+    (let ([v central] [n (- end trimmed)])
+      (while (>= n (-> r nd))
+        (set! (@ (-> r d) n) (+ 48 (cast i32 (% v 10))))
+        (set! v (/ v 10))
+        (-= n 1)))
+    (set! (-> r nd) (+ (- end trimmed) 1))
+    (set! (-> r dp) (+ (-> r nd) trimmed))))
+
+(define (digit-value [b i32] [radix i32]) -> i32
+  (let ([d (cond [(and (>= b #\0) (<= b #\9)) (- b #\0)]
+                 [(and (>= b #\a) (<= b #\z)) (+ (- b #\a) 10)]
+                 [(and (>= b #\A) (<= b #\Z)) (+ (- b #\A) 10)]
+                 [else 99])])
+    (if (< d radix) d -1)))
+
+(define (digits? [s string] [radix i32]) -> bool
+  (when (== (-> s length) 0) (return #f))
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (when (< (digit-value (@ s i) radix) 0) (return #f)))
+  #t)
+
+(define (digits-integer [s string] [radix i32] [negative bool] [to (ptr u64)]) -> bool
+  (let ([n u64 0] [r (cast u64 radix)] [d u64 0])
+    (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+      (set! d (cast u64 (digit-value (@ s i) radix)))
+      (when (> n (/ (- 18446744073709551615 d) r)) (return #f))
+      (set! n (+ (* n r) d)))
+    (when (and negative (> n 9223372036854775808)) (return #f))
+    (set! (@ to) (if negative (- 0 n) n))
+    #t))
+
+(define digit-values (ptr u8) 0)
+(define digit-room u32 0)
+
+(define (read-decimal [s string] [to (ptr f64)]) -> bool
+  (let ([n (-> s length)] [i u32 0] [b 0] [negative #f] [digits 0] [point #f] [fraction 0]
+        [exponent 0] [exponent-negative #f] [has-exponent #f])
+    (when (== n 0) (return #f))
+    (when (> n digit-room)
+      (set! digit-room (* 2 n))
+      (set! digit-values (cast (ptr u8) (realloc digit-values digit-room))))
+    (set! b (@ s 0))
+    (when (or (== b #\-) (== b #\+))
+      (set! negative (== b #\-))
+      (set! i 1)
+      (when (== (slice s 1) "inf.0")
+        (set! (@ to) (if negative (/ -1.0 0.0) (/ 1.0 0.0)))
+        (return #t))
+      (when (== (slice s 1) "nan.0")
+        (set! (@ to) (/ 0.0 0.0))
+        (return #t)))
+    (while (< i n)
+      (set! b (@ s i))
+      (if (and (== b #\.) (not point))
+          (set! point #t)
+          (begin
+            (when (or (< b #\0) (> b #\9)) (break))
+            (set! (@ digit-values digits) (- b #\0))
+            (+= digits 1)
+            (when point (+= fraction 1))))
+      (+= i 1))
+    (when (== digits 0) (return #f))
+    (when (< i n)
+      (set! b (@ s i))
+      (when (and (!= b #\e) (!= b #\E)) (return #f))
+      (set! has-exponent #t)
+      (+= i 1)
+      (when (< i n)
+        (set! b (@ s i))
+        (when (or (== b #\-) (== b #\+))
+          (set! exponent-negative (== b #\-))
+          (+= i 1)))
+      (when (>= i n) (return #f))
+      (while (< i n)
+        (set! b (@ s i))
+        (when (or (< b #\0) (> b #\9)) (return #f))
+        (when (< exponent 100000) (set! exponent (+ (* exponent 10) (- b #\0))))
+        (+= i 1))
+      (when (> exponent 100000) (set! exponent 100000)))
+    (unless (or point has-exponent) (return #f))
+    (set! (@ to) (decimal-flonum (slice digit-values digits) (- (if exponent-negative (- exponent) exponent) fraction)
+                                 negative))
+    #t))
+
+(define (decimal-flonum [digits (slice u8)] [k i32] [negative bool]) -> f64
+  (let ([ds digits] [x f64 0])
+    (while (and (> (-> ds length) 0) (== (@ ds 0) 0)) (set! ds (slice ds 1)))
+    (let ([nd (cast i32 (-> ds length))])
+      (set! x (cond [(== nd 0) 0.0]
+                    [(> (+ nd k) 310) (bits-f64 9218868437227405312)]
+                    [(< (+ nd k) -330) 0.0]
+                    [(and (<= nd 15) (>= k -22) (<= k 22)) (small-decimal ds k)]
+                    [(fast-decimal ds k (& x)) x]
+                    [else (bits-f64 (big-decimal ds k))])))
+    (if negative (- x) x)))
+
+(define (small-decimal [digits (slice u8)] [k i32]) -> f64
+  (let ([n u64 0] [p f64 1.0])
+    (for ([i u32 0]) (< i (-> digits length)) (+= i 1) (set! n (+ (* n 10) (@ digits i))))
+    (for ([i 0]) (< i (if (>= k 0) k (- k))) (+= i 1) (set! p (* p 10)))
+    (if (>= k 0) (* (cast f64 n) p) (/ (cast f64 n) p))))
+
+;; Eisel–Lemire, after Go's strconv (eisel_lemire.go, and atof64 for more than 19 digits).
+
+(define (fast-decimal [digits (slice u8)] [k i32] [to (ptr f64)]) -> bool
+  (let* ([nd (cast i32 (-> digits length))] [man u64 0] [n (if (> nd 19) 19 nd)] [cut #f] [up f64 0])
+    (for ([i 0]) (< i n) (+= i 1) (set! man (+ (* man 10) (@ digits i))))
+    (for ([i n]) (< i nd) (+= i 1) (when (!= (@ digits i) 0) (set! cut #t)))
+    (and (eisel-lemire man (+ k (- nd n)) to)
+         (or (not cut) (and (eisel-lemire (+ man 1) (+ k (- nd n)) (& up)) (== up (@ to)))))))
+
+(define (eisel-lemire [man u64] [k i32] [to (ptr f64)]) -> bool
+  (when (or (< k -348) (> k 347)) (return #f))
+  (let* ([zeros (leading-zeros man)] [m (<< man (cast u64 zeros))] [p (power-of-ten k)]
+         [e (- (+ (>> (* 217706 k) 16) 1087) (cast i32 zeros))]
+         [(hi lo) (mul-128 m (@ p 0))])
+    (when (and (== (bit-and hi 511) 511) (< (+ lo m) m))
+      (let* ([(yhi ylo) (mul-128 m (@ p 1))] [mlo (+ lo yhi)] [mhi (+ hi (cast u64 (< mlo lo)))])
+        (when (and (== (bit-and mhi 511) 511) (== (+ mlo 1) 0) (< (+ ylo m) m)) (return #f))
+        (set! hi mhi)
+        (set! lo mlo)))
+    (let* ([top (>> hi 63)] [mantissa (>> hi (+ top 9))])
+      (-= e (cast i32 (bit-xor top 1)))
+      (when (and (== lo 0) (== (bit-and hi 511) 0) (== (bit-and mantissa 3) 1)) (return #f))
+      (set! mantissa (>> (+ mantissa (bit-and mantissa 1)) 1))
+      (when (!= (>> mantissa 53) 0)
+        (set! mantissa (>> mantissa 1))
+        (+= e 1))
+      (when (or (<= e 0) (>= e 2047)) (return #f))
+      (set! (@ to) (bits-f64 (cast i64 (bit-or (<< (cast u64 e) 52) (bit-and mantissa 4503599627370495)))))
+      #t)))
+
+(define (mul-128 [a u64] [b u64]) -> (values u64 u64)
+  (let* ([a0 (bit-and a 4294967295)] [a1 (>> a 32)] [b0 (bit-and b 4294967295)] [b1 (>> b 32)]
+         [p00 (* a0 b0)] [p01 (* a0 b1)] [p10 (* a1 b0)]
+         [mid (+ (>> p00 32) (bit-and p01 4294967295) (bit-and p10 4294967295))])
+    (values (+ (* a1 b1) (>> p01 32) (>> p10 32) (>> mid 32)) (bit-or (<< mid 32) (bit-and p00 4294967295)))))
+
+;; 10^-348 to 10^347 as 128-bit mantissas rounded down, high half first, as in Go's strconv; computed on first use.
+(define ten-powers (ptr u64) 0)
+
+(define (power-of-ten [q i32]) -> (ptr u64)
+  (when (== ten-powers 0) (set! ten-powers (make-ten-powers)))
+  (+ ten-powers (* 2 (+ q 348))))
+
+(define (make-ten-powers) -> (ptr u64)
+  (let* ([t (cast (ptr u64) (malloc 11136))] [limbs (array u64 44)] [x (slice limbs)])
+    (memset limbs 0 352)
+    (set! (@ x 0) 1)
+    (for ([q 0]) (<= q 347) (+= q 1)
+      (big-top! x (+ t (* 2 (+ q 348))))
+      (big-mul-add! x 10 0))
+    (memset limbs 0 352)
+    (set! (@ x 41) 1)
+    (for ([q -1]) (>= q -348) (-= q 1)
+      (big-divide-small! x 10)
+      (big-top! x (+ t (* 2 (+ q 348)))))
+    t))
+
+(define (big-decimal [digits (slice u8)] [k i32]) -> i64
+  (let* ([nd (cast i32 (-> digits length))] [ak (if (>= k 0) k (- k))]
+         [len (cast u32 (+ (/ (+ (* (+ nd ak) 4) 1400) 32) 4))]
+         [a (make-arena)] [n (big-new (& a) len)] [m (big-new (& a) len)] [r (big-new (& a) len)]
+         [s 0] [q u64 0] [mant u64 0] [e2 0])
+    (for ([i u32 0]) (< i (-> digits length)) (+= i 1) (big-mul-add! n 10 (@ digits i)))
+    (set! (@ m 0) 1)
+    (for ([i 0]) (< i ak) (+= i 1) (big-mul-add! (if (>= k 0) n m) 10 0))
+    (set! s (- 54 (- (big-bit-length n) (big-bit-length m))))
+    (when (> s 1075) (set! s 1075))
+    (while #t
+      (set! q (big-quotient (& a) n m s r))
+      (if (>= q 18014398509481984)
+          (-= s 1)
+          (begin
+            (when (or (>= q 9007199254740992) (== s 1075)) (break))
+            (+= s 1))))
+    (set! mant (>> q 1))
+    (when (and (!= (bit-and q 1) 0) (or (not (big-zero? r)) (!= (bit-and mant 1) 0)))
+      (+= mant 1))
+    (set! e2 (- 1 s))
+    (when (== mant 9007199254740992)
+      (set! mant 4503599627370496)
+      (+= e2 1))
+    (arena-free (& a))
+    (cond [(< mant 4503599627370496) mant]
+          [(> (+ e2 1075) 2046) 9218868437227405312]
+          [else (bit-or (<< (cast u64 (+ e2 1075)) 52) (- mant 4503599627370496))])))
+
+;; A number is 32-bit limbs, least significant first, each in a u64.
+(define (big-new [a (ptr arena)] [len u32]) -> (slice u64)
+  (let ([x (cast (ptr u64) (arena-alloc a (* 8 len)))])
+    (memset x 0 (* 8 len))
+    (slice x len)))
+
+(define (big-mul-add! [x (slice u64)] [k u64] [c u64])
+  (for ([i u32 0]) (< i (-> x length)) (+= i 1)
+    (let ([v (+ (* (@ x i) k) c)])
+      (set! (@ x i) (bit-and v 4294967295))
+      (set! c (>> v 32)))))
+
+(define (big-divide-small! [x (slice u64)] [d u64])
+  (let ([r u64 0] [i (-> x length)])
+    (while (> i 0)
+      (-= i 1)
+      (let ([v (bit-or (<< r 32) (@ x i))])
+        (set! (@ x i) (/ v d))
+        (set! r (% v d))))))
+
+(define (big-limb [x (slice u64)] [i u32]) -> u64 (if (< i (-> x length)) (@ x i) 0))
+
+(define (big-bits [x (slice u64)] [i i32]) -> u64
+  (cond [(<= i -64) 0]
+        [(< i 0) (<< (big-bits x 0) (cast u64 (- i)))]
+        [else
+         (let* ([w (cast u32 (/ i 32))] [s (cast u64 (% i 32))]
+                [v (bit-or (>> (big-limb x w) s) (<< (big-limb x (+ w 1)) (- 32 s)))])
+           (if (== s 0) v (bit-or v (<< (big-limb x (+ w 2)) (- 64 s)))))]))
+
+(define (big-top! [x (slice u64)] [p (ptr u64)])
+  (let ([n (big-bit-length x)])
+    (set! (@ p 0) (big-bits x (- n 64)))
+    (set! (@ p 1) (big-bits x (- n 128)))))
+
+(define (big-bit-length [x (slice u64)]) -> i32
+  (let ([i (cast i32 (-> x length))])
+    (while (> i 0)
+      (-= i 1)
+      (when (!= (@ x i) 0)
+        (return (+ (* i 32) (- 64 (cast i32 (leading-zeros (@ x i))))))))
+    0))
+
+(define (big-zero? [x (slice u64)]) -> bool (== (big-bit-length x) 0))
+
+(define (big-shl [a (ptr arena)] [x (slice u64)] [b i32]) -> (slice u64)
+  (let ([r (big-new a (-> x length))] [w (/ b 32)] [t (cast u64 (% b 32))])
+    (for ([i w]) (< i (cast i32 (-> x length))) (+= i 1)
+      (let ([v (<< (@ x (- i w)) t)])
+        (when (and (!= t 0) (> i w))
+          (set! v (bit-or v (>> (@ x (- i w 1)) (- 32 t)))))
+        (set! (@ r i) (bit-and v 4294967295))))
+    r))
+
+(define (big-shr1! [x (slice u64)])
+  (for ([i u32 0]) (< i (-> x length)) (+= i 1)
+    (let ([v (>> (@ x i) 1)])
+      (when (< (+ i 1) (-> x length)) (set! v (bit-or v (<< (bit-and (@ x (+ i 1)) 1) 31))))
+      (set! (@ x i) v))))
+
+(define (big-compare [x (slice u64)] [y (slice u64)]) -> i32
+  (let ([i (cast i32 (-> x length))])
+    (while (> i 0)
+      (-= i 1)
+      (when (< (@ x i) (@ y i)) (return -1))
+      (when (> (@ x i) (@ y i)) (return 1)))
+    0))
+
+(define (big-sub! [x (slice u64)] [y (slice u64)])
+  (let ([borrow i64 0])
+    (for ([i u32 0]) (< i (-> x length)) (+= i 1)
+      (let ([v (- (cast i64 (@ x i)) (cast i64 (@ y i)) borrow)])
+        (set! borrow (< v 0))
+        (set! (@ x i) (bit-and v 4294967295))))))
+
+(define (big-quotient [a (ptr arena)] [n (slice u64)] [m (slice u64)] [s i32] [r (slice u64)]) -> u64
+  (let ([x (big-shl a n (if (>= s 0) s 0))]
+        [t (big-shl a (if (>= s 0) m (big-shl a m (- s))) 55)]
+        [q u64 0])
+    (for ([i 0]) (<= i 55) (+= i 1)
+      (set! q (<< q 1))
+      (when (>= (big-compare x t) 0)
+        (big-sub! x t)
+        (set! q (bit-or q 1)))
+      (big-shr1! t))
+    (memcpy (-> r items) (-> x items) (* 8 (-> x length)))
+    q))
+
+;; ---- events and traps ----
+;; The host calls on-event for each event. An event with a tag goes to the handler in its event-head, and one without
+;; goes to each handler given to untagged-handler!. After a trap, the host calls on-trap with the message, which goes
+;; to each handler given to trap-handler!; on-trap returns 0 when none was given. Handlers are called in the order they
+;; were given, and one given twice is kept once. A program's own on-event or on-trap replaces these.
+
+(typedef handler (fn (u32 u32 u32 (ptr void) i32)))
+
+(struct event-head [handle handler])
+
+(struct handlers [count u32] [fs (array i32 8)])
+
+(define untagged handlers)
+
+(define (untagged-handler! [f handler]) (handler-add! (& untagged) (cast i32 f)))
+
+(define (on-event [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (if (!= tag 0)
+      ((-> (cast (ptr event-head) tag) handle) source kind id tag value)
+      (for ([i u32 0]) (< i (-> untagged count)) (+= i 1)
+        ((cast handler (@ (-> untagged fs) i)) source kind id tag value))))
+
+(typedef recovery (fn (string)))
+
+(define recoveries handlers)
+
+(define (trap-handler! [f recovery]) (handler-add! (& recoveries) (cast i32 f)))
+
+(define (on-trap [why (ptr u8)] [n u32]) -> bool
+  (reset-stack!)
+  (for ([i u32 0]) (< i (-> recoveries count)) (+= i 1)
+    ((cast recovery (@ (-> recoveries fs) i)) (cast string (slice why n))))
+  (free why)
+  (> (-> recoveries count) 0))
+
+(define (handler-add! [hs (ptr handlers)] [f i32])
+  (for ([i u32 0]) (< i (-> hs count)) (+= i 1) (when (== (@ (-> hs fs) i) f) (return)))
+  (when (== (-> hs count) 8) (host-trap "more than 8 handlers of one kind"))
+  (set! (@ (-> hs fs) (-> hs count)) f)
+  (+= (-> hs count) 1))
+
+;; ---- entry lists ----
+;; Lists cross to and from the host as entries, each ended by a zero.
+
+(define (buffer-add-entries! [b (ptr buffer)] [l (slice string)])
+  (for ([i u32 0]) (< i (-> l length)) (+= i 1)
+    (buffer-add-string! b (@ l i))
+    (buffer-add-byte! b 0)))
+
+;; The n bytes of entries at p, which it frees, as strings in one block from malloc, which (free (-> l items)) frees.
+(define (entry-strings [p (ptr u8)] [n u32]) -> (slice string)
+  (when (== p 0) (return (slice (cast (ptr string) 0) 0)))
+  (let ([count u32 0])
+    (for ([i u32 0]) (< i n) (+= i 1) (when (== (@ p i) 0) (+= count 1)))
+    (let* ([items (cast (ptr string) (malloc (+ (* count 8) n)))] [bytes (cast (ptr u8) (+ items count))] [start u32 0]
+           [k u32 0])
+      (memcpy bytes p n)
+      (free p)
+      (for ([i u32 0]) (< i n) (+= i 1)
+        (when (== (@ bytes i) 0)
+          (set! (@ items k) (cast string (slice (+ bytes start) (- i start))))
+          (+= k 1)
+          (set! start (+ i 1))))
+      (slice items count))))

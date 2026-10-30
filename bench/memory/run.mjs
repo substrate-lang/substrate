@@ -9,7 +9,7 @@ import path from 'node:path';
 
 const [out, reps = '3'] = process.argv.slice(2);
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
-const host = `${root}/host/subhost.mjs`;
+const host = `${root}/substrate/host/subhost.mjs`;
 const get = (target, more = '') => `GET ${target} HTTP/1.1\r\nhost: 127.0.0.1\r\n${more}\r\n`;
 const upgrade = get('/ws', 'upgrade: websocket\r\nconnection: upgrade\r\n'
   + 'sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n');
@@ -124,8 +124,8 @@ let best = Infinity;
 for (let i = 0; i < Number(reps); i++) {
   fs.rmSync(`${out}/compiler`, { recursive: true, force: true });
   const t = performance.now();
-  const p = spawnSync(host, ['-A', `${root}/build/compiler`, root, 'build', 'compiler/main.sub', '-o', `${out}/compiler`,
-    '-d', root], { cwd: root, encoding: 'utf8' });
+  const p = spawnSync(host, ['-A', `${root}/build/compiler`, `${root}/substrate`, 'build', 'substrate/compiler/main.sub',
+    '-o', `${out}/compiler`, '-d', root], { cwd: root, encoding: 'utf8' });
   if (p.status !== 0) throw new Error(`the compiler's build failed: ${p.stderr}`);
   best = Math.min(best, performance.now() - t);
 }

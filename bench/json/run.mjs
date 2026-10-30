@@ -29,7 +29,7 @@ const run = (command, args) => {
 };
 
 const dir = path.dirname(files[0]);
-const ours = lines(run(process.execPath, [...flags, `${root}/host/subhost.mjs`, `-R=${dir}`, `${out}/ours`, reps, ...files]));
+const ours = lines(run(process.execPath, [...flags, `${root}/substrate/host/subhost.mjs`, `-R=${dir}`, `${out}/ours`, reps, ...files]));
 const native = lines(run(`${out}/cjson.native`, [reps, ...files]));
 
 let printed = '';

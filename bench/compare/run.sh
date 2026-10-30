@@ -16,7 +16,7 @@ for name in "${names[@]}"; do
   done
 done
 
-node=(node --stack-size=4000 --experimental-wasm-exnref --no-liftoff "$root/host/subhost.mjs")
+node=(node --stack-size=4000 --experimental-wasm-exnref --no-liftoff "$root/substrate/host/subhost.mjs")
 declare -A best result
 run() { # name lang
   local start=$EPOCHREALTIME line end us

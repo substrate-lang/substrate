@@ -41,8 +41,9 @@
             pkgs.lld           # wasm-ld: links the C benchmarks' C to wasm (bench/substrate)
             pkgs.gnumake
             pkgs.time          # GNU time: bench/bend/compile's time and memory
-            pkgs.nodejs        # V8: the host (host/subhost.mjs), and the web tests' driver
+            pkgs.nodejs        # V8: the host (substrate/host/subhost.mjs), and the web tests' driver
             pkgs.openssl       # certificates for the TLS test
+            pkgs.git           # repositories for the package tests
             (chromium pkgs)    # the headless browser of the web tests (above)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.clang     # the C benchmarks' compiler (bench/substrate)
