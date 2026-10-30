@@ -362,6 +362,31 @@ else
   fail=$((fail + 1))
   echo "FAIL sub hash and map: got $hashed and $mapped"
 fi
+# sub doc: each module as its declarations would read in a header file, in its language's own forms, each directory as
+# a list of its modules, and pages linking a type's name to where it is defined; docs/ is what make docs writes.
+documented="$builds/documented"
+rm -rf "${documented:?}"
+bin/sub doc -o "$documented/text" tests/doc/sample > /dev/null 2>&1
+bin/sub doc --html -o "$documented/html" tests/doc/sample > /dev/null 2>&1
+printed="$(bin/sub doc std/http/cookie 2>&1)"
+if diff -r tests/doc/expected "$documented/text" > /dev/null &&
+   grep -qF '<a href="#point">point</a>' "$documented/html/sample/sample.html" &&
+   grep -qF '<a href="shapes.html#shape">shape</a>' "$documented/html/sample/sample.html" &&
+   [ "$printed" = "$(cat docs/std/http/cookie.txt)" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub doc: tests/doc/expected differs, or the pages' links, or a module printed from docs/std/http/cookie.txt"
+  diff -r tests/doc/expected "$documented/text" | head -20
+fi
+bin/sub doc -o "$documented/docs" std compiler host cmd packages/sqlite > /dev/null 2>&1
+if diff -r docs "$documented/docs" > /dev/null; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL docs/ is not what sub doc writes: make docs writes it again"
+  diff -r docs "$documented/docs" | head -20
+fi
 # A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
 rm -rf "${changed:?}"
