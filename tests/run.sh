@@ -479,6 +479,15 @@ else
   fail=$((fail + 1))
   echo "FAIL fetching again and sub fetch URL: got $stored, then $fetched_url"
 fi
+# sub doc fetches what a package it documents depends on, as build does.
+fetched_doc="$(fetched doc -o "$root/$builds/fetch/doc" archives/outer -P build/doc)"
+if [[ "$fetched_doc" == "sub: fetching http://fake/json.tar.gz" ]] &&
+   grep -qx ';; requires json/json' "$builds/fetch/doc/outer/outer.txt"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub doc fetching: got $fetched_doc"
+fi
 echo "$built modules built, $unbuilt failed"
 echo "$pass passed, $fail failed; $again built again from the cache"
 [ $fail -eq 0 ] && [ $unbuilt -eq 0 ]
