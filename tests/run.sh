@@ -386,7 +386,7 @@ else
   echo "FAIL sub doc: tests/doc/expected differs, or the pages' links, or a module printed by name: got $dependency and $outside"
   diff -r tests/doc/expected "$documented/text" | head -20
 fi
-bin/sub doc -o "$documented/docs" std compiler host cmd packages/sqlite > /dev/null 2>&1
+bin/sub doc -o "$documented/docs" substrate std cmd packages/sqlite > /dev/null 2>&1
 if diff -r docs "$documented/docs" > /dev/null; then
   pass=$((pass + 1))
 else

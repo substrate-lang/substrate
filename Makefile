@@ -20,10 +20,10 @@ repl:
 
 docs:
 	rm -rf docs
-	bin/sub doc -o docs std compiler host cmd packages/sqlite
+	bin/sub doc -o docs substrate std cmd packages/sqlite
 
 html:
-	bin/sub doc --html -o $(OUT)/doc std compiler host cmd packages/sqlite
+	bin/sub doc --html -o $(OUT)/doc substrate std cmd packages/sqlite
 
 clean:
 	rm -rf build
