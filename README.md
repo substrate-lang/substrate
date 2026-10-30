@@ -14,7 +14,9 @@ compiler is written in it, builds itself, and runs in a browser.
   modules, phases and macros that run at compile time. `checker.sub` checks
   and lowers Substrate's other forms. `substrate.sub` is the default language,
   `wasm.sub` gives wasm's forms as `wasm:name`, and `syntax.sub` and
-  `macros.sub` hold the data and tools macros work with.
+  `macros.sub` hold the data and tools macros work with. `roots.sub` finds
+  the module a name or a path means, under the module map's rules, for the
+  compiler and for sub.
 - `substrate/host/`: what runs compiled programs: `subhost.mjs` on Node, and
   `web/` in a browser (experimental).
 - `std/`: libraries written in Substrate, a package every program has without
@@ -29,9 +31,10 @@ compiler is written in it, builds itself, and runs in a browser.
   library, WebGPU and `shade/` for GPU programs compiled to WGSL, a game
   library, examples and a REPL.
 - `packages/`: packages outside the standard library: `sqlite/`.
-- `cmd/`: a package of sub, the command `bin/sub` runs, and the server
-  `sub serve` runs.
-- `seed/`: a checked-in build of the compiler, which builds it from source.
+- `cmd/`: a package of sub, the command `bin/sub` runs, which reads packages
+  and runs the compiler, and the server `sub serve` runs.
+- `seed/`: checked-in builds of the compiler and of sub, which build them
+  from source.
 - `docs/`: the documentation of `substrate/`, `std/`, `cmd/` and
   `packages/sqlite/`, each module's declarations and comments as text, from
   `make docs`: `bin/sub doc -o docs substrate std cmd packages/sqlite`.
@@ -55,7 +58,7 @@ In the dev shell (`nix develop`):
     make check                             # the tests
     tests/web/run.sh                       # the browser tests
     make bootstrap                         # the compiler builds itself into the same bytes
-    make seed                              # and becomes the seed
+    make seed                              # and becomes the seed, with sub
     make repl                              # the REPL's site, in build/web/repl
     make docs                              # the documentation in docs/
     make html                              # the same as HTML, in build/doc
