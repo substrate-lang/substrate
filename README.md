@@ -27,6 +27,10 @@ compiler is written in it, builds itself, and runs in a browser.
 - `host/`: what runs compiled programs: `subhost.mjs` on Node, and `web/` in a
   browser (experimental).
 - `seed/`: a checked-in build of the compiler, which builds it from source.
+- `docs/`: the documentation of `std/`, `compiler/`, `host/`, `cmd/` and
+  `packages/sqlite/`, each module's declarations and comments as text, from
+  `make docs`: `bin/sub doc -o docs std compiler host cmd packages/sqlite`.
+  `make html` writes it as HTML, into `build/doc`.
 - `tests/`, `bench/`.
 
 ## Commands
@@ -39,9 +43,13 @@ In the dev shell (`nix develop`):
     bin/sub expand FILE                    # FILE's expansion
     bin/sub site OUT FILE                  # a web site for a page program
     bin/sub serve OUT                      # serve it locally
+    bin/sub doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM
+    bin/sub doc -o DIR PACKAGE ...         # packages' documentation as text, or with --html as HTML, into DIR
     make check                             # the tests
     tests/web/run.sh                       # the browser tests
     make bootstrap                         # the compiler builds itself into the same bytes
     make seed                              # and becomes the seed
     make repl                              # the REPL's site, in build/web/repl
+    make docs                              # the documentation in docs/
+    make html                              # the same as HTML, in build/doc
     bench/*/run.sh                         # benchmarks
