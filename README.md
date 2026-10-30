@@ -30,7 +30,8 @@ compiler is written in it, builds itself, and runs in a browser.
   Substrate, with `nodes/`, the run-time nodes they share. `web/`
   (experimental) holds programs in a web page: a UI library, WebGPU and
   `shade/` for GPU programs compiled to WGSL, a game library, examples and a
-  REPL. `sqlite/` is SQLite.
+  REPL. `sqlite/` is SQLite as a wasm module, with its file layer and API in
+  Substrate.
 - `cmd/`: a package of sub, the command `bin/sub` runs, which reads packages
   and runs the compiler, and the server `sub serve` runs.
 - `seed/`: checked-in builds of the compiler and of sub, which build them

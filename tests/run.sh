@@ -84,8 +84,7 @@ for t in "${tests[@]}"; do
     if [ -f "$base.out" ]; then diff <(echo "$actual") "$base.out" | head -20; else echo "$actual" | head -10; fi
   fi
 done
-# Each module in cmd, std, packages, bench, substrate/host, tests/web and tests/proxy builds, except the pieces in
-# bench/bend/compile.
+# Each module in cmd, std, packages, bench, substrate/host, tests/web and tests/proxy builds.
 mapfile -t modules < <(find cmd std packages bench substrate/host tests/web tests/proxy -name '*.sub' \
                          -not -name package.sub -not -path 'bench/bend/compile/*' | sort)
 for m in "${modules[@]}"; do
@@ -247,8 +246,7 @@ else
   fail=$((fail + 1))
   echo "FAIL sub run: got $counted and exit $code, or a program not in build/"
 fi
-# A package's hash covers every file in its directory but its build/: a test and a README count, what sub builds there
-# does not.
+# A package's hash covers every file in its directory but build/.
 walked="$builds/walked"
 rm -rf "${walked:?}"
 cp -r tests/packages/walked "$walked"
@@ -267,8 +265,7 @@ else
   fail=$((fail + 1))
   echo "FAIL a package's hash and its files: got $before, $tested, $used, $after_build and $noted"
 fi
-# In a git repository that tracks a package's package.sub, its files are those git tracks: in an index of version 2, 3
-# or 4, of a repository naming objects by SHA-1 or SHA-256, and in a worktree; elsewhere every file counts.
+# A package in a git repository is the files git tracks: index versions 2 to 4, SHA-1 and SHA-256, worktrees.
 gitted="$root/$builds/gitted"
 rm -rf "${gitted:?}"
 in_git() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@" > /dev/null 2>&1; }
@@ -301,7 +298,7 @@ else
   fail=$((fail + 1))
   echo "FAIL packages in git: got $committed, $untracked, $intended, $four, $other, $sha and $copied"
 fi
-# A package's module requires any file in its directory, also through a macro, as a test of the package does.
+# A package's modules and tests require any file in its directory, also through a macro.
 held="$builds/held"
 rm -rf "${held:?}"
 mkdir -p "$held/q/tests"
@@ -325,8 +322,7 @@ else
   fail=$((fail + 1))
   echo "FAIL a package's files in a test's build: got $private and $public"
 fi
-# Nothing in a package is read through a link, which can lead outside it: not by a test, nor by one of its modules; its
-# hash leaves links out.
+# Nothing in a package is required through a link; its hash leaves links out.
 linked="$builds/linked"
 rm -rf "${linked:?}"
 mkdir -p "$linked/p/tests" "$linked/elsewhere"
@@ -404,8 +400,7 @@ else
   fail=$((fail + 1))
   echo "FAIL sub hash and map: got $hashed and $mapped"
 fi
-# A package that needs a newer substrate than this one is refused, and sub version prints this one's, with the hash of
-# substrate/.
+# A package needing a newer substrate is refused; sub version prints this one's, with substrate/'s hash.
 newer="$builds/newer"
 rm -rf "${newer:?}"
 mkdir -p "$newer"
@@ -421,9 +416,7 @@ else
   fail=$((fail + 1))
   echo "FAIL a newer substrate, and sub version: got $refused and $version"
 fi
-# sub doc: a package's files, each module as its declarations would read in a header file, in its language's own forms,
-# each directory as a list of its modules, the private ones below, and pages linking a type's name to where it is
-# defined; a name, found through the module map of the package holding the current directory; and the toolchain's.
+# sub doc: a package's modules as text and HTML, a module by name, and the toolchain's.
 documented="$builds/documented"
 rm -rf "${documented:?}"
 bin/sub doc -o "$documented/text" tests/doc/sample > /dev/null 2>&1
@@ -452,8 +445,7 @@ else
   fail=$((fail + 1))
   echo "FAIL sub doc of the toolchain: exit $whole"
 fi
-# sub doc with no arguments writes the package holding the current directory and those its module map gives, std among
-# them, as HTML in its build/doc, and refuses outside packages.
+# sub doc with no arguments writes the current package's and its map's documentation as HTML into its build/doc.
 packaged="$builds/packaged"
 rm -rf "${packaged:?}"
 mkdir -p "$packaged/loose"
@@ -528,8 +520,7 @@ for t in tests/fetch/*.sub; do
     echo "$actual" | head -10
   fi
 done
-# A store entry holds the files its hash covers: all of json's archive, and nest's with its inner package's at their
-# path; a checkout of a package's archive in git hashes as the archive does.
+# A store entry holds the files its hash covers, and a package's archive hashes as its checkout does.
 json_entry="$(find tests/fetch/build/app -name json.sub -printf '%h\n' | head -1)"
 nest_entry="$(find tests/fetch/build/nested -name nest.sub -printf '%h\n' | head -1)"
 json_files="$(cd "$json_entry" && find . -type f | LC_ALL=C sort | tr '\n' ' ')"
