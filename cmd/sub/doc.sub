@@ -1,20 +1,23 @@
-;; sub doc: the documentation of a package, or of a package of the toolchain (std, compiler, host, cmd), from its
-;; modules' source: as text, each module as a header file would read and each directory as a list of its modules, or
-;; as HTML. A module's language describes its forms (std/doc/doc.sub).
+;; sub doc: the documentation of a package, or of a root of the toolchain (std, compiler, host, cmd), from its modules'
+;; source: as text, each module as a header file would read and each directory as a list of its modules, or as HTML.
+;; A package's modules are its files, the modules it exports public and the rest private; every module of a root of the
+;; toolchain is public. A module's language describes its forms (std/doc/doc.sub).
 (require-unqualified macros compiler/macros)
 (require-unqualified ex compiler/expander)
 (require-unqualified rd compiler/reader)
 (require-unqualified fs host/fs)
 (require-unqualified manifest std/package/manifest)
+(require-unqualified map std/package/map)
 (require-unqualified paths std/package/path)
 (require-unqualified doc std/doc)
 (require-unqualified text std/doc/text)
 (require-unqualified html std/doc/html)
 (require-unqualified common cmd/sub/common)
+(require-unqualified build cmd/sub/build)
 
 (provide doc-command!)
 
-(struct target [label string] [dir string])
+(struct target [label string] [dir string] [modules datum] [public datum])
 
 (define (doc-command! [args (slice string)])
   (let ([out (option args "-o")] [rest (without (without args "-o" #t) "--html" #f)])
@@ -29,127 +32,101 @@
           [else (usage)])))
 
 (define (target-of [given string]) -> target
-  (let ([t target] [m manifest] [err (make-buffer)])
-    (if (toolchain? given)
-        (begin
-          (set! (-> t label) given)
-          (set! (-> t dir) (joined-path root given)))
-        (let ([dir (absolute given)])
-          (unless (manifest-read (& a) (joined-path dir "package.sub") (& m) (& err)) (failed! (local (buffer-string (& err)))))
-          (set! (-> t label) (-> m name))
-          (set! (-> t dir) dir)))
+  (if (toolchain-root? (string->datum given))
+      (toolchain-target given)
+      (let ([roots (mapped! (absolute given))]) (package-target (& (@ roots 0))))))
+
+;; ---- targets ----
+
+(define (toolchain-target [label string]) -> target
+  (let ([t target])
+    (set! (-> t label) label)
+    (set! (-> t dir) (joined-path root label))
+    (set! (-> t modules) (modules-under (-> t dir) ""))
+    (set! (-> t public) (-> t modules))
     t))
 
-(define (toolchain? [s string]) -> bool (or (== s "std") (== s "compiler") (== s "host") (== s "cmd")))
-
-;; ---- modules ----
-
-(define (modules-of [t (ptr target)] [rel string]) -> datum
-  (let ([here (if (== (-> rel length) 0) (-> t dir) (joined-path (-> t dir) rel))] [names (slice string)] [why string]
-        [out nil])
+;; modules-under gives every module of a root of the toolchain: each .sub file under its directory but its package.sub.
+(define (modules-under [dir string] [rel string]) -> datum
+  (let ([here (if (== (-> rel length) 0) dir (joined-path dir rel))] [names (slice string)] [why string] [out nil])
     (when (< (fs-list here (& names) (& why)) 0) (failed! why))
     (for ([i u32 0]) (< i (-> names length)) (+= i 1)
-      (let* ([n (@ names i)] [r (if (== (-> rel length) 0) n (joined-path rel n))] [full (joined-path here n)]
-             [kind (kind-of full)])
-        (cond [(starts? n ".") (begin)]
-              [(and (== kind fs-file) (ends? n ".sub") (!= n "package.sub")) (set! out (cons (string->datum r) out))]
-              [(and (== kind fs-directory) (!= n "build") (!= (kind-of (joined-path full "package.sub")) fs-file))
-               (set! out (append (modules-of t r) out))])))
-    (sort out (lambda ([x datum] [y datum]) -> bool (< (datum->string x) (datum->string y))))))
+      (let* ([n (@ names i)] [r (if (== (-> rel length) 0) n (joined-path rel n))] [kind (kind-of (joined-path here n))])
+        (cond [(and (== kind fs-file) (ends? n ".sub") (!= r "package.sub")) (set! out (cons (string->datum r) out))]
+              [(== kind fs-directory) (set! out (append (modules-under dir r) out))])))
+    (sorted out)))
 
-(define (module-name [t (ptr target)] [rel string]) -> datum
-  (string->datum (joined (joined (-> t label) "/") (if (ends? rel ".sub") (slice rel 0 (- (-> rel length) 4)) rel))))
+;; mapped! gives the roots of the module map of the package at dir, the package first, and gives the compiler the map.
+(define (mapped! [dir string]) -> (slice package-root)
+  (let ([m manifest] [err (make-buffer)] [text (make-buffer)] [roots (make-buffer)])
+    (unless (manifest-read (& a) (joined-path dir "package.sub") (& m) (& err)) (failed! (local (buffer-string (& err)))))
+    (locations! dir)
+    (unless (package-map (& a) dir "" (& m) store-dir (& text) (& roots) (& err)) (failed! (local (buffer-string (& err)))))
+    (set-module-map-text! (string->datum (buffer-string (& text))) '"the module map")
+    (slice (cast (ptr package-root) (-> roots bytes)) (/ (-> roots length) (sizeof package-root)))))
 
-(define (source-text [file string]) -> string
-  (let ([b (slice u8)] [why string])
-    (when (< (fs-read-file file (& b) (& why)) 0) (failed! why))
-    (cast string b)))
+(define (package-target [r (ptr package-root)]) -> target
+  (let ([t target])
+    (set! (-> t label) (-> r name))
+    (set! (-> t dir) (-> r dir))
+    (set! (-> t modules) (sorted (modules-in (-> r dir) (-> r files))))
+    (set! (-> t public) (modules-in (-> r dir) (-> r exports)))
+    t))
 
-(define (forms-of [file string] [text string]) -> datum (read-all text (string->symbol (local file))))
+(define (modules-in [dir string] [files (slice string)]) -> datum
+  (let ([out nil])
+    (for ([i u32 0]) (< i (-> files length)) (+= i 1)
+      (let ([f (@ files i)])
+        (when (and (ends? f ".sub") (within? f dir) (== (kind-of f) fs-file))
+          (set! out (cons (string->datum (slice f (+ (-> dir length) 1))) out)))))
+    out))
 
-(define (documented [t (ptr target)] [rel string] [full bool]) -> datum
-  (let* ([file (joined-path (-> t dir) rel)] [text (source-text file)] [forms (if full (forms-of file text) nil)]
-         [d (module-doc (module-name t rel) text forms (if full (description file forms t) 0))])
-    `(,(doc-name d) ,(doc-header d) ,(named t file (doc-language d))
-      ,(map (lambda ([r datum]) -> datum (named t file r)) (doc-requires d)) ,(doc-reexports d) ,(doc-items d))))
+(define (sorted [l datum]) -> datum (sort l (lambda ([x datum] [y datum]) -> bool (< (datum->string x) (datum->string y)))))
 
-;; named gives a module written by path, as a require or a language form writes it, by its name.
-(define (named [t (ptr target)] [file string] [written datum]) -> datum
-  (let ([w (datum->string written)] [full string])
-    (unless (and (> (-> w length) 2) (starts? w "\"") (ends? w "\"")) (return written))
-    (set! full (normal-path (& a) (joined-path (parent-of file) (slice w 1 (- (-> w length) 1)))))
-    (unless (within? full (-> t dir)) (return written))
-    (module-name t (slice full (+ (-> t dir length) 1)))))
+(define (identity-in [t (ptr target)] [rel datum]) -> datum
+  (string->datum (joined (joined (-> t label) "/") (datum->string rel))))
 
-;; ---- languages ----
-
-(define descriptions datum nil)
-
-(define (description [file string] [forms datum] [t (ptr target)]) -> datum
-  (let ([source (language-of forms)])
-    (if (== source 0)
-        (described (joined-path root "compiler/substrate.sub") t)
-        (let ([l (language-file file source t)]) (if (== (-> l length) 0) 0 (described l t))))))
-
-(define (described [file string] [t (ptr target)]) -> datum
-  (let ([known (assoc (string->datum file) descriptions)] [forms datum 0] [d datum 0] [source datum 0])
-    (unless (== known 0) (return (cdr known)))
-    (unless (== (kind-of file) fs-file) (return 0))
-    (set! forms (forms-of file (source-text file)))
-    (set! d (doc-forms-of forms))
-    (set! source (language-of forms))
-    (when (and (== d 0) (!= source 0))
-      (let ([l (language-file file source t)]) (unless (== (-> l length) 0) (set! d (described l t)))))
-    (set! descriptions (cons (cons (string->datum file) d) descriptions))
-    d))
-
-(define (language-file [file string] [source datum] [t (ptr target)]) -> string
-  (cond [(string? source) (normal-path (& a) (joined-path (parent-of file) (datum->string source)))]
-        [(symbol? source)
-         (let* ([n (symbol->string source)] [slash u32 0] [base string])
-           (while (and (< slash (-> n length)) (!= (@ n slash) #\/)) (+= slash 1))
-           (set! base (cond [(toolchain? (slice n 0 slash)) (joined-path root (slice n 0 slash))]
-                            [(== (slice n 0 slash) (-> t label)) (-> t dir)]
-                            [else ""]))
-           (cond [(== (-> base length) 0) ""]
-                 [(== slash (-> n length)) (joined-path base (joined n ".sub"))]
-                 [else (joined-path base (datum->string (named-file (string->datum base)
-                                                                   (string->datum (slice n (+ slash 1))))))]))]
-        [else ""]))
+(define (owner-of [t (ptr target)] [rel datum]) -> datum
+  (if (== (member rel (-> t public)) 0) (string->datum (-> t label)) '""))
 
 ;; ---- writing ----
 
-;; gathered gives a package's label, its modules' documentation, and its directories' indexes.
+;; gathered gives a target's label; for each of its modules, its path, its documentation and the package it is private
+;; to, if it is; and its directories' indexes.
 (define (gathered [t (ptr target)]) -> datum
-  (let* ([rels (modules-of t "")] [docs (map (lambda ([r datum]) -> datum (cons r (documented t (datum->string r) #t))) rels)])
-    `(,(string->datum (-> t label)) ,docs ,(map (lambda ([dir datum]) -> datum (index-of t (datum->string dir) docs))
-                                                (directories rels)))))
+  (let* ([docs (map (lambda ([r datum]) -> datum `(,r ,(module-doc (identity-in t r)) ,(owner-of t r))) (-> t modules))]
+         [heads (map (lambda ([e datum]) -> datum `(,(car e) ,(doc-name (cadr e)) ,(doc-header (cadr e)) ,(caddr e))) docs)])
+    `(,(string->datum (-> t label)) ,docs
+      ,(map (lambda ([dir datum]) -> datum (index-of t (datum->string dir) heads)) (directories (-> t modules))))))
 
 (define (texts! [out string] [sets datum])
   (file! out "index.txt"
          (index-text '"documentation" '""
-                     (map (lambda ([set datum]) -> datum (cons (string->datum (joined (datum->string (car set)) "/")) '"")) sets)))
+                     (map (lambda ([set datum]) -> datum (cons (string->datum (joined (datum->string (car set)) "/")) '"")) sets)
+                     nil))
   (while (pair? sets)
     (let ([es (cadr (car sets))] [is (caddr (car sets))])
       (while (pair? es)
-        (file! out (joined (datum->string (doc-name (cdr (car es)))) ".txt") (module-text (cdr (car es))))
+        (let ([e (car es)]) (file! out (joined (datum->string (doc-name (cadr e))) ".txt") (module-text (cadr e) (caddr e))))
         (set! es (cdr es)))
       (while (pair? is)
-        (let ([i (car is)]) (file! out (joined-path (datum->string (car i)) "index.txt") (index-text (car i) (cadr i) (caddr i))))
+        (let ([i (car is)])
+          (file! out (joined-path (datum->string (car i)) "index.txt") (index-text (car i) (cadr i) (caddr i) (cadddr i))))
         (set! is (cdr is))))
     (set! sets (cdr sets))))
 
 (define (site! [out string] [sets datum])
-  (let ([docs nil] [names nil] [labels nil] [ss sets] [ds datum 0])
+  (let ([docs nil] [names nil] [labels nil] [ss sets] [es datum 0])
     (while (pair? ss)
       (set! labels (cons (car (car ss)) labels))
-      (set! docs (append docs (map (lambda ([e datum]) -> datum (cdr e)) (cadr (car ss)))))
+      (set! docs (append docs (cadr (car ss))))
       (set! ss (cdr ss)))
-    (set! names (map (lambda ([d datum]) -> datum (doc-name d)) docs))
-    (set! ds docs)
-    (while (pair? ds)
-      (file! out (joined (datum->string (doc-name (car ds))) ".html") (module-page (car ds) names (types-for (car ds) docs names)))
-      (set! ds (cdr ds)))
+    (set! names (map (lambda ([e datum]) -> datum (doc-name (cadr e))) docs))
+    (set! es docs)
+    (while (pair? es)
+      (let ([d (cadr (car es))])
+        (file! out (joined (datum->string (doc-name d)) ".html") (module-page d names (types-for d docs) (caddr (car es)))))
+      (set! es (cdr es)))
     (set! ss sets)
     (while (pair? ss)
       (let ([is (caddr (car ss))])
@@ -162,23 +139,19 @@
 
 ;; types-for gives each type a signature in a module may name, its own and those of the modules it requires, with the
 ;; module that defines it.
-(define (types-for [d datum] [docs datum] [names datum]) -> datum
-  (let ([out nil] [ms (cons (doc-name d) (map (lambda ([r datum]) -> datum (main-name r names)) (doc-requires d)))])
+(define (types-for [d datum] [docs datum]) -> datum
+  (let ([out nil] [ms (cons (doc-name d) (doc-requires d))])
     (while (pair? ms)
-      (let ([ds docs])
-        (while (pair? ds)
-          (when (equal? (doc-name (car ds)) (car ms))
-            (let ([is (doc-items (car ds))])
+      (let ([es docs])
+        (while (pair? es)
+          (when (equal? (doc-name (cadr (car es))) (car ms))
+            (let ([is (doc-items (cadr (car es)))])
               (while (pair? is)
                 (when (equal? (item-kind (car is)) '"type") (set! out (cons (cons (item-name (car is)) (car ms)) out)))
                 (set! is (cdr is)))))
-          (set! ds (cdr ds))))
+          (set! es (cdr es))))
       (set! ms (cdr ms)))
     (reverse out)))
-
-(define (main-name [name datum] [names datum]) -> datum
-  (let ([alias (string->datum (joined-path (datum->string name) (base-of (datum->string name))))])
-    (if (and (== (member name names) 0) (!= (member alias names) 0)) alias name)))
 
 (define (directories [rels datum]) -> datum
   (let ([out (cons '"" nil)])
@@ -189,31 +162,34 @@
                       (let ([dir (string->datum (slice d 0 i))]) (when (== (member dir out) 0) (set! out (cons dir out)))))
                     (+= i 1))))
               rels)
-    (sort out (lambda ([x datum] [y datum]) -> bool (< (datum->string x) (datum->string y))))))
+    (sorted out)))
 
-;; index-of gives a directory's name, the header of its main module, and its entries: each module in it, then each
-;; directory in it, with the first sentence of a header (a directory's from its main module).
-(define (index-of [t (ptr target)] [dir string] [docs datum]) -> datum
+;; index-of gives a directory's name, the header of its main module (the root's is label.sub), its entries, and its
+;; private modules' entries, from each module's path, name, header and the package it is private to: an entry is a
+;; public module in it, or a directory in it, with the first sentence of a header (a directory's from its main module).
+(define (index-of [t (ptr target)] [dir string] [heads datum]) -> datum
   (let ([name (if (== (-> dir length) 0) (string->datum (-> t label)) (string->datum (joined-path (-> t label) dir)))]
-        [modules nil] [subdirs nil])
-    (for-each (lambda ([e datum])
-                (let* ([r (datum->string (car e))] [sub (child-of dir r)])
+        [modules nil] [private nil] [subdirs nil])
+    (for-each (lambda ([h datum])
+                (let* ([r (datum->string (car h))] [sub (child-of dir r)] [entry (cons (cadr h) (first-sentence (caddr h)))])
                   (when (== (parent-in r) dir)
-                    (set! modules (cons (cons (doc-name (cdr e)) (first-sentence (doc-header (cdr e)))) modules)))
+                    (if (equal? (cadddr h) '"") (set! modules (cons entry modules)) (set! private (cons entry private))))
                   (when (and (> (-> sub length) 0) (== (member (string->datum sub) subdirs) 0))
                     (set! subdirs (cons (string->datum sub) subdirs)))))
-              docs)
-    `(,name ,(header-in (main-of dir) docs)
+              heads)
+    `(,name ,(header-in (main-of t dir) heads)
       ,(append (reverse modules)
                (map (lambda ([s datum]) -> datum
                       (cons (string->datum (joined (joined-path (-> t label) (datum->string s)) "/"))
-                            (first-sentence (header-in (main-of (datum->string s)) docs))))
-                    (reverse subdirs))))))
+                            (first-sentence (header-in (main-of t (datum->string s)) heads))))
+                    (reverse subdirs)))
+      ,(reverse private))))
 
-(define (main-of [dir string]) -> string (if (== (-> dir length) 0) "" (joined-path dir (joined (base-of dir) ".sub"))))
+(define (main-of [t (ptr target)] [dir string]) -> string
+  (if (== (-> dir length) 0) (joined (-> t label) ".sub") (joined-path dir (joined (base-of dir) ".sub"))))
 
-(define (header-in [rel string] [docs datum]) -> datum
-  (let ([e (assoc (string->datum rel) docs)]) (if (== e 0) '"" (doc-header (cdr e)))))
+(define (header-in [rel string] [heads datum]) -> datum
+  (let ([h (assoc (string->datum rel) heads)]) (if (== h 0) '"" (caddr h))))
 
 (define (child-of [dir string] [rel string]) -> string
   (let* ([prefix (if (== (-> dir length) 0) "" (joined dir "/"))] [i (-> prefix length)])
@@ -233,24 +209,55 @@
 
 ;; ---- printing ----
 
+;; printed! prints the module or directory a name means as the compiler finds it, in the package holding the current
+;; directory, with its module map, or in the toolchain; or one item of the module.
 (define (printed! [name string] [item string])
-  (let* ([slash u32 0] [t target] [rel string] [file string])
-    (while (and (< slash (-> name length)) (!= (@ name slash) #\/)) (+= slash 1))
-    (unless (toolchain? (slice name 0 slash)) (failed! (joined name " is not in host, compiler, std or cmd")))
-    (set! t (target-of (slice name 0 slash)))
-    (set! rel (if (== slash (-> name length)) "" (slice name (+ slash 1))))
-    (set! file (joined-path (-> t dir) (joined rel ".sub")))
-    (cond [(and (> (-> rel length) 0) (== (kind-of file) fs-file))
-           (let ([d (documented (& t) (joined rel ".sub") #t)])
+  (let* ([project (project-of cwd)]
+         [roots (if (> (-> project length) 0) (mapped! project) (slice (cast (ptr package-root) 0) 0))]
+         [id (identity-named name (if (> (-> roots length) 0) (string->datum (joined (-> (@ roots 0) name) "/package.sub")) 0))]
+         [label string] [rest string] [path string] [t target])
+    (when (== id 0) (failed! (joined name " is not a module or a directory")))
+    (set! label (head-of (datum->string id)))
+    (set! path (slice (datum->string id) (+ (-> label length) 1)))
+    (set! rest (if (== (head-of name) name) "" (slice name (+ (-> (head-of name) length) 1))))
+    (set! t (if (toolchain-root? (string->datum label)) (toolchain-target label) (package-target (package-in roots label))))
+    (cond [(and (> (-> rest length) 0) (== path (joined rest ".sub")) (== (kind-of (joined-path (-> t dir) path)) fs-file))
+           (unless (!= (member (string->datum path) (-> t modules)) 0)
+             (failed! (joined (joined (joined name " is not one of the files of ") label) ", its exports and what their source requires")))
+           (let ([d (module-doc id)])
              (if (== (-> item length) 0)
-                 (say 1 (datum->string (module-text d)))
+                 (say 1 (datum->string (module-text d (owner-of (& t) (string->datum path)))))
                  (let ([i (filter (lambda ([x datum]) -> bool (equal? (item-name x) (string->datum item))) (doc-items d))])
                    (when (null? i) (failed! (joined (joined name " has no ") item)))
                    (say 1 (datum->string (item-text (car i)))))))]
-          [(or (== (-> rel length) 0) (== (kind-of (joined-path (-> t dir) rel)) fs-directory))
-           (let* ([rels (filter (lambda ([r datum]) -> bool (or (== (-> rel length) 0) (starts? (datum->string r) (joined rel "/"))))
-                                (modules-of (& t) ""))]
-                  [docs (map (lambda ([r datum]) -> datum (cons r (documented (& t) (datum->string r) #f))) rels)]
-                  [i (index-of (& t) rel docs)])
-             (say 1 (datum->string (index-text (car i) (cadr i) (caddr i)))))]
+          [(or (== (-> rest length) 0) (== (kind-of (joined-path (-> t dir) rest)) fs-directory))
+           (let* ([rels (filter (lambda ([r datum]) -> bool (or (== (-> rest length) 0) (starts? (datum->string r) (joined rest "/"))))
+                                (-> t modules))]
+                  [i (index-of (& t) rest
+                               (map (lambda ([r datum]) -> datum
+                                      (let ([m (identity-in (& t) r)]) `(,r ,(name-of m) ,(module-header m) ,(owner-of (& t) r))))
+                                    rels))])
+             (say 1 (datum->string (index-text (car i) (cadr i) (caddr i) (cadddr i)))))]
           [else (failed! (joined name " is not a module or a directory"))])))
+
+;; project-of gives the package holding dir, or "" when none or a root of the toolchain does.
+(define (project-of [dir string]) -> string
+  (let ([holder (package-holding (& a) dir)])
+    (if (or (== (-> holder length) 0) (!= (toolchain-holding (string->datum (joined-path holder "package.sub"))) 0)) "" holder)))
+
+(define (identity-named [name string] [from datum]) -> datum
+  (let ([id datum 0])
+    (try (let ([forms (read-all name (string->symbol "the command line"))])
+           (when (and (pair? forms) (null? (cdr forms)) (identifier? (car forms))) (set! id (module-identity (car forms) from))))
+         [catch compile-error (message blamed loc) (set! id 0)])
+    id))
+
+(define (head-of [s string]) -> string
+  (let ([i u32 0])
+    (while (and (< i (-> s length)) (!= (@ s i) #\/)) (+= i 1))
+    (slice s 0 i)))
+
+(define (package-in [roots (slice package-root)] [label string]) -> (ptr package-root)
+  (for ([i u32 0]) (< i (-> roots length)) (+= i 1) (when (== (-> (@ roots i) name) label) (return (& (@ roots i)))))
+  (failed! (joined "internal: there is no package " label))
+  0)

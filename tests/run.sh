@@ -362,21 +362,27 @@ else
   fail=$((fail + 1))
   echo "FAIL sub hash and map: got $hashed and $mapped"
 fi
-# sub doc: each module as its declarations would read in a header file, in its language's own forms, each directory as
-# a list of its modules, and pages linking a type's name to where it is defined; docs/ is what make docs writes.
+# sub doc: a package's files, each module as its declarations would read in a header file, in its language's own forms,
+# each directory as a list of its modules, the private ones below, and pages linking a type's name to where it is
+# defined; a name, found through the module map of the package holding the current directory; docs/ is what make docs
+# writes.
 documented="$builds/documented"
 rm -rf "${documented:?}"
 bin/sub doc -o "$documented/text" tests/doc/sample > /dev/null 2>&1
 bin/sub doc --html -o "$documented/html" tests/doc/sample > /dev/null 2>&1
 printed="$(bin/sub doc std/http/cookie 2>&1)"
+dependency="$(cd tests/packages/app && "$root/bin/sub" doc tools/text 2>&1 | head -1)"
+outside="$(cd tests/doc/sample && "$root/bin/sub" doc sample/unused 2>&1)"
 if diff -r tests/doc/expected "$documented/text" > /dev/null &&
    grep -qF '<a href="#point">point</a>' "$documented/html/sample/sample.html" &&
    grep -qF '<a href="shapes.html#shape">shape</a>' "$documented/html/sample/sample.html" &&
-   [ "$printed" = "$(cat docs/std/http/cookie.txt)" ]; then
+   grep -qF '<dt>private to</dt>' "$documented/html/sample/shapes.html" &&
+   [ "$printed" = "$(cat docs/std/http/cookie.txt)" ] && [ "$dependency" = ";; tools/text" ] &&
+   [ "$outside" = "sub: sample/unused is not one of the files of sample, its exports and what their source requires" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL sub doc: tests/doc/expected differs, or the pages' links, or a module printed from docs/std/http/cookie.txt"
+  echo "FAIL sub doc: tests/doc/expected differs, or the pages' links, or a module printed by name: got $dependency and $outside"
   diff -r tests/doc/expected "$documented/text" | head -20
 fi
 bin/sub doc -o "$documented/docs" std compiler host cmd packages/sqlite > /dev/null 2>&1
