@@ -411,6 +411,24 @@ else
   echo "FAIL docs/ is not what sub doc writes: make docs writes it again"
   diff -r docs "$documented/docs" | head -20
 fi
+# sub doc with no arguments writes the package holding the current directory and those its module map gives, std among
+# them, as HTML in its build/doc, and refuses outside packages.
+packaged="$builds/packaged"
+rm -rf "${packaged:?}"
+mkdir -p "$packaged/loose"
+cp -r tests/packages/app tests/packages/tools "$packaged/"
+wrote="$(cd "$packaged/app" && "$root/bin/sub" doc 2>&1)"
+unpackaged="$(cd "$packaged/loose" && "$root/bin/sub" doc 2>&1)"
+if [ "$wrote" = "build/doc/index.html" ] &&
+   grep -qF '<a href="tools/index.html">tools</a></td></tr><tr><td><a href="std/index.html">std</a>' \
+     "$packaged/app/build/doc/index.html" &&
+   grep -qF '<a href="../tools/text.html"><code>tools/text</code></a>' "$packaged/app/build/doc/app/app.html" &&
+   [ "$unpackaged" = "sub: there is no package.sub in the current directory or above it" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub doc with no arguments: got $wrote and $unpackaged"
+fi
 # A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
 rm -rf "${changed:?}"
