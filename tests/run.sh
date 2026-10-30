@@ -363,6 +363,23 @@ else
   fail=$((fail + 1))
   echo "FAIL sub hash and map: got $hashed and $mapped"
 fi
+# A package that needs a newer substrate than this one is refused, and sub version prints this one's, with the hash of
+# substrate/.
+newer="$builds/newer"
+rm -rf "${newer:?}"
+mkdir -p "$newer"
+printf '(package newer (version "1.0.0") (substrate "99.0.0"))\n' > "$newer/package.sub"
+printf '(define (main) (printf "newer~n"))\n' > "$newer/newer.sub"
+refused="$(bin/sub build "$newer/newer.sub" -c "$cache" 2>&1)"
+version="$(bin/sub version 2>&1)"
+shape="^substrate $(cat substrate/VERSION) sha256:[0-9a-f]{64}\$"
+if [ "$refused" = "sub: the package newer needs substrate 99.0.0 or newer, and this is $(cat substrate/VERSION)" ] &&
+   [[ "$version" =~ $shape ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL a newer substrate, and sub version: got $refused and $version"
+fi
 # sub doc: a package's files, each module as its declarations would read in a header file, in its language's own forms,
 # each directory as a list of its modules, the private ones below, and pages linking a type's name to where it is
 # defined; a name, found through the module map of the package holding the current directory; docs/ is what make docs
