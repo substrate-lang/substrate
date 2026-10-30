@@ -19,13 +19,10 @@ repl:
 	  $(shell find substrate/host std/languages/scheme std/languages/bend -name '*.sub' | sort) std/languages/nodes.sub std/encoding/utf8.sub
 
 docs:
-	rm -rf docs
-	bin/sub doc -o docs substrate std cmd packages/sqlite
-
-html:
+	rm -rf $(OUT)/doc
 	bin/sub doc --html -o $(OUT)/doc substrate std cmd packages/sqlite
 
 clean:
 	rm -rf build
 
-.PHONY: build/sub check bootstrap seed repl docs html clean
+.PHONY: build/sub check bootstrap seed repl docs clean

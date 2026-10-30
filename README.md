@@ -35,10 +35,6 @@ compiler is written in it, builds itself, and runs in a browser.
   and runs the compiler, and the server `sub serve` runs.
 - `seed/`: checked-in builds of the compiler and of sub, which build them
   from source.
-- `docs/`: the documentation of `substrate/`, `std/`, `cmd/` and
-  `packages/sqlite/`, each module's declarations and comments as text, from
-  `make docs`: `bin/sub doc -o docs substrate std cmd packages/sqlite`.
-  `make html` writes it as HTML, into `build/doc`.
 - `tests/`, `bench/`.
 
 ## Commands
@@ -60,6 +56,5 @@ In the dev shell (`nix develop`):
     make bootstrap                         # the compiler builds itself into the same bytes
     make seed                              # and becomes the seed, with sub
     make repl                              # the REPL's site, in build/web/repl
-    make docs                              # the documentation in docs/
-    make html                              # the same as HTML, in build/doc
+    make docs                              # the toolchain's and packages' documentation, as HTML in build/doc
     bench/*/run.sh                         # benchmarks
