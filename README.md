@@ -20,17 +20,17 @@ compiler is written in it, builds itself, and runs in a browser.
 - `substrate/host/`: what runs compiled programs: `subhost.mjs` on Node, and
   `web/` in a browser (experimental).
 - `std/`: libraries written in Substrate, a package every program has without
-  depending on it. `languages/` holds the languages
-  built on it, `scheme/`, a Scheme, and `bend/`, a dependently typed
-  language, with `nodes.sub`, the run-time nodes they share. `http/` is an
-  HTTP/1.1 server toolkit; `crypto/`, `compress/` and `log/` hold hashes and
-  passwords, DEFLATE and gzip, and logs. `meta/` reads types at
-  compile time, for code that writes code; `encoding/` holds UTF-8, Base64,
-  JSON and wire (postcard). `package/` reads packages and `archive/` tar
-  archives. `web/` (experimental) holds programs in a web page: a UI
-  library, WebGPU and `shade/` for GPU programs compiled to WGSL, a game
-  library, examples and a REPL.
-- `packages/`: packages outside the standard library: `sqlite/`.
+  depending on it. `http/` is an HTTP/1.1 server toolkit; `crypto/`,
+  `compress/` and `log/` hold hashes and passwords, DEFLATE and gzip, and
+  logs. `meta/` reads types at compile time, for code that writes code;
+  `encoding/` holds UTF-8, Base64, JSON and wire (postcard). `package/` reads
+  packages and `archive/` tar archives.
+- `packages/`: packages outside the standard library. `scheme/`, a Scheme,
+  and `bend/`, a dependently typed language, are languages built on
+  Substrate, with `nodes/`, the run-time nodes they share. `web/`
+  (experimental) holds programs in a web page: a UI library, WebGPU and
+  `shade/` for GPU programs compiled to WGSL, a game library, examples and a
+  REPL. `sqlite/` is SQLite.
 - `cmd/`: a package of sub, the command `bin/sub` runs, which reads packages
   and runs the compiler, and the server `sub serve` runs.
 - `seed/`: checked-in builds of the compiler and of sub, which build them

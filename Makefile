@@ -14,13 +14,14 @@ seed:
 	bin/bootstrap seed
 
 repl:
-	bin/sub site -c build/cache $(OUT)/web/repl std/web/repl/repl.sub -p std/web/repl/page.html \
+	bin/sub site -c build/cache $(OUT)/web/repl packages/web/repl/repl.sub -p packages/web/repl/page.html \
 	  -f files $(addprefix substrate/compiler/,macros.sub substrate.sub syntax.sub wasm.sub writer.sub) \
-	  $(shell find substrate/host std/languages/scheme std/languages/bend -name '*.sub' | sort) std/languages/nodes.sub std/encoding/utf8.sub
+	  $(shell find substrate/host packages/scheme packages/bend -name '*.sub' | sort) packages/nodes/nodes.sub std/encoding/utf8.sub
 
 docs:
 	rm -rf $(OUT)/doc
-	bin/sub doc --html -o $(OUT)/doc substrate std cmd packages/sqlite
+	bin/sub doc --html -o $(OUT)/doc substrate std cmd packages/web packages/scheme packages/bend packages/nodes \
+	  packages/sqlite
 
 clean:
 	rm -rf build

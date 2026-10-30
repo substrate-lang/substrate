@@ -13,13 +13,13 @@ bin/sub expand build/empty.sub > /dev/null
 
 site="$sites/session"
 bin/sub site "$site" build/compiler -p tests/web/session.html \
-  -f files $(find substrate/compiler substrate/host std/languages/scheme std/languages/bend tests/session -name '*.sub' | sort) \
-  std/languages/nodes.sub std/encoding/utf8.sub tests/web/session.map
+  -f files $(find substrate/compiler substrate/host packages/scheme packages/bend tests/session -name '*.sub' | sort) \
+  packages/nodes/nodes.sub std/encoding/utf8.sub tests/web/session.map
 status=0
 node tests/web/session.mjs "$site" funcs scheme substrate switch bend || status=1
 
-bin/sub site "$sites/counter" std/web/examples/counter.sub
-bin/sub site "$sites/rows" std/web/examples/rows.sub
+bin/sub site "$sites/counter" packages/web/examples/counter.sub
+bin/sub site "$sites/rows" packages/web/examples/rows.sub
 make -s repl OUT="${OUT:-build}"
 bin/sub site "$sites/focus" tests/web/focus.sub
 bin/sub site "$sites/floor" tests/web/floor.sub
@@ -32,11 +32,11 @@ bin/sub site "$sites/files" tests/web/files.sub
 bin/sub site "$sites/fields" tests/web/fields.sub
 bin/sub site "$sites/assets" tests/web/assets.sub
 bin/sub site "$sites/canvas" tests/web/canvas.sub
-bin/sub site "$sites/snake" std/web/examples/snake/snake.sub -p std/web/examples/snake/page.html
-bin/sub site "$sites/platformer" std/web/examples/platformer/platformer.sub -p std/web/examples/platformer/page.html
-bin/sub site "$sites/blocks" std/web/examples/blocks/blocks.sub -p std/web/examples/blocks/page.html
-bin/sub site "$sites/valley" std/web/examples/valley/valley.sub -p std/web/examples/valley/page.html
-bin/sub site "$sites/sounds" tests/web/sounds.sub -p std/web/examples/platformer/page.html
+bin/sub site "$sites/snake" packages/web/examples/snake/snake.sub -p packages/web/examples/snake/page.html
+bin/sub site "$sites/platformer" packages/web/examples/platformer/platformer.sub -p packages/web/examples/platformer/page.html
+bin/sub site "$sites/blocks" packages/web/examples/blocks/blocks.sub -p packages/web/examples/blocks/page.html
+bin/sub site "$sites/valley" packages/web/examples/valley/valley.sub -p packages/web/examples/valley/page.html
+bin/sub site "$sites/sounds" tests/web/sounds.sub -p packages/web/examples/platformer/page.html
 bin/sub site "$sites/stopped" tests/web/stopped.sub
 bin/sub site "$sites/stopped-at-start" tests/web/stopped-at-start.sub
 bin/sub site "$sites/gpu" tests/web/gpu.sub -p tests/web/gpu.html

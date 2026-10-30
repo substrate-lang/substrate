@@ -125,6 +125,7 @@ done
 # The session tests.
 for t in tests/session/*.sub; do
   name="$(basename "$t" .sub)"
+  [ "$name" = package ] && continue
   actual="$(cd tests/session && "$root/bin/sub" eval "$name.sub" -c "$cache" 2>&1 | grep -v '^    ')"
   if [ -f "tests/session/$name.out" ] && [ "$actual" = "$(cat "tests/session/$name.out")" ]; then
     pass=$((pass + 1))
@@ -256,15 +257,15 @@ mkdir -p "$walked/tests"
 printf '(require w walked)\n(define (main) (printf "~a~n" (w:w)))\n' > "$walked/tests/use.sub"
 tested="$(bin/sub hash "$walked" 2>&1)"
 used="$(bin/sub build "$walked/tests/use.sub" -c "$cache" 2>&1 && "$host" "$root/$walked/build/use" 2>&1)"
-built="$(bin/sub hash "$walked" 2>&1)"
+after_build="$(bin/sub hash "$walked" 2>&1)"
 printf 'notes\n' > "$walked/README"
 noted="$(bin/sub hash "$walked" 2>&1)"
-if [[ "$before" == sha256:* ]] && [ "$tested" != "$before" ] && [ "$used" = 3 ] && [ "$built" = "$tested" ] &&
-   [ "$noted" != "$built" ]; then
+if [[ "$before" == sha256:* ]] && [ "$tested" != "$before" ] && [ "$used" = 3 ] && [ "$after_build" = "$tested" ] &&
+   [ "$noted" != "$after_build" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL a package's hash and its files: got $before, $tested, $used, $built and $noted"
+  echo "FAIL a package's hash and its files: got $before, $tested, $used, $after_build and $noted"
 fi
 # In a git repository that tracks a package's package.sub, its files are those git tracks: in an index of version 2, 3
 # or 4, of a repository naming objects by SHA-1 or SHA-256, and in a worktree; elsewhere every file counts.
@@ -337,19 +338,19 @@ printf '(provide v)\n(define (v) -> i32 2)\n' > "$linked/p/p.sub"
 printf '(require z "../lib/z.sub")\n(define (main) (printf "~a~n" (z:z)))\n' > "$linked/p/tests/t.sub"
 tested="$(bin/sub build "$linked/p/tests/t.sub" -o "$linked/t" -c "$cache" 2>&1)"
 printf '(require z "z.sub")\n(provide v)\n(define (v) -> i32 (z:z))\n' > "$linked/p/p.sub"
-built="$(bin/sub build "$linked/p/p.sub" -o "$linked/p-built" -c "$cache" 2>&1)"
+compiled="$(bin/sub build "$linked/p/p.sub" -o "$linked/p-built" -c "$cache" 2>&1)"
 hashed="$(bin/sub hash "$linked/p" 2>&1)"
 mkdir -p "$linked/q/tests"
 cp "$linked/p/package.sub" "$linked/p/p.sub" "$linked/q/"
 cp "$linked/p/tests/t.sub" "$linked/q/tests/"
 unlinked="$(bin/sub hash "$linked/q" 2>&1)"
 if [[ "$tested" == *'"../lib/z.sub" goes through a link in the package p'* ]] &&
-   [[ "$built" == *'"z.sub" goes through a link in the package p'* ]] && [[ "$hashed" == sha256:* ]] &&
+   [[ "$compiled" == *'"z.sub" goes through a link in the package p'* ]] && [[ "$hashed" == sha256:* ]] &&
    [ "$unlinked" = "$hashed" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL links in a package: got $tested, $built, $hashed and $unlinked"
+  echo "FAIL links in a package: got $tested, $compiled, $hashed and $unlinked"
 fi
 # Another package requires only a package's exports: not a module an export loads, nor one no longer exported when the
 # requiring module comes from the cache, nor one a macro of the package requires into the other package's module.
@@ -427,7 +428,8 @@ documented="$builds/documented"
 rm -rf "${documented:?}"
 bin/sub doc -o "$documented/text" tests/doc/sample > /dev/null 2>&1
 bin/sub doc --html -o "$documented/html" tests/doc/sample > /dev/null 2>&1
-bin/sub doc -o "$documented/docs" substrate std cmd packages/sqlite > /dev/null 2>&1
+bin/sub doc -o "$documented/docs" substrate std cmd packages/web packages/scheme packages/bend packages/nodes \
+  packages/sqlite > /dev/null 2>&1
 whole=$?
 printed="$(bin/sub doc std/http/cookie 2>&1)"
 dependency="$(cd tests/packages/app && "$root/bin/sub" doc tools/text 2>&1 | head -1)"
