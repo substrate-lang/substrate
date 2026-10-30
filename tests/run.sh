@@ -246,28 +246,61 @@ else
   fail=$((fail + 1))
   echo "FAIL sub run: got $counted and exit $code, or a program not in build/"
 fi
-# A package's hash covers its files and nothing else: not a README, build output, tests or a module nothing requires.
+# A package's hash covers every file in its directory but its build/: a test and a README count, what sub builds there
+# does not.
 walked="$builds/walked"
 rm -rf "${walked:?}"
 cp -r tests/packages/walked "$walked"
 before="$(bin/sub hash "$walked" 2>&1)"
-mkdir -p "$walked/dist" "$walked/tests"
-printf 'notes\n' > "$walked/README"
-printf 'built\n' > "$walked/dist/program"
-printf '(provide u)\n\n(define (u) -> i32 6)\n' > "$walked/unused.sub"
+mkdir -p "$walked/tests"
 printf '(require w walked)\n(define (main) (printf "~a~n" (w:w)))\n' > "$walked/tests/use.sub"
-after="$(bin/sub hash "$walked" 2>&1)"
-printf '(provide d)\n\n(define (d) -> i32 7)\n' > "$walked/lib/deep/deep.sub"
-deeper="$(bin/sub hash "$walked" 2>&1)"
-used="$(bin/sub build "$walked/tests/use.sub" -o "$walked/use" -c "$cache" 2>&1 && "$host" "$root/$walked/use" 2>&1)"
-if [[ "$before" == sha256:* ]] && [ "$after" = "$before" ] && [ "$deeper" != "$before" ] && [ "$used" = 8 ]; then
+tested="$(bin/sub hash "$walked" 2>&1)"
+used="$(bin/sub build "$walked/tests/use.sub" -c "$cache" 2>&1 && "$host" "$root/$walked/build/use" 2>&1)"
+built="$(bin/sub hash "$walked" 2>&1)"
+printf 'notes\n' > "$walked/README"
+noted="$(bin/sub hash "$walked" 2>&1)"
+if [[ "$before" == sha256:* ]] && [ "$tested" != "$before" ] && [ "$used" = 3 ] && [ "$built" = "$tested" ] &&
+   [ "$noted" != "$built" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL a package's hash and its files: got $before, $after, $deeper and $used"
+  echo "FAIL a package's hash and its files: got $before, $tested, $used, $built and $noted"
 fi
-# A module among a package's files requires only its files, in any build: a test of the package may require any file
-# in its directory, but not a module of the package whose macro requires another.
+# In a git repository that tracks a package's package.sub, its files are those git tracks: in an index of version 2, 3
+# or 4, of a repository naming objects by SHA-1 or SHA-256, and in a worktree; elsewhere every file counts.
+gitted="$root/$builds/gitted"
+rm -rf "${gitted:?}"
+in_git() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@" > /dev/null 2>&1; }
+for repo in one two; do
+  mkdir -p "$gitted/$repo/p/inner" "$gitted/$repo/p/build"
+  printf '(package p (version "0.1.0"))\n' > "$gitted/$repo/p/package.sub"
+  printf '(package inner (version "0.1.0"))\n' > "$gitted/$repo/p/inner/package.sub"
+  printf '(provide v)\n(define (v) -> i32 2)\n' > "$gitted/$repo/p/p.sub"
+  printf 'built\n' > "$gitted/$repo/p/build/out"
+  in_git -C "$gitted/$repo" init $([ "$repo" = two ] && echo --object-format=sha256)
+  in_git -C "$gitted/$repo" add p
+  in_git -C "$gitted/$repo" commit -m p
+done
+committed="$(bin/sub hash "$gitted/one/p" 2>&1)"
+printf 'notes\n' > "$gitted/one/p/README"
+untracked="$(bin/sub hash "$gitted/one/p" 2>&1)"
+in_git -C "$gitted/one" add -N p/README
+intended="$(bin/sub hash "$gitted/one/p" 2>&1)"
+in_git -C "$gitted/one" update-index --index-version 4
+four="$(bin/sub hash "$gitted/one/p" 2>&1)"
+in_git -C "$gitted/one" worktree add --detach "$gitted/tree"
+other="$(bin/sub hash "$gitted/tree/p" 2>&1)"
+sha="$(bin/sub hash "$gitted/two/p" 2>&1)"
+cp -r "$gitted/one/p" "$gitted/copy"
+copied="$(bin/sub hash "$gitted/copy" 2>&1)"
+if [[ "$committed" == sha256:* ]] && [ "$untracked" = "$committed" ] && [ "$intended" != "$committed" ] &&
+   [ "$four" = "$intended" ] && [ "$other" = "$committed" ] && [ "$sha" = "$committed" ] && [ "$copied" = "$intended" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL packages in git: got $committed, $untracked, $intended, $four, $other, $sha and $copied"
+fi
+# A package's module requires any file in its directory, also through a macro, as a test of the package does.
 held="$builds/held"
 rm -rf "${held:?}"
 mkdir -p "$held/q/tests"
@@ -284,14 +317,15 @@ printf '(require p "pull.sub")\n(p:pull)\n(provide v)\n(define (v) -> i32 2)\n' 
 printf '(require h "../hidden.sub")\n(define (main) (printf "~a~n" (h:h)))\n' > "$held/q/tests/private.sub"
 printf '(require q "../q.sub")\n(define (main) (printf "~a~n" (q:v)))\n' > "$held/q/tests/public.sub"
 private="$(bin/sub build "$held/q/tests/private.sub" -o "$held/private" -c "$cache" 2>&1 && "$host" "$root/$held/private" 2>&1)"
-public="$(bin/sub build "$held/q/tests/public.sub" -o "$held/public" -c "$cache" 2>&1)"
-if [ "$private" = 1 ] && [[ "$public" == *'"hidden.sub" is not one of the files of q'* ]]; then
+public="$(bin/sub build "$held/q/tests/public.sub" -o "$held/public" -c "$cache" 2>&1 && "$host" "$root/$held/public" 2>&1)"
+if [ "$private" = 1 ] && [ "$public" = 2 ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
   echo "FAIL a package's files in a test's build: got $private and $public"
 fi
-# Nothing in a package is read through a link, which can lead outside it: not by a test, nor by one of its files.
+# Nothing in a package is read through a link, which can lead outside it: not by a test, nor by one of its modules; its
+# hash leaves links out.
 linked="$builds/linked"
 rm -rf "${linked:?}"
 mkdir -p "$linked/p/tests" "$linked/elsewhere"
@@ -303,13 +337,19 @@ printf '(provide v)\n(define (v) -> i32 2)\n' > "$linked/p/p.sub"
 printf '(require z "../lib/z.sub")\n(define (main) (printf "~a~n" (z:z)))\n' > "$linked/p/tests/t.sub"
 tested="$(bin/sub build "$linked/p/tests/t.sub" -o "$linked/t" -c "$cache" 2>&1)"
 printf '(require z "z.sub")\n(provide v)\n(define (v) -> i32 (z:z))\n' > "$linked/p/p.sub"
+built="$(bin/sub build "$linked/p/p.sub" -o "$linked/p-built" -c "$cache" 2>&1)"
 hashed="$(bin/sub hash "$linked/p" 2>&1)"
+mkdir -p "$linked/q/tests"
+cp "$linked/p/package.sub" "$linked/p/p.sub" "$linked/q/"
+cp "$linked/p/tests/t.sub" "$linked/q/tests/"
+unlinked="$(bin/sub hash "$linked/q" 2>&1)"
 if [[ "$tested" == *'"../lib/z.sub" goes through a link in the package p'* ]] &&
-   [[ "$hashed" == *'z.sub goes through a link in the package p'* ]]; then
+   [[ "$built" == *'"z.sub" goes through a link in the package p'* ]] && [[ "$hashed" == sha256:* ]] &&
+   [ "$unlinked" = "$hashed" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL links in a package: got $tested and $hashed"
+  echo "FAIL links in a package: got $tested, $built, $hashed and $unlinked"
 fi
 # Another package requires only a package's exports: not a module an export loads, nor one no longer exported when the
 # requiring module comes from the cache, nor one a macro of the package requires into the other package's module.
@@ -391,13 +431,13 @@ bin/sub doc -o "$documented/docs" substrate std cmd packages/sqlite > /dev/null 
 whole=$?
 printed="$(bin/sub doc std/http/cookie 2>&1)"
 dependency="$(cd tests/packages/app && "$root/bin/sub" doc tools/text 2>&1 | head -1)"
-outside="$(cd tests/doc/sample && "$root/bin/sub" doc sample/unused 2>&1)"
+outside="$(cd tests/doc/sample && "$root/bin/sub" doc sample/unused 2>&1 | head -1)"
 if diff -r tests/doc/expected "$documented/text" > /dev/null &&
    grep -qF '<a href="#point">point</a>' "$documented/html/sample/sample.html" &&
    grep -qF '<a href="shapes.html#shape">shape</a>' "$documented/html/sample/sample.html" &&
    grep -qF '<dt>private to</dt>' "$documented/html/sample/shapes.html" &&
    [ "$printed" = "$(cat "$documented/docs/std/http/cookie.txt")" ] && [ "$dependency" = ";; tools/text" ] &&
-   [ "$outside" = "sub: sample/unused is not one of the files of sample, its exports and what their source requires" ]; then
+   [ "$outside" = ";; sample/unused" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
@@ -486,18 +526,20 @@ for t in tests/fetch/*.sub; do
     echo "$actual" | head -10
   fi
 done
-# A store entry holds just the files its hash covers: json's, not its archive's README or unused module, and nest's
-# with its inner package's at their path.
+# A store entry holds the files its hash covers: all of json's archive, and nest's with its inner package's at their
+# path; a checkout of a package's archive in git hashes as the archive does.
 json_entry="$(find tests/fetch/build/app -name json.sub -printf '%h\n' | head -1)"
 nest_entry="$(find tests/fetch/build/nested -name nest.sub -printf '%h\n' | head -1)"
-json_files="$(cd "$json_entry" && find . -type f | sort | tr '\n' ' ')"
-nest_files="$(cd "$nest_entry" && find . -type f | sort | tr '\n' ' ')"
-if [ "$json_files" = "./json.sub ./package.sub " ] &&
+json_files="$(cd "$json_entry" && find . -type f | LC_ALL=C sort | tr '\n' ' ')"
+nest_files="$(cd "$nest_entry" && find . -type f | LC_ALL=C sort | tr '\n' ' ')"
+checked_out="$(bin/sub hash tests/fetch/archives/json 2>&1)"
+if [ "$json_files" = "./README ./json.sub ./package.sub ./unused.sub " ] &&
+   [[ "$(cat tests/fetch/app.sub)" == *"$checked_out"* ]] &&
    [ "$nest_files" = "./inner/inner.sub ./inner/package.sub ./nest.sub ./package.sub " ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL a store entry's files: got $json_files and $nest_files"
+  echo "FAIL a store entry's files: got $json_files, $nest_files and $checked_out"
 fi
 if [ -e tests/fetch/build/escaped.sub ] || [ -e tests/fetch/escaped.sub ]; then
   fail=$((fail + 1))

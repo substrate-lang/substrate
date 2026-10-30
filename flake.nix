@@ -43,6 +43,7 @@
             pkgs.time          # GNU time: bench/bend/compile's time and memory
             pkgs.nodejs        # V8: the host (substrate/host/subhost.mjs), and the web tests' driver
             pkgs.openssl       # certificates for the TLS test
+            pkgs.git           # repositories whose packages the tests hash
             (chromium pkgs)    # the headless browser of the web tests (above)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.clang     # the C benchmarks' compiler (bench/substrate)
