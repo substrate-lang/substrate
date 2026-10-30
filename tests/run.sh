@@ -265,8 +265,8 @@ else
   fail=$((fail + 1))
   echo "FAIL a package's hash and its files: got $before, $tested, $used, $after_build and $noted"
 fi
-# In a git repository, a package's hash covers only the files git tracks: with index versions 2 to 4, in SHA-1 and
-# SHA-256 repositories, and in a worktree.
+# In a git repository, a package's hash covers only the files git tracks. The test uses index versions 2 to 4, SHA-1
+# and SHA-256 repositories, and a worktree.
 gitted="$root/$builds/gitted"
 rm -rf "${gitted:?}"
 in_git() { git -c user.name=t -c user.email=t@t -c init.defaultBranch=main "$@" > /dev/null 2>&1; }
