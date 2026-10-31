@@ -325,9 +325,11 @@
   (syntax-match s
     [(? identifier? x) (or (memq (syntax-e x) '(i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 bool string)) (type-binding x))]
     [('slice t) (type-syntax? t)]
-    [((? identifier? h) . _)
+    [((? identifier? h) a ...)
      (or (memq (syntax-e h) '(ptr array fn closure))
-         (let ([v (type-binding h)]) (and v (== (car v) 'substrate-struct) (pair? (parameters-of v)))))]
+         (let ([v (type-binding h)])
+           (and v (== (car v) 'substrate-struct) (pair? (parameters-of v))
+                (not (ormap (lambda ([x datum]) -> bool (keyword? (syntax-e x))) a)))))]
     [_ #f]))
 
 (define (scalar! [t datum] [where datum]) -> datum
@@ -649,11 +651,11 @@
 (define (substrate-expect-equal [s datum]) -> datum
   (syntax-match s
     [(_ a b)
-     (let ([x (if (literal? a) a (fresh 'actual))] [y (if (literal? b) b (fresh 'expected))] [bound nil])
+     (let ([x (if (literal? a) a (syn 'actual))] [y (if (literal? b) b (syn 'expected))] [bound nil])
        (unless (literal? b) (set! bound (cons `(,y ,b) bound)))
        (unless (literal? a) (set! bound (cons `(,x ,a) bound)))
        (at s (syn `(let (,@bound)
-                     (if (== ,x ,y)
+                     (if ,(at s (syn `(== ,x ,y)))
                          (begin)
                          (begin
                            (test-failure-start!)
@@ -1281,7 +1283,11 @@
     (when (and (== m 0) (!= name 'let*)) (substrate-error e "~a is only allowed at module level" `(,name)))
     (case name
       [('#%datum) (literal e (syntax-e (piece-at m 1)))]
-      [('#%app) (let ([f (piece-at m 1)]) (check-call e f (callee f env) (pieces-from m 2) env))]
+      [('#%app)
+       (let ([f (piece-at m 1)])
+         (if (!= (struct-binding f) 0)
+             (check-literal e f (cddr (syntax->list e)) env hint)
+             (check-call e f (callee f env) (pieces-from m 2) env)))]
       [('quote) (cons (datum-type) `(quote ,(syntax->datum (piece-at m 1))))]
       [('quote-syntax) (cons (datum-type) `(quote ,(syntax-local-introduce (prune-local-scopes (piece-at m 1)))))]
       [('let) (check-let e (scope-shape! m) env hint #f)]
@@ -1606,6 +1612,7 @@
   (cons 'i32 (case (car p)
                [('construct) (construct e t (caddr p) (cadddr p) (list-ref p 4) env dst)]
                [('array) (construct-array e t (caddr p) env dst)]
+               [('literal) (construct-literal t (literal-pairs e (cadr p) (caddr p)) env dst)]
                [else (call e (cadr p) `(,(cadddr p) #f direct ,(list-ref p 4)) (caddr p) env dst)])))
 
 (define (copied-into [dst datum] [r datum] [t datum] [e datum]) -> datum
@@ -1626,7 +1633,8 @@
             [('#%substrate-construct v i n) `(construct ,v ,i ,n ,(mark-arguments (form-shape 'mark e)))]
             [_ 0])]
          [else 0])]
-      [('core) (syntax-match (caddr h) [('#%app f arg ...) (struct-call f arg)] [_ 0])]
+      [('core)
+       (syntax-match (caddr h) [('#%app f arg ...) (if (!= (struct-binding f) 0) `(literal ,f ,arg) (struct-call f arg))] [_ 0])]
       [else 0])))
 
 (define (production-type [p datum]) -> datum
@@ -1769,13 +1777,14 @@
 (define (construct [e datum] [t datum] [i datum] [n datum] [args datum] [env datum] [dst datum]) -> datum
   (let* ([j (syntax-e i)] [fields (case-fields e t j n args)] [d (fresh-key!)])
     `(let ((,d i32 ,dst to))
-       ,(seq `(,(prim-code 'i32.store `(,(lref d) ,(const-code 'i32 j)))
-               ,@(for/list ([f fields] [a args])
-                   (let ([p `(,(cadr f) memory ,(lref d) ,(caddr f))])
-                     (if (aggregate? (cadr f))
-                         (as-void (copy-into (address p a) a (cadr f) env))
-                         (store (cadr f) (lref d) (fixnum-value (caddr f)) (expect a (cadr f) env #t)))))
-               ,(lref d))))))
+       ,(seq `(,(prim-code 'i32.store `(,(lref d) ,(const-code 'i32 j))) ,@(field-stores d fields args env) ,(lref d))))))
+
+(define (field-stores [d datum] [fields datum] [args datum] [env datum]) -> datum
+  (for/list ([f fields] [a args])
+    (let ([p `(,(cadr f) memory ,(lref d) ,(caddr f))])
+      (if (aggregate? (cadr f))
+          (as-void (copy-into (address p a) a (cadr f) env))
+          (store (cadr f) (lref d) (fixnum-value (caddr f)) (expect a (cadr f) env #t))))))
 
 (define (array-of-type [t datum] [args datum]) -> datum `(array ,(kept! (complete! (parse-type t) t) t) ,(fixnum (length args))))
 
@@ -1810,6 +1819,52 @@
     `(let ((,d i32 ,dst to) ,@(for/list ([x xs] [f fields] [a (caddr c)]) `(,x ,(wasm-type (cadr f)) ,(expect a (cadr f) env #t) x)))
        ,(seq `(,(prim-code 'i32.store `(,(lref d) ,(const-code 'i32 i)))
                ,@(for/list ([x xs] [f fields]) (store (cadr f) (lref d) (fixnum-value (caddr f)) (lref x))))))))
+
+;; ---- struct literals ----
+
+(define (struct-binding [f datum]) -> datum
+  (let ([v (if (identifier? f) (type-binding f) 0)])
+    (if (and (!= v 0) (== (car v) 'substrate-struct) (== (list-ref v 3) 'struct)) v 0)))
+
+(define (check-literal [e datum] [f datum] [args datum] [env datum] [hint datum]) -> datum
+  (let* ([pairs (literal-pairs e f args)] [t (literal-type e f pairs env hint)])
+    (cons t (construct-literal t pairs env (temp t)))))
+
+(define (literal-pairs [e datum] [f datum] [args datum]) -> datum
+  (let ([names (for/list ([d (syntax->list (caddr (struct-binding f)))]) (syntax-match d [(g _) (syntax-e g)]))]
+        [given nil] [out nil])
+    (while (pair? args)
+      (unless (and (keyword? (syntax-e (car args))) (pair? (cdr args)))
+        (substrate-error e "~a: expected (~a #:field value ...)" `(,(syntax-e f) ,(syntax-e f))))
+      (let ([k (car args)] [name (string->symbol (keyword->string (syntax-e (car args))))])
+        (unless (memq name names) (substrate-error k "~a has no field ~a" `(,(syntax-e f) ,name)))
+        (when (memq name given) (substrate-error k "~s is given twice" `(,(syntax-e k))))
+        (set! given (cons name given))
+        (set! out (cons (cons name (cadr args)) out)))
+      (set! args (cddr args)))
+    (let ([missing (for/list ([n names] #:when (not (memq n given))) (format "#:~a" `(,n)))])
+      (when (pair? missing) (substrate-error e "~a needs ~a" `(,(syntax-e f) ,(joined missing)))))
+    (reverse out)))
+
+(define (literal-type [e datum] [f datum] [pairs datum] [env datum] [hint datum]) -> datum
+  (let ([v (struct-binding f)])
+    (cond [(null? (parameters-of v)) (named-type f)]
+          [(and (struct-type? hint) (== (cadr hint) (identifier-name f))) hint]
+          [else
+           (let* ([ps (parameters-of v)]
+                  [types (parse-types-with (type-variables ps) (for/list ([p pairs]) (declared-type v (car p))))]
+                  [s (infer e types (for/list ([p pairs]) (cdr p)) env)])
+             `(struct ,(identifier-name f) ,(cadr v) ,(for/list ([p ps]) (bound-type e s p (syntax-e f)))))])))
+
+(define (declared-type [v datum] [name datum]) -> datum
+  (for/each ([d (syntax->list (caddr v))])
+    (syntax-match d [(g gt) (when (== (syntax-e g) name) (return gt))]))
+  0)
+
+(define (construct-literal [t datum] [pairs datum] [env datum] [dst datum]) -> datum
+  (let ([d (fresh-key!)] [fields (caddr (layout t))])
+    `(let ((,d i32 ,dst to))
+       ,(seq `(,@(field-stores d (for/list ([p pairs]) (assq (car p) fields)) (for/list ([p pairs]) (cdr p)) env) ,(lref d))))))
 
 (define (check-match [e datum] [m datum] [env datum] [hint datum]) -> datum
   (let* ([v (piece-at m 1)]
@@ -2599,7 +2654,37 @@
           [(== t 'f32) (call-of 'print-float `(,(prim-code 'f64.promote_f32 `(,(cdr r))) ,(i32-const 1)))]
           [(equal? t (datum-type)) `(call ,(syntax-function-of 'print-datum (-> state phase)) (,(cdr r) ,(i32-const display)))]
           [(address-type? t) (call-of 'print-integer `(,(prim-code 'i64.extend_i32_u `(,(cdr r))) ,(i32-const 0)))]
+          [(and (struct-type? t) (variant-type? t)) (printed-variant r t a display)]
+          [(and (struct-type? t) (== (type-kind t) 'struct)) (printed-struct r t a display)]
           [else (seq `(,(as-void r) ,(text-printed (format "#<~s>" `(,(shown t))))))])))
+
+(define (printed-struct [r datum] [t datum] [a datum] [display bool]) -> datum
+  (let ([d (fresh-key!)])
+    `(let ((,d i32 ,(cdr r) d))
+       ,(seq `(,(text-printed (format "(~a" `(,(caddr t))))
+               ,@(for/list ([f (caddr (layout t))])
+                   (seq `(,(text-printed (format " #:~a " `(,(car f)))) ,(printed-field d f a display))))
+               ,(text-printed '")"))))))
+
+(define (printed-variant [r datum] [t datum] [a datum] [display bool]) -> datum
+  (let ([d (fresh-key!)] [tag (fresh-key!)])
+    `(let ((,d i32 ,(cdr r) d))
+       (let ((,tag i32 ,(load 'u32 (lref d) 0) tag))
+         ,(printed-cases d tag (cases-of t) 0 a display)))))
+
+(define (printed-cases [d datum] [tag datum] [cases datum] [i i32] [a datum] [display bool]) -> datum
+  (if (null? cases)
+      '#f
+      `(if ,(prim-code 'i32.eq `(,(lref tag) ,(i32-const i)))
+           ,(seq `(,(text-printed (format "(~a" `(,(car (car cases)))))
+                   ,@(for/list ([f (cdr (car cases))]) (seq `(,(text-printed '" ") ,(printed-field d f a display))))
+                   ,(text-printed '")")))
+           ,(printed-cases d tag (cdr cases) (+ i 1) a display))))
+
+(define (printed-field [d datum] [f datum] [a datum] [display bool]) -> datum
+  (printed (read-place `(,(cadr f) memory ,(lref d) ,(caddr f)) a) a display))
+
+(define (type-kind [t datum]) -> datum (cadddr (type-value (syntax-local-value (name-identifier (cadr t))))))
 
 ;; ---- modules ----
 
