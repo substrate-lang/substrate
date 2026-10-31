@@ -1,0 +1,184 @@
+;; Tests that build programs with the compiler in the test program and the module map that sub test gives it.
+;; expect-compile-error compiles a file and expects a compile error, and expect-run builds a program and runs it in its
+;; own host process.
+(require-unqualified macros compiler/macros)
+(require-unqualified ex compiler/expander)
+(require-unqualified rt compiler/roots)
+(require-unqualified main compiler/main)
+(require-unqualified fs host/fs)
+(require-unqualified process host/node/process)
+(require-unqualified paths "../package/path.sub")
+(require-unqualified tests "test.sub")
+(require-unqualified compare "compare.sub")
+
+(provide expect-compile-error expect-run)
+
+;; ---- building ----
+
+(define ready bool #f)
+(define directory string)
+
+;; ready! sets the compiler up once, with the toolchain, the module map and the cache that sub test gives. The current
+;; directory is the package's.
+(define (ready!)
+  (unless ready
+    (set! ready #t)
+    (let ([why string] [map (string->datum (test-option "--map"))])
+      (when (< (fs-cwd (& directory) (& why)) 0) (throw test-failed why))
+      (set-toolchain-directory! (string->datum (test-option "--toolchain")))
+      (install-core!)
+      (set-module-map-text! (file-text map) map)
+      (set-cache-directory! (string->datum (test-option "--cache"))))))
+
+;; built! builds the program in the file at path in the package, as sub build does from the file's directory, into
+;; build/test/programs, and gives the program's directory. It gives "" when the program does not compile, with the error
+;; in err as sub build writes it.
+(define (built! [path string] [err (ptr buffer)]) -> string
+  (ready!)
+  (let ([full (joined-path directory path)]
+        [out (joined-path directory (text-of "build/test/programs/" (if (ends? path ".sub") (slice path 0 (- (-> path length) 4)) path)))])
+    (set-display-directory! (string->datum (parent-of full)))
+    (try (begin (write-program! 0 (string->datum full) (string->datum out) #f) out)
+         [catch compile-error (message blamed loc)
+           (write-error err message blamed loc)
+           ""])))
+
+(define (compile-error-check [path string] [text string] [message string])
+  (let ([err (make-buffer)])
+    (when (> (-> (built! path (& err)) length) 0) (failure! message "the file compiled"))
+    (unless (contains? (buffer-string (& err)) text) (failure! message (text-of "its compile error is\n" (buffer-string (& err)))))
+    (buffer-free! (& err))))
+
+;; ---- running ----
+
+(struct run-result [code i32] [output string])
+
+;; run-program builds the program at path and runs it with the host in the file's directory, with the grants, the
+;; arguments and input as its stdin, for at most a minute.
+(define (run-program [path string] [args (slice string)] [grants (slice string)] [input (slice u8)] [message string])
+  -> run-result
+  (let ([err (make-buffer)] [out string] [argv (make-buffer)] [o process-options] [r run-result] [bytes (slice u8)]
+        [why string])
+    (set! out (built! path (& err)))
+    (when (== (-> out length) 0) (failure! message (text-of "the program does not compile\n" (buffer-string (& err)))))
+    (for ([i u32 0]) (< i (-> grants length)) (+= i 1) (push! (& argv) (@ grants i)))
+    (push! (& argv) out)
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (push! (& argv) (@ args i)))
+    (process-options-init! (& o))
+    (set! (-> o dir) (parent-of (joined-path directory path)))
+    (set! (-> r code) (process-run (joined-path (test-option "--toolchain") "host/subhost.mjs")
+                                   (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string))) (& o)
+                                   input 60000 (& bytes) (& why)))
+    (when (< (-> r code) 0) (failure! message why))
+    (set! (-> r output) (cast string bytes))
+    r))
+
+;; run-check! checks a run: with fails given, that it failed with output containing fails, or else that it exited with
+;; 0. Then it compares the output with expected when compare is 1, or with the file at the path expected when compare is
+;; 2.
+(define (run-check! [r (ptr run-result)] [fails string] [compare u32] [expected string] [message string])
+  (let ([output (-> r output)])
+    (if (> (-> fails length) 0)
+        (begin
+          (when (== (-> r code) 0) (failure! message (text-of "the program exited with 0, and its output is\n" output)))
+          (unless (contains? output fails) (failure! message (text-of "the program failed, and its output is\n" output))))
+        (unless (== (-> r code) 0)
+          (failure! message (text-of (text-of "the program exited with " (digits-of (-> r code)))
+                                     (text-of ", and its output is\n" output)))))
+    (cond [(== compare 2)
+           (let ([bytes (file-bytes-of expected message)])
+             (unless (== (trimmed output) (trimmed (cast string bytes))) (output-differs! output (cast string bytes) message))
+             (free (-> bytes items)))]
+          [(== compare 1) (unless (== (trimmed output) (trimmed expected)) (output-differs! output expected message))])))
+
+(define (file-bytes-of [path string] [message string]) -> (slice u8)
+  (let ([bytes (slice u8)] [why string])
+    (when (< (fs-read-file path (& bytes) (& why)) 0) (failure! message why))
+    bytes))
+
+;; ---- helpers ----
+
+(define (failure! [message string] [detail string]) (throw test-failed (text-of (text-of message "\n") detail)))
+
+(define (text-of [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+(define (digits-of [n i32]) -> string
+  (let ([b (make-buffer)])
+    (when (< n 0) (buffer-add-byte! (& b) #\-))
+    (write-digits (& b) (cast u64 (if (< n 0) (- 0 n) n)) 10)
+    (buffer-string (& b))))
+
+(define (push! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+;; ---- the forms ----
+
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (message-of [s datum] [first datum]) -> datum
+    (literal (format "line ~a: (~a ~s ...)" `(,(syntax-line s) ,(syntax-e (car (syntax->list s))) ,(syntax->datum first)))))
+
+  ;; package-path gives the path of file, relative to the module that s is in, from the package's directory. The module
+  ;; is label/path in its root, and the label is the package's.
+  (define (package-path [s datum] [file datum]) -> datum
+    (let* ([module (symbol->string (syntax-source s))] [start u32 0] [end u32 0])
+      (for ([i u32 0]) (< i (-> module length)) (+= i 1)
+        (when (== (@ module i) #\/)
+          (when (== start 0) (set! start (+ i 1)))
+          (set! end (+ i 1))))
+      (literal (string->datum (format-message "~a~a" `(,(string->datum (slice module start (if (< end start) start end)))
+                                                       ,file))))))
+
+  (define (text? [x datum]) -> bool (string? (syntax-e x)))
+
+  ;; (expect-compile-error "path" "text"): the file at path, relative to the module, fails to compile with an error
+  ;; containing text.
+  (define (expect-compile-error-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? text? file) (? text? text))
+       #`(compile-error-check #,(package-path s (syntax-e file)) #,text #,(message-of s file))]
+      [_ (raise-syntax-error 'expect-compile-error "expected (expect-compile-error \"path\" \"text\")" s)]))
+
+  ;; (expect-run "path" option ...) builds the program at path, relative to the module, runs it and checks it. The
+  ;; options are #:args ("text" ...), #:grants ("flag" ...), #:stdin "text", #:stdin-file "path", #:output "text",
+  ;; #:output-file "path" and #:fails "text".
+  (define (expect-run-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? text? file) options ...)
+       (let ([args #`(slice (cast (ptr string) 0) 0)] [grants #`(slice (cast (ptr string) 0) 0)]
+             [input #`(slice (cast (ptr u8) 0) 0)] [compare (literal (make-integer 0))] [expected (literal '"")]
+             [fails (literal '"")] [message (message-of s file)] [l options])
+         (while (pair? l)
+           (unless (and (keyword? (syntax-e (car l))) (pair? (cdr l)))
+             (raise-syntax-error 'expect-run "expected a keyword and its value" (car l)))
+           (let ([k (keyword->string (syntax-e (car l)))] [v (cadr l)])
+             (cond [(or (== k "args") (== k "grants"))
+                    (let ([items (syntax->list v)])
+                      (unless (and (!= items 0) (andmap (lambda ([x datum]) -> bool (text? x)) items))
+                        (raise-syntax-error 'expect-run "expected a list of texts" v))
+                      (let ([code (if (null? items) #`(slice (cast (ptr string) 0) 0) #`(slice (array-of string #,@items)))])
+                        (if (== k "args") (set! args code) (set! grants code))))]
+                   [(not (text? v)) (raise-syntax-error 'expect-run "expected a text" v)]
+                   [(== k "stdin") (set! input #`(cast (slice u8) #,v))]
+                   [(== k "stdin-file") (set! input #`(file-bytes-of #,(package-path s (syntax-e v)) #,message))]
+                   [(== k "output")
+                    (set! compare (literal (make-integer 1)))
+                    (set! expected v)]
+                   [(== k "output-file")
+                    (set! compare (literal (make-integer 2)))
+                    (set! expected (package-path s (syntax-e v)))]
+                   [(== k "fails") (set! fails v)]
+                   [else (raise-syntax-error 'expect-run "the options are #:args, #:grants, #:stdin, #:stdin-file, #:output, #:output-file and #:fails" (car l))]))
+           (set! l (cddr l)))
+         #`(let ([r (run-program #,(package-path s (syntax-e file)) #,args #,grants #,input #,message)])
+             (run-check! (& r) #,fails #,compare #,expected #,message)))]
+      [_ (raise-syntax-error 'expect-run "expected (expect-run \"path\" option ...)" s)])))
+
+(define-syntax expect-compile-error expect-compile-error-form)
+(define-syntax expect-run expect-run-form)

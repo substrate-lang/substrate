@@ -1,0 +1,216 @@
+;; sub test: a package's tests built into one program and run, after cargo test.
+(require-unqualified macros compiler/macros)
+(require-unqualified rt compiler/roots)
+(require-unqualified fs host/fs)
+(require-unqualified events host/events)
+(require-unqualified process host/node/process)
+(require-unqualified manifest std/package/manifest)
+(require-unqualified paths std/package/path)
+(require-unqualified doc std/doc/doc)
+(require-unqualified common cmd/sub/common)
+(require-unqualified build cmd/sub/build)
+
+(provide test-directory test-command!)
+
+;; ---- arguments ----
+
+;; -v, --ignored and --nocapture go to the test program, and so do patterns. --no-run only builds the program. -j N tests
+;; N packages at once. Grants, as for sub run, are added to the test program's. A directory that holds a package.sub is a
+;; package to test.
+(define program-args buffer)
+(define grant-args buffer)
+(define dirs buffer)
+(define running bool #t)
+(define jobs u32 4)
+
+(define (options! [args (slice string)])
+  (set! program-args (make-buffer))
+  (set! grant-args (make-buffer))
+  (set! dirs (make-buffer))
+  (let ([i u32 0] [n u64 0])
+    (while (< i (-> args length))
+      (let ([x (@ args i)])
+        (cond [(or (== x "-v") (== x "--ignored") (== x "--nocapture")) (push! (& program-args) x)]
+              [(== x "--no-run") (set! running #f)]
+              [(and (== x "-j") (< (+ i 1) (-> args length)))
+               (+= i 1)
+               (unless (and (digits-integer (@ args i) 10 #f (& n)) (> n 0) (< n 1000)) (usage))
+               (set! jobs (cast u32 n))]
+              [(grant? x) (push! (& grant-args) x)]
+              [(and (not (starts? x "-")) (== (kind-of (joined-path (absolute x) "package.sub")) fs-file))
+               (push! (& dirs) (absolute x))]
+              [(starts? x "-") (usage)]
+              [else (push! (& program-args) x)]))
+      (+= i 1))))
+
+(define (grant? [x string]) -> bool
+  (or (== x "-A") (starts? x "-R") (starts? x "-W") (starts? x "-N") (starts? x "-E") (starts? x "--allow-run")))
+
+(define (push! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+(define (strings [b (ptr buffer)]) -> (slice string) (slice (cast (ptr string) (-> b bytes)) (/ (-> b length) (sizeof string))))
+
+;; test-directory gives the directory of the one package that args name, or of the package holding the current
+;; directory when they name none. It gives "" when they name several.
+(define (test-directory [args (slice string)]) -> string
+  (options! args)
+  (let ([named (strings (& dirs))] [holder string])
+    (cond [(== (-> named length) 1) (@ named 0)]
+          [(> (-> named length) 1) ""]
+          [else
+           (set! holder (package-holding (& a) cwd))
+           (when (== (-> holder length) 0) (failed! "the current directory is in no package"))
+           holder])))
+
+;; ---- one package ----
+
+(define (test-command! [args (slice string)])
+  (options! args)
+  (if (> (-> (strings (& dirs)) length) 1) (failed! "several packages at once are not done yet") (test-one!)))
+
+(define tested-dir string)
+(define program-out string)
+
+(define (test-one!)
+  (let* ([dir program-dir] [out (joined-path dir "build/test")] [main (joined-path out "main.sub")])
+    (prepare-tests!)
+    (made! out)
+    (main! main dir)
+    (cache!)
+    (set! tested-dir dir)
+    (set! program-out (joined-path out "program"))
+    (compile! "build" main program-out (slice (cast (ptr string) 0) 0) (grants main program-out) built)))
+
+(define (built [code i32])
+  (cond [(!= code 0) (host-exit code)]
+        [(not running) (host-exit 0)]
+        [else (run-program!)]))
+
+(struct test-run [head event-head])
+
+(define test-process test-run)
+
+;; run-program! runs the test program in the package's directory, with the given grants and grants to read the module
+;; map's roots and the cache, to write build/test and the cache, and to run the host. Its options give the toolchain,
+;; the module map and the cache, for compiling in the test program.
+(define (run-program!)
+  (let ([argv (make-buffer)] [r (make-buffer)] [w (make-buffer)] [dirs (root-directories)] [o process-options]
+        [map (joined-path tested-dir "build/test/test.map")] [why string])
+    (map-written! map)
+    (buffer-add-string! (& r) "-R=")
+    (while (pair? dirs)
+      (granted! (& r) (datum->string (car dirs)))
+      (set! dirs (cdr dirs)))
+    (granted! (& r) cache-dir)
+    (buffer-add-string! (& w) "-W=")
+    (granted! (& w) (joined-path tested-dir "build/test"))
+    (granted! (& w) cache-dir)
+    (push! (& argv) (buffer-string (& r)))
+    (push! (& argv) (buffer-string (& w)))
+    (push! (& argv) (joined "--allow-run=" (joined-path (substrate-dir) "host/subhost.mjs")))
+    (for-each-string (& grant-args) (& argv))
+    (push! (& argv) program-out)
+    (push! (& argv) "--name")
+    (push! (& argv) program-package)
+    (push! (& argv) "--toolchain")
+    (push! (& argv) (substrate-dir))
+    (push! (& argv) "--map")
+    (push! (& argv) map)
+    (push! (& argv) "--cache")
+    (push! (& argv) cache-dir)
+    (for-each-string (& program-args) (& argv))
+    (process-options-init! (& o))
+    (set! (-> o dir) tested-dir)
+    (set! (-> o stdin) process-inherit)
+    (set! (-> o stdout) process-inherit)
+    (set! (-> o stderr) process-inherit)
+    (set! (-> test-process head handle) ran)
+    (when (== (process-spawn (joined-path (substrate-dir) "host/subhost.mjs") (strings (& argv)) (& o) (& test-process)
+                             (& why))
+              0)
+      (failed! why))))
+
+(define (for-each-string [from (ptr buffer)] [to (ptr buffer)])
+  (let ([l (strings from)]) (for ([i u32 0]) (< i (-> l length)) (+= i 1) (push! to (@ l i)))))
+
+(define (ran [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (== source process-source)
+    (if (== kind process-exit) (host-exit value) (failed! (events-take-text)))))
+
+;; ---- the program ----
+
+;; main! writes the test program: it requires the package's modules that its exports reach, then its test modules, and
+;; runs the tests they provide.
+(define (main! [main string] [dir string])
+  (let ([text (make-buffer)] [modules (append (package-modules dir) (test-modules dir))] [k u32 0] [seen datum nil]
+        [why string])
+    (buffer-add-string! (& text) ";; The test program for the package ")
+    (buffer-add-string! (& text) program-package)
+    (buffer-add-string! (& text) ", which sub test writes.\n(require-unqualified %runner std/test/test)\n")
+    (while (pair? modules)
+      (unless (!= (member (car modules) seen) 0)
+        (set! seen (cons (car modules) seen))
+        (buffer-add-string! (& text) "(require t")
+        (write-digits (& text) k 10)
+        (buffer-add-byte! (& text) 32)
+        (write-string (& text) (joined "../../" (datum->string (car modules))))
+        (buffer-add-string! (& text) ")\n")
+        (+= k 1))
+      (set! modules (cdr modules)))
+    (buffer-add-string! (& text) "(define (main) (run-tests")
+    (for ([i u32 0]) (< i k) (+= i 1)
+      (buffer-add-string! (& text) " t")
+      (write-digits (& text) i 10))
+    (buffer-add-string! (& text) "))\n")
+    (when (< (fs-write-file main (buffer-bytes (& text)) (& why)) 0) (failed! why))))
+
+;; package-modules gives the paths in the package of the modules that its exports reach.
+(define (package-modules [dir string]) -> datum
+  (let* ([r (& (@ packages 0))] [es (-> r exports)] [public nil] [out nil] [rs datum nil])
+    (for ([i u32 0]) (< i (-> es length)) (+= i 1)
+      (let ([f (@ es i)])
+        (when (and (ends? f ".sub") (within? f dir)) (set! public (cons (string->datum (slice f (+ (-> dir length) 1))) public)))))
+    (set! rs (reached (string->datum (-> r name)) public))
+    (while (pair? rs)
+      (when (== (kind-of (joined-path dir (datum->string (car rs)))) fs-file) (set! out (cons (car rs) out)))
+      (set! rs (cdr rs)))
+    (sorted out)))
+
+;; test-modules gives the paths of the files that the manifest's tests clause names, tests/*.sub by default. A * in a
+;; file's name stands for any text.
+(define (test-modules [dir string]) -> datum
+  (let ([patterns (-> program-manifest tests)] [out nil])
+    (for ([i u32 0]) (< i (-> patterns length)) (+= i 1)
+      (let* ([p (@ patterns i)] [cut (last-slash p)] [sub (if (< cut 0) "" (slice p 0 (cast u32 cut)))]
+             [name (slice p (cast u32 (+ cut 1)))] [names (slice string)] [found nil])
+        (when (>= (fs-list (if (== (-> sub length) 0) dir (joined-path dir sub)) (& names) 0) 0)
+          (for ([j u32 0]) (< j (-> names length)) (+= j 1)
+            (let ([f (if (== (-> sub length) 0) (@ names j) (joined-path sub (@ names j)))])
+              (when (and (matches? (@ names j) name) (== (kind-of (joined-path dir f)) fs-file))
+                (set! found (cons (string->datum f) found))))))
+        (set! out (append out (sorted found)))))
+    out))
+
+(define (last-slash [s string]) -> i32
+  (let ([at i32 -1]) (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) #\/) (set! at (cast i32 i)))) at))
+
+;; matches? is whether name is pattern, where * stands for any text.
+(define (matches? [name string] [pattern string]) -> bool
+  (let ([i u32 0] [j u32 0] [star i32 -1] [mark u32 0])
+    (while (< i (-> name length))
+      (cond [(and (< j (-> pattern length)) (== (@ pattern j) #\*))
+             (set! star (cast i32 j))
+             (set! mark i)
+             (+= j 1)]
+            [(and (< j (-> pattern length)) (== (@ pattern j) (@ name i)))
+             (+= i 1)
+             (+= j 1)]
+            [(>= star 0)
+             (set! j (cast u32 (+ star 1)))
+             (+= mark 1)
+             (set! i mark)]
+            [else (return #f)]))
+    (while (and (< j (-> pattern length)) (== (@ pattern j) #\*)) (+= j 1))
+    (== j (-> pattern length))))
+
+(define (sorted [l datum]) -> datum (sort l (lambda ([x datum] [y datum]) -> bool (< (datum->string x) (datum->string y)))))
