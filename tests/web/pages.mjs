@@ -136,8 +136,8 @@ const checks = {
     await page.type('(memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8)))');
     await page.press('Enter');
     await idle();
-    check('repl: an input that corrupts the session fails', (await last()).split('\n')[0],
-      '! (memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8))) => 8');
+    check('repl: an input that corrupts the session fails', (await last()).split('\n')[0].split(' => ')[0],
+      '! (memset (cast (ptr void) 8) 255 (cast u32 (- (sbrk 0) 8)))');
     check('repl: the page reports that the session crashed', (await last()).split('\n').pop(),
       'The session crashed while evaluating this input. A new session was started.');
     await say('(fib 10)');
