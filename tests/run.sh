@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs every package's tests with sub test, then builds every module and runs the event tests against the real modules.
+# Runs every package's tests with sub test and builds each test program again from the cache, then builds every module and
+# runs the event tests against the real modules.
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,6 +13,11 @@ mkdir -p "$builds"
 cache="$root/$builds/cache"
 rm -rf "${cache:?}"
 mkdir -p "$cache"
+
+same_program() {
+  cmp -s "$1/program" "$2/program" || return 1
+  while read -r l; do cmp -s "$1/$l.wasm" "$2/$l.wasm" || return 1; done < "$1/program"
+}
 
 pass=0
 fail=0
@@ -26,6 +32,20 @@ else
   fail=$((fail + 1))
   echo "FAIL sub test"
 fi
+# Each package's test program, built again from the cache, is the same.
+again=0
+for p in "${packages[@]}"; do
+  first="$builds/again/$p"
+  rm -rf "${first:?}"
+  mkdir -p "$(dirname "$first")"
+  cp -r "$p/build/test/program" "$first"
+  if bin/sub test -c "$cache" --no-run "$p" > /dev/null 2>&1 && same_program "$p/build/test/program" "$first"; then
+    again=$((again + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL $p: its test program, built again from the cache, differs"
+  fi
+done
 # Each module in cmd, std, packages, bench, substrate/host, tests/web and tests/proxy builds.
 mapfile -t modules < <(find cmd std packages bench substrate/host tests/web tests/proxy -name '*.sub' \
                          -not -name package.sub -not -path 'bench/bend/compile/*' -not -path '*/tests/*' | sort)
@@ -67,5 +87,5 @@ done
 [ -n "$server" ] && kill "$server"
 
 echo "$built modules built, $unbuilt failed"
-echo "$pass passed, $fail failed"
+echo "$pass passed, $fail failed; $again built again from the cache"
 [ $fail -eq 0 ] && [ $unbuilt -eq 0 ]
