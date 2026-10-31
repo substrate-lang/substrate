@@ -63,20 +63,3 @@ In the dev shell (`nix develop`):
     make repl                              # the REPL's site, in build/web/repl
     make docs                              # documentation of the toolchain and the packages, as HTML in build/doc
     bench/*/run.sh                         # benchmarks
-
-## Tests
-
-A test is a `test` form, which only a package's test build compiles:
-
-    (test round-trip
-      (expect-equal (decoded (encoded "hello")) "hello"))
-
-`expect` checks a condition, and `expect-equal` compares two values and
-shows both when they differ. A package's test modules are the files in its
-`tests/` directory, or those its manifest names with `(tests "path" ...)`,
-where `*` in a file's name stands for any text. `(grants "flag" ...)` in
-that clause gives the test program more grants, as `sub run` takes them.
-`sub test` builds all of the package's modules and its test modules into one
-program and runs it, and a trap fails only its own test. `std/test/test`
-compares what code prints with text or a file, and `std/test/build` checks a
-file's compile error, and builds and runs programs in processes of their own.
