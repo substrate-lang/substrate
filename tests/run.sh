@@ -45,14 +45,13 @@ for p in "${packages[@]}"; do
     echo "FAIL $p: its test program, built again from the cache, differs"
   fi
 done
-# Programs built with sub: the tests of packages, those copied outside every package, and those whose output or error
-# comes from compiling them.
+# Programs built with sub: the tests of packages, and those copied outside every package.
 loose="${OUT:-build}/loose"
 rm -rf "${loose:?}"
 mkdir -p "$loose"
 cp -r tests/packages/err-name.* tests/packages/err-other-package-path.* tests/packages/loose-path.* tests/packages/cside \
   "$loose/"
-tests=(tests/packages/*.sub tests/packages/cside/tests/*.sub tests/packages/bounds/*.sub tests/compile-time/*.sub "$loose"/*.sub)
+tests=(tests/packages/*.sub tests/packages/cside/tests/*.sub tests/packages/bounds/*.sub "$loose"/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   [ "$name" = package ] && continue
@@ -180,13 +179,6 @@ if [ "$whole" = 3 ]; then
 else
   fail=$((fail + 1))
   echo "FAIL the cache entries cut short: got $whole"
-fi
-# A build that traps fails.
-if (cd tests/compile-time && "$root/bin/sub" build err-macro-trap.sub -o "$root/$builds/trapped" -c "$cache" > /dev/null 2>&1); then
-  fail=$((fail + 1))
-  echo "FAIL tests/compile-time/err-macro-trap: the build traps and exits 0"
-else
-  pass=$((pass + 1))
 fi
 # A package built from two directories gives the same program.
 moved="$builds/moved"

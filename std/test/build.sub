@@ -1,6 +1,7 @@
-;; Tests that build programs with the compiler in the test program and the module map that sub test gives it.
-;; expect-compile-error compiles a file and expects a compile error, and expect-run builds a program and runs it in its
-;; own host process.
+;; Tests that build programs with the module map that sub test gives. expect-compile-error compiles a file with the
+;; compiler in the test program and expects a compile error, and expect-run builds a program that way and runs it in its
+;; own host process. expect-build builds a program with the compiler program, in a process of its own and with an empty
+;; cache, and checks what the build prints: what the program's code printed while it compiled, or its compile error.
 (require-unqualified macros compiler/macros)
 (require-unqualified ex compiler/expander)
 (require-unqualified rt compiler/roots)
@@ -11,7 +12,7 @@
 (require-unqualified tests "test.sub")
 (require-unqualified compare "compare.sub")
 
-(provide expect-compile-error expect-run)
+(provide expect-compile-error expect-run expect-build)
 
 ;; ---- building ----
 
@@ -55,20 +56,18 @@
 (struct run-result [code i32] [output string])
 
 ;; run-program builds the program at path and runs it with the host in dir, with the grants, the arguments and input as
-;; its stdin, for at most a minute. In the grants and the arguments, @program stands for the program's directory and
-;; @build for an empty directory of the program's own in build/test/runs.
+;; its stdin, for at most a minute. In the grants and the arguments, $SCRATCH stands for a new scratch directory, the
+;; same one throughout the run.
 (define (run-program [path string] [dir string] [args (slice string)] [grants (slice string)] [input (slice u8)]
                      [message string]) -> run-result
   (let ([err (make-buffer)] [out string] [argv (make-buffer)] [o process-options] [r run-result] [bytes (slice u8)]
         [why string])
     (set! out (built! path (& err)))
     (when (== (-> out length) 0) (failure! message (text-of "the program does not compile\n" (buffer-string (& err)))))
-    (set! scratch (joined-path directory (text-of "build/test/runs/" (if (ends? path ".sub") (slice path 0 (- (-> path length) 4)) path))))
-    (fs-remove scratch #t 0)
-    (when (< (fs-make-dir scratch (& why)) 0) (failure! message why))
-    (for ([i u32 0]) (< i (-> grants length)) (+= i 1) (push! (& argv) (placed (@ grants i) out)))
+    (set! scratch "")
+    (for ([i u32 0]) (< i (-> grants length)) (+= i 1) (push! (& argv) (placed (@ grants i))))
     (push! (& argv) out)
-    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (push! (& argv) (placed (@ args i) out)))
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (push! (& argv) (placed (@ args i))))
     (process-options-init! (& o))
     (set! (-> o dir) (joined-path directory dir))
     (set! (-> r code) (process-run (joined-path (test-option "--toolchain") "host/subhost.mjs")
@@ -78,17 +77,65 @@
     (set! (-> r output) (cast string bytes))
     r))
 
-;; run-check! checks a run: with fails given, that it failed with output containing fails, or else that it exited with
-;; 0. Then it compares the output with expected when compare is 1, or with the file at the path expected when compare is
-;; 2.
-(define (run-check! [r (ptr run-result)] [fails string] [compare u32] [expected string] [message string])
+;; build-apart builds the program at path with the compiler program, as sub build does from the file's directory, but
+;; with an empty cache, so that the program and what it requires compile and their code that runs while compiling runs.
+;; It grants reading the module map's roots and the cache, and writing the cache and the program.
+(define (build-apart [path string] [message string]) -> run-result
+  (ready!)
+  (let* ([full (joined-path directory path)] [toolchain (test-option "--toolchain")] [cache (scratch-directory)]
+         [out (joined-path directory (text-of "build/test/built/" (if (ends? path ".sub") (slice path 0 (- (-> path length) 4)) path)))]
+         [argv (make-buffer)] [r (make-buffer)] [w (make-buffer)] [dirs (root-directories)] [o process-options]
+         [result run-result] [bytes (slice u8)] [why string])
+    (fs-remove out #t 0)
+    (buffer-add-string! (& r) "-R=")
+    (while (pair? dirs)
+      (granted! (& r) (datum->string (car dirs)))
+      (set! dirs (cdr dirs)))
+    (granted! (& r) cache)
+    (buffer-add-string! (& w) "-W=")
+    (granted! (& w) cache)
+    (granted! (& w) out)
+    (push! (& argv) (buffer-string (& r)))
+    (push! (& argv) (buffer-string (& w)))
+    (push! (& argv) (joined-path (parent-of toolchain) "build/compiler"))
+    (push! (& argv) toolchain)
+    (push! (& argv) "-c")
+    (push! (& argv) cache)
+    (push! (& argv) "-d")
+    (push! (& argv) (parent-of full))
+    (push! (& argv) "-m")
+    (push! (& argv) (test-option "--map"))
+    (push! (& argv) "build")
+    (push! (& argv) full)
+    (push! (& argv) "-o")
+    (push! (& argv) out)
+    (process-options-init! (& o))
+    (set! (-> o dir) (parent-of full))
+    (set! (-> result code) (process-run (joined-path toolchain "host/subhost.mjs")
+                                        (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string)))
+                                        (& o) (slice (cast (ptr u8) 0) 0) 60000 (& bytes) (& why)))
+    (when (< (-> result code) 0) (failure! message why))
+    (set! (-> result output) (cast string bytes))
+    result))
+
+;; In grant flags, a comma in a path is written ",," (substrate/host/grants.mjs).
+(define (granted! [b (ptr buffer)] [path string])
+  (when (> (-> b length) 3) (buffer-add-byte! b #\,))
+  (for ([i u32 0]) (< i (-> path length)) (+= i 1)
+    (when (== (@ path i) #\,) (buffer-add-byte! b #\,))
+    (buffer-add-byte! b (cast i32 (@ path i)))))
+
+;; run-check! checks a run of what, the program or the build: with fails given, that it failed with output containing
+;; fails, or else that it exited with 0. Then it compares the output with expected when compare is 1, or with the file
+;; at the path expected when compare is 2.
+(define (run-check! [r (ptr run-result)] [what string] [fails string] [compare u32] [expected string] [message string])
   (let ([output (-> r output)])
     (if (> (-> fails length) 0)
         (begin
-          (when (== (-> r code) 0) (failure! message (text-of "the program exited with 0, and its output is\n" output)))
-          (unless (contains? output fails) (failure! message (text-of "the program failed, and its output is\n" output))))
+          (when (== (-> r code) 0) (failure! message (text-of (text-of "the " what) (text-of " exited with 0, and its output is\n" output))))
+          (unless (contains? output fails) (failure! message (text-of (text-of "the " what) (text-of " failed, and its output is\n" output)))))
         (unless (== (-> r code) 0)
-          (failure! message (text-of (text-of "the program exited with " (digits-of (-> r code)))
+          (failure! message (text-of (text-of (text-of "the " what) (text-of " exited with " (digits-of (-> r code))))
                                      (text-of ", and its output is\n" output)))))
     (cond [(== compare 2)
            (let ([bytes (file-bytes-of expected message)])
@@ -103,14 +150,12 @@
 
 (define scratch string)
 
-(define (placed [text string] [program string]) -> string
-  (let ([b (make-buffer)] [build scratch] [i u32 0])
+(define (placed [text string]) -> string
+  (let ([b (make-buffer)] [i u32 0])
     (while (< i (-> text length))
-      (cond [(at? text i "@build")
-             (buffer-add-string! (& b) build)
-             (+= i 6)]
-            [(at? text i "@program")
-             (buffer-add-string! (& b) program)
+      (cond [(at? text i "$SCRATCH")
+             (when (== (-> scratch length) 0) (set! scratch (scratch-directory)))
+             (buffer-add-string! (& b) scratch)
              (+= i 8)]
             [else
              (buffer-add-byte! (& b) (cast i32 (@ text i)))
@@ -192,8 +237,33 @@
                    [else (raise-syntax-error 'expect-run "the options are #:args, #:grants, #:stdin, #:stdin-file, #:output, #:output-file and #:fails" (car l))]))
            (set! l (cddr l)))
          #`(let ([r (run-program #,(path-of s file) #,(path-of s (literal '"")) #,args #,grants #,input #,message)])
-             (run-check! (& r) #,fails #,compare #,expected #,message)))]
-      [_ (raise-syntax-error 'expect-run "expected (expect-run \"path\" option ...)" s)])))
+             (run-check! (& r) "program" #,fails #,compare #,expected #,message)))]
+      [_ (raise-syntax-error 'expect-run "expected (expect-run \"path\" option ...)" s)]))
+
+  ;; (expect-build "path" option ...) builds the program at path, relative to the module, with the compiler program and
+  ;; checks what the build prints. The options are #:output "text", #:output-file "path" and #:fails "text".
+  (define (expect-build-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? text? file) options ...)
+       (let ([compare (literal (make-integer 0))] [expected (literal '"")] [fails (literal '"")]
+             [message (message-of s file)] [l options])
+         (while (pair? l)
+           (unless (and (keyword? (syntax-e (car l))) (pair? (cdr l)) (text? (cadr l)))
+             (raise-syntax-error 'expect-build "expected a keyword and a text" (car l)))
+           (let ([k (keyword->string (syntax-e (car l)))] [v (cadr l)])
+             (cond [(== k "output")
+                    (set! compare (literal (make-integer 1)))
+                    (set! expected v)]
+                   [(== k "output-file")
+                    (set! compare (literal (make-integer 2)))
+                    (set! expected (path-of s v))]
+                   [(== k "fails") (set! fails v)]
+                   [else (raise-syntax-error 'expect-build "the options are #:output, #:output-file and #:fails" (car l))]))
+           (set! l (cddr l)))
+         #`(let ([r (build-apart #,(path-of s file) #,message)])
+             (run-check! (& r) "build" #,fails #,compare #,expected #,message)))]
+      [_ (raise-syntax-error 'expect-build "expected (expect-build \"path\" option ...)" s)])))
 
 (define-syntax expect-compile-error expect-compile-error-form)
 (define-syntax expect-run expect-run-form)
+(define-syntax expect-build expect-build-form)
