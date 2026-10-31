@@ -80,8 +80,6 @@ export function processes(grants, loader, setup = {}) {
         });
         return id;
       },
-      // run runs a program to its end. Its stdout and stderr go, in order, to a file of the host's own, whose bytes it
-      // gives at op.
       run(pp, pl, ap, al, dp, dl, ep, el, clear, ip, il, timeout, op, err) {
         let dir = null;
         try {

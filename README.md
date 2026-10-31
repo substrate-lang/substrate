@@ -77,6 +77,6 @@ shows both when they differ. A package's test modules are the files in its
 where `*` in a file's name stands for any text. `(grants "flag" ...)` in
 that clause gives the test program more grants, as `sub run` takes them.
 `sub test` builds all of the package's modules and its test modules into one
-program and runs it, and a trap fails only its own test. `std/test/test` compares what code prints
-with text or a file, and `std/test/build` checks a file's compile error, and
-builds and runs programs in processes of their own.
+program and runs it, and a trap fails only its own test. `std/test/test`
+compares what code prints with text or a file, and `std/test/build` checks a
+file's compile error, and builds and runs programs in processes of their own.

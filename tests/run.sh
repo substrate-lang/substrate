@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Runs every package's tests with sub test, which builds each package's modules, and builds each test program again from
-# the cache. Then it builds the modules outside packages and runs the event tests against the real modules.
+# The tests make check runs.
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,7 +23,7 @@ fail=0
 built=0
 unbuilt=0
 
-# The packages' tests, and the programs they build again from the cache.
+# The packages' tests.
 packages=(./std ./cmd ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite ./tests ./tests/web)
 if bin/sub test -c "$cache" --check-cache "${packages[@]}"; then
   pass=$((pass + 1))
@@ -46,8 +45,7 @@ for p in "${packages[@]}"; do
     echo "FAIL $p: its test program, built again from the cache, differs"
   fi
 done
-# Each module in bench, substrate/host and tests/proxy builds, and so does each one-file package elsewhere outside tests
-# directories: a file whose first form is its own (package ...).
+# Each module of bench, substrate/host and tests/proxy builds, and so does each one-file package.
 one_file() { awk 'NF && !/^[[:space:]]*;/ { found = 1; code = !/^[[:space:]]*\(package([[:space:]]|$)/; exit } END { exit found ? code : 1 }' "$1"; }
 mapfile -t modules < <( (find bench substrate/host tests/proxy -name '*.sub' -not -name package.sub \
                            -not -path 'bench/bend/compile/*' -not -path '*/build/*'
@@ -63,8 +61,7 @@ for m in "${modules[@]}"; do
     echo "$actual" | head -10
   fi
 done
-# The event tests again, against the real modules and the server in tests/events/fixtures, with the programs sub test
-# built.
+# The event tests again, against the real modules and the server in tests/events/fixtures.
 server=""
 for t in tests/events/*.sub; do
   name="$(basename "$t" .sub)"
