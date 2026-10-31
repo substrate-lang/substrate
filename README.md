@@ -37,8 +37,8 @@ compiler is written in it, builds itself, and runs in a browser.
 - `seed/`: checked-in builds of the compiler and of sub, which build them
   from source.
 - `tests/`: the tests of the compiler and the host, as the package
-  substrate-tests, and the tests of sub, which `tests/run.sh` runs. Each
-  package's own tests are in its `tests/` directory.
+  substrate-tests. Each package's own tests are in its `tests/` directory,
+  and `tests/run.sh` runs them all.
 - `bench/`: benchmarks.
 
 ## Commands
@@ -77,5 +77,5 @@ shows both when they differ. A package's test modules are the files in its
 where `*` in a file's name stands for any text. `sub test` builds the
 package's modules and its test modules into one program and runs it, and a
 trap fails only its own test. `std/test/test` compares what code prints
-with text or a file, and `std/test/build` checks a file's compile error and
-runs a program in a process of its own.
+with text or a file, and `std/test/build` checks a file's compile error, and
+builds and runs programs in processes of their own.

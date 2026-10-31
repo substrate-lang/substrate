@@ -1,0 +1,104 @@
+;; The compile cache, through sub build: stale and cut entries, what an edit compiles again, programs built again from
+;; the cache, the order of requires, and the compiler's check of changed sources.
+(require-unqualified fs host/fs)
+(require-unqualified tests std/test/test)
+(require-unqualified paths std/package/path)
+(require-unqualified support "support/sub.sub")
+
+(test stale-entry
+  (let* ([d (scratch-directory)] [cache (test-option "--cache")] [out (joined-path d "a-built")])
+    (written! (joined-path d "b.sub") "(provide x)\n(define (x) -> i32 1)\n")
+    (written! (joined-path d "a.sub") "(require b \"b.sub\" x)\n(define (main) (printf \"~a~n\" (x)))\n")
+    (expect-ran (built-run d "a.sub" out cache) #:output "1")
+    (removed! (joined-path d "b.sub"))
+    (written! (joined-path d "a.sub") "(define (main) (printf \"~a~n\" 2))\n")
+    (expect-ran (built-run d "a.sub" out cache) #:output "2")))
+
+(test cut-entries
+  (let* ([d (scratch-directory)] [cache (joined-path d "cache")] [out (joined-path d "c-built")] [names (slice string)])
+    (written! (joined-path d "c.sub") "(define (main) (printf \"~a~n\" 3))\n")
+    (expect-ran (built-run d "c.sub" out cache) #:output "3")
+    (fs-list cache (& names) 0)
+    (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+      (when (ends? (@ names i) ".subc") (truncated! (joined-path cache (@ names i)) 100)))
+    (expect-ran (built-run d "c.sub" out cache) #:output "3")))
+
+;; An edit compiles again only the module edited and those that require it, and its entry replaces the old one.
+(test edit
+  (let* ([d (scratch-directory)] [cache (joined-path d "cache")] [out (joined-path d "built")] [before u32 0]
+         [marker (joined-path d "marker")])
+    (written! (joined-path d "b.sub") "(provide b)\n(define (b) -> i32 1)\n")
+    (written! (joined-path d "a.sub") "(require b \"b.sub\")\n(provide a)\n(define (a) -> i32 (b:b))\n")
+    (written! (joined-path d "c.sub") "(provide c)\n(define (c) -> i32 3)\n")
+    (written! (joined-path d "main.sub")
+              "(require a \"a.sub\")\n(require c \"c.sub\")\n(define (main) (printf \"~a~n\" (+ (a:a) (c:c))))\n")
+    (expect-ran (built-run d "main.sub" out cache) #:output "4")
+    (set! before (entries cache ".subc"))
+    (written! marker "")
+    (written! (joined-path d "b.sub") "(provide b)\n(define (b) -> i32 2)\n")
+    (expect-ran (built-run d "main.sub" out cache) #:output "5")
+    (expect-equal (entries-since cache ".subc" (modified-at marker)) 3)
+    (expect-equal (entries cache ".subc") before)))
+
+;; rebuilt-same? builds file with an empty cache, then again from the cache, and compares the two programs.
+(define (rebuilt-same? [file string]) -> bool
+  (let* ([d (scratch-directory)] [cache (joined-path d "cache")] [one (joined-path d "one")] [two (joined-path d "two")])
+    (expect-ran (sub d "build" file "-o" one "-c" cache))
+    (expect-ran (sub d "build" file "-o" two "-c" cache))
+    (same-program? one two)))
+
+;; A program built again from the cache is the same, and so is a test program.
+(test built-again-from-cache
+  (expect (rebuilt-same? (joined-path (root) "cmd/sub/sub.sub")))
+  (expect (rebuilt-same? (joined-path (root) "packages/web/examples/snake/snake.sub")))
+  (expect (rebuilt-same? (joined-path (root) "packages/scheme/tests/append-long.sub")))
+  (expect (rebuilt-same? (joined-path (root) "packages/bend/tests/base.sub")))
+  (expect (rebuilt-same? (joined-path (root) "packages/sqlite/tests/basics.sub")))
+  (let* ([d (scratch-directory)] [failing (joined-path d "failing")] [cache (joined-path d "cache")])
+    (copied! "tests/failing" failing)
+    (expect-ran (sub d "test" "--no-run" "-c" cache "failing"))
+    (copied! (joined-path failing "build/test/program") (joined-path d "first"))
+    (expect-ran (sub d "test" "--no-run" "-c" cache "failing"))
+    (expect (same-program? (joined-path d "first") (joined-path failing "build/test/program")))))
+
+;; same-modules? is whether the programs in a and b have the same modules named from prefix, and at least one.
+(define (same-modules? [a string] [b string] [prefix string]) -> bool
+  (let ([names (slice string)] [found #f])
+    (fs-list a (& names) 0)
+    (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+      (when (starts? (@ names i) prefix)
+        (set! found #t)
+        (unless (== (text-in (joined-path a (@ names i))) (text-in (joined-path b (@ names i)))) (return #f))))
+    found))
+
+;; order-a and order-b require the same two modules in either order: the same bytes.
+(test require-order
+  (let* ([d (scratch-directory)] [dir (joined-path (root) "packages/scheme/tests")] [cache (test-option "--cache")])
+    (expect-ran (sub dir "build" "order-a.sub" "-o" (joined-path d "a") "-c" cache))
+    (expect-ran (sub dir "build" "order-b.sub" "-o" (joined-path d "b") "-c" cache))
+    (expect (same-modules? (joined-path d "a") (joined-path d "b") "order-m."))
+    (expect (same-modules? (joined-path d "a") (joined-path d "b") "order-n."))))
+
+;; changed-run builds tests/forms.sub against the compiler's sources in dir, with the running compiler, and runs it.
+(define (changed-run [dir string]) -> ran
+  (let* ([out (joined-path dir "out")]
+         [b (host dir "-R" "-W" (joined-path (root) "build/compiler") (joined-path dir "substrate") "build" "tests/forms.sub"
+                  "-o" out "-d" dir)])
+    (when (!= (-> b code) 0) (return b))
+    (let ([r (host dir out)])
+      (set! (-> r output) (joined (-> b output) (-> r output)))
+      r)))
+
+;; A program with macros builds against changed compiler sources and runs as it does here, until a change alters a
+;; struct that code run while compiling shares with the running compiler.
+(test changed-sources
+  (let* ([d (scratch-directory)] [compiler (joined-path d "substrate/compiler")])
+    (copied! (joined-path (root) "substrate/compiler") compiler)
+    (copied! (joined-path (root) "substrate/host/fs.sub") (joined-path d "substrate/host/fs.sub"))
+    (copied! "tests/changed/forms.sub" (joined-path d "tests/forms.sub"))
+    (written! (joined-path compiler "substrate.sub") (joined (text-in (joined-path compiler "substrate.sub")) ";; changed\n"))
+    (edited! (joined-path compiler "syntax.sub") "(provide datum srcloc scope-set\n" "(provide datum srcloc scope-set added\n")
+    (edited! (joined-path compiler "syntax.sub") "(struct srcloc [" "(struct added [a i32])\n(struct srcloc [")
+    (expect-ran (changed-run d) #:output (text-in "tests/changed/forms.out"))
+    (edited! (joined-path compiler "syntax.sub") "(struct srcloc [" "(struct srcloc [unused i32] [")
+    (expect-ran (changed-run d) #:fails "whose srcloc differs")))
