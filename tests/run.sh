@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds and runs every test, then checks that the cache gives each build back.
+# Runs every package's tests with sub test, then the checks of sub itself and of the compiler's cache.
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -23,48 +23,50 @@ fail=0
 built=0
 unbuilt=0
 
-# A certificate for the TLS tests, which their clients trust because it is granted.
-mkdir -p "$builds/tls"
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
-  -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$builds/tls/key.pem" -out "$builds/tls/cert.pem" 2> /dev/null
-
-# Archives for tests/archive/tar.sub, made by GNU tar in each of its formats.
-tarred="$builds/tar"
-deep="pkg/a-directory-whose-name-is-long-enough-that/a-path-through-it-is-longer-than-the-hundred-bytes-of-a-name"
-mkdir -p "$tarred/tree/$deep"
-printf 'hello\n' > "$tarred/tree/pkg/hello.txt"
-printf 'deep\n' > "$tarred/tree/$deep/deep.txt"
-: > "$tarred/tree/pkg/empty"
-ln -s hello.txt "$tarred/tree/pkg/link"
-for format in ustar gnu pax; do
-  tar --sort=name --format="$format" -cf "$tarred/$format.tar" -C "$tarred/tree" pkg
+# The packages' tests.
+packages=(std cmd packages/web packages/scheme packages/bend packages/nodes packages/sqlite tests)
+if bin/sub test -c "$cache" "${packages[@]}"; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL sub test"
+fi
+# Each package's test program, built again from the cache, is the same.
+again=0
+for p in "${packages[@]}"; do
+  first="$builds/again/$p"
+  rm -rf "${first:?}"
+  mkdir -p "$(dirname "$first")"
+  cp -r "$p/build/test/program" "$first"
+  if bin/sub test -c "$cache" --no-run "$p" > /dev/null 2>&1 && same_program "$p/build/test/program" "$first"; then
+    again=$((again + 1))
+  else
+    fail=$((fail + 1))
+    echo "FAIL $p: its test program, built again from the cache, differs"
+  fi
 done
-tar --sort=name --format=pax --pax-option=comment=a-global-header -cf "$tarred/global.tar" -C "$tarred/tree" pkg
-head -c 600 /dev/zero | tr '\0' x > "$tarred/not.tar"
-head -c 1000 "$tarred/ustar.tar" > "$tarred/short.tar"
-
-tests=(tests/*.sub tests/substrate/*.sub tests/scheme/*.sub tests/bend/*.sub tests/ui/*.sub tests/events/*.sub tests/http/*.sub
-       tests/crypto/*.sub tests/encoding/*.sub tests/meta/*.sub tests/log/*.sub tests/compress/*.sub tests/cmd/*.sub
-       tests/packages/*.sub tests/packages/cside/tests/*.sub tests/packages/bounds/*.sub tests/sqlite/*.sub
-       tests/archive/*.sub)
+# Programs built with sub: the tests of packages, those copied outside every package, and those whose output or error
+# comes from compiling them.
+loose="${OUT:-build}/loose"
+rm -rf "${loose:?}"
+mkdir -p "$loose"
+cp -r tests/packages/err-name.* tests/packages/err-other-package-path.* tests/packages/loose-path.* tests/packages/cside \
+  "$loose/"
+tests=(tests/packages/*.sub tests/packages/cside/tests/*.sub tests/packages/bounds/*.sub tests/compile-time/*.sub "$loose"/*.sub)
 for t in "${tests[@]}"; do
   name="$(basename "$t" .sub)"
   [ "$name" = package ] && continue
+  [ -f "$loose/$name.sub" ] && [ "$t" != "$loose/$name.sub" ] && continue
   dir="$(dirname "$t")"
   base="$dir/$name"
-  program="$builds/${dir#tests}/$name"
+  program="$builds/programs/$base"
   rm -rf "${program:?}"
   args=()
   if [ -f "$base.args" ]; then read -r -a args < "$base.args"; fi
-  args=("${args[@]/@program/$root/$program}")
-  args=("${args[@]//@build/$root/$builds}")
   options=()
   if [ -f "$base.host" ]; then read -r -a options < "$base.host"; fi
-  options=("${options[@]//@build/$root/$builds}")
-  input=/dev/null
-  if [ -f "$base.in" ]; then input="$root/$base.in"; fi
   actual="$(cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$program" -c "$cache" 2>&1 &&
-            timeout 60 "$host" ${options[@]+"${options[@]}"} "$root/$program" ${args[@]+"${args[@]}"} 2>&1 < "$input")"
+            timeout 60 "$host" ${options[@]+"${options[@]}"} "$root/$program" ${args[@]+"${args[@]}"} 2>&1 < /dev/null)"
   code=$?
   problem=""
   if [ -f "$base.out" ]; then
@@ -86,7 +88,7 @@ for t in "${tests[@]}"; do
 done
 # Each module in cmd, std, packages, bench, substrate/host, tests/web and tests/proxy builds.
 mapfile -t modules < <(find cmd std packages bench substrate/host tests/web tests/proxy -name '*.sub' \
-                         -not -name package.sub -not -path 'bench/bend/compile/*' | sort)
+                         -not -name package.sub -not -path 'bench/bend/compile/*' -not -path '*/tests/*' | sort)
 for m in "${modules[@]}"; do
   actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
@@ -97,7 +99,8 @@ for m in "${modules[@]}"; do
     echo "$actual" | head -10
   fi
 done
-# The event tests again, against the real modules and the server in tests/events/fixtures.
+# The event tests again, against the real modules and the server in tests/events/fixtures, with the programs sub test
+# built.
 server=""
 for t in tests/events/*.sub; do
   name="$(basename "$t" .sub)"
@@ -110,7 +113,8 @@ for t in tests/events/*.sub; do
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
-  actual="$(cd tests/events && timeout 60 "$host" -N=127.0.0.1 -R=. "$root/$builds/events/$name" "$url" "ws${url#http}" 2>&1)"
+  actual="$(cd tests/events && timeout 60 "$host" -N=127.0.0.1 -R=. "$root/tests/build/test/programs/events/$name" "$url" \
+              "ws${url#http}" 2>&1)"
   code=$?
   if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then
     pass=$((pass + 1))
@@ -121,44 +125,32 @@ for t in tests/events/*.sub; do
   fi
 done
 [ -n "$server" ] && kill "$server"
-# The session tests.
-for t in tests/session/*.sub; do
-  name="$(basename "$t" .sub)"
-  [ "$name" = package ] && continue
-  actual="$(cd tests/session && "$root/bin/sub" eval "$name.sub" -c "$cache" 2>&1 | grep -v '^    ')"
-  if [ -f "tests/session/$name.out" ] && [ "$actual" = "$(cat "tests/session/$name.out")" ]; then
-    pass=$((pass + 1))
-  else
-    fail=$((fail + 1))
-    echo "FAIL tests/session/$name: output differs"
-    diff <(echo "$actual") "tests/session/$name.out" | head -20
-  fi
-done
+
+# sub eval of a program with a manifest of its own.
+actual="$(cd tests/session && "$root/bin/sub" eval supplied.sub -c "$cache" 2>&1 | grep -v '^    ')"
+if [ "$actual" = "$(cat tests/session/supplied.out)" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  echo "FAIL tests/session/supplied: output differs"
+  diff <(echo "$actual") tests/session/supplied.out | head -20
+fi
 # order-a and order-b require the same two modules in either order: the same bytes.
+for o in order-a order-b; do
+  (cd packages/scheme/tests && "$root/bin/sub" build "$o.sub" -o "$root/$builds/scheme/$o" -c "$cache" > /dev/null 2>&1)
+done
+compared=0
 for f in "$builds"/scheme/order-a/order-[mn].*.wasm; do
+  compared=$((compared + 1))
   if ! cmp -s "$f" "$builds/scheme/order-b/$(basename "$f")"; then
     fail=$((fail + 1))
-    echo "FAIL tests/scheme/order-b: $(basename "$f") differs from order-a's"
+    echo "FAIL packages/scheme/tests/order-b: $(basename "$f") differs from order-a's"
   fi
 done
-again=0
-for t in "${tests[@]}"; do
-  name="$(basename "$t" .sub)"
-  dir="$(dirname "$t")"
-  program="$builds/${dir#tests}/$name"
-  [ -f "$program/program" ] || continue
-  rebuilt="$builds/again/${dir#tests}/$name"
-  rm -rf "${rebuilt:?}"
-  if ! (cd "$dir" && "$root/bin/sub" build "$name.sub" -o "$root/$rebuilt" -c "$cache" > /dev/null 2>&1); then
-    fail=$((fail + 1))
-    echo "FAIL $dir/$name: does not build again from the cache"
-  elif ! same_program "$rebuilt" "$program"; then
-    fail=$((fail + 1))
-    echo "FAIL $dir/$name: built again from the cache, the program differs"
-  else
-    again=$((again + 1))
-  fi
-done
+if [ $compared -ne 2 ]; then
+  fail=$((fail + 1))
+  echo "FAIL packages/scheme/tests/order-a and order-b: built $compared of their modules, not 2"
+fi
 # A stale cache entry is not used.
 stale="$builds/stale"
 rm -rf "${stale:?}"
@@ -190,9 +182,9 @@ else
   echo "FAIL the cache entries cut short: got $whole"
 fi
 # A build that traps fails.
-if (cd tests && "$root/bin/sub" build err-macro-trap.sub -o "$root/$builds/trapped" -c "$cache" > /dev/null 2>&1); then
+if (cd tests/compile-time && "$root/bin/sub" build err-macro-trap.sub -o "$root/$builds/trapped" -c "$cache" > /dev/null 2>&1); then
   fail=$((fail + 1))
-  echo "FAIL tests/err-macro-trap: the build traps and exits 0"
+  echo "FAIL tests/compile-time/err-macro-trap: the build traps and exits 0"
 else
   pass=$((pass + 1))
 fi
@@ -468,22 +460,22 @@ fi
 # A test with macros builds against changed compiler sources and runs as it does here.
 changed="$builds/changed"
 rm -rf "${changed:?}"
-mkdir -p "$changed/tests/substrate" "$changed/substrate/host"
+mkdir -p "$changed/tests/substrate/programs" "$changed/substrate/host"
 cp -r substrate/compiler "$changed/substrate/"
 cp substrate/host/fs.sub "$changed/substrate/host/"
-cp tests/substrate/forms.sub "$changed/tests/substrate/"
+cp tests/substrate/programs/forms.sub "$changed/tests/substrate/programs/"
 from_changed() {
-  "$host" -R -W "$root/build/compiler" "$root/$changed/substrate" build tests/substrate/forms.sub -o "$root/$changed/out" \
+  "$host" -R -W "$root/build/compiler" "$root/$changed/substrate" build tests/substrate/programs/forms.sub -o "$root/$changed/out" \
     -d "$root/$changed" 2>&1 && "$host" "$root/$changed/out" 2>&1
 }
 echo ';; changed' >> "$changed/substrate/compiler/substrate.sub"
 sed -i 's|^(provide datum srcloc scope-set$|& added|; s|^(struct srcloc \[|(struct added [a i32])\n&|' \
   "$changed/substrate/compiler/syntax.sub"
-if [ "$(from_changed)" = "$(cat tests/substrate/forms.out)" ]; then
+if [ "$(from_changed)" = "$(cat tests/substrate/programs/forms.out)" ]; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
-  echo "FAIL changed sources: tests/substrate/forms.sub does not build and run as it does here"
+  echo "FAIL changed sources: tests/substrate/programs/forms.sub does not build and run as it does here"
 fi
 sed -i 's|^(struct srcloc \[|(struct srcloc [unused i32] [|' "$changed/substrate/compiler/syntax.sub"
 if grep -qF "whose srcloc differs" <<< "$(from_changed)"; then

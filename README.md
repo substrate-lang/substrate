@@ -36,7 +36,10 @@ compiler is written in it, builds itself, and runs in a browser.
   packages and runs the compiler, and the server that `sub serve` runs.
 - `seed/`: checked-in builds of the compiler and of sub, which build them
   from source.
-- `tests/`, `bench/`.
+- `tests/`: the tests of the compiler and the host, as the package
+  substrate-tests, and the tests of sub, which `tests/run.sh` runs. Each
+  package's own tests are in its `tests/` directory.
+- `bench/`: benchmarks.
 
 ## Commands
 
@@ -51,6 +54,7 @@ In the dev shell (`nix develop`):
     bin/sub doc                            # documentation of the current package and its dependencies, as HTML in build/doc
     bin/sub doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM
     bin/sub doc -o DIR PACKAGE ...         # packages' documentation as text, or with --html as HTML, into DIR
+    bin/sub test [DIR ...] [PATTERN ...]   # the tests of the current package, or of each DIR at once
     bin/sub version                        # substrate's version, and the hash of its files
     make check                             # the tests, then make docs when they pass
     tests/web/run.sh                       # the browser tests
@@ -59,3 +63,19 @@ In the dev shell (`nix develop`):
     make repl                              # the REPL's site, in build/web/repl
     make docs                              # documentation of the toolchain and the packages, as HTML in build/doc
     bench/*/run.sh                         # benchmarks
+
+## Tests
+
+A test is a `test` form, which only a package's test build compiles:
+
+    (test round-trip
+      (expect-equal (decoded (encoded "hello")) "hello"))
+
+`expect` checks a condition, and `expect-equal` compares two values and
+shows both when they differ. A package's test modules are the files in its
+`tests/` directory, or those its manifest names with `(tests "path" ...)`,
+where `*` in a file's name stands for any text. `sub test` builds the
+package's modules and its test modules into one program and runs it, and a
+trap fails only its own test. `std/test/test` compares what code prints
+with text or a file, and `std/test/build` checks a file's compile error and
+runs a program in a process of its own.

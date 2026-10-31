@@ -1,0 +1,146 @@
+;; Requests to a server, each connection's sent at once: pipelined, malformed and refused requests, HEAD, 204,
+;; 100-continue, absolute targets, paths that leave the root, Connection: close, and the client's address.
+(require-unqualified events host/events)
+(require-unqualified stream host/stream)
+(require-unqualified fs host/fs)
+(require-unqualified net host/node/net)
+(require-unqualified timer host/modules/timer)
+(require-unqualified http std/http)
+(require-unqualified server std/http/server)
+(require-unqualified static std/http/static)
+
+(struct side [head event-head] [name string] [request string] [after string] [show string] [stream u32]
+  [bodiless bool] [finish bool] [parser http-parser] [body buffer] [in (array u8 1024)])
+
+(struct delay [head event-head] [request (ptr http-request)])
+
+(define server http-server)
+(define files http-files)
+(define late delay)
+(define echoed buffer)
+(define sides (array side 18))
+(define at u32 0)
+
+(define (answer! [r (ptr http-request)] [text string])
+  (http-respond! r 200)
+  (http-send-text! r text))
+
+(define (later [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (answer! (-> (cast (ptr delay) tag) request) "slow"))
+
+(define (echo-body [r (ptr http-request)] [b (slice u8)]) (buffer-add! (& echoed) b))
+
+(define (echo-end [r (ptr http-request)]) (answer! r (buffer-string (& echoed))))
+
+(define (handle [r (ptr http-request)])
+  (cond [(== (-> r target) "/slow")
+         (set! (-> late request) r)
+         (timer-after 20.0 (& late))]
+        [(== (-> r target) "/echo")
+         (set! (-> r on-body) echo-body)
+         (set! (-> r on-end) echo-end)]
+        [(== (-> r target) "/stream")
+         (http-respond! r 200)
+         (http-send-stream! r (fs-read-stream (fs-open-file "served/files/hello.txt" fs-read-flag 0) 0 0 0) -1)]
+        [(== (-> r target) "/empty")
+         (http-respond! r 204)
+         (http-send-text! r "dropped")]
+        [(== (-> r target) "/host") (answer! r (http-request-header r "host"))]
+        [(== (-> r target) "/address") (answer! r (http-request-address r))]
+        [(and (>= (-> r target length) 7) (== (slice (-> r target) 0 7) "/files/")) (http-static! r (& files))]
+        [else (answer! r (-> r target))]))
+
+(define (side-head [p (ptr http-parser)])
+  (let ([s (cast (ptr side) (-> p user))])
+    (set! (-> s body length) 0)
+    (printf "~a: ~a" (-> s name) (-> p head status))
+    (when (-> s bodiless)
+      (set! (-> s bodiless) #f)
+      (http-parser-no-body! p))
+    (when (and (== (-> p head status) 100) (!= (-> s after) "")) (stream-write-text (-> s stream) (-> s after)))))
+
+(define (side-body [p (ptr http-parser)] [b (slice u8)])
+  (buffer-add! (& (-> (cast (ptr side) (-> p user)) body)) b))
+
+(define (side-end [p (ptr http-parser)])
+  (let ([s (cast (ptr side) (-> p user))])
+    (if (== (-> s body length) 0)
+        (printf "\n")
+        (printf " ~a\n" (buffer-string (& (-> s body)))))
+    (when (!= (-> s show) "") (printf "~a: ~a\n" (-> s name) (http-header (& (-> p head)) (-> s show))))))
+
+(define (start! [s (ptr side)])
+  (http-parser-init! (& (-> s parser)) (cast (ptr void) s) side-head side-body side-end)
+  (set! (-> s body) (make-buffer))
+  (net-connect (-> server port) "127.0.0.1" #f s 0))
+
+(define (heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([s (cast (ptr side) tag)])
+    (cond [(== kind net-connected)
+           (set! (-> s stream) id)
+           (stream-write-text id (-> s request))
+           (when (-> s finish) (stream-finish id))
+           (stream-read! id (slice (-> s in)))]
+          [(and (== kind stream-read) (> value 0))
+           (when (< (http-feed! (& (-> s parser)) (slice (-> s in) (cast u32 value))) 0) (printf "~a: malformed\n" (-> s name)))
+           (stream-read! id (slice (-> s in)))]
+          [(or (== kind stream-read) (== kind stream-failed))
+           (http-parser-closed! (& (-> s parser)))
+           (printf "~a: closed\n" (-> s name))
+           (stream-close id)
+           (+= at 1)
+           (if (< at 18) (start! (& (@ sides at))) (http-server-close! (& server)))])))
+
+(define (side! [i u32] [name string] [request string] [after string] [show string])
+  (let ([s (& (@ sides i))])
+    (set! (-> s head handle) heard)
+    (set! (-> s name) name)
+    (set! (-> s request) request)
+    (set! (-> s after) after)
+    (set! (-> s show) show)
+    (set! (-> s bodiless) (== (slice request 0 4) "HEAD"))))
+
+(define (listening [s (ptr http-server)]) (start! (& (@ sides 0))))
+
+(define (then-last [request string]) -> string
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) request)
+    (buffer-add-string! (& b) "GET /fast HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+    (buffer-string (& b))))
+
+(define (with-headers [n u32]) -> string
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "GET /many HTTP/1.1\r\nhost: x\r\nconnection: close\r\n")
+    (for ([i u32 2]) (< i n) (+= i 1) (buffer-add-string! (& b) "x-h: v\r\n"))
+    (buffer-add-string! (& b) "\r\n")
+    (buffer-string (& b))))
+
+(define (main)
+  (set! (-> files root) "served")
+  (side! 0 "pipelined" (then-last "GET /slow HTTP/1.1\r\nhost: x\r\n\r\n") "" "")
+  (side! 1 "no host" "GET / HTTP/1.1\r\n\r\n" "" "")
+  (side! 2 "two hosts" "GET / HTTP/1.1\r\nhost: a\r\nhost: b\r\n\r\n" "" "")
+  (side! 3 "response" "HTTP/1.1 200 OK\r\n\r\n" "" "")
+  (side! 4 "old" "GET /old HTTP/1.0\r\n\r\n" "" "date")
+  (side! 5 "continue" "POST /echo HTTP/1.1\r\nhost: x\r\nexpect: 100-continue\r\ncontent-length: 5\r\nconnection: close\r\n\r\n"
+         "hello" "")
+  (side! 6 "100 headers" (with-headers 100) "" "")
+  (side! 7 "101 headers" (with-headers 101) "" "")
+  (side! 8 "unknown length" (then-last "GET /stream HTTP/1.1\r\nhost: x\r\n\r\n") "" "")
+  (side! 9 "directory" "GET /files/dir?x=1 HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n" "" "location")
+  (side! 10 "head" (then-last "HEAD /files/missing HTTP/1.1\r\nhost: x\r\n\r\n") "" "content-length")
+  (side! 11 "no content" (then-last "GET /empty HTTP/1.1\r\nhost: x\r\n\r\n") "" "")
+  (side! 12 "half-closed" "GET /slow HTTP/1.1\r\nhost: x\r\n\r\n" "" "")
+  (set! (-> (& (@ sides 12)) finish) #t)
+  (side! 13 "absolute"
+         (then-last "GET http://a.b/host HTTP/1.1\r\nhost: c\r\n\r\nGET http://a.b HTTP/1.1\r\nhost: a.b\r\n\r\n") "" "")
+  (side! 14 "user" "GET http://u@a.b/ HTTP/1.1\r\nhost: a.b\r\n\r\n" "" "")
+  (side! 15 "dots"
+         (then-last "GET /files/%2e%2e/x HTTP/1.1\r\nhost: x\r\n\r\nGET /files/..x HTTP/1.1\r\nhost: x\r\n\r\n") "" "")
+  (side! 16 "connection twice"
+         "GET /fast HTTP/1.1\r\nhost: x\r\nconnection: keep-alive\r\nconnection: close\r\n\r\n" "" "")
+  (side! 17 "address" "GET /address HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n" "" "")
+  (set! echoed (make-buffer))
+  (set! (-> late head handle) later)
+  (set! (-> server listening) listening)
+  (http-serve! (& server) 0 handle))
