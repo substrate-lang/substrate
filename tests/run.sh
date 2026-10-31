@@ -46,9 +46,13 @@ for p in "${packages[@]}"; do
     echo "FAIL $p: its test program, built again from the cache, differs"
   fi
 done
-# Each module in bench, substrate/host and tests/proxy builds, and so does the one-file package tests/web/sqlite.sub.
+# Each module in bench, substrate/host and tests/proxy builds, and so does each one-file package elsewhere outside tests
+# directories: a file whose first form is its own (package ...).
+one_file() { awk 'NF && !/^[[:space:]]*;/ { found = 1; code = !/^[[:space:]]*\(package([[:space:]]|$)/; exit } END { exit found ? code : 1 }' "$1"; }
 mapfile -t modules < <( (find bench substrate/host tests/proxy -name '*.sub' -not -name package.sub \
-                           -not -path 'bench/bend/compile/*' -not -path '*/build/*'; echo tests/web/sqlite.sub) | sort)
+                           -not -path 'bench/bend/compile/*' -not -path '*/build/*'
+                         find cmd std packages tests/web -name '*.sub' -not -name package.sub -not -path '*/build/*' \
+                           -not -path '*/tests/*' | while read -r f; do if one_file "$f"; then echo "$f"; fi; done) | sort)
 for m in "${modules[@]}"; do
   actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
