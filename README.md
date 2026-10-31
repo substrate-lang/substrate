@@ -54,7 +54,7 @@ In the dev shell (`nix develop`):
     bin/sub doc                            # documentation of the current package and its dependencies, as HTML in build/doc
     bin/sub doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM
     bin/sub doc -o DIR PACKAGE ...         # packages' documentation as text, or with --html as HTML, into DIR
-    bin/sub test [DIR ...] [PATTERN ...]   # the tests of the current package, or of each DIR at once
+    bin/sub test [./DIR ...] [PATTERN ...] # the tests of the current package, or of each DIR at once
     bin/sub version                        # substrate's version, and the hash of its files
     make check                             # the tests, then make docs when they pass
     tests/web/run.sh                       # the browser tests
@@ -74,8 +74,9 @@ A test is a `test` form, which only a package's test build compiles:
 `expect` checks a condition, and `expect-equal` compares two values and
 shows both when they differ. A package's test modules are the files in its
 `tests/` directory, or those its manifest names with `(tests "path" ...)`,
-where `*` in a file's name stands for any text. `sub test` builds the
-package's modules and its test modules into one program and runs it, and a
-trap fails only its own test. `std/test/test` compares what code prints
+where `*` in a file's name stands for any text. `(grants "flag" ...)` in
+that clause gives the test program more grants, as `sub run` takes them.
+`sub test` builds all of the package's modules and its test modules into one
+program and runs it, and a trap fails only its own test. `std/test/test` compares what code prints
 with text or a file, and `std/test/build` checks a file's compile error, and
 builds and runs programs in processes of their own.

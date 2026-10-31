@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs every package's tests with sub test and builds each test program again from the cache, then builds every module and
-# runs the event tests against the real modules.
+# Runs every package's tests with sub test, which builds each package's modules, and builds each test program again from
+# the cache. Then it builds the modules outside packages and runs the event tests against the real modules.
 set -uo pipefail
 shopt -s nullglob
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,9 +24,9 @@ fail=0
 built=0
 unbuilt=0
 
-# The packages' tests. cmd's tests run git, tar, ln and the C compiler.
-packages=(std cmd packages/web packages/scheme packages/bend packages/nodes packages/sqlite tests)
-if bin/sub test -c "$cache" --allow-run=git,tar,ln,wasm32-unknown-wasi-clang "${packages[@]}"; then
+# The packages' tests, and the programs they build again from the cache.
+packages=(./std ./cmd ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite ./tests ./tests/web)
+if bin/sub test -c "$cache" --check-cache "${packages[@]}"; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
@@ -46,9 +46,9 @@ for p in "${packages[@]}"; do
     echo "FAIL $p: its test program, built again from the cache, differs"
   fi
 done
-# Each module in cmd, std, packages, bench, substrate/host, tests/web and tests/proxy builds.
-mapfile -t modules < <(find cmd std packages bench substrate/host tests/web tests/proxy -name '*.sub' \
-                         -not -name package.sub -not -path 'bench/bend/compile/*' -not -path '*/tests/*' | sort)
+# Each module in bench, substrate/host and tests/proxy builds, and so does the one-file package tests/web/sqlite.sub.
+mapfile -t modules < <( (find bench substrate/host tests/proxy -name '*.sub' -not -name package.sub \
+                           -not -path 'bench/bend/compile/*' -not -path '*/build/*'; echo tests/web/sqlite.sub) | sort)
 for m in "${modules[@]}"; do
   actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
