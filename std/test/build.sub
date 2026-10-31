@@ -1,0 +1,287 @@
+;; Tests that build programs.
+(require-unqualified macros compiler/macros)
+(require-unqualified ex compiler/expander)
+(require-unqualified rt compiler/roots)
+(require-unqualified main compiler/main)
+(require-unqualified fs host/fs)
+(require-unqualified process host/node/process)
+(require-unqualified paths "../package/path.sub")
+(require-unqualified tests "test.sub")
+(require-unqualified compare "compare.sub")
+
+(provide expect-compile-error expect-run expect-build)
+
+;; ---- building ----
+
+(define ready bool #f)
+(define directory string)
+
+(define (ready!)
+  (unless ready
+    (set! ready #t)
+    (let ([why string] [map (string->datum (test-option "--map"))])
+      (when (< (fs-cwd (& directory) (& why)) 0) (throw test-failed why))
+      (set-toolchain-directory! (string->datum (test-option "--toolchain")))
+      (install-core!)
+      (set-module-map-text! (file-text map) map)
+      (set-cache-directory! (string->datum (test-option "--cache"))))))
+
+(define (built! [path string] [err (ptr buffer)]) -> string
+  (ready!)
+  (let ([full (joined-path directory path)] [out (joined-path directory (text-of "build/test/programs/" (program-name path)))])
+    (set-display-directory! (string->datum (parent-of full)))
+    (fs-remove out #t 0)
+    (try (begin (write-program! 0 (string->datum full) (string->datum out) #f) out)
+         [catch compile-error (message blamed loc)
+           (write-error err message blamed loc)
+           ""])))
+
+(define (compile-error-check [path string] [text string] [message string])
+  (let ([err (make-buffer)])
+    (when (> (-> (built! path (& err)) length) 0) (failure! message "the file compiled"))
+    (unless (contains? (buffer-string (& err)) text) (failure! message (text-of "its compile error is\n" (buffer-string (& err)))))
+    (buffer-free! (& err))))
+
+;; ---- running ----
+
+(struct run-result [code i32] [output string])
+
+(define (run-program [path string] [dir string] [args (slice string)] [grants (slice string)] [input (slice u8)]
+                     [message string]) -> run-result
+  (let ([err (make-buffer)] [out string] [argv (make-buffer)] [o process-options] [r run-result] [bytes (slice u8)]
+        [why string])
+    (set! out (built! path (& err)))
+    (when (== (-> out length) 0) (failure! message (text-of "the program does not compile\n" (buffer-string (& err)))))
+    (again-check! path out message)
+    (set! scratch "")
+    (for ([i u32 0]) (< i (-> grants length)) (+= i 1) (push! (& argv) (placed (@ grants i))))
+    (push! (& argv) out)
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (push! (& argv) (placed (@ args i))))
+    (process-options-init! (& o))
+    (set! (-> o dir) (joined-path directory dir))
+    (set! (-> r code) (process-run (joined-path (test-option "--toolchain") "host/subhost.mjs")
+                                   (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string))) (& o)
+                                   input 60000 (& bytes) (& why)))
+    (when (< (-> r code) 0) (failure! message why))
+    (set! (-> r output) (cast string bytes))
+    r))
+
+(define (build-apart [path string] [message string]) -> run-result
+  (ready!)
+  (compiler-run path (scratch-directory) (joined-path directory (text-of "build/test/built/" (program-name path))) message))
+
+(define checked buffer)
+
+(define (again-check! [path string] [out string] [message string])
+  (when (and (flagged? "--check-cache") (not (listed? (& checked) path)))
+    (push! (& checked) path)
+    (let* ([again (joined-path directory (text-of "build/test/again/" (program-name path)))]
+           [r (compiler-run path (test-option "--cache") again message)] [which string])
+      (when (!= (-> r code) 0) (failure! message (text-of "the program does not build again from the cache\n" (-> r output))))
+      (set! which (differing out again))
+      (when (> (-> which length) 0) (failure! message (text-of "the program, built again from the cache, differs: " which))))))
+
+(define (differing [a string] [b string]) -> string
+  (let ([listed (slice u8)] [start u32 0] [which ""])
+    (cond [(not (same-file? (joined-path a "program") (joined-path b "program"))) (set! which "program")]
+          [(>= (fs-read-file (joined-path a "program") (& listed) 0) 0)
+           (for ([i u32 0]) (and (< i (-> listed length)) (== (-> which length) 0)) (+= i 1)
+             (when (== (@ listed i) 10)
+               (let ([wasm (text-of (cast string (slice listed start i)) ".wasm")])
+                 (unless (same-file? (joined-path a wasm) (joined-path b wasm)) (set! which wasm)))
+               (set! start (+ i 1))))
+           (free (-> listed items))])
+    which))
+
+(define (same-file? [a string] [b string]) -> bool
+  (let ([x (slice u8)] [y (slice u8)] [same #f])
+    (when (and (>= (fs-read-file a (& x) 0) 0) (>= (fs-read-file b (& y) 0) 0)) (set! same (== (cast string x) (cast string y))))
+    (unless (== (-> x items) 0) (free (-> x items)))
+    (unless (== (-> y items) 0) (free (-> y items)))
+    same))
+
+(define (compiler-run [path string] [cache string] [out string] [message string]) -> run-result
+  (let* ([full (joined-path directory path)] [toolchain (test-option "--toolchain")]
+         [argv (make-buffer)] [r (make-buffer)] [w (make-buffer)] [dirs (root-directories)] [o process-options]
+         [result run-result] [bytes (slice u8)] [why string])
+    (fs-remove out #t 0)
+    (buffer-add-string! (& r) "-R=")
+    (while (pair? dirs)
+      (granted! (& r) (datum->string (car dirs)))
+      (set! dirs (cdr dirs)))
+    (granted! (& r) cache)
+    (buffer-add-string! (& w) "-W=")
+    (granted! (& w) cache)
+    (granted! (& w) out)
+    (push! (& argv) (buffer-string (& r)))
+    (push! (& argv) (buffer-string (& w)))
+    (push! (& argv) (joined-path (parent-of toolchain) "build/compiler"))
+    (push! (& argv) toolchain)
+    (push! (& argv) "-c")
+    (push! (& argv) cache)
+    (push! (& argv) "-d")
+    (push! (& argv) (parent-of full))
+    (push! (& argv) "-m")
+    (push! (& argv) (test-option "--map"))
+    (push! (& argv) "build")
+    (push! (& argv) full)
+    (push! (& argv) "-o")
+    (push! (& argv) out)
+    (process-options-init! (& o))
+    (set! (-> o dir) (parent-of full))
+    (set! (-> result code) (process-run (joined-path toolchain "host/subhost.mjs")
+                                        (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string)))
+                                        (& o) (slice (cast (ptr u8) 0) 0) 60000 (& bytes) (& why)))
+    (when (< (-> result code) 0) (failure! message why))
+    (set! (-> result output) (cast string bytes))
+    result))
+
+;; In grant flags, a comma in a path is written ",," (substrate/host/grants.mjs).
+(define (granted! [b (ptr buffer)] [path string])
+  (when (> (-> b length) 3) (buffer-add-byte! b #\,))
+  (for ([i u32 0]) (< i (-> path length)) (+= i 1)
+    (when (== (@ path i) #\,) (buffer-add-byte! b #\,))
+    (buffer-add-byte! b (cast i32 (@ path i)))))
+
+(define (run-check! [r (ptr run-result)] [what string] [fails string] [compare u32] [expected string] [message string])
+  (let ([output (-> r output)])
+    (if (> (-> fails length) 0)
+        (begin
+          (when (== (-> r code) 0) (failure! message (text-of (text-of "the " what) (text-of " exited with 0, and its output is\n" output))))
+          (unless (contains? output fails) (failure! message (text-of (text-of "the " what) (text-of " failed, and its output is\n" output)))))
+        (unless (== (-> r code) 0)
+          (failure! message (text-of (text-of (text-of "the " what) (text-of " exited with " (digits-of (-> r code))))
+                                     (text-of ", and its output is\n" output)))))
+    (cond [(== compare 2)
+           (let ([bytes (file-bytes-of expected message)])
+             (unless (== (trimmed output) (trimmed (cast string bytes))) (output-differs! output (cast string bytes) message))
+             (free (-> bytes items)))]
+          [(== compare 1) (unless (== (trimmed output) (trimmed expected)) (output-differs! output expected message))])))
+
+(define (file-bytes-of [path string] [message string]) -> (slice u8)
+  (let ([bytes (slice u8)] [why string])
+    (when (< (fs-read-file path (& bytes) (& why)) 0) (failure! message why))
+    bytes))
+
+(define scratch string)
+
+(define (placed [text string]) -> string
+  (let ([b (make-buffer)] [i u32 0])
+    (while (< i (-> text length))
+      (cond [(at? text i "$SCRATCH")
+             (when (== (-> scratch length) 0) (set! scratch (scratch-directory)))
+             (buffer-add-string! (& b) scratch)
+             (+= i 8)]
+            [else
+             (buffer-add-byte! (& b) (cast i32 (@ text i)))
+             (+= i 1)]))
+    (buffer-string (& b))))
+
+(define (at? [text string] [i u32] [part string]) -> bool
+  (and (<= (+ i (-> part length)) (-> text length)) (== (slice text i (+ i (-> part length))) part)))
+
+;; ---- helpers ----
+
+(define (failure! [message string] [detail string]) (throw test-failed (text-of (text-of message "\n") detail)))
+
+(define (text-of [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+(define (digits-of [n i32]) -> string
+  (let ([b (make-buffer)])
+    (when (< n 0) (buffer-add-byte! (& b) #\-))
+    (write-digits (& b) (cast u64 (if (< n 0) (- 0 n) n)) 10)
+    (buffer-string (& b))))
+
+(define (push! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+(define (listed? [b (ptr buffer)] [s string]) -> bool
+  (let ([l (slice (cast (ptr string) (-> b bytes)) (/ (-> b length) (sizeof string)))])
+    (for ([i u32 0]) (< i (-> l length)) (+= i 1) (when (== (@ l i) s) (return #t)))
+    #f))
+
+(define (flagged? [flag string]) -> bool
+  (let ([args (host-args)]) (for ([i u32 0]) (< i (-> args length)) (+= i 1) (when (== (@ args i) flag) (return #t))) #f))
+
+(define (program-name [path string]) -> string (if (ends? path ".sub") (slice path 0 (- (-> path length) 4)) path))
+
+;; ---- the forms ----
+
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (message-of [s datum] [first datum]) -> datum
+    (literal (format "~a:~a: (~a ~s ...)" `(,(syntax-source s) ,(syntax-line s) ,(syntax-e (car (syntax->list s))) ,(syntax->datum first)))))
+
+  (define (path-of [s datum] [file datum]) -> datum
+    #`(test-path #,(literal (string->datum (symbol->string (syntax-source s)))) #,file))
+
+  (define (text? [x datum]) -> bool (string? (syntax-e x)))
+
+  (define (expect-compile-error-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? text? file) (? text? text))
+       #`(compile-error-check #,(path-of s file) #,text #,(message-of s file))]
+      [_ (raise-syntax-error 'expect-compile-error "expected (expect-compile-error \"path\" \"text\")" s)]))
+
+  (define (expect-run-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? text? file) options ...)
+       (let ([args #`(slice (cast (ptr string) 0) 0)] [grants #`(slice (cast (ptr string) 0) 0)]
+             [input #`(slice (cast (ptr u8) 0) 0)] [compare (literal (make-integer 0))] [expected (literal '"")]
+             [fails (literal '"")] [message (message-of s file)] [l options])
+         (while (pair? l)
+           (unless (and (keyword? (syntax-e (car l))) (pair? (cdr l)))
+             (raise-syntax-error 'expect-run "expected a keyword and its value" (car l)))
+           (let ([k (keyword->string (syntax-e (car l)))] [v (cadr l)])
+             (cond [(or (== k "args") (== k "grants"))
+                    (let ([items (syntax->list v)])
+                      (unless (!= items 0) (raise-syntax-error 'expect-run "expected a list" v))
+                      (let ([code (if (null? items) #`(slice (cast (ptr string) 0) 0) #`(slice (array-of string #,@items)))])
+                        (if (== k "args") (set! args code) (set! grants code))))]
+                   [(not (text? v)) (raise-syntax-error 'expect-run "expected a text" v)]
+                   [(== k "stdin") (set! input #`(cast (slice u8) #,v))]
+                   [(== k "stdin-file") (set! input #`(file-bytes-of #,(path-of s v) #,message))]
+                   [(== k "output")
+                    (set! compare (literal (make-integer 1)))
+                    (set! expected v)]
+                   [(== k "output-file")
+                    (set! compare (literal (make-integer 2)))
+                    (set! expected (path-of s v))]
+                   [(== k "fails") (set! fails v)]
+                   [else (raise-syntax-error 'expect-run "the options are #:args, #:grants, #:stdin, #:stdin-file, #:output, #:output-file and #:fails" (car l))]))
+           (set! l (cddr l)))
+         #`(let ([r (run-program #,(path-of s file) #,(path-of s (literal '"")) #,args #,grants #,input #,message)])
+             (run-check! (& r) "program" #,fails #,compare #,expected #,message)))]
+      [_ (raise-syntax-error 'expect-run "expected (expect-run \"path\" option ...)" s)]))
+
+  (define (expect-build-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? text? file) options ...)
+       (let ([compare (literal (make-integer 0))] [expected (literal '"")] [fails (literal '"")]
+             [message (message-of s file)] [l options])
+         (while (pair? l)
+           (unless (and (keyword? (syntax-e (car l))) (pair? (cdr l)) (text? (cadr l)))
+             (raise-syntax-error 'expect-build "expected a keyword and a text" (car l)))
+           (let ([k (keyword->string (syntax-e (car l)))] [v (cadr l)])
+             (cond [(== k "output")
+                    (set! compare (literal (make-integer 1)))
+                    (set! expected v)]
+                   [(== k "output-file")
+                    (set! compare (literal (make-integer 2)))
+                    (set! expected (path-of s v))]
+                   [(== k "fails") (set! fails v)]
+                   [else (raise-syntax-error 'expect-build "the options are #:output, #:output-file and #:fails" (car l))]))
+           (set! l (cddr l)))
+         #`(let ([r (build-apart #,(path-of s file) #,message)])
+             (run-check! (& r) "build" #,fails #,compare #,expected #,message)))]
+      [_ (raise-syntax-error 'expect-build "expected (expect-build \"path\" option ...)" s)])))
+
+(define-syntax expect-compile-error expect-compile-error-form)
+(define-syntax expect-run expect-run-form)
+(define-syntax expect-build expect-build-form)

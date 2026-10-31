@@ -1,0 +1,269 @@
+;; The test runner, and expect-output and expect-output-file.
+(require-unqualified fs host/fs)
+(require-unqualified timer host/modules/timer)
+(require-unqualified clock host/modules/clock)
+(require-unqualified compare "compare.sub")
+
+(provide run-tests expect-output expect-output-file test-option test-path scratch-directory compare-output!
+         compare-output-file!)
+
+;; ---- the runner ----
+
+(struct entry [module string] [name string] [line u32] [ignored bool] [traps string] [run (fn ())])
+
+(define entries (ptr entry) 0)
+(define entry-count u32 0)
+(define entry-room u32 0)
+
+(define (add-test! [module string] [name string] [line u32] [ignored bool] [traps string] [run (fn ())])
+  (when (== entry-count entry-room)
+    (set! entry-room (if (== entry-room 0) 64 (* entry-room 2)))
+    (set! entries (cast (ptr entry) (realloc (cast (ptr void) entries) (* entry-room (sizeof entry))))))
+  (let ([e (& (@ entries entry-count))])
+    (set! (-> e module) module)
+    (set! (-> e name) name)
+    (set! (-> e line) line)
+    (set! (-> e ignored) ignored)
+    (set! (-> e traps) traps)
+    (set! (-> e run) run))
+  (+= entry-count 1))
+
+(define arguments (slice string))
+(define package-name string "")
+(define running-file string "")
+(define verbose bool #f)
+(define ignored-only bool #f)
+(define capturing bool #t)
+
+(define (options!)
+  (set! arguments (host-args))
+  (set! package-name (test-option "--name"))
+  (set! running-file (test-option "--running"))
+  (for ([i u32 0]) (< i (-> arguments length)) (+= i 1)
+    (let ([a (@ arguments i)])
+      (cond [(== a "-v") (set! verbose #t)]
+            [(== a "--ignored") (set! ignored-only #t)]
+            [(== a "--nocapture") (set! capturing #f)]))))
+
+(define (valued? [a string]) -> bool
+  (or (== a "--name") (== a "--toolchain") (== a "--map") (== a "--cache") (== a "--scratch") (== a "--running")))
+
+(define (flag? [a string]) -> bool (or (== a "-v") (== a "--ignored") (== a "--nocapture") (== a "--check-cache")))
+
+(define (test-option [name string]) -> string
+  (let ([args (host-args)])
+    (for ([i u32 0]) (< (+ i 1) (-> args length)) (+= i 1) (when (== (@ args i) name) (return (@ args (+ i 1)))))
+    ""))
+
+(define (scratch-directory) -> string
+  (let ([d string] [why string])
+    (when (< (fs-make-temp-dir (test-option "--scratch") "" "" (& d) (& why)) 0) (throw test-failed why))
+    d))
+
+(define (selected? [e (ptr entry)]) -> bool
+  (let ([any #f] [i u32 0])
+    (while (< i (-> arguments length))
+      (let ([a (@ arguments i)])
+        (cond [(valued? a) (+= i 1)]
+              [(flag? a) (begin)]
+              [else
+               (set! any #t)
+               (when (or (contains? (-> e name) a) (contains? (-> e module) a)) (return #t))]))
+      (+= i 1))
+    (not any)))
+
+(define next u32 0)
+(define current u32 0)
+(define passed u32 0)
+(define failed u32 0)
+(define skipped u32 0)
+(define started f64 0.0)
+(define captured buffer)
+(define resume event-head)
+(define handlers u32 0)
+
+(define (run!)
+  (options!)
+  (trap-handler! trapped)
+  (set! (-> resume handle) resumed)
+  (set! started (clock-monotonic))
+  (run-from! 0))
+
+(define (run-from! [i u32])
+  (set! next i)
+  (while (< next entry-count)
+    (set! current next)
+    (+= next 1)
+    (let ([e (& (@ entries current))])
+      (cond [(not (selected? e)) (begin)]
+            [(and (-> e ignored) (not ignored-only))
+             (+= skipped 1)
+             (when verbose (printf "ignored ~a:~a ~a~n" (-> e module) (-> e line) (-> e name)))]
+            [(and ignored-only (not (-> e ignored))) (begin)]
+            [else (run-one! e)])))
+  (finish!))
+
+(define (run-one! [e (ptr entry)])
+  (when (> (-> running-file length) 0)
+    (let ([b (make-buffer)])
+      (buffer-add-string! (& b) (-> e module))
+      (buffer-add-byte! (& b) #\:)
+      (write-digits (& b) (-> e line) 10)
+      (buffer-add-byte! (& b) 32)
+      (buffer-add-string! (& b) (-> e name))
+      (fs-write-file running-file (buffer-bytes (& b)) 0)
+      (buffer-free! (& b))))
+  (set! (-> captured length) 0)
+  (set! handlers (trap-handler-count))
+  (when capturing (output-to! (& captured)))
+  (try (begin
+         ((-> e run))
+         (output-to! 0)
+         (if (== (-> (-> e traps) length) 0) (passed! e) (failed! e (trap-expected (-> e traps)))))
+       [catch test-failed (message)
+         (output-to! 0)
+         (failed! e message)])
+  (trap-handlers-keep! handlers))
+
+(define (trap-expected [traps string]) -> string
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "the test ended without the trap it expects, with the message ")
+    (write-string (& b) traps)
+    (buffer-string (& b))))
+
+(define (trapped [why string])
+  (trap-handlers-keep! handlers)
+  (output-to! 0)
+  (let ([e (& (@ entries current))])
+    (if (and (> (-> (-> e traps) length) 0) (contains? why (-> e traps))) (passed! e) (failed! e (without-runner why))))
+  (timer-after 0.0 (cast (ptr void) (& resume))))
+
+(define (without-runner [why string]) -> string
+  (let ([ls (lines-of why)] [b (make-buffer)])
+    (for ([i u32 0]) (< i (-> ls length)) (+= i 1)
+      (unless (contains? (@ ls i) " std/test/test.sub:")
+        (when (> (-> b length) 0) (buffer-add-byte! (& b) 10))
+        (buffer-add-string! (& b) (@ ls i))))
+    (free (cast (ptr u8) (-> ls items)))
+    (buffer-string (& b))))
+
+(define (resumed [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32]) (run-from! next))
+
+(define (passed! [e (ptr entry)])
+  (+= passed 1)
+  (when verbose (printf "ok ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))))
+
+(define (failed! [e (ptr entry)] [message string])
+  (+= failed 1)
+  (printf "FAIL ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))
+  (indented message "  ")
+  (when (> (-> captured length) 0)
+    (printf "  output:~n")
+    (indented (buffer-string (& captured)) "    ")))
+
+(define (indented [text string] [prefix string])
+  (let ([start u32 0])
+    (for ([i u32 0]) (<= i (-> text length)) (+= i 1)
+      (when (or (== i (-> text length)) (== (@ text i) 10))
+        (when (< start i) (printf "~a~a~n" prefix (slice text start i)))
+        (when (and (== start i) (< i (-> text length))) (printf "~n"))
+        (set! start (+ i 1))))))
+
+(define (finish!)
+  (output-to! 0)
+  (let ([tenths (cast u64 (nearbyint (/ (- (clock-monotonic) started) 100.0)))])
+    (printf "~a: ~a passed" package-name passed)
+    (when (> failed 0) (printf ", ~a failed" failed))
+    (when (> skipped 0) (printf ", ~a ignored" skipped))
+    (printf " (~a.~a s)~n" (/ tenths 10) (% tenths 10)))
+  (host-exit (if (> failed 0) 1 0)))
+
+;; ---- printed output ----
+
+(define (compare-output! [got string] [expected string] [message string])
+  (unless (== (trimmed got) (trimmed expected))
+    (output-differs! got expected message)))
+
+(define (compare-output-file! [got string] [module string] [file string] [message string])
+  (let ([why string] [bytes (slice u8)] [path (test-path module file)])
+    (when (< (fs-read-file path (& bytes) (& why)) 0)
+      (let ([b (make-buffer)])
+        (buffer-add-string! (& b) message)
+        (buffer-add-byte! (& b) 10)
+        (buffer-add-string! (& b) why)
+        (throw test-failed (buffer-string (& b)))))
+    (unless (== (trimmed got) (trimmed (cast string bytes))) (output-differs! got (cast string bytes) message))
+    (free (-> bytes items))))
+
+(define (test-path [module string] [file string]) -> string
+  (let ([start u32 0] [end u32 0] [b (make-buffer)])
+    (for ([i u32 0]) (< i (-> module length)) (+= i 1)
+      (when (== (@ module i) #\/)
+        (when (== start 0) (set! start (+ i 1)))
+        (set! end (+ i 1))))
+    (buffer-add-string! (& b) (slice module start (if (< end start) start end)))
+    (buffer-add-string! (& b) file)
+    (buffer-string (& b))))
+
+;; ---- the forms ----
+
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (run-tests-form [s datum]) -> datum
+    (let ([adds nil])
+      (for/each ([m (cdr (syntax->list s))])
+        (let ([found nil])
+          (for/each ([name (syntax-local-module-provides m)])
+            (let ([text (symbol->string name)])
+              (when (and (> (-> text length) 6) (== (slice text 0 6) "%test-"))
+                (let* ([id (datum->syntax m (string->symbol (format-message "~a:~a" `(,(syntax-e m) ,name))) m)]
+                       [fact (test-fact (syntax-local-facts id))])
+                  (when (pair? fact)
+                    (set! found (cons (cons fact id) found)))))))
+          (for/each ([f (sort found (lambda ([a datum] [b datum]) -> bool
+                                      (< (integer-value (caddr (car a))) (integer-value (caddr (car b))))))])
+            (let ([info (cdr (car f))])
+              (set! adds (cons #`(add-test! #,(literal (car (car f))) #,(literal (car info)) #,(literal (cadr info))
+                                            #,(literal (caddr info)) #,(literal (cadddr info)) #,(cdr f))
+                               adds))))))
+      #`(begin #,@(reverse adds) (run!))))
+
+  (define (test-fact [facts datum]) -> datum
+    (for/each ([f facts])
+      (let ([v (caddr f)])
+        (when (and (pair? v) (== (car v) 'test))
+          (return (cons (string->datum (symbol->string (car f))) (cdr v))))))
+    nil)
+
+  (define (message-of [s datum] [first datum]) -> datum
+    (literal (format "~a:~a: (~a ~s ...)" `(,(syntax-source s) ,(syntax-line s) ,(syntax-e (car (syntax->list s))) ,(syntax->datum first)))))
+
+  (define (expect-output-form [s datum]) -> datum
+    (syntax-match s
+      [(_ text body ...) (captured-code s #`(compare-output! got #,text #,(message-of s text)) body)]
+      [_ (raise-syntax-error 'expect-output "expected (expect-output \"text\" body ...)" s)]))
+
+  (define (expect-output-file-form [s datum]) -> datum
+    (syntax-match s
+      [(_ file body ...)
+       (unless (string? (syntax-e file)) (raise-syntax-error 'expect-output-file "expected a file's path as text" file))
+       (captured-code s #`(compare-output-file! got #,(module-of s) #,file #,(message-of s file))
+                      body)]
+      [_ (raise-syntax-error 'expect-output-file "expected (expect-output-file \"path\" body ...)" s)]))
+
+  (define (captured-code [s datum] [compare datum] [body datum]) -> datum
+    #`(let ([b (make-buffer)])
+        (let ([before (output-to! (& b))])
+          #,@body
+          (output-to! before)
+          (let ([got (buffer-string (& b))]) #,compare)
+          (buffer-free! (& b)))))
+
+  (define (module-of [s datum]) -> datum (literal (string->datum (symbol->string (syntax-source s))))))
+
+(define-syntax run-tests run-tests-form)
+(define-syntax expect-output expect-output-form)
+(define-syntax expect-output-file expect-output-file-form)

@@ -1,6 +1,8 @@
 // The host module "process" (process.sub).
 import child from 'node:child_process';
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
 import { entries } from '../entries.mjs';
@@ -77,6 +79,41 @@ export function processes(grants, loader, setup = {}) {
           caller.event(EXIT, id, tag, code !== null ? code : 128 + (os.constants.signals[signal] || 0));
         });
         return id;
+      },
+      run(pp, pl, ap, al, dp, dl, ep, el, clear, ip, il, timeout, op, err) {
+        let dir = null;
+        try {
+          mainOnly(setup, 'run');
+          const program = caller.string(pp, pl);
+          const cwd = caller.string(dp, dl) || undefined;
+          const env = clear ? {} : { ...globalThis.process.env };
+          for (const e of entries(caller.string(ep, el))) {
+            const equals = e.indexOf('=');
+            env[equals < 0 ? e : e.slice(0, equals)] = equals < 0 ? '' : e.slice(equals + 1);
+          }
+          const file = programFile(program, cwd, env.PATH ?? '/usr/bin:/bin');
+          if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
+          dir = fs.mkdtempSync(path.join(os.tmpdir(), 'subhost-run-'));
+          const out = fs.openSync(path.join(dir, 'output'), 'w');
+          let r;
+          try {
+            r = child.spawnSync(file ?? program, entries(caller.string(ap, al)), {
+              cwd, env, input: caller.memory().slice(caller.u(ip), caller.u(ip) + il), stdio: ['pipe', out, out],
+              timeout: timeout || undefined, killSignal: 'SIGKILL',
+            });
+          } finally {
+            fs.closeSync(out);
+          }
+          if (r.error && r.error.code !== 'ETIMEDOUT') throw r.error;
+          const p = caller.give(fs.readFileSync(path.join(dir, 'output')), caller.u(op) + 4);
+          new DataView(caller.memory().buffer).setUint32(caller.u(op), p, true);
+          return r.status !== null ? r.status : 128 + (os.constants.signals[r.signal] || 0);
+        } catch (e) {
+          caller.fail(err, e.message);
+          return -1;
+        } finally {
+          if (dir) fs.rmSync(dir, { recursive: true, force: true });
+        }
       },
       exec(pp, pl, ap, al, err) {
         try {

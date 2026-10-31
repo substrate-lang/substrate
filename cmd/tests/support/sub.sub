@@ -1,0 +1,247 @@
+(require-unqualified fs host/fs)
+(require-unqualified process host/node/process)
+(require-unqualified paths std/package/path)
+(require-unqualified tests std/test/test)
+
+(provide ran root built-run written! copied! linked! removed! truncated! text-in exists? modified-at entries entries-since
+         files-in listed same-program? contains? joined replaced edited! trimmed first-line hash-in words sub sub-run host
+         program expect-ran printed)
+
+;; output is stdout and stderr, in order.
+(struct ran [code i32] [output string])
+
+(define (root) -> string (parent-of (test-option "--toolchain")))
+
+;; ---- running ----
+
+(define (program-in [dir string] [program string] [args (slice string)]) -> ran
+  (let ([o process-options] [r ran] [bytes (slice u8)] [why string])
+    (process-options-init! (& o))
+    (set! (-> o dir) dir)
+    (set! (-> r code) (process-run program args (& o) (slice (cast (ptr u8) 0) 0) 60000 (& bytes) (& why)))
+    (when (< (-> r code) 0) (throw test-failed (joined (joined program ": ") why)))
+    (set! (-> r output) (cast string bytes))
+    r))
+
+(define (host-in [dir string] [args (slice string)]) -> ran
+  (program-in dir (joined-path (test-option "--toolchain") "host/subhost.mjs") args))
+
+(define (sub-in [dir string] [flags (slice string)] [args (slice string)]) -> ran
+  (let ([argv (make-buffer)])
+    (push! (& argv) "-A")
+    (for ([i u32 0]) (< i (-> flags length)) (+= i 1) (push! (& argv) (@ flags i)))
+    (push! (& argv) (joined-path (root) "build/sub"))
+    (push! (& argv) (root))
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (push! (& argv) (@ args i)))
+    (host-in dir (strings-of (& argv)))))
+
+(define (built-run [dir string] [file string] [out string] [cache string]) -> ran
+  (let ([b (sub-in dir (slice (cast (ptr string) 0) 0) (slice (array-of string "build" file "-o" out "-c" cache)))])
+    (when (!= (-> b code) 0) (return b))
+    (let ([r (host-in dir (slice (array-of string out)))])
+      (set! (-> r output) (joined (-> b output) (-> r output)))
+      r)))
+
+(define (ran-check! [r (ptr ran)] [fails string] [compare bool] [expected string] [message string])
+  (cond [(> (-> fails length) 0)
+         (when (== (-> r code) 0) (failure! message "the run exited with 0, and its output is" (-> r output)))
+         (unless (contains? (-> r output) fails) (failure! message "the run failed, and its output is" (-> r output)))]
+        [(!= (-> r code) 0)
+         (failure! message (joined (joined "the run exited with " (digits (-> r code))) ", and its output is") (-> r output))]
+        [compare (compare-output! (-> r output) expected message)]))
+
+(define (expected-text [path string]) -> string
+  (let ([bytes (slice u8)] [why string])
+    (when (< (fs-read-file path (& bytes) (& why)) 0) (throw test-failed (joined (joined path ": ") why)))
+    (cast string bytes)))
+
+(define (sub-run-in [dir string] [name string] [grants (slice string)]) -> ran
+  (let ([argv (make-buffer)])
+    (push! (& argv) "run")
+    (push! (& argv) "-c")
+    (push! (& argv) (test-option "--cache"))
+    (for ([i u32 0]) (< i (-> grants length)) (+= i 1) (push! (& argv) (@ grants i)))
+    (push! (& argv) (joined name ".sub"))
+    (sub-in dir (slice (cast (ptr string) 0) 0) (strings-of (& argv)))))
+
+(define (failure! [message string] [what string] [output string])
+  (throw test-failed (joined (joined (joined (joined message "\n") what) "\n") output)))
+
+;; ---- files ----
+
+(define (written! [path string] [text string])
+  (let ([why string])
+    (when (< (fs-make-dir (parent-of path) (& why)) 0) (throw test-failed why))
+    (when (< (fs-write-file path (cast (slice u8) text) (& why)) 0) (throw test-failed why))))
+
+(define (copied! [from string] [to string])
+  (let ([info fs-info] [why string] [names (slice string)])
+    (when (< (fs-lstat from (& info) (& why)) 0) (throw test-failed why))
+    (when (< (fs-make-dir (if (== (-> info kind) fs-directory) to (parent-of to)) (& why)) 0) (throw test-failed why))
+    (if (== (-> info kind) fs-directory)
+        (begin
+          (when (< (fs-list from (& names) (& why)) 0) (throw test-failed why))
+          (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+            (unless (== (@ names i) "build") (copied! (joined-path from (@ names i)) (joined-path to (@ names i))))))
+        (when (< (fs-copy from to (& why)) 0) (throw test-failed why)))))
+
+(define (linked! [target string] [path string])
+  (let ([r (program-in "." "ln" (slice (array-of string "-s" target path)))])
+    (ran-check! (& r) "" #f "" (joined "ln -s " path))))
+
+(define (removed! [path string]) (fs-remove path #t 0))
+
+(define (truncated! [path string] [n i64])
+  (let* ([why string] [h (fs-open-file path fs-write-flag (& why))])
+    (when (== h 0) (throw test-failed why))
+    (when (< (fs-set-size h n (& why)) 0) (throw test-failed why))
+    (fs-close-file h 0)))
+
+(define (text-in [path string]) -> string
+  (let ([bytes (slice u8)]) (if (< (fs-read-file path (& bytes) 0) 0) "" (cast string bytes))))
+
+(define (exists? [path string]) -> bool (let ([info fs-info]) (== (fs-stat path (& info) 0) 0)))
+
+(define (modified-at [path string]) -> f64 (let ([info fs-info]) (fs-stat path (& info) 0) (-> info modified)))
+
+(define (entries [dir string] [suffix string]) -> u32 (entries-since dir suffix -1.0))
+
+(define (entries-since [dir string] [suffix string] [time f64]) -> u32
+  (let ([names (slice string)] [n u32 0])
+    (when (< (fs-list dir (& names) 0) 0) (return 0))
+    (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+      (when (and (ends? (@ names i) suffix) (> (modified-at (joined-path dir (@ names i))) time)) (+= n 1)))
+    n))
+
+(define (files-in [dir string]) -> (slice string)
+  (let ([b (make-buffer)])
+    (files-into! (& b) dir "")
+    (strings-of (& b))))
+
+(define (files-into! [b (ptr buffer)] [dir string] [prefix string])
+  (let ([names (slice string)] [info fs-info])
+    (when (< (fs-list (if (== (-> prefix length) 0) dir (joined-path dir prefix)) (& names) 0) 0) (return))
+    (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+      (let ([path (if (== (-> prefix length) 0) (@ names i) (joined-path prefix (@ names i)))])
+        (fs-lstat (joined-path dir path) (& info) 0)
+        (if (== (-> info kind) fs-directory) (files-into! b dir path) (push! b path))))))
+
+(define (same-program? [a string] [b string]) -> bool
+  (let ([listed (text-in (joined-path a "program"))] [start u32 0])
+    (unless (and (> (-> listed length) 0) (== listed (text-in (joined-path b "program")))) (return #f))
+    (for ([i u32 0]) (< i (-> listed length)) (+= i 1)
+      (when (== (@ listed i) 10)
+        (let ([wasm (joined (slice listed start i) ".wasm")])
+          (unless (== (text-in (joined-path a wasm)) (text-in (joined-path b wasm))) (return #f)))
+        (set! start (+ i 1))))
+    #t))
+
+;; ---- text ----
+
+(define (contains? [s string] [part string]) -> bool
+  (for ([i u32 0]) (<= (+ i (-> part length)) (-> s length)) (+= i 1)
+    (when (== (slice s i (+ i (-> part length))) part) (return #t)))
+  #f)
+
+(define (replaced [text string] [old string] [new string]) -> string
+  (for ([i u32 0]) (<= (+ i (-> old length)) (-> text length)) (+= i 1)
+    (when (== (slice text i (+ i (-> old length))) old)
+      (return (joined (joined (slice text 0 i) new) (slice text (+ i (-> old length)))))))
+  (throw test-failed (joined "no text to replace: " old)))
+
+(define (edited! [path string] [old string] [new string]) (written! path (replaced (text-in path) old new)))
+
+(define (joined [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+(define (listed [items (slice string)]) -> string
+  (let ([out (make-buffer)])
+    (for ([i u32 0]) (< i (-> items length)) (+= i 1)
+      (buffer-add-string! (& out) (@ items i))
+      (buffer-add-byte! (& out) 32))
+    (buffer-string (& out))))
+
+(define (trimmed [s string]) -> string
+  (let ([n (-> s length)]) (while (and (> n 0) (== (@ s (- n 1)) 10)) (-= n 1)) (slice s 0 n)))
+
+(define (first-line [s string]) -> string
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) 10) (return (slice s 0 i))))
+  s)
+
+(define (hash-in [text string]) -> string
+  (for ([i u32 0]) (<= (+ i 71) (-> text length)) (+= i 1)
+    (when (and (== (slice text i (+ i 7)) "sha256:") (hex? (slice text (+ i 7) (+ i 71)))) (return (slice text i (+ i 71)))))
+  "")
+
+(define (hex? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (unless (or (and (>= (@ s i) #\0) (<= (@ s i) #\9)) (and (>= (@ s i) #\a) (<= (@ s i) #\f))) (return #f)))
+  #t)
+
+(define (words [text string]) -> (slice string)
+  (let ([b (make-buffer)] [start u32 0])
+    (for ([i u32 0]) (<= i (-> text length)) (+= i 1)
+      (when (or (== i (-> text length)) (== (@ text i) 32) (== (@ text i) 10))
+        (when (< start i) (push! (& b) (slice text start i)))
+        (set! start (+ i 1))))
+    (strings-of (& b))))
+
+(define (digits [n i32]) -> string
+  (let ([b (make-buffer)])
+    (when (< n 0) (buffer-add-byte! (& b) #\-))
+    (write-digits (& b) (cast u64 (if (< n 0) (- 0 n) n)) 10)
+    (buffer-string (& b))))
+
+(define (push! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+(define (strings-of [b (ptr buffer)]) -> (slice string)
+  (slice (cast (ptr string) (-> b bytes)) (/ (-> b length) (sizeof string))))
+
+;; ---- the forms ----
+
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (host? [x datum]) -> bool (equal? (syntax-e x) '#:host))
+
+  (define (strings [items datum]) -> datum
+    (if (null? items) #'(slice (cast (ptr string) 0) 0) #`(slice (array-of string #,@items))))
+
+  (define (sub-form [s datum]) -> datum
+    (syntax-match s
+      [(_ dir (? host? k) (flag ...) arg ...) #`(sub-in #,dir #,(strings flag) #,(strings arg))]
+      [(_ dir arg ...) #`(sub-in #,dir (slice (cast (ptr string) 0) 0) #,(strings arg))]))
+
+  (define (sub-run-form [s datum]) -> datum
+    (syntax-match s [(_ dir name grant ...) #`(sub-run-in #,dir #,name #,(strings grant))]))
+
+  (define (host-form [s datum]) -> datum (syntax-match s [(_ dir arg ...) #`(host-in #,dir #,(strings arg))]))
+
+  (define (program-form [s datum]) -> datum
+    (syntax-match s [(_ dir name arg ...) #`(program-in #,dir #,name #,(strings arg))]))
+
+  (define (expect-ran-form [s datum]) -> datum
+    (let ([message (literal (format "~a:~a: ~s" `(,(syntax-source s) ,(syntax-line s) ,(syntax->datum s))))])
+      (syntax-match s
+        [(_ run) #`(let ([r #,run]) (ran-check! (& r) "" #f "" #,message))]
+        [(_ run k text)
+         (let ([key (if (keyword? (syntax-e k)) (keyword->string (syntax-e k)) "")])
+           (cond [(== key "output") #`(let ([r #,run]) (ran-check! (& r) "" #t #,text #,message))]
+                 [(== key "output-file") #`(let ([r #,run]) (ran-check! (& r) "" #t (expected-text #,text) #,message))]
+                 [(== key "fails") #`(let ([r #,run]) (ran-check! (& r) #,text #f "" #,message))]
+                 [else (raise-syntax-error 'expect-ran "the options are #:output, #:output-file and #:fails" k)]))]
+        [_ (raise-syntax-error 'expect-ran "expected (expect-ran run [#:output text | #:output-file path | #:fails text])" s)])))
+
+  (define (printed-form [s datum]) -> datum (syntax-match s [(_ run) #`(let ([r #,run]) (trimmed (-> r output)))])))
+
+(define-syntax sub sub-form)
+(define-syntax sub-run sub-run-form)
+(define-syntax host host-form)
+(define-syntax program program-form)
+(define-syntax expect-ran expect-ran-form)
+(define-syntax printed printed-form)
