@@ -279,7 +279,7 @@ async function load() {
   }
   run({
     files: new Map(files.map(([p, b]) => [p, b.slice()])),
-    args: [],
+    args: new URLSearchParams(location.search).getAll('arg'),
     output,
     onEnd: (code, reason) => {
       ended = { code, reason };

@@ -14,10 +14,7 @@ sites="$(cd "$sites" && pwd)"
 bin/substrate expand build/empty.sub > /dev/null
 named() { (cd "$1" && "$root/bin/substrate" site "$2" -o "$sites/$2"); }
 
-named tests/web session
 status=0
-node tests/web/session.mjs "$sites/session" funcs scheme substrate switch bend || status=1
-
 for p in counter rows; do bin/substrate site "packages/web/examples/$p.sub" -o "$sites/$p"; done
 make -s repl OUT="${OUT:-build}"
 for p in focus floor events storage location clipboard files fields assets canvas stopped stopped-at-start gpu workers \

@@ -1,6 +1,6 @@
-// A site's start: the program, given the files in assets.list and files.pack, with the host modules it imports. The
-// modules are kept in window.modules, window.ready is set once the program has started, and window.ended to the
-// status the program ends with.
+// A site's start: the program, given the files in assets.list and files.pack and the URL's arg parameters as its
+// arguments, with the host modules it imports. The modules are kept in window.modules, window.ready is set once the
+// program has started, and window.ended to the status the program ends with.
 import { boot } from './subhost-web.mjs';
 
 const query = new URLSearchParams(location.search);
@@ -27,6 +27,7 @@ window.app = await boot({
   program: 'program/',
   lists: [['assets.list', '/']],
   packs: [['files.pack', '/']],
+  args: query.getAll('arg'),
   onEnd: (code) => {
     window.ended = code;
   },
