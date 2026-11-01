@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MessageChannel, Worker, receiveMessageOnPort } from 'node:worker_threads';
 import { literalPath } from './fs.mjs';
+import { entries } from '../entries.mjs';
 
 const utf8 = new TextEncoder();
 const browser = new URL('../web/simulated/browser.mjs', import.meta.url);
@@ -62,10 +63,11 @@ export function pages(grants) {
         for (const page of open.values()) page.worker.terminate();
         open.clear();
       },
-      open(dp, dl, mp, ml, ap, al, err) {
+      open(dp, dl, mp, ml, ap, al, up, ul, err) {
         let worker = null;
         try {
           const dir = caller.string(dp, dl);
+          const url = caller.string(up, ul);
           const names = read(path.join(dir, 'program')).toString().split(/\r?\n/).filter((n) => n !== '');
           const wasm = names.map((n) => [n, read(path.join(dir, `${n}.wasm`))]);
           const markup = read(ml > 0 ? caller.string(mp, ml) : defaultPage).toString();
@@ -76,7 +78,7 @@ export function pages(grants) {
           const signal = new Int32Array(new SharedArrayBuffer(4));
           worker = new Worker(start, { eval: true, workerData: { port: port2, signal }, transferList: [port2] });
           const page = { worker, port: port1, signal, dead: false };
-          const reply = ask(page, { type: 'open', markup, names, wasm, files, seed: 1 });
+          const reply = ask(page, { type: 'open', markup, names, wasm, files, url, seed: 1 });
           if (!reply.ok) {
             worker.terminate();
             caller.fail(err, reply.message);
@@ -97,7 +99,18 @@ export function pages(grants) {
           caller.fail(err, page ? 'the page stopped answering' : `no page ${id} is open`);
           return -1;
         }
-        const reply = ask(page, { type: 'request', fields: caller.string(ptr, len) });
+        const fields = caller.string(ptr, len);
+        const message = { type: 'request', fields };
+        const [kind, ...paths] = entries(fields);
+        if (kind === 'choose-files') {
+          try {
+            message.files = paths.map((p) => [path.basename(p), read(p)]);
+          } catch (e) {
+            caller.fail(err, e.message);
+            return -1;
+          }
+        }
+        const reply = ask(page, message);
         if (!reply.ok) {
           caller.fail(err, reply.message);
           return -1;

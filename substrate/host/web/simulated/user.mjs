@@ -38,9 +38,12 @@ export function user(document, window) {
   const disabled = (e) => ['button', 'input', 'select', 'textarea'].includes(e.localName)
     && (e.hasAttribute('disabled') || !!e.closest('fieldset[disabled]'));
 
-  const key = (e, type, name, held) => e.dispatchEvent(new Event(type, {
-    bubbles: true, cancelable: true, key: name, code: codeOf(name), repeat: false, view: window, ...down, ...held,
-  }));
+  const key = (e, type, name, held) => {
+    if (type === 'keydown' && name !== 'Escape') document.activated = document.hooks.now();
+    return e.dispatchEvent(new Event(type, {
+      bubbles: true, cancelable: true, key: name, code: codeOf(name), repeat: false, view: window, ...down, ...held,
+    }));
+  };
 
   const insert = (e, s) => {
     if (!textField(e) || e.hasAttribute('readonly') || disabled(e)) return;
@@ -104,6 +107,7 @@ export function user(document, window) {
       const [x, y] = at || (e.localName === 'canvas' ? [e.width / 2, e.height / 2] : [0, 0]);
       const mouse = { button: 0, detail: 1, offsetX: x, offsetY: y, clientX: x, clientY: y, view: window, ...down };
       const pointer = { pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      document.activated = document.hooks.now();
       e.dispatchEvent(new Event('pointerdown', { bubbles: true, cancelable: true, buttons: 1, ...mouse, ...pointer }));
       if (e.dispatchEvent(new Event('mousedown', { bubbles: true, cancelable: true, buttons: 1, ...mouse }))) {
         let f = e;

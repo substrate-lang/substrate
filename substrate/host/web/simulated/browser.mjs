@@ -1,16 +1,26 @@
 // The simulated browser: one page on its own thread, the real web host running a program over the simulated
-// document and clock. It answers substrate/host/node/page.mjs: it opens the page, then carries out requests to act on
-// the page, read it and check it, settling the page after each.
+// document, clock, storage, network and the rest. It answers substrate/host/node/page.mjs: it opens the page, then
+// carries out requests to act on the page, read it and check it, settling the page after each.
+import { resolveObjectURL } from 'node:buffer';
 import { workerData } from 'node:worker_threads';
 import { Document, Event, Node, NodeFilter, Window, parseInto } from './document.mjs';
 import { makeClock } from './clock.mjs';
 import { describe, findAll, parse } from './find.mjs';
 import { user as userOf } from './user.mjs';
+import { historyOf, locationOf, makeHistory } from './navigation.mjs';
+import { makeIndexedDB } from './indexeddb.mjs';
+import { makeFetch, makeWebSocket } from './network.mjs';
+import { sizeOf } from './images.mjs';
 import { run } from '../subhost-web.mjs';
 import { dom } from '../dom.mjs';
+import { storage } from '../storage.mjs';
+import { locationModule } from '../location.mjs';
+import { clipboard } from '../clipboard.mjs';
+import { files as filesModule } from '../files.mjs';
 import { clock as clockModule } from '../../modules/clock.mjs';
 import { random } from '../../modules/random.mjs';
 import { timer } from '../../modules/timer.mjs';
+import { websocket } from '../../modules/websocket.mjs';
 import { entries } from '../../entries.mjs';
 
 const { port, signal } = workerData;
@@ -18,13 +28,21 @@ const turn = () => new Promise((resolve) => setImmediate(resolve));
 const quote = (s) => JSON.stringify(s);
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}...` : s);
 const short = (e) => clip(e.outerHTML, 160);
+const utf8 = new TextEncoder();
+const text = new TextDecoder();
+const origin = 'http://localhost';
+
+// What lasts for the browser's life: what reloading the page or going to another URL keeps.
+const kept = { databases: new Map(), clipboard: '', downloads: new Map(), answers: new Map(), chosen: null, history: null, program: null };
 
 const lines = [];
 const partial = { 1: '', 2: '' };
-const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
+let decoders = null;
 let document = null;
+let location = null;
 let clock = null;
 let user = null;
+let site = null;
 let pending = 0;
 let activity = 0;
 let ended = null;
@@ -40,20 +58,76 @@ function output(fd, bytes) {
   }
 }
 
+function later(f) {
+  pending++;
+  setImmediate(() => {
+    pending--;
+    activity++;
+    f();
+  });
+}
+
+async function track(work) {
+  pending++;
+  try {
+    return await work();
+  } finally {
+    pending--;
+    activity++;
+  }
+}
+
+const sameBytes = (a, b) => a.length === b.length && Buffer.from(a.buffer, a.byteOffset, a.length).equals(Buffer.from(b.buffer, b.byteOffset, b.length));
+
+function loadImage(img) {
+  const src = img.getAttribute('src') || '';
+  track(async () => {
+    let bytes = null;
+    if (src.startsWith('blob:')) {
+      const blob = resolveObjectURL(src);
+      bytes = blob ? new Uint8Array(await blob.arrayBuffer()) : null;
+    } else {
+      const url = new URL(src, location.href);
+      if (url.origin === origin) bytes = site.get(decodeURIComponent(url.pathname)) || null;
+    }
+    if (img.getAttribute('src') !== src) return;
+    const size = bytes && sizeOf(bytes);
+    const named = bytes && [...site].find(([, b]) => sameBytes(b, bytes));
+    img.recordedName = named ? named[0] : src;
+    img.complete = true;
+    if (size) {
+      [img.naturalWidth, img.naturalHeight] = size;
+      img.dispatchEvent(new Event('load'));
+    } else img.dispatchEvent(new Event('error'));
+  });
+}
+
 function install(seed) {
   clock = makeClock();
   document = new Document();
   const window = new Window(document);
+  location = locationOf(kept.history);
   document.hooks = {
-    later(f) {
-      pending++;
-      setImmediate(() => {
-        pending--;
-        activity++;
-        f();
+    later,
+    now: () => clock.now(),
+    download(name, href) {
+      track(async () => {
+        const blob = resolveObjectURL(href);
+        if (blob) kept.downloads.set(name, new Uint8Array(await blob.arrayBuffer()));
       });
     },
-    download() {},
+    pick(input) {
+      const chosen = kept.chosen;
+      kept.chosen = null;
+      later(() => {
+        if (chosen) {
+          input.files = chosen.map(([name, bytes]) => new File([bytes], name));
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        } else input.dispatchEvent(new Event('cancel'));
+      });
+    },
+    loadImage,
     error: (e) => say(`uncaught: ${e && e.message ? e.message : e}`),
   };
   const RealDate = Date;
@@ -74,13 +148,31 @@ function install(seed) {
     state ^= state << 5;
     return state & 0xff;
   };
+  function Image(width, height) {
+    const img = document.createElement('img');
+    img.complete = true;
+    img.naturalWidth = 0;
+    img.naturalHeight = 0;
+    if (width !== undefined) img.setAttribute('width', width);
+    if (height !== undefined) img.setAttribute('height', height);
+    return img;
+  }
+  const { indexedDB, IDBKeyRange } = makeIndexedDB(kept.databases, later);
+  const where = () => kept.history.current();
   const g = globalThis;
   Object.assign(g, {
     document,
     window,
+    location,
+    history: historyOf(kept.history, () => later(() => window.dispatchEvent(new Event('popstate')))),
     Node,
     NodeFilter,
     Event,
+    Image,
+    indexedDB,
+    IDBKeyRange,
+    fetch: makeFetch(site, kept.answers, where, track),
+    WebSocket: makeWebSocket(later, where),
     Date: SimulatedDate,
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
@@ -94,18 +186,28 @@ function install(seed) {
     console: { log: (...a) => say(a.join(' ')), info: (...a) => say(a.join(' ')), warn: (...a) => say(a.join(' ')),
       error: (...a) => say(a.join(' ')), debug: (...a) => say(a.join(' ')) },
   });
-  Object.defineProperty(g, 'performance', { value: { now: () => clock.now(), timeOrigin: clock.epoch }, configurable: true, writable: true });
-  Object.defineProperty(g, 'crypto', {
-    value: {
-      getRandomValues(a) {
-        const bytes = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
-        for (let i = 0; i < bytes.length; i++) bytes[i] = nextByte();
-        return a;
+  const value = (v) => ({ value: v, configurable: true, writable: true });
+  Object.defineProperty(g, 'performance', value({ now: () => clock.now(), timeOrigin: clock.epoch }));
+  Object.defineProperty(g, 'crypto', value({
+    getRandomValues(a) {
+      const bytes = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+      for (let i = 0; i < bytes.length; i++) bytes[i] = nextByte();
+      return a;
+    },
+  }));
+  Object.defineProperty(g, 'navigator', value({
+    userAgent: 'substrate simulated browser',
+    language: 'en-US',
+    languages: ['en-US'],
+    hardwareConcurrency: 4,
+    clipboard: {
+      readText: () => Promise.resolve(kept.clipboard),
+      writeText: (t) => {
+        kept.clipboard = String(t);
+        return Promise.resolve();
       },
     },
-    configurable: true,
-    writable: true,
-  });
+  }));
   user = userOf(document, window);
 }
 
@@ -141,13 +243,20 @@ async function settle() {
   }
 }
 
-async function open({ markup, names, wasm, files, seed }) {
+const storageName = () => location.pathname.replace(/[^/]*$/, '');
+
+// load starts the program at the history's current URL in a new page.
+async function load() {
+  const { markup, names, wasm, files, seed } = kept.program;
+  ended = null;
+  decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   install(seed);
   placeMarkup(markup);
   const root = document.getElementById('root');
   if (!root) throw new Error('the page has no element with the id root');
+  const { fetchModule } = await import('../../modules/fetch.mjs');
   run({
-    files: new Map(files),
+    files: new Map(files.map(([p, b]) => [p, b.slice()])),
     cwd: '/',
     args: [],
     output,
@@ -157,7 +266,10 @@ async function open({ markup, names, wasm, files, seed }) {
     delivered: () => {
       activity++;
     },
-    modules: { dom: dom(root), clock: clockModule(), random: random(), timer: timer() },
+    modules: {
+      dom: dom(root), clock: clockModule(), random: random(), timer: timer(), fetch: fetchModule(), websocket: websocket(),
+      storage: storage(storageName()), location: locationModule(), clipboard: clipboard(), files: filesModule(),
+    },
   }, names, new Map(wasm));
   await settle();
   if (ended && ended.code !== 0) throw new Error(`the program ended with ${ended.code}\n${consoleText()}`);
@@ -166,6 +278,13 @@ async function open({ markup, names, wasm, files, seed }) {
     autofocus.focus();
     await settle();
   }
+}
+
+async function open({ markup, names, wasm, files, url, seed }) {
+  kept.program = { markup, names, wasm, files, seed };
+  kept.history = makeHistory(new URL(url, `${origin}/index.html`).href);
+  site = new Map([['/index.html', utf8.encode(markup)], ...files]);
+  await load();
 }
 
 function one(f) {
@@ -184,8 +303,23 @@ async function act(f) {
   return '';
 }
 
-async function handle(text) {
-  const fields = entries(text);
+function drawingOf(f) {
+  const e = one(f);
+  if (e.localName !== 'canvas') throw new Error(`${describe(f)} is not a canvas\n  it is ${short(e)}`);
+  return e.context ? e.context.commands.join('\n') : '';
+}
+
+const includes = (drawing, lines) => `\n${drawing}\n`.includes(`\n${lines}\n`);
+
+const storeOf = () => {
+  const db = kept.databases.get(storageName()) || new Map();
+  kept.databases.set(storageName(), db);
+  if (!db.has('keys')) db.set('keys', new Map());
+  return db.get('keys');
+};
+
+async function handle(m) {
+  const fields = entries(m.fields);
   const kind = fields[0];
   const found = () => parse(fields, 1);
   switch (kind) {
@@ -218,6 +352,39 @@ async function handle(text) {
       await clock.advance(Number(fields[1]), settle);
       await settle();
       return '';
+    case 'go':
+      kept.history.push(new URL(fields[1], location.href).href);
+      await load();
+      return '';
+    case 'reload':
+      await load();
+      return '';
+    case 'url':
+      return location.href;
+    case 'storage-get': {
+      const v = storeOf().get(fields[1]);
+      if (v === undefined) throw new Error(`the page's storage has no key ${quote(fields[1])}`);
+      return text.decode(v);
+    }
+    case 'storage-set':
+      storeOf().set(fields[1], utf8.encode(fields[2]));
+      return '';
+    case 'clipboard-get':
+      return kept.clipboard;
+    case 'clipboard-set':
+      kept.clipboard = fields[1];
+      return '';
+    case 'choose-files':
+      kept.chosen = m.files;
+      return '';
+    case 'downloaded': {
+      const bytes = kept.downloads.get(fields[1]);
+      if (!bytes) throw new Error(`no file named ${quote(fields[1])} was downloaded`);
+      return text.decode(bytes);
+    }
+    case 'respond':
+      kept.answers.set(new URL(fields[1], location.href).href, { status: Number(fields[2]), body: utf8.encode(fields[3]) });
+      return '';
     case 'text':
       return one(found()[0]).textContent;
     case 'html':
@@ -239,11 +406,17 @@ async function handle(text) {
       return one(found()[0]).checked ? 'true' : 'false';
     case 'count':
       return String(findAll(document, found()[0]).length);
-    case 'drawing': {
-      const [f] = found();
-      const e = one(f);
-      if (e.localName !== 'canvas') throw new Error(`${describe(f)} is not a canvas\n  it is ${short(e)}`);
-      return e.context ? e.context.commands.join('\n') : '';
+    case 'drawing':
+      return drawingOf(found()[0]);
+    case 'drawn': {
+      const [f, k] = found();
+      return includes(drawingOf(f), fields[k]) ? 'true' : 'false';
+    }
+    case 'expect-drawn': {
+      const [f, k] = found();
+      const drawing = drawingOf(f);
+      if (!includes(drawing, fields[k])) throw new Error(`the last drawing of ${describe(f)} does not include\n  ${fields[k].replace(/\n/g, '\n  ')}\nit is\n  ${drawing.replace(/\n/g, '\n  ')}`);
+      return '';
     }
     case 'console':
       return consoleText();
@@ -282,8 +455,7 @@ async function handle(text) {
     case 'expect-checked': {
       const [f, k] = found();
       const e = one(f);
-      const want = fields[k] === 'true';
-      if (e.checked !== want) throw new Error(`${describe(f)} is ${e.checked ? '' : 'not '}checked\n  it is ${short(e)}`);
+      if (e.checked !== (fields[k] === 'true')) throw new Error(`${describe(f)} is ${e.checked ? '' : 'not '}checked\n  it is ${short(e)}`);
       return '';
     }
     case 'expect-count': {
@@ -313,7 +485,7 @@ process.on('unhandledRejection', (e) => say(`uncaught: ${e && e.message ? e.mess
 port.on('message', async (m) => {
   let reply;
   try {
-    reply = { ok: true, text: m.type === 'open' ? (await open(m), '') : await handle(m.fields) };
+    reply = { ok: true, text: m.type === 'open' ? (await open(m), '') : await handle(m) };
   } catch (e) {
     reply = { ok: false, message: e && e.message ? e.message : String(e) };
   }

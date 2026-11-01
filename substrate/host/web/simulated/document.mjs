@@ -664,6 +664,38 @@ export class Element extends Node {
     this.setAttribute('href', v);
   }
 
+  get src() {
+    return this.getAttribute('src') || '';
+  }
+
+  set src(v) {
+    this.setAttribute('src', v);
+  }
+
+  get alt() {
+    return this.getAttribute('alt') || '';
+  }
+
+  set alt(v) {
+    this.setAttribute('alt', v);
+  }
+
+  attributeChanged(name) {
+    if (this.localName === 'img' && name === 'src') {
+      this.complete = false;
+      this.naturalWidth = 0;
+      this.naturalHeight = 0;
+      if (this.ownerDocument) this.ownerDocument.hooks.loadImage(this);
+    }
+  }
+
+  // An <input type="file">'s picker: the files a test chose for it, or none, which cancels it.
+  showPicker() {
+    const doc = this.ownerDocument;
+    if (!doc.userActive()) throw new Error("HTMLInputElement::showPicker() requires a user gesture.");
+    doc.hooks.pick(this);
+  }
+
   get download() {
     return this.getAttribute('download') || '';
   }
@@ -715,7 +747,11 @@ export class Element extends Node {
 
   requestPointerLock() {
     const doc = this.ownerDocument;
-    if (doc && this.isConnected && doc.pointerLockElement !== this) {
+    if (!doc || !this.isConnected || !doc.userActive()) {
+      if (doc) doc.hooks.later(() => doc.dispatchEvent(new Event('pointerlockerror')));
+      return Promise.reject(new Error('the pointer can be locked only on a user gesture'));
+    }
+    if (doc.pointerLockElement !== this) {
       doc.pointerLockElement = this;
       doc.hooks.later(() => doc.dispatchEvent(new Event('pointerlockchange')));
     }
@@ -769,7 +805,15 @@ export class Document extends Node {
     this.focused = null;
     this.pointerLockElement = null;
     this.defaultView = null;
-    this.hooks = { later: (f) => queueMicrotask(f), download: () => {}, error: (e) => { throw e; } };
+    this.activated = -Infinity;
+    this.hooks = {
+      later: (f) => queueMicrotask(f),
+      now: () => 0,
+      download: () => {},
+      pick: () => {},
+      loadImage: () => {},
+      error: (e) => { throw e; },
+    };
     const html = this.createElement('html');
     html.appendChild(this.createElement('head'));
     html.appendChild(this.createElement('body'));
@@ -834,6 +878,11 @@ export class Document extends Node {
       element.dispatchEvent(new Event('focus'));
       element.dispatchEvent(new Event('focusin', { bubbles: true }));
     }
+  }
+
+  // Whether a click or key was within the last 5 seconds, as Chromium's user activation is.
+  userActive() {
+    return this.hooks.now() - this.activated <= 5000;
   }
 
   exitPointerLock() {
@@ -1160,7 +1209,7 @@ export class Context2d {
 
   scale(x, y) { this.say('scale', number(x), number(y)); }
 
-  drawImage(image, ...n) { this.say('draw-image', quoted(image.name || image.src || ''), ...n.map(number)); }
+  drawImage(image, ...n) { this.say('draw-image', quoted(image.recordedName || image.getAttribute('src') || ''), ...n.map(number)); }
 
   measureText(s) { return { width: String(s).length * 8 }; }
 
