@@ -5,18 +5,18 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { createHost, Exit } from './subhost-core.mjs';
 import { grantFlag, grantsOf, noGrants } from './grants.mjs';
-import { hostFlag, hostModules, setupOf } from './node/modules.mjs';
+import { hostFlag, hostModules, setupOf, system } from './node/modules.mjs';
 
 const require = createRequire(import.meta.url);
 const resolveGrant = (p, k) => require('./node/fs.mjs').resolveGrant(p, k);
 const resolveFlag = (p, k) => {
   const item = resolveGrant(p, k);
-  if (item === null) process.stderr.write(`subhost: --allow-run: ${p} is not found, so it is not granted\n`);
+  if (item === null) process.stderr.write(`substrate: --allow-run: ${p} is not found, so it is not granted\n`);
   return item;
 };
 
 function usage() {
-  process.stderr.write('usage: sub run [FLAG ...] DIR [ARG ...]\n'
+  process.stderr.write('usage: substrate run [FLAG ...] DIR [ARG ...]\n'
     + '  grants: -A, -R[=PATH,...], -W[=PATH,...], -N[=HOST[:PORT],...], -E[=NAME,...], --allow-run[=PROGRAM,...],\n'
     + '          --deny-read=PATH,..., --deny-write=PATH,..., --deny-net=HOST[:PORT],..., --deny-env=NAME,...,\n'
     + '          --deny-run=PROGRAM,...\n'
@@ -26,7 +26,7 @@ function usage() {
 }
 
 function fail(message) {
-  process.stderr.write(`subhost: ${message}\n`);
+  process.stderr.write(`substrate: ${message}\n`);
   process.exit(64);
 }
 
@@ -48,22 +48,23 @@ function read(file) {
   try {
     return fs.readFileSync(file);
   } catch (e) {
-    process.stderr.write(`subhost: cannot read ${file}\n`);
+    process.stderr.write(`substrate: cannot read ${file}\n`);
     process.exit(1);
   }
 }
-const names = read(`${dir}/program`).toString().split('\n').filter((n) => n !== '');
+const names = read(`${dir}/program`).toString().split(/\r?\n/).filter((n) => n !== '');
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
 
 // The program process.exec_at_end kept (node/process.mjs).
 const atEnd = () => {
   const kept = setup.atEnd;
-  if (kept) process.execve(kept.file, kept.argv, kept.env);
+  if (kept) require('./node/process.mjs').become(kept.file, kept.argv, kept.env);
 };
 process.on('beforeExit', atEnd);
 
 const host = createHost({
   args: programArgs,
+  os: system,
   write(fd, bytes) {
     try {
       fs.writeSync(fd, bytes);

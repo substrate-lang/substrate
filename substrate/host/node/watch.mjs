@@ -4,7 +4,7 @@ import path from 'node:path';
 import { errorOf } from '../errors.mjs';
 import { entries, joined } from '../entries.mjs';
 import { under } from '../grants.mjs';
-import { literalPath, plainMessage } from './fs.mjs';
+import { comparable, literalPath, plainMessage } from './fs.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -43,7 +43,7 @@ export function watchModule(grants) {
           const watcher = fs.watch(abs, { recursive: recursive !== 0 && dir === abs }, (type, name) => {
             if (watches.get(id) !== w) return;
             const changed = name === null ? abs : path.join(dir, name.toString());
-            if (ignore.some((root) => under(changed, root))) return;
+            if (ignore.some((root) => under(comparable(changed), comparable(root)))) return;
             const kind = type === 'change' ? MODIFY : fs.existsSync(changed) ? CREATE : REMOVE;
             caller.event(CHANGED, id, tag, kind, utf8.encode(joined([changed])));
           });

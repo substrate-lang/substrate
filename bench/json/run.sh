@@ -8,7 +8,7 @@ reps="${1:-20}"
 mkdir -p "$out/data"
 install -m 644 "$JSON_BENCH_FILES"/*.json "$out/data"
 
-(cd "$here" && "$root/bin/sub" build json.sub -o "$out/ours" -c "$root/build/bench/cache" > /dev/null)
+(cd "$here" && "$root/bin/substrate" build json.sub -o "$out/ours" -c "$root/build/bench/cache" > /dev/null)
 NIX_HARDENING_ENABLE= clang -O2 -I"$CJSON_SOURCE" -o "$out/cjson.native" "$here/cjson.c" -lm
 NIX_HARDENING_ENABLE= wasm32-unknown-wasi-clang -O2 -I"$CJSON_SOURCE" -o "$out/cjson.wasm" "$here/cjson.c"
 

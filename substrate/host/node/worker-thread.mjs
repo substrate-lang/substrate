@@ -3,7 +3,7 @@ import { parentPort } from 'node:worker_threads';
 import { createHost, Exit } from '../subhost-core.mjs';
 import { workerSide } from '../worker-side.mjs';
 import { grantsOf } from '../grants.mjs';
-import { hostModules } from './modules.mjs';
+import { hostModules, system } from './modules.mjs';
 import { resolveGrant } from './fs.mjs';
 
 const side = workerSide((m, transfer) => parentPort.postMessage(m, transfer));
@@ -15,6 +15,7 @@ parentPort.on('message', (m) => {
     const setup = { grants: m.grants, fakes: new Map(m.fakes), tls: m.tls, loader: m.loader, worker: true };
     const host = createHost({
       args: [m.argument],
+      os: system,
       write: side.write,
       exit(code) {
         throw new Exit(code);

@@ -25,7 +25,7 @@ unbuilt=0
 
 # The packages' tests.
 packages=(./std ./cmd ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite ./tests ./tests/web)
-if bin/sub test -c "$cache" --check-cache "${packages[@]}"; then
+if bin/substrate test -c "$cache" --check-cache "${packages[@]}"; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
@@ -38,7 +38,7 @@ for p in "${packages[@]}"; do
   rm -rf "${first:?}"
   mkdir -p "$(dirname "$first")"
   cp -r "$p/build/test/program" "$first"
-  if bin/sub test -c "$cache" --no-run "$p" > /dev/null 2>&1 && same_program "$p/build/test/program" "$first"; then
+  if bin/substrate test -c "$cache" --no-run "$p" > /dev/null 2>&1 && same_program "$p/build/test/program" "$first"; then
     again=$((again + 1))
   else
     fail=$((fail + 1))
@@ -52,7 +52,7 @@ mapfile -t modules < <( (find bench substrate/host tests/proxy -name '*.sub' -no
                          find cmd std packages tests/web -name '*.sub' -not -name package.sub -not -path '*/build/*' \
                            -not -path '*/tests/*' | while read -r f; do if one_file "$f"; then echo "$f"; fi; done) | sort)
 for m in "${modules[@]}"; do
-  actual="$(cd "$(dirname "$m")" && "$root/bin/sub" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
+  actual="$(cd "$(dirname "$m")" && "$root/bin/substrate" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
     built=$((built + 1))
   else
@@ -68,7 +68,7 @@ for t in tests/events/*.sub; do
   [ -f "tests/events/$name.real" ] || continue
   if [ -z "$server" ]; then
     : > "$builds/servers.url"
-    (cd tests/events/fixtures && "$root/bin/sub" build servers.sub -o "$root/$builds/events/servers" -c "$cache")
+    (cd tests/events/fixtures && "$root/bin/substrate" build servers.sub -o "$root/$builds/events/servers" -c "$cache")
     "$host" -N=127.0.0.1 -R="$root/tests/events/files" "$root/$builds/events/servers" "$root/tests/events/files" \
       > "$builds/servers.url" & server=$!
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done

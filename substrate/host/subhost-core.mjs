@@ -398,6 +398,9 @@ export function createHost(platform) {
         const a = platform.args[i];
         return give(typeof a === 'string' ? utf8.encode(a) : a, out);
       },
+      os(out) {
+        return give(utf8.encode(platform.os), out);
+      },
       exit(code) {
         platform.exit(code);
       },

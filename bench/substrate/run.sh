@@ -12,7 +12,7 @@ names=("$@")
 mkdir -p "$out"
 
 for name in "${names[@]}"; do
-  (cd "$here" && "$root/bin/sub" build "$name.sub" -o "$out/$name" -c "$root/build/bench/cache" > /dev/null)
+  (cd "$here" && "$root/bin/substrate" build "$name.sub" -o "$out/$name" -c "$root/build/bench/cache" > /dev/null)
   NIX_HARDENING_ENABLE= clang -O2 -o "$out/$name.native" "$here/$name.c"
   for v in wasm noinline; do
     NIX_HARDENING_ENABLE= clang --target=wasm32 -O2 $([ $v = noinline ] && echo -fno-inline) -ffreestanding -nostdlib \

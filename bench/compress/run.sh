@@ -9,7 +9,7 @@ out="$root/build/bench/compress"
 reps="${1:-1}"
 mkdir -p "$out/zlib"
 
-(cd "$here" && "$root/bin/sub" build compress.sub -o "$out/ours" -c "$root/build/bench/cache" > /dev/null)
+(cd "$here" && "$root/bin/substrate" build compress.sub -o "$out/ours" -c "$root/build/bench/cache" > /dev/null)
 [ -f "$out/zlib/zlib.h" ] || tar -xzf "$ZLIB_SOURCE" -C "$out/zlib" --strip-components=1
 sources=("$out"/zlib/{adler32,crc32,deflate,inffast,inflate,inftrees,trees,zutil}.c)
 flags=(-O2 -I"$out/zlib")

@@ -82,6 +82,7 @@ export function run(options, names, wasm) {
 
   const host = createHost({
     args: options.args || [],
+    os: 'web',
     write: output,
     exit(code) {
       throw new Exit(code);

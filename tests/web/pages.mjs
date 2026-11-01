@@ -803,7 +803,7 @@ const { server, url } = await served(sites);
 // tests/web/server.sub serves the events page; a second one on another port is the other origin, which its CORS allows.
 const site = path.join(sites, 'events');
 const started = (...args) => {
-  const p = spawn(path.join(here, '../../bin/sub'),
+  const p = spawn(path.join(here, '../../bin/substrate'),
     ['run', '-N=127.0.0.1', `-R=${site}`, path.join(sites, 'server'), site, ...args],
     { stdio: ['ignore', 'pipe', 'inherit'] });
   return [p, new Promise((resolve) => p.stdout.once('data', (d) => resolve(String(d).trim())))];

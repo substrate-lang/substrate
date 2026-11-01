@@ -32,10 +32,13 @@ compiler is written in it, builds itself, and runs in a browser.
   `shade/` for GPU programs compiled to WGSL, a game library, examples and a
   REPL. `sqlite/` is SQLite as a wasm module, with its file layer and API in
   Substrate.
-- `cmd/`: a package holding sub, the command `bin/sub` runs, which reads
-  packages and runs the compiler, and the server that `sub serve` runs.
-- `seed/`: checked-in builds of the compiler and of sub, which build them
+- `cmd/`: a package holding substrate, the command `bin/substrate` runs, which
+  reads packages and runs the compiler, and the server that `substrate serve`
+  runs.
+- `seed/`: checked-in builds of the compiler and of substrate, which build them
   from source.
+- `npm/`: the npm package substrate-lang: its manifest, the command it
+  installs, and the scripts `make npm` runs to pack it and try it.
 - `tests/`: the tests of the compiler and the host, as the package
   substrate-tests. Each package's own tests are in its `tests/` directory,
   and `tests/run.sh` runs them all.
@@ -43,23 +46,26 @@ compiler is written in it, builds itself, and runs in a browser.
 
 ## Commands
 
-In the dev shell (`nix develop`):
+In the dev shell (`nix develop`), where `bin/sub` is short for `bin/substrate`:
 
-    bin/sub build FILE -o DIR              # FILE's program, into DIR
-    bin/sub run [GRANT ...] DIR [ARG ...]  # run it, granted -R, -W, -N, -E, --allow-run or -A
-    bin/sub eval FILE                      # FILE's forms, one at a time, as a session
-    bin/sub expand FILE                    # FILE's expansion
-    bin/sub site OUT FILE                  # a web site for a page program
-    bin/sub serve OUT                      # serve it locally
-    bin/sub doc                            # documentation of the current package and its dependencies, as HTML in build/doc
-    bin/sub doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM
-    bin/sub doc -o DIR PACKAGE ...         # packages' documentation as text, or with --html as HTML, into DIR
-    bin/sub test [./DIR ...] [PATTERN ...] # the tests of the current package, or of each DIR at once
-    bin/sub version                        # substrate's version, and the hash of its files
-    make check                             # the tests, then make docs when they pass
-    tests/web/run.sh                       # the browser tests
-    make bootstrap                         # the compiler builds itself into the same bytes
-    make seed                              # the bootstrap check, then the compiler and sub become the seed
-    make repl                              # the REPL's site, in build/web/repl
-    make docs                              # documentation of the toolchain and the packages, as HTML in build/doc
-    bench/*/run.sh                         # benchmarks
+    bin/substrate build FILE -o DIR              # FILE's program, into DIR
+    bin/substrate run [GRANT ...] DIR [ARG ...]  # run it, granted -R, -W, -N, -E, --allow-run or -A
+    bin/substrate compile FILE -o DIR [-m MAP]   # the compiler alone, given the module map that map prints
+    bin/substrate map FILE                       # FILE's module map
+    bin/substrate eval FILE                      # FILE's forms, one at a time, as a session
+    bin/substrate expand FILE                    # FILE's expansion
+    bin/substrate site OUT FILE                  # a web site for a page program
+    bin/substrate serve OUT                      # serve it locally
+    bin/substrate doc                            # documentation of the current package and its dependencies, as HTML in build/doc
+    bin/substrate doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM
+    bin/substrate doc -o DIR PACKAGE ...         # packages' documentation as text, or with --html as HTML, into DIR
+    bin/substrate test [./DIR ...] [PATTERN ...] # the tests of the current package, or of each DIR at once
+    bin/substrate version                        # substrate's version, and the hash of its files
+    make check                                   # the tests, then make docs when they pass
+    tests/web/run.sh                             # the browser tests
+    make bootstrap                               # the compiler builds itself into the same bytes
+    make seed                                    # the bootstrap check, then the compiler and substrate become the seed
+    make repl                                    # the REPL's site, in build/web/repl
+    make docs                                    # documentation of the toolchain and the packages, as HTML in build/doc
+    make npm                                     # the npm package, packed into build and tried in a temporary install
+    bench/*/run.sh                               # benchmarks

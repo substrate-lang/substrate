@@ -26,6 +26,8 @@ const loaders = {
   signal: () => require('./signal.mjs').signals(),
 };
 
+export const system = { darwin: 'macos', win32: 'windows' }[process.platform] ?? process.platform;
+
 const fakeable = new Set(['clock', 'timer', 'fetch', 'websocket']);
 
 // loader holds the dynamic loader's variables as the host started with them.

@@ -12,7 +12,7 @@ langs=(substrate bend scheme)
 mkdir -p "$out"
 for name in "${names[@]}"; do
   for lang in "${langs[@]}"; do
-    (cd "$here/$name" && "$root/bin/sub" build "$lang.sub" -o "$out/$name-$lang" -c "$root/build/bench/cache" > /dev/null)
+    (cd "$here/$name" && "$root/bin/substrate" build "$lang.sub" -o "$out/$name-$lang" -c "$root/build/bench/cache" > /dev/null)
   done
 done
 

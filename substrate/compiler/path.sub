@@ -1,0 +1,145 @@
+;; Paths on the host, by Windows's rules or by POSIX's, which each function is given; path-windows? tells which rules the
+;; host follows. On Windows a separator is / or \, a root is X:/, //server/share or a lone /, X: alone is relative to that
+;; drive, and paths compare without ASCII case. A path made normal is written with / after its root.
+(provide path-windows? path-absolute? path-root path-normal path-resolved path-joined path-parent path-base
+         path-within? path-same? path-relative)
+
+(define host-system string "")
+
+(define (path-windows?) -> bool
+  (when (== (-> host-system length) 0) (set! host-system (host-os)))
+  (== host-system "windows"))
+
+(define (separator? [w bool] [c u8]) -> bool (or (== c #\/) (and w (== c #\\))))
+
+(define (letter? [c u8]) -> bool (or (and (>= c #\a) (<= c #\z)) (and (>= c #\A) (<= c #\Z))))
+
+(define (lower [c u8]) -> i32 (let ([x (cast i32 c)]) (if (and (>= x 65) (<= x 90)) (+ x 32) x)))
+
+(define (same-byte? [w bool] [a u8] [b u8]) -> bool
+  (or (== a b) (and w (or (and (separator? w a) (separator? w b)) (== (lower a) (lower b))))))
+
+(define (same-text? [w bool] [a string] [b string]) -> bool
+  (unless (== (-> a length) (-> b length)) (return #f))
+  (for ([i u32 0]) (< i (-> a length)) (+= i 1) (unless (same-byte? w (@ a i) (@ b i)) (return #f)))
+  #t)
+
+;; The length of p's root, 0 when it has none: on Windows, 2 for a drive alone and the server and share of
+;; //server/share without a separator after them.
+(define (root-length [w bool] [p string]) -> u32
+  (let ([n (-> p length)] [i u32 2])
+    (cond [(not w) (if (and (> n 0) (== (@ p 0) #\/)) 1 0)]
+          [(and (>= n 3) (separator? w (@ p 0)) (separator? w (@ p 1)) (not (separator? w (@ p 2))))
+           (while (and (< i n) (not (separator? w (@ p i)))) (+= i 1))
+           (when (< i n)
+             (+= i 1)
+             (while (and (< i n) (not (separator? w (@ p i)))) (+= i 1)))
+           i]
+          [(and (>= n 2) (letter? (@ p 0)) (== (@ p 1) #\:)) (if (and (>= n 3) (separator? w (@ p 2))) 3 2)]
+          [(and (> n 0) (separator? w (@ p 0))) 1]
+          [else 0])))
+
+(define (path-absolute? [w bool] [p string]) -> bool
+  (let ([r (root-length w p)]) (and (> r 0) (not (and w (== r 2) (== (@ p 1) #\:))))))
+
+;; p's root written with /: /, or on Windows X:/, X: or //server/share; "" when it has none.
+(define (path-root [w bool] [p string]) -> string
+  (let ([r (root-length w p)] [b (make-buffer)])
+    (for ([i u32 0]) (< i r) (+= i 1) (buffer-add-byte! (& b) (if (separator? w (@ p i)) 47 (cast i32 (@ p i)))))
+    (when (and (> r 3) (separator? w (@ p (- r 1)))) (set! (-> b length) (- (-> b length) 1)))
+    (buffer-string (& b))))
+
+(define (part-at [b (ptr buffer)] [i u32]) -> string (@ (cast (ptr string) (-> b bytes)) i))
+
+(define (parts! [w bool] [p string] [into (ptr buffer)]) -> u32
+  (let ([n u32 0] [start (root-length w p)])
+    (for ([i u32 start]) (<= i (-> p length)) (+= i 1)
+      (when (or (== i (-> p length)) (separator? w (@ p i)))
+        (when (> i start)
+          (let ([seg (slice p start i)])
+            (buffer-add! into (slice (cast (ptr u8) (& seg)) (sizeof string)))
+            (+= n 1)))
+        (set! start (+ i 1))))
+    n))
+
+;; p with its . parts and empty ones left out and each .. part taking back the one before, never past the root of an
+;; absolute path; "" when nothing is left of a relative one.
+(define (path-normal [w bool] [p string]) -> string
+  (let* ([root (path-root w p)] [absolute (path-absolute? w p)] [given (make-buffer)] [kept (make-buffer)]
+         [n (parts! w p (& given))] [k u32 0] [out (make-buffer)])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let ([seg (part-at (& given) i)])
+        (cond [(== seg ".") (begin)]
+              [(and (== seg "..") (> k 0) (!= (part-at (& kept) (- k 1)) ".."))
+               (-= k 1)
+               (set! (-> kept length) (* k (sizeof string)))]
+              [(and (== seg "..") absolute) (begin)]
+              [else
+               (buffer-add! (& kept) (slice (cast (ptr u8) (& seg)) (sizeof string)))
+               (+= k 1)])))
+    (buffer-add-string! (& out) root)
+    (for ([i u32 0]) (< i k) (+= i 1)
+      (when (or (> i 0) (and (> (-> root length) 0) (!= (@ root (- (-> root length) 1)) #\/)
+                             (not (and (== (-> root length) 2) (== (@ root 1) #\:)))))
+        (buffer-add-byte! (& out) #\/))
+      (buffer-add-string! (& out) (part-at (& kept) i)))
+    (buffer-free! (& given))
+    (buffer-free! (& kept))
+    (buffer-string (& out))))
+
+;; p made absolute from the directory cwd, and normal. On Windows a lone / starts at cwd's root, and X: alone at cwd when
+;; cwd is on that drive.
+(define (path-resolved [w bool] [cwd string] [p string]) -> string
+  (let ([r (root-length w p)])
+    (cond [(and w (== r 1)) (path-normal w (path-joined w (path-root w cwd) (slice p 1)))]
+          [(path-absolute? w p) (path-normal w p)]
+          [(and w (== r 2))
+           (path-normal w (path-joined w (if (and (>= (-> cwd length) 2) (same-text? w (slice cwd 0 2) (slice p 0 2)))
+                                             cwd
+                                             (path-joined w (slice p 0 2) ""))
+                                       (slice p 2)))]
+          [else (path-normal w (path-joined w cwd p))])))
+
+(define (path-joined [w bool] [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (unless (and (> (-> a length) 0) (separator? w (@ a (- (-> a length) 1)))) (buffer-add-byte! (& out) #\/))
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+;; The directory that holds p: p up to its last separator past its root, or else its root.
+(define (path-parent [w bool] [p string]) -> string
+  (let ([r (root-length w p)] [i (-> p length)])
+    (while (and (> i r) (not (separator? w (@ p (- i 1))))) (-= i 1))
+    (if (> i r) (slice p 0 (- i 1)) (path-root w p))))
+
+(define (path-base [w bool] [p string]) -> string
+  (let ([r (root-length w p)] [i (-> p length)])
+    (while (and (> i r) (not (separator? w (@ p (- i 1))))) (-= i 1))
+    (slice p i (-> p length))))
+
+;; Whether p is under the directory dir, both normal.
+(define (path-within? [w bool] [p string] [dir string]) -> bool
+  (let ([n (-> dir length)])
+    (and (> n 0) (> (-> p length) n) (same-text? w (slice p 0 n) dir)
+         (or (separator? w (@ dir (- n 1))) (separator? w (@ p n))))))
+
+(define (path-same? [w bool] [a string] [b string]) -> bool (same-text? w a b))
+
+;; The path from the directory dir to p, both normal and absolute, with / between its parts; p itself when their roots
+;; differ.
+(define (path-relative [w bool] [dir string] [p string]) -> string
+  (let ([ds (make-buffer)] [ps (make-buffer)] [out (make-buffer)] [dn u32 0] [pn u32 0] [k u32 0])
+    (unless (same-text? w (path-root w dir) (path-root w p)) (return p))
+    (set! dn (parts! w dir (& ds)))
+    (set! pn (parts! w p (& ps)))
+    (while (and (< k dn) (< k pn) (same-text? w (part-at (& ds) k) (part-at (& ps) k))) (+= k 1))
+    (for ([i u32 k]) (< i dn) (+= i 1)
+      (when (> (-> out length) 0) (buffer-add-byte! (& out) #\/))
+      (buffer-add-string! (& out) ".."))
+    (for ([i u32 k]) (< i pn) (+= i 1)
+      (when (> (-> out length) 0) (buffer-add-byte! (& out) #\/))
+      (buffer-add-string! (& out) (part-at (& ps) i)))
+    (buffer-free! (& ds))
+    (buffer-free! (& ps))
+    (buffer-string (& out))))

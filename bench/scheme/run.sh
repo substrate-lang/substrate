@@ -10,7 +10,7 @@ names=("$@")
 [ ${#names[@]} -gt 0 ] || names=(big-arith big-traverse big-conses big-calls lists closures interp queens strings)
 mkdir -p "$out"
 for name in "${names[@]}"; do
-  (cd "$here" && "$root/bin/sub" build "$name.sub" -o "$out/$name" -c "$root/build/bench/cache" > /dev/null)
+  (cd "$here" && "$root/bin/substrate" build "$name.sub" -o "$out/$name" -c "$root/build/bench/cache" > /dev/null)
 done
 
 node=(node --stack-size=4000 --experimental-wasm-exnref --no-liftoff "$root/substrate/host/subhost.mjs")

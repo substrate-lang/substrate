@@ -2,7 +2,7 @@ OUT ?= build
 
 build/sub:
 	@mkdir -p build && : > build/empty.sub
-	bin/sub expand build/empty.sub -c build/cache > /dev/null
+	bin/substrate expand build/empty.sub -c build/cache > /dev/null
 
 check:
 	tests/run.sh
@@ -15,16 +15,20 @@ seed:
 	bin/bootstrap seed
 
 repl:
-	bin/sub site -c build/cache $(OUT)/web/repl packages/web/repl/repl.sub -p packages/web/repl/page.html \
+	bin/substrate site -c build/cache $(OUT)/web/repl packages/web/repl/repl.sub -p packages/web/repl/page.html \
 	  -f files $(addprefix substrate/compiler/,macros.sub substrate.sub syntax.sub wasm.sub writer.sub) \
 	  $(shell find substrate/host packages/scheme packages/bend -name '*.sub' | sort) packages/nodes/nodes.sub std/encoding/utf8.sub
 
 docs:
 	rm -rf $(OUT)/doc
-	bin/sub doc --html -o $(OUT)/doc substrate std cmd packages/web packages/scheme packages/bend packages/nodes \
+	bin/substrate doc --html -o $(OUT)/doc substrate std cmd packages/web packages/scheme packages/bend packages/nodes \
 	  packages/sqlite
+
+npm:
+	npm/pack.sh
+	npm/smoke.sh
 
 clean:
 	rm -rf build
 
-.PHONY: build/sub check bootstrap seed repl docs clean
+.PHONY: build/sub check bootstrap seed repl docs npm clean
