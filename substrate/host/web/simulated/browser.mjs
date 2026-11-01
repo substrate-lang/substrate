@@ -4,14 +4,16 @@
 import { resolveObjectURL } from 'node:buffer';
 import { workerData } from 'node:worker_threads';
 import { Document, Element, Event, Node, NodeFilter, Window, parseInto } from './document.mjs';
-import { makeClock } from './clock.mjs';
-import { describe, findAll, parse } from './find.mjs';
+import { makeClock } from '../testing/clock.mjs';
+import { parse } from '../testing/find.mjs';
+import { documentRequest, one as oneIn } from '../testing/requests.mjs';
+import { canvasOf, drawingRequest } from '../testing/logs.mjs';
 import { user as userOf } from './user.mjs';
 import { historyOf, locationOf, makeHistory } from './navigation.mjs';
 import { makeIndexedDB } from './indexeddb.mjs';
 import { makeFetch, makeWebSocket } from './network.mjs';
 import { sizeOf } from './images.mjs';
-import { installClock, installRandom } from './globals.mjs';
+import { installClock, installRandom } from '../testing/globals.mjs';
 import { makeWorker } from './threads.mjs';
 import { makeAudio, makeWebGpu } from './media.mjs';
 import { importedModules, run, unpack } from '../subhost-web.mjs';
@@ -36,8 +38,6 @@ const realSetTimeout = setTimeout;
 const realNow = Date.now;
 const pause = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms));
 const quote = (s) => JSON.stringify(s);
-const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}...` : s);
-const short = (e) => clip(e.outerHTML, 160);
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
 const origin = 'http://localhost';
@@ -318,15 +318,7 @@ async function open({ site: given, url, seed }) {
   await load();
 }
 
-function one(f) {
-  const found = findAll(document, f);
-  if (found.length === 1) return found[0];
-  if (found.length === 0) throw new Error(`nothing matches ${describe(f)}\n  the document's body: ${clip(document.body.innerHTML, 2000)}`);
-  const listed = found.slice(0, 5).map((e) => `\n  ${short(e)}`).join('');
-  throw new Error(`${found.length} elements match ${describe(f)}:${listed}${found.length > 5 ? '\n  ...' : ''}`);
-}
-
-const differs = (what, f, actual, expected, e) => new Error(`${what} of ${describe(f)} is ${quote(actual)}, not ${quote(expected)}\n  it is ${short(e)}`);
+const one = (f) => oneIn(document, f);
 
 async function act(f) {
   f();
@@ -335,12 +327,9 @@ async function act(f) {
 }
 
 function drawingOf(f) {
-  const e = one(f);
-  if (e.localName !== 'canvas') throw new Error(`${describe(f)} is not a canvas\n  it is ${short(e)}`);
+  const e = canvasOf(document, f);
   return e.context ? e.context.commands.join('\n') : '';
 }
-
-const includes = (drawing, lines) => `\n${drawing}\n`.includes(`\n${lines}\n`);
 
 const storeOf = () => {
   const db = kept.databases.get(storageName()) || new Map();
@@ -353,6 +342,8 @@ async function handle(m) {
   const fields = entries(m.fields);
   const kind = fields[0];
   const found = () => parse(fields, 1);
+  const read = documentRequest(document, fields) ?? await drawingRequest(fields, drawingOf);
+  if (read !== undefined) return read;
   switch (kind) {
     case 'click': {
       const [f, k] = found();
@@ -418,100 +409,10 @@ async function handle(m) {
     case 'respond':
       kept.answers.set(new URL(fields[1], location.href).href, { status: Number(fields[2]), body: utf8.encode(fields[3]) });
       return '';
-    case 'text':
-      return one(found()[0]).textContent;
-    case 'html':
-      return one(found()[0]).outerHTML;
-    case 'attribute': {
-      const [f, k] = found();
-      const e = one(f);
-      const v = e.getAttribute(fields[k]);
-      if (v === null) throw new Error(`${describe(f)} has no attribute ${fields[k]}\n  it is ${short(e)}`);
-      return v;
-    }
-    case 'has-attribute': {
-      const [f, k] = found();
-      return one(f).hasAttribute(fields[k]) ? 'true' : 'false';
-    }
-    case 'value':
-      return String(one(found()[0]).value ?? '');
-    case 'checked':
-      return one(found()[0]).checked ? 'true' : 'false';
-    case 'count':
-      return String(findAll(document, found()[0]).length);
-    case 'drawing':
-      return drawingOf(found()[0]);
-    case 'drawn': {
-      const [f, k] = found();
-      return includes(drawingOf(f), fields[k]) ? 'true' : 'false';
-    }
-    case 'expect-drawn': {
-      const [f, k] = found();
-      const drawing = drawingOf(f);
-      const indented = (s) => s.replace(/\n/g, '\n  ');
-      if (!includes(drawing, fields[k])) {
-        throw new Error(`the last drawing of ${describe(f)} does not include\n  ${indented(fields[k])}\nit is\n  ${indented(drawing)}`);
-      }
-      return '';
-    }
     case 'console':
       return consoleText();
     case 'sounds':
       return sounds.join('\n');
-    case 'expect-text': {
-      const [f, k] = found();
-      const e = one(f);
-      if (e.textContent !== fields[k]) throw differs('the text', f, e.textContent, fields[k], e);
-      return '';
-    }
-    case 'expect-html': {
-      const [f, k] = found();
-      const e = one(f);
-      if (e.outerHTML !== fields[k]) throw new Error(`the HTML of ${describe(f)} is\n  ${e.outerHTML}\nnot\n  ${fields[k]}`);
-      return '';
-    }
-    case 'expect-value': {
-      const [f, k] = found();
-      const e = one(f);
-      if (String(e.value ?? '') !== fields[k]) throw differs('the value', f, String(e.value ?? ''), fields[k], e);
-      return '';
-    }
-    case 'expect-attribute': {
-      const [f, k] = found();
-      const e = one(f);
-      const v = e.getAttribute(fields[k]);
-      if (v === null) throw new Error(`${describe(f)} has no attribute ${fields[k]}\n  it is ${short(e)}`);
-      if (v !== fields[k + 1]) throw differs(`the attribute ${fields[k]}`, f, v, fields[k + 1], e);
-      return '';
-    }
-    case 'expect-no-attribute': {
-      const [f, k] = found();
-      const e = one(f);
-      if (e.hasAttribute(fields[k])) throw new Error(`${describe(f)} has the attribute ${fields[k]}\n  it is ${short(e)}`);
-      return '';
-    }
-    case 'expect-checked': {
-      const [f, k] = found();
-      const e = one(f);
-      if (e.checked !== (fields[k] === 'true')) throw new Error(`${describe(f)} is ${e.checked ? '' : 'not '}checked\n  it is ${short(e)}`);
-      return '';
-    }
-    case 'expect-count': {
-      const [f, k] = found();
-      const all = findAll(document, f);
-      const want = Number(fields[k]);
-      if (all.length !== want) {
-        const listed = all.slice(0, 5).map((e) => `\n  ${short(e)}`).join('');
-        throw new Error(`${describe(f)} matches ${all.length} element${all.length === 1 ? '' : 's'}, not ${want}${listed}${all.length > 5 ? '\n  ...' : ''}`);
-      }
-      return '';
-    }
-    case 'expect-missing': {
-      const [f] = found();
-      const all = findAll(document, f);
-      if (all.length > 0) throw new Error(`${describe(f)} matches ${short(all[0])}${all.length > 1 ? ` and ${all.length - 1} more` : ''}`);
-      return '';
-    }
     default:
       throw new Error(`no request ${kind}`);
   }

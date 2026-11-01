@@ -1,6 +1,7 @@
 // The simulated browser's document: the parts of the DOM that the web host and browser tests use, parsing and
 // writing HTML by Chromium's rules, with a 2D canvas that records its drawing.
 import { compileList, select } from './selectors.mjs';
+import { drawn } from '../testing/logs.mjs';
 
 const ELEMENT = 1;
 const TEXT = 3;
@@ -1137,9 +1138,6 @@ export function serialize(node) {
 
 const serializeChildren = (node) => node.childNodes.map(serialize).join('');
 
-const number = (x) => String(Number(Number(x).toFixed(3)));
-const quoted = (s) => JSON.stringify(String(s));
-
 // A 2D context that keeps each drawing as lines, one for each call or setting: what browser-drawing gives.
 export class Context2d {
   constructor(canvas) {
@@ -1155,73 +1153,72 @@ export class Context2d {
     this.commands = [];
   }
 
-  say(...parts) {
-    this.commands.push(parts.join(' '));
+  say(name, args) {
+    const line = drawn(name, args, (image) => image.recordedName || (image.getAttribute ? image.getAttribute('src') : '') || '');
+    if (line !== null) this.commands.push(line);
   }
 
   get fillStyle() { return this.settings.fillStyle; }
 
-  set fillStyle(v) { this.settings.fillStyle = v; this.say('fill-style', quoted(v)); }
+  set fillStyle(v) { this.settings.fillStyle = v; this.say('fillStyle', [v]); }
 
   get strokeStyle() { return this.settings.strokeStyle; }
 
-  set strokeStyle(v) { this.settings.strokeStyle = v; this.say('stroke-style', quoted(v)); }
+  set strokeStyle(v) { this.settings.strokeStyle = v; this.say('strokeStyle', [v]); }
 
   get lineWidth() { return this.settings.lineWidth; }
 
-  set lineWidth(v) { this.settings.lineWidth = v; this.say('line-width', number(v)); }
+  set lineWidth(v) { this.settings.lineWidth = v; this.say('lineWidth', [v]); }
 
   get font() { return this.settings.font; }
 
-  set font(v) { this.settings.font = v; this.say('font', quoted(v)); }
+  set font(v) { this.settings.font = v; this.say('font', [v]); }
 
   get textAlign() { return this.settings.textAlign; }
 
-  set textAlign(v) { this.settings.textAlign = v; this.say('text-align', quoted(v)); }
+  set textAlign(v) { this.settings.textAlign = v; this.say('textAlign', [v]); }
 
   get textBaseline() { return this.settings.textBaseline; }
 
-  set textBaseline(v) { this.settings.textBaseline = v; this.say('text-baseline', quoted(v)); }
+  set textBaseline(v) { this.settings.textBaseline = v; this.say('textBaseline', [v]); }
 
   get globalAlpha() { return this.settings.globalAlpha; }
 
-  set globalAlpha(v) { this.settings.globalAlpha = v; this.say('global-alpha', number(v)); }
+  set globalAlpha(v) { this.settings.globalAlpha = v; this.say('globalAlpha', [v]); }
 
-  clearRect(x, y, w, h) { this.say('clear-rect', number(x), number(y), number(w), number(h)); }
+  clearRect(...a) { this.say('clearRect', a); }
 
-  fillRect(x, y, w, h) { this.say('fill-rect', number(x), number(y), number(w), number(h)); }
+  fillRect(...a) { this.say('fillRect', a); }
 
-  strokeRect(x, y, w, h) { this.say('stroke-rect', number(x), number(y), number(w), number(h)); }
+  strokeRect(...a) { this.say('strokeRect', a); }
 
-  beginPath() { this.say('begin-path'); }
+  moveTo(...a) { this.say('moveTo', a); }
 
-  moveTo(x, y) { this.say('move-to', number(x), number(y)); }
+  lineTo(...a) { this.say('lineTo', a); }
 
-  lineTo(x, y) { this.say('line-to', number(x), number(y)); }
+  arc(...a) { this.say('arc', a); }
 
-  arc(x, y, r, a, b) { this.say('arc', number(x), number(y), number(r), number(a), number(b)); }
+  fillText(...a) { this.say('fillText', a); }
 
-  closePath() { this.say('close-path'); }
+  translate(...a) { this.say('translate', a); }
 
-  fill() { this.say('fill'); }
+  rotate(...a) { this.say('rotate', a); }
 
-  stroke() { this.say('stroke'); }
+  scale(...a) { this.say('scale', a); }
 
-  fillText(s, x, y) { this.say('fill-text', quoted(s), number(x), number(y)); }
+  drawImage(...a) { this.say('drawImage', a); }
 
-  save() { this.say('save'); }
+  beginPath() { this.say('beginPath', []); }
 
-  restore() { this.say('restore'); }
+  closePath() { this.say('closePath', []); }
 
-  translate(x, y) { this.say('translate', number(x), number(y)); }
+  fill() { this.say('fill', []); }
 
-  rotate(a) { this.say('rotate', number(a)); }
+  stroke() { this.say('stroke', []); }
 
-  scale(x, y) { this.say('scale', number(x), number(y)); }
+  save() { this.say('save', []); }
 
-  drawImage(image, ...n) {
-    this.say('draw-image', quoted(image.recordedName || (image.getAttribute ? image.getAttribute('src') : '') || ''), ...n.map(number));
-  }
+  restore() { this.say('restore', []); }
 
   measureText(s) { return { width: String(s).length * 8 }; }
 

@@ -2,9 +2,7 @@
 // are kept as lines, what browser-sounds gives; the GPU draws nothing, and what is read back from it is zeros.
 import { Event, EventTarget } from './document.mjs';
 import { sizeOf } from './images.mjs';
-
-const number = (x) => String(Number(Number(x).toFixed(3)));
-const quote = (s) => JSON.stringify(String(s));
+import { heard } from '../testing/logs.mjs';
 
 // A WAV file's length in seconds, or null.
 function wavSeconds(b) {
@@ -49,13 +47,13 @@ export function makeAudio(browser) {
 
     start() {
       const volume = this.next && this.next.gain ? this.next.gain.value : 1;
-      browser.sound(`start ${quote(this.buffer.name)} volume ${number(volume)}${this.loop ? ' looping' : ''}`);
+      browser.sound(heard({ kind: 'start', name: this.buffer.name, volume, loop: this.loop }));
       if (!this.loop) this.timer = browser.clock().setTimeout(() => this.ended(true), (this.buffer.duration * 1000) / this.playbackRate.value);
     }
 
     stop() {
       if (this.done) return;
-      browser.sound(`stop ${quote(this.buffer.name)}`);
+      browser.sound(heard({ kind: 'stop', name: this.buffer.name }));
       browser.clock().clearTimeout(this.timer);
       this.ended(false);
     }
@@ -63,7 +61,7 @@ export function makeAudio(browser) {
     ended(naturally) {
       if (this.done) return;
       this.done = true;
-      if (naturally) browser.sound(`end ${quote(this.buffer.name)}`);
+      if (naturally) browser.sound(heard({ kind: 'end', name: this.buffer.name }));
       browser.later(() => {
         if (this.onended) this.onended();
       });
@@ -106,7 +104,7 @@ export function makeAudio(browser) {
         },
         stop(end) {
           const { first = o.frequency.value, last = o.frequency.value } = o.frequency;
-          browser.sound(`tone ${o.type} ${number(first)} ${number(last)} ${number((end - (o.at ?? 0)) * 1000)} ms`);
+          browser.sound(heard({ kind: 'tone', type: o.type, first, last, ms: (end - (o.at ?? 0)) * 1000 }));
         },
       };
       return o;

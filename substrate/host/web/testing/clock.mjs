@@ -1,5 +1,5 @@
-// The simulated browser's clock: time moves only when a test moves it. Timers, animation frames at 60 a second,
-// Date and performance all read it.
+// The clock of a browser in browser tests: time moves only when a test moves it. Timers, animation frames at 60 a
+// second, Date and performance all read it.
 export function makeClock(epoch = 1700000000000) {
   let now = 0;
   let next = 1;

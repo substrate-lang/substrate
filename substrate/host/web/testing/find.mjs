@@ -1,6 +1,5 @@
 // Finding elements as browser tests describe them: by CSS selector, text, role and accessible name, label or test id,
 // within another finder's elements, or as the nth of a finder's elements.
-import { descendants, select } from './selectors.mjs';
 
 const arity = { css: 1, text: 1, 'text-containing': 1, role: 2, label: 1, 'test-id': 1 };
 
@@ -40,9 +39,9 @@ const hidden = (e) => {
   return false;
 };
 
-const shown = (scope) => descendants(scope).filter((e) => !unseen.has(e.localName) && !hidden(e));
+const shown = (scope) => [...scope.querySelectorAll('*')].filter((e) => !unseen.has(e.localName) && !hidden(e));
 
-const ownText = (e) => e.childNodes.filter((c) => c.nodeType === 3).map((c) => c.data).join('');
+const ownText = (e) => [...e.childNodes].filter((c) => c.nodeType === 3).map((c) => c.data).join('');
 
 // The text that names an element: its text, with images' alt text, leaving out what is hidden and the control a
 // label is for.
@@ -192,7 +191,7 @@ const labelled = (e, want) => {
 };
 
 function inOrder(doc, list) {
-  const order = new Map(descendants(doc).map((e, k) => [e, k]));
+  const order = new Map([...doc.querySelectorAll('*')].map((e, k) => [e, k]));
   return [...new Set(list)].sort((a, b) => order.get(a) - order.get(b));
 }
 
@@ -200,7 +199,7 @@ function inOrder(doc, list) {
 export function findAll(doc, f, scope = doc) {
   switch (f.kind) {
     case 'css':
-      return select(scope, f.args[0]);
+      return [...scope.querySelectorAll(f.args[0])];
     case 'text': {
       const want = normal(f.args[0]);
       return shown(scope).filter((e) => normal(ownText(e)) === want && want !== '');
@@ -218,7 +217,7 @@ export function findAll(doc, f, scope = doc) {
       return shown(scope).filter((e) => labelled(e, want));
     }
     case 'test-id':
-      return select(scope, '*').filter((e) => e.getAttribute('data-testid') === f.args[0]);
+      return [...scope.querySelectorAll('*')].filter((e) => e.getAttribute('data-testid') === f.args[0]);
     case 'within':
       return inOrder(doc, findAll(doc, f.outer, scope).flatMap((outer) => findAll(doc, f.inner, outer)));
     case 'nth': {
