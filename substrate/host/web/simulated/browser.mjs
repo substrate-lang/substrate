@@ -11,8 +11,11 @@ import { historyOf, locationOf, makeHistory } from './navigation.mjs';
 import { makeIndexedDB } from './indexeddb.mjs';
 import { makeFetch, makeWebSocket } from './network.mjs';
 import { sizeOf } from './images.mjs';
+import { installClock, installRandom } from './globals.mjs';
+import { makeWorker } from './threads.mjs';
 import { run } from '../subhost-web.mjs';
 import { dom } from '../dom.mjs';
+import { workers as workerModule } from '../worker.mjs';
 import { storage } from '../storage.mjs';
 import { locationModule } from '../location.mjs';
 import { clipboard } from '../clipboard.mjs';
@@ -25,6 +28,9 @@ import { entries } from '../../entries.mjs';
 
 const { port, signal } = workerData;
 const turn = () => new Promise((resolve) => setImmediate(resolve));
+const realSetTimeout = setTimeout;
+const realNow = Date.now;
+const pause = (ms) => new Promise((resolve) => realSetTimeout(resolve, ms));
 const quote = (s) => JSON.stringify(s);
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}...` : s);
 const short = (e) => clip(e.outerHTML, 160);
@@ -46,6 +52,8 @@ let site = null;
 let pending = 0;
 let activity = 0;
 let ended = null;
+let workers = null;
+let workersSeen = false;
 
 const say = (line) => lines.push(line);
 const consoleText = () => [...lines, ...[partial[1], partial[2]].filter((p) => p !== '')].join('\n');
@@ -130,24 +138,13 @@ function install(seed) {
     loadImage,
     error: (e) => say(`uncaught: ${e && e.message ? e.message : e}`),
   };
-  const RealDate = Date;
-  class SimulatedDate extends RealDate {
-    constructor(...args) {
-      if (args.length === 0) super(clock.epoch + Math.floor(clock.now()));
-      else super(...args);
-    }
-
-    static now() {
-      return clock.epoch + Math.floor(clock.now());
-    }
-  }
-  let state = (seed >>> 0) || 1;
-  const nextByte = () => {
-    state ^= state << 13;
-    state ^= state >>> 17;
-    state ^= state << 5;
-    return state & 0xff;
-  };
+  if (workers) workers.stopAll();
+  workers = makeWorker({
+    later, say, seed, clock: () => clock, site: () => site, answers: () => kept.answers, url: () => location.href,
+    seen: () => {
+      workersSeen = true;
+    },
+  });
   function Image(width, height) {
     const img = document.createElement('img');
     img.complete = true;
@@ -173,41 +170,27 @@ function install(seed) {
     IDBKeyRange,
     fetch: makeFetch(site, kept.answers, where, track),
     WebSocket: makeWebSocket(later, where),
-    Date: SimulatedDate,
-    setTimeout: clock.setTimeout,
-    clearTimeout: clock.clearTimeout,
-    setInterval: clock.setInterval,
-    clearInterval: clock.clearInterval,
-    requestAnimationFrame: clock.requestAnimationFrame,
-    cancelAnimationFrame: clock.cancelAnimationFrame,
+    Worker: workers.Worker,
     addEventListener: window.addEventListener.bind(window),
     removeEventListener: window.removeEventListener.bind(window),
     dispatchEvent: window.dispatchEvent.bind(window),
     console: { log: (...a) => say(a.join(' ')), info: (...a) => say(a.join(' ')), warn: (...a) => say(a.join(' ')),
       error: (...a) => say(a.join(' ')), debug: (...a) => say(a.join(' ')) },
   });
-  const value = (v) => ({ value: v, configurable: true, writable: true });
-  Object.defineProperty(g, 'performance', value({ now: () => clock.now(), timeOrigin: clock.epoch }));
-  Object.defineProperty(g, 'crypto', value({
-    getRandomValues(a) {
-      const bytes = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
-      for (let i = 0; i < bytes.length; i++) bytes[i] = nextByte();
-      return a;
+  installClock(g, clock);
+  installRandom(g, seed);
+  const clipboardOf = {
+    readText: () => Promise.resolve(kept.clipboard),
+    writeText: (t) => {
+      kept.clipboard = String(t);
+      return Promise.resolve();
     },
-  }));
-  Object.defineProperty(g, 'navigator', value({
-    userAgent: 'substrate simulated browser',
-    language: 'en-US',
-    languages: ['en-US'],
-    hardwareConcurrency: 4,
-    clipboard: {
-      readText: () => Promise.resolve(kept.clipboard),
-      writeText: (t) => {
-        kept.clipboard = String(t);
-        return Promise.resolve();
-      },
-    },
-  }));
+  };
+  Object.defineProperty(g, 'navigator', {
+    value: { userAgent: 'substrate simulated browser', language: 'en-US', languages: ['en-US'], hardwareConcurrency: 4, clipboard: clipboardOf },
+    configurable: true,
+    writable: true,
+  });
   user = userOf(document, window);
 }
 
@@ -269,6 +252,7 @@ async function load() {
     modules: {
       dom: dom(root), clock: clockModule(), random: random(), timer: timer(), fetch: fetchModule(), websocket: websocket(),
       storage: storage(storageName()), location: locationModule(), clipboard: clipboard(), files: filesModule(),
+      worker: workerModule(),
     },
   }, names, new Map(wasm));
   await settle();
@@ -350,6 +334,7 @@ async function handle(m) {
     }
     case 'advance':
       await clock.advance(Number(fields[1]), settle);
+      workers.tell(clock.now());
       await settle();
       return '';
     case 'go':
@@ -479,13 +464,29 @@ async function handle(m) {
   }
 }
 
+// On a page that has started a worker, an expectation is tried again for up to 10 seconds, as workers answer in
+// their own time.
+async function handled(m) {
+  if (!workersSeen || !entries(m.fields)[0].startsWith('expect-')) return handle(m);
+  const until = realNow() + 10000;
+  for (;;) {
+    try {
+      return await handle(m);
+    } catch (e) {
+      if (realNow() >= until) throw e;
+    }
+    await pause(10);
+    await settle();
+  }
+}
+
 process.on('uncaughtException', (e) => say(`uncaught: ${e && e.message ? e.message : e}`));
 process.on('unhandledRejection', (e) => say(`uncaught: ${e && e.message ? e.message : e}`));
 
 port.on('message', async (m) => {
   let reply;
   try {
-    reply = { ok: true, text: m.type === 'open' ? (await open(m), '') : await handle(m) };
+    reply = { ok: true, text: m.type === 'open' ? (await open(m), '') : await handled(m) };
   } catch (e) {
     reply = { ok: false, message: e && e.message ? e.message : String(e) };
   }
