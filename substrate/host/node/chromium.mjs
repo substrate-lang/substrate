@@ -38,7 +38,6 @@ const before = (seed) => `(() => {
   const installClock = ${installClock};
   const seeded = ${seeded};
   const installRecorders = ${installRecorders};
-  const realSetTimeout = window.setTimeout.bind(window);
   const clock = makeClock();
   installClock(window, clock);
   const fill = seeded(${seed});
@@ -46,7 +45,7 @@ const before = (seed) => `(() => {
     fill(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
     return a;
   };
-  Object.defineProperty(window, Symbol.for('substrate.testing'), { value: { clock, realSetTimeout, ...installRecorders(window, clock) } });
+  Object.defineProperty(window, Symbol.for('substrate.testing'), { value: { clock, ...installRecorders(window, clock) } });
 })();`;
 
 // ---- Chromium and the protocol ----

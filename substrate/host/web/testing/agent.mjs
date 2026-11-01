@@ -4,8 +4,15 @@ import { describe, parse } from './find.mjs';
 import { documentRequest, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
 
-const { clock, realSetTimeout, drawings, blobs, decoded, sounds, kinds, getContext, frames } = window[Symbol.for('substrate.testing')];
-const turn = () => new Promise((resolve) => realSetTimeout(resolve, 0));
+const { clock, drawings, blobs, decoded, sounds, kinds, getContext, frames } = window[Symbol.for('substrate.testing')];
+const channel = new MessageChannel();
+const turns = [];
+channel.port1.onmessage = () => turns.shift()();
+// A turn of the page's event loop, through a channel, as a timer's turn would wait at least 4 ms once timers nest.
+const turn = () => new Promise((resolve) => {
+  turns.push(resolve);
+  channel.port2.postMessage(null);
+});
 const quote = (s) => JSON.stringify(s);
 
 // settle runs what the program has left to do without the clock moving: due timers, and the page's own work.
