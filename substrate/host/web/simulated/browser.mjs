@@ -258,7 +258,7 @@ const storageName = () => location.pathname.replace(/[^/]*$/, '');
 
 // load starts the program at the history's current URL, in a new document.
 async function load() {
-  const { markup, names, wasm, files, cwd, seed } = kept.program;
+  const { markup, names, wasm, files, seed } = kept.program;
   ended = null;
   sounds = [];
   decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
@@ -279,7 +279,6 @@ async function load() {
   }
   run({
     files: new Map(files.map(([p, b]) => [p, b.slice()])),
-    cwd,
     args: [],
     output,
     onEnd: (code, reason) => {
@@ -299,7 +298,7 @@ async function load() {
   }
 }
 
-// open opens a site as start.mjs starts one: its program, given the files site.json says, at url.
+// open opens a site as start.mjs starts one: its program, given the files in assets.list and files.pack, at url.
 async function open({ site: given, url, seed }) {
   site = new Map(given);
   const file = (path) => {
@@ -307,19 +306,14 @@ async function open({ site: given, url, seed }) {
     if (!bytes) throw new Error(`the site has no ${path.slice(1)}`);
     return bytes;
   };
-  const settings = site.has('/site.json') ? JSON.parse(text.decode(site.get('/site.json'))) : {};
   const names = text.decode(file('/program/program')).split(/\r?\n/).filter((n) => n !== '');
   const files = new Map();
-  for (const [list, dir] of settings.lists || []) {
-    for (const path of text.decode(file(`/${list}`)).split('\n').filter((p) => p !== '')) {
-      files.set(resolvePath(dir, path), file(`/${path}`));
-    }
+  for (const path of text.decode(file('/assets.list')).split('\n').filter((p) => p !== '')) {
+    files.set(resolvePath('/', path), file(`/${path}`));
   }
-  for (const [pack, dir] of settings.packs || []) unpack(file(`/${pack}`), dir, files);
-  kept.program = {
-    markup: text.decode(file('/index.html')), names, wasm: names.map((n) => [n, file(`/program/${n}.wasm`)]), files: [...files],
-    cwd: settings.cwd || '/', seed,
-  };
+  unpack(file('/files.pack'), '/', files);
+  const wasm = names.map((n) => [n, file(`/program/${n}.wasm`)]);
+  kept.program = { markup: text.decode(file('/index.html')), names, wasm, files: [...files], seed };
   kept.history = makeHistory(new URL(url, `${origin}/index.html`).href);
   await load();
 }

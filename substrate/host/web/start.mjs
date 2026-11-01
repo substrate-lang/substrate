@@ -1,9 +1,8 @@
-// A site's start: the program, with the files site.json gives it (substrate site writes it), and the host modules it
-// imports. The modules are kept in window.modules, and window.ready is set once the program has started.
+// A site's start: the program, given the files in assets.list and files.pack, with the host modules it imports. The
+// modules are kept in window.modules, and window.ready is set once the program has started.
 import { boot } from './subhost-web.mjs';
 
 const query = new URLSearchParams(location.search);
-const settings = await (await fetch(new URL('site.json', document.baseURI))).json();
 const root = document.getElementById('root');
 const made = {};
 const makers = {
@@ -25,9 +24,8 @@ const make = (name) => (made[name] ||= makers[name]());
 
 window.app = await boot({
   program: 'program/',
-  lists: settings.lists,
-  packs: settings.packs,
-  cwd: settings.cwd,
+  lists: [['assets.list', '/']],
+  packs: [['files.pack', '/']],
   async modules(wanted) {
     const modules = {};
     for (const name of wanted) if (Object.hasOwn(makers, name)) modules[name] = await make(name);
