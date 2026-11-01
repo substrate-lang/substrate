@@ -1,16 +1,14 @@
-// The host module "browser" (browser.sub): built web programs opened in simulated browsers (../web/simulated), each
-// on its own thread. Each call waits for the browser's answer. The program's files are read within the caller's
-// grants.
+// The host module "browser" (browser.sub): sites, as substrate site builds them, opened in simulated browsers
+// (../web/simulated), each on its own thread. Each call waits for the browser's answer. The site's files are read within
+// the caller's grants.
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { MessageChannel, Worker, receiveMessageOnPort } from 'node:worker_threads';
 import { literalPath } from './fs.mjs';
 import { entries } from '../entries.mjs';
 
 const utf8 = new TextEncoder();
 const script = new URL('../web/simulated/browser.mjs', import.meta.url);
-const defaultHtml = fileURLToPath(new URL('../web/index.html', import.meta.url));
 const patience = 60000;
 
 // The thread's code: it imports the browser, and answers with the error when that fails.
@@ -29,9 +27,11 @@ export function browsers(grants) {
     let next = 1;
     const read = (p) => fs.readFileSync(literalPath(grants, 'read', p));
 
+    // The site's files but those of the web host, which the simulated browser has as its own.
     const filesUnder = (dir, base, into) => {
       for (const name of fs.readdirSync(literalPath(grants, 'read', dir)).sort()) {
         const full = path.join(dir, name);
+        if (base === '' && name === 'host') continue;
         if (fs.statSync(full).isDirectory()) filesUnder(full, `${base}/${name}`, into);
         else into.push([`${base}/${name}`, read(full)]);
       }
@@ -63,22 +63,18 @@ export function browsers(grants) {
         for (const b of open.values()) b.worker.terminate();
         open.clear();
       },
-      open(dp, dl, mp, ml, ap, al, up, ul, err) {
+      open(dp, dl, up, ul, err) {
         let worker = null;
         try {
           const dir = caller.string(dp, dl);
           const url = caller.string(up, ul);
-          const names = read(path.join(dir, 'program')).toString().split(/\r?\n/).filter((n) => n !== '');
-          const wasm = names.map((n) => [n, read(path.join(dir, `${n}.wasm`))]);
-          const markup = read(ml > 0 ? caller.string(mp, ml) : defaultHtml).toString();
-          const files = [];
-          const assets = caller.string(ap, al);
-          if (al > 0 && fs.existsSync(literalPath(grants, 'read', assets))) filesUnder(assets, '/assets', files);
+          const site = [];
+          filesUnder(dir, '', site);
           const { port1, port2 } = new MessageChannel();
           const signal = new Int32Array(new SharedArrayBuffer(4));
           worker = new Worker(start, { eval: true, workerData: { port: port2, signal }, transferList: [port2] });
           const b = { worker, port: port1, signal, dead: false };
-          const reply = ask(b, { type: 'open', markup, names, wasm, files, url, seed: 1 });
+          const reply = ask(b, { type: 'open', site, url, seed: 1 });
           if (!reply.ok) {
             worker.terminate();
             caller.fail(err, reply.message);

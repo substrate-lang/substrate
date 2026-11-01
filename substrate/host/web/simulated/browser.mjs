@@ -14,7 +14,8 @@ import { sizeOf } from './images.mjs';
 import { installClock, installRandom } from './globals.mjs';
 import { makeWorker } from './threads.mjs';
 import { makeAudio, makeWebGpu } from './media.mjs';
-import { run } from '../subhost-web.mjs';
+import { importedModules, run, unpack } from '../subhost-web.mjs';
+import { resolvePath } from '../fs.mjs';
 import { dom } from '../dom.mjs';
 import { audio } from '../audio.mjs';
 import { gpu } from '../gpu.mjs';
@@ -160,7 +161,7 @@ function install(seed) {
   });
   if (workers) workers.stopAll();
   workers = makeWorker({
-    later, say, seed, clock: () => clock, site: () => site, answers: () => kept.answers, url: () => location.href,
+    later, say, seed, site: () => site, answers: () => kept.answers, url: () => location.href,
     seen: () => {
       workersSeen = true;
     },
@@ -257,7 +258,7 @@ const storageName = () => location.pathname.replace(/[^/]*$/, '');
 
 // load starts the program at the history's current URL, in a new document.
 async function load() {
-  const { markup, names, wasm, files, seed } = kept.program;
+  const { markup, names, wasm, files, cwd, seed } = kept.program;
   ended = null;
   sounds = [];
   decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
@@ -267,10 +268,18 @@ async function load() {
   if (!root) throw new Error('the HTML file has no element with the id root');
   const { fetchModule } = await import('../../modules/fetch.mjs');
   const theDom = dom(root);
-  const theGpu = await gpu({ dom: theDom });
+  const makers = {
+    dom: () => theDom, audio: () => audio(), gpu: () => gpu({ dom: theDom }), storage: () => storage(storageName()),
+    location: () => locationModule(), clipboard: () => clipboard(), files: () => filesModule(), worker: () => workerModule(),
+    clock: () => clockModule(), random: () => random(), timer: () => timer(), fetch: () => fetchModule(), websocket: () => websocket(),
+  };
+  const modules = {};
+  for (const [, bytes] of wasm) {
+    for (const name of importedModules(bytes)) if (Object.hasOwn(makers, name) && !modules[name]) modules[name] = await makers[name]();
+  }
   run({
     files: new Map(files.map(([p, b]) => [p, b.slice()])),
-    cwd: '/',
+    cwd,
     args: [],
     output,
     onEnd: (code, reason) => {
@@ -279,11 +288,7 @@ async function load() {
     delivered: () => {
       activity++;
     },
-    modules: {
-      dom: theDom, audio: audio(), gpu: theGpu, clock: clockModule(), random: random(), timer: timer(), fetch: fetchModule(),
-      websocket: websocket(), storage: storage(storageName()), location: locationModule(), clipboard: clipboard(),
-      files: filesModule(), worker: workerModule(),
-    },
+    modules,
   }, names, new Map(wasm));
   await settle();
   if (ended && ended.code !== 0) throw new Error(`the program ended with ${ended.code}\n${consoleText()}`);
@@ -294,10 +299,28 @@ async function load() {
   }
 }
 
-async function open({ markup, names, wasm, files, url, seed }) {
-  kept.program = { markup, names, wasm, files, seed };
+// open opens a site as start.mjs starts one: its program, given the files site.json says, at url.
+async function open({ site: given, url, seed }) {
+  site = new Map(given);
+  const file = (path) => {
+    const bytes = site.get(path);
+    if (!bytes) throw new Error(`the site has no ${path.slice(1)}`);
+    return bytes;
+  };
+  const settings = site.has('/site.json') ? JSON.parse(text.decode(site.get('/site.json'))) : {};
+  const names = text.decode(file('/program/program')).split(/\r?\n/).filter((n) => n !== '');
+  const files = new Map();
+  for (const [list, dir] of settings.lists || []) {
+    for (const path of text.decode(file(`/${list}`)).split('\n').filter((p) => p !== '')) {
+      files.set(resolvePath(dir, path), file(`/${path}`));
+    }
+  }
+  for (const [pack, dir] of settings.packs || []) unpack(file(`/${pack}`), dir, files);
+  kept.program = {
+    markup: text.decode(file('/index.html')), names, wasm: names.map((n) => [n, file(`/program/${n}.wasm`)]), files: [...files],
+    cwd: settings.cwd || '/', seed,
+  };
   kept.history = makeHistory(new URL(url, `${origin}/index.html`).href);
-  site = new Map([['/index.html', utf8.encode(markup)], ...files]);
   await load();
 }
 
@@ -366,7 +389,6 @@ async function handle(m) {
     }
     case 'advance':
       await clock.advance(Number(fields[1]), settle);
-      workers.tell(clock.now());
       await settle();
       return '';
     case 'go':

@@ -1,12 +1,15 @@
-;; Web sites for web programs, and packs of files for the web host.
+;; Web sites for web programs, and packs of files for the web host. A site is a directory a server can serve: the HTML
+;; file as index.html, the web host, the program, its assets, the files it is given as packs, and site.json, which
+;; says how the program starts (substrate/host/web/start.mjs).
 (require-unqualified macros compiler/macros)
 (require-unqualified fs host/fs)
+(require-unqualified manifests std/package/manifest)
 (require-unqualified pack "pack.sub")
 (require-unqualified paths std/package/path)
 (require-unqualified common cmd/sub/common)
 (require-unqualified build cmd/sub/build)
 
-(provide pack! site!)
+(provide pack! site! site-program)
 
 (define (pack! [args (slice string)])
   (let ([to (option args "-o")] [from (option args "-C")] [paths (without (without args "-o" #t) "-C" #t)]
@@ -43,52 +46,171 @@
 (define (written! [path string] [b (slice u8)])
   (let ([why string]) (when (< (fs-write-file path b (& why)) 0) (failed! why))))
 
+;; ---- what a site is ----
+
+(struct plan [name string] [program string] [html string] [cwd string] [files (slice site-files)] [base string])
+
+;; Whether spec names a site, rather than giving a program's source or a built program's directory, either of which
+;; holds a separator or ends in .sub.
+(define (named? [spec string]) -> bool
+  (for ([i u32 0]) (< i (-> spec length)) (+= i 1) (when (or (== (@ spec i) #\/) (== (@ spec i) #\\)) (return #f)))
+  (not (ends? spec ".sub")))
+
+;; The site called name in the package that holds the current directory.
+(define (declared [name string]) -> plan
+  (let ([dir (package-holding (& a) cwd)] [m manifest] [err (make-buffer)] [p plan])
+    (when (== (-> dir length) 0) (failed! (joined (joined "site: " name) " is not a program, and the current directory is in no package")))
+    (unless (manifest-read (& a) (joined-path dir "package.sub") (& m) (& err)) (failed! (local (buffer-string (& err)))))
+    (for ([i u32 0]) (< i (-> m sites length)) (+= i 1)
+      (let ([s (& (@ (-> m sites) i))])
+        (when (== (-> s name) name)
+          (return (plan #:name name #:program (resolved-path dir (-> s program))
+                        #:html (if (== (-> s html length) 0) "" (resolved-path dir (-> s html))) #:cwd (-> s cwd)
+                        #:files (-> s files) #:base dir)))))
+    (failed! (joined (joined (joined "site: the package " (-> m name)) " has no site ") name))
+    p))
+
+;; site-program gives the program file of the site that spec names, or "" when its program is built already.
+(define (site-program [spec string]) -> string
+  (let ([program (if (named? spec) (-> (declared spec) program) (absolute spec))])
+    (if (== (kind-of program) fs-directory) "" program)))
+
+;; ---- files ----
+
+(define (star? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) #\*) (return #t)))
+  #f)
+
+(define (kept! [into (ptr buffer)] [path string])
+  (let ([ps (cast (ptr string) (-> into bytes))] [n (/ (-> into length) (sizeof string))])
+    (for ([i u32 0]) (< i n) (+= i 1) (when (== (@ ps i) path) (return)))
+    (buffer-add! into (slice (cast (ptr u8) (& path)) (sizeof string)))))
+
+;; The paths under base that match the parts of a pattern from k on, rel being the path matched so far.
+(define (matched! [base string] [rel string] [parts (slice string)] [k u32] [into (ptr buffer)])
+  (let ([here (if (== (-> rel length) 0) base (joined-path base rel))])
+    (cond [(== k (-> parts length)) (when (!= (kind-of here) 0) (kept! into rel))]
+          [(== (@ parts k) "**")
+           (matched! base rel parts (+ k 1) into)
+           (when (== (kind-of here) fs-directory)
+             (let ([names (names-in here)])
+               (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+                 (when (== (kind-of (joined-path here (@ names i))) fs-directory)
+                   (matched! base (child rel (@ names i)) parts k into)))))]
+          [(star? (@ parts k))
+           (when (== (kind-of here) fs-directory)
+             (let ([names (names-in here)])
+               (for ([i u32 0]) (< i (-> names length)) (+= i 1)
+                 (when (matches? (@ names i) (@ parts k)) (matched! base (child rel (@ names i)) parts (+ k 1) into)))))]
+          [else (matched! base (child rel (@ parts k)) parts (+ k 1) into)])))
+
+(define (child [rel string] [name string]) -> string (if (== (-> rel length) 0) name (joined-path rel name)))
+
+(define (parts-of [pattern string]) -> (slice string)
+  (let ([out (make-buffer)] [start u32 0])
+    (for ([i u32 0]) (<= i (-> pattern length)) (+= i 1)
+      (when (or (== i (-> pattern length)) (== (@ pattern i) #\/))
+        (when (> i start)
+          (let ([part (slice pattern start i)]) (buffer-add! (& out) (slice (cast (ptr u8) (& part)) (sizeof string)))))
+        (set! start (+ i 1))))
+    (slice (cast (ptr string) (-> out bytes)) (/ (-> out length) (sizeof string)))))
+
+(define (packed! [p (ptr plan)] [g (ptr site-files)] [out string] [name string])
+  (let ([base (if (== (-> g from length) 0) (-> p base) (resolved-path (-> p base) (-> g from)))] [found (make-buffer)]
+        [err (make-buffer)])
+    (for ([i u32 0]) (< i (-> g patterns length)) (+= i 1)
+      (let ([before (-> found length)])
+        (matched! base "" (parts-of (@ (-> g patterns) i)) 0 (& found))
+        (when (== (-> found length) before)
+          (failed! (joined (joined (joined "site: nothing in " base) " matches ") (@ (-> g patterns) i))))))
+    (unless (pack-files base (slice (cast (ptr string) (-> found bytes)) (/ (-> found length) (sizeof string)))
+                        (joined-path out name) (& err))
+      (failed! (buffer-string (& err))))))
+
+;; ---- site.json ----
+
+(define (quoted! [b (ptr buffer)] [s string])
+  (buffer-add-byte! b #\")
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+    (let ([c (@ s i)])
+      (cond [(or (== c #\") (== c #\\)) (buffer-add-byte! b #\\) (buffer-add-byte! b (cast i32 c))]
+            [(< c 32) (buffer-add-string! b "\\u00") (buffer-add-byte! b (cast i32 (@ "0123456789abcdef" (>> c 4))))
+                      (buffer-add-byte! b (cast i32 (@ "0123456789abcdef" (bit-and c 15))))]
+            [else (buffer-add-byte! b (cast i32 c))])))
+  (buffer-add-byte! b #\"))
+
+(define (pair! [b (ptr buffer)] [first bool] [file string] [dir string])
+  (unless first (buffer-add-byte! b #\,))
+  (buffer-add-byte! b #\[)
+  (quoted! b file)
+  (buffer-add-byte! b #\,)
+  (quoted! b dir)
+  (buffer-add-byte! b #\]))
+
+;; ---- building ----
+
 (define (site! [args (slice string)])
-  (when (< (-> args length) 2) (usage))
-  (let ([out (@ args 0)] [file (@ args 1)] [html (joined-path (substrate-dir) "host/web/index.html")] [k u32 2]
-        [files (make-buffer)] [list (make-buffer)] [err (make-buffer)] [why string])
-    (when (and (!= (kind-of out) 0)
-               (or (!= (kind-of out) fs-directory)
-                   (and (> (-> (names-in out) length) 0) (!= (kind-of (joined-path out ".site")) fs-file))))
-      (failed! (joined (joined "site: " out) " is not a site, so it is not replaced")))
-    (when (and (!= (kind-of out) 0) (< (fs-remove out #t (& why)) 0)) (failed! why))
-    (made! (joined-path out "host/modules"))
-    (made! (joined-path out "host/web"))
-    (written! (joined-path out ".site") (cast (slice u8) (joined file "\n")))
-    (while (< k (-> args length))
-      (let ([x (@ args k)])
-        (cond [(and (== x "--html") (< (+ k 1) (-> args length)))
-               (set! html (@ args (+ k 1)))
-               (+= k 2)]
-              [(and (== x "-f") (< (+ k 2) (-> args length)))
-               (let ([name (@ args (+ k 1))] [start (+ k 2)])
-                 (set! k start)
-                 (while (and (< k (-> args length)) (not (starts? (@ args k) "-"))) (+= k 1))
-                 (unless (pack-files root (slice args start k) (joined-path out (joined name ".pack")) (& err))
-                   (failed! (buffer-string (& err)))))]
-              [else (usage)])))
-    (let ([assets (joined-path (parent-of (absolute file)) "assets")] [found (make-buffer)])
-      (when (== (kind-of assets) fs-directory)
-        (copy-tree! assets (joined-path out "assets") "assets" (& found))
-        (let ([ps (cast (ptr string) (-> found bytes))] [n (/ (-> found length) (sizeof string))])
-          (for ([i u32 1]) (< i n) (+= i 1)
-            (let ([s (@ ps i)] [j i])
-              (while (and (> j 0) (< s (@ ps (- j 1))))
-                (set! (@ ps j) (@ ps (- j 1)))
-                (-= j 1))
-              (set! (@ ps j) s)))
-          (for ([i u32 0]) (< i n) (+= i 1)
-            (buffer-add-string! (& list) (@ ps i))
-            (buffer-add-byte! (& list) 10))))
-      (written! (joined-path out "assets.list") (buffer-bytes (& list))))
-    (copy-modules! (joined-path (substrate-dir) "host") (joined-path out "host"))
-    (copy-modules! (joined-path (substrate-dir) "host/modules") (joined-path out "host/modules"))
-    (copy-modules! (joined-path (substrate-dir) "host/web") (joined-path out "host/web"))
-    (copied! html (joined-path out "index.html"))
-    (if (== (kind-of file) fs-directory)
-        (copy-tree! file (joined-path out "program") "" (& files))
-        (let* ([full (absolute file)] [dir (target! full (joined-path out "program"))])
-          (cache!)
-          (compile! "build" full dir (slice (cast (ptr string) 0) 0) (grants full dir) built)))))
+  (let* ([plain (without (without args "-o" #t) "--html" #t)] [given-html (option args "--html")]
+         [p plan] [list (make-buffer)] [files (make-buffer)] [settings (make-buffer)] [why string])
+    (unless (== (-> plain length) 1) (usage))
+    (if (named? (@ plain 0))
+        (set! p (declared (@ plain 0)))
+        (set! p (plan #:name (stem-of (@ plain 0)) #:program (absolute (@ plain 0)) #:html "" #:cwd ""
+                      #:files (slice (cast (ptr site-files) 0) 0) #:base cwd)))
+    (when (> (-> given-html length) 0) (set! (-> p html) (absolute given-html)))
+    (let* ([given-out (option args "-o")]
+           [out (if (> (-> given-out length) 0) (absolute given-out)
+                    (joined-path (-> p base) (joined "build/sites/" (-> p name))))])
+      (when (and (!= (kind-of out) 0)
+                 (or (!= (kind-of out) fs-directory)
+                     (and (> (-> (names-in out) length) 0) (!= (kind-of (joined-path out ".site")) fs-file))))
+        (failed! (joined (joined "site: " out) " is not a site, so it is not replaced")))
+      (when (and (!= (kind-of out) 0) (< (fs-remove out #t (& why)) 0)) (failed! why))
+      (made! (joined-path out "host/modules"))
+      (made! (joined-path out "host/web"))
+      (written! (joined-path out ".site") (cast (slice u8) (joined (-> p program) "\n")))
+      (buffer-add-byte! (& settings) #\{)
+      (let ([assets (joined-path (parent-of (-> p program)) "assets")] [found (make-buffer)])
+        (when (== (kind-of assets) fs-directory)
+          (copy-tree! assets (joined-path out "assets") "assets" (& found))
+          (let ([ps (cast (ptr string) (-> found bytes))] [n (/ (-> found length) (sizeof string))])
+            (for ([i u32 1]) (< i n) (+= i 1)
+              (let ([s (@ ps i)] [j i])
+                (while (and (> j 0) (< s (@ ps (- j 1))))
+                  (set! (@ ps j) (@ ps (- j 1)))
+                  (-= j 1))
+                (set! (@ ps j) s)))
+            (for ([i u32 0]) (< i n) (+= i 1)
+              (buffer-add-string! (& list) (@ ps i))
+              (buffer-add-byte! (& list) 10)))
+          (written! (joined-path out "assets.list") (buffer-bytes (& list)))
+          (buffer-add-string! (& settings) "\"lists\":[")
+          (pair! (& settings) #t "assets.list" "/")
+          (buffer-add-byte! (& settings) #\])))
+      (when (> (-> p files length) 0)
+        (when (> (-> settings length) 1) (buffer-add-byte! (& settings) #\,))
+        (buffer-add-string! (& settings) "\"packs\":[")
+        (for ([i u32 0]) (< i (-> p files length)) (+= i 1)
+          (let ([name (let ([b (make-buffer)]) (buffer-add-string! (& b) "files-") (write-digits (& b) (cast u64 (+ i 1)) 10)
+                         (buffer-add-string! (& b) ".pack") (buffer-string (& b)))])
+            (packed! (& p) (& (@ (-> p files) i)) out name)
+            (pair! (& settings) (== i 0) name (-> (@ (-> p files) i) dir))))
+        (buffer-add-byte! (& settings) #\]))
+      (when (> (-> p cwd length) 0)
+        (when (> (-> settings length) 1) (buffer-add-byte! (& settings) #\,))
+        (buffer-add-string! (& settings) "\"cwd\":")
+        (quoted! (& settings) (-> p cwd)))
+      (buffer-add-string! (& settings) "}\n")
+      (written! (joined-path out "site.json") (buffer-bytes (& settings)))
+      (copy-modules! (joined-path (substrate-dir) "host") (joined-path out "host"))
+      (copy-modules! (joined-path (substrate-dir) "host/modules") (joined-path out "host/modules"))
+      (copy-modules! (joined-path (substrate-dir) "host/web") (joined-path out "host/web"))
+      (copied! (if (== (-> p html length) 0) (joined-path (substrate-dir) "host/web/index.html") (-> p html))
+               (joined-path out "index.html"))
+      (if (== (kind-of (-> p program)) fs-directory)
+          (copy-tree! (-> p program) (joined-path out "program") "" (& files))
+          (let ([dir (begin (prepare! (-> p program)) (joined-path out "program"))])
+            (cache!)
+            (compile! "build" (-> p program) dir (slice (cast (ptr string) 0) 0) (grants (-> p program) dir) built))))))
 
 (define (built [code i32]) (host-exit code))

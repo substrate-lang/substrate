@@ -54,7 +54,7 @@ In the dev shell (`nix develop`), where `bin/sub` is short for `bin/substrate`:
     bin/substrate map FILE                       # FILE's module map
     bin/substrate eval FILE                      # FILE's forms, one at a time, as a session
     bin/substrate expand FILE                    # FILE's expansion
-    bin/substrate site OUT FILE                  # a web site for a web program
+    bin/substrate site NAME|FILE [-o DIR]        # a web site: the package's site NAME, or FILE's program
     bin/substrate serve OUT                      # serve it locally
     bin/substrate doc                            # documentation of the current package and its dependencies, as HTML in build/doc
     bin/substrate doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM

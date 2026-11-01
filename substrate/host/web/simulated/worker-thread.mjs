@@ -1,20 +1,14 @@
-// A worker in the simulated browser: one of Node's threads made to look like a Web Worker, with the browser's clock,
-// network and console, running the web host's worker script (../worker-script.mjs).
+// A worker in the simulated browser: one of Node's threads made to look like a Web Worker, with the browser's network
+// and console, running the web host's worker script (../worker-script.mjs). Its time is real, as a thread's is.
 import { parentPort, workerData } from 'node:worker_threads';
-import { makeClock } from './clock.mjs';
-import { installClock, installRandom } from './globals.mjs';
+import { installRandom } from './globals.mjs';
 import { makeFetch, makeWebSocket } from './network.mjs';
 
-const { script, control, now, epoch, site, answers, url, seed } = workerData;
-const turn = () => new Promise((resolve) => setImmediate(resolve));
-const clock = makeClock(epoch);
-await clock.advance(now, async () => {});
-
+const { script, control, site, answers, url, seed } = workerData;
 const later = (f) => setImmediate(f);
 const say = (...a) => control.postMessage({ type: 'console', line: a.join(' ') });
 const where = () => new URL(url);
 const g = globalThis;
-installClock(g, clock);
 installRandom(g, seed);
 Object.assign(g, {
   self: g,
@@ -26,8 +20,5 @@ Object.assign(g, {
 });
 parentPort.on('message', (data) => {
   if (typeof g.onmessage === 'function') g.onmessage({ data });
-});
-control.on('message', async (m) => {
-  if (m.type === 'time' && m.now > clock.now()) await clock.advance(m.now - clock.now(), turn);
 });
 await import(script);

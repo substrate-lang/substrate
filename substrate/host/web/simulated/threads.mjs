@@ -1,5 +1,5 @@
 // Web Workers in the simulated browser, each one of Node's threads (worker-thread.mjs). browser holds what a worker
-// is started with and how it reports: later, the clock, the site and answers, the program's URL, say and seen.
+// is started with and how it reports: later, the site and answers, the program's URL, say and seen.
 import { MessageChannel, Worker as NodeWorker } from 'node:worker_threads';
 
 const thread = new URL('./worker-thread.mjs', import.meta.url);
@@ -17,8 +17,8 @@ export function makeWorker(browser) {
       browser.seen();
       this.thread = new NodeWorker(thread, {
         workerData: {
-          script: String(url), control: port2, now: browser.clock().now(), epoch: browser.clock().epoch, site: [...browser.site()],
-          answers: [...browser.answers()], url: new URL('host/web/worker-script.mjs', browser.url()).href, seed: browser.seed + started,
+          script: String(url), control: port2, site: [...browser.site()], answers: [...browser.answers()],
+          url: new URL('host/web/worker-script.mjs', browser.url()).href, seed: browser.seed + started,
         },
         transferList: [port2],
       });
@@ -47,10 +47,6 @@ export function makeWorker(browser) {
   }
   return {
     Worker,
-    // The workers' clocks brought to the browser's time.
-    tell(now) {
-      for (const w of all) w.control.postMessage({ type: 'time', now });
-    },
     stopAll() {
       for (const w of [...all]) w.terminate();
     },

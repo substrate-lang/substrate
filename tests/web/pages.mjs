@@ -297,7 +297,7 @@ const checks = {
       '1 stderr: careful',
       '1 message: warned',
       '1 done',
-      '1 message: read 12 bytes',
+      '1 message: read 25 bytes',
       '1 done',
       '1 message: cannot write /out/made.txt: Read-only file system',
       '1 done',
@@ -412,7 +412,7 @@ const checks = {
     check('snake: the A key turns left and starts the game', await text('status'), 'Arrow keys or W A S D to turn. Space to pause.');
 
     await page.evaluate(`new Promise((resolve) => {
-      const r = indexedDB.open('snake', 1);
+      const r = indexedDB.open(location.pathname.replace(/[^/]*$/, ''), 1);
       r.onsuccess = () => {
         const t = r.result.transaction('keys', 'readwrite');
         t.objectStore('keys').put(new TextEncoder().encode('42'), 'best');
@@ -426,11 +426,11 @@ const checks = {
 
   async platformer(page) {
     const pixel = (x, y) => page.evaluate(
-      `window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
+      `window.modules.gpu.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
     const sky = '143,211,255,255';
     const dirt = '160,103,63,255';
     const shirt = '83,155,245,255';
-    await page.waitFor(`window.gpuModule.readSurface(1, 8, 170, 1, 1).then((p) => p[0] === 160 && p[1] === 103)`, 10000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 8, 170, 1, 1).then((p) => p[0] === 160 && p[1] === 103)`, 10000);
     check('platformer: the ground is drawn from the sprite sheet', await pixel(8, 170), dirt);
     check('platformer: the sky is drawn', await pixel(100, 100), sky);
     check('platformer: the player is drawn where the level puts it', await pixel(40, 140), shirt);
@@ -455,14 +455,14 @@ const checks = {
     })()`), true);
 
     await page.keyDown('ArrowRight');
-    await page.waitFor(`window.gpuModule.readSurface(1, 40, 140, 1, 1).then((p) => p[0] === 143 && p[1] === 211)`, 5000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 40, 140, 1, 1).then((p) => p[0] === 143 && p[1] === 211)`, 5000);
     check('platformer: holding the right arrow moves the player away', await pixel(40, 140), sky);
     await page.keyUp('ArrowRight');
 
-    const before = await page.evaluate('window.audio.played()');
+    const before = await page.evaluate('window.modules.audio.played()');
     await page.press(' ');
-    await page.waitFor(`window.audio.played() > ${before}`, 5000);
-    check('platformer: a jump plays a sound', (await page.evaluate('window.audio.played()')) > before, true);
+    await page.waitFor(`window.modules.audio.played() > ${before}`, 5000);
+    check('platformer: a jump plays a sound', (await page.evaluate('window.modules.audio.played()')) > before, true);
   },
 
   async gpu(page) {
@@ -480,8 +480,8 @@ const checks = {
   async sprites(page) {
     await page.evaluate('location.search = "?n=1"');
     await page.waitFor('window.ready && location.search === "?n=1"', 20000);
-    const pixel = (x, y) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
-    await page.waitFor('window.gpuModule.readSurface(1, 11, 13, 1, 1).then((p) => p[0] === 160 && p[1] === 103)', 10000);
+    const pixel = (x, y) => page.evaluate(`window.modules.gpu.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
+    await page.waitFor('window.modules.gpu.readSurface(1, 11, 13, 1, 1).then((p) => p[0] === 160 && p[1] === 103)', 10000);
     check('sprites: the GPU draws the sprite', await pixel(11, 13), '160,103,63,255');
     check('sprites: the GPU draws its top rows', await pixel(8, 8), '87,171,90,255');
     check('sprites: the GPU fills the background', await pixel(300, 200), '143,211,255,255');
@@ -502,14 +502,14 @@ const checks = {
   },
 
   async blocks(page) {
-    const picture = () => page.evaluate(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s; })`);
-    const pixel = (x, y) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
-    await page.waitFor('window.gpuModule.readSurface(1, 320, 340, 1, 1).then((p) => p[0] > 40)', 10000);
+    const picture = () => page.evaluate(`window.modules.gpu.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s; })`);
+    const pixel = (x, y) => page.evaluate(`window.modules.gpu.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
+    await page.waitFor('window.modules.gpu.readSurface(1, 320, 340, 1, 1).then((p) => p[0] > 40)', 10000);
     const top = (await pixel(320, 20)).split(',').map(Number);
     check('blocks: the sky is at the top, blue', top[2] > 200 && top[2] >= top[1] && top[1] > top[0], true);
     const ground = (await pixel(320, 340)).split(',').map(Number);
     check('blocks: the land is at the bottom, not the sky', ground[2] < 150 && ground[3] === 255, true);
-    const greens = await page.evaluate(`window.gpuModule.readSurface(1, 0, 60, 640, 300).then((p) => {
+    const greens = await page.evaluate(`window.modules.gpu.readSurface(1, 0, 60, 640, 300).then((p) => {
       let lit = 0, shaded = 0;
       for (let i = 0; i < p.length; i += 4) {
         if (p[i + 1] > p[i] + 40 && p[i + 1] > p[i + 2] + 40) { if (p[i + 1] > 150) lit++; else if (p[i + 1] > 50) shaded++; }
@@ -523,7 +523,7 @@ const checks = {
     await page.keyDown('ArrowUp');
     await new Promise((resolve) => setTimeout(resolve, 330));
     await page.keyUp('ArrowUp');
-    await page.waitFor(`window.gpuModule.readSurface(1, 0, 0, 640, 240).then((p) => { for (let i = 0; i < p.length; i += 4) if (p[i] >= 252 && p[i + 1] >= 252 && p[i + 2] >= 252) return true; return false; })`, 5000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 0, 0, 640, 240).then((p) => { for (let i = 0; i < p.length; i += 4) if (p[i] >= 252 && p[i + 1] >= 252 && p[i + 2] >= 252) return true; return false; })`, 5000);
     check('blocks: the sun is in the sky', true, true);
     await page.keyDown('ArrowDown');
     await new Promise((resolve) => setTimeout(resolve, 330));
@@ -542,7 +542,7 @@ const checks = {
     await page.keyDown('w');
     await new Promise((resolve) => setTimeout(resolve, 600));
     await page.keyUp('w');
-    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 5000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 5000);
     check('blocks: walking changes the view', (await picture()) !== before, true);
     await page.keyDown('ArrowDown');
     await new Promise((resolve) => setTimeout(resolve, 700));
@@ -550,7 +550,7 @@ const checks = {
     await new Promise((resolve) => setTimeout(resolve, 100));
     const looking = await picture();
     await page.press('x');
-    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${looking}; })`, 5000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${looking}; })`, 5000);
     check('blocks: digging changes the view', (await picture()) !== looking, true);
 
     const dug = await picture();
@@ -558,11 +558,11 @@ const checks = {
     await page.waitFor('document.pointerLockElement !== null', 5000);
     check('blocks: a click locks the pointer to the screen', await page.evaluate('document.pointerLockElement && document.pointerLockElement.tagName'), 'CANVAS');
     await page.waitFor(`(window.dispatchEvent(new MouseEvent('mousemove', { movementX: 30, movementY: 0 })),
-      window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${dug}; }))`, 5000);
+      window.modules.gpu.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${dug}; }))`, 5000);
     check('blocks: moving the mouse turns the view', (await picture()) !== dug, true);
     const turned = await picture();
     await page.evaluate(`document.querySelector('canvas').dispatchEvent(new MouseEvent('mousedown', { button: 0, bubbles: true })); window.dispatchEvent(new MouseEvent('mouseup', { button: 0 }))`);
-    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${turned}; })`, 5000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${turned}; })`, 5000);
     check('blocks: the left button digs', (await picture()) !== turned, true);
     await page.evaluate('document.exitPointerLock()');
     await page.waitFor('document.pointerLockElement === null', 5000);
@@ -571,14 +571,14 @@ const checks = {
   },
 
   async valley(page) {
-    const pixel = (x, y) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
-    const count = (x, y, w, h, test) => page.evaluate(`window.gpuModule.readSurface(1, ${x}, ${y}, ${w}, ${h}).then((p) => {
+    const pixel = (x, y) => page.evaluate(`window.modules.gpu.readSurface(1, ${x}, ${y}, 1, 1).then((p) => Array.from(p).join(","))`);
+    const count = (x, y, w, h, test) => page.evaluate(`window.modules.gpu.readSurface(1, ${x}, ${y}, ${w}, ${h}).then((p) => {
       let n = 0;
       for (let i = 0; i < p.length; i += 4) { const r = p[i], g = p[i + 1], b = p[i + 2]; if (${test}) n++; }
       return n;
     })`);
-    const picture = () => page.evaluate(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s; })`);
-    await page.waitFor('window.gpuModule.readSurface(1, 100, 330, 1, 1).then((p) => p[1] > 60)', 15000);
+    const picture = () => page.evaluate(`window.modules.gpu.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s; })`);
+    await page.waitFor('window.modules.gpu.readSurface(1, 100, 330, 1, 1).then((p) => p[1] > 60)', 15000);
     const top = (await pixel(320, 10)).split(',').map(Number);
     check('valley: the sky is at the top, blue', top[2] > 200 && top[2] >= top[1] && top[1] > top[0], true);
     const atLeast = (n, least) => (n >= least ? true : n);
@@ -589,24 +589,24 @@ const checks = {
     check('valley: the character is seen from behind (300 blue pixels)', atLeast(await tunic(), 300), true);
     await page.keyDown('v');
     await page.keyUp('v');
-    await page.waitFor(`window.gpuModule.readSurface(1, 270, 150, 100, 150).then((p) => { let n = 0; for (let i = 0; i < p.length; i += 4) if (p[i + 2] > p[i] + 50 && p[i + 2] > p[i + 1] + 20 && p[i + 2] > 120) n++; return n < 50; })`, 30000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 270, 150, 100, 150).then((p) => { let n = 0; for (let i = 0; i < p.length; i += 4) if (p[i + 2] > p[i] + 50 && p[i + 2] > p[i + 1] + 20 && p[i + 2] > 120) n++; return n < 50; })`, 30000);
     check('valley: through its eyes, the character is not seen', (await tunic()) < 50, true);
     await page.keyDown('v');
     await page.keyUp('v');
     const before = await picture();
     await page.keyDown('w');
-    await page.waitFor(`window.gpuModule.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 30000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 0, 120, 640, 120).then((p) => { let s = 0; for (let i = 0; i < p.length; i += 4) s = (s * 31 + p[i] + p[i + 1] * 3) % 1000000007; return s !== ${before}; })`, 30000);
     await page.keyUp('w');
     check('valley: walking changes the view', (await picture()) !== before, true);
     await page.evaluate('window.app.call("look", 146, 120, -2.2, 0.1)');
-    await page.waitFor(`window.gpuModule.readSurface(1, 0, 240, 640, 100).then((p) => { let n = 0; for (let i = 0; i < p.length; i += 4) if (p[i + 2] > p[i] + 30) n++; return n > 40000; })`, 30000);
+    await page.waitFor(`window.modules.gpu.readSurface(1, 0, 240, 640, 100).then((p) => { let n = 0; for (let i = 0; i < p.length; i += 4) if (p[i + 2] > p[i] + 30) n++; return n > 40000; })`, 30000);
     check('valley: from the lake, water fills the lower picture (40,000 pixels)', atLeast(await count(0, 240, 640, 100, 'b > r + 30'), 40000), true);
     check('valley: the game has not stopped', await page.evaluate('document.querySelector(".game-stopped") === null'), true);
     check('valley: nothing is written to the console', page.log.join('\n'), '');
   },
 
   async sounds(page) {
-    const count = (what) => page.evaluate(`window.audio.${what}()`);
+    const count = (what) => page.evaluate(`window.modules.audio.${what}()`);
     await page.waitFor(`(() => {
       const d = document.querySelector("canvas").getContext("2d").getImageData(10, 10, 1, 1).data;
       return d[0] === 46 && d[1] === 125;
@@ -616,23 +616,23 @@ const checks = {
       page.log.some((line) => line.includes('audio: cannot load the sound assets/nothing.wav')), true);
     check('sounds: nothing plays before a key is pressed', await count('started'), 0);
     await page.press('x');
-    await page.waitFor('window.audio.running()', 5000);
-    await page.waitFor('window.audio.started() === 1', 5000);
+    await page.waitFor('window.modules.audio.running()', 5000);
+    await page.waitFor('window.modules.audio.started() === 1', 5000);
     await new Promise((resolve) => setTimeout(resolve, 500));
     check('sounds: the music started with the first key press, and keeps playing', await count('playing'), 1);
     await page.press('s');
-    await page.waitFor('window.audio.playing() === 0', 5000);
+    await page.waitFor('window.modules.audio.playing() === 0', 5000);
     check('sounds: S stopped the music', await count('started'), 1);
 
     await page.press(' ');
-    await page.waitFor('window.audio.started() === 2', 5000);
-    await page.waitFor('window.audio.playing() === 0', 5000);
+    await page.waitFor('window.modules.audio.started() === 2', 5000);
+    await page.waitFor('window.modules.audio.playing() === 0', 5000);
     check('sounds: Space played the sound once', await count('started'), 2);
 
     await page.press('m');
-    await page.waitFor('window.audio.started() === 3 && window.audio.playing() === 1', 5000);
+    await page.waitFor('window.modules.audio.started() === 3 && window.modules.audio.playing() === 1', 5000);
     await page.press('s');
-    await page.waitFor('window.audio.playing() === 0', 5000);
+    await page.waitFor('window.modules.audio.playing() === 0', 5000);
     check('sounds: M started the music again and S stopped it', await count('started'), 3);
   },
 

@@ -8,42 +8,25 @@ sites="${OUT:-build}/web"
 
 mkdir -p build
 rm -rf "${sites:?}"
+mkdir -p "$sites"
+sites="$(cd "$sites" && pwd)"
 : > build/empty.sub
 bin/substrate expand build/empty.sub > /dev/null
+named() { (cd "$1" && "$root/bin/substrate" site "$2" -o "$sites/$2"); }
 
-site="$sites/session"
-bin/substrate site "$site" build/compiler --html tests/web/session.html \
-  -f files $(find substrate/compiler substrate/host packages/scheme packages/bend tests/session -name '*.sub' | sort) \
-  packages/nodes/nodes.sub std/encoding/utf8.sub tests/web/session.map
+named tests/web session
 status=0
-node tests/web/session.mjs "$site" funcs scheme substrate switch bend || status=1
+node tests/web/session.mjs "$sites/session" funcs scheme substrate switch bend || status=1
 
-bin/substrate site "$sites/counter" packages/web/examples/counter.sub
-bin/substrate site "$sites/rows" packages/web/examples/rows.sub
+for p in counter rows; do bin/substrate site "packages/web/examples/$p.sub" -o "$sites/$p"; done
 make -s repl OUT="${OUT:-build}"
-bin/substrate site "$sites/focus" tests/web/focus.sub
-bin/substrate site "$sites/floor" tests/web/floor.sub
-bin/substrate site "$sites/events" tests/web/events.sub
+for p in focus floor events storage location clipboard files fields assets canvas stopped stopped-at-start gpu workers \
+         sqlite; do
+  bin/substrate site "tests/web/$p.sub" -o "$sites/$p"
+done
 bin/substrate build tests/web/server.sub -o "$sites/server"
-bin/substrate site "$sites/storage" tests/web/storage.sub
-bin/substrate site "$sites/location" tests/web/location.sub
-bin/substrate site "$sites/clipboard" tests/web/clipboard.sub
-bin/substrate site "$sites/files" tests/web/files.sub
-bin/substrate site "$sites/fields" tests/web/fields.sub
-bin/substrate site "$sites/assets" tests/web/assets.sub
-bin/substrate site "$sites/canvas" tests/web/canvas.sub
-bin/substrate site "$sites/snake" packages/web/examples/snake/snake.sub --html packages/web/examples/snake/index.html
-bin/substrate site "$sites/platformer" packages/web/examples/platformer/platformer.sub --html packages/web/examples/platformer/index.html
-bin/substrate site "$sites/blocks" packages/web/examples/blocks/blocks.sub --html packages/web/examples/blocks/index.html
-bin/substrate site "$sites/valley" packages/web/examples/valley/valley.sub --html packages/web/examples/valley/index.html
-bin/substrate site "$sites/sounds" tests/web/sounds.sub --html packages/web/examples/platformer/index.html
-bin/substrate site "$sites/stopped" tests/web/stopped.sub
-bin/substrate site "$sites/stopped-at-start" tests/web/stopped-at-start.sub
-bin/substrate site "$sites/gpu" tests/web/gpu.sub --html tests/web/gpu.html
-bin/substrate site "$sites/sprites" tests/web/sprites.sub --html tests/web/sprites.html
-bin/substrate site "$sites/sprites-canvas" tests/web/sprites-canvas.sub --html tests/web/sprites.html
-bin/substrate site "$sites/workers" tests/web/workers.sub --html tests/web/workers.html
-bin/substrate site "$sites/sqlite" tests/web/sqlite.sub
+for s in snake platformer blocks valley; do named packages/web "$s"; done
+for s in sounds sprites sprites-canvas; do named tests/web "$s"; done
 node tests/web/pages.mjs "$sites" counter rows focus floor events storage location clipboard files fields assets canvas \
   snake platformer sounds stopped stopped-at-start workers repl gpu sprites sprites-canvas blocks valley sqlite || status=1
 exit $status
