@@ -30,6 +30,19 @@ function refuse(grant, file, program, env, loader) {
   }
 }
 
+const launched = (file, args, program = file) => {
+  const node = globalThis.process.execPath;
+  return /\.m?js$/.test(file) ? { command: node, args: ['--stack-size=4000', file, ...args], argv0: node }
+    : { command: file, args, argv0: program };
+};
+
+export function become(command, argv, env) {
+  if (typeof globalThis.process.execve === 'function') globalThis.process.execve(command, argv, env);
+  const r = child.spawnSync(command, argv.slice(1), { env, stdio: 'inherit' });
+  if (r.error) throw r.error;
+  globalThis.process.exit(r.status !== null ? r.status : 128 + (os.constants.signals[r.signal] || 0));
+}
+
 const mainOnly = (setup, call) => {
   if (setup.worker) throw new Error(`process.${call} is not available in a worker`);
 };
@@ -57,7 +70,8 @@ export function processes(grants, loader, setup = {}) {
           }
           const file = programFile(program, cwd, env.PATH ?? '/usr/bin:/bin');
           if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
-          process = child.spawn(file ?? program, entries(caller.string(ap, al)), { cwd, env, stdio: modes });
+          const l = launched(file ?? program, entries(caller.string(ap, al)));
+          process = child.spawn(l.command, l.args, { cwd, env, stdio: modes });
         } catch (e) {
           caller.fail(err, e.message);
           return 0;
@@ -97,7 +111,8 @@ export function processes(grants, loader, setup = {}) {
           const out = fs.openSync(path.join(dir, 'output'), 'w');
           let r;
           try {
-            r = child.spawnSync(file ?? program, entries(caller.string(ap, al)), {
+            const l = launched(file ?? program, entries(caller.string(ap, al)));
+            r = child.spawnSync(l.command, l.args, {
               cwd, env, input: caller.memory().slice(caller.u(ip), caller.u(ip) + il), stdio: ['pipe', out, out],
               timeout: timeout || undefined, killSignal: 'SIGKILL',
             });
@@ -122,7 +137,8 @@ export function processes(grants, loader, setup = {}) {
           const env = globalThis.process.env;
           const file = programFile(program, undefined, env.PATH ?? '/usr/bin:/bin');
           if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
-          globalThis.process.execve(file ?? program, [program, ...entries(caller.string(ap, al))], env);
+          const l = launched(file ?? program, entries(caller.string(ap, al)), program);
+          become(l.command, [l.argv0, ...l.args], env);
         } catch (e) {
           caller.fail(err, e.message);
         }
@@ -136,7 +152,8 @@ export function processes(grants, loader, setup = {}) {
           const env = { ...globalThis.process.env };
           const file = programFile(program, undefined, env.PATH ?? '/usr/bin:/bin');
           if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
-          setup.atEnd = { file: file ?? program, argv: [program, ...entries(caller.string(ap, al))], env };
+          const l = launched(file ?? program, entries(caller.string(ap, al)), program);
+          setup.atEnd = { file: l.command, argv: [l.argv0, ...l.args], env };
         } catch (e) {
           caller.fail(err, e.message);
           return -1;

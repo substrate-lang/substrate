@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { createHost, Exit } from './subhost-core.mjs';
 import { grantFlag, grantsOf, noGrants } from './grants.mjs';
 import { hostFlag, hostModules, setupOf } from './node/modules.mjs';
+import { become } from './node/process.mjs';
 
 const require = createRequire(import.meta.url);
 const resolveGrant = (p, k) => require('./node/fs.mjs').resolveGrant(p, k);
@@ -58,7 +59,7 @@ const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
 // The program process.exec_at_end kept (node/process.mjs).
 const atEnd = () => {
   const kept = setup.atEnd;
-  if (kept) process.execve(kept.file, kept.argv, kept.env);
+  if (kept) become(kept.file, kept.argv, kept.env);
 };
 process.on('beforeExit', atEnd);
 
