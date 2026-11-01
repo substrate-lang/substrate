@@ -37,6 +37,8 @@ compiler is written in it, builds itself, and runs in a browser.
   runs.
 - `seed/`: checked-in builds of the compiler and of substrate, which build them
   from source.
+- `npm/`: the npm package substrate-lang: its manifest, the command it
+  installs, and the scripts `make npm` runs to pack it and try it.
 - `tests/`: the tests of the compiler and the host, as the package
   substrate-tests. Each package's own tests are in its `tests/` directory,
   and `tests/run.sh` runs them all.
@@ -65,4 +67,5 @@ In the dev shell (`nix develop`), where `bin/sub` is short for `bin/substrate`:
     make seed                                    # the bootstrap check, then the compiler and substrate become the seed
     make repl                                    # the REPL's site, in build/web/repl
     make docs                                    # documentation of the toolchain and the packages, as HTML in build/doc
+    make npm                                     # the npm package, packed into build and tried in a temporary install
     bench/*/run.sh                               # benchmarks

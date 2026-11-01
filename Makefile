@@ -24,7 +24,11 @@ docs:
 	bin/substrate doc --html -o $(OUT)/doc substrate std cmd packages/web packages/scheme packages/bend packages/nodes \
 	  packages/sqlite
 
+npm:
+	npm/pack.sh
+	npm/smoke.sh
+
 clean:
 	rm -rf build
 
-.PHONY: build/sub check bootstrap seed repl docs clean
+.PHONY: build/sub check bootstrap seed repl docs npm clean
