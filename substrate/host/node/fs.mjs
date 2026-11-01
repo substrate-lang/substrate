@@ -7,6 +7,7 @@ import { allowsAll, mayPath, mayTree, notGranted, pathDenied, under, unlimited }
 import { sameFile, tempName } from '../fs.mjs';
 
 const { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NOFOLLOW } = fs.constants;
+const windows = process.platform === 'win32';
 
 export function plainMessage(e) {
   if (typeof e.errno !== 'number') return e.message;
@@ -23,10 +24,11 @@ const plain = (f) => (...args) => {
   }
 };
 
-// comparable gives a path as Deno compares paths, which on macOS is in one Unicode form and case.
+// comparable gives a path as Deno compares paths, which on macOS is in one Unicode form and case, and on Windows in one
+// case, with slashes.
 export const comparable = process.platform === 'darwin'
   ? (p) => p.normalize('NFKD').toUpperCase().toLowerCase()
-  : (p) => p;
+  : windows ? (p) => p.replace(/\\/g, '/').toLowerCase() : (p) => p;
 
 // realPath gives an absolute path with its links followed; of a path that does not exist yet, it follows the part
 // that does.
@@ -36,25 +38,29 @@ export function realPath(abs) {
   } catch (e) {
     if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') throw e;
   }
-  const slash = abs.lastIndexOf('/');
-  const parent = realPath(slash === 0 ? '/' : abs.slice(0, slash));
-  return `${parent === '/' ? '' : parent}/${abs.slice(slash + 1)}`;
+  const parent = path.dirname(abs);
+  return parent === abs ? abs : path.join(realPath(parent), path.basename(abs));
 }
 
 // programFile gives the file a program runs, found as spawn finds it: from dir for a name with a slash, and otherwise
-// in the first directory of search with an executable file of that name; it gives null when there is none.
+// in the first directory of search with an executable file of that name; it gives null when there is none. On Windows,
+// as libuv finds it: the name, if it has an extension, then the name with .com and with .exe.
 export function programFile(name, dir = '.', search = process.env.PATH ?? '') {
-  if (name.includes('/')) return path.resolve(dir, name);
-  for (const d of search.split(':')) {
-    const p = path.resolve(dir, d, name);
+  const names = windows ? [...(path.extname(name) ? [name] : []), `${name}.com`, `${name}.exe`] : [name];
+  const found = (d) => names.map((m) => path.resolve(dir, d, m)).find((p) => {
     try {
-      if (fs.statSync(p).isFile()) {
-        fs.accessSync(p, fs.constants.X_OK);
-        return p;
-      }
+      if (!fs.statSync(p).isFile()) return false;
+      fs.accessSync(p, fs.constants.X_OK);
+      return true;
     } catch (e) {
       if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR' && e.code !== 'EACCES') throw e;
+      return false;
     }
+  });
+  if (name.includes('/') || (windows && name.includes('\\'))) return (windows && found('')) || path.resolve(dir, name);
+  for (const d of search.split(path.delimiter)) {
+    const p = found(d);
+    if (p) return p;
   }
   return null;
 }
@@ -65,10 +71,15 @@ export const resolveGrant = (text, k) => {
   return p === null ? null : comparable(p);
 };
 
-// Deno's rules for /dev, /proc and /sys: the four devices any program may use, /dev/tty for reading, /proc/pressure,
-// a pipe the host was given as /dev/fd/N or /proc/self/fd/N past 2, and anything else there with -A.
+// Deno's rules for /dev, and on Linux /proc and /sys: the four devices any program may use, /dev/tty for reading,
+// /proc/pressure, a pipe the host was given as /dev/fd/N or /proc/self/fd/N past 2, an environ file with all of -E, and
+// anything else there with -A. On Windows, a path that starts with \\ but is not \\?\ and a drive needs -A, and \\.\nul
+// does not.
+const linux = process.platform === 'linux';
 const devices = new Set(['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom']);
-const special = (p) => under(p, '/dev') || under(p, '/proc') || under(p, '/sys');
+const special = windows ? (p) => p.startsWith('\\\\') && !/^\\\\\?\\[A-Za-z]:\\/.test(p)
+  : linux ? (p) => under(p, '/dev') || under(p, '/proc') || under(p, '/sys')
+  : (p) => under(p, '/dev');
 const pipe = (p) => {
   const fd = /^\/(?:dev\/fd|proc\/self\/fd)\/(\d+)$/.exec(p);
   if (fd === null || Number(fd[1]) <= 2) return false;
@@ -78,8 +89,16 @@ const pipe = (p) => {
     return false;
   }
 };
-const usable = (p, k) => devices.has(p) || (p === '/dev/tty' && k === 'read') || under(p, '/proc/pressure') || pipe(p);
-const unresolved = process.platform === 'linux' ? (p) => under(p, '/proc') || under(p, '/dev') : () => false;
+const usable = windows ? (p) => p.toLowerCase() === '\\\\.\\nul'
+  : (p, k) => devices.has(p) || (p === '/dev/tty' && k === 'read') || under(p, '/proc/pressure') || pipe(p);
+// refusal gives the flag a special path needs, or null when it may be used.
+const refusal = (grants, p, k) => {
+  if (!special(p) || usable(p, k)) return null;
+  if (linux && p.endsWith('/environ')) return unlimited(grants.env) ? null : '--allow-env';
+  return '--allow-all';
+};
+const unresolved = windows ? (p) => p.startsWith('\\\\.\\')
+  : linux ? (p) => under(p, '/proc') || under(p, '/dev') : () => false;
 const missing = () => Object.assign(new Error('ENOENT: no such file or directory'), { errno: -2, code: 'ENOENT' });
 const infoOf = (s) => [s.isFile() ? 1 : s.isDirectory() ? 2 : s.isSymbolicLink() ? 3 : 4, s.size, s.mtimeMs, s.mode];
 
@@ -88,7 +107,8 @@ export function literalPath(grants, k, p) {
   const abs = path.resolve(p);
   if (allowsAll(grants)) return abs;
   if (!mayPath(grants[k], comparable(abs))) throw pathDenied(k);
-  if (special(abs) && !usable(abs, k)) throw pathDenied(k, '--allow-all');
+  const flag = refusal(grants, abs, k);
+  if (flag !== null) throw pathDenied(k, flag);
   return abs;
 }
 
@@ -110,7 +130,8 @@ export function nodeFiles(grants) {
     return hit.abs;
   };
   const checked = (k, p) => {
-    if (special(p) && !usable(p, k)) throw pathDenied(k, '--allow-all');
+    const flag = refusal(grants, p, k);
+    if (flag !== null) throw pathDenied(k, flag);
     return p;
   };
   // at gives the path a call that does not follow links works on, checked as Deno checks it.
@@ -121,6 +142,7 @@ export function nodeFiles(grants) {
     const abs = allowed(k, p);
     if (unresolved(abs)) return open(checked(k, abs), flag);
     const where = checked(k, realPath(abs));
+    if (windows && fs.lstatSync(where, { throwIfNoEntry: false })?.isSymbolicLink()) throw missing();
     try {
       return open(where, flag | O_NOFOLLOW);
     } catch (e) {
@@ -188,10 +210,13 @@ export function nodeFiles(grants) {
     openFile: plain((p, how) => {
       const writes = how.write || how.append;
       const changes = writes || how.truncate || how.create || how.createNew;
+      const truncateOpen = windows && how.truncate && !how.create && !how.createNew;
       const flag = (how.read ? (writes ? O_RDWR : O_RDONLY) : O_WRONLY) | (how.append ? O_APPEND : 0)
-        | (how.truncate ? O_TRUNC : 0) | (how.create || how.createNew ? O_CREAT : 0) | (how.createNew ? O_EXCL : 0);
+        | (how.truncate && !truncateOpen ? O_TRUNC : 0) | (how.create || how.createNew ? O_CREAT : 0)
+        | (how.createNew ? O_EXCL : 0);
       if (how.read && changes && !everything()) allowed('read', p);
       const fd = everything() ? fs.openSync(p, flag) : opening(changes ? 'write' : 'read', p, flag, fs.openSync);
+      if (truncateOpen) fs.ftruncateSync(fd, 0);
       const kind = fs.fstatSync(fd);
       const seekable = kind.isFile() || kind.isBlockDevice();
       return {

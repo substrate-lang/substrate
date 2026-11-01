@@ -44,6 +44,7 @@
             pkgs.nodejs        # V8: the host (substrate/host/subhost.mjs), and the web tests' driver
             pkgs.openssl       # certificates for the proxy tests
             pkgs.git           # repositories for the package tests
+            pkgs.gh            # GitHub: the CI runs
             (chromium pkgs)    # the headless browser of the web tests (above)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.clang     # the C benchmarks' compiler (bench/substrate)

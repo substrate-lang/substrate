@@ -37,11 +37,26 @@ const launched = (file, args, program = file) => {
 };
 
 export function become(command, argv, env) {
-  if (typeof globalThis.process.execve === 'function') globalThis.process.execve(command, argv, env);
+  if (globalThis.process.platform !== 'win32') globalThis.process.execve(command, argv, env);
   const r = child.spawnSync(command, argv.slice(1), { env, stdio: 'inherit' });
   if (r.error) throw r.error;
   globalThis.process.exit(r.status !== null ? r.status : 128 + (os.constants.signals[r.signal] || 0));
 }
+
+const searchOf = (env) => env[Object.keys(env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH'] ?? '/usr/bin:/bin';
+
+const windows = globalThis.process.platform === 'win32';
+
+const childEnv = (clear, given) => {
+  const env = clear ? {} : { ...globalThis.process.env };
+  for (const e of given) {
+    const equals = e.indexOf('=');
+    const name = equals < 0 ? e : e.slice(0, equals);
+    if (windows) for (const k of Object.keys(env)) if (k.toUpperCase() === name.toUpperCase()) delete env[k];
+    env[name] = equals < 0 ? '' : e.slice(equals + 1);
+  }
+  return env;
+};
 
 const mainOnly = (setup, call) => {
   if (setup.worker) throw new Error(`process.${call} is not available in a worker`);
@@ -63,12 +78,8 @@ export function processes(grants, loader, setup = {}) {
         try {
           const program = caller.string(pp, pl);
           const cwd = caller.string(dp, dl) || undefined;
-          const env = clear ? {} : { ...globalThis.process.env };
-          for (const e of entries(caller.string(ep, el))) {
-            const equals = e.indexOf('=');
-            env[equals < 0 ? e : e.slice(0, equals)] = equals < 0 ? '' : e.slice(equals + 1);
-          }
-          const file = programFile(program, cwd, env.PATH ?? '/usr/bin:/bin');
+          const env = childEnv(clear, entries(caller.string(ep, el)));
+          const file = programFile(program, cwd, searchOf(env));
           if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
           const l = launched(file ?? program, entries(caller.string(ap, al)));
           process = child.spawn(l.command, l.args, { cwd, env, stdio: modes });
@@ -100,12 +111,8 @@ export function processes(grants, loader, setup = {}) {
           mainOnly(setup, 'run');
           const program = caller.string(pp, pl);
           const cwd = caller.string(dp, dl) || undefined;
-          const env = clear ? {} : { ...globalThis.process.env };
-          for (const e of entries(caller.string(ep, el))) {
-            const equals = e.indexOf('=');
-            env[equals < 0 ? e : e.slice(0, equals)] = equals < 0 ? '' : e.slice(equals + 1);
-          }
-          const file = programFile(program, cwd, env.PATH ?? '/usr/bin:/bin');
+          const env = childEnv(clear, entries(caller.string(ep, el)));
+          const file = programFile(program, cwd, searchOf(env));
           if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
           dir = fs.mkdtempSync(path.join(os.tmpdir(), 'subhost-run-'));
           const out = fs.openSync(path.join(dir, 'output'), 'w');
@@ -135,7 +142,7 @@ export function processes(grants, loader, setup = {}) {
           mainOnly(setup, 'exec');
           const program = caller.string(pp, pl);
           const env = globalThis.process.env;
-          const file = programFile(program, undefined, env.PATH ?? '/usr/bin:/bin');
+          const file = programFile(program, undefined, searchOf(env));
           if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
           const l = launched(file ?? program, entries(caller.string(ap, al)), program);
           become(l.command, [l.argv0, ...l.args], env);
@@ -150,7 +157,7 @@ export function processes(grants, loader, setup = {}) {
           mainOnly(setup, 'exec_at_end');
           const program = caller.string(pp, pl);
           const env = { ...globalThis.process.env };
-          const file = programFile(program, undefined, env.PATH ?? '/usr/bin:/bin');
+          const file = programFile(program, undefined, searchOf(env));
           if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
           const l = launched(file ?? program, entries(caller.string(ap, al)), program);
           setup.atEnd = { file: l.command, argv: [l.argv0, ...l.args], env };
