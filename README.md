@@ -60,6 +60,7 @@ In the dev shell (`nix develop`), where `bin/sub` is short for `bin/substrate`:
     bin/substrate doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM
     bin/substrate doc -o DIR PACKAGE ...         # packages' documentation as text, or with --html as HTML, into DIR
     bin/substrate test [./DIR ...] [PATTERN ...] # the tests of the current package, or of each DIR at once
+    bin/substrate test --browser=chromium ./DIR  # DIR's tests, opening browsers in Chromium and running those marked #:chromium
     bin/substrate version                        # substrate's version, and the hash of its files
     make check                                   # the tests, then make docs when they pass
     tests/web/run.sh                             # the browser tests
