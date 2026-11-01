@@ -19,6 +19,6 @@ NIX_HARDENING_ENABLE= clang "${flags[@]}" -o "$out/speedtest1" "$out/speedtest1.
 NIX_HARDENING_ENABLE= clang "${flags[@]}" -o "$out/native" "$here/native.c" "$SQLITE_AMALGAMATION/sqlite3.c" -lm
 "$out/speedtest1" --testset main,orm/25,cte/20,json,fp/3,parsenumber/25,star --size "$size" \
   --script "$out/script.sql" :memory: > /dev/null
-(cd "$here" && "$root/bin/sub" build speed.sub -o "$out/ours" -c "$root/build/bench/cache" > /dev/null)
+(cd "$here" && "$root/bin/substrate" build speed.sub -o "$out/ours" -c "$root/build/bench/cache" > /dev/null)
 
 node --experimental-wasm-exnref --no-liftoff --no-warnings "$here/run.mjs" "$out" "$reps"

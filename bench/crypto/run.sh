@@ -7,7 +7,7 @@ out="$root/build/bench/crypto"
 reps="${1:-5}"
 mkdir -p "$out"
 
-(cd "$here" && "$root/bin/sub" build crypto.sub -o "$out/ours" -c "$root/build/bench/cache" > /dev/null)
+(cd "$here" && "$root/bin/substrate" build crypto.sub -o "$out/ours" -c "$root/build/bench/cache" > /dev/null)
 sources=("$MBEDTLS_SOURCE"/library/{sha256,md,pkcs5,platform_util,constant_time}.c)
 flags=(-O2 -I"$here" -I"$MBEDTLS_SOURCE/include" -I"$MBEDTLS_SOURCE/library" -DMBEDTLS_CONFIG_FILE='"config.h"')
 NIX_HARDENING_ENABLE= clang "${flags[@]}" -o "$out/mbedtls.native" "$here/mbedtls.c" "${sources[@]}"

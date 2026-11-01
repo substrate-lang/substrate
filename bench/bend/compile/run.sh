@@ -10,9 +10,9 @@ mkdir -p "$out"
   "$here/proofs.sh" "$n"; } > "$out/proofs-$n.sub"
 cache="$out/cache"
 mkdir -p "$cache"
-(cd "$here" && "$root/bin/sub" build warm.sub -o "$out/warm" -c "$cache" > /dev/null)
+(cd "$here" && "$root/bin/substrate" build warm.sub -o "$out/warm" -c "$cache" > /dev/null)
 rm -rf "$out/proofs-$n"
 log="$out/time.log"
-(cd "$out" && command time -f '%e %M' "$root/bin/sub" build "proofs-$n.sub" -o "$out/proofs-$n" -c "$cache" > "$log" 2>&1) || { cat "$log"; exit 1; }
+(cd "$out" && command time -f '%e %M' "$root/bin/substrate" build "proofs-$n.sub" -o "$out/proofs-$n" -c "$cache" > "$log" 2>&1) || { cat "$log"; exit 1; }
 read -r real kb < <(tail -1 "$log")
 printf "proofs-%s %6s s  %5s MB\n" "$n" "$real" "$((kb / 1024))"

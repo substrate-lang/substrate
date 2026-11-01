@@ -11,12 +11,12 @@ const require = createRequire(import.meta.url);
 const resolveGrant = (p, k) => require('./node/fs.mjs').resolveGrant(p, k);
 const resolveFlag = (p, k) => {
   const item = resolveGrant(p, k);
-  if (item === null) process.stderr.write(`subhost: --allow-run: ${p} is not found, so it is not granted\n`);
+  if (item === null) process.stderr.write(`substrate: --allow-run: ${p} is not found, so it is not granted\n`);
   return item;
 };
 
 function usage() {
-  process.stderr.write('usage: sub run [FLAG ...] DIR [ARG ...]\n'
+  process.stderr.write('usage: substrate run [FLAG ...] DIR [ARG ...]\n'
     + '  grants: -A, -R[=PATH,...], -W[=PATH,...], -N[=HOST[:PORT],...], -E[=NAME,...], --allow-run[=PROGRAM,...],\n'
     + '          --deny-read=PATH,..., --deny-write=PATH,..., --deny-net=HOST[:PORT],..., --deny-env=NAME,...,\n'
     + '          --deny-run=PROGRAM,...\n'
@@ -26,7 +26,7 @@ function usage() {
 }
 
 function fail(message) {
-  process.stderr.write(`subhost: ${message}\n`);
+  process.stderr.write(`substrate: ${message}\n`);
   process.exit(64);
 }
 
@@ -48,7 +48,7 @@ function read(file) {
   try {
     return fs.readFileSync(file);
   } catch (e) {
-    process.stderr.write(`subhost: cannot read ${file}\n`);
+    process.stderr.write(`substrate: cannot read ${file}\n`);
     process.exit(1);
   }
 }

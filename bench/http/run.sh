@@ -8,5 +8,5 @@ out="$root/build/bench/http"
 seconds="${1:-5}"
 mkdir -p "$out"
 
-(cd "$here" && "$root/bin/sub" build server.sub -o "$out/server" -c "$root/build/bench/cache" > /dev/null)
+(cd "$here" && "$root/bin/substrate" build server.sub -o "$out/server" -c "$root/build/bench/cache" > /dev/null)
 node --no-warnings "$here/run.mjs" "$out" "$seconds"
