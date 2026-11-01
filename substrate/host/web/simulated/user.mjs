@@ -127,6 +127,12 @@ export function user(document, window) {
       const { key: name, held } = parseKey(spec);
       press(name, held);
     },
+    moveMouse(dx, dy) {
+      const e = document.pointerLockElement || document.body;
+      const mouse = { button: 0, buttons: 0, movementX: dx, movementY: dy, view: window, ...down };
+      e.dispatchEvent(new Event('pointermove', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...mouse }));
+      e.dispatchEvent(new Event('mousemove', { bubbles: true, cancelable: true, ...mouse }));
+    },
     keyDown(spec) {
       const { key: name, held } = parseKey(spec);
       if (modifiers[name]) down[modifiers[name]] = true;

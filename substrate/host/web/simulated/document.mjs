@@ -378,7 +378,14 @@ function styleOf(element) {
     get(_, prop) {
       if (prop === 'cssText') return element.getAttribute('style') || '';
       if (prop === 'getPropertyValue') return (name) => read().get(name) || '';
-      if (prop === 'setProperty') return (name, value) => { const m = read(); if (value === '' || value === null) m.delete(name); else m.set(name, String(value)); write(m); };
+      if (prop === 'setProperty') {
+        return (name, value) => {
+          const m = read();
+          if (value === '' || value === null) m.delete(name);
+          else m.set(name, String(value));
+          write(m);
+        };
+      }
       if (prop === 'removeProperty') return (name) => { const m = read(); const v = m.get(name) || ''; m.delete(name); write(m); return v; };
       return typeof prop === 'string' ? read().get(css(prop)) || '' : undefined;
     },
@@ -739,7 +746,9 @@ export class Element extends Node {
 
   // A new drawing for each call: dom.mjs's draw patch calls it once for each.
   getContext(kind) {
-    if (this.localName !== 'canvas' || kind !== '2d') return null;
+    if (this.localName !== 'canvas') return null;
+    if (kind === 'webgpu') return this.context ? null : (this.gpuContext ||= this.ownerDocument.hooks.webgpuContext(this));
+    if (kind !== '2d' || this.gpuContext) return null;
     if (!this.context) this.context = new Context2d(this);
     this.context.begin();
     return this.context;
@@ -812,6 +821,7 @@ export class Document extends Node {
       download: () => {},
       pick: () => {},
       loadImage: () => {},
+      webgpuContext: () => null,
       error: (e) => { throw e; },
     };
     const html = this.createElement('html');
@@ -1209,9 +1219,11 @@ export class Context2d {
 
   scale(x, y) { this.say('scale', number(x), number(y)); }
 
-  drawImage(image, ...n) { this.say('draw-image', quoted(image.recordedName || image.getAttribute('src') || ''), ...n.map(number)); }
+  drawImage(image, ...n) {
+    this.say('draw-image', quoted(image.recordedName || (image.getAttribute ? image.getAttribute('src') : '') || ''), ...n.map(number));
+  }
 
   measureText(s) { return { width: String(s).length * 8 }; }
 
-  getImageData() { throw new Error('the simulated browser keeps no pixels'); }
+  getImageData(x, y, w, h) { return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }; }
 }

@@ -64,7 +64,8 @@ export function makeWebSocket(later, where) {
 
     send(data) {
       if (this.readyState !== 1) throw new Error('InvalidStateError: the WebSocket is not open');
-      const echo = typeof data === 'string' ? data : new Uint8Array(ArrayBuffer.isView(data) ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data.slice(0)).buffer;
+      const bytes = ArrayBuffer.isView(data) ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data.slice(0);
+      const echo = typeof data === 'string' ? data : bytes;
       later(() => {
         if (this.readyState === 1) this.dispatchEvent(new Event('message', { data: echo }));
       });

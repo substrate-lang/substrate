@@ -3,7 +3,7 @@
 // carries out requests to act on the page, read it and check it, settling the page after each.
 import { resolveObjectURL } from 'node:buffer';
 import { workerData } from 'node:worker_threads';
-import { Document, Event, Node, NodeFilter, Window, parseInto } from './document.mjs';
+import { Document, Element, Event, Node, NodeFilter, Window, parseInto } from './document.mjs';
 import { makeClock } from './clock.mjs';
 import { describe, findAll, parse } from './find.mjs';
 import { user as userOf } from './user.mjs';
@@ -13,8 +13,11 @@ import { makeFetch, makeWebSocket } from './network.mjs';
 import { sizeOf } from './images.mjs';
 import { installClock, installRandom } from './globals.mjs';
 import { makeWorker } from './threads.mjs';
+import { makeAudio, makeWebGpu } from './media.mjs';
 import { run } from '../subhost-web.mjs';
 import { dom } from '../dom.mjs';
+import { audio } from '../audio.mjs';
+import { gpu } from '../gpu.mjs';
 import { workers as workerModule } from '../worker.mjs';
 import { storage } from '../storage.mjs';
 import { locationModule } from '../location.mjs';
@@ -54,6 +57,7 @@ let activity = 0;
 let ended = null;
 let workers = null;
 let workersSeen = false;
+let sounds = [];
 
 const say = (line) => lines.push(line);
 const consoleText = () => [...lines, ...[partial[1], partial[2]].filter((p) => p !== '')].join('\n');
@@ -87,6 +91,18 @@ async function track(work) {
 
 const sameBytes = (a, b) => a.length === b.length && Buffer.from(a.buffer, a.byteOffset, a.length).equals(Buffer.from(b.buffer, b.byteOffset, b.length));
 
+// The path of the site's file with these bytes, or otherwise.
+const nameOf = (bytes, otherwise) => {
+  const named = [...site].find(([, b]) => sameBytes(b, bytes));
+  return named ? named[0] : otherwise;
+};
+
+class HTMLCanvasElement {
+  static [Symbol.hasInstance](x) {
+    return x instanceof Element && x.localName === 'canvas';
+  }
+}
+
 function loadImage(img) {
   const src = img.getAttribute('src') || '';
   track(async () => {
@@ -100,8 +116,7 @@ function loadImage(img) {
     }
     if (img.getAttribute('src') !== src) return;
     const size = bytes && sizeOf(bytes);
-    const named = bytes && [...site].find(([, b]) => sameBytes(b, bytes));
-    img.recordedName = named ? named[0] : src;
+    img.recordedName = bytes ? nameOf(bytes, src) : src;
     img.complete = true;
     if (size) {
       [img.naturalWidth, img.naturalHeight] = size;
@@ -136,8 +151,13 @@ function install(seed) {
       });
     },
     loadImage,
+    webgpuContext: (canvas) => webgpu.context(canvas),
     error: (e) => say(`uncaught: ${e && e.message ? e.message : e}`),
   };
+  const webgpu = makeWebGpu();
+  const { AudioContext, OfflineAudioContext } = makeAudio({
+    document: () => document, clock: () => clock, later, nameOf: (bytes) => nameOf(bytes, ''), sound: (line) => sounds.push(line),
+  });
   if (workers) workers.stopAll();
   workers = makeWorker({
     later, say, seed, clock: () => clock, site: () => site, answers: () => kept.answers, url: () => location.href,
@@ -171,6 +191,10 @@ function install(seed) {
     fetch: makeFetch(site, kept.answers, where, track),
     WebSocket: makeWebSocket(later, where),
     Worker: workers.Worker,
+    AudioContext,
+    OfflineAudioContext,
+    HTMLCanvasElement,
+    ...webgpu.globals,
     addEventListener: window.addEventListener.bind(window),
     removeEventListener: window.removeEventListener.bind(window),
     dispatchEvent: window.dispatchEvent.bind(window),
@@ -187,7 +211,10 @@ function install(seed) {
     },
   };
   Object.defineProperty(g, 'navigator', {
-    value: { userAgent: 'substrate simulated browser', language: 'en-US', languages: ['en-US'], hardwareConcurrency: 4, clipboard: clipboardOf },
+    value: {
+      userAgent: 'substrate simulated browser', language: 'en-US', languages: ['en-US'], hardwareConcurrency: 4,
+      clipboard: clipboardOf, gpu: webgpu.gpu,
+    },
     configurable: true,
     writable: true,
   });
@@ -232,12 +259,15 @@ const storageName = () => location.pathname.replace(/[^/]*$/, '');
 async function load() {
   const { markup, names, wasm, files, seed } = kept.program;
   ended = null;
+  sounds = [];
   decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   install(seed);
   placeMarkup(markup);
   const root = document.getElementById('root');
   if (!root) throw new Error('the page has no element with the id root');
   const { fetchModule } = await import('../../modules/fetch.mjs');
+  const theDom = dom(root);
+  const theGpu = await gpu({ dom: theDom });
   run({
     files: new Map(files.map(([p, b]) => [p, b.slice()])),
     cwd: '/',
@@ -250,9 +280,9 @@ async function load() {
       activity++;
     },
     modules: {
-      dom: dom(root), clock: clockModule(), random: random(), timer: timer(), fetch: fetchModule(), websocket: websocket(),
-      storage: storage(storageName()), location: locationModule(), clipboard: clipboard(), files: filesModule(),
-      worker: workerModule(),
+      dom: theDom, audio: audio(), gpu: theGpu, clock: clockModule(), random: random(), timer: timer(), fetch: fetchModule(),
+      websocket: websocket(), storage: storage(storageName()), location: locationModule(), clipboard: clipboard(),
+      files: filesModule(), worker: workerModule(),
     },
   }, names, new Map(wasm));
   await settle();
@@ -319,6 +349,8 @@ async function handle(m) {
     }
     case 'press':
       return act(() => user.press(fields[1]));
+    case 'move-mouse':
+      return act(() => user.moveMouse(Number(fields[1]), Number(fields[2])));
     case 'key-down':
       return act(() => user.keyDown(fields[1]));
     case 'key-up':
@@ -400,11 +432,16 @@ async function handle(m) {
     case 'expect-drawn': {
       const [f, k] = found();
       const drawing = drawingOf(f);
-      if (!includes(drawing, fields[k])) throw new Error(`the last drawing of ${describe(f)} does not include\n  ${fields[k].replace(/\n/g, '\n  ')}\nit is\n  ${drawing.replace(/\n/g, '\n  ')}`);
+      const indented = (s) => s.replace(/\n/g, '\n  ');
+      if (!includes(drawing, fields[k])) {
+        throw new Error(`the last drawing of ${describe(f)} does not include\n  ${indented(fields[k])}\nit is\n  ${indented(drawing)}`);
+      }
       return '';
     }
     case 'console':
       return consoleText();
+    case 'sounds':
+      return sounds.join('\n');
     case 'expect-text': {
       const [f, k] = found();
       const e = one(f);
