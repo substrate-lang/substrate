@@ -5,8 +5,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { createHost, Exit } from './subhost-core.mjs';
 import { grantFlag, grantsOf, noGrants } from './grants.mjs';
-import { hostFlag, hostModules, setupOf } from './node/modules.mjs';
-import { become } from './node/process.mjs';
+import { hostFlag, hostModules, setupOf, system } from './node/modules.mjs';
 
 const require = createRequire(import.meta.url);
 const resolveGrant = (p, k) => require('./node/fs.mjs').resolveGrant(p, k);
@@ -53,18 +52,19 @@ function read(file) {
     process.exit(1);
   }
 }
-const names = read(`${dir}/program`).toString().split('\n').filter((n) => n !== '');
+const names = read(`${dir}/program`).toString().split(/\r?\n/).filter((n) => n !== '');
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
 
 // The program process.exec_at_end kept (node/process.mjs).
 const atEnd = () => {
   const kept = setup.atEnd;
-  if (kept) become(kept.file, kept.argv, kept.env);
+  if (kept) require('./node/process.mjs').become(kept.file, kept.argv, kept.env);
 };
 process.on('beforeExit', atEnd);
 
 const host = createHost({
   args: programArgs,
+  os: system,
   write(fd, bytes) {
     try {
       fs.writeSync(fd, bytes);
