@@ -1,5 +1,5 @@
 // node sprites.mjs SITES [hardware] times the many-sprites game drawn with the 2D context and with WebGPU.
-import { served, withBrowser, webgpuFlags, hardwareGpuFlags } from '../../tests/web/browser.mjs';
+import { served, withBrowser, webgpuFlags, hardwareGpuFlags } from './browser.mjs';
 
 const [sites, hardware] = process.argv.slice(2);
 const counts = [1000, 5000, 20000];

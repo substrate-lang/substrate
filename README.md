@@ -63,7 +63,6 @@ In the dev shell (`nix develop`), where `bin/sub` is short for `bin/substrate`:
     bin/substrate test --browser=chromium ./DIR  # DIR's tests, opening browsers in Chromium and running those marked #:chromium
     bin/substrate version                        # substrate's version, and the hash of its files
     make check                                   # the tests, then make docs when they pass
-    tests/web/run.sh                             # the browser tests
     make bootstrap                               # the compiler builds itself into the same bytes
     make seed                                    # the bootstrap check, then the compiler and substrate become the seed
     make repl                                    # the REPL's site, in build/web/repl
