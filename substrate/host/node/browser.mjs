@@ -63,8 +63,8 @@ export function browsers(grants) {
       return got.message;
     };
 
-    const answer = (out, text) => {
-      const p = caller.give(utf8.encode(text), caller.u(out) + 4);
+    const answer = (out, bytes) => {
+      const p = caller.give(bytes, caller.u(out) + 4);
       new DataView(caller.memory().buffer).setUint32(caller.u(out), p, true);
     };
 
@@ -138,7 +138,7 @@ export function browsers(grants) {
           caller.fail(err, reply.message);
           return -1;
         }
-        answer(out, reply.text);
+        answer(out, reply.bytes ? new Uint8Array(reply.bytes) : utf8.encode(reply.text));
         return 0;
       },
       close(id) {

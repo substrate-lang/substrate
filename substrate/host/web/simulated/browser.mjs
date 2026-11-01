@@ -411,6 +411,11 @@ async function handle(m) {
       return '';
     case 'console':
       return consoleText();
+    case 'pixels':
+    case 'expect-pixel':
+      throw new Error('the simulated browser draws no pixels: a test that reads them is marked #:chromium and runs with --browser=chromium');
+    case 'box':
+      throw new Error('the simulated browser lays nothing out: a test that reads where elements are is marked #:chromium and runs with --browser=chromium');
     case 'sounds':
       return sounds.join('\n');
     default:

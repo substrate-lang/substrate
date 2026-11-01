@@ -4,7 +4,7 @@ import { describe, parse } from './find.mjs';
 import { documentRequest, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
 
-const { clock, realSetTimeout, drawings, blobs, decoded, sounds } = window[Symbol.for('substrate.testing')];
+const { clock, realSetTimeout, drawings, blobs, decoded, sounds, kinds, getContext, frames } = window[Symbol.for('substrate.testing')];
 const turn = () => new Promise((resolve) => realSetTimeout(resolve, 0));
 const quote = (s) => JSON.stringify(s);
 
@@ -54,6 +54,36 @@ async function soundLines() {
   const lines = [];
   for (const s of sounds) lines.push(heard({ ...s, name: s.buffer ? await nameOf(decoded.get(s.buffer) || new Uint8Array(), '') : '' }));
   return lines.join('\n');
+}
+
+const base64 = (bytes) => {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 32768) s += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  return btoa(s);
+};
+
+// A canvas's pixels in a rectangle, as RGBA bytes, row by row: a 2D canvas's own, a WebGPU canvas's last frame, or
+// none for a canvas with neither.
+async function pixels(canvas, x, y, w, h) {
+  if (kinds.get(canvas) === '2d') return getContext.call(canvas, '2d').getImageData(x, y, w, h).data;
+  const kept = frames.get(canvas);
+  if (!kept) return new Uint8Array(w * h * 4);
+  const { device, texture } = kept;
+  const bytesPerRow = (w * 4 + 255) & ~255;
+  const staging = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const encoder = device.createCommandEncoder();
+  encoder.copyTextureToBuffer({ texture, origin: [x, y, 0] }, { buffer: staging, bytesPerRow, rowsPerImage: h }, [w, h, 1]);
+  device.queue.submit([encoder.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const padded = new Uint8Array(staging.getMappedRange());
+  const bytes = new Uint8Array(w * 4 * h);
+  for (let row = 0; row < h; row++) bytes.set(padded.subarray(row * bytesPerRow, row * bytesPerRow + w * 4), row * w * 4);
+  staging.unmap();
+  staging.destroy();
+  if (texture.format.startsWith('bgra')) {
+    for (let i = 0; i < bytes.length; i += 4) [bytes[i], bytes[i + 2]] = [bytes[i + 2], bytes[i]];
+  }
+  return bytes;
 }
 
 // The storage module's database for this page (substrate/host/web/storage.mjs), used as it uses it.
@@ -112,6 +142,22 @@ async function carriedOut(fields) {
       return location.href;
     case 'sounds':
       return soundLines();
+    case 'pixels': {
+      const [f, k] = found();
+      const [x, y, w, h] = fields.slice(k, k + 4).map(Number);
+      return { pixels: base64(await pixels(canvasOf(document, f), x, y, w, h)) };
+    }
+    case 'expect-pixel': {
+      const [f, k] = found();
+      const [x, y] = [Number(fields[k]), Number(fields[k + 1])];
+      const p = [...(await pixels(canvasOf(document, f), x, y, 1, 1))].join(',');
+      if (p !== fields[k + 2]) throw new Error(`the pixel at ${x}, ${y} of ${describe(f)} is ${p}, not ${fields[k + 2]}`);
+      return '';
+    }
+    case 'box': {
+      const r = one(document, found()[0]).getBoundingClientRect();
+      return [r.x, r.y, r.width, r.height].map((n) => n.toFixed(3)).join(' ');
+    }
     case 'storage-get': {
       const v = await stored('readonly', (s) => s.get(fields[1]));
       if (v === undefined) throw new Error(`the browser's storage has no key ${quote(fields[1])}`);

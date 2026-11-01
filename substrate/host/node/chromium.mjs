@@ -360,6 +360,8 @@ async function handle(b, m) {
       return '';
     case 'downloaded':
       return downloaded(b, fields[1]);
+    case 'pixels':
+      return Buffer.from((await agent(b, fields)).pixels, 'base64');
     case 'respond': {
       const url = new URL(fields[1], await agent(b, ['url'])).href;
       b.answers.set(url, { status: Number(fields[2]), body: Buffer.from(fields[3]) });
@@ -384,12 +386,12 @@ async function ended() {
 port.on('message', async (m) => {
   let reply;
   try {
-    let text = '';
+    let value = '';
     if (m.type === 'open') await opened(m.browser, m.site, m.url, m.seed);
     else if (m.type === 'close') await closed(browsers.get(m.browser));
     else if (m.type === 'end') await ended();
-    else text = await handle(browsers.get(m.browser), m);
-    reply = { ok: true, text };
+    else value = await handle(browsers.get(m.browser), m);
+    reply = value instanceof Uint8Array ? { ok: true, bytes: value } : { ok: true, text: value };
   } catch (e) {
     reply = { ok: false, message: e && e.message ? e.message : String(e) };
   }
