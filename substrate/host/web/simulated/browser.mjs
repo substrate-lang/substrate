@@ -11,7 +11,7 @@ import { canvasOf, drawingRequest } from '../testing/logs.mjs';
 import { user as userOf } from './user.mjs';
 import { historyOf, locationOf, makeHistory } from './navigation.mjs';
 import { makeIndexedDB } from './indexeddb.mjs';
-import { makeFetch, makeWebSocket } from './network.mjs';
+import { makeFetch, makeWebSocket, nodeFetch } from './network.mjs';
 import { sizeOf } from './images.mjs';
 import { installClock, installRandom } from '../testing/globals.mjs';
 import { makeWorker } from './threads.mjs';
@@ -31,6 +31,7 @@ import { random } from '../../modules/random.mjs';
 import { timer } from '../../modules/timer.mjs';
 import { websocket } from '../../modules/websocket.mjs';
 import { entries } from '../../entries.mjs';
+import { mayUrl } from '../../grants.mjs';
 
 const { port, signal } = workerData;
 const turn = () => new Promise((resolve) => setImmediate(resolve));
@@ -43,7 +44,9 @@ const text = new TextDecoder();
 const origin = 'http://localhost';
 
 // What lasts for the browser's life: what loading the program again, or going to another URL, keeps.
-const kept = { databases: new Map(), clipboard: '', downloads: new Map(), answers: new Map(), chosen: null, history: null, program: null };
+const kept = {
+  databases: new Map(), clipboard: '', downloads: new Map(), answers: new Map(), chosen: null, history: null, program: null, net: null,
+};
 
 const lines = [];
 const partial = { 1: '', 2: '' };
@@ -189,7 +192,7 @@ function install(seed) {
     Image,
     indexedDB,
     IDBKeyRange,
-    fetch: makeFetch(site, kept.answers, where, track),
+    fetch: makeFetch(site, kept.answers, where, track, (u) => kept.net !== null && mayUrl(kept.net, u) && nodeFetch),
     WebSocket: makeWebSocket(later, where),
     Worker: workers.Worker,
     AudioContext,
@@ -299,8 +302,9 @@ async function load() {
 }
 
 // open opens a site as start.mjs starts one: its program, given the files in assets.list and files.pack, at url.
-async function open({ site: given, url, seed }) {
+async function open({ site: given, url, seed, net }) {
   site = new Map(given);
+  kept.net = net || null;
   const file = (path) => {
     const bytes = site.get(path);
     if (!bytes) throw new Error(`the site has no ${path.slice(1)}`);
@@ -423,10 +427,10 @@ async function handle(m) {
   }
 }
 
-// Once the program has started a worker, an expectation is tried again for up to 10 seconds, as workers answer in
-// their own time.
+// Once the program has started a worker, or can reach a test's server, an expectation is tried again for up to 10
+// seconds, as workers and servers answer in their own time.
 async function handled(m) {
-  if (!workersSeen || !entries(m.fields)[0].startsWith('expect-')) return handle(m);
+  if (!(workersSeen || kept.net) || !entries(m.fields)[0].startsWith('expect-')) return handle(m);
   const until = realNow() + 10000;
   for (;;) {
     try {

@@ -13,6 +13,7 @@ import { installRecorders } from '../web/testing/recorders.mjs';
 import { parse } from '../web/testing/find.mjs';
 import { codeOf, modifiers, parseKey } from '../web/testing/keys.mjs';
 import { entries } from '../entries.mjs';
+import { mayUrl } from '../grants.mjs';
 
 const { port, signal, file } = workerData;
 const testing = fileURLToPath(new URL('../web/testing/', import.meta.url));
@@ -142,8 +143,8 @@ function heard(m) {
   }
 }
 
-// served answers a page's request: from the answers a test gave, the site's files, or the page's half of a test.
-// Anything else fails, as there is no network.
+// served answers a page's request: with the page's half of a test, the answers a test gave, the site's files, or, for
+// a site opened through a test's server, the network, as far as the test's grants reach. Anything else fails.
 async function served(b, m) {
   const { requestId, request } = m.params;
   const url = new URL(request.url);
@@ -151,15 +152,18 @@ async function served(b, m) {
     requestId, responseCode: status, body: Buffer.from(body).toString('base64'),
     responseHeaders: [{ name: 'Content-Type', value: type }, { name: 'Cache-Control', value: 'no-store' }],
   }, m.sessionId);
-  const answer = b.answers.get(url.href);
-  if (answer) return fulfil(answer.status, typeOf(url.pathname), answer.body);
-  if (url.origin !== origin) return send('Fetch.failRequest', { requestId, errorReason: 'Failed' }, m.sessionId);
   const p = decodeURIComponent(url.pathname);
   if (p.startsWith(reserved) && /^[a-z]+\.mjs$/.test(p.slice(reserved.length))) {
     return fulfil(200, 'text/javascript', fs.readFileSync(path.join(testing, p.slice(reserved.length))));
   }
-  const bytes = b.site.get(p === '/' ? '/index.html' : p);
-  return bytes ? fulfil(200, typeOf(p), bytes) : fulfil(404, 'text/plain', 'not found');
+  const answer = b.answers.get(url.href);
+  if (answer) return fulfil(answer.status, typeOf(url.pathname), answer.body);
+  if (url.origin === origin) {
+    const bytes = b.site.get(p === '/' ? '/index.html' : p);
+    return bytes ? fulfil(200, typeOf(p), bytes) : fulfil(404, 'text/plain', 'not found');
+  }
+  if (b.net && mayUrl(b.net, url)) return send('Fetch.continueRequest', { requestId }, m.sessionId);
+  return send('Fetch.failRequest', { requestId, errorReason: 'Failed' }, m.sessionId);
 }
 
 // chosen answers a file picker with the files a test chose for it, or cancels it when there are none.
@@ -173,14 +177,14 @@ async function chosen(b, { backendNodeId }) {
 
 // ---- browsers ----
 
-async function opened(id, site, url, seed) {
+async function opened(id, site, url, seed, net) {
   if (!chrome) launch();
   const { browserContextId } = await send('Target.createBrowserContext', { disposeOnDetach: true });
   const { targetId } = await send('Target.createTarget', { url: 'about:blank', browserContextId });
   const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
   const downloadPath = fs.mkdtempSync(path.join(profile, 'downloads-'));
   const b = {
-    id, browserContextId, targetId, sessionId, downloadPath, site: new Map(site), answers: new Map(), downloads: new Map(),
+    id, browserContextId, targetId, sessionId, downloadPath, site: new Map(site), net, answers: new Map(), downloads: new Map(),
     lines: [], thrown: false, chosen: null, held: 0, mouse: { x: 0, y: 0 },
     page: (method, params) => send(method, params, sessionId),
   };
@@ -386,7 +390,7 @@ port.on('message', async (m) => {
   let reply;
   try {
     let value = '';
-    if (m.type === 'open') await opened(m.browser, m.site, m.url, m.seed);
+    if (m.type === 'open') await opened(m.browser, m.site, m.url, m.seed, m.net);
     else if (m.type === 'close') await closed(browsers.get(m.browser));
     else if (m.type === 'end') await ended();
     else value = await handle(browsers.get(m.browser), m);

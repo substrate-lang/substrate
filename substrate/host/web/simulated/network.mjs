@@ -1,5 +1,9 @@
-// The simulated browser's network: fetch gets the site's own files and the answers a test gave, and fails for any
-// other URL; a WebSocket connects to a server that echoes what it is sent.
+// The simulated browser's network: fetch gets the answers a test gave, the network as far as network gives, or else the
+// site's own files, and fails for any other URL; a WebSocket connects to a server that echoes what it is sent.
+import http from 'node:http';
+import https from 'node:https';
+import { Readable } from 'node:stream';
+import zlib from 'node:zlib';
 import { Event, EventTarget } from './document.mjs';
 
 const types = {
@@ -13,10 +17,34 @@ export const typeOf = (path) => types[path.slice(path.lastIndexOf('.') + 1).toLo
 
 const bodiless = new Set([101, 103, 204, 205, 304]);
 
-// site maps a path to its bytes, answers a URL to its status and body, and track runs the work as the program's.
-export function makeFetch(site, answers, where, track) {
-  return (input, init = {}) => track(async () => {
-    const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url, where().href);
+const decoders = { gzip: () => zlib.createGunzip(), deflate: () => zlib.createInflate(), br: () => zlib.createBrotliDecompress() };
+
+// nodeFetch fetches over Node's HTTP for the simulated browser's pages, whose timers and performance are the page's and
+// so useless to Node's own fetch. It decodes compressed bodies, as a browser does.
+export function nodeFetch(url, init = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const headers = {};
+    for (const [k, v] of Array.isArray(init.headers) ? init.headers : Object.entries(init.headers || {})) headers[k] = v;
+    const options = { method: init.method || 'GET', headers, signal: init.signal };
+    const request = (target.protocol === 'https:' ? https : http).request(target, options, (response) => {
+      const decoder = decoders[String(response.headers['content-encoding'] || '').toLowerCase()];
+      const body = decoder ? response.pipe(decoder()) : response;
+      const list = [];
+      for (let i = 0; i + 1 < response.rawHeaders.length; i += 2) list.push([response.rawHeaders[i], response.rawHeaders[i + 1]]);
+      const none = options.method === 'HEAD' || bodiless.has(response.statusCode);
+      resolve(new Response(none ? null : Readable.toWeb(body), { status: response.statusCode, statusText: response.statusMessage, headers: list }));
+    });
+    request.on('error', (e) => reject(new TypeError('Failed to fetch', { cause: e })));
+    request.end(init.body ? Buffer.from(init.body) : undefined);
+  });
+}
+
+// site maps a path to its bytes, answers a URL to its status and body, track runs the work as the program's, and
+// network gives the real fetch for a URL the browser may reach, or null. What the network does takes its own time,
+// so it is not the program's work for settling.
+export function makeFetch(site, answers, where, track, network = () => null) {
+  const local = (url, init) => track(async () => {
     if (url.origin === where().origin) {
       const bytes = site.get(decodeURIComponent(url.pathname));
       if (bytes) {
@@ -31,6 +59,11 @@ export function makeFetch(site, answers, where, track) {
     }
     throw new TypeError('Failed to fetch');
   });
+  return async (input, init = {}) => {
+    const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url, where().href);
+    const real = !answers.has(url.href) && network(url);
+    return real ? real(url.href, init) : local(url, init);
+  };
 }
 
 export function makeWebSocket(later, where) {
