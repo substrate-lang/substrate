@@ -13,7 +13,7 @@ export const typeOf = (path) => types[path.slice(path.lastIndexOf('.') + 1).toLo
 
 const bodiless = new Set([101, 103, 204, 205, 304]);
 
-// site maps a path to its bytes, answers a URL to its status and body, and track runs the work as the page's.
+// site maps a path to its bytes, answers a URL to its status and body, and track runs the work as the program's.
 export function makeFetch(site, answers, where, track) {
   return (input, init = {}) => track(async () => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url, where().href);

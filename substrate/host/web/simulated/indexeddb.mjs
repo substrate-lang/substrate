@@ -1,5 +1,5 @@
 // The simulated browser's IndexedDB: as much as substrate/host/web/storage.mjs uses. The databases last for the
-// browser's life, so a page reloaded finds what it stored.
+// browser's life, so a program loaded again finds what it stored.
 export function makeIndexedDB(databases, later) {
   const request = (work) => {
     const r = { result: undefined, error: null, onsuccess: null, onerror: null };

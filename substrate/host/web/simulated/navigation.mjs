@@ -1,5 +1,6 @@
-// The simulated browser's location and history: the page's URL, and the entries that pushState and back move
-// between. The entries last for the browser's life, so a page reloaded or gone to keeps them.
+// The simulated browser's location and history: the program's URL, and the entries that pushState and back move
+// between. The entries last for the browser's life, so loading the program again or going to another URL keeps
+// them.
 export function makeHistory(url) {
   const entries = [url];
   let index = 0;

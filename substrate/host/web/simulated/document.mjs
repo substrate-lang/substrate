@@ -1,4 +1,4 @@
-// The simulated browser's document: the parts of the DOM that the web host and the page tests use, parsing and
+// The simulated browser's document: the parts of the DOM that the web host and browser tests use, parsing and
 // writing HTML by Chromium's rules, with a 2D canvas that records its drawing.
 import { compileList, select } from './selectors.mjs';
 
@@ -1140,7 +1140,7 @@ const serializeChildren = (node) => node.childNodes.map(serialize).join('');
 const number = (x) => String(Number(Number(x).toFixed(3)));
 const quoted = (s) => JSON.stringify(String(s));
 
-// A 2D context that keeps each drawing as lines, one for each call or setting: what page-drawing gives.
+// A 2D context that keeps each drawing as lines, one for each call or setting: what browser-drawing gives.
 export class Context2d {
   constructor(canvas) {
     this.canvas = canvas;

@@ -1,6 +1,6 @@
-// The host module "page" (page.sub): built web programs opened as pages in the simulated browser
-// (../web/simulated), each on its own thread. Each call waits for the page's answer. The program's files and the
-// page's are read within the caller's grants.
+// The host module "browser" (browser.sub): built web programs opened in simulated browsers (../web/simulated), each
+// on its own thread. Each call waits for the browser's answer. The program's files are read within the caller's
+// grants.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,13 +9,13 @@ import { literalPath } from './fs.mjs';
 import { entries } from '../entries.mjs';
 
 const utf8 = new TextEncoder();
-const browser = new URL('../web/simulated/browser.mjs', import.meta.url);
-const defaultPage = fileURLToPath(new URL('../web/page.html', import.meta.url));
+const script = new URL('../web/simulated/browser.mjs', import.meta.url);
+const defaultHtml = fileURLToPath(new URL('../web/index.html', import.meta.url));
 const patience = 60000;
 
 // The thread's code: it imports the browser, and answers with the error when that fails.
 const start = `const { workerData } = require('node:worker_threads');
-import(${JSON.stringify(browser.href)}).catch((e) => {
+import(${JSON.stringify(script.href)}).catch((e) => {
   workerData.port.once('message', () => {
     workerData.port.postMessage({ ok: false, message: 'the simulated browser cannot start: ' + (e && e.stack || e) });
     Atomics.store(workerData.signal, 0, 1);
@@ -23,7 +23,7 @@ import(${JSON.stringify(browser.href)}).catch((e) => {
   });
 });`;
 
-export function pages(grants) {
+export function browsers(grants) {
   return (caller) => {
     const open = new Map();
     let next = 1;
@@ -37,18 +37,18 @@ export function pages(grants) {
       }
     };
 
-    const ask = (page, message) => {
-      Atomics.store(page.signal, 0, 0);
-      page.port.postMessage(message);
-      if (Atomics.wait(page.signal, 0, 0, patience) === 'timed-out') {
-        page.worker.terminate();
-        page.dead = true;
-        return { ok: false, message: `the page did not answer within ${patience / 1000} s` };
+    const ask = (b, message) => {
+      Atomics.store(b.signal, 0, 0);
+      b.port.postMessage(message);
+      if (Atomics.wait(b.signal, 0, 0, patience) === 'timed-out') {
+        b.worker.terminate();
+        b.dead = true;
+        return { ok: false, message: `the browser did not answer within ${patience / 1000} s` };
       }
-      let got = receiveMessageOnPort(page.port);
+      let got = receiveMessageOnPort(b.port);
       while (got === undefined) {
-        Atomics.wait(page.signal, 0, 1, 10);
-        got = receiveMessageOnPort(page.port);
+        Atomics.wait(b.signal, 0, 1, 10);
+        got = receiveMessageOnPort(b.port);
       }
       return got.message;
     };
@@ -60,7 +60,7 @@ export function pages(grants) {
 
     return {
       end() {
-        for (const page of open.values()) page.worker.terminate();
+        for (const b of open.values()) b.worker.terminate();
         open.clear();
       },
       open(dp, dl, mp, ml, ap, al, up, ul, err) {
@@ -70,22 +70,22 @@ export function pages(grants) {
           const url = caller.string(up, ul);
           const names = read(path.join(dir, 'program')).toString().split(/\r?\n/).filter((n) => n !== '');
           const wasm = names.map((n) => [n, read(path.join(dir, `${n}.wasm`))]);
-          const markup = read(ml > 0 ? caller.string(mp, ml) : defaultPage).toString();
+          const markup = read(ml > 0 ? caller.string(mp, ml) : defaultHtml).toString();
           const files = [];
           const assets = caller.string(ap, al);
           if (al > 0 && fs.existsSync(literalPath(grants, 'read', assets))) filesUnder(assets, '/assets', files);
           const { port1, port2 } = new MessageChannel();
           const signal = new Int32Array(new SharedArrayBuffer(4));
           worker = new Worker(start, { eval: true, workerData: { port: port2, signal }, transferList: [port2] });
-          const page = { worker, port: port1, signal, dead: false };
-          const reply = ask(page, { type: 'open', markup, names, wasm, files, url, seed: 1 });
+          const b = { worker, port: port1, signal, dead: false };
+          const reply = ask(b, { type: 'open', markup, names, wasm, files, url, seed: 1 });
           if (!reply.ok) {
             worker.terminate();
             caller.fail(err, reply.message);
             return 0;
           }
           const id = next++;
-          open.set(id, page);
+          open.set(id, b);
           return id;
         } catch (e) {
           if (worker) worker.terminate();
@@ -94,9 +94,9 @@ export function pages(grants) {
         }
       },
       request(id, ptr, len, out, err) {
-        const page = open.get(id);
-        if (!page || page.dead) {
-          caller.fail(err, page ? 'the page stopped answering' : `no page ${id} is open`);
+        const b = open.get(id);
+        if (!b || b.dead) {
+          caller.fail(err, b ? 'the browser stopped answering' : `no browser ${id} is open`);
           return -1;
         }
         const fields = caller.string(ptr, len);
@@ -110,7 +110,7 @@ export function pages(grants) {
             return -1;
           }
         }
-        const reply = ask(page, message);
+        const reply = ask(b, message);
         if (!reply.ok) {
           caller.fail(err, reply.message);
           return -1;
@@ -119,9 +119,9 @@ export function pages(grants) {
         return 0;
       },
       close(id) {
-        const page = open.get(id);
-        if (!page) return;
-        page.worker.terminate();
+        const b = open.get(id);
+        if (!b) return;
+        b.worker.terminate();
         open.delete(id);
       },
     };

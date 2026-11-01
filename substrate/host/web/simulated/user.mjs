@@ -18,7 +18,7 @@ const codeOf = (key) => {
   return punctuation[key] || '';
 };
 
-// parseKey reads a key as page-press! takes it: a key's name or one character, after any of Shift, Control, Alt and
+// parseKey reads a key as browser-press! takes it: a key's name or one character, after any of Shift, Control, Alt and
 // Meta, each followed by +, as in "Shift+Enter".
 export function parseKey(spec) {
   const m = /^((?:(?:Shift|Control|Alt|Meta)\+)*)(.+)$/.exec(spec);

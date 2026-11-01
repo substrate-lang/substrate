@@ -1,10 +1,10 @@
-// Finding elements as page tests describe them: by CSS selector, text, role and accessible name, label or test id,
+// Finding elements as browser tests describe them: by CSS selector, text, role and accessible name, label or test id,
 // within another finder's elements, or as the nth of a finder's elements.
 import { descendants, select } from './selectors.mjs';
 
 const arity = { css: 1, text: 1, 'text-containing': 1, role: 2, label: 1, 'test-id': 1 };
 
-// parse reads a finder from the request fields at k, as std/test/page.sub writes it, and gives it with the index
+// parse reads a finder from the request fields at k, as std/test/browser.sub writes it, and gives it with the index
 // after it.
 export function parse(fields, k) {
   const kind = fields[k];

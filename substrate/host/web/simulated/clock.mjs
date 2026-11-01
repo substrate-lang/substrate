@@ -47,8 +47,8 @@ export function makeClock(epoch = 1700000000000) {
       fire(t);
       return true;
     },
-    // advance moves the clock ms ahead, running each timer and frame on the way in time order, and settling the page
-    // after each.
+    // advance moves the clock ms ahead, running each timer and frame on the way in time order, and settling the
+    // program after each.
     async advance(ms, settle) {
       const end = now + Math.max(0, ms);
       for (;;) {

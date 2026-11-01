@@ -1,4 +1,4 @@
-// The globals a simulated page and its workers share: time from the simulated clock, and seeded random bytes.
+// The globals the simulated browser and its workers share: time from the simulated clock, and seeded random bytes.
 export function installClock(g, clock) {
   const RealDate = Date;
   class SimulatedDate extends RealDate {

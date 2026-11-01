@@ -1,6 +1,6 @@
-// The simulated browser: one page on its own thread, the real web host running a program over the simulated
-// document, clock, storage, network and the rest. It answers substrate/host/node/page.mjs: it opens the page, then
-// carries out requests to act on the page, read it and check it, settling the page after each.
+// The simulated browser, on its own thread: the real web host running a program over the simulated document, clock,
+// storage, network and the rest. It answers substrate/host/node/browser.mjs: it opens the program, then carries out
+// requests to act on its document, read it and check it, settling the program after each.
 import { resolveObjectURL } from 'node:buffer';
 import { workerData } from 'node:worker_threads';
 import { Document, Element, Event, Node, NodeFilter, Window, parseInto } from './document.mjs';
@@ -41,7 +41,7 @@ const utf8 = new TextEncoder();
 const text = new TextDecoder();
 const origin = 'http://localhost';
 
-// What lasts for the browser's life: what reloading the page or going to another URL keeps.
+// What lasts for the browser's life: what loading the program again, or going to another URL, keeps.
 const kept = { databases: new Map(), clipboard: '', downloads: new Map(), answers: new Map(), chosen: null, history: null, program: null };
 
 const lines = [];
@@ -221,7 +221,7 @@ function install(seed) {
   user = userOf(document, window);
 }
 
-// The page's body: a page file's elements, leaving out its head, its scripts, and the comments and blank text
+// The document's body: the HTML file's elements, leaving out its head, its scripts, and the comments and blank text
 // around its elements.
 function placeMarkup(markup) {
   const scratch = document.createDocumentFragment();
@@ -237,7 +237,7 @@ function placeMarkup(markup) {
   place(scratch);
 }
 
-// settle runs what the page has left to do without the clock moving: due timers, promises and the browser's own
+// settle runs what the program has left to do without the clock moving: due timers, promises and the browser's own
 // later work.
 async function settle() {
   let steps = 0;
@@ -245,7 +245,7 @@ async function settle() {
     const before = activity;
     while (clock.dueNow()) {
       activity++;
-      if (++steps > 100000) throw new Error('the page kept setting timers due now, so the clock could not stand still');
+      if (++steps > 100000) throw new Error('the program kept setting timers due now, so the clock could not stand still');
     }
     await turn();
     if (pending === 0 && activity === before) quiet++;
@@ -255,7 +255,7 @@ async function settle() {
 
 const storageName = () => location.pathname.replace(/[^/]*$/, '');
 
-// load starts the program at the history's current URL in a new page.
+// load starts the program at the history's current URL, in a new document.
 async function load() {
   const { markup, names, wasm, files, seed } = kept.program;
   ended = null;
@@ -264,7 +264,7 @@ async function load() {
   install(seed);
   placeMarkup(markup);
   const root = document.getElementById('root');
-  if (!root) throw new Error('the page has no element with the id root');
+  if (!root) throw new Error('the HTML file has no element with the id root');
   const { fetchModule } = await import('../../modules/fetch.mjs');
   const theDom = dom(root);
   const theGpu = await gpu({ dom: theDom });
@@ -304,7 +304,7 @@ async function open({ markup, names, wasm, files, url, seed }) {
 function one(f) {
   const found = findAll(document, f);
   if (found.length === 1) return found[0];
-  if (found.length === 0) throw new Error(`nothing matches ${describe(f)}\n  the page: ${clip(document.body.innerHTML, 2000)}`);
+  if (found.length === 0) throw new Error(`nothing matches ${describe(f)}\n  the document's body: ${clip(document.body.innerHTML, 2000)}`);
   const listed = found.slice(0, 5).map((e) => `\n  ${short(e)}`).join('');
   throw new Error(`${found.length} elements match ${describe(f)}:${listed}${found.length > 5 ? '\n  ...' : ''}`);
 }
@@ -380,7 +380,7 @@ async function handle(m) {
       return location.href;
     case 'storage-get': {
       const v = storeOf().get(fields[1]);
-      if (v === undefined) throw new Error(`the page's storage has no key ${quote(fields[1])}`);
+      if (v === undefined) throw new Error(`the browser's storage has no key ${quote(fields[1])}`);
       return text.decode(v);
     }
     case 'storage-set':
@@ -501,7 +501,7 @@ async function handle(m) {
   }
 }
 
-// On a page that has started a worker, an expectation is tried again for up to 10 seconds, as workers answer in
+// Once the program has started a worker, an expectation is tried again for up to 10 seconds, as workers answer in
 // their own time.
 async function handled(m) {
   if (!workersSeen || !entries(m.fields)[0].startsWith('expect-')) return handle(m);

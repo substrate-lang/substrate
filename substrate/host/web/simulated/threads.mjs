@@ -1,10 +1,10 @@
-// Web Workers for a simulated page, each one of Node's threads (worker-thread.mjs). page holds what a worker is
-// started with and how it reports: later, the clock, the site and answers, the page's URL, say and seen.
+// Web Workers in the simulated browser, each one of Node's threads (worker-thread.mjs). browser holds what a worker
+// is started with and how it reports: later, the clock, the site and answers, the program's URL, say and seen.
 import { MessageChannel, Worker as NodeWorker } from 'node:worker_threads';
 
 const thread = new URL('./worker-thread.mjs', import.meta.url);
 
-export function makeWorker(page) {
+export function makeWorker(browser) {
   const all = new Set();
   let started = 0;
   class Worker {
@@ -14,23 +14,23 @@ export function makeWorker(page) {
       this.onmessage = null;
       this.onerror = null;
       started++;
-      page.seen();
+      browser.seen();
       this.thread = new NodeWorker(thread, {
         workerData: {
-          script: String(url), control: port2, now: page.clock().now(), epoch: page.clock().epoch, site: [...page.site()],
-          answers: [...page.answers()], url: new URL('host/web/worker-script.mjs', page.url()).href, seed: page.seed + started,
+          script: String(url), control: port2, now: browser.clock().now(), epoch: browser.clock().epoch, site: [...browser.site()],
+          answers: [...browser.answers()], url: new URL('host/web/worker-script.mjs', browser.url()).href, seed: browser.seed + started,
         },
         transferList: [port2],
       });
-      this.thread.on('message', (data) => page.later(() => {
+      this.thread.on('message', (data) => browser.later(() => {
         if (this.onmessage) this.onmessage({ data });
       }));
-      this.thread.on('error', (e) => page.later(() => {
+      this.thread.on('error', (e) => browser.later(() => {
         if (this.onerror) this.onerror({ message: e && e.message ? e.message : String(e), preventDefault() {} });
       }));
       this.thread.on('exit', () => all.delete(this));
       port1.on('message', (m) => {
-        if (m.type === 'console') page.say(m.line);
+        if (m.type === 'console') browser.say(m.line);
       });
       all.add(this);
     }
@@ -47,7 +47,7 @@ export function makeWorker(page) {
   }
   return {
     Worker,
-    // The workers' clocks brought to the page's time.
+    // The workers' clocks brought to the browser's time.
     tell(now) {
       for (const w of all) w.control.postMessage({ type: 'time', now });
     },

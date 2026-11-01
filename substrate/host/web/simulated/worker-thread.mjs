@@ -1,5 +1,5 @@
-// A simulated page's worker: one of Node's threads made to look like a Web Worker, with the page's clock, network
-// and console, running the web host's worker script (../worker-script.mjs).
+// A worker in the simulated browser: one of Node's threads made to look like a Web Worker, with the browser's clock,
+// network and console, running the web host's worker script (../worker-script.mjs).
 import { parentPort, workerData } from 'node:worker_threads';
 import { makeClock } from './clock.mjs';
 import { installClock, installRandom } from './globals.mjs';

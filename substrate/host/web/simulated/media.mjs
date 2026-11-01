@@ -1,5 +1,5 @@
 // The simulated browser's Web Audio and WebGPU: as much of each as the web host's audio and gpu modules use. Sounds
-// are kept as lines, what page-sounds gives; the GPU draws nothing, and what is read back from it is zeros.
+// are kept as lines, what browser-sounds gives; the GPU draws nothing, and what is read back from it is zeros.
 import { Event, EventTarget } from './document.mjs';
 import { sizeOf } from './images.mjs';
 
@@ -20,8 +20,8 @@ function wavSeconds(b) {
   return null;
 }
 
-// page holds the document, the clock, later, nameOf, which names a file by its bytes, and sound, which keeps a line.
-export function makeAudio(page) {
+// browser holds the document, the clock, later, nameOf, which names a file by its bytes, and sound, which keeps a line.
+export function makeAudio(browser) {
   const param = (value) => ({
     value,
     setValueAtTime(v) {
@@ -49,22 +49,22 @@ export function makeAudio(page) {
 
     start() {
       const volume = this.next && this.next.gain ? this.next.gain.value : 1;
-      page.sound(`start ${quote(this.buffer.name)} volume ${number(volume)}${this.loop ? ' looping' : ''}`);
-      if (!this.loop) this.timer = page.clock().setTimeout(() => this.ended(true), (this.buffer.duration * 1000) / this.playbackRate.value);
+      browser.sound(`start ${quote(this.buffer.name)} volume ${number(volume)}${this.loop ? ' looping' : ''}`);
+      if (!this.loop) this.timer = browser.clock().setTimeout(() => this.ended(true), (this.buffer.duration * 1000) / this.playbackRate.value);
     }
 
     stop() {
       if (this.done) return;
-      page.sound(`stop ${quote(this.buffer.name)}`);
-      page.clock().clearTimeout(this.timer);
+      browser.sound(`stop ${quote(this.buffer.name)}`);
+      browser.clock().clearTimeout(this.timer);
       this.ended(false);
     }
 
     ended(naturally) {
       if (this.done) return;
       this.done = true;
-      if (naturally) page.sound(`end ${quote(this.buffer.name)}`);
-      page.later(() => {
+      if (naturally) browser.sound(`end ${quote(this.buffer.name)}`);
+      browser.later(() => {
         if (this.onended) this.onended();
       });
     }
@@ -72,18 +72,18 @@ export function makeAudio(page) {
   class AudioContext extends EventTarget {
     constructor() {
       super();
-      this.state = page.document().activated > -Infinity ? 'running' : 'suspended';
+      this.state = browser.document().activated > -Infinity ? 'running' : 'suspended';
       this.destination = {};
     }
 
     get currentTime() {
-      return page.clock().now() / 1000;
+      return browser.clock().now() / 1000;
     }
 
     resume() {
-      if (this.state !== 'running' && page.document().activated > -Infinity) {
+      if (this.state !== 'running' && browser.document().activated > -Infinity) {
         this.state = 'running';
-        page.later(() => this.dispatchEvent(new Event('statechange')));
+        browser.later(() => this.dispatchEvent(new Event('statechange')));
       }
       return Promise.resolve();
     }
@@ -106,7 +106,7 @@ export function makeAudio(page) {
         },
         stop(end) {
           const { first = o.frequency.value, last = o.frequency.value } = o.frequency;
-          page.sound(`tone ${o.type} ${number(first)} ${number(last)} ${number((end - (o.at ?? 0)) * 1000)} ms`);
+          browser.sound(`tone ${o.type} ${number(first)} ${number(last)} ${number((end - (o.at ?? 0)) * 1000)} ms`);
         },
       };
       return o;
@@ -117,7 +117,7 @@ export function makeAudio(page) {
       const bytes = new Uint8Array(buffer);
       const seconds = wavSeconds(bytes);
       if (seconds === null) return Promise.reject(Object.assign(new Error('Unable to decode audio data'), { name: 'EncodingError' }));
-      return Promise.resolve({ duration: seconds, name: page.nameOf(bytes), numberOfChannels: 1, sampleRate: 44100 });
+      return Promise.resolve({ duration: seconds, name: browser.nameOf(bytes), numberOfChannels: 1, sampleRate: 44100 });
     }
   }
   return { AudioContext, OfflineAudioContext };
@@ -125,7 +125,7 @@ export function makeAudio(page) {
 
 const usages = (names) => Object.fromEntries(names.map((n, k) => [n, 1 << k]));
 
-export function makeWebGpu(page) {
+export function makeWebGpu() {
   const view = () => ({});
   const texture = (d) => ({
     width: d && d.size ? d.size[0] : 1, height: d && d.size ? d.size[1] : 1, format: d ? d.format : 'bgra8unorm',
