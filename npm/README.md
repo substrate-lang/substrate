@@ -14,5 +14,6 @@ or newer.
     substrate test [./DIR ...] [PATTERN ...] # the tests of the current package, or of each DIR at once
     substrate compile FILE -o DIR [-m MAP]   # the compiler alone, given the module map that map prints
     substrate version                        # substrate's version, and the hash of its files
+    substrate upgrade                        # the newest substrate, from npm, which this command then runs
 
 The source and the rest of the commands: https://github.com/Ejhfast/substrate-lisp
