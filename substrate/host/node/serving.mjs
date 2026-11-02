@@ -1,5 +1,5 @@
-// A server a browser test opens its site through, on its own thread (browser.mjs): a program given the site's
-// directory, whose first line of output is its address, stopped with its browser.
+// Runs a browser test's server on its own thread for browser.mjs. The server is a program given the site's directory.
+// It prints its address on its first line, and it is stopped when its browser closes.
 import { spawn } from 'node:child_process';
 import { workerData } from 'node:worker_threads';
 

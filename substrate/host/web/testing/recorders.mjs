@@ -1,7 +1,6 @@
-// What a Chromium page keeps for browser tests, as the simulated browser keeps it: each canvas's last 2D drawing, the
-// sounds played, the blobs and bytes that images and sounds are made from, which kind of context each canvas has, each
-// WebGPU canvas's last frame, and the work the page is waiting on. substrate/host/node/chromium.mjs sends
-// installRecorders' text to run before the page's scripts, so it may use nothing outside itself.
+// Records what browser tests read from a Chromium page, as the simulated browser does: drawings, sounds, the bytes
+// behind images and sounds, WebGPU frames, and the work the page is waiting on. chromium.mjs injects the text of
+// installRecorders into each page, so it must not use anything outside itself.
 export function installRecorders(window, clock, site) {
   const drawings = new WeakMap();
   const kinds = new WeakMap();
@@ -9,8 +8,7 @@ export function installRecorders(window, clock, site) {
   const decoded = new WeakMap();
   const sounds = [];
 
-  // The work the page is waiting on, by kind, as the simulated browser counts it: fetches of the site's files, images,
-  // sounds, audio starting, storage, the clipboard and the GPU.
+  // Counts the work the page is waiting on, by kind, as the simulated browser does.
   const waiting = new Map();
   const idlers = [];
   const wait = (kind) => waiting.set(kind, (waiting.get(kind) || 0) + 1);
@@ -127,7 +125,7 @@ export function installRecorders(window, clock, site) {
     return url;
   };
 
-  // Each call starts a new drawing of the canvas, as the web host's draw patches call it once for each.
+  // Each getContext call starts a new drawing, since the web host calls it once per drawing.
   const getContext = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function context(kind, ...rest) {
     const given = getContext.call(this, kind, ...rest);
@@ -218,8 +216,8 @@ export function installRecorders(window, clock, site) {
     return scheduledStop.call(this, end, ...rest);
   };
 
-  // A WebGPU canvas shows its frame only until the next, and reading it gives nothing once it is shown, so each frame
-  // is copied, after the work drawing it is submitted, into a texture kept for the canvas.
+  // A WebGPU canvas cannot be read once its frame is shown, so each frame is copied into a texture kept for the canvas,
+  // right after the work that draws it is submitted.
   const frames = new WeakMap();
   if (window.GPUCanvasContext) {
     const configured = new WeakMap();

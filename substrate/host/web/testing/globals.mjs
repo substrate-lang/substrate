@@ -1,4 +1,4 @@
-// The globals a browser test controls: time from its clock, and seeded random bytes.
+// Replaces the globals a browser test controls: time, with the test's clock, and random bytes, with seeded ones.
 export function installClock(g, clock) {
   const RealDate = Date;
   class SimulatedDate extends RealDate {
@@ -23,7 +23,6 @@ export function installClock(g, clock) {
   Object.defineProperty(g, 'performance', { value: { now: () => clock.now(), timeOrigin: clock.epoch }, configurable: true, writable: true });
 }
 
-// seeded gives a function that fills bytes with the same numbers for the same seed.
 export function seeded(seed) {
   let state = (seed >>> 0) || 1;
   return (bytes) => {

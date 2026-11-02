@@ -1,5 +1,5 @@
-// The lines browser tests read of a page's drawing and sounds, for both browsers: a canvas's last 2D drawing as one
-// line for each call or setting, and sounds as they start, stop and end.
+// The text that browser tests read for a page's drawings and sounds, in both browsers. A 2D drawing is one line per
+// call or setting, and each sound gives a line when it starts, stops or ends.
 import { describe, parse } from './find.mjs';
 import { one, short } from './requests.mjs';
 
@@ -18,8 +18,8 @@ const calls = {
   scale: ['scale', 2],
 };
 
-// drawn gives the line for a call or setting of a 2D context, or null for one a drawing does not keep. nameOf names a
-// drawn image.
+// drawn gives the line for a 2D context's call or setting, or null for one that drawings leave out. nameOf names drawn
+// images.
 export function drawn(name, args, nameOf) {
   if (settings[name]) return `${settings[name]} ${numeric.has(name) ? number(args[0]) : quoted(args[0])}`;
   if (name === 'fillText') return `fill-text ${quoted(args[0])} ${number(args[1])} ${number(args[2])}`;
@@ -28,8 +28,7 @@ export function drawn(name, args, nameOf) {
   return c ? [c[0], ...args.slice(0, c[1]).map(number)].join(' ') : null;
 }
 
-// heard gives the line for a sound: one that starts, with its volume and whether it loops, that stops or ends, or a
-// tone.
+// heard gives the line for a sound: a start with its volume and whether it loops, a stop, an end, or a tone.
 export function heard(s) {
   switch (s.kind) {
     case 'start':
@@ -43,7 +42,6 @@ export function heard(s) {
   }
 }
 
-// canvasOf gives the canvas f finds.
 export function canvasOf(document, f) {
   const e = one(document, f);
   if (e.localName !== 'canvas') throw new Error(`${describe(f)} is not a canvas\n  it is ${short(e)}`);
@@ -53,7 +51,7 @@ export function canvasOf(document, f) {
 const includes = (drawing, lines) => `\n${drawing}\n`.includes(`\n${lines}\n`);
 const indented = (s) => s.replace(/\n/g, '\n  ');
 
-// drawingRequest carries out a request about a canvas's last drawing, which drawingOf gives for a finder, or gives
+// drawingRequest answers a request about a canvas's last drawing, which drawingOf gives for a finder. It gives
 // undefined for any other request.
 export async function drawingRequest(fields, drawingOf) {
   switch (fields[0]) {

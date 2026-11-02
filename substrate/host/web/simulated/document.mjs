@@ -1,5 +1,5 @@
-// The simulated browser's document: the parts of the DOM that the web host and browser tests use, parsing and
-// writing HTML by Chromium's rules, with a 2D canvas that records its drawing.
+// The simulated browser's document: the parts of the DOM that the web host and browser tests use. It parses and
+// writes HTML by Chromium's rules, and its 2D canvas records what is drawn.
 import { compileList, select } from './selectors.mjs';
 import { drawn } from '../testing/logs.mjs';
 
@@ -360,7 +360,7 @@ export class DocumentFragment extends Node {
   }
 }
 
-// An element's inline style, kept in its style attribute as Chromium writes it.
+// An element's inline style, kept in its style attribute in the form Chromium writes.
 function styleOf(element) {
   const read = () => {
     const map = new Map();
@@ -697,7 +697,7 @@ export class Element extends Node {
     }
   }
 
-  // An <input type="file">'s picker: the files a test chose for it, or none, which cancels it.
+  // Opens a file input's picker, which gives the files a test chose, or is cancelled when the test chose none.
   showPicker() {
     const doc = this.ownerDocument;
     if (!doc.userActive()) throw new Error("HTMLInputElement::showPicker() requires a user gesture.");
@@ -745,7 +745,7 @@ export class Element extends Node {
     if (doc) doc.clickOn(this, { detail: 0 });
   }
 
-  // A new drawing for each call: dom.mjs's draw patch calls it once for each.
+  // Each call starts a new drawing, since dom.mjs calls it once per drawing.
   getContext(kind) {
     if (this.localName !== 'canvas') return null;
     if (kind === 'webgpu') return this.context ? null : (this.gpuContext ||= this.ownerDocument.hooks.webgpuContext(this));
@@ -876,7 +876,7 @@ export class Document extends Node {
     return this.querySelectorAll('*').find((e) => e.getAttribute('id') === id) || null;
   }
 
-  // moveFocus gives element the focus, or takes it away with null, with the events a browser sends.
+  // moveFocus gives element the focus, or takes the focus away when element is null, with the events a browser sends.
   moveFocus(element) {
     const old = this.focused && this.focused.isConnected ? this.focused : null;
     if (old === element) return;
@@ -891,7 +891,7 @@ export class Document extends Node {
     }
   }
 
-  // Whether a click or key was within the last 5 seconds, as Chromium's user activation is.
+  // Whether a click or key press happened in the last 5 seconds, which is how long Chromium's user activation lasts.
   userActive() {
     return this.hooks.now() - this.activated <= 5000;
   }
@@ -1138,7 +1138,7 @@ export function serialize(node) {
 
 const serializeChildren = (node) => node.childNodes.map(serialize).join('');
 
-// A 2D context that keeps each drawing as lines, one for each call or setting: what browser-drawing gives.
+// A 2D context that records each drawing as one line per call or setting, which is what browser-drawing gives.
 export class Context2d {
   constructor(canvas) {
     this.canvas = canvas;

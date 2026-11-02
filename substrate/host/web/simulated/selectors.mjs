@@ -246,7 +246,7 @@ function matchesFrom(e, parts, k) {
 
 const compiled = new Map();
 
-// compileList gives a test of whether an element matches the selector list text.
+// compileList compiles the selector list text into a test of whether an element matches it.
 export function compileList(text) {
   let list = compiled.get(text);
   if (!list) {

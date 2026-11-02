@@ -1,7 +1,6 @@
-// The host module "browser" (browser.sub): sites, as substrate site builds them, opened in simulated browsers
-// (../web/simulated), each on its own thread, or in Chromium (chromium.mjs), one for all of them, and opened through
-// a test's server (serving.mjs) when it gives one. Each call waits for the browser's answer. The site's files are read,
-// Chromium and servers run, and a browser reaches a server, all as the caller's grants allow.
+// The host module "browser" (browser.sub). It opens sites in the simulated browser (../web/simulated) or in Chromium
+// (chromium.mjs), each on another thread, and blocks until they answer. A test's server runs through serving.mjs. The
+// caller's grants limit what this module reads, runs and reaches.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +16,7 @@ const serving = new URL('./serving.mjs', import.meta.url);
 const subhost = fileURLToPath(new URL('../subhost.mjs', import.meta.url));
 const patience = 60000;
 
-// A thread's code: it imports the browser, and answers with the error when that fails.
+// The code each thread runs. If importing the browser fails, the thread answers the first request with the error.
 const start = (script, name) => `const { workerData } = require('node:worker_threads');
 import(${JSON.stringify(script.href)}).catch((e) => {
   workerData.port.once('message', () => {
@@ -42,7 +41,7 @@ export function browsers(grants) {
     const servers = new Map();
     const read = (p) => fs.readFileSync(literalPath(grants, 'read', p));
 
-    // The site's files, but for Chromium's those of the web host, which the simulated browser has as its own.
+    // Reads the site's files. Only Chromium gets host/, since the simulated browser runs its own copy of the web host.
     const filesUnder = (dir, base, into, host) => {
       for (const name of fs.readdirSync(literalPath(grants, 'read', dir)).sort()) {
         const full = path.join(dir, name);
@@ -73,7 +72,7 @@ export function browsers(grants) {
       new DataView(caller.memory().buffer).setUint32(caller.u(out), p, true);
     };
 
-    // served starts a test's server on the site and waits for its address.
+    // served starts a test's server for the site and waits for it to print its address.
     const served = (program, site) => {
       if (!mayRun(grants.run, comparable(subhost), subhost)) throw new Error(`browser.open: ${subhost} is not granted (--allow-run), so the server cannot run`);
       const t = thread(serving, 'the server', { command: process.execPath, args: ['--stack-size=4000', subhost, '-N=127.0.0.1', `-R=${site}`, program, site] });
@@ -95,7 +94,7 @@ export function browsers(grants) {
       t.worker.terminate();
     };
 
-    // openedIn opens the site in Chromium, at file, starting it for the first browser.
+    // openedIn opens the site in the Chromium at file, starting the driver thread on first use.
     const openedIn = (file, dir, url, net) => {
       if (!mayRun(grants.run, comparable(file), file)) throw new Error(`browser.open: ${file} is not granted (--allow-run)`);
       if (!driver || driver.dead) driver = thread(chromium, 'Chromium', { file });

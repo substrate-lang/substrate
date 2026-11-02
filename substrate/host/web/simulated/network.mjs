@@ -1,5 +1,5 @@
-// The simulated browser's network: fetch gets the answers a test gave, the network as far as network gives, or else the
-// site's own files, and fails for any other URL; a WebSocket connects to a server that echoes what it is sent.
+// The simulated browser's network. fetch gives a test's answers, the site's own files, or the real network where the
+// test allows it, and fails for anything else. A WebSocket connects to a server that echoes what it is sent.
 import http from 'node:http';
 import https from 'node:https';
 import { Readable } from 'node:stream';
@@ -19,8 +19,8 @@ const bodiless = new Set([101, 103, 204, 205, 304]);
 
 const decoders = { gzip: () => zlib.createGunzip(), deflate: () => zlib.createInflate(), br: () => zlib.createBrotliDecompress() };
 
-// nodeFetch fetches over Node's HTTP for the simulated browser's pages, whose timers and performance are the page's and
-// so useless to Node's own fetch. It decodes compressed bodies, as a browser does.
+// nodeFetch fetches over Node's http module, because a page's fake timers and performance break Node's own fetch. It
+// decodes compressed bodies, as a browser does.
 export function nodeFetch(url, init = {}) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
@@ -40,9 +40,9 @@ export function nodeFetch(url, init = {}) {
   });
 }
 
-// site maps a path to its bytes, answers a URL to its status and body, track runs the work as the program's, and
-// network gives the real fetch for a URL the browser may reach, or null. What the network does takes its own time,
-// so it is not the program's work for settling.
+// site maps paths to bytes, answers maps URLs to a status and body, track counts work for settling, and network gives
+// the real fetch for a URL the browser may reach, or null. Network requests are not counted, since they take their
+// own time.
 export function makeFetch(site, answers, where, track, network = () => null) {
   const local = (url, init) => track(async () => {
     if (url.origin === where().origin) {

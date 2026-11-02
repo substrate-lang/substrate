@@ -46,7 +46,7 @@ function lines(line) {
   };
 }
 
-// The names of the modules that a wasm module's imports come from, read from its import section.
+// The module names in a wasm module's import section.
 export function importedModules(bytes) {
   const names = new Set();
   let at = 8;
@@ -93,7 +93,7 @@ export function importedModules(bytes) {
   return names;
 }
 
-// options.modules may be a function, given the names the program imports from, that gives the modules.
+// options.modules is the modules, or a function that takes the names the program imports and gives the modules.
 export async function boot(options) {
   const base = options.program.endsWith('/') ? options.program : `${options.program}/`;
   const files = options.files || new Map();

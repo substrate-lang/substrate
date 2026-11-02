@@ -1,5 +1,5 @@
-// What a user does in the simulated browser, turned into the events a browser sends: clicks, typing, keys held and
-// pressed, and what they do by default to text fields, buttons, checkboxes and the focus.
+// Turns what a user does in the simulated browser into the events a browser sends, with their default effects on text
+// fields, buttons, checkboxes and the focus.
 import { Event, focusable } from './document.mjs';
 import { codeOf, modifiers, parseKey } from '../testing/keys.mjs';
 

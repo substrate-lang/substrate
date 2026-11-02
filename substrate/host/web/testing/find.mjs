@@ -1,10 +1,8 @@
-// Finding elements as browser tests describe them: by CSS selector, text, role and accessible name, label or test id,
-// within another finder's elements, or as the nth of a finder's elements.
+// Finds the elements that browser tests' finders describe (std/test/browser.sub), in both browsers.
 
 const arity = { css: 1, text: 1, 'text-containing': 1, role: 2, label: 1, 'test-id': 1 };
 
-// parse reads a finder from the request fields at k, as std/test/browser.sub writes it, and gives it with the index
-// after it.
+// parse reads the finder that starts at fields[k], and gives it with the index of the field after it.
 export function parse(fields, k) {
   const kind = fields[k];
   if (kind === 'within') {
@@ -43,8 +41,8 @@ const shown = (scope) => [...scope.querySelectorAll('*')].filter((e) => !unseen.
 
 const ownText = (e) => [...e.childNodes].filter((c) => c.nodeType === 3).map((c) => c.data).join('');
 
-// The text that names an element: its text, with images' alt text, leaving out what is hidden and the control a
-// label is for.
+// The text that names an element: its text and its images' alt text, without hidden text or the control that a label
+// is for.
 function textOf(e, leaving = null) {
   let s = '';
   const walk = (n) => {

@@ -1,12 +1,11 @@
-// Reading and checking a document as browser tests ask, for both browsers: what a finder finds, its text, HTML,
-// attributes, value and state, and how many elements it finds.
+// Reads and checks the document for browser tests, in both browsers.
 import { describe, findAll, parse } from './find.mjs';
 
 const quote = (s) => JSON.stringify(s);
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}...` : s);
 export const short = (e) => clip(e.outerHTML, 160);
 
-// one gives the element f finds, which must be the only one.
+// one gives the only element that f finds, and fails when it finds none or several.
 export function one(document, f) {
   const found = findAll(document, f);
   if (found.length === 1) return found[0];
@@ -17,7 +16,7 @@ export function one(document, f) {
 
 const differs = (what, f, actual, expected, e) => new Error(`${what} of ${describe(f)} is ${quote(actual)}, not ${quote(expected)}\n  it is ${short(e)}`);
 
-// documentRequest carries out a request that reads or checks the document, or gives undefined for any other.
+// documentRequest answers a request that reads or checks the document, and gives undefined for any other request.
 export function documentRequest(document, fields) {
   const found = () => parse(fields, 1);
   switch (fields[0]) {

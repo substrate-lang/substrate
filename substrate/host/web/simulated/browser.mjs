@@ -1,6 +1,5 @@
-// The simulated browser, on its own thread: the real web host running a program over the simulated document, clock,
-// storage, network and the rest. It answers substrate/host/node/browser.mjs: it opens the program, then carries out
-// requests to act on its document, read it and check it, settling the program after each.
+// The simulated browser, on its own thread. It runs the real web host over a simulated document, clock, storage and
+// network, and carries out the requests from substrate/host/node/browser.mjs, settling the program after each.
 import { resolveObjectURL } from 'node:buffer';
 import { workerData } from 'node:worker_threads';
 import { Document, Element, Event, Node, NodeFilter, Window, parseInto } from './document.mjs';
@@ -43,7 +42,7 @@ const utf8 = new TextEncoder();
 const text = new TextDecoder();
 const origin = 'http://localhost';
 
-// What lasts for the browser's life: what loading the program again, or going to another URL, keeps.
+// State that lasts for the browser's whole life, through reloads and going to other URLs.
 const kept = {
   databases: new Map(), clipboard: '', downloads: new Map(), answers: new Map(), chosen: null, history: null, program: null, net: null,
 };
@@ -95,7 +94,7 @@ async function track(work) {
 
 const sameBytes = (a, b) => a.length === b.length && Buffer.from(a.buffer, a.byteOffset, a.length).equals(Buffer.from(b.buffer, b.byteOffset, b.length));
 
-// The path of the site's file with these bytes, or otherwise.
+// The path of the site's file with these bytes, or otherwise when there is none.
 const nameOf = (bytes, otherwise) => {
   const named = [...site].find(([, b]) => sameBytes(b, bytes));
   return named ? named[0] : otherwise;
@@ -225,8 +224,8 @@ function install(seed) {
   user = userOf(document, window);
 }
 
-// The document's body: the HTML file's elements, leaving out its head, its scripts, and the comments and blank text
-// around its elements.
+// Fills the document's body with the HTML file's elements, leaving out its head, its scripts, and the comments and
+// blank text between elements.
 function placeMarkup(markup) {
   const scratch = document.createDocumentFragment();
   parseInto(markup, scratch);
@@ -241,8 +240,8 @@ function placeMarkup(markup) {
   place(scratch);
 }
 
-// settle runs what the program has left to do without the clock moving: due timers, promises and the browser's own
-// later work.
+// settle lets the program finish what it can without moving the clock: due timers, promises, and the browser's own
+// pending work.
 async function settle() {
   let steps = 0;
   for (let quiet = 0; quiet < 2;) {
@@ -301,7 +300,7 @@ async function load() {
   }
 }
 
-// open opens a site as start.mjs starts one: its program, given the files in assets.list and files.pack, at url.
+// open opens a site at url as start.mjs starts one, giving the program the files in assets.list and files.pack.
 async function open({ site: given, url, seed, net }) {
   site = new Map(given);
   kept.net = net || null;
@@ -427,8 +426,8 @@ async function handle(m) {
   }
 }
 
-// Once the program has started a worker, or can reach a test's server, an expectation is tried again for up to 10
-// seconds, as workers and servers answer in their own time.
+// Once the program has started a worker or can reach a test's server, expectations are retried for up to 10 seconds,
+// since workers and servers answer in their own time.
 async function handled(m) {
   if (!(workersSeen || kept.net) || !entries(m.fields)[0].startsWith('expect-')) return handle(m);
   const until = realNow() + 10000;

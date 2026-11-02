@@ -1,4 +1,4 @@
-// Drives a headless Chromium over the DevTools protocol, and starts `sub serve`, for the browser benchmarks.
+// Drives headless Chromium over the DevTools protocol and starts `sub serve`, for the browser benchmarks.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';

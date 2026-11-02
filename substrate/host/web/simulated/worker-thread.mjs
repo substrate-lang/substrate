@@ -1,5 +1,5 @@
-// A worker in the simulated browser: one of Node's threads made to look like a Web Worker, with the browser's network
-// and console, running the web host's worker script (../worker-script.mjs). Its time is real, as a thread's is.
+// A worker in the simulated browser: a Node thread made to look like a Web Worker, with the browser's network and
+// console, running the web host's worker script (../worker-script.mjs). Its clock is real time, not the page's.
 import { parentPort, workerData } from 'node:worker_threads';
 import { installRandom } from '../testing/globals.mjs';
 import { makeFetch, makeWebSocket } from './network.mjs';

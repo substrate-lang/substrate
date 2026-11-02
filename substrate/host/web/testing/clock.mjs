@@ -1,5 +1,5 @@
-// The clock of a browser in browser tests: time moves only when a test moves it. Timers, animation frames at 60 a
-// second, Date and performance all read it.
+// The clock of a browser in browser tests. Time moves only when a test advances it, and timers, animation frames at 60
+// a second, Date and performance all follow it.
 export function makeClock(epoch = 1700000000000) {
   let now = 0;
   let next = 1;
@@ -40,14 +40,14 @@ export function makeClock(epoch = 1700000000000) {
       return id;
     },
     cancelAnimationFrame: (id) => frames.delete(id),
-    // dueNow runs one timer that is due without the clock moving, and tells whether there was one.
+    // dueNow runs one timer that is already due, without moving the clock, and reports whether there was one.
     dueNow() {
       const t = earliest();
       if (t === null || t.due > now) return false;
       fire(t);
       return true;
     },
-    // advance moves the clock ms ahead, running each timer and frame on the way in time order, and settling the
+    // advance moves the clock ms ahead, running the timers and frames due on the way in time order and settling the
     // program after each.
     async advance(ms, settle) {
       const end = now + Math.max(0, ms);

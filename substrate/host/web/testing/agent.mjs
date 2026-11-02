@@ -1,5 +1,5 @@
-// The page's half of a browser test in Chromium (substrate/host/node/chromium.mjs): it reads and checks the document,
-// finds where to click, and runs the page's clock, which the driver installs before the page's own scripts.
+// The page's side of a browser test in Chromium (substrate/host/node/chromium.mjs). It reads and checks the document,
+// finds where to click, and runs the clock that the driver installs before the page's scripts.
 import { describe, parse } from './find.mjs';
 import { documentRequest, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
@@ -10,7 +10,7 @@ const {
 const channel = new MessageChannel();
 const turns = [];
 channel.port1.onmessage = () => turns.shift()();
-// A turn of the page's event loop, through a channel, as a timer's turn would wait at least 4 ms once timers nest.
+// Waits one turn of the event loop. It posts to a channel because nested timers wait at least 4 ms.
 const turn = () => new Promise((resolve) => {
   turns.push(resolve);
   channel.port2.postMessage(null);
@@ -18,8 +18,8 @@ const turn = () => new Promise((resolve) => {
 const quote = (s) => JSON.stringify(s);
 const patience = 30000;
 
-// settle runs what the program has left to do without the clock moving: due timers, the page's own work, and the work
-// the page is waiting on (recorders.mjs), for up to 30 seconds of that.
+// settle lets the program finish what it can without moving the clock: due timers, the page's own tasks, and the work
+// the page is waiting on (recorders.mjs). It waits at most 30 seconds for that work.
 export async function settle() {
   let steps = 0;
   const until = real.now() + patience;
@@ -41,7 +41,7 @@ export async function settle() {
 let assets = null;
 const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-// nameOf names bytes by the site's asset that has them, as the simulated browser names drawn images and sounds.
+// nameOf gives the path of the site's asset with these bytes, as the simulated browser names drawn images and sounds.
 async function nameOf(bytes, otherwise) {
   if (!assets) {
     const listed = (await (await fetch('/assets.list')).text()).split('\n').filter((p) => p !== '');
@@ -78,8 +78,8 @@ const base64 = (bytes) => {
   return btoa(s);
 };
 
-// A canvas's pixels in a rectangle, as RGBA bytes, row by row: a 2D canvas's own, a WebGPU canvas's last frame, or
-// none for a canvas with neither.
+// The RGBA pixels of a rectangle of a canvas, row by row. A WebGPU canvas gives its last frame, and a canvas with no
+// context gives zeros.
 async function pixels(canvas, x, y, w, h) {
   if (kinds.get(canvas) === '2d') return getContext.call(canvas, '2d').getImageData(x, y, w, h).data;
   const kept = frames.get(canvas);
@@ -102,7 +102,7 @@ async function pixels(canvas, x, y, w, h) {
   return bytes;
 }
 
-// The storage module's database for this page (substrate/host/web/storage.mjs), used as it uses it.
+// Opens this page's database as the storage module does (substrate/host/web/storage.mjs) and runs use on it.
 function stored(mode, use) {
   return new Promise((resolve, reject) => {
     const opening = indexedDB.open(location.pathname.replace(/[^/]*$/, ''), 1);
@@ -192,8 +192,7 @@ async function carriedOut(fields) {
   }
 }
 
-// request carries out what the driver asks of the page, after settling the program, and gives its answer or what went
-// wrong.
+// request settles the program, carries out the driver's request, and gives the answer or the error.
 export async function request(fields) {
   try {
     await settle();

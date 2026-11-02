@@ -1,5 +1,5 @@
-// Web Workers in the simulated browser, each one of Node's threads (worker-thread.mjs). browser holds what a worker
-// is started with and how it reports: later, the site and answers, the program's URL, say and seen.
+// Web Workers in the simulated browser, each running on one of Node's threads (worker-thread.mjs). browser gives what a
+// worker needs to start and to report: later, the site and answers, the program's URL, say and seen.
 import { MessageChannel, Worker as NodeWorker } from 'node:worker_threads';
 
 const thread = new URL('./worker-thread.mjs', import.meta.url);

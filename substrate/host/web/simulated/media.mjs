@@ -1,10 +1,10 @@
-// The simulated browser's Web Audio and WebGPU: as much of each as the web host's audio and gpu modules use. Sounds
-// are kept as lines, what browser-sounds gives; the GPU draws nothing, and what is read back from it is zeros.
+// The simulated browser's Web Audio and WebGPU, with as much of each as the web host's audio and gpu modules use.
+// Sounds are recorded as the lines browser-sounds gives. The GPU draws nothing, and reading it back gives zeros.
 import { Event, EventTarget } from './document.mjs';
 import { sizeOf } from './images.mjs';
 import { heard } from '../testing/logs.mjs';
 
-// A WAV file's length in seconds, or null.
+// The length in seconds of a WAV file, or null when b is not one.
 function wavSeconds(b) {
   const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
   const ascii = (at) => String.fromCharCode(...b.subarray(at, at + 4));
@@ -18,7 +18,7 @@ function wavSeconds(b) {
   return null;
 }
 
-// browser holds the document, the clock, later, nameOf, which names a file by its bytes, and sound, which keeps a line.
+// browser gives the document, the clock and later, plus nameOf to name a file by its bytes and sound to record a line.
 export function makeAudio(browser) {
   const param = (value) => ({
     value,

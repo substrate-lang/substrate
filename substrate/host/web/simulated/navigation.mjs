@@ -1,6 +1,5 @@
-// The simulated browser's location and history: the program's URL, and the entries that pushState and back move
-// between. The entries last for the browser's life, so loading the program again or going to another URL keeps
-// them.
+// The simulated browser's location and history. History entries last as long as the browser, so reloading or going
+// to another URL keeps them.
 export function makeHistory(url) {
   const entries = [url];
   let index = 0;
@@ -34,7 +33,7 @@ export function locationOf(history) {
   return location;
 }
 
-// popped runs after back, forward or go moves to another entry, as popstate is sent.
+// popped is called when back, forward or go moves to another entry, where a browser sends popstate.
 export function historyOf(history, popped) {
   const resolved = (url) => {
     const here = history.current();

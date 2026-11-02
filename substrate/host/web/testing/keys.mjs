@@ -1,4 +1,4 @@
-// Keys as browser tests name them, for both browsers: a key's name or one character, and the modifiers held with it.
+// Keys as browser tests name them, shared by both browsers.
 export const keyNames = new Set(['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'Insert', 'Home', 'End', 'PageUp',
   'PageDown', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Shift', 'Control', 'Alt', 'Meta', 'CapsLock',
   'ContextMenu', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12']);
@@ -14,8 +14,8 @@ export const codeOf = (key) => {
   return punctuation[key] || '';
 };
 
-// parseKey reads a key as browser-press! takes it: a key's name or one character, after any of Shift, Control, Alt and
-// Meta, each followed by +, as in "Shift+Enter".
+// parseKey reads a key as browser-press! takes it: a key's name or one character, after any of Shift+, Control+, Alt+
+// and Meta+, as in "Shift+Enter".
 export function parseKey(spec) {
   const m = /^((?:(?:Shift|Control|Alt|Meta)\+)*)(.+)$/.exec(spec);
   const held = {};

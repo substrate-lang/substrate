@@ -1,4 +1,4 @@
-// An image's width and height, read from the header of a PNG, GIF, JPEG, BMP or WebP file, or null.
+// Reads an image's width and height from the header of a PNG, GIF, JPEG, BMP or WebP file, or gives null.
 export function sizeOf(b) {
   const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
   const ascii = (at, n) => String.fromCharCode(...b.subarray(at, at + n));

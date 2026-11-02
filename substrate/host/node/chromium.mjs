@@ -1,6 +1,6 @@
-// Chromium for browser tests, on its own thread: one headless Chromium for a test run, driven over the DevTools
-// protocol on a pipe, with a browser context for each browser a test opens. It answers browser.mjs as the simulated
-// browser does, and the page's half of each request is ../web/testing/agent.mjs.
+// Runs one headless Chromium for a test run, on its own thread, and drives it over the DevTools protocol on a pipe.
+// Each browser a test opens gets its own browser context. It takes the same requests from browser.mjs as the simulated
+// browser, and ../web/testing/agent.mjs carries out the page's side of them.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,7 +33,7 @@ const types = {
 };
 const typeOf = (p) => types[path.extname(p).toLowerCase()] || 'application/octet-stream';
 
-// The script each page runs before its own: the test's clock, seeded random bytes, and what the page keeps for the test.
+// Runs in each page before the page's own scripts, installing the test's clock, seeded random bytes and the recorders.
 const before = (seed) => `(() => {
   const makeClock = ${makeClock};
   const installClock = ${installClock};
@@ -109,7 +109,7 @@ function launch() {
 const valueOf = (a) => (a.value !== undefined ? String(a.value) : a.unserializableValue ?? a.description ?? '');
 const described = (d) => (d.exception && d.exception.description ? d.exception.description.split('\n')[0] : d.text);
 
-// heard takes an event from Chromium: a page's requests, console and file pickers, its workers, and downloads.
+// heard handles an event from Chromium: a page's requests, console output, file pickers and workers, and downloads.
 function heard(m) {
   if (m.method === 'Browser.downloadWillBegin' || m.method === 'Browser.downloadProgress') {
     for (const b of browsers.values()) {
@@ -147,8 +147,8 @@ function heard(m) {
   }
 }
 
-// served answers a page's request: with the page's half of a test, the answers a test gave, the site's files, or, for
-// a site opened through a test's server, the network, as far as the test's grants reach. Anything else fails.
+// served answers a page's request with, in order: the agent's modules, a test's answers, the site's files, and for a
+// site opened through a test's server, the network as far as the test's grants allow. Any other request fails.
 async function served(b, m) {
   const { requestId, request } = m.params;
   const url = new URL(request.url);
@@ -226,7 +226,7 @@ async function evaluated(b, expression) {
   return r.result.value;
 }
 
-// loaded goes to a page by go and waits for its program to start, as start.mjs says it has with window.ready.
+// loaded navigates with go and waits until start.mjs sets window.ready, or until the program ends.
 async function loaded(b, go) {
   await evaluated(b, 'window.ready = false').catch(() => {});
   b.thrown = false;
@@ -250,7 +250,7 @@ async function agent(b, fields) {
   return answer.value;
 }
 
-// retried asks the page again until it can answer, for up to 10 seconds, as a real browser works in its own time.
+// retried repeats a request for up to 10 seconds until the page can answer it, since a real browser takes its own time.
 async function retried(b, fields) {
   const until = Date.now() + patience;
   for (;;) {
@@ -285,7 +285,7 @@ function key(b, type, name, mods) {
   });
 }
 
-// pressed presses a key and lets it go, holding the modifiers of held around it.
+// pressed presses and releases a key, holding the modifiers in held down around it.
 async function pressed(b, name, held) {
   const extra = Object.keys(modifiers).filter((m) => held[modifiers[m]] && name !== m);
   let mods = b.held;
