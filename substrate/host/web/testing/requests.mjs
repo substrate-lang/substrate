@@ -1,4 +1,4 @@
-// Reads and checks the document for browser tests, in both browsers.
+// Reads and checks the document for browser tests.
 import { describe, findAll, parse } from './find.mjs';
 
 const quote = (s) => JSON.stringify(s);

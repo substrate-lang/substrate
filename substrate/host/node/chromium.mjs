@@ -1,6 +1,6 @@
 // Runs one headless Chromium for a test run, on its own thread, and drives it over the DevTools protocol on a pipe.
-// Each browser a test opens gets its own browser context. It takes the same requests from browser.mjs as the simulated
-// browser, and ../web/testing/agent.mjs carries out the page's side of them.
+// Each browser a test opens gets its own browser context. It carries out the requests from browser.mjs, and
+// ../web/testing/agent.mjs carries out the page's side of them.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,7 +11,6 @@ import { makeClock } from '../web/testing/clock.mjs';
 import { installClock, seeded } from '../web/testing/globals.mjs';
 import { installRecorders } from '../web/testing/recorders.mjs';
 import { parse } from '../web/testing/find.mjs';
-import { codeOf, modifiers, parseKey } from '../web/testing/keys.mjs';
 import { entries } from '../entries.mjs';
 import { mayUrl } from '../grants.mjs';
 
@@ -22,8 +21,9 @@ const reserved = '/.substrate-testing/';
 const patience = 5000;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const gpuFlags = process.platform === 'darwin' ? ['--enable-unsafe-webgpu']
-  : ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-angle=vulkan'];
+const gpuFlags = process.platform === 'linux'
+  ? ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-angle=vulkan']
+  : ['--enable-unsafe-webgpu'];
 
 const types = {
   '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.json': 'application/json', '.css': 'text/css',
@@ -41,7 +41,7 @@ const before = (seed) => `(() => {
   const installRecorders = ${installRecorders};
   const clock = makeClock();
   const real = { now: Date.now.bind(Date), setTimeout: setTimeout.bind(window) };
-  installClock(window, clock, true);
+  installClock(window, clock);
   Object.defineProperty(Event.prototype, 'timeStamp', { get: () => clock.now(), configurable: true });
   const fill = seeded(${seed});
   Crypto.prototype.getRandomValues = function getRandomValues(a) {
@@ -146,6 +146,15 @@ function heard(m) {
     case 'Page.fileChooserOpened':
       chosen(b, m.params).catch((e) => b.lines.push(`files: ${e.message}`));
       break;
+    case 'Page.frameNavigated':
+      if (!m.params.frame.parentId) {
+        b.documents += 1;
+        b.landed = m.params.frame;
+      }
+      break;
+    case 'Page.frameStoppedLoading':
+      if (m.params.frameId === b.targetId) b.stops += 1;
+      break;
     default:
   }
 }
@@ -192,6 +201,7 @@ async function opened(id, site, url, seed, net) {
   const b = {
     id, browserContextId, targetId, sessionId, downloadPath, site: new Map(site), net, answers: new Map(), downloads: new Map(),
     lines: [], thrown: false, errors: [], chosen: null, held: 0, mouse: { x: 0, y: 0 },
+    home: new URL(url, `${origin}/index.html`).origin, documents: 0, stops: 0, landed: null,
     page: (method, params) => send(method, params, sessionId),
   };
   browsers.set(id, b);
@@ -228,13 +238,18 @@ async function evaluated(b, expression) {
   return r.result.value;
 }
 
-// loaded navigates with go and waits until start.mjs sets window.ready, or until the program ends.
+// loaded navigates with go and waits until the program has started.
 async function loaded(b, go) {
   await evaluated(b, 'window.ready = false').catch(() => {});
   b.thrown = false;
   b.errors.length = 0;
   const r = await go();
   if (r && r.errorText) throw new Error(`the browser cannot open the page: ${r.errorText}`);
+  await started(b);
+}
+
+// started waits until start.mjs sets window.ready, or until the program ends, and settles the page.
+async function started(b) {
   const until = Date.now() + 30000;
   for (;;) {
     const state = await evaluated(b, 'window.ready === true ? (typeof window.ended === \'number\' ? window.ended : 0) : null').catch(() => null);
@@ -247,6 +262,46 @@ async function loaded(b, go) {
   await agent(b, ['settle']);
 }
 
+// The errors Chromium gives for a request to a page that a navigation has replaced.
+const navigatedAway = (e) => /Execution context was destroyed|Cannot find context with specified id|Inspected target navigated or closed/
+  .test(e.message);
+
+// acted carries out what a user does, with act, and follows the page wherever that sends it.
+async function acted(b, act) {
+  const { documents, stops } = b;
+  try {
+    await act();
+  } catch (e) {
+    if (b.documents === documents && !navigatedAway(e)) throw e;
+  }
+  return followed(b, documents, stops);
+}
+
+// followed settles the page and, when the page has started going to another page, waits for that page's program to
+// start. A page of another site counts as started once it settles, and a navigation that ends without a new page, as
+// a download does, ends the wait.
+async function followed(b, documents, stops) {
+  let leaving = false;
+  try {
+    leaving = (await agent(b, ['settle'])) === 'leaving';
+  } catch (e) {
+    if (b.documents === documents && !navigatedAway(e)) throw e;
+    leaving = true;
+  }
+  if (!leaving && b.documents === documents) return '';
+  const until = Date.now() + 30000;
+  while (b.documents === documents) {
+    if (b.stops !== stops) return '';
+    if (Date.now() >= until) throw new Error(`the page did not reach the page it went to within 30 s\n${b.lines.join('\n')}`);
+    await pause(20);
+  }
+  if (b.landed.unreachableUrl) throw new Error(`the page went to ${b.landed.unreachableUrl}, which the browser cannot open`);
+  if (new URL(b.landed.url).origin !== b.home) return agent(b, ['settle']);
+  b.thrown = false;
+  await started(b);
+  return '';
+}
+
 async function agent(b, fields) {
   const answer = await evaluated(b, `import(${JSON.stringify(`${reserved}agent.mjs`)}).then((a) => a.request(${JSON.stringify(fields)}))`);
   if (!answer.ok) throw new Error(answer.message);
@@ -254,19 +309,48 @@ async function agent(b, fields) {
 }
 
 // retried repeats a request for up to 5 seconds until the page can answer it, since a real browser takes its own time.
+// A request that a navigation interrupts is not repeated, since it may have done what it does.
 async function retried(b, fields) {
   const until = Date.now() + patience;
   for (;;) {
     try {
       return await agent(b, fields);
     } catch (e) {
-      if (Date.now() >= until) throw e;
+      if (Date.now() >= until || navigatedAway(e)) throw e;
     }
     await pause(20);
   }
 }
 
 // ---- what a user does ----
+
+const keyNames = new Set(['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'Insert', 'Home', 'End', 'PageUp',
+  'PageDown', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Shift', 'Control', 'Alt', 'Meta', 'CapsLock',
+  'ContextMenu', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12']);
+const modifiers = { Shift: 'shiftKey', Control: 'ctrlKey', Alt: 'altKey', Meta: 'metaKey' };
+const punctuation = { '-': 'Minus', '=': 'Equal', '[': 'BracketLeft', ']': 'BracketRight', '\\': 'Backslash',
+  ';': 'Semicolon', "'": 'Quote', ',': 'Comma', '.': 'Period', '/': 'Slash', '`': 'Backquote' };
+
+const codeOf = (key) => {
+  if (/^[a-zA-Z]$/.test(key)) return `Key${key.toUpperCase()}`;
+  if (/^[0-9]$/.test(key)) return `Digit${key}`;
+  if (key === ' ') return 'Space';
+  if (keyNames.has(key)) return key;
+  return punctuation[key] || '';
+};
+
+// parseKey reads a key as browser-press! takes it: a key's name or one character, after any of Shift+, Control+, Alt+
+// and Meta+, as in "Shift+Enter".
+function parseKey(spec) {
+  const m = /^((?:(?:Shift|Control|Alt|Meta)\+)*)(.+)$/.exec(spec);
+  const held = {};
+  if (!m) throw new Error(`${JSON.stringify(spec)} is not a key`);
+  for (const name of m[1].split('+').filter(Boolean)) held[modifiers[name]] = true;
+  let key = m[2] === 'Space' ? ' ' : m[2];
+  if (!keyNames.has(key) && [...key].length !== 1) throw new Error(`${JSON.stringify(spec)} is not a key: a key is a name such as Enter, or one character`);
+  if (held.shiftKey && /^[a-z]$/.test(key)) key = key.toUpperCase();
+  return { key, held };
+}
 
 const virtual = {
   Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, Insert: 45, Home: 36, End: 35, PageUp: 33, PageDown: 34,
@@ -345,60 +429,57 @@ async function handle(b, m) {
 async function carried(b, m) {
   const fields = entries(m.fields);
   const kind = fields[0];
+  const point = (end = fields.length) => retried(b, ['point', ...fields.slice(1, end)]);
   switch (kind) {
     case 'click':
-      await clicked(b, await retried(b, ['point', ...fields.slice(1)]));
-      return agent(b, ['settle']);
+      return acted(b, async () => clicked(b, await point()));
     case 'right-click':
-      await clicked(b, await retried(b, ['point', ...fields.slice(1)]), 'right');
-      return agent(b, ['settle']);
+      return acted(b, async () => clicked(b, await point(), 'right'));
     case 'double-click':
-      await clicked(b, await retried(b, ['point', ...fields.slice(1)]), 'left', [1, 2]);
-      return agent(b, ['settle']);
-    case 'hover': {
-      const at = await retried(b, ['point', ...fields.slice(1)]);
-      if (at.locked) return agent(b, ['settle']);
-      await b.page('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x, y: at.y, modifiers: b.held });
-      b.mouse = { x: at.x, y: at.y };
-      return agent(b, ['settle']);
-    }
-    case 'wheel': {
-      const [, k] = parse(fields, 1);
-      const point = await retried(b, ['point', ...fields.slice(1, k)]);
-      const at = point.locked ? b.mouse : point;
-      await b.page('Input.dispatchMouseEvent', {
-        type: 'mouseWheel', x: at.x, y: at.y, deltaX: Number(fields[k]), deltaY: Number(fields[k + 1]), modifiers: b.held,
+      return acted(b, async () => clicked(b, await point(), 'left', [1, 2]));
+    case 'hover':
+      return acted(b, async () => {
+        const at = await point();
+        if (at.locked) return;
+        await b.page('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x, y: at.y, modifiers: b.held });
+        b.mouse = { x: at.x, y: at.y };
       });
-      b.mouse = { x: at.x, y: at.y };
-      return agent(b, ['settle']);
-    }
+    case 'wheel':
+      return acted(b, async () => {
+        const k = parse(fields, 1)[1];
+        const found = await point(k);
+        const at = found.locked ? b.mouse : found;
+        await b.page('Input.dispatchMouseEvent', {
+          type: 'mouseWheel', x: at.x, y: at.y, deltaX: Number(fields[k]), deltaY: Number(fields[k + 1]), modifiers: b.held,
+        });
+        b.mouse = { x: at.x, y: at.y };
+      });
     case 'select':
-      return retried(b, fields);
+    case 'focus':
+    case 'fire':
+      return acted(b, () => retried(b, fields));
     case 'resize':
       await b.page('Emulation.setDeviceMetricsOverride', { width: Number(fields[1]), height: Number(fields[2]), deviceScaleFactor: 1, mobile: false });
       return agent(b, ['settle']);
-    case 'type': {
-      const [, k] = parse(fields, 1);
-      await retried(b, ['focus', ...fields.slice(1, k)]);
-      for (const c of fields[k]) await pressed(b, c === '\n' ? 'Enter' : c, {});
-      return agent(b, ['settle']);
-    }
+    case 'type':
+      return acted(b, async () => {
+        const k = parse(fields, 1)[1];
+        await retried(b, ['focus', ...fields.slice(1, k)]);
+        for (const c of fields[k]) await pressed(b, c === '\n' ? 'Enter' : c, {});
+      });
     case 'press': {
       const { key: name, held } = parseKey(fields[1]);
-      await pressed(b, name, held);
-      return agent(b, ['settle']);
+      return acted(b, () => pressed(b, name, held));
     }
     case 'key-down':
     case 'key-up': {
       const { key: name, held } = parseKey(fields[1]);
       if (modifiers[name]) b.held = kind === 'key-down' ? b.held | bits[modifiers[name]] : b.held & ~bits[modifiers[name]];
-      await key(b, kind === 'key-down' ? 'keyDown' : 'keyUp', name, b.held | heldBits(held));
-      return agent(b, ['settle']);
+      return acted(b, () => key(b, kind === 'key-down' ? 'keyDown' : 'keyUp', name, b.held | heldBits(held)));
     }
     case 'move-mouse':
       b.mouse = { x: b.mouse.x + Number(fields[1]), y: b.mouse.y + Number(fields[2]) };
-      await b.page('Input.dispatchMouseEvent', { type: 'mouseMoved', x: b.mouse.x, y: b.mouse.y, modifiers: b.held });
-      return agent(b, ['settle']);
+      return acted(b, () => b.page('Input.dispatchMouseEvent', { type: 'mouseMoved', x: b.mouse.x, y: b.mouse.y, modifiers: b.held }));
     case 'go': {
       const url = new URL(fields[1], await agent(b, ['url'])).href;
       await loaded(b, () => b.page('Page.navigate', { url }));

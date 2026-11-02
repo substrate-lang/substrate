@@ -1,4 +1,4 @@
-// Finds the elements that browser tests' finders describe (std/test/browser.sub), in both browsers.
+// Finds the elements that browser tests' finders describe (std/test/browser.sub).
 
 const arity = { css: 1, text: 1, 'text-containing': 1, role: 2, label: 1, 'test-id': 1 };
 

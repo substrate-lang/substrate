@@ -1,5 +1,5 @@
-// The text that browser tests read for a page's drawings and sounds, in both browsers. A 2D drawing is one line per
-// call or setting, and each sound gives a line when it starts, stops or ends.
+// The text that browser tests read for a page's drawings and sounds. A 2D drawing is one line per call or setting, and
+// each sound gives a line when it starts, stops or ends.
 import { describe, parse } from './find.mjs';
 import { one, short } from './requests.mjs';
 

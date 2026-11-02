@@ -1,6 +1,6 @@
-// Records what browser tests read from a Chromium page, as the simulated browser does: drawings, sounds, the bytes
-// behind images and sounds, and the work the page is waiting on. chromium.mjs injects the text of installRecorders into
-// each page, so it must not use anything outside itself.
+// Records what browser tests read from a page: drawings, sounds, the bytes behind images and sounds, and the work the
+// page is waiting on. chromium.mjs injects the text of installRecorders into each page, so it must not use anything
+// outside itself.
 export function installRecorders(window, clock, site) {
   const drawings = new WeakMap();
   const kinds = new WeakMap();
@@ -8,7 +8,7 @@ export function installRecorders(window, clock, site) {
   const decoded = new WeakMap();
   const sounds = [];
 
-  // Counts the work the page is waiting on, by kind, as the simulated browser does.
+  // Counts the work the page is waiting on, by kind.
   const waiting = new Map();
   const idlers = [];
   const wait = (kind) => waiting.set(kind, (waiting.get(kind) || 0) + 1);
@@ -64,7 +64,8 @@ export function installRecorders(window, clock, site) {
   const local = new WeakMap();
   const fetch = window.fetch;
   window.fetch = function fetching(input, ...rest) {
-    const mine = new URL(input instanceof Request ? input.url : String(input), location.href).origin === site;
+    const given = input instanceof Request ? input.url : String(input);
+    const mine = URL.canParse(given, location.href) && new URL(given, location.href).origin === site;
     const answered = (r) => {
       if (r.body) local.set(r.body, mine);
       return r;
@@ -158,6 +159,15 @@ export function installRecorders(window, clock, site) {
     counted(GPUQueue.prototype, 'onSubmittedWorkDone', 'the GPU');
   }
 
+  // The navigation that is taking the page to another page, if any (chromium.mjs waits for that page).
+  let going = null;
+  if (window.navigation) {
+    window.navigation.addEventListener('navigate', (e) => {
+      if (!e.destination.sameDocument && !e.downloadRequest) going = e;
+    });
+  }
+  const leaving = () => going !== null && !going.defaultPrevented;
+
   const createObjectURL = URL.createObjectURL;
   URL.createObjectURL = function made(object) {
     const url = createObjectURL.call(URL, object);
@@ -205,7 +215,7 @@ export function installRecorders(window, clock, site) {
     return connect.call(this, node, ...rest);
   };
 
-  // A sound that does not loop ends when its length has passed on the page's clock, as in the simulated browser.
+  // A sound that does not loop ends when its length has passed on the page's clock.
   const playing = new WeakMap();
   const start = AudioBufferSourceNode.prototype.start;
   AudioBufferSourceNode.prototype.start = function started(...args) {
@@ -256,5 +266,5 @@ export function installRecorders(window, clock, site) {
     return scheduledStop.call(this, end, ...rest);
   };
 
-  return { drawings, blobs, decoded, sounds, kinds, getContext, waiting, idle, network };
+  return { drawings, blobs, decoded, sounds, kinds, getContext, waiting, idle, network, leaving };
 }

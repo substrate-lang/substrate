@@ -1,5 +1,5 @@
 // Replaces the globals a browser test controls: time, with the test's clock, and random bytes, with seeded ones.
-export function installClock(g, clock, keepPerformance = false) {
+export function installClock(g, clock) {
   const RealDate = Date;
   class SimulatedDate extends RealDate {
     constructor(...args) {
@@ -20,12 +20,8 @@ export function installClock(g, clock, keepPerformance = false) {
     requestAnimationFrame: clock.requestAnimationFrame,
     cancelAnimationFrame: clock.cancelAnimationFrame,
   });
-  if (keepPerformance) {
-    Object.defineProperty(g.Performance.prototype, 'now', { value: () => clock.now(), configurable: true, writable: true });
-    Object.defineProperty(g.Performance.prototype, 'timeOrigin', { get: () => clock.epoch, configurable: true });
-  } else {
-    Object.defineProperty(g, 'performance', { value: { now: () => clock.now(), timeOrigin: clock.epoch }, configurable: true, writable: true });
-  }
+  Object.defineProperty(g.Performance.prototype, 'now', { value: () => clock.now(), configurable: true, writable: true });
+  Object.defineProperty(g.Performance.prototype, 'timeOrigin', { get: () => clock.epoch, configurable: true });
 }
 
 export function seeded(seed) {
@@ -38,18 +34,4 @@ export function seeded(seed) {
       bytes[i] = state & 0xff;
     }
   };
-}
-
-export function installRandom(g, seed) {
-  const fill = seeded(seed);
-  Object.defineProperty(g, 'crypto', {
-    value: {
-      getRandomValues(a) {
-        fill(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
-        return a;
-      },
-    },
-    configurable: true,
-    writable: true,
-  });
 }

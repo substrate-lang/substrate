@@ -6,7 +6,7 @@ import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
 import { unsettledOf } from './clock.mjs';
 
 const {
-  clock, real, waiting, idle, network, drawings, blobs, decoded, sounds, kinds, getContext,
+  clock, real, waiting, idle, network, leaving, drawings, blobs, decoded, sounds, kinds, getContext,
 } = window[Symbol.for('substrate.testing')];
 const channel = new MessageChannel();
 const turns = [];
@@ -46,7 +46,7 @@ export async function settle() {
 let assets = null;
 const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-// nameOf gives the path of the site's asset with these bytes, as the simulated browser names drawn images and sounds.
+// nameOf names drawn images and sounds by the path of the site's asset with the same bytes.
 async function nameOf(bytes, otherwise) {
   if (!assets) {
     const listed = (await (await fetch('/assets.list')).text()).split('\n').filter((p) => p !== '');
@@ -133,7 +133,7 @@ async function carriedOut(fields) {
   const found = () => parse(fields, 1);
   switch (fields[0]) {
     case 'settle':
-      return '';
+      return leaving() ? 'leaving' : '';
     case 'point': {
       const [f, k] = found();
       const e = one(document, f);
