@@ -64,7 +64,7 @@ let workersSeen = false;
 let sounds = [];
 let realTime = [];
 
-// The network's real-time work, which settling waits for only while it makes progress, as it does the web host's.
+// The network's real-time work. Settling waits for it, and for the web host's, only while it makes progress.
 const network = { count: 0, done: 0, pending: () => network.count, progress: () => network.done };
 const softly = (start) => {
   network.count++;

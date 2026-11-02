@@ -66,7 +66,7 @@ export function makeFetch(site, answers, where, track, network = () => null, sof
   };
 }
 
-// A response whose body is read under softly, so that settling waits for what the network sends.
+// readSoftly passes each read of a response's body through softly, so that settling waits for what the network sends.
 function readSoftly(r, softly) {
   if (!r.body) return r;
   const reader = r.body.getReader();
