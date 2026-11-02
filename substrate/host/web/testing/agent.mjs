@@ -88,20 +88,12 @@ const base64 = (bytes) => {
 };
 
 // The RGBA pixels of a rectangle of a canvas, row by row. A WebGPU canvas gives the last frame drawn into its
-// offscreen surface (substrate/host/web/gpu.mjs), or what it shows when the GPU draws to it, and a canvas with neither
-// gives zeros.
+// offscreen surface (substrate/host/web/gpu.mjs), and a canvas with neither gives zeros.
 async function pixels(canvas, x, y, w, h) {
   if (kinds.get(canvas) === '2d') return getContext.call(canvas, '2d').getImageData(x, y, w, h).data;
   const gpu = window.modules && window.modules.gpu;
   const surface = gpu && gpu.surfaceOf ? gpu.surfaceOf(canvas) : null;
-  if (!surface && kinds.get(canvas) === 'webgpu') {
-    const copy = document.createElement('canvas');
-    copy.width = w;
-    copy.height = h;
-    const c = getContext.call(copy, '2d');
-    c.drawImage(canvas, x, y, w, h, 0, 0, w, h);
-    return c.getImageData(0, 0, w, h).data;
-  }
+  if (!surface && kinds.get(canvas) === 'webgpu') throw new Error('the GPU draws to this canvas on the page, which a test cannot read back, rather than offscreen');
   if (!surface) return new Uint8Array(w * h * 4);
   const { device, texture } = surface;
   const bytesPerRow = (w * 4 + 255) & ~255;
