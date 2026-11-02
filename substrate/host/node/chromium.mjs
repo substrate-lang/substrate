@@ -40,13 +40,16 @@ const before = (seed) => `(() => {
   const seeded = ${seeded};
   const installRecorders = ${installRecorders};
   const clock = makeClock();
+  const real = { now: Date.now.bind(Date), setTimeout: setTimeout.bind(window) };
   installClock(window, clock);
   const fill = seeded(${seed});
   Crypto.prototype.getRandomValues = function getRandomValues(a) {
     fill(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
     return a;
   };
-  Object.defineProperty(window, Symbol.for('substrate.testing'), { value: { clock, ...installRecorders(window, clock) } });
+  Object.defineProperty(window, Symbol.for('substrate.testing'), {
+    value: { clock, real, ...installRecorders(window, clock, ${JSON.stringify(origin)}) },
+  });
 })();`;
 
 // ---- Chromium and the protocol ----
@@ -127,7 +130,8 @@ function heard(m) {
       send('Runtime.runIfWaitingForDebugger', {}, m.params.sessionId).catch(() => {});
       break;
     case 'Fetch.requestPaused':
-      served(b, m).catch(() => {});
+      served(b, m).catch(() => send('Fetch.failRequest', { requestId: m.params.requestId, errorReason: 'Failed' }, m.sessionId)
+        .catch(() => {}));
       break;
     case 'Runtime.consoleAPICalled':
       b.lines.push(m.params.args.map(valueOf).join(' '));
@@ -199,7 +203,7 @@ async function opened(id, site, url, seed, net) {
     await b.page('Emulation.setFocusEmulationEnabled', { enabled: true });
     await b.page('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
     await b.page('Page.addScriptToEvaluateOnNewDocument', { source: before(seed) });
-    await send('Browser.grantPermissions', { permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'], origin, browserContextId });
+    await send('Browser.grantPermissions', { permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'], browserContextId });
     await send('Browser.setDownloadBehavior', { behavior: 'allowAndName', downloadPath, browserContextId, eventsEnabled: true });
     await loaded(b, () => b.page('Page.navigate', { url: new URL(url, `${origin}/index.html`).href }));
   } catch (e) {

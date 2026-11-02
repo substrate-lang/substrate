@@ -1,13 +1,124 @@
 // What a Chromium page keeps for browser tests, as the simulated browser keeps it: each canvas's last 2D drawing, the
-// sounds played, the blobs and bytes that images and sounds are made from, which kind of context each canvas has, and
-// each WebGPU canvas's last frame. substrate/host/node/chromium.mjs sends
+// sounds played, the blobs and bytes that images and sounds are made from, which kind of context each canvas has, each
+// WebGPU canvas's last frame, and the work the page is waiting on. substrate/host/node/chromium.mjs sends
 // installRecorders' text to run before the page's scripts, so it may use nothing outside itself.
-export function installRecorders(window, clock) {
+export function installRecorders(window, clock, site) {
   const drawings = new WeakMap();
   const kinds = new WeakMap();
   const blobs = new Map();
   const decoded = new WeakMap();
   const sounds = [];
+
+  // The work the page is waiting on, by kind, as the simulated browser counts it: fetches of the site's files, images,
+  // sounds, audio starting, storage, the clipboard and the GPU.
+  const waiting = new Map();
+  const idlers = [];
+  const wait = (kind) => waiting.set(kind, (waiting.get(kind) || 0) + 1);
+  const done = (kind) => {
+    if (waiting.get(kind) > 1) waiting.set(kind, waiting.get(kind) - 1);
+    else waiting.delete(kind);
+    if (waiting.size === 0) for (const resolve of idlers.splice(0)) resolve();
+  };
+  const idle = () => new Promise((resolve) => (waiting.size === 0 ? resolve() : idlers.push(resolve)));
+  const tracked = (kind, start) => {
+    wait(kind);
+    let p;
+    try {
+      p = start();
+    } catch (e) {
+      done(kind);
+      throw e;
+    }
+    return Promise.resolve(p).finally(() => done(kind));
+  };
+  const counted = (proto, name, kind) => {
+    const f = proto && proto[name];
+    if (typeof f !== 'function') return;
+    proto[name] = function counting(...args) {
+      return tracked(kind, () => f.apply(this, args));
+    };
+  };
+  const until = (target, kind, events) => {
+    wait(kind);
+    const finished = () => {
+      for (const e of events) target.removeEventListener(e, finished);
+      done(kind);
+    };
+    for (const e of events) target.addEventListener(e, finished);
+  };
+
+  if (location.origin === site) {
+    const fetched = new WeakSet();
+    const fetch = window.fetch;
+    window.fetch = function fetching(...args) {
+      return tracked('a fetch', () => fetch.apply(this, args).then((r) => {
+        fetched.add(r);
+        return r;
+      }));
+    };
+    for (const name of ['arrayBuffer', 'blob', 'bytes', 'json', 'text']) {
+      const read = Response.prototype[name];
+      if (typeof read !== 'function') continue;
+      Response.prototype[name] = function reading(...args) {
+        return fetched.has(this) ? tracked('a fetch', () => read.apply(this, args)) : read.apply(this, args);
+      };
+    }
+  }
+
+  const src = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+  const loading = new WeakSet();
+  Object.defineProperty(HTMLImageElement.prototype, 'src', {
+    ...src,
+    set(value) {
+      src.set.call(this, value);
+      if (this.complete || loading.has(this)) return;
+      loading.add(this);
+      wait('an image');
+      const loaded = () => {
+        this.removeEventListener('load', loaded);
+        this.removeEventListener('error', loaded);
+        loading.delete(this);
+        done('an image');
+      };
+      this.addEventListener('load', loaded);
+      this.addEventListener('error', loaded);
+    },
+  });
+  const bitmap = window.createImageBitmap;
+  window.createImageBitmap = function createImageBitmap(...args) {
+    return tracked('an image', () => bitmap.apply(this, args));
+  };
+
+  const open = IDBFactory.prototype.open;
+  IDBFactory.prototype.open = function opening(...args) {
+    const r = open.apply(this, args);
+    until(r, 'storage', ['success', 'error']);
+    return r;
+  };
+  const transaction = IDBDatabase.prototype.transaction;
+  IDBDatabase.prototype.transaction = function transacting(...args) {
+    const t = transaction.apply(this, args);
+    until(t, 'storage', ['complete', 'abort']);
+    return t;
+  };
+  if (window.Clipboard) for (const name of ['readText', 'writeText']) counted(Clipboard.prototype, name, 'the clipboard');
+
+  const resume = AudioContext.prototype.resume;
+  AudioContext.prototype.resume = function resuming(...args) {
+    if (!navigator.userActivation.isActive) return resume.apply(this, args);
+    return tracked('audio starting', () => resume.apply(this, args));
+  };
+
+  if (window.GPU) {
+    counted(GPU.prototype, 'requestAdapter', 'the GPU');
+    counted(GPUAdapter.prototype, 'requestDevice', 'the GPU');
+    counted(GPUDevice.prototype, 'popErrorScope', 'the GPU');
+    counted(GPUDevice.prototype, 'createRenderPipelineAsync', 'the GPU');
+    counted(GPUDevice.prototype, 'createComputePipelineAsync', 'the GPU');
+    counted(GPUShaderModule.prototype, 'getCompilationInfo', 'the GPU');
+    counted(GPUBuffer.prototype, 'mapAsync', 'the GPU');
+    counted(GPUQueue.prototype, 'onSubmittedWorkDone', 'the GPU');
+  }
 
   const createObjectURL = URL.createObjectURL;
   URL.createObjectURL = function made(object) {
@@ -43,7 +154,7 @@ export function installRecorders(window, clock) {
   const decode = BaseAudioContext.prototype.decodeAudioData;
   BaseAudioContext.prototype.decodeAudioData = function decodeAudioData(data, ...rest) {
     const bytes = new Uint8Array(data.slice(0));
-    return decode.call(this, data, ...rest).then((buffer) => {
+    return tracked('a sound', () => decode.call(this, data, ...rest)).then((buffer) => {
       decoded.set(buffer, bytes);
       return buffer;
     });
@@ -147,5 +258,5 @@ export function installRecorders(window, clock) {
     };
   }
 
-  return { drawings, blobs, decoded, sounds, kinds, getContext, frames };
+  return { drawings, blobs, decoded, sounds, kinds, getContext, frames, waiting, idle };
 }

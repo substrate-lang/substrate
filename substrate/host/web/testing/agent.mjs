@@ -4,7 +4,9 @@ import { describe, parse } from './find.mjs';
 import { documentRequest, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
 
-const { clock, drawings, blobs, decoded, sounds, kinds, getContext, frames } = window[Symbol.for('substrate.testing')];
+const {
+  clock, real, waiting, idle, drawings, blobs, decoded, sounds, kinds, getContext, frames,
+} = window[Symbol.for('substrate.testing')];
 const channel = new MessageChannel();
 const turns = [];
 channel.port1.onmessage = () => turns.shift()();
@@ -14,17 +16,24 @@ const turn = () => new Promise((resolve) => {
   channel.port2.postMessage(null);
 });
 const quote = (s) => JSON.stringify(s);
+const patience = 30000;
 
-// settle runs what the program has left to do without the clock moving: due timers, and the page's own work.
+// settle runs what the program has left to do without the clock moving: due timers, the page's own work, and the work
+// the page is waiting on (recorders.mjs), for up to 30 seconds of that.
 export async function settle() {
   let steps = 0;
+  const until = real.now() + patience;
   for (let quiet = 0; quiet < 2;) {
     let ran = false;
     while (clock.dueNow()) {
       ran = true;
       if (++steps > 100000) throw new Error('the program kept setting timers due now, so the clock could not stand still');
     }
-    await turn();
+    if (waiting.size > 0) {
+      ran = true;
+      if (real.now() >= until) throw new Error(`the page waited ${patience / 1000} s for ${[...waiting.keys()].join(', ')}`);
+      await Promise.race([idle(), new Promise((resolve) => real.setTimeout(resolve, until - real.now()))]);
+    } else await turn();
     quiet = ran ? 0 : quiet + 1;
   }
 }
