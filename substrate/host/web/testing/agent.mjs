@@ -6,7 +6,7 @@ import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
 import { unsettledOf } from './clock.mjs';
 
 const {
-  clock, real, waiting, idle, network, leaving, drawings, blobs, decoded, sounds, kinds, getContext,
+  clock, real, waiting, idle, network, leaving, drawings, frames, blobs, decoded, sounds, kinds, getContext,
 } = window[Symbol.for('substrate.testing')];
 const channel = new MessageChannel();
 const turns = [];
@@ -87,15 +87,13 @@ const base64 = (bytes) => {
   return btoa(s);
 };
 
-// The RGBA pixels of a rectangle of a canvas, row by row. A WebGPU canvas gives the last frame drawn into its
-// offscreen surface (substrate/host/web/gpu.mjs), and a canvas with neither gives zeros.
+// The RGBA pixels of a rectangle of a canvas, row by row: what a 2D canvas holds, or the last frame drawn on a WebGPU
+// canvas (recorders.mjs). A canvas with neither gives zeros.
 async function pixels(canvas, x, y, w, h) {
   if (kinds.get(canvas) === '2d') return getContext.call(canvas, '2d').getImageData(x, y, w, h).data;
-  const gpu = window.modules && window.modules.gpu;
-  const surface = gpu && gpu.surfaceOf ? gpu.surfaceOf(canvas) : null;
-  if (!surface && kinds.get(canvas) === 'webgpu') throw new Error('the GPU draws to this canvas on the page, which a test cannot read back, rather than offscreen');
-  if (!surface) return new Uint8Array(w * h * 4);
-  const { device, texture } = surface;
+  const frame = frames.get(canvas);
+  if (!frame) return new Uint8Array(w * h * 4);
+  const { device, texture } = frame;
   const bytesPerRow = (w * 4 + 255) & ~255;
   const staging = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const encoder = device.createCommandEncoder();

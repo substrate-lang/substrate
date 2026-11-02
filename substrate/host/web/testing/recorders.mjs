@@ -159,6 +159,44 @@ export function installRecorders(window, clock, site) {
     counted(GPUQueue.prototype, 'onSubmittedWorkDone', 'the GPU');
   }
 
+  // The last frame drawn on each WebGPU canvas, copied as the page submits the work that draws it, since a frame that
+  // has been shown cannot be read back.
+  const frames = new WeakMap();
+  if (window.GPUCanvasContext) {
+    const devices = new WeakMap();
+    const live = new Map();
+    const configure = GPUCanvasContext.prototype.configure;
+    GPUCanvasContext.prototype.configure = function configured(c) {
+      devices.set(this, c.device);
+      return configure.call(this, { ...c, usage: (c.usage ?? GPUTextureUsage.RENDER_ATTACHMENT) | GPUTextureUsage.COPY_SRC });
+    };
+    const current = GPUCanvasContext.prototype.getCurrentTexture;
+    GPUCanvasContext.prototype.getCurrentTexture = function currentTexture() {
+      const texture = current.call(this);
+      if (live.size === 0) queueMicrotask(() => live.clear());
+      live.set(this, texture);
+      return texture;
+    };
+    const submit = GPUQueue.prototype.submit;
+    GPUQueue.prototype.submit = function submitted(buffers) {
+      const r = submit.call(this, buffers);
+      for (const [context, texture] of live) {
+        const device = devices.get(context);
+        if (!device || device.queue !== this) continue;
+        let kept = frames.get(context.canvas);
+        if (!kept || kept.texture.width !== texture.width || kept.texture.height !== texture.height) {
+          kept = { device, texture: device.createTexture({ size: [texture.width, texture.height], format: texture.format,
+            usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC }) };
+          frames.set(context.canvas, kept);
+        }
+        const encoder = device.createCommandEncoder();
+        encoder.copyTextureToTexture({ texture }, { texture: kept.texture }, [texture.width, texture.height]);
+        submit.call(this, [encoder.finish()]);
+      }
+      return r;
+    };
+  }
+
   // The navigation that is taking the page to another page, if any (chromium.mjs waits for that page).
   let going = null;
   if (window.navigation) {
@@ -266,5 +304,5 @@ export function installRecorders(window, clock, site) {
     return scheduledStop.call(this, end, ...rest);
   };
 
-  return { drawings, blobs, decoded, sounds, kinds, getContext, waiting, idle, network, leaving };
+  return { drawings, frames, blobs, decoded, sounds, kinds, getContext, waiting, idle, network, leaving };
 }

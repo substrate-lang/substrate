@@ -14,16 +14,12 @@ import { ending } from '../web/testing/requests.mjs';
 import { entries } from '../entries.mjs';
 import { mayUrl } from '../grants.mjs';
 
-const { port, signal, file, files } = workerData;
+const { port, signal, file, files, args } = workerData;
 const testing = fileURLToPath(new URL('../web/testing/', import.meta.url));
 const origin = 'http://localhost';
 const reserved = '/.substrate-testing/';
 const patience = 5000;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const gpuFlags = process.platform === 'linux'
-  ? ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-angle=vulkan']
-  : ['--enable-unsafe-webgpu'];
 
 const types = {
   '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.json': 'application/json', '.css': 'text/css',
@@ -82,7 +78,8 @@ function launch() {
   profile = fs.mkdtempSync(path.join(files, 'chromium-'));
   chrome = spawn(file, ['--headless=new', '--remote-debugging-pipe', `--user-data-dir=${profile}`, '--no-first-run',
     '--no-default-browser-check', '--no-sandbox', '--mute-audio', '--disable-background-timer-throttling',
-    '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', ...gpuFlags, 'about:blank'],
+    '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', '--enable-unsafe-webgpu', ...args,
+    'about:blank'],
   { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] });
   chrome.stderr.on('data', (d) => {
     said = (said + d).slice(-4000);
@@ -498,6 +495,9 @@ async function carried(b, m) {
       return downloaded(b, fields[1]);
     case 'pixels':
       return Buffer.from((await agent(b, fields)).pixels, 'base64');
+    case 'screenshot':
+      await agent(b, ['settle']);
+      return Buffer.from((await b.page('Page.captureScreenshot', { format: 'png' })).data, 'base64');
     case 'respond': {
       const url = new URL(fields[1], await agent(b, ['url'])).href;
       b.answers.set(url, { status: Number(fields[2]), body: Buffer.from(fields[3]) });
@@ -508,9 +508,9 @@ async function carried(b, m) {
   }
 }
 
-// probed gives Chromium's version and its WebGPU adapter on two lines, the second empty when WebGPU has only a software
-// adapter or none.
-async function probed() {
+// checked gives Chromium's version, and on the next line the WebGPU adapter it draws canvases with, or on the line after
+// that why it cannot.
+async function checked() {
   if (!chrome) launch();
   const { product } = await send('Browser.getVersion');
   const { browserContextId } = await send('Target.createBrowserContext', { disposeOnDetach: true });
@@ -526,22 +526,55 @@ async function probed() {
     for (;;) {
       const r = await page('Runtime.evaluate', { expression: 'location.origin', returnByValue: true }).catch(() => null);
       if (r && r.result.value === origin) break;
-      if (Date.now() >= until) throw new Error('Chromium did not open a page to look for a GPU');
+      if (Date.now() >= until) throw new Error('Chromium did not open a page to check WebGPU on');
       await pause(20);
     }
-    const r = await page('Runtime.evaluate', { expression: adapter, awaitPromise: true, returnByValue: true });
+    const r = await page('Runtime.evaluate', { expression: canvasCheck, awaitPromise: true, returnByValue: true });
     if (r.exceptionDetails) throw new Error(described(r.exceptionDetails));
-    return `${product}\n${r.result.value}`;
+    return `${product}\n${r.result.value.adapter || ''}\n${r.result.value.why || ''}`;
   } finally {
     for (const [s, owner] of bySession) if (owner === probe) bySession.delete(s);
     await send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
   }
 }
 
-const adapter = `(async () => {
+// Draws ten frames on a WebGPU canvas, copying each as recorders.mjs does, and reads the copy back, as tests read
+// pixels.
+const canvasCheck = `(async () => {
   const a = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
-  if (!a || a.info.isFallbackAdapter) return '';
-  return [a.info.vendor, a.info.architecture].filter((s) => s).join(' ') || 'a GPU';
+  if (!a) return { why: 'it has no WebGPU adapter' };
+  const adapter = [a.info.vendor, a.info.architecture].filter((s) => s).join(' ') || 'an adapter';
+  let lost = null;
+  try {
+    const device = await a.requestDevice();
+    device.lost.then((info) => { lost = info.message.split('\\n')[0]; });
+    const canvas = document.body.appendChild(document.createElement('canvas'));
+    canvas.width = 64;
+    canvas.height = 64;
+    const context = canvas.getContext('webgpu');
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const kept = device.createTexture({ size: [64, 64], format, usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });
+    for (let frame = 0; frame < 10 && !lost; frame++) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const texture = context.getCurrentTexture();
+      const e = device.createCommandEncoder();
+      e.beginRenderPass({ colorAttachments: [{ view: texture.createView(), loadOp: 'clear', clearValue: [1, 0, 0, 1], storeOp: 'store' }] }).end();
+      e.copyTextureToTexture({ texture }, { texture: kept }, [64, 64]);
+      device.queue.submit([e.finish()]);
+    }
+    const buffer = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const e = device.createCommandEncoder();
+    e.copyTextureToBuffer({ texture: kept }, { buffer, bytesPerRow: 256 }, [1, 1, 1]);
+    device.queue.submit([e.finish()]);
+    await buffer.mapAsync(GPUMapMode.READ);
+    const p = new Uint8Array(buffer.getMappedRange());
+    if (lost) return { why: 'the device was lost: ' + lost };
+    return (format.startsWith('bgra') ? p[2] : p[0]) === 255 ? { adapter } : { why: 'the frames it drew read back wrong' };
+  } catch (e) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return { why: lost ? 'the device was lost: ' + lost : String(e && e.message || e).split('\\n')[0] };
+  }
 })()`;
 
 async function ended() {
@@ -562,7 +595,7 @@ port.on('message', async (m) => {
     if (m.type === 'open') await opened(m.browser, m.site, m.url, m.seed, m.net);
     else if (m.type === 'close') await closed(browsers.get(m.browser));
     else if (m.type === 'end') await ended();
-    else if (m.type === 'gpu') value = await probed();
+    else if (m.type === 'webgpu') value = await checked();
     else value = await handle(browsers.get(m.browser), m);
     reply = value instanceof Uint8Array ? { ok: true, bytes: value } : { ok: true, text: value };
   } catch (e) {

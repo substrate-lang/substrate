@@ -1,7 +1,6 @@
 // Starts a site's program with the files in assets.list and files.pack, the URL's arg parameters as its arguments, and
 // the host modules it imports. It sets window.modules, sets window.ready once the program has started, and sets
-// window.ended to the program's exit status and window.endReason to why it ended. In browser tests, the GPU draws
-// offscreen unless the URL says offscreen=0.
+// window.ended to the program's exit status and window.endReason to why it ended.
 import { boot } from './subhost-web.mjs';
 
 const query = new URLSearchParams(location.search);
@@ -10,10 +9,7 @@ const made = {};
 const makers = {
   dom: async () => (await import('./dom.mjs')).dom(root),
   audio: async () => (await import('./audio.mjs')).audio(),
-  gpu: async () => (await import('./gpu.mjs')).gpu({
-    dom: await make('dom'),
-    offscreen: query.get('offscreen') === '1' || (query.get('offscreen') !== '0' && Boolean(window[Symbol.for('substrate.testing')])),
-  }),
+  gpu: async () => (await import('./gpu.mjs')).gpu({ dom: await make('dom') }),
   storage: async () => (await import('./storage.mjs')).storage(location.pathname.replace(/[^/]*$/, '')),
   location: async () => (await import('./location.mjs')).locationModule(),
   clipboard: async () => (await import('./clipboard.mjs')).clipboard(),

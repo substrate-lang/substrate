@@ -96,9 +96,11 @@ export function browsers(grants) {
       t.worker.terminate();
     };
 
-    const opened = (file, files, dir, url, net) => {
+    const argsOf = (ap, al) => caller.string(ap, al).split(/\s+/).filter(Boolean);
+
+    const opened = (file, files, args, dir, url, net) => {
       runnable(file, 'open');
-      if (!driver || driver.dead) driver = thread(chromium, 'Chromium', { file, files: writable(files) });
+      if (!driver || driver.dead) driver = thread(chromium, 'Chromium', { file, files: writable(files), args });
       const id = next++;
       const site = [];
       filesUnder(dir, '', site);
@@ -119,7 +121,7 @@ export function browsers(grants) {
         }
         driver = null;
       },
-      open(dp, dl, up, ul, cp, cl, sp, sl, fp, fl, err) {
+      open(dp, dl, up, ul, cp, cl, sp, sl, fp, fl, ap, al, err) {
         let server = null;
         try {
           const dir = caller.string(dp, dl);
@@ -129,7 +131,7 @@ export function browsers(grants) {
             server = served(caller.string(sp, sl), dir);
             url = new URL(url, `${server.address}index.html`).href;
           }
-          const id = opened(caller.string(cp, cl), caller.string(fp, fl), dir, url, server ? grants.net : null);
+          const id = opened(caller.string(cp, cl), caller.string(fp, fl), argsOf(ap, al), dir, url, server ? grants.net : null);
           if (server) servers.set(id, server);
           return id;
         } catch (e) {
@@ -162,12 +164,12 @@ export function browsers(grants) {
         answer(out, reply.bytes ? new Uint8Array(reply.bytes) : utf8.encode(reply.text));
         return 0;
       },
-      gpu(cp, cl, fp, fl, out, err) {
+      webgpu(cp, cl, fp, fl, ap, al, out, err) {
         try {
           const file = caller.string(cp, cl);
-          runnable(file, 'gpu');
-          const t = thread(chromium, 'Chromium', { file, files: writable(caller.string(fp, fl)) });
-          const reply = ask(t, { type: 'gpu' });
+          runnable(file, 'webgpu');
+          const t = thread(chromium, 'Chromium', { file, files: writable(caller.string(fp, fl)), args: argsOf(ap, al) });
+          const reply = ask(t, { type: 'webgpu' });
           if (!t.dead) ask(t, { type: 'end' });
           t.worker.terminate();
           if (!reply.ok) throw new Error(reply.message);
