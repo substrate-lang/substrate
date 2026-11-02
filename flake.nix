@@ -50,7 +50,7 @@
             pkgs.clang     # the C benchmarks' compiler (bench/substrate)
             pkgs.pkgsCross.wasi32.stdenv.cc   # clang for wasm with a C library: cJSON (bench/json)
           ];
-          # substrate test: on Linux, Chromium's software GPU, the one on which headless Chromium draws WebGPU canvases
+          # substrate test: Chromium's software GPU, on which alone headless Chromium on Linux draws WebGPU canvases
           SUBSTRATE_CHROMIUM_ARGS = pkgs.lib.optionalString pkgs.stdenv.isLinux
             "--enable-unsafe-swiftshader --enable-features=Vulkan --use-vulkan=swiftshader --use-angle=vulkan";
           # bench/json: cJSON's source, and nativejson-benchmark's three files

@@ -235,7 +235,6 @@ async function evaluated(b, expression) {
   return r.result.value;
 }
 
-// loaded navigates with go and waits until the program has started.
 async function loaded(b, go) {
   await evaluated(b, 'window.ready = false').catch(() => {});
   b.thrown = false;
@@ -263,7 +262,7 @@ async function started(b) {
 const navigatedAway = (e) => /Execution context was destroyed|Cannot find context with specified id|Inspected target navigated or closed/
   .test(e.message);
 
-// acted carries out what a user does, with act, and follows the page wherever that sends it.
+// acted carries out a user's action and follows the page wherever it goes.
 async function acted(b, act) {
   const { documents, stops } = b;
   try {
@@ -274,9 +273,9 @@ async function acted(b, act) {
   return followed(b, documents, stops);
 }
 
-// followed settles the page and, when the page has started going to another page, waits for that page's program to
-// start. A page of another site counts as started once it settles, and a navigation that ends without a new page, as
-// a download does, ends the wait.
+// followed settles the page and, when it has started going to another page, waits for that page's program to start.
+// A page of another site only has to settle, and a navigation that ends without a new page, as a download does, ends
+// the wait.
 async function followed(b, documents, stops) {
   let leaving = false;
   try {
