@@ -75,23 +75,95 @@ export function user(document, window) {
     }
   };
 
+  const pointer = { pointerId: 1, pointerType: 'mouse', isPrimary: true };
+  const where = (e, at) => {
+    const [x, y] = at || (e.localName === 'canvas' ? [e.width / 2, e.height / 2] : [0, 0]);
+    return { offsetX: x, offsetY: y, clientX: x, clientY: y, view: window, ...down };
+  };
+
+  // moveTo moves the mouse over e, with the events a browser sends as the mouse leaves one element and enters another.
+  // A locked pointer stays where it is.
+  const moveTo = (e, at) => {
+    if (document.pointerLockElement) return;
+    const mouse = { button: 0, buttons: 0, ...where(e, at) };
+    const old = document.hovered && document.hovered.isConnected ? document.hovered : null;
+    if (old !== e) {
+      if (old) {
+        old.dispatchEvent(new Event('pointerout', { bubbles: true, relatedTarget: e, ...mouse, ...pointer }));
+        old.dispatchEvent(new Event('mouseout', { bubbles: true, cancelable: true, relatedTarget: e, ...mouse }));
+        for (let n = old; n && n.nodeType === 1 && !n.contains(e); n = n.parentNode) {
+          n.dispatchEvent(new Event('pointerleave', { relatedTarget: e, ...mouse, ...pointer }));
+          n.dispatchEvent(new Event('mouseleave', { relatedTarget: e, ...mouse }));
+        }
+      }
+      document.hovered = e;
+      e.dispatchEvent(new Event('pointerover', { bubbles: true, relatedTarget: old, ...mouse, ...pointer }));
+      e.dispatchEvent(new Event('mouseover', { bubbles: true, cancelable: true, relatedTarget: old, ...mouse }));
+      const entered = [];
+      for (let n = e; n && n.nodeType === 1 && !(old && n.contains(old)); n = n.parentNode) entered.unshift(n);
+      for (const n of entered) {
+        n.dispatchEvent(new Event('pointerenter', { relatedTarget: old, ...mouse, ...pointer }));
+        n.dispatchEvent(new Event('mouseenter', { relatedTarget: old, ...mouse }));
+      }
+    }
+    e.dispatchEvent(new Event('pointermove', { bubbles: true, cancelable: true, ...mouse, ...pointer }));
+    e.dispatchEvent(new Event('mousemove', { bubbles: true, cancelable: true, ...mouse }));
+  };
+
+  const pressAt = (e, button, mouse) => {
+    const buttons = button === 2 ? 2 : 1;
+    document.activated = document.hooks.now();
+    e.dispatchEvent(new Event('pointerdown', { bubbles: true, cancelable: true, buttons, ...mouse, ...pointer }));
+    if (e.dispatchEvent(new Event('mousedown', { bubbles: true, cancelable: true, buttons, ...mouse }))) {
+      let f = e;
+      while (f && f.nodeType === 1 && !focusable(f)) f = f.parentNode;
+      if (f && f.nodeType === 1) f.focus();
+      else document.moveFocus(null);
+    }
+  };
+
+  const releaseAt = (e, mouse) => {
+    e.dispatchEvent(new Event('pointerup', { bubbles: true, cancelable: true, buttons: 0, ...mouse, ...pointer }));
+    e.dispatchEvent(new Event('mouseup', { bubbles: true, cancelable: true, buttons: 0, ...mouse }));
+  };
+
+  const clicked = (e, at, detail) => {
+    const mouse = { button: 0, detail, ...where(e, at) };
+    pressAt(e, 0, mouse);
+    releaseAt(e, mouse);
+    document.clickOn(e, { buttons: 0, ...mouse });
+  };
+
   return {
     click(e, at) {
       if (disabled(e)) return;
-      const [x, y] = at || (e.localName === 'canvas' ? [e.width / 2, e.height / 2] : [0, 0]);
-      const mouse = { button: 0, detail: 1, offsetX: x, offsetY: y, clientX: x, clientY: y, view: window, ...down };
-      const pointer = { pointerId: 1, pointerType: 'mouse', isPrimary: true };
-      document.activated = document.hooks.now();
-      e.dispatchEvent(new Event('pointerdown', { bubbles: true, cancelable: true, buttons: 1, ...mouse, ...pointer }));
-      if (e.dispatchEvent(new Event('mousedown', { bubbles: true, cancelable: true, buttons: 1, ...mouse }))) {
-        let f = e;
-        while (f && f.nodeType === 1 && !focusable(f)) f = f.parentNode;
-        if (f && f.nodeType === 1) f.focus();
-        else document.moveFocus(null);
-      }
-      e.dispatchEvent(new Event('pointerup', { bubbles: true, cancelable: true, buttons: 0, ...mouse, ...pointer }));
-      e.dispatchEvent(new Event('mouseup', { bubbles: true, cancelable: true, buttons: 0, ...mouse }));
-      document.clickOn(e, { buttons: 0, ...mouse });
+      moveTo(e, at);
+      clicked(e, at, 1);
+    },
+    rightClick(e) {
+      if (disabled(e)) return;
+      moveTo(e, null);
+      const mouse = { button: 2, detail: 1, ...where(e, null) };
+      pressAt(e, 2, mouse);
+      e.dispatchEvent(new Event('contextmenu', { bubbles: true, cancelable: true, buttons: 2, ...mouse }));
+      releaseAt(e, mouse);
+      e.dispatchEvent(new Event('auxclick', { bubbles: true, cancelable: true, buttons: 0, ...mouse, ...pointer }));
+    },
+    doubleClick(e) {
+      if (disabled(e)) return;
+      moveTo(e, null);
+      clicked(e, null, 1);
+      clicked(e, null, 2);
+      e.dispatchEvent(new Event('dblclick', { bubbles: true, cancelable: true, button: 0, buttons: 0, detail: 2, ...where(e, null) }));
+    },
+    hover(e) {
+      moveTo(e, null);
+    },
+    wheel(e, dx, dy) {
+      moveTo(e, null);
+      e.dispatchEvent(new Event('wheel', {
+        bubbles: true, cancelable: true, deltaX: dx, deltaY: dy, deltaZ: 0, deltaMode: 0, button: 0, buttons: 0, ...where(e, null),
+      }));
     },
     type(e, text) {
       if (document.activeElement !== e) e.focus();

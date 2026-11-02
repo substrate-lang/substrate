@@ -197,15 +197,17 @@ function pseudoTest(text, name, arg, nth) {
     case 'focus': return (e) => e.ownerDocument && e.ownerDocument.activeElement === e;
     case 'empty': return (e) => e.childNodes.every((n) => n.nodeType === 8 || (n.nodeType === 3 && n.data === ''));
     case 'root': return (e) => e.ownerDocument && e.ownerDocument.documentElement === e;
-    case 'hover':
+    case 'hover': return (e) => holds(e, e.ownerDocument && e.ownerDocument.hovered);
+    case 'focus-within': return (e) => holds(e, e.ownerDocument && e.ownerDocument.focused);
     case 'active':
     case 'visited':
     case 'focus-visible':
-    case 'focus-within':
       return () => false;
     default: throw unsupported(text, `no pseudo-class :${name}`);
   }
 }
+
+const holds = (e, inner) => !!inner && inner.isConnected && (e === inner || e.contains(inner));
 
 function descendants(root) {
   const out = [];

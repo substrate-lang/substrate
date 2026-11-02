@@ -1,7 +1,7 @@
 // The page's side of a browser test in Chromium (substrate/host/node/chromium.mjs). It reads and checks the document,
 // finds where to click, and runs the clock that the driver installs before the page's scripts.
 import { describe, parse } from './find.mjs';
-import { documentRequest, one, short } from './requests.mjs';
+import { advancedUntil, chose, documentRequest, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
 import { unsettledOf } from './clock.mjs';
 
@@ -146,7 +146,7 @@ async function carriedOut(fields) {
       if (at !== e && !e.contains(at)) {
         throw new Error(`${describe(f)} is covered where it would be clicked, by ${at ? short(at) : 'nothing'}\n  it is ${short(e)}`);
       }
-      return { x, y };
+      return { x, y, locked: document.pointerLockElement !== null };
     }
     case 'focus':
       one(document, found()[0]).focus();
@@ -180,6 +180,10 @@ async function carriedOut(fields) {
       const r = one(document, found()[0]).getBoundingClientRect();
       return [r.x, r.y, r.width, r.height].map((n) => n.toFixed(3)).join(' ');
     }
+    case 'select':
+      return chose(document, fields);
+    case 'advance-until':
+      return advancedUntil(document, fields, clock, settle);
     case 'storage-get': {
       const v = await stored('readonly', (s) => s.get(fields[1]));
       if (v === undefined) throw new Error(`the browser's storage has no key ${quote(fields[1])}`);

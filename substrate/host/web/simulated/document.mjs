@@ -813,6 +813,7 @@ export class Document extends Node {
   constructor() {
     super(null, DOCUMENT);
     this.focused = null;
+    this.hovered = null;
     this.pointerLockElement = null;
     this.defaultView = null;
     this.activated = -Infinity;
@@ -959,8 +960,8 @@ export class Window extends EventTarget {
     super();
     this.document = document;
     document.defaultView = this;
-    this.innerWidth = 1000;
-    this.innerHeight = 700;
+    this.innerWidth = 1280;
+    this.innerHeight = 800;
     this.devicePixelRatio = 1;
   }
 

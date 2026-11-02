@@ -303,11 +303,18 @@ async function pressed(b, name, held) {
   }
 }
 
-async function clicked(b, { x, y }) {
-  const mouse = (type, buttons) => b.page('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons, clickCount: 1, modifiers: b.held });
-  await b.page('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, modifiers: b.held });
-  await mouse('mousePressed', 1);
-  await mouse('mouseReleased', 0);
+// clicked moves the mouse to the point and clicks the button as many times as counts says, each click's count in turn.
+// A locked pointer stays where it is.
+async function clicked(b, point, button = 'left', counts = [1]) {
+  const { x, y } = point.locked ? b.mouse : point;
+  const mouse = (type, buttons, clickCount) => b.page('Input.dispatchMouseEvent', {
+    type, x, y, button, buttons, clickCount, modifiers: b.held,
+  });
+  if (!point.locked) await b.page('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, modifiers: b.held });
+  for (const n of counts) {
+    await mouse('mousePressed', button === 'right' ? 2 : 1, n);
+    await mouse('mouseReleased', 0, n);
+  }
   b.mouse = { x, y };
 }
 
@@ -341,6 +348,34 @@ async function carried(b, m) {
   switch (kind) {
     case 'click':
       await clicked(b, await retried(b, ['point', ...fields.slice(1)]));
+      return agent(b, ['settle']);
+    case 'right-click':
+      await clicked(b, await retried(b, ['point', ...fields.slice(1)]), 'right');
+      return agent(b, ['settle']);
+    case 'double-click':
+      await clicked(b, await retried(b, ['point', ...fields.slice(1)]), 'left', [1, 2]);
+      return agent(b, ['settle']);
+    case 'hover': {
+      const at = await retried(b, ['point', ...fields.slice(1)]);
+      if (at.locked) return agent(b, ['settle']);
+      await b.page('Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x, y: at.y, modifiers: b.held });
+      b.mouse = { x: at.x, y: at.y };
+      return agent(b, ['settle']);
+    }
+    case 'wheel': {
+      const [, k] = parse(fields, 1);
+      const point = await retried(b, ['point', ...fields.slice(1, k)]);
+      const at = point.locked ? b.mouse : point;
+      await b.page('Input.dispatchMouseEvent', {
+        type: 'mouseWheel', x: at.x, y: at.y, deltaX: Number(fields[k]), deltaY: Number(fields[k + 1]), modifiers: b.held,
+      });
+      b.mouse = { x: at.x, y: at.y };
+      return agent(b, ['settle']);
+    }
+    case 'select':
+      return retried(b, fields);
+    case 'resize':
+      await b.page('Emulation.setDeviceMetricsOverride', { width: Number(fields[1]), height: Number(fields[2]), deviceScaleFactor: 1, mobile: false });
       return agent(b, ['settle']);
     case 'type': {
       const [, k] = parse(fields, 1);

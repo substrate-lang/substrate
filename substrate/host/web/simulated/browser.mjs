@@ -5,7 +5,7 @@ import { workerData } from 'node:worker_threads';
 import { Document, Element, Event, Node, NodeFilter, Window, parseInto } from './document.mjs';
 import { makeClock, unsettledOf } from '../testing/clock.mjs';
 import { parse } from '../testing/find.mjs';
-import { documentRequest, one as oneIn } from '../testing/requests.mjs';
+import { advancedUntil, chose, documentRequest, one as oneIn } from '../testing/requests.mjs';
 import { canvasOf, drawingRequest } from '../testing/logs.mjs';
 import { user as userOf } from './user.mjs';
 import { historyOf, locationOf, makeHistory } from './navigation.mjs';
@@ -371,6 +371,27 @@ async function handle(m) {
       const e = one(f);
       return act(() => user.click(e, k < fields.length ? [Number(fields[k]), Number(fields[k + 1])] : null));
     }
+    case 'right-click':
+    case 'double-click':
+    case 'hover': {
+      const e = one(found()[0]);
+      return act(() => user[{ 'right-click': 'rightClick', 'double-click': 'doubleClick', hover: 'hover' }[kind]](e));
+    }
+    case 'wheel': {
+      const [f, k] = found();
+      const e = one(f);
+      return act(() => user.wheel(e, Number(fields[k]), Number(fields[k + 1])));
+    }
+    case 'select':
+      return act(() => chose(document, fields));
+    case 'resize':
+      return act(() => {
+        window.innerWidth = Number(fields[1]);
+        window.innerHeight = Number(fields[2]);
+        window.dispatchEvent(new Event('resize'));
+      });
+    case 'advance-until':
+      return advancedUntil(document, fields, clock, settle);
     case 'type': {
       const [f, k] = found();
       const e = one(f);

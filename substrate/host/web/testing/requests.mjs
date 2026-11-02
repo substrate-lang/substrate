@@ -13,6 +13,41 @@ export function one(document, f) {
   throw new Error(`${found.length} elements match ${describe(f)}:${listed}${found.length > 5 ? '\n  ...' : ''}`);
 }
 
+// chose chooses, as a user does, the option whose text the request gives of the select element a finder finds.
+export function chose(document, fields) {
+  const [f, k] = parse(fields, 1);
+  const e = one(document, f);
+  if (e.localName !== 'select') throw new Error(`${describe(f)} is not a select element\n  it is ${short(e)}`);
+  if (e.hasAttribute('disabled')) throw new Error(`${describe(f)} is disabled, so no option can be chosen\n  it is ${short(e)}`);
+  const option = [...e.querySelectorAll('option')].find((o) => o.textContent.trim() === fields[k]);
+  if (!option) throw new Error(`${describe(f)} has no option ${quote(fields[k])}\n  it is ${short(e)}`);
+  e.focus();
+  e.value = option.value;
+  e.dispatchEvent(new Event('input', { bubbles: true }));
+  e.dispatchEvent(new Event('change', { bubbles: true }));
+  return '';
+}
+
+// advancedUntil moves the clock ahead, a frame at a time, until the text of what a finder finds is the text the request
+// gives, for at most the milliseconds it gives.
+export async function advancedUntil(document, fields, clock, settle) {
+  const [f, k] = parse(fields, 1);
+  const ms = Number(fields[k + 1]);
+  const text = () => {
+    const found = findAll(document, f);
+    return found.length === 1 ? found[0].textContent : null;
+  };
+  for (let waited = 0; text() !== fields[k]; waited += 1000 / 60) {
+    if (waited >= ms) {
+      const t = text();
+      throw new Error(`after ${ms} ms, ${t === null ? `not one element matches ${describe(f)}` : `the text of ${describe(f)} is ${quote(t)}, not ${quote(fields[k])}`}`);
+    }
+    await clock.advance(1000 / 60, settle);
+    await settle();
+  }
+  return '';
+}
+
 const differs = (what, f, actual, expected, e) => new Error(`${what} of ${describe(f)} is ${quote(actual)}, not ${quote(expected)}\n  it is ${short(e)}`);
 
 // documentRequest answers a request that reads or checks the document, and gives undefined for any other request.
