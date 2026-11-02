@@ -13,7 +13,8 @@ export function one(document, f) {
   throw new Error(`${found.length} elements match ${describe(f)}:${listed}${found.length > 5 ? '\n  ...' : ''}`);
 }
 
-// chose chooses, as a user does, the option whose text the request gives of the select element a finder finds.
+// chose chooses an option of the select element that a finder finds, as a user does: the one whose text the request
+// gives.
 export function chose(document, fields) {
   const [f, k] = parse(fields, 1);
   const e = one(document, f);
