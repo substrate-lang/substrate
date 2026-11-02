@@ -193,7 +193,7 @@ async function carriedOut(fields) {
       await stored('readwrite', (s) => s.put(new TextEncoder().encode(fields[2]), fields[1]));
       return '';
     case 'clipboard-get':
-      return navigator.clipboard.readText();
+      return (await navigator.clipboard.readText()).replace(/\r\n/g, '\n');
     case 'clipboard-set':
       await navigator.clipboard.writeText(fields[1]);
       return '';
