@@ -508,75 +508,6 @@ async function carried(b, m) {
   }
 }
 
-// checked gives Chromium's version, and on the next line the WebGPU adapter it draws canvases with, or on the line after
-// that why it cannot.
-async function checked() {
-  if (!chrome) launch();
-  const { product } = await send('Browser.getVersion');
-  const { browserContextId } = await send('Target.createBrowserContext', { disposeOnDetach: true });
-  const probe = { site: new Map([['/index.html', Buffer.from('<!doctype html>')]]), answers: new Map(), net: null, lines: [] };
-  try {
-    const { targetId } = await send('Target.createTarget', { url: 'about:blank', browserContextId });
-    const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
-    const page = (method, params) => send(method, params, sessionId);
-    bySession.set(sessionId, probe);
-    await page('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
-    await page('Page.navigate', { url: `${origin}/index.html` });
-    const until = Date.now() + patience;
-    for (;;) {
-      const r = await page('Runtime.evaluate', { expression: 'location.origin', returnByValue: true }).catch(() => null);
-      if (r && r.result.value === origin) break;
-      if (Date.now() >= until) throw new Error('Chromium did not open a page to check WebGPU on');
-      await pause(20);
-    }
-    const r = await page('Runtime.evaluate', { expression: canvasCheck, awaitPromise: true, returnByValue: true });
-    if (r.exceptionDetails) throw new Error(described(r.exceptionDetails));
-    return `${product}\n${r.result.value.adapter || ''}\n${r.result.value.why || ''}`;
-  } finally {
-    for (const [s, owner] of bySession) if (owner === probe) bySession.delete(s);
-    await send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
-  }
-}
-
-// Draws ten frames on a WebGPU canvas, copying each as recorders.mjs does, and reads the copy back, as tests read
-// pixels.
-const canvasCheck = `(async () => {
-  const a = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
-  if (!a) return { why: 'it has no WebGPU adapter' };
-  const adapter = [a.info.vendor, a.info.architecture].filter((s) => s).join(' ') || 'an adapter';
-  let lost = null;
-  try {
-    const device = await a.requestDevice();
-    device.lost.then((info) => { lost = info.message.split('\\n')[0]; });
-    const canvas = document.body.appendChild(document.createElement('canvas'));
-    canvas.width = 64;
-    canvas.height = 64;
-    const context = canvas.getContext('webgpu');
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    context.configure({ device, format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-    const kept = device.createTexture({ size: [64, 64], format, usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });
-    for (let frame = 0; frame < 10 && !lost; frame++) {
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      const texture = context.getCurrentTexture();
-      const e = device.createCommandEncoder();
-      e.beginRenderPass({ colorAttachments: [{ view: texture.createView(), loadOp: 'clear', clearValue: [1, 0, 0, 1], storeOp: 'store' }] }).end();
-      e.copyTextureToTexture({ texture }, { texture: kept }, [64, 64]);
-      device.queue.submit([e.finish()]);
-    }
-    const buffer = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const e = device.createCommandEncoder();
-    e.copyTextureToBuffer({ texture: kept }, { buffer, bytesPerRow: 256 }, [1, 1, 1]);
-    device.queue.submit([e.finish()]);
-    await buffer.mapAsync(GPUMapMode.READ);
-    const p = new Uint8Array(buffer.getMappedRange());
-    if (lost) return { why: 'the device was lost: ' + lost };
-    return (format.startsWith('bgra') ? p[2] : p[0]) === 255 ? { adapter } : { why: 'the frames it drew read back wrong' };
-  } catch (e) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    return { why: lost ? 'the device was lost: ' + lost : String(e && e.message || e).split('\\n')[0] };
-  }
-})()`;
-
 async function ended() {
   for (const b of [...browsers.values()]) await closed(b);
   if (chrome) {
@@ -595,7 +526,6 @@ port.on('message', async (m) => {
     if (m.type === 'open') await opened(m.browser, m.site, m.url, m.seed, m.net);
     else if (m.type === 'close') await closed(browsers.get(m.browser));
     else if (m.type === 'end') await ended();
-    else if (m.type === 'webgpu') value = await checked();
     else value = await handle(browsers.get(m.browser), m);
     reply = value instanceof Uint8Array ? { ok: true, bytes: value } : { ok: true, text: value };
   } catch (e) {

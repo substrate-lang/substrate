@@ -5,7 +5,7 @@ build/sub:
 	bin/substrate expand build/empty.sub -c build/cache > /dev/null
 
 check:
-	tests/run.sh
+	tests/run.sh $(TEST_ARGS)
 	$(MAKE) docs
 
 bootstrap:

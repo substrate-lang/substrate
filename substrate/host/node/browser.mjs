@@ -164,22 +164,6 @@ export function browsers(grants) {
         answer(out, reply.bytes ? new Uint8Array(reply.bytes) : utf8.encode(reply.text));
         return 0;
       },
-      webgpu(cp, cl, fp, fl, ap, al, out, err) {
-        try {
-          const file = caller.string(cp, cl);
-          runnable(file, 'webgpu');
-          const t = thread(chromium, 'Chromium', { file, files: writable(caller.string(fp, fl)), args: argsOf(ap, al) });
-          const reply = ask(t, { type: 'webgpu' });
-          if (!t.dead) ask(t, { type: 'end' });
-          t.worker.terminate();
-          if (!reply.ok) throw new Error(reply.message);
-          answer(out, utf8.encode(reply.text));
-          return 0;
-        } catch (e) {
-          caller.fail(err, e.message);
-          return -1;
-        }
-      },
       close(id) {
         if (!open.has(id)) return;
         open.delete(id);
