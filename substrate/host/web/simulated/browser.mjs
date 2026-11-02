@@ -3,7 +3,7 @@
 import { resolveObjectURL } from 'node:buffer';
 import { workerData } from 'node:worker_threads';
 import { Document, Element, Event, Node, NodeFilter, Window, parseInto } from './document.mjs';
-import { makeClock } from '../testing/clock.mjs';
+import { makeClock, unsettledOf } from '../testing/clock.mjs';
 import { parse } from '../testing/find.mjs';
 import { documentRequest, one as oneIn } from '../testing/requests.mjs';
 import { canvasOf, drawingRequest } from '../testing/logs.mjs';
@@ -62,6 +62,18 @@ let ended = null;
 let workers = null;
 let workersSeen = false;
 let sounds = [];
+let realTime = [];
+
+// The network's real-time work, which settling waits for only while it makes progress, as it does the web host's.
+const network = { count: 0, done: 0, pending: () => network.count, progress: () => network.done };
+const softly = (start) => {
+  network.count++;
+  return Promise.resolve().then(start).finally(() => {
+    network.count--;
+    network.done++;
+  });
+};
+const unsettled = unsettledOf(() => [network, ...realTime], () => realNow());
 
 const say = (line) => lines.push(line);
 const consoleText = () => [...lines, ...[partial[1], partial[2]].filter((p) => p !== '')].join('\n');
@@ -191,7 +203,7 @@ function install(seed) {
     Image,
     indexedDB,
     IDBKeyRange,
-    fetch: makeFetch(site, kept.answers, where, track, (u) => kept.net !== null && mayUrl(kept.net, u) && nodeFetch),
+    fetch: makeFetch(site, kept.answers, where, track, (u) => kept.net !== null && mayUrl(kept.net, u) && nodeFetch, softly),
     WebSocket: makeWebSocket(later, where),
     Worker: workers.Worker,
     AudioContext,
@@ -240,8 +252,8 @@ function placeMarkup(markup) {
   place(scratch);
 }
 
-// settle lets the program finish what it can without moving the clock: due timers, promises, and the browser's own
-// pending work.
+// settle lets the program finish what it can without moving the clock: due timers, promises, the browser's own pending
+// work, and real-time work while it makes progress.
 async function settle() {
   let steps = 0;
   for (let quiet = 0; quiet < 2;) {
@@ -249,6 +261,11 @@ async function settle() {
     while (clock.dueNow()) {
       activity++;
       if (++steps > 100000) throw new Error('the program kept setting timers that are already due, so it never settled');
+    }
+    if (unsettled()) {
+      await pause(10);
+      quiet = 0;
+      continue;
     }
     await turn();
     if (pending === 0 && activity === before) quiet++;
@@ -280,7 +297,7 @@ async function load() {
   for (const [, bytes] of wasm) {
     for (const name of importedModules(bytes)) if (Object.hasOwn(makers, name) && !modules[name]) modules[name] = await makers[name]();
   }
-  run({
+  realTime = run({
     files: new Map(files.map(([p, b]) => [p, b.slice()])),
     args: new URLSearchParams(location.search).getAll('arg'),
     output,
@@ -291,7 +308,7 @@ async function load() {
       activity++;
     },
     modules,
-  }, names, new Map(wasm));
+  }, names, new Map(wasm)).realTime;
   await settle();
   if (ended && ended.code !== 0) throw new Error(`the program ended with ${ended.code}\n${consoleText()}`);
   const autofocus = document.body.querySelector('[autofocus]');
@@ -427,11 +444,11 @@ async function handle(m) {
   }
 }
 
-// Once the program has started a worker or can reach a test's server, expectations are retried for up to 10 seconds,
+// Once the program has started a worker or can reach a test's server, expectations are retried for up to 5 seconds,
 // since workers and servers answer in their own time.
 async function retried(m) {
   if (!(workersSeen || kept.net) || !entries(m.fields)[0].startsWith('expect-')) return handle(m);
-  const until = realNow() + 10000;
+  const until = realNow() + 5000;
   for (;;) {
     try {
       return await handle(m);

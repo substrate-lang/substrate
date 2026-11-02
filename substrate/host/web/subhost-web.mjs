@@ -123,7 +123,7 @@ export function run(options, names, wasm) {
   const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 
-  const app = { files, cwd, entry: null, ended: false };
+  const app = { files, cwd, entry: null, ended: false, realTime: [] };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
   if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd)));

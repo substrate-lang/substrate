@@ -45,23 +45,55 @@ export function installRecorders(window, clock, site) {
     for (const e of events) target.addEventListener(e, finished);
   };
 
-  if (location.origin === site) {
-    const fetched = new WeakSet();
-    const fetch = window.fetch;
-    window.fetch = function fetching(...args) {
-      return tracked('a fetch', () => fetch.apply(this, args).then((r) => {
-        fetched.add(r);
-        return r;
-      }));
-    };
-    for (const name of ['arrayBuffer', 'blob', 'bytes', 'json', 'text']) {
-      const read = Response.prototype[name];
-      if (typeof read !== 'function') continue;
-      Response.prototype[name] = function reading(...args) {
-        return fetched.has(this) ? tracked('a fetch', () => read.apply(this, args)) : read.apply(this, args);
-      };
+  // Fetches from the network, and reading their bodies, which settling waits for only while they make progress.
+  const network = { count: 0, done: 0, pending: () => network.count, progress: () => network.done };
+  const softly = (start) => {
+    network.count++;
+    let p;
+    try {
+      p = start();
+    } catch (e) {
+      network.count--;
+      throw e;
     }
+    return Promise.resolve(p).finally(() => {
+      network.count--;
+      network.done++;
+    });
+  };
+  const local = new WeakMap();
+  const fetch = window.fetch;
+  window.fetch = function fetching(input, ...rest) {
+    const mine = new URL(input instanceof Request ? input.url : String(input), location.href).origin === site;
+    const answered = (r) => {
+      if (r.body) local.set(r.body, mine);
+      return r;
+    };
+    return mine ? tracked('a fetch', () => fetch.call(this, input, ...rest).then(answered))
+      : softly(() => fetch.call(this, input, ...rest).then(answered));
+  };
+  const whileReading = (body, start) => {
+    if (!body || !local.has(body)) return start();
+    return local.get(body) ? tracked('a fetch', start) : softly(start);
+  };
+  for (const name of ['arrayBuffer', 'blob', 'bytes', 'json', 'text']) {
+    const read = Response.prototype[name];
+    if (typeof read !== 'function') continue;
+    Response.prototype[name] = function reading(...args) {
+      return whileReading(this.body, () => read.apply(this, args));
+    };
   }
+  const bodyOf = new WeakMap();
+  const getReader = ReadableStream.prototype.getReader;
+  ReadableStream.prototype.getReader = function reader(...args) {
+    const r = getReader.apply(this, args);
+    bodyOf.set(r, this);
+    return r;
+  };
+  const read = ReadableStreamDefaultReader.prototype.read;
+  ReadableStreamDefaultReader.prototype.read = function reading(...args) {
+    return whileReading(bodyOf.get(this), () => read.apply(this, args));
+  };
 
   const src = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
   const loading = new WeakSet();
@@ -224,5 +256,5 @@ export function installRecorders(window, clock, site) {
     return scheduledStop.call(this, end, ...rest);
   };
 
-  return { drawings, blobs, decoded, sounds, kinds, getContext, waiting, idle };
+  return { drawings, blobs, decoded, sounds, kinds, getContext, waiting, idle, network };
 }

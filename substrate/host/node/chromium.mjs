@@ -19,7 +19,7 @@ const { port, signal, file } = workerData;
 const testing = fileURLToPath(new URL('../web/testing/', import.meta.url));
 const origin = 'http://localhost';
 const reserved = '/.substrate-testing/';
-const patience = 10000;
+const patience = 5000;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const gpuFlags = process.platform === 'darwin' ? ['--enable-unsafe-webgpu']
@@ -41,7 +41,8 @@ const before = (seed) => `(() => {
   const installRecorders = ${installRecorders};
   const clock = makeClock();
   const real = { now: Date.now.bind(Date), setTimeout: setTimeout.bind(window) };
-  installClock(window, clock);
+  installClock(window, clock, true);
+  Object.defineProperty(Event.prototype, 'timeStamp', { get: () => clock.now(), configurable: true });
   const fill = seeded(${seed});
   Crypto.prototype.getRandomValues = function getRandomValues(a) {
     fill(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
@@ -154,16 +155,16 @@ function heard(m) {
 async function served(b, m) {
   const { requestId, request } = m.params;
   const url = new URL(request.url);
-  const fulfil = (status, type, body) => send('Fetch.fulfillRequest', {
+  const fulfil = (status, type, body, more = []) => send('Fetch.fulfillRequest', {
     requestId, responseCode: status, body: Buffer.from(body).toString('base64'),
-    responseHeaders: [{ name: 'Content-Type', value: type }, { name: 'Cache-Control', value: 'no-store' }],
+    responseHeaders: [{ name: 'Content-Type', value: type }, { name: 'Cache-Control', value: 'no-store' }, ...more],
   }, m.sessionId);
   const p = decodeURIComponent(url.pathname);
   if (p.startsWith(reserved) && /^[a-z]+\.mjs$/.test(p.slice(reserved.length))) {
     return fulfil(200, 'text/javascript', fs.readFileSync(path.join(testing, p.slice(reserved.length))));
   }
   const answer = b.answers.get(url.href);
-  if (answer) return fulfil(answer.status, typeOf(url.pathname), answer.body);
+  if (answer) return fulfil(answer.status, typeOf(url.pathname), answer.body, [{ name: 'Access-Control-Allow-Origin', value: '*' }]);
   if (url.origin === origin) {
     const bytes = b.site.get(p === '/' ? '/index.html' : p);
     return bytes ? fulfil(200, typeOf(p), bytes) : fulfil(404, 'text/plain', 'not found');
@@ -252,7 +253,7 @@ async function agent(b, fields) {
   return answer.value;
 }
 
-// retried repeats a request for up to 10 seconds until the page can answer it, since a real browser takes its own time.
+// retried repeats a request for up to 5 seconds until the page can answer it, since a real browser takes its own time.
 async function retried(b, fields) {
   const until = Date.now() + patience;
   for (;;) {

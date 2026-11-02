@@ -70,3 +70,25 @@ export function makeClock(epoch = 1700000000000) {
     frames: () => frame,
   };
 }
+
+// unsettledOf gives a test of whether the real-time work that trackers count, each with pending() and progress(), is
+// worth waiting for: some is pending, and some started or finished in the last half second.
+export function unsettledOf(trackers, now) {
+  let mark = '';
+  let since = 0;
+  let stalled = '';
+  return () => {
+    const all = trackers();
+    const pending = all.reduce((n, t) => n + t.pending(), 0);
+    const next = `${pending} ${all.reduce((n, t) => n + t.progress(), 0)}`;
+    const at = now();
+    if (next !== mark) {
+      mark = next;
+      since = at;
+    }
+    if (pending === 0 || mark === stalled) return false;
+    if (at - since < 500) return true;
+    stalled = mark;
+    return false;
+  };
+}

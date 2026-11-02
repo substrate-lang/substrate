@@ -1,5 +1,5 @@
 // Replaces the globals a browser test controls: time, with the test's clock, and random bytes, with seeded ones.
-export function installClock(g, clock) {
+export function installClock(g, clock, keepPerformance = false) {
   const RealDate = Date;
   class SimulatedDate extends RealDate {
     constructor(...args) {
@@ -20,7 +20,12 @@ export function installClock(g, clock) {
     requestAnimationFrame: clock.requestAnimationFrame,
     cancelAnimationFrame: clock.cancelAnimationFrame,
   });
-  Object.defineProperty(g, 'performance', { value: { now: () => clock.now(), timeOrigin: clock.epoch }, configurable: true, writable: true });
+  if (keepPerformance) {
+    Object.defineProperty(g.Performance.prototype, 'now', { value: () => clock.now(), configurable: true, writable: true });
+    Object.defineProperty(g.Performance.prototype, 'timeOrigin', { get: () => clock.epoch, configurable: true });
+  } else {
+    Object.defineProperty(g, 'performance', { value: { now: () => clock.now(), timeOrigin: clock.epoch }, configurable: true, writable: true });
+  }
 }
 
 export function seeded(seed) {

@@ -3,9 +3,10 @@
 import { describe, parse } from './find.mjs';
 import { documentRequest, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
+import { unsettledOf } from './clock.mjs';
 
 const {
-  clock, real, waiting, idle, drawings, blobs, decoded, sounds, kinds, getContext,
+  clock, real, waiting, idle, network, drawings, blobs, decoded, sounds, kinds, getContext,
 } = window[Symbol.for('substrate.testing')];
 const channel = new MessageChannel();
 const turns = [];
@@ -17,9 +18,10 @@ const turn = () => new Promise((resolve) => {
 });
 const quote = (s) => JSON.stringify(s);
 const patience = 30000;
+const unsettled = unsettledOf(() => [network, ...((window.app && window.app.realTime) || [])], real.now);
 
-// settle lets the program finish what it can without moving the clock: due timers, the page's own tasks, and the work
-// the page is waiting on (recorders.mjs). It waits at most 30 seconds for that work.
+// settle lets the program finish what it can without moving the clock: due timers, the page's own tasks, the work the
+// page is waiting on (recorders.mjs), for at most 30 seconds, and real-time work while it makes progress.
 export async function settle() {
   let steps = 0;
   const until = real.now() + patience;
@@ -33,6 +35,9 @@ export async function settle() {
       ran = true;
       if (real.now() >= until) throw new Error(`the page waited ${patience / 1000} s for ${[...waiting.keys()].join(', ')}`);
       await Promise.race([idle(), new Promise((resolve) => real.setTimeout(resolve, until - real.now()))]);
+    } else if (unsettled()) {
+      ran = true;
+      await new Promise((resolve) => real.setTimeout(resolve, 10));
     } else await turn();
     quiet = ran ? 0 : quiet + 1;
   }

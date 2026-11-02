@@ -43,8 +43,12 @@ export function nodeFetch(url, init = {}) {
 // site maps paths to bytes, answers maps URLs to a status and body, track counts work for settling, and network gives
 // the real fetch for a URL the browser may reach, or null. Network requests are not counted, since they take their
 // own time.
-export function makeFetch(site, answers, where, track, network = () => null) {
+export function makeFetch(site, answers, where, track, network = () => null, softly = (start) => start()) {
   const local = (url, init) => track(async () => {
+    const answer = answers.get(url.href);
+    if (answer) {
+      return new Response(bodiless.has(answer.status) ? null : answer.body, { status: answer.status, headers: { 'content-type': typeOf(url.pathname) } });
+    }
     if (url.origin === where().origin) {
       const bytes = site.get(decodeURIComponent(url.pathname));
       if (bytes) {
@@ -53,17 +57,24 @@ export function makeFetch(site, answers, where, track, network = () => null) {
       }
       return new Response('not found', { status: 404, statusText: 'Not Found', headers: { 'content-type': types.txt } });
     }
-    const answer = answers.get(url.href);
-    if (answer) {
-      return new Response(bodiless.has(answer.status) ? null : answer.body, { status: answer.status, headers: { 'content-type': typeOf(url.pathname) } });
-    }
     throw new TypeError('Failed to fetch');
   });
   return async (input, init = {}) => {
     const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url, where().href);
     const real = !answers.has(url.href) && network(url);
-    return real ? real(url.href, init) : local(url, init);
+    return real ? softly(() => real(url.href, init)).then((r) => readSoftly(r, softly)) : local(url, init);
   };
+}
+
+// A response whose body is read under softly, so that settling waits for what the network sends.
+function readSoftly(r, softly) {
+  if (!r.body) return r;
+  const reader = r.body.getReader();
+  const body = new ReadableStream({
+    pull: (controller) => softly(() => reader.read()).then(({ value, done }) => (done ? controller.close() : controller.enqueue(value))),
+    cancel: (reason) => reader.cancel(reason),
+  });
+  return new Response(body, { status: r.status, statusText: r.statusText, headers: r.headers });
 }
 
 export function makeWebSocket(later, where) {

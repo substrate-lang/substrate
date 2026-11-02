@@ -17,6 +17,7 @@ export function workerModule({ spawn }) {
   let caller = null;
   const alive = new Map();
   let nextNumber = 1;
+  let started = 0;
 
   const deliver = (w, tag, kind, value, bytes) => {
     if (caller) caller.event(kind, w, tag, value, bytes);
@@ -52,10 +53,14 @@ export function workerModule({ spawn }) {
       return 0;
     }
     const w = nextNumber++;
-    const worker = { thread, tag, time, timer: null };
+    const worker = { thread, tag, time, timer: null, owed: 1 };
     alive.set(w, worker);
     thread.onMessage((m) => {
       if (alive.get(w) !== worker) return;
+      if (m.type === 'busy' && worker.owed > 0) {
+        worker.owed--;
+        started++;
+      }
       if (m.type === 'output' && !heard) caller.write(m.fd, m.bytes);
       else if (m.type === 'output') deliver(w, tag, m.fd === 2 ? STDERR : STDOUT, 0, m.bytes);
       else if (m.type === 'message') deliver(w, tag, MESSAGE, 0, m.bytes);
@@ -71,6 +76,10 @@ export function workerModule({ spawn }) {
 
   return (theCaller, app) => {
     caller = theCaller;
+    // What workers have been sent and not yet started on, which browser tests wait for as they settle a page.
+    if (app && app.realTime) {
+      app.realTime.push({ pending: () => [...alive.values()].reduce((n, x) => n + x.owed, 0), progress: () => started });
+    }
     const string = (ptr, len) => caller.string(ptr, len);
     const bytes = (ptr, len) => caller.memory().slice(caller.u(ptr), caller.u(ptr) + len);
     return {
@@ -102,6 +111,7 @@ export function workerModule({ spawn }) {
         if (!worker) return -1;
         const b = bytes(ptr, len);
         worker.thread.post({ type: 'message', bytes: b }, [b.buffer]);
+        worker.owed++;
         return 0;
       },
       stop(w) {
