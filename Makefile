@@ -5,7 +5,7 @@ build/sub:
 	bin/substrate expand build/empty.sub -c build/cache > /dev/null
 
 check:
-	tests/run.sh
+	tests/run.sh $(TEST_ARGS)
 	$(MAKE) docs
 
 bootstrap:
@@ -15,9 +15,7 @@ seed:
 	bin/bootstrap seed
 
 repl:
-	bin/substrate site -c build/cache $(OUT)/web/repl packages/web/repl/repl.sub -p packages/web/repl/page.html \
-	  -f files $(addprefix substrate/compiler/,macros.sub substrate.sub syntax.sub wasm.sub writer.sub) \
-	  $(shell find substrate/host packages/scheme packages/bend -name '*.sub' | sort) packages/nodes/nodes.sub std/encoding/utf8.sub
+	cd packages/web && ../../bin/substrate site -c $(abspath build/cache) repl -o $(abspath $(OUT)/web/repl)
 
 docs:
 	rm -rf $(OUT)/doc

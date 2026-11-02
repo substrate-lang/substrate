@@ -4,12 +4,15 @@
 (require-unqualified clock host/modules/clock)
 (require-unqualified compare "compare.sub")
 
-(provide run-tests expect-output expect-output-file test-option test-path scratch-directory compare-output!
-         compare-output-file!)
+(provide run-tests expect-output expect-output-file test-option test-flag? test-path scratch-directory test-skipped
+         compare-output! compare-output-file!)
 
 ;; ---- the runner ----
 
-(struct entry [module string] [name string] [line u32] [ignored bool] [traps string] [run (fn ())])
+;; A test that throws test-skipped counts as skipped, for the reason it gives.
+(exception test-skipped string)
+
+(struct entry [module string] [name string] [line u32] [skip string] [traps string] [run (fn ())])
 
 (define entries (ptr entry) 0)
 (define entry-count u32 0)
@@ -23,22 +26,35 @@
     (set! (-> e module) module)
     (set! (-> e name) name)
     (set! (-> e line) line)
-    (set! (-> e ignored) (or ignored (not (here? platforms))))
+    (set! (-> e skip) (let ([why (not-here platforms)]) (if (or (> (-> why length) 0) (not ignored)) why "ignored")))
     (set! (-> e traps) traps)
     (set! (-> e run) run))
   (+= entry-count 1))
 
 (define system string "")
 
-(define (here? [platforms string]) -> bool
-  (when (== (-> platforms length) 0) (return #t))
+;; Why a test with these marks does not run here, or "" when it does. A test that names systems runs only on those, and
+;; one marked #:webgpu does not run without Chromium (--no-chromium) or with --no-webgpu.
+(define (not-here [marks string]) -> string
+  (when (== (-> marks length) 0) (return ""))
   (when (== (-> system length) 0) (set! system (host-os)))
-  (let ([start u32 0])
-    (for ([i u32 0]) (<= i (-> platforms length)) (+= i 1)
-      (when (or (== i (-> platforms length)) (== (@ platforms i) #\space))
-        (let ([p (slice platforms start i)])
-          (when (or (== p system) (and (== p "unix") (!= system "windows") (!= system "web"))) (return #t)))
+  (let ([start u32 0] [systems #f] [on-one #f] [webgpu #f])
+    (for ([i u32 0]) (<= i (-> marks length)) (+= i 1)
+      (when (or (== i (-> marks length)) (== (@ marks i) #\space))
+        (let ([p (slice marks start i)])
+          (cond [(== p "webgpu") (set! webgpu #t)]
+                [else
+                 (set! systems #t)
+                 (when (or (== p system) (and (== p "unix") (!= system "windows") (!= system "web"))) (set! on-one #t))]))
         (set! start (+ i 1))))
+    (cond [(and systems (not on-one)) "only on other systems"]
+          [(and webgpu (test-flag? "--no-chromium")) "need Chromium"]
+          [(and webgpu (test-flag? "--no-webgpu")) "left out by --no-webgpu"]
+          [else ""])))
+
+(define (test-flag? [flag string]) -> bool
+  (let ([args (host-args)])
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (when (== (@ args i) flag) (return #t)))
     #f))
 
 (define arguments (slice string))
@@ -59,9 +75,11 @@
             [(== a "--nocapture") (set! capturing #f)]))))
 
 (define (valued? [a string]) -> bool
-  (or (== a "--name") (== a "--toolchain") (== a "--map") (== a "--cache") (== a "--scratch") (== a "--running")))
+  (or (== a "--name") (== a "--toolchain") (== a "--chromium") (== a "--chromium-args") (== a "--map") (== a "--cache")
+      (== a "--scratch") (== a "--running")))
 
-(define (flag? [a string]) -> bool (or (== a "-v") (== a "--ignored") (== a "--nocapture") (== a "--check-cache")))
+(define (flag? [a string]) -> bool
+  (or (== a "-v") (== a "--ignored") (== a "--nocapture") (== a "--check-cache") (== a "--no-webgpu") (== a "--no-chromium")))
 
 (define (test-option [name string]) -> string
   (let ([args (host-args)])
@@ -89,7 +107,9 @@
 (define current u32 0)
 (define passed u32 0)
 (define failed u32 0)
-(define skipped u32 0)
+(define skip-reasons (array string 16))
+(define skip-counts (array u32 16))
+(define skip-kinds u32 0)
 (define started f64 0.0)
 (define captured buffer)
 (define resume event-head)
@@ -109,11 +129,9 @@
     (+= next 1)
     (let ([e (& (@ entries current))])
       (cond [(not (selected? e)) (begin)]
-            [(and (-> e ignored) (not ignored-only))
-             (+= skipped 1)
-             (when verbose (printf "ignored ~a:~a ~a~n" (-> e module) (-> e line) (-> e name)))]
-            [(and ignored-only (not (-> e ignored))) (begin)]
-            [else (run-one! e)])))
+            [(== (-> (-> e skip) length) 0) (unless ignored-only (run-one! e))]
+            [(and (== (-> e skip) "ignored") ignored-only) (run-one! e)]
+            [else (skipped! e (-> e skip))])))
   (finish!))
 
 (define (run-one! [e (ptr entry)])
@@ -135,7 +153,10 @@
          (if (== (-> (-> e traps) length) 0) (passed! e) (failed! e (trap-expected (-> e traps)))))
        [catch test-failed (message)
          (output-to! 0)
-         (failed! e message)])
+         (failed! e message)]
+       [catch test-skipped (why)
+         (output-to! 0)
+         (skipped! e why)])
   (trap-handlers-keep! handlers))
 
 (define (trap-expected [traps string]) -> string
@@ -166,6 +187,18 @@
   (+= passed 1)
   (when verbose (printf "ok ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))))
 
+(define (skipped! [e (ptr entry)] [why string])
+  (let ([k u32 0])
+    (while (and (< k skip-kinds) (!= (@ skip-reasons k) why)) (+= k 1))
+    (when (and (== k skip-kinds) (< k 16))
+      (set! (@ skip-reasons k) why)
+      (+= skip-kinds 1))
+    (when (< k 16) (set! (@ skip-counts k) (+ (@ skip-counts k) 1))))
+  (when verbose
+    (if (== why "ignored")
+        (printf "ignored ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))
+        (printf "skipped ~a:~a ~a: ~a~n" (-> e module) (-> e line) (-> e name) why))))
+
 (define (failed! [e (ptr entry)] [message string])
   (+= failed 1)
   (printf "FAIL ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))
@@ -187,7 +220,7 @@
   (let ([tenths (cast u64 (nearbyint (/ (- (clock-monotonic) started) 100.0)))])
     (printf "~a: ~a passed" package-name passed)
     (when (> failed 0) (printf ", ~a failed" failed))
-    (when (> skipped 0) (printf ", ~a ignored" skipped))
+    (for ([k u32 0]) (< k skip-kinds) (+= k 1) (printf ", ~a ~a" (@ skip-counts k) (@ skip-reasons k)))
     (printf " (~a.~a s)~n" (/ tenths 10) (% tenths 10)))
   (host-exit (if (> failed 0) 1 0)))
 

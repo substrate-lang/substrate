@@ -1,10 +1,14 @@
-;; A page that reads its server's event stream with the event stream client, which reconnects with the last id until
-;; the server answers 204 (tests/web/server.sub).
+;; A page that reads its server's event stream (tests/web/server.sub) with the event stream client, which reconnects
+;; with the last id until the server answers 204. It then makes requests whose answers depend on the browser's
+;; cross-origin rules.
 (require-unqualified web web)
 (require-unqualified http std/http)
 (require-unqualified client std/http/sse-client)
+(require-unqualified events host/events)
+(require-unqualified fetch host/modules/fetch)
+(require-unqualified stream host/stream)
 
-(struct model [stream sse-client] [log buffer])
+(struct model [stream sse-client] [log buffer] [checks buffer])
 (variant message [changed])
 (messages message)
 
@@ -21,10 +25,78 @@
 
 (define (closed [c (ptr sse-client)] [why i32])
   (said! c (slice (array-of string "closed " (cond [(== why sse-ended) "ended"] [(== why sse-lost) "lost"]
-                                                   [(== (-> c status) 204) "refused 204"] [else "refused"])))))
+                                                   [(== (-> c status) 204) "refused 204"] [else "refused"]))))
+  (when (== (-> c status) 204)
+    (set! (-> ask m) (cast (ptr model) (-> c user)))
+    (set! (-> ask head handle) ask-heard)
+    (set! (-> ask body) (make-buffer))
+    (asked! "POST" "/guarded" (no-headers) "x")))
+
+(struct asking [head event-head] [m (ptr model)] [id u32] [step u32] [status i32] [body buffer] [other string]
+  [chunk (array u8 4096)])
+
+(define ask asking)
+
+(define (no-headers) -> (slice string) (slice (cast (ptr string) 0) 0))
+
+(define (asked! [method string] [url string] [headers (slice string)] [body string])
+  (set! (-> ask status) 0)
+  (set! (-> ask body length) 0)
+  (set! (-> ask id) (fetch-start method url headers (cast (slice u8) body) (cast (ptr void) (& ask)))))
+
+(define (noted! [parts (slice string)])
+  (let ([m (-> ask m)] [e message changed])
+    (when (> (-> m checks length) 0) (buffer-add-string! (& (-> m checks)) " | "))
+    (for ([i u32 0]) (< i (-> parts length)) (+= i 1) (buffer-add-string! (& (-> m checks)) (@ parts i)))
+    (send! (& e))))
+
+(define (status-text) -> string
+  (let ([b (make-buffer)])
+    (write-digits (& b) (cast u64 (-> ask status)) 10)
+    (buffer-string (& b))))
+
+(define (joined [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+;; answered! sends the next request after each answer: a POST to this origin, then a request for the other origin's
+;; address, a POST to it, a request for its count of refused POSTs, and a PUT.
+(define (answered!)
+  (let ([text (buffer-string (& (-> ask body)))] [step (-> ask step)])
+    (+= (-> ask step) 1)
+    (cond [(== step 0)
+           (noted! (slice (array-of string "posted " (status-text) " " text)))
+           (asked! "GET" "/other" (no-headers) "")]
+          [(== step 1)
+           (set! (-> ask other) (string-copy text))
+           (asked! "POST" (joined (-> ask other) "guarded") (no-headers) "x")]
+          [(== step 2) (asked! "GET" (joined (-> ask other) "refused") (no-headers) "")]
+          [(== step 3)
+           (noted! (slice (array-of string "refused " text)))
+           (asked! "PUT" (joined (-> ask other) "api") (slice (array-of string "x-key" "1")) "")]
+          [(== step 4) (noted! (slice (array-of string "put " (status-text) " " text)))])))
+
+(define (ask-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (cond [(!= id (-> ask id)) (begin)]
+        [(== source fetch-source)
+         (if (== kind fetch-head)
+             (let ([headers (events-take-strings)])
+               (free (-> headers items))
+               (set! (-> ask status) value)
+               (stream-read! id (slice (-> ask chunk))))
+             (answered!))]
+        [(and (== kind stream-read) (> value 0))
+         (buffer-add! (& (-> ask body)) (slice (-> ask chunk) (cast u32 value)))
+         (stream-read! id (slice (-> ask chunk)))]
+        [(or (== kind stream-read) (== kind stream-failed))
+         (stream-close id)
+         (answered!)]))
 
 (define (init [m (ptr model)])
   (set! (-> m log) (make-buffer))
+  (set! (-> m checks) (make-buffer))
   (set! (-> m stream user) (cast (ptr void) m))
   (set! (-> m stream reconnect) #t)
   (set! (-> m stream on-open) opened)
@@ -35,6 +107,7 @@
 (define (update [m (ptr model)] [e (ptr message)]) (match e [changed (begin)]))
 
 (view (page [m (ptr model)])
-  (p ([id "log"]) (text (buffer-string (& (-> m log))))))
+  (p ([id "log"]) (text (buffer-string (& (-> m log)))))
+  (p ([id "checks"]) (text (buffer-string (& (-> m checks))))))
 
 (app model message init update page)

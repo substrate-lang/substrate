@@ -54,7 +54,7 @@ In the dev shell (`nix develop`), where `bin/sub` is short for `bin/substrate`:
     bin/substrate map FILE                       # FILE's module map
     bin/substrate eval FILE                      # FILE's forms, one at a time, as a session
     bin/substrate expand FILE                    # FILE's expansion
-    bin/substrate site OUT FILE                  # a web site for a page program
+    bin/substrate site NAME|FILE [-o DIR]        # the current package's site NAME, or a site for FILE's program
     bin/substrate serve OUT                      # serve it locally
     bin/substrate doc                            # documentation of the current package and its dependencies, as HTML in build/doc
     bin/substrate doc NAME [ITEM]                # the documentation of module or directory NAME, or of its ITEM
@@ -62,7 +62,6 @@ In the dev shell (`nix develop`), where `bin/sub` is short for `bin/substrate`:
     bin/substrate test [./DIR ...] [PATTERN ...] # the tests of the current package, or of each DIR at once
     bin/substrate version                        # substrate's version, and the hash of its files
     make check                                   # the tests, then make docs when they pass
-    tests/web/run.sh                             # the browser tests
     make bootstrap                               # the compiler builds itself into the same bytes
     make seed                                    # the bootstrap check, then the compiler and substrate become the seed
     make repl                                    # the REPL's site, in build/web/repl

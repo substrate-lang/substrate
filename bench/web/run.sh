@@ -6,6 +6,5 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 cd "$root"
 sites=build/bench/web
-bin/substrate site "$sites/sprites" tests/web/sprites.sub -p tests/web/sprites.html
-bin/substrate site "$sites/sprites-canvas" tests/web/sprites-canvas.sub -p tests/web/sprites.html
+for s in sprites sprites-canvas; do (cd tests/web && "$root/bin/substrate" site "$s" -o "$root/$sites/$s"); done
 node "$here/sprites.mjs" "$sites" "$@"

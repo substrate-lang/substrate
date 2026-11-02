@@ -1,0 +1,553 @@
+;; Tests of web programs in Chromium. with-browser builds a site, as substrate site does, and opens it. Finders pick out
+;; elements, and actions, reads and expectations use them as a user would. A package whose tests open browsers says
+;; (browser) in its tests clause.
+;;
+;; Chromium runs headless with WebGPU enabled; SUBSTRATE_CHROMIUM_ARGS adds arguments, separated by spaces. Tests marked
+;; #:webgpu need Chromium to draw WebGPU canvases, and --no-webgpu leaves them out. On Linux, headless Chromium draws
+;; them only on its software GPU: --enable-unsafe-swiftshader --enable-features=Vulkan --use-vulkan=swiftshader
+;; --use-angle=vulkan
+(require-unqualified fs host/fs)
+(require-unqualified browsers host/node/browser)
+(require-unqualified process host/node/process)
+(require-unqualified tests "test.sub")
+(require-unqualified paths "../package/path.sub")
+(require-unqualified url "../http/url.sub")
+
+(provide with-browser browser finder by-css by-text by-text-containing by-role by-label by-test-id within nth
+         browser-click! browser-click-at! browser-right-click! browser-double-click! browser-hover! browser-wheel!
+         browser-select! browser-resize! browser-advance-until! browser-type! browser-press! browser-key-down! browser-key-up!
+         browser-focus! browser-move-mouse! browser-fire! browser-advance! browser-go! browser-reload!
+         browser-choose-files! browser-respond! browser-storage-set! browser-clipboard-set! browser-text browser-html
+         browser-attribute browser-attribute? browser-value browser-checked? browser-count browser-drawing
+         browser-drawn? browser-url browser-storage-get browser-clipboard-get browser-downloaded browser-sounds
+         browser-console browser-show browser-show-drawing expect-text expect-html expect-value expect-attribute
+         expect-no-attribute expect-checked expect-count expect-missing expect-drawn browser-opened browser-closed!
+         browser-expect browser-choose-files-at! browser-pixels browser-box browser-screenshot element-box expect-pixel
+         %browser-step!)
+
+(struct browser [id u32])
+
+(struct finder [code string])
+
+(struct element-box [x f64] [y f64] [width f64] [height f64])
+
+;; ---- finders ----
+
+(define (field! [out (ptr buffer)] [s string])
+  (buffer-add-string! out s)
+  (buffer-add-byte! out 0))
+
+(define (number! [out (ptr buffer)] [n u32])
+  (write-digits out (cast u64 n) 10)
+  (buffer-add-byte! out 0))
+
+(define (signed! [out (ptr buffer)] [n i32])
+  (when (< n 0) (buffer-add-byte! out #\-))
+  (number! out (cast u32 (if (< n 0) (- 0 n) n))))
+
+(define (finder-of [kind string] [text string]) -> finder
+  (let ([out (make-buffer)])
+    (field! (& out) kind)
+    (field! (& out) text)
+    (finder #:code (buffer-string (& out)))))
+
+(define (by-css [selector string]) -> finder (finder-of "css" selector))
+
+(define (by-text [text string]) -> finder (finder-of "text" text))
+
+(define (by-text-containing [text string]) -> finder (finder-of "text-containing" text))
+
+;; Finds elements by role and accessible name. An empty name matches any name.
+(define (by-role [role string] [name string]) -> finder
+  (let ([out (make-buffer)])
+    (field! (& out) "role")
+    (field! (& out) role)
+    (field! (& out) name)
+    (finder #:code (buffer-string (& out)))))
+
+(define (by-label [text string]) -> finder (finder-of "label" text))
+
+(define (by-test-id [id string]) -> finder (finder-of "test-id" id))
+
+(define (within [outer finder] [inner finder]) -> finder
+  (let ([out (make-buffer)])
+    (field! (& out) "within")
+    (buffer-add-string! (& out) (-> outer code))
+    (buffer-add-string! (& out) (-> inner code))
+    (finder #:code (buffer-string (& out)))))
+
+;; The nth of the elements that finder finds, counting from 1.
+(define (nth [of finder] [n u32]) -> finder
+  (let ([out (make-buffer)])
+    (field! (& out) "nth")
+    (buffer-add-string! (& out) (-> of code))
+    (number! (& out) n)
+    (finder #:code (buffer-string (& out)))))
+
+;; ---- requests ----
+
+(define (request-of [kind string] [f finder]) -> buffer
+  (let ([out (make-buffer)])
+    (field! (& out) kind)
+    (buffer-add-string! (& out) (-> f code))
+    out))
+
+;; The step of a with-browser body that is running, as file:line: (form ...), which messages about failures name.
+(define step string "")
+
+(define (%browser-step! [s string]) (set! step s))
+
+(define (stepped [why string]) -> string (if (== (-> step length) 0) why (lines-joined step why)))
+
+(define (sent [b browser] [request (ptr buffer)]) -> string
+  (let ([answer string] [why string] [code i32 0])
+    (set! code (browser-request (-> b id) (buffer-string request) (& answer) (& why)))
+    (buffer-free! request)
+    (when (< code 0) (throw test-failed (stepped why)))
+    answer))
+
+(define (asked [b browser] [kind string] [f finder]) -> string (let ([out (request-of kind f)]) (sent b (& out))))
+
+(define (asked-with [b browser] [kind string] [f finder] [text string]) -> string
+  (let ([out (request-of kind f)])
+    (field! (& out) text)
+    (sent b (& out))))
+
+(define (told [b browser] [kind string] [text string]) -> string
+  (let ([out (make-buffer)])
+    (field! (& out) kind)
+    (field! (& out) text)
+    (sent b (& out))))
+
+(define (said [b browser] [kind string]) -> string
+  (let ([out (make-buffer)])
+    (field! (& out) kind)
+    (sent b (& out))))
+
+(define (browser-opened [spec string] [html string] [url string] [args (slice string)] [server string] [message string])
+                        -> browser
+  (when (test-flag? "--no-chromium") (throw test-skipped "need Chromium"))
+  (when (== (-> (test-option "--chromium") length) 0)
+    (throw test-failed (lines-joined message "a test that opens a browser needs (browser) in the tests clause of its package's package.sub")))
+  (let* ([dir (built-by "site" spec html message)] [served (if (== (-> server length) 0) "" (built-by "build" server "" message))]
+         [why string] [id (browser-open dir (with-args url args) (test-option "--chromium") served (test-option "--scratch")
+                           (test-option "--chromium-args") (& why))])
+    (when (== id 0) (throw test-failed (lines-joined message why)))
+    (browser #:id id)))
+
+;; Adds args to url as arg parameters, which a site passes to its program as its arguments.
+(define (with-args [url string] [args (slice string)]) -> string
+  (let ([b (make-buffer)] [query #f])
+    (buffer-add-string! (& b) url)
+    (for ([i u32 0]) (< i (-> url length)) (+= i 1) (when (== (@ url i) #\?) (set! query #t)))
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1)
+      (buffer-add-string! (& b) (if (or query (> i 0)) "&arg=" "?arg="))
+      (url-add-form-value! (& b) (@ args i)))
+    (buffer-string (& b))))
+
+(struct built [command string] [spec string] [html string] [dir string])
+
+(define made buffer)
+
+;; Builds spec once per run: with substrate site into build/test/sites, or substrate build into build/test/servers.
+(define (built-by [command string] [spec string] [html string] [message string]) -> string
+  (let* ([all (cast (ptr built) (-> made bytes))] [n (/ (-> made length) (sizeof built))]
+         [base (base-of spec)] [name (if (ends? base ".sub") (slice base 0 (- (-> base length) 4)) base)]
+         [dir (joined-path (if (== command "site") "build/test/sites" "build/test/servers") name)]
+         [root (parent-of (test-option "--toolchain"))] [host (joined-path (test-option "--toolchain") "host/subhost.mjs")]
+         [cache (test-option "--cache")] [argv (make-buffer)] [o process-options] [output (slice u8)] [why string]
+         [code i32 0] [b built])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let ([m (& (@ all i))])
+        (when (and (== (-> m command) command) (== (-> m spec) spec) (== (-> m html) html)) (return (-> m dir)))
+        (when (== (-> m dir) dir) (set! dir (numbered dir n)))))
+    (arg! (& argv) "-R")
+    (arg! (& argv) (granted "-W=" (slice (array-of string dir cache))))
+    (arg! (& argv) (granted "--allow-run=" (slice (array-of string host))))
+    (arg! (& argv) (joined-path root "build/sub"))
+    (arg! (& argv) root)
+    (arg! (& argv) command)
+    (arg! (& argv) spec)
+    (arg! (& argv) "-c")
+    (arg! (& argv) cache)
+    (arg! (& argv) "-o")
+    (arg! (& argv) dir)
+    (when (> (-> html length) 0)
+      (arg! (& argv) "--html")
+      (arg! (& argv) html))
+    (process-options-init! (& o))
+    (set! code (process-run host (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string))) (& o)
+                            (slice (cast (ptr u8) 0) 0) 120000 (& output) (& why)))
+    (when (< code 0) (throw test-failed (lines-joined message why)))
+    (unless (== code 0) (throw test-failed (lines-joined message (cast string output))))
+    (set! b (built #:command command #:spec spec #:html html #:dir dir))
+    (buffer-add! (& made) (slice (cast (ptr u8) (& b)) (sizeof built)))
+    dir))
+
+(define (arg! [argv (ptr buffer)] [s string]) (buffer-add! argv (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+;; In grant flags, a comma in a path is written ",," (substrate/host/grants.mjs).
+(define (granted [flag string] [paths (slice string)]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) flag)
+    (for ([i u32 0]) (< i (-> paths length)) (+= i 1)
+      (when (> i 0) (buffer-add-byte! (& out) #\,))
+      (let ([p (@ paths i)])
+        (for ([k u32 0]) (< k (-> p length)) (+= k 1)
+          (when (== (@ p k) #\,) (buffer-add-byte! (& out) #\,))
+          (buffer-add-byte! (& out) (cast i32 (@ p k))))))
+    (buffer-string (& out))))
+
+(define (numbered [dir string] [n u32]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) dir)
+    (buffer-add-byte! (& out) #\-)
+    (write-digits (& out) (cast u64 n) 10)
+    (buffer-string (& out))))
+
+(define (browser-closed! [b browser]) (browser-close (-> b id)))
+
+;; Saves a PNG of the browser's window as build/test/screenshots/name.png in the package, and gives that path.
+(define (browser-screenshot [b browser] [name string]) -> string
+  (let ([out (make-buffer)] [path (make-buffer)] [why string] [png string])
+    (field! (& out) "screenshot")
+    (set! png (sent b (& out)))
+    (buffer-add-string! (& path) "build/test/screenshots/")
+    (buffer-add-string! (& path) name)
+    (buffer-add-string! (& path) ".png")
+    (when (or (< (fs-make-dir "build/test/screenshots" (& why)) 0)
+              (< (fs-write-file (buffer-string (& path)) (cast (slice u8) png) (& why)) 0))
+      (throw test-failed (stepped why)))
+    (buffer-string (& path))))
+
+(define (lines-joined [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-byte! (& out) 10)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+;; ---- actions ----
+
+(define (browser-click! [b browser] [f finder]) (asked b "click" f))
+
+;; Clicks at x, y within the element.
+(define (browser-click-at! [b browser] [f finder] [x u32] [y u32])
+  (let ([out (request-of "click" f)])
+    (number! (& out) x)
+    (number! (& out) y)
+    (sent b (& out))))
+
+(define (browser-right-click! [b browser] [f finder]) (asked b "right-click" f))
+
+(define (browser-double-click! [b browser] [f finder]) (asked b "double-click" f))
+
+(define (browser-hover! [b browser] [f finder]) (asked b "hover" f))
+
+;; Turns the mouse wheel over the element, by dx and dy pixels.
+(define (browser-wheel! [b browser] [f finder] [dx i32] [dy i32])
+  (let ([out (request-of "wheel" f)])
+    (signed! (& out) dx)
+    (signed! (& out) dy)
+    (sent b (& out))))
+
+;; Chooses the option of a select element whose text is option.
+(define (browser-select! [b browser] [f finder] [option string]) (asked-with b "select" f option))
+
+;; Makes the browser's window width by height CSS pixels.
+(define (browser-resize! [b browser] [width u32] [height u32])
+  (let ([out (make-buffer)])
+    (field! (& out) "resize")
+    (number! (& out) width)
+    (number! (& out) height)
+    (sent b (& out))))
+
+(define (browser-type! [b browser] [f finder] [text string]) (asked-with b "type" f text))
+
+;; Presses and releases a key, given as a key's name or one character after any of Shift+, Control+, Alt+ and Meta+.
+(define (browser-press! [b browser] [key string]) (told b "press" key))
+
+(define (browser-key-down! [b browser] [key string]) (told b "key-down" key))
+
+(define (browser-key-up! [b browser] [key string]) (told b "key-up" key))
+
+(define (browser-focus! [b browser] [f finder]) (asked b "focus" f))
+
+;; Moves the mouse by dx, dy over the element that has locked the pointer, or else over the document's body.
+(define (browser-move-mouse! [b browser] [dx i32] [dy i32])
+  (let ([out (make-buffer)])
+    (field! (& out) "move-mouse")
+    (signed! (& out) dx)
+    (signed! (& out) dy)
+    (sent b (& out))))
+
+(define (browser-fire! [b browser] [f finder] [event string]) (asked-with b "fire" f event))
+
+;; Moves the browser's clock ms ahead, running its timers and animation frames on the way.
+(define (browser-advance! [b browser] [ms u32])
+  (let ([out (make-buffer)])
+    (field! (& out) "advance")
+    (number! (& out) ms)
+    (sent b (& out))))
+
+;; Goes to url, relative to the browser's URL, and starts the program again.
+(define (browser-go! [b browser] [url string]) (told b "go" url))
+
+;; Reloads the page, keeping its storage, history and clipboard.
+(define (browser-reload! [b browser]) (said b "reload"))
+
+(define (browser-choose-files-at! [b browser] [paths (slice string)])
+  (let ([out (make-buffer)])
+    (field! (& out) "choose-files")
+    (for ([i u32 0]) (< i (-> paths length)) (+= i 1) (field! (& out) (@ paths i)))
+    (sent b (& out))))
+
+;; Answers fetches of url with status and body.
+(define (browser-respond! [b browser] [url string] [status u32] [body string])
+  (let ([out (make-buffer)])
+    (field! (& out) "respond")
+    (field! (& out) url)
+    (number! (& out) status)
+    (field! (& out) body)
+    (sent b (& out))))
+
+(define (browser-storage-set! [b browser] [key string] [value string])
+  (let ([out (make-buffer)])
+    (field! (& out) "storage-set")
+    (field! (& out) key)
+    (field! (& out) value)
+    (sent b (& out))))
+
+(define (browser-clipboard-set! [b browser] [text string]) (told b "clipboard-set" text))
+
+;; ---- reads ----
+
+(define (browser-text [b browser] [f finder]) -> string (asked b "text" f))
+
+(define (browser-html [b browser] [f finder]) -> string (asked b "html" f))
+
+(define (browser-attribute [b browser] [f finder] [name string]) -> string (asked-with b "attribute" f name))
+
+(define (browser-attribute? [b browser] [f finder] [name string]) -> bool (== (asked-with b "has-attribute" f name) "true"))
+
+(define (browser-value [b browser] [f finder]) -> string (asked b "value" f))
+
+(define (browser-checked? [b browser] [f finder]) -> bool (== (asked b "checked" f) "true"))
+
+(define (browser-count [b browser] [f finder]) -> u32
+  (let ([n u64 0])
+    (digits-integer (asked b "count" f) 10 #f (& n))
+    (cast u32 n)))
+
+;; The commands of the canvas's last drawing, one per line.
+(define (browser-drawing [b browser] [f finder]) -> string (asked b "drawing" f))
+
+;; Whether the canvas's last drawing contains the commands in lines, consecutively and in order.
+(define (browser-drawn? [b browser] [f finder] [lines string]) -> bool (== (asked-with b "drawn" f lines) "true"))
+
+(define (browser-url [b browser]) -> string (said b "url"))
+
+(define (browser-storage-get [b browser] [key string]) -> string (told b "storage-get" key))
+
+;; The text on the browser's clipboard, with its line breaks as \n on every system.
+(define (browser-clipboard-get [b browser]) -> string (said b "clipboard-get"))
+
+;; The contents of the file the program saved as name.
+(define (browser-downloaded [b browser] [name string]) -> string (told b "downloaded" name))
+
+;; The sounds the program started, stopped and finished, one per line.
+(define (browser-sounds [b browser]) -> string (said b "sounds"))
+
+(define (browser-console [b browser]) -> string (said b "console"))
+
+;; The RGBA pixels of a rectangle of the canvas that f finds, row by row: what a 2D canvas holds, or the last frame
+;; drawn on a WebGPU canvas.
+(define (browser-pixels [b browser] [f finder] [x u32] [y u32] [width u32] [height u32]) -> (slice u8)
+  (let ([out (request-of "pixels" f)])
+    (number! (& out) x)
+    (number! (& out) y)
+    (number! (& out) width)
+    (number! (& out) height)
+    (cast (slice u8) (sent b (& out)))))
+
+;; Where the element that f finds is in the window, in CSS pixels.
+(define (browser-box [b browser] [f finder]) -> element-box
+  (let ([text (asked b "box" f)] [n (array f64 4)] [k u32 0] [start u32 0])
+    (for ([i u32 0]) (<= i (-> text length)) (+= i 1)
+      (when (and (< k 4) (or (== i (-> text length)) (== (@ text i) 32)))
+        (set! (@ n k) (decimal (slice text start i)))
+        (+= k 1)
+        (set! start (+ i 1))))
+    (element-box #:x (@ n 0) #:y (@ n 1) #:width (@ n 2) #:height (@ n 3))))
+
+;; Parses a number written with three decimals, such as -12.345.
+(define (decimal [s string]) -> f64
+  (let* ([negative (and (> (-> s length) 0) (== (@ s 0) #\-))] [dot (if negative 1 0)] [whole u64 0] [part u64 0])
+    (while (and (< dot (-> s length)) (!= (@ s dot) #\.)) (+= dot 1))
+    (digits-integer (slice s (if negative 1 0) dot) 10 #f (& whole))
+    (when (< (+ dot 1) (-> s length)) (digits-integer (slice s (+ dot 1) (-> s length)) 10 #f (& part)))
+    (let ([v (+ (cast f64 whole) (/ (cast f64 part) 1000.0))]) (if negative (- 0.0 v) v))))
+
+(define (browser-show [b browser] [f finder]) (printf "~a\n" (browser-html b f)))
+
+(define (browser-show-drawing [b browser] [f finder]) (printf "~a\n" (browser-drawing b f)))
+
+;; ---- expectations ----
+
+(define (browser-expect [b browser] [kind string] [f finder] [fields (slice string)] [message string])
+  (let ([out (request-of kind f)] [answer string] [why string] [code i32 0])
+    (for ([i u32 0]) (< i (-> fields length)) (+= i 1) (field! (& out) (@ fields i)))
+    (set! code (browser-request (-> b id) (buffer-string (& out)) (& answer) (& why)))
+    (buffer-free! (& out))
+    (when (< code 0) (throw test-failed (if (== step message) (lines-joined message why) (stepped (lines-joined message why)))))))
+
+(define (count-text [n u32]) -> string
+  (let ([out (make-buffer)])
+    (write-digits (& out) (cast u64 n) 10)
+    (buffer-string (& out))))
+
+(begin-for-syntax
+  (require-unqualified macros compiler/macros)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (message-of [s datum]) -> datum
+    (let ([parts (syntax->list s)])
+      (literal (format (if (> (length parts) 3) "~a:~a: (~a ~s ~s ...)" "~a:~a: (~a ~s ~s)")
+                       `(,(syntax-source s) ,(syntax-line s) ,(syntax-e (car parts)) ,(syntax->datum (cadr parts))
+                         ,(syntax->datum (caddr parts)))))))
+
+  ;; A body form's location and start, as message-of gives them.
+  (define (step-of [s datum]) -> datum
+    (let ([parts (syntax->list s)])
+      (cond [(and (!= parts 0) (>= (length parts) 3)) (message-of s)]
+            [else (literal (format "~a:~a: ~s" `(,(syntax-source s) ,(syntax-line s) ,(syntax->datum s))))])))
+
+  (define (path-of [s datum] [file datum]) -> datum
+    #`(test-path #,(literal (string->datum (symbol->string (syntax-source s)))) #,file))
+
+  (define (text? [x datum]) -> bool (string? (syntax-e x)))
+
+  (define (no-fields) -> datum #`(slice (cast (ptr string) 0) 0))
+
+  ;; Whether spec is a site's name rather than a path, by the same rule as substrate site.
+  (define (named? [spec datum]) -> bool
+    (let* ([text (datum->string spec)] [n (-> text length)])
+      (for ([i u32 0]) (< i n) (+= i 1) (when (or (== (@ text i) #\/) (== (@ text i) #\\)) (return #f)))
+      (not (and (>= n 4) (== (slice text (- n 4) n) ".sub")))))
+
+  (define (with-browser-form [s datum]) -> datum
+    (syntax-match s
+      [(_ ((? identifier? b) (? text? file) options ...) body ...)
+       (let ([html (literal '"")] [url (literal '"")] [args (no-fields)] [server (literal '"")] [l options])
+         (while (pair? l)
+           (unless (and (keyword? (syntax-e (car l))) (pair? (cdr l)))
+             (raise-syntax-error 'with-browser "expected a keyword and its value" (car l)))
+           (let ([k (keyword->string (syntax-e (car l)))] [v (cadr l)])
+             (cond [(and (== k "html") (text? v)) (set! html (path-of s v))]
+                   [(and (== k "url") (text? v)) (set! url v)]
+                   [(== k "args") (set! args (arguments v))]
+                   [(and (== k "server") (text? v)) (set! server (path-of s v))]
+                   [else (raise-syntax-error 'with-browser "the options are #:html \"file\", #:url \"url\", #:args and #:server \"server.sub\"" (car l))]))
+           (set! l (cddr l)))
+         #`(let ([#,b (browser-opened #,(if (named? (syntax-e file)) file (path-of s file)) #,html #,url #,args #,server
+                                      #,(literal (format "~a:~a: (with-browser (~s ~s) ...)"
+                                                         `(,(syntax-source s) ,(syntax-line s) ,(syntax->datum b)
+                                                           ,(syntax-e file)))))])
+             (try (begin #,@(for/list ([f body]) #`(begin (%browser-step! #,(step-of f)) #,f)) (begin))
+               [catch-all (browser-closed! #,b) (rethrow)])
+             (%browser-step! "")
+             (browser-closed! #,b)))]
+      [_ (raise-syntax-error 'with-browser "expected (with-browser (name \"site or program.sub\" [#:html \"index.html\"] [#:url \"url\"] [#:args (\"argument\" ...)]
+                                       [#:server \"server.sub\"]) body ...)" s)]))
+
+  ;; The program's arguments from #:args: either a list of strings, or an expression that gives a slice of strings.
+  (define (arguments [v datum]) -> datum
+    (syntax-match v
+      [() (no-fields)]
+      [((? text? a) ...) #`(slice (array-of string #,@(syntax->list v)))]
+      [_ v]))
+
+  ;; (browser-choose-files! browser "path" ...) sets the files that the next file picker gives. The paths are relative
+  ;; to the test.
+  (define (choose-files-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b (? text? file) ...)
+       (let ([paths (for/list ([f (cddr (syntax->list s))]) (path-of s f))])
+         #`(browser-choose-files-at! #,b #,(if (null? paths) (no-fields) #`(slice (array-of string #,@paths)))))]
+      [_ (raise-syntax-error 'browser-choose-files! "expected (browser-choose-files! browser \"path\" ...)" s)]))
+
+  (define (expect-text-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f text) #`(browser-expect #,b "expect-text" #,f (slice (array-of string #,text)) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-text "expected (expect-text browser finder \"text\")" s)]))
+
+  (define (expect-html-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f html) #`(browser-expect #,b "expect-html" #,f (slice (array-of string #,html)) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-html "expected (expect-html browser finder \"html\")" s)]))
+
+  (define (expect-value-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f value) #`(browser-expect #,b "expect-value" #,f (slice (array-of string #,value)) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-value "expected (expect-value browser finder \"value\")" s)]))
+
+  (define (expect-attribute-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f name value)
+       #`(browser-expect #,b "expect-attribute" #,f (slice (array-of string #,name #,value)) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-attribute "expected (expect-attribute browser finder \"name\" \"value\")" s)]))
+
+  (define (expect-no-attribute-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f name) #`(browser-expect #,b "expect-no-attribute" #,f (slice (array-of string #,name)) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-no-attribute "expected (expect-no-attribute browser finder \"name\")" s)]))
+
+  (define (expect-checked-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f on)
+       #`(browser-expect #,b "expect-checked" #,f (slice (array-of string (if #,on "true" "false"))) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-checked "expected (expect-checked browser finder #t-or-#f)" s)]))
+
+  (define (expect-count-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f n) #`(browser-expect #,b "expect-count" #,f (slice (array-of string (count-text #,n))) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-count "expected (expect-count browser finder n)" s)]))
+
+  (define (expect-drawn-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f lines) #`(browser-expect #,b "expect-drawn" #,f (slice (array-of string #,lines)) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-drawn "expected (expect-drawn browser finder \"lines\")" s)]))
+
+  (define (expect-pixel-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f x y rgba)
+       #`(browser-expect #,b "expect-pixel" #,f (slice (array-of string (count-text #,x) (count-text #,y) #,rgba)) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-pixel "expected (expect-pixel browser finder x y \"r,g,b,a\")" s)]))
+
+  ;; (browser-advance-until! browser finder "text" ms) moves the clock ahead, a frame at a time, until the element's
+  ;; text is text, and fails when it is not after ms.
+  (define (advance-until-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f text ms)
+       #`(browser-expect #,b "advance-until" #,f (slice (array-of string #,text (count-text #,ms))) #,(message-of s))]
+      [_ (raise-syntax-error 'browser-advance-until! "expected (browser-advance-until! browser finder \"text\" ms)" s)]))
+
+  (define (expect-missing-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b f) #`(browser-expect #,b "expect-missing" #,f #,(no-fields) #,(message-of s))]
+      [_ (raise-syntax-error 'expect-missing "expected (expect-missing browser finder)" s)])))
+
+(define-syntax with-browser with-browser-form)
+(define-syntax browser-choose-files! choose-files-form)
+(define-syntax expect-text expect-text-form)
+(define-syntax expect-html expect-html-form)
+(define-syntax expect-value expect-value-form)
+(define-syntax expect-attribute expect-attribute-form)
+(define-syntax expect-no-attribute expect-no-attribute-form)
+(define-syntax expect-checked expect-checked-form)
+(define-syntax expect-count expect-count-form)
+(define-syntax expect-pixel expect-pixel-form)
+(define-syntax expect-missing expect-missing-form)
+(define-syntax browser-advance-until! advance-until-form)
+(define-syntax expect-drawn expect-drawn-form)

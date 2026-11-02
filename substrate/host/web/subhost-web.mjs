@@ -46,6 +46,53 @@ function lines(line) {
   };
 }
 
+export function importedModules(bytes) {
+  const names = new Set();
+  let at = 8;
+  const u32 = () => {
+    let n = 0;
+    for (let shift = 0; ; shift += 7) {
+      const b = bytes[at++];
+      n += (b & 0x7f) * 2 ** shift;
+      if ((b & 0x80) === 0) return n;
+    }
+  };
+  const limits = () => {
+    const flags = u32();
+    u32();
+    if (flags & 1) u32();
+  };
+  while (at < bytes.length) {
+    const id = bytes[at++];
+    const end = u32() + at;
+    if (id !== 2) {
+      at = end;
+      continue;
+    }
+    for (let count = u32(); count > 0; count--) {
+      const length = u32();
+      names.add(text.decode(bytes.subarray(at, at + length)));
+      at += length;
+      const field = u32();
+      at += field;
+      const kind = bytes[at++];
+      if (kind === 0) u32();
+      else if (kind === 1) {
+        at++;
+        limits();
+      } else if (kind === 2) limits();
+      else if (kind === 3) at += 2;
+      else if (kind === 4) {
+        at++;
+        u32();
+      }
+    }
+    break;
+  }
+  return names;
+}
+
+// options.modules is the modules, or a function that takes the names the program imports and gives the modules.
 export async function boot(options) {
   const base = options.program.endsWith('/') ? options.program : `${options.program}/`;
   const files = options.files || new Map();
@@ -57,7 +104,13 @@ export async function boot(options) {
   await Promise.all(names.map(async (name) => {
     wasm.set(name, await fetchBytes(`${base}${encodeURIComponent(name)}.wasm`));
   }));
-  return run({ ...options, files }, names, wasm);
+  let { modules } = options;
+  if (typeof modules === 'function') {
+    const wanted = new Set();
+    for (const bytes of wasm.values()) for (const name of importedModules(bytes)) wanted.add(name);
+    modules = await modules(wanted);
+  }
+  return run({ ...options, files, modules }, names, wasm);
 }
 
 export function run(options, names, wasm) {
@@ -70,7 +123,7 @@ export function run(options, names, wasm) {
   const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 
-  const app = { files, cwd, entry: null, ended: false };
+  const app = { files, cwd, entry: null, ended: false, realTime: [] };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
   if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd)));

@@ -417,7 +417,7 @@ export function createHost(platform) {
   function later(self, made, from, fname) {
     let f = null;
     return (...args) => {
-      if (f === null) {
+      if (!f) {
         if (!made.has(from)) {
           const info = {};
           let factory;
