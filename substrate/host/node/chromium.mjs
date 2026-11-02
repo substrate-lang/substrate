@@ -3,7 +3,6 @@
 // ../web/testing/agent.mjs carries out the page's side of them.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { workerData } from 'node:worker_threads';
@@ -11,10 +10,11 @@ import { makeClock } from '../web/testing/clock.mjs';
 import { installClock, seeded } from '../web/testing/globals.mjs';
 import { installRecorders } from '../web/testing/recorders.mjs';
 import { parse } from '../web/testing/find.mjs';
+import { ending } from '../web/testing/requests.mjs';
 import { entries } from '../entries.mjs';
 import { mayUrl } from '../grants.mjs';
 
-const { port, signal, file } = workerData;
+const { port, signal, file, files } = workerData;
 const testing = fileURLToPath(new URL('../web/testing/', import.meta.url));
 const origin = 'http://localhost';
 const reserved = '/.substrate-testing/';
@@ -79,7 +79,7 @@ function send(method, params = {}, sessionId = undefined) {
 }
 
 function launch() {
-  profile = fs.mkdtempSync(path.join(os.tmpdir(), 'substrate-chromium-'));
+  profile = fs.mkdtempSync(path.join(files, 'chromium-'));
   chrome = spawn(file, ['--headless=new', '--remote-debugging-pipe', `--user-data-dir=${profile}`, '--no-first-run',
     '--no-default-browser-check', '--no-sandbox', '--mute-audio', '--disable-background-timer-throttling',
     '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows', ...gpuFlags, 'about:blank'],
@@ -252,9 +252,9 @@ async function loaded(b, go) {
 async function started(b) {
   const until = Date.now() + 30000;
   for (;;) {
-    const state = await evaluated(b, 'window.ready === true ? (typeof window.ended === \'number\' ? window.ended : 0) : null').catch(() => null);
-    if (state === 0) break;
-    if (state !== null) throw new Error(`the program ended with ${state}\n${b.lines.join('\n')}`);
+    const state = await evaluated(b, 'window.ready === true ? [typeof window.ended === \'number\' ? window.ended : 0, window.endReason || \'\'] : null').catch(() => null);
+    if (state !== null && state[0] === 0) break;
+    if (state !== null) throw new Error(`${ending(state[0], state[1])}\n${b.lines.join('\n')}`);
     if (b.thrown) throw new Error(`the page did not start\n${b.lines.join('\n')}`);
     if (Date.now() >= until) throw new Error(`the page did not start within 30 s\n${b.lines.join('\n')}`);
     await pause(20);

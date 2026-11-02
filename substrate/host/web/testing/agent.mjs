@@ -1,7 +1,7 @@
 // The page's side of a browser test in Chromium (substrate/host/node/chromium.mjs). It reads and checks the document,
 // finds where to click, and runs the clock that the driver installs before the page's scripts.
 import { describe, parse } from './find.mjs';
-import { advancedUntil, chose, documentRequest, one, short } from './requests.mjs';
+import { advancedUntil, chose, documentRequest, ending, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
 import { unsettledOf } from './clock.mjs';
 
@@ -19,9 +19,13 @@ const turn = () => new Promise((resolve) => {
 const quote = (s) => JSON.stringify(s);
 const patience = 30000;
 const unsettled = unsettledOf(() => [network, ...((window.app && window.app.realTime) || [])], real.now);
+// How long one request waits, in all, for real-time work that keeps making progress, as a page that polls does.
+const budget = 1000;
+let budgetEnds = 0;
 
 // settle lets the program finish what it can without moving the clock: due timers, the page's own tasks, the work the
-// page is waiting on (recorders.mjs), for at most 30 seconds, and real-time work while it makes progress.
+// page is waiting on (recorders.mjs), for at most 30 seconds, and real-time work while it makes progress and the
+// request's budget lasts.
 export async function settle() {
   let steps = 0;
   const until = real.now() + patience;
@@ -35,7 +39,7 @@ export async function settle() {
       ran = true;
       if (real.now() >= until) throw new Error(`the page waited ${patience / 1000} s for ${[...waiting.keys()].join(', ')}`);
       await Promise.race([idle(), new Promise((resolve) => real.setTimeout(resolve, until - real.now()))]);
-    } else if (unsettled()) {
+    } else if (real.now() < budgetEnds && unsettled()) {
       ran = true;
       await new Promise((resolve) => real.setTimeout(resolve, 10));
     } else await turn();
@@ -84,11 +88,20 @@ const base64 = (bytes) => {
 };
 
 // The RGBA pixels of a rectangle of a canvas, row by row. A WebGPU canvas gives the last frame drawn into its
-// offscreen surface (substrate/host/web/gpu.mjs), and a canvas with neither gives zeros.
+// offscreen surface (substrate/host/web/gpu.mjs), or what it shows when the GPU draws to it, and a canvas with neither
+// gives zeros.
 async function pixels(canvas, x, y, w, h) {
   if (kinds.get(canvas) === '2d') return getContext.call(canvas, '2d').getImageData(x, y, w, h).data;
   const gpu = window.modules && window.modules.gpu;
   const surface = gpu && gpu.surfaceOf ? gpu.surfaceOf(canvas) : null;
+  if (!surface && kinds.get(canvas) === 'webgpu') {
+    const copy = document.createElement('canvas');
+    copy.width = w;
+    copy.height = h;
+    const c = getContext.call(copy, '2d');
+    c.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+    return c.getImageData(0, 0, w, h).data;
+  }
   if (!surface) return new Uint8Array(w * h * 4);
   const { device, texture } = surface;
   const bytesPerRow = (w * 4 + 255) & ~255;
@@ -203,10 +216,11 @@ async function carriedOut(fields) {
 }
 
 export async function request(fields) {
+  budgetEnds = real.now() + budget;
   try {
     await settle();
     const value = await carriedOut(fields);
-    if (typeof window.ended === 'number' && window.ended !== 0) throw new Error(`the program ended with ${window.ended}`);
+    if (typeof window.ended === 'number' && window.ended !== 0) throw new Error(ending(window.ended, window.endReason));
     return { ok: true, value };
   } catch (e) {
     return { ok: false, message: e && e.message ? e.message : String(e) };

@@ -26,18 +26,17 @@ export function describe(f) {
 }
 
 const normal = (s) => s.replace(/\s+/g, ' ').trim();
-const unseen = new Set(['script', 'style', 'template', 'head', 'title', 'meta', 'link', 'base', 'noscript']);
 
+// Whether a user cannot see e, as the browser lays the page out, or e is hidden from assistive technology. An option
+// is seen when its select is.
 const hidden = (e) => {
-  for (let n = e; n && n.nodeType === 1; n = n.parentNode) {
-    if (n.hasAttribute('hidden') || n.getAttribute('aria-hidden') === 'true') return true;
-    if (/(^|;)\s*display\s*:\s*none/.test(n.getAttribute('style') || '')) return true;
-    if (n.localName === 'input' && n.type === 'hidden') return true;
-  }
+  const box = e.localName === 'option' || e.localName === 'optgroup' ? e.closest('select') || e : e;
+  if (!box.checkVisibility({ visibilityProperty: true })) return true;
+  for (let n = e; n && n.nodeType === 1; n = n.parentNode) if (n.getAttribute('aria-hidden') === 'true') return true;
   return false;
 };
 
-const shown = (scope) => [...scope.querySelectorAll('*')].filter((e) => !unseen.has(e.localName) && !hidden(e));
+const shown = (scope) => [...scope.querySelectorAll('*')].filter((e) => !hidden(e));
 
 const ownText = (e) => [...e.childNodes].filter((c) => c.nodeType === 3).map((c) => c.data).join('');
 
@@ -48,7 +47,7 @@ function textOf(e, leaving = null) {
   const walk = (n) => {
     for (const c of n.childNodes) {
       if (c.nodeType === 3) s += c.data;
-      else if (c.nodeType === 1 && c !== leaving && !unseen.has(c.localName) && !hidden(c)) {
+      else if (c.nodeType === 1 && c !== leaving && !hidden(c)) {
         if (c.localName === 'img') s += c.getAttribute('alt') || '';
         else walk(c);
       }

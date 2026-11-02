@@ -49,6 +49,9 @@ export async function advancedUntil(document, fields, clock, settle) {
   return '';
 }
 
+// ending says how the program ended: with its exit status, and after a trap, with the trap's message.
+export const ending = (code, reason) => `the program ended with ${code}${reason ? `: ${reason.split('\n')[0]}` : ''}`;
+
 const differs = (what, f, actual, expected, e) => new Error(`${what} of ${describe(f)} is ${quote(actual)}, not ${quote(expected)}\n  it is ${short(e)}`);
 
 // documentRequest answers a request that reads or checks the document, and gives undefined for any other request.

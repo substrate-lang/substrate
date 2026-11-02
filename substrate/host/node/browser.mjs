@@ -69,6 +69,8 @@ export function browsers(grants) {
       new DataView(caller.memory().buffer).setUint32(caller.u(out), p, true);
     };
 
+    const writable = (dir) => literalPath(grants, 'write', dir);
+
     const runnable = (file, what) => {
       if (!mayRun(grants.run, comparable(file), file)) throw new Error(`browser.${what}: ${file} is not granted (--allow-run)`);
     };
@@ -94,9 +96,9 @@ export function browsers(grants) {
       t.worker.terminate();
     };
 
-    const opened = (file, dir, url, net) => {
+    const opened = (file, files, dir, url, net) => {
       runnable(file, 'open');
-      if (!driver || driver.dead) driver = thread(chromium, 'Chromium', { file });
+      if (!driver || driver.dead) driver = thread(chromium, 'Chromium', { file, files: writable(files) });
       const id = next++;
       const site = [];
       filesUnder(dir, '', site);
@@ -117,7 +119,7 @@ export function browsers(grants) {
         }
         driver = null;
       },
-      open(dp, dl, up, ul, cp, cl, sp, sl, err) {
+      open(dp, dl, up, ul, cp, cl, sp, sl, fp, fl, err) {
         let server = null;
         try {
           const dir = caller.string(dp, dl);
@@ -127,7 +129,7 @@ export function browsers(grants) {
             server = served(caller.string(sp, sl), dir);
             url = new URL(url, `${server.address}index.html`).href;
           }
-          const id = opened(caller.string(cp, cl), dir, url, server ? grants.net : null);
+          const id = opened(caller.string(cp, cl), caller.string(fp, fl), dir, url, server ? grants.net : null);
           if (server) servers.set(id, server);
           return id;
         } catch (e) {
@@ -160,11 +162,11 @@ export function browsers(grants) {
         answer(out, reply.bytes ? new Uint8Array(reply.bytes) : utf8.encode(reply.text));
         return 0;
       },
-      gpu(cp, cl, out, err) {
+      gpu(cp, cl, fp, fl, out, err) {
         try {
           const file = caller.string(cp, cl);
           runnable(file, 'gpu');
-          const t = thread(chromium, 'Chromium', { file });
+          const t = thread(chromium, 'Chromium', { file, files: writable(caller.string(fp, fl)) });
           const reply = ask(t, { type: 'gpu' });
           if (!t.dead) ask(t, { type: 'end' });
           t.worker.terminate();
