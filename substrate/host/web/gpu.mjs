@@ -649,5 +649,9 @@ export async function gpu(options = {}) {
   module.readSurface = (id, x, y, width, height) =>
     new Promise((resolve, reject) => surfaceReads.push({ id, x, y, width, height, resolve, reject }));
   module.timing = timing;
+  module.surfaceOf = (canvas) => {
+    for (const s of surfaces.values()) if (s.canvas === canvas && s.texture) return { device, texture: s.texture };
+    return null;
+  };
   return module;
 }

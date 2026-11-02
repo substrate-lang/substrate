@@ -5,7 +5,7 @@ import { documentRequest, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
 
 const {
-  clock, real, waiting, idle, drawings, blobs, decoded, sounds, kinds, getContext, frames,
+  clock, real, waiting, idle, drawings, blobs, decoded, sounds, kinds, getContext,
 } = window[Symbol.for('substrate.testing')];
 const channel = new MessageChannel();
 const turns = [];
@@ -78,13 +78,14 @@ const base64 = (bytes) => {
   return btoa(s);
 };
 
-// The RGBA pixels of a rectangle of a canvas, row by row. A WebGPU canvas gives its last frame, and a canvas with no
-// context gives zeros.
+// The RGBA pixels of a rectangle of a canvas, row by row. A WebGPU canvas gives the last frame drawn into its
+// offscreen surface (substrate/host/web/gpu.mjs), and a canvas with neither gives zeros.
 async function pixels(canvas, x, y, w, h) {
   if (kinds.get(canvas) === '2d') return getContext.call(canvas, '2d').getImageData(x, y, w, h).data;
-  const kept = frames.get(canvas);
-  if (!kept) return new Uint8Array(w * h * 4);
-  const { device, texture } = kept;
+  const gpu = window.modules && window.modules.gpu;
+  const surface = gpu && gpu.surfaceOf ? gpu.surfaceOf(canvas) : null;
+  if (!surface) return new Uint8Array(w * h * 4);
+  const { device, texture } = surface;
   const bytesPerRow = (w * 4 + 255) & ~255;
   const staging = device.createBuffer({ size: bytesPerRow * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const encoder = device.createCommandEncoder();
@@ -195,7 +196,9 @@ async function carriedOut(fields) {
 export async function request(fields) {
   try {
     await settle();
-    return { ok: true, value: await carriedOut(fields) };
+    const value = await carriedOut(fields);
+    if (typeof window.ended === 'number' && window.ended !== 0) throw new Error(`the program ended with ${window.ended}`);
+    return { ok: true, value };
   } catch (e) {
     return { ok: false, message: e && e.message ? e.message : String(e) };
   }

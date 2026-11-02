@@ -176,6 +176,22 @@ export function browsers(grants) {
         answer(out, reply.bytes ? new Uint8Array(reply.bytes) : utf8.encode(reply.text));
         return 0;
       },
+      gpu(cp, cl, out, err) {
+        try {
+          const file = caller.string(cp, cl);
+          if (!mayRun(grants.run, comparable(file), file)) throw new Error(`browser.gpu: ${file} is not granted (--allow-run)`);
+          const t = thread(chromium, 'Chromium', { file });
+          const reply = ask(t, { type: 'gpu' });
+          if (!t.dead) ask(t, { type: 'end' });
+          t.worker.terminate();
+          if (!reply.ok) throw new Error(reply.message);
+          answer(out, utf8.encode(reply.text));
+          return 0;
+        } catch (e) {
+          caller.fail(err, e.message);
+          return -1;
+        }
+      },
       close(id) {
         const b = open.get(id);
         if (!b) return;

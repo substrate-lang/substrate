@@ -22,8 +22,8 @@ const reserved = '/.substrate-testing/';
 const patience = 10000;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const gpuFlags = process.platform === 'darwin' ? ['--enable-unsafe-webgpu'] : ['--enable-unsafe-webgpu',
-  '--enable-unsafe-swiftshader', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--use-angle=vulkan'];
+const gpuFlags = process.platform === 'darwin' ? ['--enable-unsafe-webgpu']
+  : ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist', '--enable-features=Vulkan', '--use-angle=vulkan'];
 
 const types = {
   '.html': 'text/html', '.mjs': 'text/javascript', '.js': 'text/javascript', '.json': 'application/json', '.css': 'text/css',
@@ -135,10 +135,13 @@ function heard(m) {
     case 'Runtime.consoleAPICalled':
       b.lines.push(m.params.args.map(valueOf).join(' '));
       break;
-    case 'Runtime.exceptionThrown':
-      b.lines.push(`uncaught: ${described(m.params.exceptionDetails)}`);
+    case 'Runtime.exceptionThrown': {
+      const line = `uncaught: ${described(m.params.exceptionDetails)}`;
+      b.lines.push(line);
       b.thrown = true;
+      if (b.errors) b.errors.push(line);
       break;
+    }
     case 'Page.fileChooserOpened':
       chosen(b, m.params).catch((e) => b.lines.push(`files: ${e.message}`));
       break;
@@ -187,7 +190,7 @@ async function opened(id, site, url, seed, net) {
   const downloadPath = fs.mkdtempSync(path.join(profile, 'downloads-'));
   const b = {
     id, browserContextId, targetId, sessionId, downloadPath, site: new Map(site), net, answers: new Map(), downloads: new Map(),
-    lines: [], thrown: false, chosen: null, held: 0, mouse: { x: 0, y: 0 },
+    lines: [], thrown: false, errors: [], chosen: null, held: 0, mouse: { x: 0, y: 0 },
     page: (method, params) => send(method, params, sessionId),
   };
   browsers.set(id, b);
@@ -228,6 +231,7 @@ async function evaluated(b, expression) {
 async function loaded(b, go) {
   await evaluated(b, 'window.ready = false').catch(() => {});
   b.thrown = false;
+  b.errors.length = 0;
   const r = await go();
   if (r && r.errorText) throw new Error(`the browser cannot open the page: ${r.errorText}`);
   const until = Date.now() + 30000;
@@ -319,7 +323,18 @@ async function downloaded(b, name) {
 
 // ---- requests ----
 
+// handle carries out a request, which fails when the page has thrown an error that nothing caught.
 async function handle(b, m) {
+  const value = await carried(b, m);
+  if (b.errors.length > 0) {
+    const first = b.errors[0];
+    b.errors.length = 0;
+    throw new Error(`the page has an uncaught error: ${first.slice('uncaught: '.length)}`);
+  }
+  return value;
+}
+
+async function carried(b, m) {
   const fields = entries(m.fields);
   const kind = fields[0];
   switch (kind) {
@@ -376,6 +391,42 @@ async function handle(b, m) {
   }
 }
 
+// probed gives Chromium's version and its WebGPU adapter on two lines, the second empty when WebGPU has only a software
+// adapter or none.
+async function probed() {
+  if (!chrome) launch();
+  const { product } = await send('Browser.getVersion');
+  const { browserContextId } = await send('Target.createBrowserContext', { disposeOnDetach: true });
+  const probe = { site: new Map([['/index.html', Buffer.from('<!doctype html>')]]), answers: new Map(), net: null, lines: [] };
+  try {
+    const { targetId } = await send('Target.createTarget', { url: 'about:blank', browserContextId });
+    const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+    const page = (method, params) => send(method, params, sessionId);
+    bySession.set(sessionId, probe);
+    await page('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+    await page('Page.navigate', { url: `${origin}/index.html` });
+    const until = Date.now() + patience;
+    for (;;) {
+      const r = await page('Runtime.evaluate', { expression: 'location.origin', returnByValue: true }).catch(() => null);
+      if (r && r.result.value === origin) break;
+      if (Date.now() >= until) throw new Error('Chromium did not open a page to look for a GPU');
+      await pause(20);
+    }
+    const r = await page('Runtime.evaluate', { expression: adapter, awaitPromise: true, returnByValue: true });
+    if (r.exceptionDetails) throw new Error(described(r.exceptionDetails));
+    return `${product}\n${r.result.value}`;
+  } finally {
+    for (const [s, owner] of bySession) if (owner === probe) bySession.delete(s);
+    await send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
+  }
+}
+
+const adapter = `(async () => {
+  const a = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+  if (!a || a.info.isFallbackAdapter) return '';
+  return [a.info.vendor, a.info.architecture].filter((s) => s).join(' ') || 'a GPU';
+})()`;
+
 async function ended() {
   for (const b of [...browsers.values()]) await closed(b);
   if (chrome) {
@@ -394,10 +445,14 @@ port.on('message', async (m) => {
     if (m.type === 'open') await opened(m.browser, m.site, m.url, m.seed, m.net);
     else if (m.type === 'close') await closed(browsers.get(m.browser));
     else if (m.type === 'end') await ended();
+    else if (m.type === 'gpu') value = await probed();
     else value = await handle(browsers.get(m.browser), m);
     reply = value instanceof Uint8Array ? { ok: true, bytes: value } : { ok: true, text: value };
   } catch (e) {
-    reply = { ok: false, message: e && e.message ? e.message : String(e) };
+    let message = e && e.message ? e.message : String(e);
+    const b = m.type === 'request' ? browsers.get(m.browser) : null;
+    if (b && b.lines.length > 0) message += `\n  the console ends with:\n    ${b.lines.slice(-10).join('\n    ')}`;
+    reply = { ok: false, message };
   }
   port.postMessage(reply);
   Atomics.store(signal, 0, 1);

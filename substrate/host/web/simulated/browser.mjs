@@ -48,6 +48,7 @@ const kept = {
 };
 
 const lines = [];
+const errors = [];
 const partial = { 1: '', 2: '' };
 let decoders = null;
 let document = null;
@@ -261,6 +262,7 @@ const storageName = () => location.pathname.replace(/[^/]*$/, '');
 async function load() {
   const { markup, names, wasm, files, seed } = kept.program;
   ended = null;
+  errors.length = 0;
   sounds = [];
   decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   install(seed);
@@ -427,7 +429,7 @@ async function handle(m) {
 
 // Once the program has started a worker or can reach a test's server, expectations are retried for up to 10 seconds,
 // since workers and servers answer in their own time.
-async function handled(m) {
+async function retried(m) {
   if (!(workersSeen || kept.net) || !entries(m.fields)[0].startsWith('expect-')) return handle(m);
   const until = realNow() + 10000;
   for (;;) {
@@ -441,15 +443,36 @@ async function handled(m) {
   }
 }
 
-process.on('uncaughtException', (e) => say(`uncaught: ${e && e.message ? e.message : e}`));
-process.on('unhandledRejection', (e) => say(`uncaught: ${e && e.message ? e.message : e}`));
+// handled carries out a request, which fails when the program has ended with an error or the page has thrown an error
+// that nothing caught.
+async function handled(m) {
+  const value = await retried(m);
+  if (ended && ended.code !== 0) throw new Error(`the program ended with ${ended.code}`);
+  if (errors.length > 0) {
+    const first = errors[0];
+    errors.length = 0;
+    throw new Error(`the page has an uncaught error: ${first}`);
+  }
+  return value;
+}
+
+const uncaught = (e) => {
+  const text = e && e.message ? e.message : String(e);
+  say(`uncaught: ${text}`);
+  errors.push(text);
+};
+process.on('uncaughtException', uncaught);
+process.on('unhandledRejection', uncaught);
 
 port.on('message', async (m) => {
   let reply;
   try {
     reply = { ok: true, text: m.type === 'open' ? (await open(m), '') : await handled(m) };
   } catch (e) {
-    reply = { ok: false, message: e && e.message ? e.message : String(e) };
+    let message = e && e.message ? e.message : String(e);
+    const shown = m.type === 'open' ? [] : consoleText().split('\n').filter((l) => l !== '');
+    if (shown.length > 0) message += `\n  the console ends with:\n    ${shown.slice(-10).join('\n    ')}`;
+    reply = { ok: false, message };
   }
   port.postMessage(reply);
   Atomics.store(signal, 0, 1);

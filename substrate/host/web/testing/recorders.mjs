@@ -1,6 +1,6 @@
 // Records what browser tests read from a Chromium page, as the simulated browser does: drawings, sounds, the bytes
-// behind images and sounds, WebGPU frames, and the work the page is waiting on. chromium.mjs injects the text of
-// installRecorders into each page, so it must not use anything outside itself.
+// behind images and sounds, and the work the page is waiting on. chromium.mjs injects the text of installRecorders into
+// each page, so it must not use anything outside itself.
 export function installRecorders(window, clock, site) {
   const drawings = new WeakMap();
   const kinds = new WeakMap();
@@ -109,7 +109,15 @@ export function installRecorders(window, clock, site) {
 
   if (window.GPU) {
     counted(GPU.prototype, 'requestAdapter', 'the GPU');
-    counted(GPUAdapter.prototype, 'requestDevice', 'the GPU');
+    const requestDevice = GPUAdapter.prototype.requestDevice;
+    GPUAdapter.prototype.requestDevice = function requesting(...args) {
+      return tracked('the GPU', () => requestDevice.apply(this, args).then((device) => {
+        device.lost.then((info) => {
+          if (info.reason !== 'destroyed') console.error(`gpu: the device was lost: ${info.message}`);
+        });
+        return device;
+      }));
+    };
     counted(GPUDevice.prototype, 'popErrorScope', 'the GPU');
     counted(GPUDevice.prototype, 'createRenderPipelineAsync', 'the GPU');
     counted(GPUDevice.prototype, 'createComputePipelineAsync', 'the GPU');
@@ -216,45 +224,5 @@ export function installRecorders(window, clock, site) {
     return scheduledStop.call(this, end, ...rest);
   };
 
-  // A WebGPU canvas cannot be read once its frame is shown, so each frame is copied into a texture kept for the canvas,
-  // right after the work that draws it is submitted.
-  const frames = new WeakMap();
-  if (window.GPUCanvasContext) {
-    const configured = new WeakMap();
-    const configure = GPUCanvasContext.prototype.configure;
-    GPUCanvasContext.prototype.configure = function configuring(c) {
-      configured.set(this, c);
-      return configure.call(this, c);
-    };
-    const drawing = new Map();
-    const getCurrentTexture = GPUCanvasContext.prototype.getCurrentTexture;
-    GPUCanvasContext.prototype.getCurrentTexture = function current() {
-      const texture = getCurrentTexture.call(this);
-      if (!drawing.has(this)) queueMicrotask(() => drawing.delete(this));
-      drawing.set(this, texture);
-      return texture;
-    };
-    const submit = GPUQueue.prototype.submit;
-    GPUQueue.prototype.submit = function submitted(buffers) {
-      const r = submit.call(this, buffers);
-      for (const [context, texture] of drawing) {
-        const c = configured.get(context);
-        if (!c || c.device.queue !== this || !(c.usage & GPUTextureUsage.COPY_SRC)) continue;
-        let kept = frames.get(context.canvas);
-        if (!kept || kept.texture.width !== texture.width || kept.texture.height !== texture.height) {
-          if (kept) kept.texture.destroy();
-          kept = { device: c.device, texture: c.device.createTexture({
-            size: [texture.width, texture.height], format: texture.format, usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
-          }) };
-          frames.set(context.canvas, kept);
-        }
-        const encoder = c.device.createCommandEncoder();
-        encoder.copyTextureToTexture({ texture }, { texture: kept.texture }, [texture.width, texture.height]);
-        submit.call(this, [encoder.finish()]);
-      }
-      return r;
-    };
-  }
-
-  return { drawings, blobs, decoded, sounds, kinds, getContext, frames, waiting, idle };
+  return { drawings, blobs, decoded, sounds, kinds, getContext, waiting, idle };
 }
