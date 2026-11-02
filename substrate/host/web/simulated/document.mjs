@@ -182,7 +182,7 @@ export class Node extends EventTarget {
   insertBefore(node, ref) {
     if (ref && ref.parentNode !== this) throw new Error('NotFoundError: the node to insert before is not a child of this node');
     if (node === ref) return node;
-    for (let n = this; n; n = n.parentNode) if (n === node) throw new Error('HierarchyRequestError: a node cannot hold itself');
+    for (let n = this; n; n = n.parentNode) if (n === node) throw new Error('HierarchyRequestError: a node cannot contain itself');
     const nodes = node.nodeType === FRAGMENT ? [...node.childNodes] : [node];
     for (const n of nodes) n.remove();
     let at = ref ? this.childNodes.indexOf(ref) : this.childNodes.length;

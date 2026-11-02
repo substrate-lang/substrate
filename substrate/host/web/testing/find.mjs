@@ -15,7 +15,7 @@ export function parse(fields, k) {
     return [{ kind, of, n: Number(fields[a]) }, a + 1];
   }
   const n = arity[kind];
-  if (n === undefined || k + n >= fields.length) throw new Error(`a finder is cut short or unknown: ${JSON.stringify(fields.slice(k))}`);
+  if (n === undefined || k + n >= fields.length) throw new Error(`the finder ${JSON.stringify(fields.slice(k))} is unknown or incomplete`);
   return [{ kind, args: fields.slice(k + 1, k + 1 + n) }, k + 1 + n];
 }
 
@@ -193,7 +193,6 @@ function inOrder(doc, list) {
   return [...new Set(list)].sort((a, b) => order.get(a) - order.get(b));
 }
 
-// findAll gives the elements f finds under scope, in document order.
 export function findAll(doc, f, scope = doc) {
   switch (f.kind) {
     case 'css':

@@ -40,7 +40,6 @@ export function makeClock(epoch = 1700000000000) {
       return id;
     },
     cancelAnimationFrame: (id) => frames.delete(id),
-    // dueNow runs one timer that is already due, without moving the clock, and reports whether there was one.
     dueNow() {
       const t = earliest();
       if (t === null || t.due > now) return false;

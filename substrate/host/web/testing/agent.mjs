@@ -27,7 +27,7 @@ export async function settle() {
     let ran = false;
     while (clock.dueNow()) {
       ran = true;
-      if (++steps > 100000) throw new Error('the program kept setting timers due now, so the clock could not stand still');
+      if (++steps > 100000) throw new Error('the program kept setting timers that are already due, so it never settled');
     }
     if (waiting.size > 0) {
       ran = true;
@@ -192,7 +192,6 @@ async function carriedOut(fields) {
   }
 }
 
-// request settles the program, carries out the driver's request, and gives the answer or the error.
 export async function request(fields) {
   try {
     await settle();

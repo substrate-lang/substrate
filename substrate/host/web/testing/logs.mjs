@@ -28,7 +28,6 @@ export function drawn(name, args, nameOf) {
   return c ? [c[0], ...args.slice(0, c[1]).map(number)].join(' ') : null;
 }
 
-// heard gives the line for a sound: a start with its volume and whether it loops, a stop, an end, or a tone.
 export function heard(s) {
   switch (s.kind) {
     case 'start':

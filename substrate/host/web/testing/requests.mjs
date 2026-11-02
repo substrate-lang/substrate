@@ -5,7 +5,6 @@ const quote = (s) => JSON.stringify(s);
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}...` : s);
 export const short = (e) => clip(e.outerHTML, 160);
 
-// one gives the only element that f finds, and fails when it finds none or several.
 export function one(document, f) {
   const found = findAll(document, f);
   if (found.length === 1) return found[0];

@@ -46,7 +46,6 @@ function lines(line) {
   };
 }
 
-// The module names in a wasm module's import section.
 export function importedModules(bytes) {
   const names = new Set();
   let at = 8;

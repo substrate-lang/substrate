@@ -109,7 +109,6 @@ function launch() {
 const valueOf = (a) => (a.value !== undefined ? String(a.value) : a.unserializableValue ?? a.description ?? '');
 const described = (d) => (d.exception && d.exception.description ? d.exception.description.split('\n')[0] : d.text);
 
-// heard handles an event from Chromium: a page's requests, console output, file pickers and workers, and downloads.
 function heard(m) {
   if (m.method === 'Browser.downloadWillBegin' || m.method === 'Browser.downloadProgress') {
     for (const b of browsers.values()) {
@@ -170,7 +169,6 @@ async function served(b, m) {
   return send('Fetch.failRequest', { requestId, errorReason: 'Failed' }, m.sessionId);
 }
 
-// chosen answers a file picker with the files a test chose for it, or cancels it when there are none.
 async function chosen(b, { backendNodeId }) {
   const files = b.chosen;
   b.chosen = null;
@@ -285,7 +283,6 @@ function key(b, type, name, mods) {
   });
 }
 
-// pressed presses and releases a key, holding the modifiers in held down around it.
 async function pressed(b, name, held) {
   const extra = Object.keys(modifiers).filter((m) => held[modifiers[m]] && name !== m);
   let mods = b.held;

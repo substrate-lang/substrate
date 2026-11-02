@@ -39,7 +39,7 @@ export function historyOf(history, popped) {
     const here = history.current();
     if (url === undefined || url === null) return here.href;
     const next = new URL(url, here);
-    if (next.origin !== here.origin) throw new Error(`SecurityError: a history entry cannot be at ${next.origin}, not ${here.origin}`);
+    if (next.origin !== here.origin) throw new Error(`SecurityError: a page at ${here.origin} cannot add a history entry at ${next.origin}`);
     return next.href;
   };
   return {

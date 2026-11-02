@@ -72,7 +72,6 @@ export function browsers(grants) {
       new DataView(caller.memory().buffer).setUint32(caller.u(out), p, true);
     };
 
-    // served starts a test's server for the site and waits for it to print its address.
     const served = (program, site) => {
       if (!mayRun(grants.run, comparable(subhost), subhost)) throw new Error(`browser.open: ${subhost} is not granted (--allow-run), so the server cannot run`);
       const t = thread(serving, 'the server', { command: process.execPath, args: ['--stack-size=4000', subhost, '-N=127.0.0.1', `-R=${site}`, program, site] });
@@ -84,7 +83,7 @@ export function browsers(grants) {
       t.address = reply.text;
       if (!mayUrl(grants.net, new URL(t.address))) {
         stopped(t);
-        throw new Error(`browser.open: the test may not reach the server at ${t.address} (-N)`);
+        throw new Error(`browser.open: ${new URL(t.address).host} is not granted (--allow-net), so the browser cannot reach the server`);
       }
       return t;
     };
@@ -94,7 +93,6 @@ export function browsers(grants) {
       t.worker.terminate();
     };
 
-    // openedIn opens the site in the Chromium at file, starting the driver thread on first use.
     const openedIn = (file, dir, url, net) => {
       if (!mayRun(grants.run, comparable(file), file)) throw new Error(`browser.open: ${file} is not granted (--allow-run)`);
       if (!driver || driver.dead) driver = thread(chromium, 'Chromium', { file });

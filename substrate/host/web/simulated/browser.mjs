@@ -94,7 +94,6 @@ async function track(work) {
 
 const sameBytes = (a, b) => a.length === b.length && Buffer.from(a.buffer, a.byteOffset, a.length).equals(Buffer.from(b.buffer, b.byteOffset, b.length));
 
-// The path of the site's file with these bytes, or otherwise when there is none.
 const nameOf = (bytes, otherwise) => {
   const named = [...site].find(([, b]) => sameBytes(b, bytes));
   return named ? named[0] : otherwise;
@@ -248,7 +247,7 @@ async function settle() {
     const before = activity;
     while (clock.dueNow()) {
       activity++;
-      if (++steps > 100000) throw new Error('the program kept setting timers due now, so the clock could not stand still');
+      if (++steps > 100000) throw new Error('the program kept setting timers that are already due, so it never settled');
     }
     await turn();
     if (pending === 0 && activity === before) quiet++;
@@ -416,9 +415,9 @@ async function handle(m) {
       return consoleText();
     case 'pixels':
     case 'expect-pixel':
-      throw new Error('the simulated browser draws no pixels: a test that reads them is marked #:chromium and runs with --browser=chromium');
+      throw new Error('the simulated browser draws no pixels, so a test that reads them must be marked #:chromium and run with --browser=chromium');
     case 'box':
-      throw new Error('the simulated browser lays nothing out: a test that reads where elements are is marked #:chromium and runs with --browser=chromium');
+      throw new Error('the simulated browser does no layout, so a test that reads where elements are must be marked #:chromium and run with --browser=chromium');
     case 'sounds':
       return sounds.join('\n');
     default:

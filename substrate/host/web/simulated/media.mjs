@@ -4,7 +4,6 @@ import { Event, EventTarget } from './document.mjs';
 import { sizeOf } from './images.mjs';
 import { heard } from '../testing/logs.mjs';
 
-// The length in seconds of a WAV file, or null when b is not one.
 function wavSeconds(b) {
   const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
   const ascii = (at) => String.fromCharCode(...b.subarray(at, at + 4));

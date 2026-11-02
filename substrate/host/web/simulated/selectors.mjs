@@ -43,7 +43,7 @@ function parser(text) {
     const m = /^([+-]?\d*)n([+-]\d+)?$/.exec(s);
     if (m) return [m[1] === '' || m[1] === '+' ? 1 : m[1] === '-' ? -1 : Number(m[1]), m[2] ? Number(m[2]) : 0];
     if (/^[+-]?\d+$/.test(s)) return [0, Number(s)];
-    throw unsupported(text, `${arg} is not an+b`);
+    throw unsupported(text, `${arg} is not of the form an+b`);
   };
   const argument = () => {
     let depth = 1;
@@ -246,7 +246,6 @@ function matchesFrom(e, parts, k) {
 
 const compiled = new Map();
 
-// compileList compiles the selector list text into a test of whether an element matches it.
 export function compileList(text) {
   let list = compiled.get(text);
   if (!list) {
@@ -257,7 +256,6 @@ export function compileList(text) {
   return list;
 }
 
-// select gives the elements under root that match text, in document order.
 export function select(root, text) {
   const test = compileList(text);
   return descendants(root).filter(test);
