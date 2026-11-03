@@ -3,7 +3,6 @@
 // cannot check where fetch is redirected or where names resolve, and a child may keep the dynamic loader's variables
 // the host started with.
 const kinds = ['read', 'write', 'net', 'env', 'run'];
-const short = { read: '-R', write: '-W', net: '-N', env: '-E' };
 export const flags = {
   read: '--allow-read', write: '--allow-write', net: '--allow-net', env: '--allow-env', run: '--allow-run',
 };
@@ -27,24 +26,6 @@ export function notGranted(message) {
 export const pathDenied = (k, flag = flags[k]) => notGranted(
   `${k === 'read' ? 'reading' : 'writing'} is not granted (${flag})`,
 );
-
-// The items of a list have commas between them, and ",," is a comma within one.
-export function listOf(text) {
-  const list = [];
-  let item = '';
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] !== ',') item += text[i];
-    else if (text[i + 1] === ',') {
-      item += ',';
-      i++;
-    } else {
-      list.push(item);
-      item = '';
-    }
-  }
-  list.push(item);
-  return list;
-}
 
 const urlHost = (bare) => {
   if (/[@/?#\\%\s]/.test(bare)) return bare.toLowerCase();
@@ -133,38 +114,56 @@ const itemOf = (k, text, resolve, deny) => {
   return resolve(text, k);
 };
 
-// grantFlag adds a grant flag to g and returns true, or returns false for a flag that is not one.
-export function grantFlag(g, flag, resolve) {
-  const equals = flag.indexOf('=');
-  const name = equals < 0 ? flag : flag.slice(0, equals);
-  const value = equals < 0 ? null : flag.slice(equals + 1);
-  if (name === '-A' || name === '--allow-all') {
-    if (value !== null) throw new Error(`${name} takes no list`);
-    for (const k of kinds) g[k].all = true;
-    return true;
-  }
-  for (const k of kinds) {
-    const into = name === short[k] || name === flags[k] ? g[k] : name === `--deny-${k}` ? g[k].deny : null;
-    if (into === null) continue;
-    if (value === null) into.all = true;
-    else {
-      const list = listOf(value);
-      if (list.includes('')) throw new Error(`${flag} has an empty item`);
-      const items = list.map((text) => itemOf(k, text, resolve, into === g[k].deny)).filter((item) => item !== null);
-      into.items.push(...items);
-      if (into === g.run) g.write.deny.items.push(...items);
-    }
-    return true;
-  }
-  return false;
+const fakeable = new Set(['clock', 'timer', 'websocket', 'fetch']);
+
+export function pairsFrom(list) {
+  if (list.length % 2 !== 0) throw new Error(`the grant ${list[list.length - 1]} has no item`);
+  const pairs = [];
+  for (let i = 0; i < list.length; i += 2) pairs.push([list[i], list[i + 1]]);
+  return pairs;
 }
 
-// grantsOf gives the grants a list of flags makes, every one of which must be a grant flag.
-export function grantsOf(list, resolve) {
+const grantKind = (name) => {
+  const deny = name.startsWith('deny-');
+  const k = deny ? name.slice(5) : name;
+  return kinds.includes(k) ? { k, deny } : null;
+};
+
+// requestOf reads kind and item pairs (grants.sub) into grants, inherited kinds, fakes and TLS files.
+export function requestOf(pairs, resolve) {
   const g = noGrants();
-  for (const flag of list) if (!grantFlag(g, flag, resolve)) throw new Error(`${flag} is not a grant`);
-  return g;
+  const request = { grants: g, inherit: new Set(), fakes: new Map(), tls: null };
+  for (const [kind, item] of pairs) {
+    if (item === '') throw new Error(`${kind} has an empty item`);
+    const granted = grantKind(kind);
+    const all = kind === 'all' ? grantKind(item) : null;
+    if (granted) {
+      const into = granted.deny ? g[granted.k].deny : g[granted.k];
+      const resolved = itemOf(granted.k, item, resolve, granted.deny);
+      if (resolved !== null) {
+        into.items.push(resolved);
+        if (into === g.run) g.write.deny.items.push(resolved);
+      }
+    } else if (all) (all.deny ? g[all.k].deny : g[all.k]).all = true;
+    else if (kind === 'inherit' && kinds.includes(item)) request.inherit.add(item);
+    else if (kind === 'fake' && fakeable.has(item)) {
+      if (!request.fakes.has(item)) request.fakes.set(item, null);
+    } else if (kind === 'fetch') request.fakes.set('fetch', item);
+    else if (kind === 'tls-cert' || kind === 'tls-key') (request.tls ||= {})[kind.slice(4)] = item;
+    else throw new Error(`${kind} ${item} is not a grant`);
+  }
+  if (request.tls && !(request.tls.cert && request.tls.key)) throw new Error('--tls-cert and --tls-key go together');
+  return request;
 }
+
+export const joinedGrants = (a, b) => Object.fromEntries(kinds.map((k) => [k, {
+  all: a[k].all || b[k].all,
+  items: [...a[k].items, ...b[k].items],
+  deny: { all: a[k].deny.all || b[k].deny.all, items: [...a[k].deny.items, ...b[k].deny.items] },
+}]));
+
+export const askedOf = (request, parent) => joinedGrants(request.grants,
+  Object.fromEntries(kinds.map((k) => [k, request.inherit.has(k) ? parent[k] : kind()])));
 
 export const under = (p, root) => root === '/' || p === root
   || (p.startsWith(root) && p.charCodeAt(root.length) === 47);
@@ -248,7 +247,7 @@ export function within(asked, parent) {
     if (beyond) {
       const subnet = beyond.bits === undefined ? '' : `/${beyond.bits}`;
       const item = k === 'net' ? `${beyond.host}${subnet}${beyond.port === null ? '' : `:${beyond.port}`}` : beyond;
-      throw new Error(`${flags[k]}${beyond === true ? '' : `=${item}`} reaches beyond the parent's grants`);
+      throw new Error(`${beyond === true ? `all ${k}` : `${k} ${item}`} reaches beyond the parent's grants`);
     }
     const deny = { all: a.deny.all || p.deny.all, items: [...a.deny.items, ...p.deny.items] };
     out[k] = { all: a.all, items: [...a.items], deny };

@@ -6,6 +6,7 @@
 (require-unqualified env host/node/env)
 (require-unqualified events host/events)
 (require-unqualified process host/node/process)
+(require-unqualified gr host/grants)
 (require-unqualified manifest std/package/manifest)
 (require-unqualified map std/package/map)
 (require-unqualified paths std/package/path)
@@ -13,7 +14,7 @@
 
 (provide prepare! package-in! prepare-tests! map-written! program-found program-manifest program-dir program-package
          find-package! module-map! supported! cache-dir store-dir located location user-cache locations! cache! target!
-         build! compile! bare-compile! grants every-grant granted! given-cache given-packages set-in?)
+         build! compile! bare-compile! compiler-grants every-grant given-cache given-packages set-in?)
 
 (define (prepare! [file string]) -> string
   (let ([project (find-package! file)])
@@ -146,8 +147,8 @@
 
 (define (build! [file string] [out string] [strip bool] [next (fn (i32))])
   (let* ([full (absolute file)] [dir (target! full out)])
-    (compile! "build" full dir (if strip (slice (array-of string "-s")) (slice (cast (ptr string) 0) 0)) (grants full dir)
-              next)))
+    (compile! "build" full dir (if strip (slice (array-of string "-s")) (slice (cast (ptr string) 0) 0))
+              (compiler-grants full dir) next)))
 
 ;; ---- the compiler ----
 
@@ -159,13 +160,11 @@
 
 ;; compile! runs the compiler's command on the file full, with the module map prepare! made and the given grants. When
 ;; the compiler exits, it calls next with the exit code.
-(define (compile! [command string] [full string] [out string] [args (slice string)] [given (slice string)]
+(define (compile! [command string] [full string] [out string] [args (slice string)] [given (ptr grants)]
                   [next (fn (i32))])
   (let ([argv (make-buffer)] [why string])
     (when (< (fs-make-temp-file cache-dir "map-" ".map" (& map-file) (& why)) 0) (failed! why))
     (when (< (fs-write-file map-file (buffer-bytes (& map-text)) (& why)) 0) (failed! why))
-    (for ([i u32 0]) (< i (-> given length)) (+= i 1) (argument! (& argv) (@ given i)))
-    (argument! (& argv) (joined-path root "build/compiler"))
     (argument! (& argv) (substrate-dir))
     (argument! (& argv) "-c")
     (argument! (& argv) cache-dir)
@@ -179,18 +178,15 @@
       (argument! (& argv) "-o")
       (argument! (& argv) out))
     (for ([i u32 0]) (< i (-> args length)) (+= i 1) (argument! (& argv) (@ args i)))
-    (compiler! (& argv) next)))
+    (compiler! given (& argv) next)))
 
 (define (bare-compile! [full string] [out string] [map string] [cache string] [strip bool] [next (fn (i32))])
-  (let ([argv (make-buffer)] [w (make-buffer)]
+  (let ([argv (make-buffer)] [g (make-grants)]
         [dir (if (> (-> out length) 0) (absolute out) (joined-path (parent-of full) (stem-of full)))])
     (set! map-file "")
-    (buffer-add-string! (& w) "-W=")
-    (granted! (& w) dir)
-    (when (> (-> cache length) 0) (granted! (& w) cache))
-    (argument! (& argv) "-R")
-    (argument! (& argv) (buffer-string (& w)))
-    (argument! (& argv) (joined-path root "build/compiler"))
+    (grants-allow-all! (& g) grant-read)
+    (grants-allow! (& g) grant-write dir)
+    (when (> (-> cache length) 0) (grants-allow! (& g) grant-write cache))
     (argument! (& argv) (substrate-dir))
     (when (> (-> cache length) 0)
       (argument! (& argv) "-c")
@@ -205,10 +201,11 @@
     (argument! (& argv) "-o")
     (argument! (& argv) dir)
     (when strip (argument! (& argv) "-s"))
-    (compiler! (& argv) next)))
+    (compiler! (& g) (& argv) next)))
 
-(define (compiler! [argv (ptr buffer)] [next (fn (i32))])
-  (let ([o process-options] [why string] [id u32 0])
+(define (compiler! [g (ptr grants)] [argv (ptr buffer)] [next (fn (i32))])
+  (let ([o process-options] [why string] [id u32 0]
+        [args (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string)))])
     (process-options-init! (& o))
     (set! (-> o stdin) process-inherit)
     (set! (-> o stdout) process-inherit)
@@ -216,8 +213,8 @@
     (set! (-> compiler-run head handle) compiled)
     (set! compiled-then next)
     (set! id (process-spawn (joined-path (substrate-dir) "host/subhost.mjs")
-                            (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string))) (& o)
-                            (& compiler-run) (& why)))
+                            (grants-arguments g (joined-path root "build/compiler") args) (& o) (& compiler-run)
+                            (& why)))
     (when (== id 0) (failed! why))))
 
 (define (argument! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
@@ -229,34 +226,28 @@
 
 ;; ---- grants ----
 
-;; grants gives the compiler's grants: reading the roots, the cache and out, and writing the cache and out. For a program
-;; outside packages, it may read any file.
-(define (grants [full string] [out string]) -> (slice string)
-  (let ([r (make-buffer)] [w (make-buffer)] [dirs (root-directories)]
-        [flags (cast (ptr string) (arena-alloc (& a) (* 2 (sizeof string))))])
-    (buffer-add-string! (& r) "-R")
-    (when (or (> (-> program-package length) 0) (toolchain-file? full))
-      (buffer-add-byte! (& r) #\=)
-      (while (pair? dirs)
-        (granted! (& r) (datum->string (car dirs)))
-        (set! dirs (cdr dirs)))
-      (granted! (& r) cache-dir)
-      (when (> (-> out length) 0) (granted! (& r) out)))
-    (buffer-add-string! (& w) "-W=")
-    (granted! (& w) cache-dir)
-    (when (> (-> out length) 0) (granted! (& w) out))
-    (set! (@ flags 0) (buffer-string (& r)))
-    (set! (@ flags 1) (buffer-string (& w)))
-    (slice flags 2)))
+;; The compiler reads the roots, the cache and out, or any file for a program outside packages, and writes the cache
+;; and out.
+(define (compiler-grants [full string] [out string]) -> (ptr grants)
+  (let ([g (kept-grants)] [dirs (root-directories)])
+    (if (or (> (-> program-package length) 0) (toolchain-file? full))
+        (begin
+          (while (pair? dirs)
+            (grants-allow! g grant-read (datum->string (car dirs)))
+            (set! dirs (cdr dirs)))
+          (grants-allow! g grant-read cache-dir)
+          (when (> (-> out length) 0) (grants-allow! g grant-read out)))
+        (grants-allow-all! g grant-read))
+    (grants-allow! g grant-write cache-dir)
+    (when (> (-> out length) 0) (grants-allow! g grant-write out))
+    g))
 
-(define (every-grant) -> (slice string)
-  (let ([flags (cast (ptr string) (arena-alloc (& a) (sizeof string)))])
-    (set! (@ flags 0) "-A")
-    (slice flags 1)))
+(define (every-grant) -> (ptr grants)
+  (let ([g (kept-grants)])
+    (grants-all! g)
+    g))
 
-;; In grant flags, a comma in a path is written ",," (substrate/host/grants.mjs).
-(define (granted! [b (ptr buffer)] [path string])
-  (when (> (-> b length) 3) (buffer-add-byte! b #\,))
-  (for ([i u32 0]) (< i (-> path length)) (+= i 1)
-    (when (== (@ path i) #\,) (buffer-add-byte! b #\,))
-    (buffer-add-byte! b (cast i32 (@ path i)))))
+(define (kept-grants) -> (ptr grants)
+  (let ([g (cast (ptr grants) (arena-alloc (& a) (sizeof grants)))])
+    (set! (-> g list) (make-buffer))
+    g))

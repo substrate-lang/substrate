@@ -1,0 +1,110 @@
+;; Grants: parsing flags and clauses, building values, and what workers get (substrate/host/grants.sub).
+(require-unqualified tests std/test/test)
+(require-unqualified gr host/grants)
+(require-unqualified worker host/worker)
+
+(define (listed [g (ptr grants)]) -> string
+  (let ([l (slice (cast (ptr grant) (-> g list bytes)) (/ (-> g list length) (sizeof grant)))] [out (make-buffer)])
+    (for ([i u32 0]) (< i (-> l length)) (+= i 1)
+      (let ([e (& (@ l i))])
+        (buffer-add-string! (& out) (-> e kind))
+        (buffer-add-string! (& out) " ")
+        (buffer-add-string! (& out) (-> e item))
+        (buffer-add-string! (& out) "\n")))
+    (buffer-string (& out))))
+
+(define (joined [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+(define (parsed [flags (slice string)]) -> string
+  (let ([g (make-grants)] [why string])
+    (if (grants-parse! (& g) flags (& why)) (listed (& g)) why)))
+
+(test kinds
+  (expect-equal (parsed (slice (array-of string "-R=a,b" "--allow-write=c" "-N" "--deny-net=10.0.0.0/8" "-E=HOME"
+                                         "--allow-run=git" "--deny-run")))
+                "read a\nread b\nwrite c\nall net\ndeny-net 10.0.0.0/8\nenv HOME\nrun git\nall deny-run\n"))
+
+(test all (expect-equal (parsed (slice (array-of string "-A"))) "all read\nall write\nall net\nall env\nall run\n"))
+
+(test commas (expect-equal (parsed (slice (array-of string "-R=a,,b,c,,"))) "read a,b\nread c,\n"))
+
+(test setup
+  (expect-equal (parsed (slice (array-of string "--fake=timer,fetch,fetch:files" "--tls-cert=c.pem" "--tls-key=k.pem")))
+                "fake timer\nfake fetch\nfetch files\ntls-cert c.pem\ntls-key k.pem\n"))
+
+(test errors
+  (expect-equal (parsed (slice (array-of string "-R="))) "-R= has an empty item")
+  (expect-equal (parsed (slice (array-of string "-R=a,,,"))) "-R=a,,, has an empty item")
+  (expect-equal (parsed (slice (array-of string "-A=x"))) "-A takes no list")
+  (expect-equal (parsed (slice (array-of string "--fake=sleep"))) "no fake sleep")
+  (expect-equal (parsed (slice (array-of string "--fake"))) "--fake takes a list")
+  (expect-equal (parsed (slice (array-of string "--tls-cert"))) "--tls-cert takes a file")
+  (expect-equal (parsed (slice (array-of string "--allow-ffi"))) "--allow-ffi is not a grant"))
+
+(test builders
+  (let ([g (make-grants)])
+    (grants-allow! (& g) grant-read "a")
+    (grants-allow-all! (& g) grant-net)
+    (grants-deny-all! (& g) grant-env)
+    (grants-inherit! (& g))
+    (expect-equal (listed (& g)) (joined "read a\nall net\nall deny-env\n"
+                                         "inherit read\ninherit write\ninherit net\ninherit env\ninherit run\n"))))
+
+(test worker-defaults
+  (let ([narrowed worker-options] [o worker-options])
+    (worker-options-init! (& narrowed))
+    (grants-deny! (& (-> narrowed grants)) grant-read "x")
+    (worker-options-init! (& o))
+    (expect-equal (listed (& (-> o grants))) "inherit read\ninherit write\ninherit net\ninherit env\ninherit run\n")))
+
+(test flags
+  (expect (grants-flag? "-R=a"))
+  (expect (grants-flag? "--deny-run"))
+  (expect (grants-flag? "-A"))
+  (expect (grants-flag? "--fake=timer"))
+  (expect (not (grants-flag? "-Rx"))))
+
+(define (clause [g (ptr grants)] [parts (slice string)]) -> string
+  (let ([why string]) (if (grants-add! g (@ parts 0) (slice parts 1 (-> parts length)) (& why)) "" why)))
+
+(define (refusal [parts (slice string)]) -> string (let ([g (make-grants)]) (clause (& g) parts)))
+
+(test clauses
+  (let ([g (make-grants)])
+    (clause (& g) (slice (array-of string "read" "a" "b")))
+    (clause (& g) (slice (array-of string "deny-net" "10.0.0.0/8")))
+    (clause (& g) (slice (array-of string "all" "net" "deny-run")))
+    (clause (& g) (slice (array-of string "fake" "timer" "fetch")))
+    (clause (& g) (slice (array-of string "fetch" "files")))
+    (clause (& g) (slice (array-of string "tls" "c.pem" "k.pem")))
+    (expect-equal (listed (& g)) (joined "read a\nread b\ndeny-net 10.0.0.0/8\nall net\nall deny-run\nfake timer\n"
+                                         "fake fetch\nfetch files\ntls-cert c.pem\ntls-key k.pem\n"))))
+
+(test clause-errors
+  (expect-equal (refusal (slice (array-of string "read"))) "read has no items")
+  (expect-equal (refusal (slice (array-of string "read" ""))) "read has an empty item")
+  (expect-equal (refusal (slice (array-of string "all" "reed"))) "reed is not a kind")
+  (expect-equal (refusal (slice (array-of string "fake" "sleep"))) "no fake sleep")
+  (expect-equal (refusal (slice (array-of string "fetch" "a" "b"))) "fetch takes one directory")
+  (expect-equal (refusal (slice (array-of string "tls" "c.pem"))) "tls takes a certificate and a key")
+  (expect-equal (refusal (slice (array-of string "inherit" "read"))) "inherit is not a grant"))
+
+(test join
+  (let ([g (make-grants)] [h (make-grants)])
+    (grants-allow! (& g) grant-read "a")
+    (grants-allow-all! (& h) grant-net)
+    (grants-join! (& g) (& h))
+    (expect-equal (listed (& g)) "read a\nall net\n")))
+
+(define (idle) (begin))
+
+(test worker-fakes
+  (let ([o worker-options] [why string])
+    (worker-options-init! (& o))
+    (grants-fake! (& (-> o grants)) "clock")
+    (expect-equal (worker-start idle (slice (cast (ptr u8) 0) 0) (& o) 0 (& why)) 0)
+    (expect-equal why "worker.start: fakes and TLS files are set when a program starts")))

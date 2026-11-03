@@ -4,6 +4,7 @@
 (require-unqualified rt compiler/roots)
 (require-unqualified fs host/fs)
 (require-unqualified process host/node/process)
+(require-unqualified gr host/grants)
 (require-unqualified hash std/package/hash)
 (require-unqualified paths std/package/path)
 (require-unqualified common cmd/sub/common)
@@ -16,37 +17,40 @@
 
 ;; ---- running ----
 
-(define (become! [args (slice string)])
+(define then-dir string)
+(define then-args (slice string))
+(define then-grants grants)
+
+(define (become!)
   (let ([why string])
-    (process-exec (joined-path (substrate-dir) "host/subhost.mjs") args (& why))
+    (process-exec (joined-path (substrate-dir) "host/subhost.mjs") (grants-arguments (& then-grants) then-dir then-args)
+                  (& why))
     (failed! why)))
 
-(define then-run (slice string))
-
-;; ran runs the program in then-run after the compiler has built it.
-(define (ran [code i32]) (if (== code 0) (become! then-run) (host-exit code)))
+;; Once the compiler has built it, runs the program in then-dir.
+(define (ran [code i32]) (if (== code 0) (become!) (host-exit code)))
 
 (define (exited [code i32]) (host-exit code))
 
 (define (no-args) -> (slice string) (slice (cast (ptr string) 0) 0))
 
 (define (run! [args (slice string)])
-  (let ([i u32 0] [copy (cast (ptr string) (arena-alloc (& a) (* (-> args length) (sizeof string))))])
+  (let ([i u32 0] [why string])
     (while (and (< i (-> args length)) (starts? (@ args i) "-")) (+= i 1))
     (when (>= i (-> args length)) (usage))
-    (for ([k u32 0]) (< k (-> args length)) (+= k 1) (set! (@ copy k) (@ args k)))
+    (unless (grants-parse! (& then-grants) (slice args 0 i) (& why)) (failed! why))
+    (set! then-args (slice args (+ i 1) (-> args length)))
     (if (ends? (@ args i) ".sub")
-        (let ([full (absolute (@ args i))] [dir string])
+        (let ([full (absolute (@ args i))])
           (cache!)
-          (set! dir (target! full ""))
-          (set! (@ copy i) dir)
-          (set! then-run (slice copy (-> args length)))
-          (compile! "build" full dir (no-args) (grants full dir) ran))
-        (become! (slice copy (-> args length))))))
+          (set! then-dir (target! full ""))
+          (compile! "build" full then-dir (no-args) (compiler-grants full then-dir) ran))
+        (begin
+          (set! then-dir (@ args i))
+          (become!)))))
 
 (define (serve! [args (slice string)])
-  (let* ([address "127.0.0.1"] [dir "."] [k u32 0] [n (-> args length)] [granted (make-buffer)] [listen (make-buffer)]
-         [argv (cast (ptr string) (arena-alloc (& a) (* (+ (* n 2) 5) (sizeof string))))] [m u32 0])
+  (let* ([address "127.0.0.1"] [dir "."] [k u32 0] [n (-> args length)])
     (while (< k n)
       (let ([x (@ args k)])
         (cond [(== x "-l") (+= k 1) (when (< k n) (set! address (@ args k)))]
@@ -55,39 +59,19 @@
               [else (break)]))
       (+= k 1))
     (when (< k n) (set! dir (@ args k)))
-    (buffer-add-string! (& granted) "-R=")
-    (for ([i u32 0]) (< i (-> dir length)) (+= i 1)
-      (when (== (@ dir i) #\,) (buffer-add-byte! (& granted) #\,))
-      (buffer-add-byte! (& granted) (cast i32 (@ dir i))))
-    (buffer-add-string! (& listen) "-N=")
-    (if (and (> (-> address length) 0) (has-colon? address))
-        (begin
-          (buffer-add-byte! (& listen) #\[)
-          (buffer-add-string! (& listen) (unbracketed address))
-          (buffer-add-byte! (& listen) #\]))
-        (buffer-add-string! (& listen) address))
-    (set! (@ argv m) (buffer-string (& granted)))
-    (set! (@ argv (+ m 1)) (buffer-string (& listen)))
-    (+= m 2)
+    (when (== (-> address length) 0) (usage))
+    (grants-allow! (& then-grants) grant-read dir)
+    (grants-allow! (& then-grants) grant-net (unbracketed address))
     (let ([t (option args "-t")] [key-at u32 0])
       (when (> (-> t length) 0)
         (for ([i u32 0]) (< i n) (+= i 1) (when (== (@ args i) "-t") (set! key-at (+ i 2))))
-        (set! (@ argv m) (joined "--tls-cert=" t))
-        (set! (@ argv (+ m 1)) (joined "--tls-key=" (if (< key-at n) (@ args key-at) "")))
-        (+= m 2)))
+        (when (>= key-at n) (usage))
+        (grants-tls! (& then-grants) t (@ args key-at))))
     (cache!)
     (let* ([full (joined-path root "cmd/serve.sub")] [out (target! full (joined-path root "build/serve"))])
-      (set! (@ argv m) out)
-      (+= m 1)
-      (for ([i u32 0]) (< i n) (+= i 1)
-        (set! (@ argv m) (@ args i))
-        (+= m 1))
-      (set! then-run (slice argv m))
-      (compile! "build" full out (no-args) (grants full out) ran))))
-
-(define (has-colon? [s string]) -> bool
-  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) #\:) (return #t)))
-  #f)
+      (set! then-dir out)
+      (set! then-args args)
+      (compile! "build" full out (no-args) (compiler-grants full out) ran))))
 
 (define (unbracketed [s string]) -> string
   (let ([from (if (starts? s "[") 1 0)] [to (if (ends? s "]") (- (-> s length) 1) (-> s length))]) (slice s from to)))
@@ -182,7 +166,8 @@
          (let ([file (absolute (@ rest 0))])
            (prepare! file)
            (cache!)
-           (compile! command file "" (no-args) (if (== command "eval") (every-grant) (grants file "")) exited))]
+           (compile! command file "" (no-args) (if (== command "eval") (every-grant) (compiler-grants file ""))
+                     exited))]
         [(== command "site") (site! rest)]
         [(== command "serve") (serve! rest)]
         [(== command "test") (test-command! rest)]

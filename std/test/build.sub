@@ -5,6 +5,7 @@
 (require-unqualified main compiler/main)
 (require-unqualified fs host/fs)
 (require-unqualified process host/node/process)
+(require-unqualified gr host/grants)
 (require-unqualified paths "../package/path.sub")
 (require-unqualified tests "test.sub")
 (require-unqualified compare "compare.sub")
@@ -46,22 +47,24 @@
 
 (struct run-result [code i32] [output string])
 
-(define (run-program [path string] [dir string] [args (slice string)] [grants (slice string)] [input (slice u8)]
+(define (run-program [path string] [dir string] [args (slice string)] [asked (slice (slice string))] [input (slice u8)]
                      [message string]) -> run-result
-  (let ([err (make-buffer)] [out string] [argv (make-buffer)] [o process-options] [r run-result] [bytes (slice u8)]
-        [why string])
+  (let ([err (make-buffer)] [out string] [g (make-grants)] [argv (make-buffer)]
+        [o process-options] [r run-result] [bytes (slice u8)] [why string])
     (set! out (built! path (& err)))
     (when (== (-> out length) 0) (failure! message (text-of "the program does not compile\n" (buffer-string (& err)))))
     (again-check! path out message)
     (set! scratch "")
-    (for ([i u32 0]) (< i (-> grants length)) (+= i 1) (push! (& argv) (placed (@ grants i))))
-    (push! (& argv) out)
+    (for ([i u32 0]) (< i (-> asked length)) (+= i 1)
+      (let ([clause (@ asked i)] [items (make-buffer)])
+        (for ([j u32 1]) (< j (-> clause length)) (+= j 1) (push! (& items) (placed (@ clause j))))
+        (unless (grants-add! (& g) (@ clause 0) (strings-in (& items)) (& why)) (failure! message why))))
     (for ([i u32 0]) (< i (-> args length)) (+= i 1) (push! (& argv) (placed (@ args i))))
     (process-options-init! (& o))
     (set! (-> o dir) (joined-path directory dir))
     (set! (-> r code) (process-run (joined-path (test-option "--toolchain") "host/subhost.mjs")
-                                   (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string))) (& o)
-                                   input 60000 (& bytes) (& why)))
+                                   (grants-arguments (& g) out (strings-in (& argv))) (& o) input 60000 (& bytes)
+                                   (& why)))
     (when (< (-> r code) 0) (failure! message why))
     (set! (-> r output) (cast string bytes))
     r))
@@ -102,20 +105,15 @@
 
 (define (compiler-run [path string] [cache string] [out string] [message string]) -> run-result
   (let* ([full (joined-path directory path)] [toolchain (test-option "--toolchain")]
-         [argv (make-buffer)] [r (make-buffer)] [w (make-buffer)] [dirs (root-directories)] [o process-options]
-         [result run-result] [bytes (slice u8)] [why string])
+         [g (make-grants)] [argv (make-buffer)] [dirs (root-directories)] [o process-options] [result run-result]
+         [bytes (slice u8)] [why string])
     (fs-remove out #t 0)
-    (buffer-add-string! (& r) "-R=")
     (while (pair? dirs)
-      (granted! (& r) (datum->string (car dirs)))
+      (grants-allow! (& g) grant-read (datum->string (car dirs)))
       (set! dirs (cdr dirs)))
-    (granted! (& r) cache)
-    (buffer-add-string! (& w) "-W=")
-    (granted! (& w) cache)
-    (granted! (& w) out)
-    (push! (& argv) (buffer-string (& r)))
-    (push! (& argv) (buffer-string (& w)))
-    (push! (& argv) (joined-path (parent-of toolchain) "build/compiler"))
+    (grants-allow! (& g) grant-read cache)
+    (grants-allow! (& g) grant-write cache)
+    (grants-allow! (& g) grant-write out)
     (push! (& argv) toolchain)
     (push! (& argv) "-c")
     (push! (& argv) cache)
@@ -130,18 +128,12 @@
     (process-options-init! (& o))
     (set! (-> o dir) (parent-of full))
     (set! (-> result code) (process-run (joined-path toolchain "host/subhost.mjs")
-                                        (slice (cast (ptr string) (-> argv bytes)) (/ (-> argv length) (sizeof string)))
+                                        (grants-arguments (& g) (joined-path (parent-of toolchain) "build/compiler")
+                                                          (strings-in (& argv)))
                                         (& o) (slice (cast (ptr u8) 0) 0) 60000 (& bytes) (& why)))
     (when (< (-> result code) 0) (failure! message why))
     (set! (-> result output) (cast string bytes))
     result))
-
-;; In grant flags, a comma in a path is written ",," (substrate/host/grants.mjs).
-(define (granted! [b (ptr buffer)] [path string])
-  (when (> (-> b length) 3) (buffer-add-byte! b #\,))
-  (for ([i u32 0]) (< i (-> path length)) (+= i 1)
-    (when (== (@ path i) #\,) (buffer-add-byte! b #\,))
-    (buffer-add-byte! b (cast i32 (@ path i)))))
 
 (define (run-check! [r (ptr run-result)] [what string] [fails string] [compare u32] [expected string] [message string])
   (let ([output (-> r output)])
@@ -198,6 +190,9 @@
 
 (define (push! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
 
+(define (strings-in [b (ptr buffer)]) -> (slice string)
+  (slice (cast (ptr string) (-> b bytes)) (/ (-> b length) (sizeof string))))
+
 (define (listed? [b (ptr buffer)] [s string]) -> bool
   (let ([l (slice (cast (ptr string) (-> b bytes)) (/ (-> b length) (sizeof string)))])
     (for ([i u32 0]) (< i (-> l length)) (+= i 1) (when (== (@ l i) s) (return #t)))
@@ -223,6 +218,18 @@
 
   (define (text? [x datum]) -> bool (string? (syntax-e x)))
 
+  (define (clause-code [c datum]) -> datum
+    (let ([parts (syntax->list c)] [head ""] [texts nil])
+      (unless (and (!= parts 0) (pair? parts) (symbol? (syntax-e (car parts))))
+        (raise-syntax-error 'expect-run "a grant is a kind and its items, as (read \"data\") or (all net)" c))
+      (set! head (symbol->string (syntax-e (car parts))))
+      (for/each ([p (cdr parts)])
+        (set! texts (cons (if (and (or (== head "all") (== head "fake")) (symbol? (syntax-e p)))
+                              (literal (string->datum (symbol->string (syntax-e p))))
+                              p)
+                          texts)))
+      #`(slice (array-of string #,(literal (string->datum head)) #,@(reverse texts)))))
+
   (define (expect-compile-error-form [s datum]) -> datum
     (syntax-match s
       [(_ (? text? file) (? text? text))
@@ -232,18 +239,22 @@
   (define (expect-run-form [s datum]) -> datum
     (syntax-match s
       [(_ (? text? file) options ...)
-       (let ([args #`(slice (cast (ptr string) 0) 0)] [grants #`(slice (cast (ptr string) 0) 0)]
+       (let ([args #`(slice (cast (ptr string) 0) 0)] [grants #`(slice (cast (ptr (slice string)) 0) 0)]
              [input #`(slice (cast (ptr u8) 0) 0)] [compare (literal (make-integer 0))] [expected (literal '"")]
              [fails (literal '"")] [message (message-of s file)] [l options])
          (while (pair? l)
            (unless (and (keyword? (syntax-e (car l))) (pair? (cdr l)))
              (raise-syntax-error 'expect-run "expected a keyword and its value" (car l)))
            (let ([k (keyword->string (syntax-e (car l)))] [v (cadr l)])
-             (cond [(or (== k "args") (== k "grants"))
+             (cond [(== k "args")
                     (let ([items (syntax->list v)])
                       (unless (!= items 0) (raise-syntax-error 'expect-run "expected a list" v))
-                      (let ([code (if (null? items) #`(slice (cast (ptr string) 0) 0) #`(slice (array-of string #,@items)))])
-                        (if (== k "args") (set! args code) (set! grants code))))]
+                      (unless (null? items) (set! args #`(slice (array-of string #,@items)))))]
+                   [(== k "grants")
+                    (let ([clauses (syntax->list v)] [codes nil])
+                      (unless (!= clauses 0) (raise-syntax-error 'expect-run "expected a list" v))
+                      (for/each ([c clauses]) (set! codes (cons (clause-code c) codes)))
+                      (unless (null? clauses) (set! grants #`(slice (array-of (slice string) #,@(reverse codes))))))]
                    [(not (text? v)) (raise-syntax-error 'expect-run "expected a text" v)]
                    [(== k "stdin") (set! input #`(cast (slice u8) #,v))]
                    [(== k "stdin-file") (set! input #`(file-bytes-of #,(path-of s v) #,message))]

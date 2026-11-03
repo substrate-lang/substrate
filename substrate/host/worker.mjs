@@ -1,6 +1,6 @@
 // The host module "worker" (worker.sub). The browser and Node each give spawn, their way of starting a thread.
 import { entries } from './entries.mjs';
-import { within } from './grants.mjs';
+import { askedOf, within } from './grants.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -95,14 +95,16 @@ export function workerModule({ spawn }) {
           return 0;
         }
         const pages = Math.ceil((size >>> 0) / 65536);
-        let grants = caller.grants();
-        if (gl > 0) {
-          try {
-            grants = within(caller.parseGrants(entries(string(gp, gl))), grants);
-          } catch (e) {
-            caller.fail(err, `worker.start: ${e.message}`);
-            return 0;
+        let grants;
+        try {
+          const request = caller.parseGrants(entries(string(gp, gl)));
+          if (request.fakes.size > 0 || request.tls) {
+            throw new Error('fakes and TLS files are set when a program starts');
           }
+          grants = within(askedOf(request, caller.grants()), caller.grants());
+        } catch (e) {
+          caller.fail(err, `worker.start: ${e.message}`);
+          return 0;
         }
         return start(entry, bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err, grants);
       },

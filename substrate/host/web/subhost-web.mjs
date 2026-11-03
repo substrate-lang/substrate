@@ -2,7 +2,7 @@
 // workers may be given fewer.
 import { createHost, Exit } from '../subhost-core.mjs';
 import { fsModule } from '../fs.mjs';
-import { allGrants, grantsOf } from '../grants.mjs';
+import { allGrants, pairsFrom, requestOf } from '../grants.mjs';
 import { pageFiles, resolvePath } from './fs.mjs';
 
 const text = new TextDecoder();
@@ -147,7 +147,7 @@ export function run(options, names, wasm) {
     modules,
     absent: options.absent,
     grants: options.grants || allGrants(),
-    parseGrants: (list) => grantsOf(list, (p) => resolvePath(cwd, p)),
+    parseGrants: (list) => requestOf(pairsFrom(list), (p) => resolvePath(cwd, p)),
     memoryPages: options.memoryPages || 0,
   });
   app.host = host;

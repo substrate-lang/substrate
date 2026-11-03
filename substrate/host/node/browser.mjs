@@ -77,7 +77,8 @@ export function browsers(grants) {
 
     const served = (program, site) => {
       if (!mayRun(grants.run, comparable(subhost), subhost)) throw new Error(`browser.open: ${subhost} is not granted (--allow-run), so the server cannot run`);
-      const t = thread(serving, 'the server', { command: process.execPath, args: ['--stack-size=4000', subhost, '-N=127.0.0.1', `-R=${site}`, program, site] });
+      const args = ['--stack-size=4000', subhost, '--grant', 'net', '127.0.0.1', '--grant', 'read', site, '--', program, site];
+      const t = thread(serving, 'the server', { command: process.execPath, args });
       const reply = ask(t, { type: 'start' });
       if (!reply.ok) {
         t.worker.terminate();

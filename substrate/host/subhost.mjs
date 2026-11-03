@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { createHost, Exit } from './subhost-core.mjs';
-import { grantFlag, grantsOf, noGrants } from './grants.mjs';
-import { hostFlag, hostModules, setupOf, system } from './node/modules.mjs';
+import { joinedGrants, noGrants, pairsFrom, requestOf } from './grants.mjs';
+import { hostModules, setupOf, system } from './node/modules.mjs';
 
 const require = createRequire(import.meta.url);
 const resolveGrant = (p, k) => require('./node/fs.mjs').resolveGrant(p, k);
@@ -16,12 +16,9 @@ const resolveFlag = (p, k) => {
 };
 
 function usage() {
-  process.stderr.write('usage: substrate run [FLAG ...] DIR [ARG ...]\n'
-    + '  grants: -A, -R[=PATH,...], -W[=PATH,...], -N[=HOST[:PORT],...], -E[=NAME,...], --allow-run[=PROGRAM,...],\n'
-    + '          --deny-read=PATH,..., --deny-write=PATH,..., --deny-net=HOST[:PORT],..., --deny-env=NAME,...,\n'
-    + '          --deny-run=PROGRAM,...\n'
-    + '          a HOST is NAME, *.NAME, ADDRESS or ADDRESS/BITS\n'
-    + '  setup: --fake=NAME,... (clock, timer, websocket, fetch:DIR), --tls-cert=FILE --tls-key=FILE\n');
+  process.stderr.write('usage: subhost.mjs [-A] [--grant KIND ITEM ...] [--] DIR [ARG ...]\n'
+    + '  -A grants everything, and --grant grants one KIND and ITEM (grants.sub).\n'
+    + '  To run a program yourself, use substrate run.\n');
   process.exit(64);
 }
 
@@ -32,15 +29,23 @@ function fail(message) {
 
 const argv = process.argv.slice(2);
 const setup = setupOf(noGrants());
+const pairs = [];
 while (argv.length > 0 && argv[0].startsWith('-')) {
   const flag = argv.shift();
-  try {
-    if (!grantFlag(setup.grants, flag, resolveFlag) && !hostFlag(setup, flag)) usage();
-  } catch (e) {
-    fail(e.message);
-  }
+  if (flag === '--') break;
+  if (flag === '-A') for (const k of Object.keys(setup.grants)) setup.grants[k].all = true;
+  else if (flag === '--grant' && argv.length >= 2) pairs.push([argv.shift(), argv.shift()]);
+  else usage();
 }
-if (setup.tls && !(setup.tls.cert && setup.tls.key)) fail('--tls-cert and --tls-key go together');
+try {
+  const request = requestOf(pairs, resolveFlag);
+  if (request.inherit.size > 0) fail('inherit is only for workers');
+  setup.grants = joinedGrants(setup.grants, request.grants);
+  for (const [name, at] of request.fakes) setup.fakes.set(name, at);
+  if (request.tls) setup.tls = { cert: read(request.tls.cert), key: read(request.tls.key) };
+} catch (e) {
+  fail(e.message);
+}
 const [dir, ...programArgs] = argv;
 if (!dir) usage();
 
@@ -53,6 +58,8 @@ function read(file) {
   }
 }
 const names = read(`${dir}/program`).toString().split(/\r?\n/).filter((n) => n !== '');
+const outside = names.find((name) => /[/\\]/.test(name));
+if (outside !== undefined) fail(`${dir}/program lists ${outside}, which is not in ${dir}`);
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
 
 // The program process.exec_at_end kept (node/process.mjs).
@@ -85,7 +92,7 @@ const host = createHost({
   },
   modules: hostModules(setup),
   grants: setup.grants,
-  parseGrants: (list) => grantsOf(list, resolveGrant),
+  parseGrants: (list) => requestOf(pairsFrom(list), resolveGrant),
   keyOf: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 });
 

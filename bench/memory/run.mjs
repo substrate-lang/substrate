@@ -15,7 +15,7 @@ const upgrade = get('/ws', 'upgrade: websocket\r\nconnection: upgrade\r\n'
   + 'sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n');
 
 const start = () => new Promise((resolve, reject) => {
-  const p = spawn(host, ['-N=127.0.0.1', `${out}/server`], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const p = spawn(host, ['--grant', 'net', '127.0.0.1', `${out}/server`], { stdio: ['ignore', 'pipe', 'inherit'] });
   let text = '';
   p.stdout.on('data', (d) => {
     text += d;
