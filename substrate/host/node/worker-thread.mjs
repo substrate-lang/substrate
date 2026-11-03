@@ -2,7 +2,7 @@
 import { parentPort } from 'node:worker_threads';
 import { createHost, Exit } from '../subhost-core.mjs';
 import { workerSide } from '../worker-side.mjs';
-import { grantsOf } from '../grants.mjs';
+import { pairsFrom, requestOf } from '../grants.mjs';
 import { hostModules, system } from './modules.mjs';
 import { resolveGrant } from './fs.mjs';
 
@@ -26,7 +26,7 @@ parentPort.on('message', (m) => {
       active: side.active,
       modules: hostModules(setup, new Map([['worker', side.worker]])),
       grants: m.grants,
-      parseGrants: (list) => grantsOf(list, resolveGrant),
+      parseGrants: (list) => requestOf(pairsFrom(list), resolveGrant),
       absent: new Set(['stdin', 'signal']),
       memoryPages: m.pages,
     });

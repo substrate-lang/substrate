@@ -69,12 +69,14 @@ for t in tests/events/*.sub; do
   if [ -z "$server" ]; then
     : > "$builds/servers.url"
     (cd tests/events/fixtures && "$root/bin/substrate" build servers.sub -o "$root/$builds/events/servers" -c "$cache")
-    "$host" -N=127.0.0.1 -R="$root/tests/events/files" "$root/$builds/events/servers" "$root/tests/events/files" \
+    "$host" --grant net 127.0.0.1 --grant read "$root/tests/events/files" "$root/$builds/events/servers" \
+      "$root/tests/events/files" \
       > "$builds/servers.url" & server=$!
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
-  actual="$(cd tests/events && timeout 60 "$host" -N=127.0.0.1 -R=. "$root/tests/build/test/programs/events/$name" "$url" \
+  actual="$(cd tests/events && timeout 60 "$host" --grant net 127.0.0.1 --grant read . \
+              "$root/tests/build/test/programs/events/$name" "$url" \
               "ws${url#http}" 2>&1)"
   code=$?
   if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then

@@ -159,12 +159,56 @@ export function grantFlag(g, flag, resolve) {
   return false;
 }
 
-// grantsOf gives the grants a list of flags makes, every one of which must be a grant flag.
-export function grantsOf(list, resolve) {
-  const g = noGrants();
-  for (const flag of list) if (!grantFlag(g, flag, resolve)) throw new Error(`${flag} is not a grant`);
-  return g;
+const fakeable = new Set(['clock', 'timer', 'websocket', 'fetch']);
+
+export function pairsFrom(list) {
+  if (list.length % 2 !== 0) throw new Error(`the grant ${list[list.length - 1]} has no item`);
+  const pairs = [];
+  for (let i = 0; i < list.length; i += 2) pairs.push([list[i], list[i + 1]]);
+  return pairs;
 }
+
+const grantKind = (name) => {
+  const deny = name.startsWith('deny-');
+  const k = deny ? name.slice(5) : name;
+  return kinds.includes(k) ? { k, deny } : null;
+};
+
+// requestOf reads the grants that pairs of kind and item ask for (grants.sub).
+export function requestOf(pairs, resolve) {
+  const g = noGrants();
+  const request = { grants: g, inherit: new Set(), fakes: new Map(), tls: null };
+  for (const [kind, item] of pairs) {
+    if (item === '') throw new Error(`${kind} has an empty item`);
+    const granted = grantKind(kind);
+    const all = kind === 'all' ? grantKind(item) : null;
+    if (granted) {
+      const into = granted.deny ? g[granted.k].deny : g[granted.k];
+      const resolved = itemOf(granted.k, item, resolve, granted.deny);
+      if (resolved !== null) {
+        into.items.push(resolved);
+        if (into === g.run) g.write.deny.items.push(resolved);
+      }
+    } else if (all) (all.deny ? g[all.k].deny : g[all.k]).all = true;
+    else if (kind === 'inherit' && kinds.includes(item)) request.inherit.add(item);
+    else if (kind === 'fake' && fakeable.has(item)) {
+      if (!request.fakes.has(item)) request.fakes.set(item, null);
+    } else if (kind === 'fetch') request.fakes.set('fetch', item);
+    else if (kind === 'tls-cert' || kind === 'tls-key') (request.tls ||= {})[kind.slice(4)] = item;
+    else throw new Error(`${kind} ${item} is not a grant`);
+  }
+  if (request.tls && !(request.tls.cert && request.tls.key)) throw new Error('--tls-cert and --tls-key go together');
+  return request;
+}
+
+export const joinedGrants = (a, b) => Object.fromEntries(kinds.map((k) => [k, {
+  all: a[k].all || b[k].all,
+  items: [...a[k].items, ...b[k].items],
+  deny: { all: a[k].deny.all || b[k].deny.all, items: [...a[k].deny.items, ...b[k].deny.items] },
+}]));
+
+export const askedOf = (request, parent) => joinedGrants(request.grants,
+  Object.fromEntries(kinds.map((k) => [k, request.inherit.has(k) ? parent[k] : kind()])));
 
 export const under = (p, root) => root === '/' || p === root
   || (p.startsWith(root) && p.charCodeAt(root.length) === 47);
