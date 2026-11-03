@@ -6,8 +6,8 @@ import path from 'node:path';
 import { errorOf, reasonOf } from '../errors.mjs';
 import { nodeSource } from '../streams.mjs';
 import { entries } from '../entries.mjs';
-import { askedOf, isLoaderVariable, mayRun, notGranted, pairsFrom, requestOf, unlimited, within } from '../grants.mjs';
-import { comparable, programFile, resolveGrant } from './fs.mjs';
+import { isLoaderVariable, mayRun, notGranted, unlimited } from '../grants.mjs';
+import { comparable, programFile } from './fs.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -161,20 +161,6 @@ export function processes(grants, loader, setup = {}) {
           if (!unlimited(grants.run)) refuse(grants.run, file, program, env, loader);
           const l = launched(file ?? program, entries(caller.string(ap, al)), program);
           setup.atEnd = { file: l.command, argv: [l.argv0, ...l.args], env };
-        } catch (e) {
-          caller.fail(err, e.message);
-          return -1;
-        }
-        return 0;
-      },
-      restrict(gp, gl, err) {
-        try {
-          const request = requestOf(pairsFrom(entries(caller.string(gp, gl))), resolveGrant);
-          if (request.fakes.size > 0 || request.tls) {
-            throw new Error('fakes and TLS files are set when a program starts');
-          }
-          const narrowed = within(askedOf(request, grants), grants);
-          for (const k of Object.keys(narrowed)) grants[k] = narrowed[k];
         } catch (e) {
           caller.fail(err, e.message);
           return -1;

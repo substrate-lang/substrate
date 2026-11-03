@@ -39,7 +39,7 @@ while (argv.length > 0 && argv[0].startsWith('-')) {
 }
 try {
   const request = requestOf(pairs, resolveFlag);
-  if (request.inherit.size > 0) fail('inherit is for workers and process-restrict');
+  if (request.inherit.size > 0) fail('inherit is only for workers');
   setup.grants = joinedGrants(setup.grants, request.grants);
   for (const [name, at] of request.fakes) setup.fakes.set(name, at);
   if (request.tls) setup.tls = { cert: read(request.tls.cert), key: read(request.tls.key) };
