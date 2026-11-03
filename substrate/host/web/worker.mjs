@@ -18,6 +18,7 @@ export function workers() {
         names: plan.names,
         pages: plan.pages,
         heard: plan.heard,
+        args: plan.args,
       });
       return {
         post: (m, transfer) => thread.postMessage(m, transfer),

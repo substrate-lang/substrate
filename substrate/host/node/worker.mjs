@@ -29,6 +29,7 @@ export function workers(setup) {
         pages: plan.pages,
         heard: plan.heard,
         ends: plan.ends,
+        args: plan.args,
       });
       return {
         post: (m, transfer) => thread.postMessage(m, transfer),

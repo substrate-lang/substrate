@@ -47,7 +47,7 @@ self.onmessage = async (e) => {
       else absent.add(name);
     }
     const app = run({
-      args: [m.argument],
+      args: m.args ?? [m.argument],
       files: m.files,
       cwd: m.cwd,
       output: side.write,

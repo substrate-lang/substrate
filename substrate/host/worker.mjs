@@ -88,7 +88,7 @@ export function workerModule({ spawn }) {
         for (const w of [...alive.keys()]) end(w, -1, null);
       },
       // f is the function's index in the table; the thread finds it by its module and export name.
-      start(f, bp, bl, time, size, heard, tag, gp, gl, err, ends) {
+      start(f, bp, bl, time, size, heard, tag, gp, gl, err, ends, ap, al) {
         const entry = caller.named(f >>> 0);
         if (!entry) {
           caller.fail(err, 'worker.start: a function of code the program loaded');
@@ -107,7 +107,8 @@ export function workerModule({ spawn }) {
           caller.fail(err, `worker.start: ${e.message}`);
           return 0;
         }
-        const setup = { fakes: request.fakes, tls: request.tls, ends: ends === 1 };
+        const args = al > 0 ? entries(string(ap, al)) : null;
+        const setup = { fakes: request.fakes, tls: request.tls, ends: ends === 1, args };
         return start(entry, bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err, grants, setup);
       },
       send(w, ptr, len) {

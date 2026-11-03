@@ -22,7 +22,7 @@ parentPort.on('message', (m) => {
     const wasm = new Map(m.modules);
     const setup = { grants: m.grants, fakes: new Map(m.fakes), tls: m.tls, loader: m.loader, worker: true };
     const host = createHost({
-      args: [m.argument],
+      args: m.args ?? [m.argument],
       os: system,
       write: side.write,
       exit(code) {

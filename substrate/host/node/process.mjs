@@ -108,7 +108,6 @@ export function processes(grants, loader, setup = {}) {
       run(pp, pl, ap, al, dp, dl, ep, el, clear, ip, il, timeout, op, err) {
         let dir = null;
         try {
-          mainOnly(setup, 'run');
           const program = caller.string(pp, pl);
           const cwd = caller.string(dp, dl) || undefined;
           const env = childEnv(clear, entries(caller.string(ep, el)));
