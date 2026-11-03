@@ -1,8 +1,11 @@
 // The host module "worker" on Node: the thread is a worker thread, set up as its parent's host was, with the fakes and
-// TLS files its grants ask for.
+// TLS files its grants ask for. A worker that opens a site borrows a connection to this thread's Chromium (browser.mjs).
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import { SHARE_ENV, Worker } from 'node:worker_threads';
 import { workerModule } from '../worker.mjs';
+
+const require = createRequire(import.meta.url);
 
 const read = (file) => {
   try {
@@ -12,11 +15,28 @@ const read = (file) => {
   }
 };
 
+let lent = false;
+
+const lend = (m) => {
+  try {
+    const c = require('./browser.mjs').connection(m.file, m.files, m.args);
+    lent = true;
+    m.reply.postMessage({ ok: true, port: c.port, signal: c.signal }, [c.port]);
+  } catch (e) {
+    m.reply.postMessage({ ok: false, message: e.message });
+  }
+  Atomics.store(m.signal, 0, 1);
+  Atomics.notify(m.signal, 0);
+};
+
 export function workers(setup) {
-  return workerModule({
+  const made = workerModule({
     spawn(plan) {
       const tls = plan.tls ? { cert: read(plan.tls.cert), key: read(plan.tls.key) } : setup.tls;
       const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url), { env: SHARE_ENV });
+      thread.on('message', (m) => {
+        if (m.type === 'browser') lend(m);
+      });
       thread.postMessage({
         type: 'start',
         modules: plan.modules,
@@ -42,4 +62,14 @@ export function workers(setup) {
       };
     },
   });
+  return (caller, app) => {
+    const m = made(caller, app);
+    return {
+      ...m,
+      end() {
+        m.end();
+        if (lent) require('./browser.mjs').endShared();
+      },
+    };
+  };
 }

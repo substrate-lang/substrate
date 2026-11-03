@@ -1,6 +1,6 @@
 // The host module "browser" (browser.sub). It opens sites in Chromium, which chromium.mjs drives on another thread, and
-// blocks until Chromium answers. A test's server runs through serving.mjs. The caller's grants limit what this module
-// reads, runs and reaches.
+// blocks until Chromium answers. One Chromium serves a thread and the workers it starts, which borrow connections to
+// it. A test's server runs through serving.mjs. The caller's grants limit what this module reads, runs and reaches.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,7 +32,50 @@ function thread(script, name, data = {}) {
   return { worker, port: port1, signal, dead: false };
 }
 
-export function browsers(grants) {
+const ask = (t, message, transfer = []) => {
+  Atomics.store(t.signal, 0, 0);
+  t.port.postMessage(message, transfer);
+  if (Atomics.wait(t.signal, 0, 0, patience) === 'timed-out') {
+    if (t.worker) t.worker.terminate();
+    t.dead = true;
+    return { ok: false, message: `the browser did not answer within ${patience / 1000} s` };
+  }
+  let got = receiveMessageOnPort(t.port);
+  while (got === undefined) {
+    Atomics.wait(t.signal, 0, 1, 10);
+    got = receiveMessageOnPort(t.port);
+  }
+  return got.message;
+};
+
+// The thread's Chromium, started by the first site it opens, here or in a worker it started.
+let shared = null;
+
+const sharedDriver = (file, files, args) => {
+  if (!shared || shared.dead) shared = thread(chromium, 'Chromium', { file, files, args });
+  return shared;
+};
+
+// A connection to the thread's Chromium for a worker, whose module asks for it with its own grants checked.
+export function connection(file, files, args) {
+  const driver = sharedDriver(file, files, args);
+  const { port1, port2 } = new MessageChannel();
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  const reply = ask(driver, { type: 'connect', port: port2, signal }, [port2]);
+  if (!reply.ok) throw new Error(reply.message);
+  return { port: port1, signal };
+}
+
+export function endShared() {
+  if (shared && !shared.dead) {
+    ask(shared, { type: 'end' });
+    shared.worker.terminate();
+  }
+  shared = null;
+}
+
+// connect, in a worker, gives a connection to the Chromium of the thread that started it.
+export function browsers(grants, connect = null) {
   return (caller) => {
     const open = new Set();
     let next = 1;
@@ -48,20 +91,13 @@ export function browsers(grants) {
       }
     };
 
-    const ask = (t, message) => {
-      Atomics.store(t.signal, 0, 0);
-      t.port.postMessage(message);
-      if (Atomics.wait(t.signal, 0, 0, patience) === 'timed-out') {
-        t.worker.terminate();
-        t.dead = true;
-        return { ok: false, message: `the browser did not answer within ${patience / 1000} s` };
+    // A borrowed connection goes back once its browsers have closed, so a worker can end.
+    const released = () => {
+      if (connect && driver && !driver.dead) {
+        ask(driver, { type: 'end' });
+        driver.port.close();
       }
-      let got = receiveMessageOnPort(t.port);
-      while (got === undefined) {
-        Atomics.wait(t.signal, 0, 1, 10);
-        got = receiveMessageOnPort(t.port);
-      }
-      return got.message;
+      driver = null;
     };
 
     const answer = (out, bytes) => {
@@ -101,7 +137,7 @@ export function browsers(grants) {
 
     const opened = (file, files, args, dir, url, net) => {
       runnable(file, 'open');
-      if (!driver || driver.dead) driver = thread(chromium, 'Chromium', { file, files: writable(files), args });
+      if (!driver || driver.dead) driver = (connect || sharedDriver)(file, writable(files), args);
       const id = next++;
       const site = [];
       filesUnder(dir, '', site);
@@ -116,10 +152,8 @@ export function browsers(grants) {
         open.clear();
         for (const t of servers.values()) stopped(t);
         servers.clear();
-        if (driver && !driver.dead) {
-          ask(driver, { type: 'end' });
-          driver.worker.terminate();
-        }
+        if (connect) released();
+        else endShared();
         driver = null;
       },
       open(dp, dl, up, ul, cp, cl, sp, sl, fp, fl, ap, al, err) {
@@ -173,6 +207,7 @@ export function browsers(grants) {
           stopped(servers.get(id));
           servers.delete(id);
         }
+        if (open.size === 0) released();
       },
     };
   };

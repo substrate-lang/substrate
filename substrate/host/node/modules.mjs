@@ -23,7 +23,7 @@ const loaders = {
   fs: (s) => require('../fs.mjs').fsModule(require('./fs.mjs').nodeFiles(s.grants)),
   watch: (s) => require('./watch.mjs').watchModule(s.grants),
   signal: () => require('./signal.mjs').signals(),
-  browser: (s) => require('./browser.mjs').browsers(s.grants),
+  browser: (s) => require('./browser.mjs').browsers(s.grants, s.connect),
 };
 
 export const system = { darwin: 'macos', win32: 'windows' }[process.platform] ?? process.platform;

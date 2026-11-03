@@ -518,22 +518,39 @@ async function ended() {
   if (profile) fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
-port.on('message', async (m) => {
-  let reply;
-  try {
-    let value = '';
-    if (m.type === 'open') await opened(m.browser, m.site, m.url, m.seed, m.net);
-    else if (m.type === 'close') await closed(browsers.get(m.browser));
-    else if (m.type === 'end') await ended();
-    else value = await handle(browsers.get(m.browser), m);
-    reply = value instanceof Uint8Array ? { ok: true, bytes: value } : { ok: true, text: value };
-  } catch (e) {
-    let message = e && e.message ? e.message : String(e);
-    const b = m.type === 'request' ? browsers.get(m.browser) : null;
-    if (b && b.lines.length > 0) message += `\n  the console ends with:\n    ${b.lines.slice(-10).join('\n    ')}`;
-    reply = { ok: false, message };
+// A connection's requests come on its own port and are answered there, numbering its browsers within it. The first is
+// the program's, which may end Chromium; a worker borrows another (browser.mjs), which may close only its own browsers.
+let connections = 0;
+
+function serve(port, signal, owner) {
+  const own = `${connections++}:`;
+  const mine = () => [...browsers.values()].filter((b) => b.id.startsWith(own));
+  port.on('message', async (m) => {
+    let reply;
+    try {
+      let value = '';
+      if (m.type === 'connect') serve(m.port, m.signal, false);
+      else if (m.type === 'open') await opened(own + m.browser, m.site, m.url, m.seed, m.net);
+      else if (m.type === 'close') await closed(browsers.get(own + m.browser));
+      else if (m.type === 'end' && owner) await ended();
+      else if (m.type === 'end') for (const b of mine()) await closed(b);
+      else value = await handle(browsers.get(own + m.browser), m);
+      reply = value instanceof Uint8Array ? { ok: true, bytes: value } : { ok: true, text: value };
+    } catch (e) {
+      let message = e && e.message ? e.message : String(e);
+      const b = m.type === 'request' ? browsers.get(own + m.browser) : null;
+      if (b && b.lines.length > 0) message += `\n  the console ends with:\n    ${b.lines.slice(-10).join('\n    ')}`;
+      reply = { ok: false, message };
+    }
+    port.postMessage(reply);
+    Atomics.store(signal, 0, 1);
+    Atomics.notify(signal, 0);
+  });
+  if (!owner) {
+    port.on('close', () => {
+      for (const b of mine()) closed(b).catch(() => {});
+    });
   }
-  port.postMessage(reply);
-  Atomics.store(signal, 0, 1);
-  Atomics.notify(signal, 0);
-});
+}
+
+serve(port, signal, true);
