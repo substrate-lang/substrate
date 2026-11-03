@@ -129,7 +129,7 @@ const grantKind = (name) => {
   return kinds.includes(k) ? { k, deny } : null;
 };
 
-// requestOf reads the grants that pairs of kind and item ask for (grants.sub).
+// requestOf reads kind and item pairs (grants.sub) into grants, inherited kinds, fakes and TLS files.
 export function requestOf(pairs, resolve) {
   const g = noGrants();
   const request = { grants: g, inherit: new Set(), fakes: new Map(), tls: null };

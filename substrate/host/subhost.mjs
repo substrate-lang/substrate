@@ -17,7 +17,8 @@ const resolveFlag = (p, k) => {
 
 function usage() {
   process.stderr.write('usage: subhost.mjs [-A] [--grant KIND ITEM ...] [--] DIR [ARG ...]\n'
-    + '  -A grants everything, and each --grant one kind and item (grants.sub); people give grants to substrate run\n');
+    + '  -A grants everything, and --grant grants one KIND and ITEM (grants.sub).\n'
+    + '  To run a program yourself, use substrate run.\n');
   process.exit(64);
 }
 
