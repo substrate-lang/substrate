@@ -1,23 +1,19 @@
-;; The test runner, and expect-output and expect-output-file. A test with #:worker or #:grants runs on a worker of its
-;; own, with the program's grants or the ones listed, and ends as a program does; #:output and #:output-file check all
-;; that a test printed.
+;; The test runner, and expect-output and expect-output-file. Each test runs on a worker of its own, a fresh copy of the
+;; program with its grants or the ones #:grants lists, and ends once nothing it started is pending; #:output and
+;; #:output-file check all that it printed.
 (require-unqualified fs host/fs)
 (require-unqualified events host/events)
-(require-unqualified timer host/modules/timer)
 (require-unqualified clock host/modules/clock)
 (require-unqualified gr host/grants)
 (require-unqualified worker host/worker)
 (require-unqualified compare "compare.sub")
 
-(provide run-tests expect-output expect-output-file test-option test-flag? test-path scratch-directory test-skipped
+(provide run-tests expect-output expect-output-file test-option test-flag? test-path scratch-directory
          compare-output! compare-output-file!)
 
 ;; ---- the runner ----
 
-;; A test that throws test-skipped counts as skipped, for the reason it gives.
-(exception test-skipped string)
-
-(struct entry [module string] [name string] [line u32] [skip string] [traps string] [worker bool]
+(struct entry [module string] [name string] [line u32] [skip string] [traps string] [granted bool]
               [grants (slice (slice string))] [output string] [output-file string] [run (fn ())])
 
 (define entries (ptr entry) 0)
@@ -25,7 +21,7 @@
 (define entry-room u32 0)
 
 (define (add-test! [module string] [name string] [line u32] [ignored bool] [traps string] [platforms string]
-                   [worker bool] [grants (slice (slice string))] [output string] [output-file string] [run (fn ())])
+                   [granted bool] [grants (slice (slice string))] [output string] [output-file string] [run (fn ())])
   (when (== entry-count entry-room)
     (set! entry-room (if (== entry-room 0) 64 (* entry-room 2)))
     (set! entries (cast (ptr entry) (realloc (cast (ptr void) entries) (* entry-room (sizeof entry))))))
@@ -35,7 +31,7 @@
     (set! (-> e line) line)
     (set! (-> e skip) (let ([why (not-here platforms)]) (if (or (> (-> why length) 0) (not ignored)) why "ignored")))
     (set! (-> e traps) traps)
-    (set! (-> e worker) worker)
+    (set! (-> e granted) granted)
     (set! (-> e grants) (kept-clauses grants))
     (set! (-> e output) output)
     (set! (-> e output-file) output-file)
@@ -133,13 +129,9 @@
 (define skip-kinds u32 0)
 (define started f64 0.0)
 (define captured buffer)
-(define resume event-head)
-(define handlers u32 0)
 
 (define (run!)
   (options!)
-  (trap-handler! trapped)
-  (set! (-> resume handle) resumed)
   (set! started (clock-monotonic))
   (run-from! 0))
 
@@ -155,7 +147,7 @@
             [else (skipped! e (-> e skip))])))
   (finish!))
 
-;; Whether the test goes on, on a worker, after run-one! returns.
+;; Whether the test goes on, on its worker, after run-one! returns.
 (define (run-one! [e (ptr entry)]) -> bool
   (when (> (-> running-file length) 0)
     (let ([b (make-buffer)])
@@ -167,21 +159,25 @@
       (fs-write-file running-file (buffer-bytes (& b)) 0)
       (buffer-free! (& b))))
   (set! (-> captured length) 0)
-  (when (-> e worker) (return (worker-started! e)))
-  (set! handlers (trap-handler-count))
-  (when (or capturing (> (-> e output length) 0) (> (-> e output-file length) 0)) (output-to! (& captured)))
-  (try (begin
-         ((-> e run))
-         (output-to! 0)
-         (ended! e))
-       [catch test-failed (message)
-         (output-to! 0)
-         (failed! e message)]
-       [catch test-skipped (why)
-         (output-to! 0)
-         (skipped! e why)])
-  (trap-handlers-keep! handlers)
-  #f)
+  (let ([o worker-options] [why string])
+    (worker-options-init! (& o))
+    (set! (-> o output) #t)
+    (set! (-> o ends) #t)
+    (set! (-> o args) (host-args))
+    (when (-> e granted)
+      (set! (-> o grants) (make-grants))
+      (for ([i u32 0]) (< i (-> e grants length)) (+= i 1)
+        (let ([c (@ (-> e grants) i)] [items (make-buffer)])
+          (for ([j u32 1]) (< j (-> c length)) (+= j 1) (pushed! (& items) (scratch-placed (@ c j))))
+          (unless (grants-add! (& (-> o grants)) (@ c 0) (strings-in (& items)) (& why))
+            (failed! e why)
+            (return #f)))))
+    (set! watched-entry e)
+    (set! (-> watched handle) heard)
+    (when (== (worker-start (-> e run) (slice (cast (ptr u8) 0) 0) (& o) (cast (ptr void) (& watched)) (& why)) 0)
+      (failed! e why)
+      (return #f))
+    #t))
 
 ;; A test that ran to its end passes if it expected no trap and printed what it should.
 (define (ended! [e (ptr entry)])
@@ -204,32 +200,12 @@
     (buffer-add-string! (& b) what)
     (buffer-string (& b))))
 
-;; ---- tests on workers ----
+;; ---- the test's worker ----
 
-;; A test on a worker is its own function run as the worker's, where a failure traps (compiler/checker.sub).
+;; A test's worker runs the test's own function, which ends it with a reason when the test fails or is skipped
+;; (compiler/checker.sub).
 (define watched event-head)
 (define watched-entry (ptr entry) 0)
-
-(define (worker-started! [e (ptr entry)]) -> bool
-  (let ([o worker-options] [why string])
-    (worker-options-init! (& o))
-    (set! (-> o output) #t)
-    (set! (-> o ends) #t)
-    (set! (-> o args) (host-args))
-    (when (> (-> e grants length) 0)
-      (set! (-> o grants) (make-grants))
-      (for ([i u32 0]) (< i (-> e grants length)) (+= i 1)
-        (let ([c (@ (-> e grants) i)] [items (make-buffer)])
-          (for ([j u32 1]) (< j (-> c length)) (+= j 1) (pushed! (& items) (scratch-placed (@ c j))))
-          (unless (grants-add! (& (-> o grants)) (@ c 0) (strings-in (& items)) (& why))
-            (failed! e why)
-            (return #f)))))
-    (set! watched-entry e)
-    (set! (-> watched handle) heard)
-    (when (== (worker-start (-> e run) (slice (cast (ptr u8) 0) 0) (& o) (cast (ptr void) (& watched)) (& why)) 0)
-      (failed! e why)
-      (return #f))
-    #t))
 
 (define (heard [source u32] [kind u32] [w u32] [tag (ptr void)] [value i32])
   (let ([data (events-take-text)])
@@ -251,6 +227,8 @@
            (if (and (> (-> (-> e traps) length) 0) (contains? reason (-> e traps)))
                (passed! e)
                (failed! e (without-runner reason)))]
+          [(and (== code 0) (> (-> reason length) 0)) (skipped! e reason)]
+          [(> (-> reason length) 0) (failed! e reason)]
           [(!= code 0)
            (let ([b (make-buffer)])
              (buffer-add-string! (& b) "the test ended with exit code ")
@@ -285,13 +263,6 @@
     (write-string (& b) traps)
     (buffer-string (& b))))
 
-(define (trapped [why string])
-  (trap-handlers-keep! handlers)
-  (output-to! 0)
-  (let ([e (& (@ entries current))])
-    (if (and (> (-> (-> e traps) length) 0) (contains? why (-> e traps))) (passed! e) (failed! e (without-runner why))))
-  (timer-after 0.0 (cast (ptr void) (& resume))))
-
 (define (without-runner [why string]) -> string
   (let ([ls (lines-of why)] [b (make-buffer)])
     (for ([i u32 0]) (< i (-> ls length)) (+= i 1)
@@ -300,8 +271,6 @@
         (buffer-add-string! (& b) (@ ls i))))
     (free (cast (ptr u8) (-> ls items)))
     (buffer-string (& b))))
-
-(define (resumed [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32]) (run-from! next))
 
 (define (passed! [e (ptr entry)])
   (+= passed 1)
