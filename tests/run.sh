@@ -75,9 +75,9 @@ for t in tests/events/*.sub; do
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
-  actual="$(cd tests/events && timeout 60 "$host" --grant net 127.0.0.1 --grant read . \
-              "$root/tests/build/test/programs/events/$name" "$url" \
-              "ws${url#http}" 2>&1)"
+  actual="$(cd tests/events && "$root/bin/substrate" build "$name.sub" -o "$root/$builds/events/$name" -c "$cache" 2>&1 \
+              && cd .. && timeout 60 "$host" --grant net 127.0.0.1 --grant read events "$root/$builds/events/$name" "$url" \
+                            "ws${url#http}" 2>&1)"
   code=$?
   if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then
     pass=$((pass + 1))
