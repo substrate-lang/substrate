@@ -247,7 +247,7 @@ export function within(asked, parent) {
     if (beyond) {
       const subnet = beyond.bits === undefined ? '' : `/${beyond.bits}`;
       const item = k === 'net' ? `${beyond.host}${subnet}${beyond.port === null ? '' : `:${beyond.port}`}` : beyond;
-      throw new Error(`${flags[k]}${beyond === true ? '' : `=${item}`} reaches beyond the parent's grants`);
+      throw new Error(`${beyond === true ? `all ${k}` : `${k} ${item}`} reaches beyond the parent's grants`);
     }
     const deny = { all: a.deny.all || p.deny.all, items: [...a.deny.items, ...p.deny.items] };
     out[k] = { all: a.all, items: [...a.items], deny };

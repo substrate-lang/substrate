@@ -25,26 +25,33 @@
     (set! (-> r output) (cast string bytes))
     r))
 
-(define (host-in [dir string] [env (slice string)] [args (slice string)]) -> ran
-  (let ([g (make-grants)] [i u32 0] [why string])
-    (while (starts? (@ args i) "-") (+= i 1))
-    (unless (grants-parse! (& g) (slice args 0 i) (& why)) (throw test-failed why))
-    (program-in dir (joined-path (test-option "--toolchain") "host/subhost.mjs") env
-                (grants-arguments (& g) (@ args i) (slice args (+ i 1) (-> args length))))))
+(define (granted [clauses (slice (slice string))]) -> grants
+  (let ([g (make-grants)] [why string])
+    (for ([i u32 0]) (< i (-> clauses length)) (+= i 1)
+      (let ([c (@ clauses i)])
+        (unless (grants-add! (& g) (@ c 0) (slice c 1 (-> c length)) (& why)) (throw test-failed why))))
+    g))
 
-(define (sub-in [dir string] [flags (slice string)] [env (slice string)] [args (slice string)]) -> ran
-  (let ([argv (make-buffer)])
-    (push! (& argv) "-A")
-    (for ([i u32 0]) (< i (-> flags length)) (+= i 1) (push! (& argv) (@ flags i)))
+(define (host-in [dir string] [env (slice string)] [g (ptr grants)] [args (slice string)]) -> ran
+  (program-in dir (joined-path (test-option "--toolchain") "host/subhost.mjs") env
+              (grants-arguments g (@ args 0) (slice args 1 (-> args length)))))
+
+(define (sub-in [dir string] [clauses (slice (slice string))] [env (slice string)] [args (slice string)]) -> ran
+  (let ([argv (make-buffer)] [g (granted clauses)])
+    (grants-all! (& g))
     (push! (& argv) (joined-path (root) "build/sub"))
     (push! (& argv) (root))
     (for ([i u32 0]) (< i (-> args length)) (+= i 1) (push! (& argv) (@ args i)))
-    (host-in dir env (strings-of (& argv)))))
+    (host-in dir env (& g) (strings-of (& argv)))))
+
+(define (no-clauses) -> (slice (slice string)) (slice (cast (ptr (slice string)) 0) 0))
 
 (define (built-run [dir string] [file string] [out string] [cache string]) -> ran
-  (let ([b (sub-in dir (slice (cast (ptr string) 0) 0) (slice (cast (ptr string) 0) 0) (slice (array-of string "build" file "-o" out "-c" cache)))])
+  (let ([b (sub-in dir (no-clauses) (slice (cast (ptr string) 0) 0)
+                   (slice (array-of string "build" file "-o" out "-c" cache)))]
+        [none (make-grants)])
     (when (!= (-> b code) 0) (return b))
-    (let ([r (host-in dir (slice (cast (ptr string) 0) 0) (slice (array-of string out)))])
+    (let ([r (host-in dir (slice (cast (ptr string) 0) 0) (& none) (slice (array-of string out)))])
       (set! (-> r output) (joined (-> b output) (-> r output)))
       r)))
 
@@ -68,7 +75,7 @@
     (push! (& argv) (test-option "--cache"))
     (for ([i u32 0]) (< i (-> grants length)) (+= i 1) (push! (& argv) (@ grants i)))
     (push! (& argv) (joined name ".sub"))
-    (sub-in dir (slice (cast (ptr string) 0) 0) (slice (cast (ptr string) 0) 0) (strings-of (& argv)))))
+    (sub-in dir (no-clauses) (slice (cast (ptr string) 0) 0) (strings-of (& argv)))))
 
 (define (failure! [message string] [what string] [output string])
   (throw test-failed (joined (joined (joined (joined message "\n") what) "\n") output)))
@@ -216,20 +223,47 @@
   (define (strings [items datum]) -> datum
     (if (null? items) #'(slice (cast (ptr string) 0) 0) #`(slice (array-of string #,@items))))
 
+  (define (clause-code [c datum]) -> datum
+    (let ([parts (syntax->list c)] [head ""] [texts nil])
+      (unless (and (!= parts 0) (pair? parts) (symbol? (syntax-e (car parts))))
+        (raise-syntax-error 'sub "a grant is a kind and its items, as (read \"data\") or (all net)" c))
+      (set! head (symbol->string (syntax-e (car parts))))
+      (for/each ([p (cdr parts)])
+        (set! texts (cons (if (and (or (== head "all") (== head "fake")) (symbol? (syntax-e p)))
+                              (literal (string->datum (symbol->string (syntax-e p))))
+                              p)
+                          texts)))
+      #`(slice (array-of string #,(literal (string->datum head)) #,@(reverse texts)))))
+
+  (define (clauses [items datum]) -> datum
+    (let ([codes nil])
+      (for/each ([c items]) (set! codes (cons (clause-code c) codes)))
+      (if (null? items)
+          #'(slice (cast (ptr (slice string)) 0) 0)
+          #`(slice (array-of (slice string) #,@(reverse codes))))))
+
   (define (sub-form [s datum]) -> datum
-    (let* ([l (cdr (syntax->list s))] [rest (cdr l)] [flags nil] [env nil])
+    (let* ([l (cdr (syntax->list s))] [rest (cdr l)] [grant-items nil] [env nil])
       (while (and (pair? rest) (keyword? (syntax-e (car rest))) (pair? (cdr rest)))
         (let ([key (keyword->string (syntax-e (car rest)))] [items (syntax->list (cadr rest))])
-          (cond [(== key "host") (set! flags items)]
+          (cond [(== key "grants") (set! grant-items items)]
                 [(== key "env") (set! env items)]
-                [else (raise-syntax-error 'sub "the options are #:host and #:env" (car rest))]))
+                [else (raise-syntax-error 'sub "the options are #:grants and #:env" (car rest))]))
         (set! rest (cddr rest)))
-      #`(sub-in #,(car l) #,(strings flags) #,(strings env) #,(strings rest))))
+      #`(sub-in #,(car l) #,(clauses grant-items) #,(strings env) #,(strings rest))))
 
   (define (sub-run-form [s datum]) -> datum
     (syntax-match s [(_ dir name grant ...) #`(sub-run-in #,dir #,name #,(strings grant))]))
 
-  (define (host-form [s datum]) -> datum (syntax-match s [(_ dir arg ...) #`(host-in #,dir #,(strings nil) #,(strings arg))]))
+  (define (host-form [s datum]) -> datum
+    (let* ([l (cdr (syntax->list s))] [rest (cdr l)] [grant-items nil])
+      (when (and (pair? rest) (keyword? (syntax-e (car rest))) (pair? (cdr rest)))
+        (unless (== (keyword->string (syntax-e (car rest))) "grants")
+          (raise-syntax-error 'host "the option is #:grants" (car rest)))
+        (set! grant-items (syntax->list (cadr rest)))
+        (set! rest (cddr rest)))
+      #`(let ([host-grants (granted #,(clauses grant-items))])
+          (host-in #,(car l) #,(strings nil) (& host-grants) #,(strings rest)))))
 
   (define (program-form [s datum]) -> datum
     (syntax-match s [(_ dir name arg ...) #`(program-in #,dir #,name #,(strings nil) #,(strings arg))]))
