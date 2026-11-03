@@ -3,7 +3,6 @@
 // cannot check where fetch is redirected or where names resolve, and a child may keep the dynamic loader's variables
 // the host started with.
 const kinds = ['read', 'write', 'net', 'env', 'run'];
-const short = { read: '-R', write: '-W', net: '-N', env: '-E' };
 export const flags = {
   read: '--allow-read', write: '--allow-write', net: '--allow-net', env: '--allow-env', run: '--allow-run',
 };
@@ -27,24 +26,6 @@ export function notGranted(message) {
 export const pathDenied = (k, flag = flags[k]) => notGranted(
   `${k === 'read' ? 'reading' : 'writing'} is not granted (${flag})`,
 );
-
-// The items of a list have commas between them, and ",," is a comma within one.
-export function listOf(text) {
-  const list = [];
-  let item = '';
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] !== ',') item += text[i];
-    else if (text[i + 1] === ',') {
-      item += ',';
-      i++;
-    } else {
-      list.push(item);
-      item = '';
-    }
-  }
-  list.push(item);
-  return list;
-}
 
 const urlHost = (bare) => {
   if (/[@/?#\\%\s]/.test(bare)) return bare.toLowerCase();
@@ -132,32 +113,6 @@ const itemOf = (k, text, resolve, deny) => {
   if (k === 'env' || (k === 'run' && deny && !text.includes('/'))) return text;
   return resolve(text, k);
 };
-
-// grantFlag adds a grant flag to g and returns true, or returns false for a flag that is not one.
-export function grantFlag(g, flag, resolve) {
-  const equals = flag.indexOf('=');
-  const name = equals < 0 ? flag : flag.slice(0, equals);
-  const value = equals < 0 ? null : flag.slice(equals + 1);
-  if (name === '-A' || name === '--allow-all') {
-    if (value !== null) throw new Error(`${name} takes no list`);
-    for (const k of kinds) g[k].all = true;
-    return true;
-  }
-  for (const k of kinds) {
-    const into = name === short[k] || name === flags[k] ? g[k] : name === `--deny-${k}` ? g[k].deny : null;
-    if (into === null) continue;
-    if (value === null) into.all = true;
-    else {
-      const list = listOf(value);
-      if (list.includes('')) throw new Error(`${flag} has an empty item`);
-      const items = list.map((text) => itemOf(k, text, resolve, into === g[k].deny)).filter((item) => item !== null);
-      into.items.push(...items);
-      if (into === g.run) g.write.deny.items.push(...items);
-    }
-    return true;
-  }
-  return false;
-}
 
 const fakeable = new Set(['clock', 'timer', 'websocket', 'fetch']);
 

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { createHost, Exit } from './subhost-core.mjs';
-import { grantFlag, joinedGrants, noGrants, pairsFrom, requestOf } from './grants.mjs';
+import { joinedGrants, noGrants, pairsFrom, requestOf } from './grants.mjs';
 import { hostModules, setupOf, system } from './node/modules.mjs';
 
 const require = createRequire(import.meta.url);
@@ -34,13 +34,7 @@ while (argv.length > 0 && argv[0].startsWith('-')) {
   if (flag === '--') break;
   if (flag === '-A') for (const k of Object.keys(setup.grants)) setup.grants[k].all = true;
   else if (flag === '--grant' && argv.length >= 2) pairs.push([argv.shift(), argv.shift()]);
-  else {
-    try {
-      if (!grantFlag(setup.grants, flag, resolveFlag)) usage();
-    } catch (e) {
-      fail(e.message);
-    }
-  }
+  else usage();
 }
 try {
   const request = requestOf(pairs, resolveFlag);
