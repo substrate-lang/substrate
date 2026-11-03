@@ -42,12 +42,12 @@ export function workerModule({ spawn }) {
       : null;
   };
 
-  function start(entry, argument, time, pages, heard, tag, app, err, grants) {
+  function start(entry, argument, time, pages, heard, tag, app, err, grants, setup) {
     const program = caller.program();
     const modules = program.names.map((name) => [name, program.bytes(name)]);
     let thread;
     try {
-      thread = spawn({ modules, entry, argument, grants, names: caller.moduleNames(), pages, heard }, app);
+      thread = spawn({ modules, entry, argument, grants, names: caller.moduleNames(), pages, heard, ...setup }, app);
     } catch (e) {
       caller.fail(err, e.message);
       return 0;
@@ -69,7 +69,7 @@ export function workerModule({ spawn }) {
       else if (m.type === 'idle') clearTimeout(worker.timer);
       else if (m.type === 'ended') end(w, m.code, m.reason);
     });
-    thread.onError((reason) => end(w, -1, reason));
+    thread.onError((reason, code) => (setup.ends && code === 0 ? end(w, 0, '') : end(w, -1, reason)));
     limit(w, worker);
     return w;
   }
@@ -88,7 +88,7 @@ export function workerModule({ spawn }) {
         for (const w of [...alive.keys()]) end(w, -1, null);
       },
       // f is the function's index in the table; the thread finds it by its module and export name.
-      start(f, bp, bl, time, size, heard, tag, gp, gl, err) {
+      start(f, bp, bl, time, size, heard, tag, gp, gl, err, ends) {
         const entry = caller.named(f >>> 0);
         if (!entry) {
           caller.fail(err, 'worker.start: a function of code the program loaded');
@@ -96,17 +96,19 @@ export function workerModule({ spawn }) {
         }
         const pages = Math.ceil((size >>> 0) / 65536);
         let grants;
+        let request;
         try {
-          const request = caller.parseGrants(entries(string(gp, gl)));
-          if (request.fakes.size > 0 || request.tls) {
-            throw new Error('fakes and TLS files are set when a program starts');
-          }
+          request = caller.parseGrants(entries(string(gp, gl)));
+          const read = [...request.fakes].filter(([name]) => name === 'fetch').map(([, dir]) => dir || '.');
+          if (request.tls) read.push(request.tls.cert, request.tls.key);
+          within(caller.parseGrants(read.flatMap((file) => ['read', file])).grants, caller.grants());
           grants = within(askedOf(request, caller.grants()), caller.grants());
         } catch (e) {
           caller.fail(err, `worker.start: ${e.message}`);
           return 0;
         }
-        return start(entry, bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err, grants);
+        const setup = { fakes: request.fakes, tls: request.tls, ends: ends === 1 };
+        return start(entry, bytes(bp, bl), time >>> 0, pages, heard !== 0, tag, app, err, grants, setup);
       },
       send(w, ptr, len) {
         const worker = alive.get(w);

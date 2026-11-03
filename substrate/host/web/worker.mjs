@@ -4,6 +4,8 @@ import { workerModule } from '../worker.mjs';
 export function workers() {
   return workerModule({
     spawn(plan, app) {
+      if (plan.fakes.size > 0 || plan.tls) throw new Error('worker.start: a page gives its workers no fakes or TLS files');
+      if (plan.ends) throw new Error('worker.start: a page\'s workers do not end on their own');
       const thread = new Worker(new URL('./worker-script.mjs', import.meta.url), { type: 'module' });
       thread.postMessage({
         type: 'start',

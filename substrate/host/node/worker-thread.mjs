@@ -5,8 +5,16 @@ import { workerSide } from '../worker-side.mjs';
 import { pairsFrom, requestOf } from '../grants.mjs';
 import { hostModules, system } from './modules.mjs';
 import { resolveGrant } from './fs.mjs';
+import { workers } from './worker.mjs';
 
 const side = workerSide((m, transfer) => parentPort.postMessage(m, transfer));
+
+// The worker module in a worker: its own workers, and its parent as worker 0.
+const nested = (setup) => (caller, app) => {
+  const own = workers(setup)(caller, app);
+  const parent = side.worker(caller);
+  return { ...own, send: (w, p, l) => (w === 0 ? parent.send(w, p, l) : own.send(w, p, l)) };
+};
 
 parentPort.on('message', (m) => {
   if (m.type === 'start') {
@@ -24,7 +32,7 @@ parentPort.on('message', (m) => {
       ended: side.ended,
       delivered: side.delivered,
       active: side.active,
-      modules: hostModules(setup, new Map([['worker', side.worker]])),
+      modules: hostModules(setup, new Map([['worker', nested(setup)]])),
       grants: m.grants,
       parseGrants: (list) => requestOf(pairsFrom(list), resolveGrant),
       absent: new Set(['stdin', 'signal']),
@@ -44,6 +52,7 @@ parentPort.on('message', (m) => {
       return;
     }
     side.started(host, host.call(f, []));
+    if (m.ends) parentPort.unref();
   } else if (m.type === 'message') {
     side.message(m.bytes);
   }
