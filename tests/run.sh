@@ -23,9 +23,9 @@ fail=0
 built=0
 unbuilt=0
 
-# The packages' tests.
+# The packages' tests, given every grant.
 packages=(./std ./cmd ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite ./tests ./tests/web)
-if bin/substrate test -c "$cache" "$@" "${packages[@]}"; then
+if bin/substrate test -c "$cache" -A "$@" "${packages[@]}"; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))

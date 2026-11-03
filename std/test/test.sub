@@ -1,19 +1,21 @@
 ;; The test runner, and expect-output and expect-output-file. Each test runs on a worker of its own, a fresh copy of the
-;; program with its grants or the ones #:grants lists, and ends once nothing it started is pending; #:output and
-;; #:output-file check all that it printed.
+;; program with what the framework needs (needed, below) and the grants #:grants lists, within those substrate test was
+;; given, and ends once nothing it started is pending; #:output and #:output-file check all that it printed.
 (require-unqualified fs host/fs)
 (require-unqualified events host/events)
 (require-unqualified clock host/modules/clock)
 (require-unqualified gr host/grants)
 (require-unqualified worker host/worker)
 (require-unqualified compare "compare.sub")
+(require-unqualified paths "../package/path.sub")
+(require-unqualified read "../package/read.sub")
 
 (provide run-tests expect-output expect-output-file test-option test-flag? test-path scratch-directory
          compare-output! compare-output-file!)
 
 ;; ---- the runner ----
 
-(struct entry [module string] [name string] [line u32] [skip string] [traps string] [granted bool]
+(struct entry [module string] [name string] [line u32] [skip string] [traps string]
               [grants (slice (slice string))] [output string] [output-file string] [run (fn ())])
 
 (define entries (ptr entry) 0)
@@ -21,7 +23,7 @@
 (define entry-room u32 0)
 
 (define (add-test! [module string] [name string] [line u32] [ignored bool] [traps string] [platforms string]
-                   [granted bool] [grants (slice (slice string))] [output string] [output-file string] [run (fn ())])
+                   [grants (slice (slice string))] [output string] [output-file string] [run (fn ())])
   (when (== entry-count entry-room)
     (set! entry-room (if (== entry-room 0) 64 (* entry-room 2)))
     (set! entries (cast (ptr entry) (realloc (cast (ptr void) entries) (* entry-room (sizeof entry))))))
@@ -31,7 +33,6 @@
     (set! (-> e line) line)
     (set! (-> e skip) (let ([why (not-here platforms)]) (if (or (> (-> why length) 0) (not ignored)) why "ignored")))
     (set! (-> e traps) traps)
-    (set! (-> e granted) granted)
     (set! (-> e grants) (kept-clauses grants))
     (set! (-> e output) output)
     (set! (-> e output-file) output-file)
@@ -164,20 +165,66 @@
     (set! (-> o output) #t)
     (set! (-> o ends) #t)
     (set! (-> o args) (host-args))
-    (when (-> e granted)
-      (set! (-> o grants) (make-grants))
-      (for ([i u32 0]) (< i (-> e grants length)) (+= i 1)
-        (let ([c (@ (-> e grants) i)] [items (make-buffer)])
-          (for ([j u32 1]) (< j (-> c length)) (+= j 1) (pushed! (& items) (scratch-placed (@ c j))))
-          (unless (grants-add! (& (-> o grants)) (@ c 0) (strings-in (& items)) (& why))
-            (failed! e why)
-            (return #f)))))
+    (set! (-> o grants) (make-grants))
+    (grants-join! (& (-> o grants)) (needed))
+    (for ([i u32 0]) (< i (-> e grants length)) (+= i 1)
+      (let ([c (@ (-> e grants) i)] [items (make-buffer)])
+        (for ([j u32 1]) (< j (-> c length)) (+= j 1) (pushed! (& items) (scratch-placed (@ c j))))
+        (unless (grants-add! (& (-> o grants)) (@ c 0) (strings-in (& items)) (& why))
+          (failed! e why)
+          (return #f))))
     (set! watched-entry e)
     (set! (-> watched handle) heard)
     (when (== (worker-start (-> e run) (slice (cast (ptr u8) 0) 0) (& o) (cast (ptr void) (& watched)) (& why)) 0)
-      (failed! e why)
+      (failed! e (beyond why))
       (return #f))
     #t))
+
+;; What the framework needs for every test: reading the package, its dependencies, the toolchain, the cache and
+;; scratch; writing scratch, build/test and the cache; and running Chromium for browser tests.
+(define needs grants)
+(define needs-made bool #f)
+
+(define (needed) -> (ptr grants)
+  (unless needs-made
+    (set! needs-made #t)
+    (set! needs (make-grants))
+    (let ([here string] [chromium (test-option "--chromium")])
+      (fs-cwd (& here) 0)
+      (grants-allow! (& needs) grant-read here)
+      (roots-read! (& needs))
+      (grants-allow! (& needs) grant-read (test-option "--toolchain"))
+      (grants-allow! (& needs) grant-read (test-option "--cache"))
+      (grants-allow! (& needs) grant-read (test-option "--scratch"))
+      (grants-allow! (& needs) grant-write (test-option "--scratch"))
+      (grants-allow! (& needs) grant-write (test-option "--cache"))
+      (grants-allow! (& needs) grant-write (joined-path here "build/test"))
+      (when (> (-> chromium length) 0) (grants-allow! (& needs) grant-run chromium))))
+  (& needs))
+
+;; The directories of the test program's packages, from its module map (std/package/map.sub).
+(define (roots-read! [g (ptr grants)])
+  (let ([text (slice u8)] [a (make-arena)] [forms (slice data)] [e data-error])
+    (when (and (>= (fs-read-file "build/test/test.map" (& text) 0) 0)
+               (data-read (& a) (cast string text) #f (& forms) (& e)))
+      (for ([i u32 0]) (< i (-> forms length)) (+= i 1)
+        (match (& (@ forms i))
+          [(data-list items line column)
+           (when (> (-> items length) 2)
+             (match (& (@ items 2)) [(data-string dir l c) (grants-allow! g grant-read dir)] [_ (begin)]))]
+          [_ (begin)])))))
+
+;; worker-start's refusal of a test's grants, said of #:grants and substrate test.
+(define (beyond [why string]) -> string
+  (let ([start "worker.start: "] [end " reaches beyond the parent's grants"])
+    (if (and (> (-> why length) (+ (-> start length) (-> end length))) (== (slice why 0 (-> start length)) start)
+             (ends-with? why end))
+        (let ([b (make-buffer)])
+          (buffer-add-string! (& b) "#:grants asks for ")
+          (buffer-add-string! (& b) (slice why (-> start length) (- (-> why length) (-> end length))))
+          (buffer-add-string! (& b) ", which substrate test was not given")
+          (buffer-string (& b)))
+        why)))
 
 ;; A test passes if it trapped as it expects, or expected no trap, and printed what it should.
 (define (ended! [e (ptr entry)] [trapped bool])
@@ -363,8 +410,8 @@
             (let ([info (cdr (car f))])
               (set! adds (cons #`(add-test! #,(literal (car (car f))) #,(literal (car info)) #,(literal (cadr info))
                                             #,(literal (caddr info)) #,(literal (cadddr info)) #,(literal (list-ref info 4))
-                                            #,(literal (list-ref info 5)) #,(grants-code (list-ref info 6))
-                                            #,(literal (list-ref info 7)) #,(literal (list-ref info 8)) #,(cdr f))
+                                            #,(grants-code (list-ref info 5))
+                                            #,(literal (list-ref info 6)) #,(literal (list-ref info 7)) #,(cdr f))
                                adds))))))
       #`(begin #,@(reverse adds) (run!))))
 
