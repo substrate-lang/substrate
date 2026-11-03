@@ -7,7 +7,37 @@ import { hostModules, system } from './modules.mjs';
 import { resolveGrant } from './fs.mjs';
 import { workers } from './worker.mjs';
 
-const side = workerSide((m, transfer) => parentPort.postMessage(m, transfer));
+const text = new TextDecoder();
+
+// A test's server, which the browser module started, answers it with the first line it prints, or with why it ended
+// first; the rest of what it prints is dropped (browser.mjs).
+let answer = null;
+
+const answering = ({ port, signal }) => {
+  let line = '';
+  let said = '';
+  let answered = false;
+  const reply = (r) => {
+    if (answered) return;
+    answered = true;
+    port.postMessage(r);
+    Atomics.store(signal, 0, 1);
+    Atomics.notify(signal, 0);
+  };
+  return (m) => {
+    if (m.type === 'output' && m.fd === 2) said = (said + text.decode(m.bytes)).slice(-4000);
+    else if (m.type === 'output' && !answered) {
+      line += text.decode(m.bytes);
+      const k = line.indexOf('\n');
+      if (k >= 0) reply({ ok: true, text: line.slice(0, k).trim() });
+    } else if ((m.type === 'done' && m.trap) || m.type === 'ended') {
+      const why = said.trim() ? `\n${said.trim()}` : `: ${m.type === 'done' ? m.trap : m.reason || `exit ${m.code}`}`;
+      reply({ ok: false, message: `the server ended before printing its address${why}` });
+    }
+  };
+};
+
+const side = workerSide((m, transfer) => (answer ? answer(m) : parentPort.postMessage(m, transfer)));
 
 // A connection to the Chromium of the thread that started this worker, which answers it (browser.mjs, worker.mjs).
 const connect = (file, files, args) => {
@@ -35,6 +65,7 @@ const nested = (setup) => (caller, app) => {
 
 parentPort.on('message', (m) => {
   if (m.type === 'start') {
+    if (m.address) answer = answering(m.address);
     if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
     const setup = { grants: m.grants, fakes: new Map(m.fakes), tls: m.tls, loader: m.loader, worker: true, connect };

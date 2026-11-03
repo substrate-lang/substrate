@@ -1,18 +1,18 @@
 // The host module "browser" (browser.sub). It opens sites in Chromium, which chromium.mjs drives on another thread, and
 // blocks until Chromium answers. One Chromium serves a thread and the workers it starts, which borrow connections to
-// it. A test's server runs through serving.mjs. The caller's grants limit what this module reads, runs and reaches.
+// it. A test's server is a function of the program on a worker. The caller's grants limit what this module reads, runs
+// and reaches.
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { MessageChannel, Worker, receiveMessageOnPort } from 'node:worker_threads';
 import { comparable, literalPath } from './fs.mjs';
 import { mayRun, mayUrl } from '../grants.mjs';
 import { entries } from '../entries.mjs';
 
+const require = createRequire(import.meta.url);
 const utf8 = new TextEncoder();
 const chromium = new URL('./chromium.mjs', import.meta.url);
-const serving = new URL('./serving.mjs', import.meta.url);
-const subhost = fileURLToPath(new URL('../subhost.mjs', import.meta.url));
 const patience = 60000;
 
 // The code each thread runs. If importing its module fails, the thread answers the first request with the error.
@@ -32,13 +32,11 @@ function thread(script, name, data = {}) {
   return { worker, port: port1, signal, dead: false };
 }
 
-const ask = (t, message, transfer = []) => {
-  Atomics.store(t.signal, 0, 0);
-  t.port.postMessage(message, transfer);
+const waited = (t, silent) => {
   if (Atomics.wait(t.signal, 0, 0, patience) === 'timed-out') {
     if (t.worker) t.worker.terminate();
     t.dead = true;
-    return { ok: false, message: `the browser did not answer within ${patience / 1000} s` };
+    return { ok: false, message: `${silent} within ${patience / 1000} s` };
   }
   let got = receiveMessageOnPort(t.port);
   while (got === undefined) {
@@ -46,6 +44,12 @@ const ask = (t, message, transfer = []) => {
     got = receiveMessageOnPort(t.port);
   }
   return got.message;
+};
+
+const ask = (t, message, transfer = []) => {
+  Atomics.store(t.signal, 0, 0);
+  t.port.postMessage(message, transfer);
+  return waited(t, 'the browser did not answer');
 };
 
 // The thread's Chromium, started by the first site it opens, here or in a worker it started.
@@ -74,8 +78,11 @@ export function endShared() {
   shared = null;
 }
 
-// connect, in a worker, gives a connection to the Chromium of the thread that started it.
-export function browsers(grants, connect = null) {
+// setup is the thread's host's; its connect, in a worker, gives a connection to the Chromium of the thread that started
+// it.
+export function browsers(setup) {
+  const { grants } = setup;
+  const connect = setup.connect || null;
   return (caller) => {
     const open = new Set();
     let next = 1;
@@ -111,11 +118,25 @@ export function browsers(grants, connect = null) {
       if (!mayRun(grants.run, comparable(file), file)) throw new Error(`browser.${what}: ${file} is not granted (--allow-run)`);
     };
 
-    const served = (program, site) => {
-      if (!mayRun(grants.run, comparable(subhost), subhost)) throw new Error(`browser.open: ${subhost} is not granted (--allow-run), so the server cannot run`);
-      const args = ['--stack-size=4000', subhost, '--grant', 'net', '127.0.0.1', '--grant', 'read', site, '--', program, site];
-      const t = thread(serving, 'the server', { command: process.execPath, args });
-      const reply = ask(t, { type: 'start' });
+    // The server function f runs on a worker with the caller's grants, given the site's directory, and answers with the
+    // first line it prints, its address (worker-thread.mjs).
+    const served = (f, site) => {
+      const entry = caller.named(f >>> 0);
+      if (!entry) throw new Error('browser.open: the server is a function of code the program loaded');
+      const program = caller.program();
+      const { port1, port2 } = new MessageChannel();
+      const signal = new Int32Array(new SharedArrayBuffer(4));
+      const plan = {
+        modules: program.names.map((name) => [name, program.bytes(name)]),
+        entry,
+        grants: caller.grants(),
+        fakes: [],
+        pages: 0,
+        args: [site],
+        address: { port: port2, signal },
+      };
+      const t = { worker: require('./worker.mjs').workerThread(setup, plan, [port2]), port: port1, signal, dead: false };
+      const reply = waited(t, 'the server did not print its address');
       if (!reply.ok) {
         t.worker.terminate();
         throw new Error(reply.message);
@@ -128,10 +149,7 @@ export function browsers(grants, connect = null) {
       return t;
     };
 
-    const stopped = (t) => {
-      if (!t.dead) ask(t, { type: 'stop' });
-      t.worker.terminate();
-    };
+    const stopped = (t) => t.worker.terminate();
 
     const argsOf = (ap, al) => caller.string(ap, al).split(/\s+/).filter(Boolean);
 
@@ -156,14 +174,14 @@ export function browsers(grants, connect = null) {
         else endShared();
         driver = null;
       },
-      open(dp, dl, up, ul, cp, cl, sp, sl, fp, fl, ap, al, err) {
+      open(dp, dl, up, ul, cp, cl, f, fp, fl, ap, al, err) {
         let server = null;
         try {
           const dir = caller.string(dp, dl);
           let url = caller.string(up, ul);
           if (cl === 0) throw new Error('browser.open: no Chromium was given');
-          if (sl > 0) {
-            server = served(caller.string(sp, sl), dir);
+          if (f !== 0) {
+            server = served(f, dir);
             url = new URL(url, `${server.address}index.html`).href;
           }
           const id = opened(caller.string(cp, cl), caller.string(fp, fl), argsOf(ap, al), dir, url, server ? grants.net : null);

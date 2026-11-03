@@ -29,28 +29,35 @@ const lend = (m) => {
   Atomics.notify(m.signal, 0);
 };
 
+// A thread running plan, set up as this thread's host was (worker-thread.mjs).
+export function workerThread(setup, plan, transfer = []) {
+  const tls = plan.tls ? { cert: read(plan.tls.cert), key: read(plan.tls.key) } : setup.tls;
+  const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url), { env: SHARE_ENV });
+  thread.on('message', (m) => {
+    if (m.type === 'browser') lend(m);
+  });
+  thread.postMessage({
+    type: 'start',
+    modules: plan.modules,
+    entry: plan.entry,
+    argument: plan.argument,
+    grants: plan.grants,
+    fakes: [...setup.fakes, ...plan.fakes],
+    tls,
+    loader: setup.loader,
+    pages: plan.pages,
+    heard: plan.heard,
+    ends: plan.ends,
+    args: plan.args,
+    address: plan.address,
+  }, transfer);
+  return thread;
+}
+
 export function workers(setup) {
   const made = workerModule({
     spawn(plan) {
-      const tls = plan.tls ? { cert: read(plan.tls.cert), key: read(plan.tls.key) } : setup.tls;
-      const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url), { env: SHARE_ENV });
-      thread.on('message', (m) => {
-        if (m.type === 'browser') lend(m);
-      });
-      thread.postMessage({
-        type: 'start',
-        modules: plan.modules,
-        entry: plan.entry,
-        argument: plan.argument,
-        grants: plan.grants,
-        fakes: [...setup.fakes, ...plan.fakes],
-        tls,
-        loader: setup.loader,
-        pages: plan.pages,
-        heard: plan.heard,
-        ends: plan.ends,
-        args: plan.args,
-      });
+      const thread = workerThread(setup, plan);
       return {
         post: (m, transfer) => thread.postMessage(m, transfer),
         terminate: () => thread.terminate(),
