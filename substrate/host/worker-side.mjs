@@ -83,6 +83,9 @@ export function workerSide(post) {
       return 0;
     },
     stop() {},
+    wait() {
+      return -1;
+    },
   });
 
   function done(result) {

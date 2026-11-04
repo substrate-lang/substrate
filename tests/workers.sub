@@ -1,5 +1,7 @@
-;; Tests of the arguments that host/worker.sub gives workers.
+;; Tests of host/worker.sub: the arguments it gives workers, and waiting for a worker's events.
 (require-unqualified tests std/test/test)
+(require-unqualified events host/events)
+(require-unqualified clock host/modules/clock)
 (require-unqualified worker host/worker)
 
 (define (shows-args) (printf "~a ~a~n" (-> (host-args) length) (@ (host-args) 1)))
@@ -10,3 +12,86 @@
     (set! (-> o args) (slice (array-of string "a" "b")))
     (set! (-> o ends) #t)
     (expect (!= (worker-start shows-args (slice (cast (ptr u8) 0) 0) (& o) 0 (& why)) 0))))
+
+;; ---- waiting ----
+
+(struct waited [kind i32] [value i32] [text string])
+
+(define (wait-for [w u32] [ms u32]) -> waited
+  (let ([value i32 0] [bytes (slice u8)] [kind i32 0])
+    (set! kind (worker-wait w ms (& value) (& bytes)))
+    (waited #:kind kind #:value value #:text (cast string bytes))))
+
+(define (next-kind [w u32] [ms u32]) -> i32 (let ([r (wait-for w ms)]) (-> r kind)))
+
+(define (next-text [w u32] [ms u32]) -> string (let ([r (wait-for w ms)]) (-> r text)))
+
+(define (echo-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (and (== kind worker-message) (== id 0))
+    (let ([b (events-take)])
+      (worker-send 0 b)
+      (free (-> b items)))))
+
+(define (echoes) (event-handler! worker-source echo-heard))
+
+(define (none) -> (slice u8) (slice (cast (ptr u8) 0) 0))
+
+(test wait-replies
+  (let* ([why string] [w (worker-start echoes (none) 0 0 (& why))])
+    (expect (!= w 0))
+    (expect-equal (next-kind w 10000) (cast i32 worker-done))
+    (worker-send-text w "one")
+    (let ([r (wait-for w 10000)])
+      (expect-equal (-> r kind) (cast i32 worker-message))
+      (expect-equal (-> r text) "one"))
+    (expect-equal (next-kind w 10000) (cast i32 worker-done))
+    (worker-send-text w "two")
+    (expect-equal (next-text w 10000) "two")
+    (worker-stop w)))
+
+(define (idle) (begin))
+
+(test wait-times-out
+  (let* ([why string] [w (worker-start idle (none) 0 0 (& why))] [start f64 0.0])
+    (expect-equal (next-kind w 10000) (cast i32 worker-done))
+    (set! start (clock-monotonic))
+    (expect-equal (next-kind w 100) 0)
+    (expect (>= (- (clock-monotonic) start) 95.0))
+    (worker-stop w)))
+
+(define (prints-and-ends)
+  (printf "hello~n")
+  (host-exit 3 "bye"))
+
+(test wait-ended
+  (let ([o worker-options] [why string] [w u32 0] [printed (make-buffer)] [r waited])
+    (worker-options-init! (& o))
+    (set! (-> o output) #t)
+    (set! (-> o ends) #t)
+    (set! w (worker-start prints-and-ends (none) (& o) 0 (& why)))
+    (set! r (wait-for w 10000))
+    (while (or (== (-> r kind) (cast i32 worker-stdout)) (== (-> r kind) (cast i32 worker-done)))
+      (buffer-add-string! (& printed) (-> r text))
+      (set! r (wait-for w 10000)))
+    (expect-equal (buffer-string (& printed)) "hello\n")
+    (expect-equal (-> r kind) (cast i32 worker-ended))
+    (expect-equal (-> r value) 3)
+    (expect-equal (-> r text) "bye")
+    (expect-equal (next-kind w 10) -1)))
+
+(test wait-not-running (expect-equal (next-kind 12345 10) -1))
+
+(define (says-hi) (worker-send 0 (cast (slice u8) "hi")))
+
+(define listener event-head)
+
+(define (overheard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (== kind worker-message) (throw test-failed "the worker's tag got an event that worker-wait took")))
+
+(test wait-takes
+  (let ([o worker-options] [why string] [w u32 0])
+    (worker-options-init! (& o))
+    (set! (-> o ends) #t)
+    (set! (-> listener handle) overheard)
+    (set! w (worker-start says-hi (none) (& o) (cast (ptr void) (& listener)) (& why)))
+    (expect-equal (next-text w 10000) "hi")))

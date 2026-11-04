@@ -38,7 +38,18 @@ const answering = ({ port, signal }) => {
   };
 };
 
-const side = workerSide((m, transfer) => (answer ? answer(m) : parentPort.postMessage(m, transfer)));
+// The port the parent hears this worker on, and the count of messages posted to it, which the parent waits on.
+let reply = null;
+
+const side = workerSide((m, transfer) => {
+  if (answer) answer(m);
+  else if (!reply) parentPort.postMessage(m, transfer);
+  else {
+    reply.port.postMessage(m, transfer);
+    Atomics.add(reply.signal, 0, 1);
+    Atomics.notify(reply.signal, 0);
+  }
+});
 
 // Borrows a connection to the parent thread's Chromium, which lend in worker.mjs provides.
 const connect = (file, files, args) => {
@@ -66,6 +77,7 @@ const nested = (setup) => (caller, app) => {
 
 parentPort.on('message', (m) => {
   if (m.type === 'start') {
+    reply = m.reply ?? null;
     if (m.address) answer = answering(m.address);
     if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
