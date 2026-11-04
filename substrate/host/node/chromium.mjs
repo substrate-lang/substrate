@@ -518,8 +518,9 @@ async function ended() {
   if (profile) fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
-// A connection's requests come on its own port and are answered there, numbering its browsers within it. The first is
-// the program's, which may end Chromium; a worker borrows another (browser.mjs), which may close only its own browsers.
+// Each connection sends its requests and gets its answers on its own port, and numbers its own browsers. The first
+// connection is the program's and may end Chromium; a connection that a worker borrows (browser.mjs) may close only its
+// own browsers.
 let connections = 0;
 
 function serve(port, signal, owner) {

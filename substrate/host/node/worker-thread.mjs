@@ -9,8 +9,8 @@ import { workers } from './worker.mjs';
 
 const text = new TextDecoder();
 
-// A test's server, which the browser module started, answers it with the first line it prints, or with why it ended
-// first; the rest of what it prints is dropped (browser.mjs).
+// When the browser module starts a test's server on this thread, the server's first printed line, or why it ended
+// before printing one, goes back to the browser module; the rest of its output is dropped.
 let answer = null;
 
 const answering = ({ port, signal }) => {
@@ -40,7 +40,7 @@ const answering = ({ port, signal }) => {
 
 const side = workerSide((m, transfer) => (answer ? answer(m) : parentPort.postMessage(m, transfer)));
 
-// A connection to the Chromium of the thread that started this worker, which answers it (browser.mjs, worker.mjs).
+// Borrows a connection to the parent thread's Chromium, which lend in worker.mjs provides.
 const connect = (file, files, args) => {
   const { port1, port2 } = new MessageChannel();
   const signal = new Int32Array(new SharedArrayBuffer(4));
@@ -57,7 +57,7 @@ const connect = (file, files, args) => {
   return { port: got.message.port, signal: got.message.signal, worker: null, dead: false };
 };
 
-// The worker module in a worker: its own workers, and its parent as worker 0.
+// In a worker, the worker module starts the worker's own workers and reaches its parent as worker 0.
 const nested = (setup) => (caller, app) => {
   const own = workers(setup)(caller, app);
   const parent = side.worker(caller);

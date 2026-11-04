@@ -1,5 +1,6 @@
-// The host module "worker" on Node: the thread is a worker thread, set up as its parent's host was, with the fakes and
-// TLS files its grants ask for. A worker that opens a site borrows a connection to this thread's Chromium (browser.mjs).
+// The host module "worker" on Node. A worker is a worker thread set up like its parent's host: it keeps the parent's
+// fakes and adds those its grants ask for, and TLS files its grants name replace the parent's. A worker that opens a
+// site borrows a connection to this thread's Chromium (browser.mjs).
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { Worker } from 'node:worker_threads';
@@ -29,7 +30,6 @@ const lend = (m) => {
   Atomics.notify(m.signal, 0);
 };
 
-// A thread running plan, set up as this thread's host was (worker-thread.mjs).
 export function workerThread(setup, plan, transfer = []) {
   const tls = plan.tls ? { cert: read(plan.tls.cert), key: read(plan.tls.key) } : setup.tls;
   const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url));

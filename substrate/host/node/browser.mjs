@@ -1,7 +1,7 @@
 // The host module "browser" (browser.sub). It opens sites in Chromium, which chromium.mjs drives on another thread, and
-// blocks until Chromium answers. One Chromium serves a thread and the workers it starts, which borrow connections to
-// it. A test's server is a function of the program on a worker. The caller's grants limit what this module reads, runs
-// and reaches.
+// each call blocks until Chromium answers. A thread and the workers it starts share one Chromium, through connections
+// the workers borrow. A test's server runs on a worker. The caller's grants limit what this module reads, runs and
+// reaches.
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -52,7 +52,7 @@ const ask = (t, message, transfer = []) => {
   return waited(t, 'the browser did not answer');
 };
 
-// The thread's Chromium, started by the first site it opens, here or in a worker it started.
+// This thread's Chromium, started when this thread or one of its workers first opens a site.
 let shared = null;
 
 const sharedDriver = (file, files, args) => {
@@ -60,7 +60,7 @@ const sharedDriver = (file, files, args) => {
   return shared;
 };
 
-// A connection to the thread's Chromium for a worker, whose module asks for it with its own grants checked.
+// Lends a worker a connection to this thread's Chromium; the worker's browser module has already checked its grants.
 export function connection(file, files, args) {
   const driver = sharedDriver(file, files, args);
   const { port1, port2 } = new MessageChannel();
@@ -78,8 +78,7 @@ export function endShared() {
   shared = null;
 }
 
-// setup is the thread's host's; its connect, in a worker, gives a connection to the Chromium of the thread that started
-// it.
+// setup is this thread's host setup. In a worker, setup.connect borrows a connection to the parent thread's Chromium.
 export function browsers(setup) {
   const { grants } = setup;
   const connect = setup.connect || null;
@@ -98,7 +97,7 @@ export function browsers(setup) {
       }
     };
 
-    // A borrowed connection goes back once its browsers have closed, so a worker can end.
+    // A worker gives its borrowed connection back once its browsers have closed, so that the worker can end.
     const released = () => {
       if (connect && driver && !driver.dead) {
         ask(driver, { type: 'end' });
@@ -118,8 +117,8 @@ export function browsers(setup) {
       if (!mayRun(grants.run, comparable(file), file)) throw new Error(`browser.${what}: ${file} is not granted (--allow-run)`);
     };
 
-    // The server function f runs on a worker with the caller's grants, given the site's directory, and answers with the
-    // first line it prints, its address (worker-thread.mjs).
+    // Runs the server function f on a worker with the caller's grants and the site's directory as its argument. The
+    // first line the server prints is its address (see answering in worker-thread.mjs).
     const served = (f, site) => {
       const entry = caller.named(f >>> 0);
       if (!entry) throw new Error('browser.open: the server is a function of code the program loaded');
