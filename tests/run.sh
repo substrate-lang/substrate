@@ -23,9 +23,9 @@ fail=0
 built=0
 unbuilt=0
 
-# The packages' tests.
+# The packages' tests, given every grant.
 packages=(./std ./cmd ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite ./tests ./tests/web)
-if bin/substrate test -c "$cache" --check-cache "$@" "${packages[@]}"; then
+if bin/substrate test -c "$cache" -A "$@" "${packages[@]}"; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1))
@@ -75,9 +75,9 @@ for t in tests/events/*.sub; do
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
-  actual="$(cd tests/events && timeout 60 "$host" --grant net 127.0.0.1 --grant read . \
-              "$root/tests/build/test/programs/events/$name" "$url" \
-              "ws${url#http}" 2>&1)"
+  actual="$(cd tests/events && "$root/bin/substrate" build "$name.sub" -o "$root/$builds/events/$name" -c "$cache" 2>&1 \
+              && cd .. && timeout 60 "$host" --grant net 127.0.0.1 --grant read events "$root/$builds/events/$name" "$url" \
+                            "ws${url#http}" 2>&1)"
   code=$?
   if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then
     pass=$((pass + 1))

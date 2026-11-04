@@ -162,8 +162,9 @@ function importMap(bytes) {
 }
 
 export class Exit {
-  constructor(code) {
+  constructor(code, reason = '') {
     this.code = code;
+    this.reason = reason;
   }
 }
 
@@ -401,8 +402,8 @@ export function createHost(platform) {
       os(out) {
         return give(utf8.encode(platform.os), out);
       },
-      exit(code) {
-        platform.exit(code);
+      exit(code, p, l) {
+        throw new Exit(code, string(p, l));
       },
       program_modules(out) {
         return give(utf8.encode(joined(programNames)), out);
@@ -509,7 +510,7 @@ export function createHost(platform) {
           loaded = instantiate(name, bytesOf(name), new Map());
         } catch (e) {
           if (e instanceof Exit) {
-            end(e.code, '');
+            exited(e);
             return {};
           }
           if (!(e instanceof WebAssembly.Exception)) throw e;
@@ -533,13 +534,20 @@ export function createHost(platform) {
     return null;
   }
 
-  // end runs when the program is over, with its exit code, or with -1 and the reason after a trap.
+  // end runs when the program is over, with its exit code and any reason it gave, or with -1 and the reason after a trap.
   function end(code, reason) {
     ended = true;
     queue.length = 0;
     for (const close of closers.splice(0)) close();
     streams.end();
     if (platform.ended) platform.ended(code, reason);
+  }
+
+  function exited(e) {
+    if (e.reason && e.code !== 0 && !platform.worker) {
+      platform.write(2, utf8.encode(e.reason.endsWith('\n') ? e.reason : `${e.reason}\n`));
+    }
+    end(e.code, e.reason);
   }
 
   function trapped(e) {
@@ -567,7 +575,7 @@ export function createHost(platform) {
       return true;
     } catch (e) {
       if (e instanceof Exit) {
-        end(e.code, '');
+        exited(e);
         return false;
       }
       if (!trapped(e)) throw e;
@@ -578,13 +586,13 @@ export function createHost(platform) {
           if (onTrap(giveIn(entry.memory, message, 0, 'on-trap'), message.length) !== 0) return false;
         } catch (e2) {
           if (e2 instanceof Exit) {
-            end(e2.code, '');
+            exited(e2);
             return false;
           }
           if (!trapped(e2)) throw e2;
         }
       }
-      platform.report(lastError);
+      if (!platform.worker) platform.report(lastError);
       end(-1, lastError);
       return false;
     } finally {

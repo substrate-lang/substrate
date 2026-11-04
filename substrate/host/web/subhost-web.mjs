@@ -1,6 +1,6 @@
 // The host for a web page: runs a program in a browser, its files kept in memory. A page has every grant, and its
 // workers may be given fewer.
-import { createHost, Exit } from '../subhost-core.mjs';
+import { createHost } from '../subhost-core.mjs';
 import { fsModule } from '../fs.mjs';
 import { allGrants, pairsFrom, requestOf } from '../grants.mjs';
 import { pageFiles, resolvePath } from './fs.mjs';
@@ -137,9 +137,7 @@ export function run(options, names, wasm) {
     args: options.args || [],
     os: 'web',
     write: output,
-    exit(code) {
-      throw new Exit(code);
-    },
+    worker: Boolean(options.entry),
     report,
     ended,
     delivered: options.delivered,
@@ -159,7 +157,9 @@ export function run(options, names, wasm) {
   };
 
   app.entry = host.load(names, (name) => wasm.get(name));
-  if (!app.entry) {
+  if (!app.entry && options.entry) {
+    ended(2, host.lastError);
+  } else if (!app.entry) {
     report(host.lastError);
     ended(2, '');
   }

@@ -3,7 +3,6 @@
 (require-unqualified rt compiler/roots)
 (require-unqualified fs host/fs)
 (require-unqualified events host/events)
-(require-unqualified timer host/modules/timer)
 (require-unqualified process host/node/process)
 (require-unqualified gr host/grants)
 (require-unqualified env host/node/env)
@@ -22,9 +21,8 @@
 (define dirs buffer)
 (define passed-args buffer)
 (define running bool #t)
-(define jobs u32 8)
-(define timeout string "10m")
-(define timeout-ms f64 600000.0)
+(define jobs u32 2)
+(define timeout-ms f64 60000.0)
 
 ;; The Chromium that browser tests run in, found once for a run, or no-chromium when there is none.
 (define chromium string "")
@@ -42,7 +40,7 @@
       (let ([x (@ args i)])
         (unless (or (== x "-j") (and (> i 0) (== (@ args (- i 1)) "-j")) (package-arg? x) (browser-arg? x))
           (push! (& passed-args) x))
-        (cond [(or (== x "-v") (== x "--ignored") (== x "--nocapture") (== x "--check-cache") (== x "--no-webgpu"))
+        (cond [(or (== x "-v") (== x "--ignored") (== x "--nocapture") (== x "--no-webgpu"))
                (push! (& program-args) x)]
               [(== x "--no-run") (set! running #f)]
               [(and (== x "--chromium") (< (+ i 1) (-> args length)))
@@ -53,11 +51,18 @@
                (+= i 1)
                (unless (and (digits-integer (@ args i) 10 #f (& n)) (> n 0) (< n 1000)) (usage))
                (set! jobs (cast u32 n))]
+              [(and (== x "-t") (< (+ i 1) (-> args length)))
+               (+= i 1)
+               (unless (and (digits-integer (@ args i) 10 #f (& n)) (> n 0) (< n 1000)) (usage))
+               (push! (& passed-args) (@ args i))
+               (push! (& program-args) x)
+               (push! (& program-args) (@ args i))]
               [(and (== x "--timeout") (< (+ i 1) (-> args length)))
                (+= i 1)
                (push! (& passed-args) (@ args i))
-               (set! timeout (@ args i))
                (set! timeout-ms (duration-ms (@ args i)))]
+              [(or (== x "--fake") (starts? x "--fake="))
+               (failed! "test: a test asks for fakes in its #:grants, not on the command line")]
               [(grants-flag? x) (push! (& grant-args) x)]
               [(package-arg? x) (push! (& dirs) (package-dir x))]
               [(starts? x "-") (usage)]
@@ -90,8 +95,6 @@
     (when (== (-> chromium length) 0)
       (set! no-chromium #t)
       (say 1 "no Chromium was found, so the tests that open a browser are skipped: install Chromium or Chrome, or set SUBSTRATE_CHROMIUM to its file\n"))))
-
-(define (chromium-args) -> string (let ([given string]) (if (set-in? "SUBSTRATE_CHROMIUM_ARGS" (& given)) given "")))
 
 ;; Whether the package in dir says (browser) in its tests clause.
 (define (browsing? [dir string]) -> bool
@@ -217,7 +220,7 @@
     (+= ended 1)
     (let ([n (-> (strings (& dirs)) length)])
       (cond [(< started n) (start-child!)]
-            [(== ended n) (host-exit (if (> failures 0) 1 0))]))))
+            [(== ended n) (host-exit (if (> failures 0) 1 0) "")]))))
 
 ;; ---- one package ----
 
@@ -235,71 +238,85 @@
     (compile! "build" main program-out (slice (cast (ptr string) 0) 0) (compiler-grants main program-out) built)))
 
 (define (built [code i32])
-  (cond [(!= code 0) (host-exit code)]
-        [(not running) (host-exit 0)]
+  (cond [(!= code 0) (host-exit code "")]
+        [(not running) (host-exit 0 "")]
         [else (run-program!)]))
 
 (struct test-run [head event-head])
 
 (define test-process test-run)
-(define test-timer test-run)
-(define test-id u32 0)
 
+;; needs holds the grants that every test gets besides its own #:grants.
 (define (run-program!)
-  (let* ([browsing (-> program-manifest test-browser)] [g (make-grants)] [argv (make-buffer)] [dirs (root-directories)]
-         [o process-options] [map (joined-path tested-dir "build/test/test.map")] [why string])
+  (let* ([browsing (-> program-manifest test-browser)] [needs (make-grants)] [g (make-grants)] [argv (make-buffer)]
+         [env (make-buffer)] [dirs (root-directories)] [map-file (joined-path tested-dir "build/test/test.map")]
+         [o process-options] [why string])
     (when browsing (browsers!))
-    (map-written! map)
+    (map-written! map-file)
     (when (< (fs-make-temp-dir "" "sub-test-" "" (& scratch) (& why)) 0) (failed! why))
     (when (< (fs-real-path scratch (& scratch) (& why)) 0) (failed! why))
     (set! scratch (normal-path (& a) scratch))
-    (grants-allow! (& g) grant-read (substrate-dir))
+    (grants-allow! (& needs) grant-read (substrate-dir))
     (while (pair? dirs)
-      (grants-allow! (& g) grant-read (datum->string (car dirs)))
+      (grants-allow! (& needs) grant-read (datum->string (car dirs)))
       (set! dirs (cdr dirs)))
-    (grants-allow! (& g) grant-read cache-dir)
+    (grants-allow! (& needs) grant-read cache-dir)
+    (grants-allow! (& needs) grant-write (joined-path tested-dir "build/test"))
+    (grants-allow! (& needs) grant-write cache-dir)
+    (grants-allow! (& needs) grant-env "SUBSTRATE_TOOLCHAIN")
+    (grants-allow! (& needs) grant-env "SUBSTRATE_CACHE")
+    (grants-allow! (& needs) grant-env "SUBSTRATE_MODULE_MAP")
+    (grants-allow! (& needs) grant-env "SUBSTRATE_SCRATCH")
+    (push! (& env) (joined "SUBSTRATE_TOOLCHAIN=" (substrate-dir)))
+    (push! (& env) (joined "SUBSTRATE_CACHE=" cache-dir))
+    (push! (& env) (joined "SUBSTRATE_MODULE_MAP=" map-file))
+    (push! (& env) (joined "SUBSTRATE_SCRATCH=" scratch))
+    (when browsing
+      (grants-allow! (& needs) grant-env "SUBSTRATE_CHROMIUM")
+      (grants-allow! (& needs) grant-env "SUBSTRATE_CHROMIUM_ARGS")
+      (push! (& env) (joined "SUBSTRATE_CHROMIUM=" (if no-chromium "" chromium)))
+      (unless no-chromium (grants-allow! (& needs) grant-run chromium)))
+    (grants-join! (& g) (& needs))
     (grants-allow! (& g) grant-read scratch)
-    (grants-allow! (& g) grant-write (joined-path tested-dir "build/test"))
-    (grants-allow! (& g) grant-write cache-dir)
     (grants-allow! (& g) grant-write scratch)
-    (when (and browsing (> (-> chromium length) 0)) (grants-allow! (& g) grant-run chromium))
-    (grants-join! (& g) (& (-> program-manifest test-grants)))
-    (unless (grants-parse! (& g) (strings (& grant-args)) (& why)) (failed! why))
+    (let ([given (make-grants)])
+      (unless (grants-parse! (& given) (strings (& grant-args)) (& why)) (failed! why))
+      (located-grants! (& given))
+      (grants-join! (& g) (& given)))
     (push! (& argv) "--name")
     (push! (& argv) program-package)
-    (push! (& argv) "--toolchain")
-    (push! (& argv) (substrate-dir))
-    (when browsing
-      (cond [no-chromium (push! (& argv) "--no-chromium")]
-            [else
-             (push! (& argv) "--chromium")
-             (push! (& argv) chromium)
-             (when (> (-> (chromium-args) length) 0)
-               (push! (& argv) "--chromium-args")
-               (push! (& argv) (chromium-args)))]))
-    (push! (& argv) "--map")
-    (push! (& argv) map)
-    (push! (& argv) "--cache")
-    (push! (& argv) cache-dir)
-    (push! (& argv) "--scratch")
-    (push! (& argv) scratch)
-    (push! (& argv) "--running")
-    (push! (& argv) (joined-path scratch "running"))
+    (push! (& argv) "--timeout-ms")
+    (push! (& argv) (let ([b (make-buffer)]) (write-digits (& b) (cast u64 timeout-ms) 10) (buffer-string (& b))))
+    (let ([l (slice (cast (ptr grant) (-> needs list bytes)) (/ (-> needs list length) (sizeof grant)))])
+      (for ([i u32 0]) (< i (-> l length)) (+= i 1)
+        (push! (& argv) "--grant")
+        (push! (& argv) (-> (& (@ l i)) kind))
+        (push! (& argv) (-> (& (@ l i)) item))))
     (for-each-string (& program-args) (& argv))
     (process-options-init! (& o))
     (set! (-> o dir) tested-dir)
-    (set! (-> o env) (slice (array-of string (joined "SUBSTRATE_CACHE=" cache-dir))))
+    (set! (-> o env) (strings (& env)))
     (set! (-> o stdin) process-inherit)
     (set! (-> o stdout) process-inherit)
     (set! (-> o stderr) process-inherit)
     (set! (-> test-process head handle) ran)
-    (set! test-id (process-spawn (joined-path (substrate-dir) "host/subhost.mjs")
-                                 (grants-arguments (& g) program-out (strings (& argv))) (& o) (& test-process)
-                                 (& why)))
-    (when (== test-id 0) (failed! why))
-    (when (> timeout-ms 0.0)
-      (set! (-> test-timer head handle) timed-out)
-      (timer-after timeout-ms (cast (ptr void) (& test-timer))))))
+    (when (== (process-spawn (joined-path (substrate-dir) "host/subhost.mjs")
+                             (grants-arguments (& g) program-out (strings (& argv))) (& o) (& test-process) (& why))
+              0)
+      (failed! why))))
+
+;; Grant paths on the command line are relative to this directory, but the test program runs in the package's directory.
+(define (located-grants! [g (ptr grants)])
+  (let ([l (slice (cast (ptr grant) (-> g list bytes)) (/ (-> g list length) (sizeof grant)))])
+    (for ([i u32 0]) (< i (-> l length)) (+= i 1)
+      (let* ([e (& (@ l i))] [k (-> e kind)])
+        (when (or (== k "read") (== k "write") (== k "deny-read") (== k "deny-write") (== k "fetch") (== k "tls-cert")
+                  (== k "tls-key") (and (or (== k "run") (== k "deny-run")) (contains-slash? (-> e item))))
+          (set! (-> e item) (absolute (-> e item))))))))
+
+(define (contains-slash? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (or (== (@ s i) #\/) (== (@ s i) #\\)) (return #t)))
+  #f)
 
 (define (for-each-string [from (ptr buffer)] [to (ptr buffer)])
   (let ([l (strings from)]) (for ([i u32 0]) (< i (-> l length)) (+= i 1) (push! to (@ l i)))))
@@ -309,24 +326,7 @@
 (define (ran [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (when (== source process-source)
     (fs-remove scratch #t 0)
-    (if (== kind process-exit) (host-exit value) (failed! (events-take-text)))))
-
-(define (timed-out [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
-  (when (== source timer-source)
-    (let ([test (slice u8)])
-      (process-kill test-id 9)
-      (when (>= (fs-read-file (joined-path scratch "running") (& test) 0) 0)
-        (say 1 "FAIL ")
-        (host-write 1 test)
-        (say 1 "\n  the test was still running after ")
-        (say 1 timeout)
-        (say 1 "\n"))
-      (say 1 program-package)
-      (say 1 ": stopped after ")
-      (say 1 timeout)
-      (say 1 "\n")
-      (fs-remove scratch #t 0)
-      (host-exit 1))))
+    (if (== kind process-exit) (host-exit value "") (failed! (events-take-text)))))
 
 ;; ---- the program ----
 

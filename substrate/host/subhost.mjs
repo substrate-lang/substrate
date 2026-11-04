@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
-import { createHost, Exit } from './subhost-core.mjs';
+import { createHost } from './subhost-core.mjs';
 import { joinedGrants, noGrants, pairsFrom, requestOf } from './grants.mjs';
 import { hostModules, setupOf, system } from './node/modules.mjs';
 
@@ -79,9 +79,6 @@ const host = createHost({
       if (e.code === 'EPIPE') process.exit(141);
       throw e;
     }
-  },
-  exit(code) {
-    throw new Exit(code);
   },
   report(message) {
     process.stderr.write(`error: ${message}\n`);

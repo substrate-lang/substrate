@@ -47,7 +47,7 @@ self.onmessage = async (e) => {
       else absent.add(name);
     }
     const app = run({
-      args: [m.argument],
+      args: m.args ?? [m.argument],
       files: m.files,
       cwd: m.cwd,
       output: side.write,
@@ -61,8 +61,7 @@ self.onmessage = async (e) => {
       active: side.active,
     }, [...wasm.keys()], wasm);
     if (app.entry && typeof app.worker !== 'function' && !app.ended) {
-      side.report(`worker.start: no function ${m.entry[1]} in ${m.entry[0]}`);
-      side.ended(2, '');
+      side.ended(2, `worker.start: no function ${m.entry[1]} in ${m.entry[0]}`);
       return;
     }
     side.started(app.host, app.started);
