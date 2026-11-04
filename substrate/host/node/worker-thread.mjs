@@ -1,6 +1,6 @@
 // A worker's thread on Node runs the worker's modules, with the worker module's own side and the parent's modules.
 import { MessageChannel, parentPort, receiveMessageOnPort } from 'node:worker_threads';
-import { createHost, Exit } from '../subhost-core.mjs';
+import { createHost } from '../subhost-core.mjs';
 import { workerSide } from '../worker-side.mjs';
 import { pairsFrom, requestOf } from '../grants.mjs';
 import { hostModules, system } from './modules.mjs';
@@ -31,8 +31,9 @@ const answering = ({ port, signal }) => {
       const k = line.indexOf('\n');
       if (k >= 0) reply({ ok: true, text: line.slice(0, k).trim() });
     } else if ((m.type === 'done' && m.trap) || m.type === 'ended') {
-      const why = said.trim() ? `\n${said.trim()}` : `: ${m.type === 'done' ? m.trap : m.reason || `exit ${m.code}`}`;
-      reply({ ok: false, message: `the server ended before printing its address${why}` });
+      const why = m.type === 'done' ? m.trap : m.reason || `exit ${m.code}`;
+      const tail = said.trim() ? `\n${said.trim()}` : '';
+      reply({ ok: false, message: `the server ended before printing its address: ${why}${tail}` });
     }
   };
 };
@@ -73,9 +74,7 @@ parentPort.on('message', (m) => {
       args: m.args ?? [m.argument],
       os: system,
       write: side.write,
-      exit(code) {
-        throw new Exit(code);
-      },
+      worker: true,
       report: side.report,
       ended: side.ended,
       delivered: side.delivered,
@@ -88,15 +87,13 @@ parentPort.on('message', (m) => {
     });
     const entry = host.load([...wasm.keys()], (name) => wasm.get(name));
     if (!entry) {
-      side.report(host.lastError);
-      side.ended(2, '');
+      side.ended(2, host.lastError);
       return;
     }
     const exports = host.registry.get(m.entry[0]);
     const f = exports && exports[m.entry[1]];
     if (typeof f !== 'function') {
-      side.report(`worker.start: no function ${m.entry[1]} in ${m.entry[0]}`);
-      side.ended(2, '');
+      side.ended(2, `worker.start: no function ${m.entry[1]} in ${m.entry[0]}`);
       return;
     }
     side.started(host, host.call(f, []));

@@ -402,10 +402,7 @@ export function createHost(platform) {
       os(out) {
         return give(utf8.encode(platform.os), out);
       },
-      exit(code) {
-        platform.exit(code);
-      },
-      end(code, p, l) {
+      exit(code, p, l) {
         throw new Exit(code, string(p, l));
       },
       program_modules(out) {
@@ -547,7 +544,9 @@ export function createHost(platform) {
   }
 
   function exited(e) {
-    if (e.reason && e.code !== 0) platform.report(e.reason);
+    if (e.reason && e.code !== 0 && !platform.worker) {
+      platform.write(2, utf8.encode(e.reason.endsWith('\n') ? e.reason : `${e.reason}\n`));
+    }
     end(e.code, e.reason);
   }
 
@@ -593,7 +592,7 @@ export function createHost(platform) {
           if (!trapped(e2)) throw e2;
         }
       }
-      platform.report(lastError);
+      if (!platform.worker) platform.report(lastError);
       end(-1, lastError);
       return false;
     } finally {
