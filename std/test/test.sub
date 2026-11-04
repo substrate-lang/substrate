@@ -4,6 +4,7 @@
 (require-unqualified fs host/fs)
 (require-unqualified events host/events)
 (require-unqualified clock host/modules/clock)
+(require-unqualified timer host/modules/timer)
 (require-unqualified gr host/grants)
 (require-unqualified worker host/worker)
 (require-unqualified env host/node/env)
@@ -16,8 +17,16 @@
 
 ;; ---- the runner ----
 
+;; A test, and once it has finished, its outcome and what the runner prints for it.
 (struct entry [module string] [name string] [line u32] [skip string] [traps string]
-              [grants (slice (slice string))] [output string] [output-file string] [run (fn ())])
+              [grants (slice (slice string))] [output string] [output-file string] [run (fn ())]
+              [outcome u32] [why string] [report buffer])
+
+(const waiting u32 0)
+(const unrun u32 1)
+(const passing u32 2)
+(const failing u32 3)
+(const skipping u32 4)
 
 (define entries (ptr entry) 0)
 (define entry-count u32 0)
@@ -37,7 +46,10 @@
     (set! (-> e grants) (kept-clauses grants))
     (set! (-> e output) output)
     (set! (-> e output-file) output-file)
-    (set! (-> e run) run))
+    (set! (-> e run) run)
+    (set! (-> e outcome) waiting)
+    (set! (-> e why) "")
+    (set! (-> e report) (make-buffer)))
   (+= entry-count 1))
 
 ;; The clauses on the heap, since a test on a worker reads them after main has returned.
@@ -72,26 +84,32 @@
           [(and webgpu (given? "--no-webgpu")) "left out by --no-webgpu"]
           [else ""])))
 
-;; The runner's options, the test program's arguments: the package's name, -v, --ignored, --nocapture, --no-webgpu and
-;; the tests to run. The test's surroundings come in variables that substrate test sets: SUBSTRATE_TOOLCHAIN,
-;; SUBSTRATE_CACHE, SUBSTRATE_CHROMIUM and SUBSTRATE_CHROMIUM_ARGS when the package's tests open browsers, and
-;; SUBSTRATE_SCRATCH, the run's scratch directory, which the runner sets to each test's own as it starts it.
+;; The runner's options, the test program's arguments: the package's name, -v, --ignored, --nocapture, --no-webgpu, -t
+;; with how many tests run at once, --timeout-ms with each test's time limit, and the tests to run. The test's
+;; surroundings come in variables that substrate test sets: SUBSTRATE_TOOLCHAIN, SUBSTRATE_CACHE, SUBSTRATE_CHROMIUM and
+;; SUBSTRATE_CHROMIUM_ARGS when the package's tests open browsers, and SUBSTRATE_SCRATCH, the run's scratch directory,
+;; which the runner sets to each test's own as it starts it.
 (define arguments (slice string))
 (define package-name string "")
 (define verbose bool #f)
 (define ignored-only bool #f)
 (define capturing bool #t)
+(define at-once u32 4)
+(define time-limit u64 0)
 
 (define (options!)
   (set! arguments (host-args))
   (set! package-name (option "--name"))
+  (let ([n u64 0])
+    (when (and (digits-integer (option "-t") 10 #f (& n)) (> n 0)) (set! at-once (cast u32 n)))
+    (when (digits-integer (option "--timeout-ms") 10 #f (& n)) (set! time-limit n)))
   (for ([i u32 0]) (< i (-> arguments length)) (+= i 1)
     (let ([a (@ arguments i)])
       (cond [(== a "-v") (set! verbose #t)]
             [(== a "--ignored") (set! ignored-only #t)]
             [(== a "--nocapture") (set! capturing #f)]))))
 
-(define (valued? [a string]) -> bool (== a "--name"))
+(define (valued? [a string]) -> bool (or (== a "--name") (== a "-t") (== a "--timeout-ms")))
 
 (define (flag? [a string]) -> bool (or (== a "-v") (== a "--ignored") (== a "--nocapture") (== a "--no-webgpu")))
 
@@ -110,9 +128,6 @@
 ;; The test's own directory, empty when it starts.
 (define (scratch-directory) -> string (setting "SUBSTRATE_SCRATCH"))
 
-;; Where substrate test finds the test that was running when it stopped the run.
-(define running-file string "build/test/running")
-
 (define (selected? [e (ptr entry)]) -> bool
   (let ([any #f] [i u32 0])
     (while (< i (-> arguments length))
@@ -125,48 +140,73 @@
       (+= i 1))
     (not any)))
 
-(define next u32 0)
-(define current u32 0)
 (define passed u32 0)
 (define failed u32 0)
 (define skip-reasons (array string 16))
 (define skip-counts (array u32 16))
 (define skip-kinds u32 0)
 (define started f64 0.0)
-(define captured buffer)
+
+;; Tests of different modules run at once, up to -t of them (one with --nocapture), and a module's tests run in order,
+;; each in a slot of its own. What the runner prints for a test waits for the tests before it, so the output is the same
+;; as when they run one at a time.
+(struct slot [head event-head] [clock event-head] [at u32] [end u32] [entry (ptr entry)] [worker u32] [timer u32]
+             [captured buffer])
+
+(define slots (ptr slot) 0)
+(define next-module u32 0)
+(define printed u32 0)
 
 (define (run!)
   (options!)
   (set! run-scratch (setting "SUBSTRATE_SCRATCH"))
   (set! started (clock-monotonic))
-  (run-from! 0))
+  (let ([n (if capturing at-once 1)])
+    (set! slots (cast (ptr slot) (calloc n (sizeof slot))))
+    (for ([i u32 0]) (< i n) (+= i 1) (slot-go! (& (@ slots i)))))
+  (reported!))
 
-(define (run-from! [i u32])
-  (set! next i)
-  (while (< next entry-count)
-    (set! current next)
-    (+= next 1)
-    (let ([e (& (@ entries current))])
-      (cond [(not (selected? e)) (begin)]
-            [(== (-> (-> e skip) length) 0) (when (and (not ignored-only) (run-one! e)) (return))]
-            [(and (== (-> e skip) "ignored") ignored-only) (when (run-one! e) (return))]
-            [else (skipped! e (-> e skip))])))
-  (finish!))
+;; Starts the slot's next test, from its module or else the next module no slot has taken, settling those that do not run
+;; on the way; the slot is left idle once no module is left.
+(define (slot-go! [s (ptr slot)])
+  (while #t
+    (when (>= (-> s at) (-> s end))
+      (when (>= next-module entry-count) (return))
+      (set! (-> s at) next-module)
+      (set! next-module (module-end next-module))
+      (set! (-> s end) next-module))
+    (let ([e (& (@ entries (-> s at)))])
+      (+= (-> s at) 1)
+      (cond [(not (selected? e)) (set! (-> e outcome) unrun)]
+            [(== (-> (-> e skip) length) 0)
+             (if ignored-only (set! (-> e outcome) unrun) (when (started! s e) (return)))]
+            [(and (== (-> e skip) "ignored") ignored-only) (when (started! s e) (return))]
+            [else (skipped! e (-> e skip))]))))
 
-;; Whether the test goes on, on its worker, after run-one! returns.
-(define (run-one! [e (ptr entry)]) -> bool
-  (let ([b (make-buffer)])
-    (buffer-add-string! (& b) (-> e module))
-    (buffer-add-byte! (& b) #\:)
-    (write-digits (& b) (-> e line) 10)
-    (buffer-add-byte! (& b) 32)
-    (buffer-add-string! (& b) (-> e name))
-    (fs-write-file running-file (buffer-bytes (& b)) 0)
-    (buffer-free! (& b)))
-  (set! (-> captured length) 0)
+(define (module-end [i u32]) -> u32
+  (let ([m (-> (& (@ entries i)) module)] [j (+ i 1)])
+    (while (and (< j entry-count) (== (-> (& (@ entries j)) module) m)) (+= j 1))
+    j))
+
+;; Prints the reports of the tests that have finished, in order up to the first still running, and once every test has
+;; finished, the summary.
+(define (reported!)
+  (while (and (< printed entry-count) (!= (-> (& (@ entries printed)) outcome) waiting))
+    (let ([e (& (@ entries printed))])
+      (cond [(== (-> e outcome) passing) (+= passed 1)]
+            [(== (-> e outcome) failing) (+= failed 1)]
+            [(== (-> e outcome) skipping) (skip-counted! (-> e why))])
+      (host-write 1 (buffer-bytes (& (-> e report))))
+      (buffer-free! (& (-> e report)))
+      (+= printed 1)))
+  (when (== printed entry-count) (finish!)))
+
+;; Whether the test goes on, on a worker in slot s, after started! returns.
+(define (started! [s (ptr slot)] [e (ptr entry)]) -> bool
+  (set! (-> s captured length) 0)
   (let ([o worker-options] [why string] [scratch (scratch-of e)])
     (when (< (fs-make-dir scratch (& why)) 0)
-      (failed! e why)
+      (failed! e why "")
       (return #f))
     (env-set "SUBSTRATE_SCRATCH" scratch 0)
     (worker-options-init! (& o))
@@ -181,13 +221,18 @@
       (let ([c (@ (-> e grants) i)] [items (make-buffer)])
         (for ([j u32 1]) (< j (-> c length)) (+= j 1) (pushed! (& items) (scratch-placed (@ c j) scratch)))
         (unless (grants-add! (& (-> o grants)) (@ c 0) (strings-in (& items)) (& why))
-          (failed! e why)
+          (failed! e why "")
           (return #f))))
-    (set! watched-entry e)
-    (set! (-> watched handle) heard)
-    (when (== (worker-start (-> e run) (slice (cast (ptr u8) 0) 0) (& o) (cast (ptr void) (& watched)) (& why)) 0)
-      (failed! e (beyond why))
+    (set! (-> s entry) e)
+    (set! (-> s head handle) heard)
+    (set! (-> s worker) (worker-start (-> e run) (slice (cast (ptr u8) 0) 0) (& o) (cast (ptr void) (& (-> s head)))
+                                      (& why)))
+    (when (== (-> s worker) 0)
+      (failed! e (beyond why) "")
       (return #f))
+    (when (> time-limit 0)
+      (set! (-> s clock handle) out-of-time)
+      (set! (-> s timer) (timer-after (cast f64 time-limit) (cast (ptr void) (& (-> s clock))))))
     #t))
 
 ;; What the framework needs for every test: reading the package, its dependencies, the toolchain and the cache, and the
@@ -254,16 +299,14 @@
           (buffer-string (& b)))
         why)))
 
-;; A test passes if it trapped as it expects, or expected no trap, and printed what it should.
-(define (ended! [e (ptr entry)] [trapped bool])
+;; A test passes if it trapped as it expects, or expected no trap, and printed what it should; got is what it printed.
+(define (ended! [e (ptr entry)] [got string] [trapped bool])
   (if (and (not trapped) (> (-> (-> e traps) length) 0))
-      (failed! e (trap-expected (-> e traps)))
+      (failed! e (trap-expected (-> e traps)) got)
       (begin
-        (cond [(> (-> e output length) 0)
-               (compare-output! (buffer-string (& captured)) (-> e output) (where-of e "#:output"))]
+        (cond [(> (-> e output length) 0) (compare-output! got (-> e output) (where-of e "#:output"))]
               [(> (-> e output-file length) 0)
-               (compare-output-file! (buffer-string (& captured)) (-> e module) (-> e output-file)
-                                     (where-of e "#:output-file"))])
+               (compare-output-file! got (-> e module) (-> e output-file) (where-of e "#:output-file"))])
         (passed! e))))
 
 (define (where-of [e (ptr entry)] [what string]) -> string
@@ -279,32 +322,51 @@
 
 ;; A test's worker runs the test's own function, which ends it with a reason when the test fails or is skipped
 ;; (compiler/checker.sub).
-(define watched event-head)
-(define watched-entry (ptr entry) 0)
-
 (define (heard [source u32] [kind u32] [w u32] [tag (ptr void)] [value i32])
-  (let ([data (events-take-text)])
-    (cond [(or (== kind worker-stdout) (== kind worker-stderr))
-           (buffer-add-string! (& captured) data)
-           (unless capturing (host-write (if (== kind worker-stderr) 2 1) (cast (slice u8) data)))]
-          [(== kind worker-ended) (worker-ended! value data)])
+  (let ([s (cast (ptr slot) tag)] [data (events-take-text)])
+    (when (== w (-> s worker))
+      (cond [(or (== kind worker-stdout) (== kind worker-stderr))
+             (buffer-add-string! (& (-> s captured)) data)
+             (unless capturing (host-write (if (== kind worker-stderr) 2 1) (cast (slice u8) data)))]
+            [(== kind worker-ended)
+             (set! (-> s worker) 0)
+             (timer-cancel (-> s timer))
+             (worker-ended! (-> s entry) value data (buffer-string (& (-> s captured))))
+             (slot-go! s)
+             (reported!)]))
     (free (-> data bytes))))
 
-(define (worker-ended! [code i32] [reason string])
-  (let ([e watched-entry])
-    (cond [(< code 0)
-           (if (and (> (-> (-> e traps) length) 0) (contains? reason (-> e traps)))
-               (try (ended! e #t) [catch test-failed (message) (failed! e message)])
-               (failed! e (without-runner reason)))]
-          [(and (== code 0) (> (-> reason length) 0)) (skipped! e reason)]
-          [(> (-> reason length) 0) (failed! e reason)]
-          [(!= code 0)
-           (let ([b (make-buffer)])
-             (buffer-add-string! (& b) "the test ended with exit code ")
-             (write-digits (& b) (cast u64 code) 10)
-             (failed! e (buffer-string (& b))))]
-          [else (try (ended! e #f) [catch test-failed (message) (failed! e message)])])
-    (run-from! next)))
+(define (worker-ended! [e (ptr entry)] [code i32] [reason string] [got string])
+  (cond [(< code 0)
+         (if (and (> (-> (-> e traps) length) 0) (contains? reason (-> e traps)))
+             (try (ended! e got #t) [catch test-failed (message) (failed! e message got)])
+             (failed! e (without-runner reason) got))]
+        [(and (== code 0) (> (-> reason length) 0)) (skipped! e (kept reason))]
+        [(> (-> reason length) 0) (failed! e reason got)]
+        [(!= code 0)
+         (let ([b (make-buffer)])
+           (buffer-add-string! (& b) "the test ended with exit code ")
+           (write-digits (& b) (cast u64 code) 10)
+           (failed! e (buffer-string (& b)) got))]
+        [else (try (ended! e got #f) [catch test-failed (message) (failed! e message got)])]))
+
+(define (out-of-time [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([s (cast (ptr slot) (- (cast u32 tag) (offsetof slot clock)))])
+    (when (and (!= (-> s worker) 0) (== id (-> s timer)))
+      (worker-stop (-> s worker))
+      (set! (-> s worker) 0)
+      (let ([b (make-buffer)])
+        (buffer-add-string! (& b) "the test was still running after ")
+        (write-digits (& b) (/ time-limit 1000) 10)
+        (buffer-add-string! (& b) " s")
+        (failed! (-> s entry) (buffer-string (& b)) (buffer-string (& (-> s captured)))))
+      (slot-go! s)
+      (reported!))))
+
+(define (kept [s string]) -> string
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) s)
+    (buffer-string (& b))))
 
 (define (scratch-placed [text string] [scratch string]) -> string
   (let ([b (make-buffer)] [i u32 0])
@@ -341,29 +403,40 @@
     (free (cast (ptr u8) (-> ls items)))
     (buffer-string (& b))))
 
+;; passed!, skipped! and failed! give a test its outcome and write its report, which reported! prints in turn.
 (define (passed! [e (ptr entry)])
-  (+= passed 1)
-  (when verbose (printf "ok ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))))
+  (set! (-> e outcome) passing)
+  (let ([before (output-to! (& (-> e report)))])
+    (when verbose (printf "ok ~a:~a ~a~n" (-> e module) (-> e line) (-> e name)))
+    (output-to! before)))
 
 (define (skipped! [e (ptr entry)] [why string])
+  (set! (-> e outcome) skipping)
+  (set! (-> e why) why)
+  (let ([before (output-to! (& (-> e report)))])
+    (when verbose
+      (if (== why "ignored")
+          (printf "ignored ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))
+          (printf "skipped ~a:~a ~a: ~a~n" (-> e module) (-> e line) (-> e name) why)))
+    (output-to! before)))
+
+(define (failed! [e (ptr entry)] [message string] [got string])
+  (set! (-> e outcome) failing)
+  (let ([before (output-to! (& (-> e report)))])
+    (printf "FAIL ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))
+    (indented message "  ")
+    (when (> (-> got length) 0)
+      (printf "  output:~n")
+      (indented got "    "))
+    (output-to! before)))
+
+(define (skip-counted! [why string])
   (let ([k u32 0])
     (while (and (< k skip-kinds) (!= (@ skip-reasons k) why)) (+= k 1))
     (when (and (== k skip-kinds) (< k 16))
       (set! (@ skip-reasons k) why)
       (+= skip-kinds 1))
-    (when (< k 16) (set! (@ skip-counts k) (+ (@ skip-counts k) 1))))
-  (when verbose
-    (if (== why "ignored")
-        (printf "ignored ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))
-        (printf "skipped ~a:~a ~a: ~a~n" (-> e module) (-> e line) (-> e name) why))))
-
-(define (failed! [e (ptr entry)] [message string])
-  (+= failed 1)
-  (printf "FAIL ~a:~a ~a~n" (-> e module) (-> e line) (-> e name))
-  (indented message "  ")
-  (when (> (-> captured length) 0)
-    (printf "  output:~n")
-    (indented (buffer-string (& captured)) "    ")))
+    (when (< k 16) (set! (@ skip-counts k) (+ (@ skip-counts k) 1)))))
 
 (define (indented [text string] [prefix string])
   (let ([start u32 0])

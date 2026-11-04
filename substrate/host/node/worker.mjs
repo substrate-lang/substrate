@@ -2,7 +2,7 @@
 // TLS files its grants ask for. A worker that opens a site borrows a connection to this thread's Chromium (browser.mjs).
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
-import { SHARE_ENV, Worker } from 'node:worker_threads';
+import { Worker } from 'node:worker_threads';
 import { workerModule } from '../worker.mjs';
 
 const require = createRequire(import.meta.url);
@@ -32,7 +32,7 @@ const lend = (m) => {
 // A thread running plan, set up as this thread's host was (worker-thread.mjs).
 export function workerThread(setup, plan, transfer = []) {
   const tls = plan.tls ? { cert: read(plan.tls.cert), key: read(plan.tls.key) } : setup.tls;
-  const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url), { env: SHARE_ENV });
+  const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url));
   thread.on('message', (m) => {
     if (m.type === 'browser') lend(m);
   });
