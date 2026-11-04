@@ -1,9 +1,30 @@
-// The page's side of a browser test in Chromium (substrate/host/node/chromium.mjs). It reads and checks the document,
-// finds where to click, and runs the clock that the driver installs before the page's scripts.
+// The page's side of a browser test (std/test/page.sub). It reads and checks the document, finds where to click, and
+// runs the clock that install.js installs before the page's scripts.
 import { describe, parse } from './find.mjs';
 import { advancedUntil, chose, documentRequest, ending, one, short } from './requests.mjs';
 import { canvasOf, drawingRequest, drawn, heard } from './logs.mjs';
-import { unsettledOf } from './clock.mjs';
+
+// unsettledOf gives a test of whether the real-time work that trackers count, each with pending() and progress(), is
+// worth waiting for: some is pending, and some started or finished in the last half second.
+function unsettledOf(trackers, now) {
+  let mark = '';
+  let since = 0;
+  let stalled = '';
+  return () => {
+    const all = trackers();
+    const pending = all.reduce((n, t) => n + t.pending(), 0);
+    const next = `${pending} ${all.reduce((n, t) => n + t.progress(), 0)}`;
+    const at = now();
+    if (next !== mark) {
+      mark = next;
+      since = at;
+    }
+    if (pending === 0 || mark === stalled) return false;
+    if (at - since < 500) return true;
+    stalled = mark;
+    return false;
+  };
+}
 
 const {
   clock, real, waiting, idle, network, leaving, drawings, frames, blobs, decoded, sounds, kinds, getContext,

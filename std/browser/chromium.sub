@@ -1,0 +1,123 @@
+;; Chromium for programs to drive over the DevTools protocol (devtools.sub). chromium-start runs the Chromium file
+;; headless, keeping its own files in profile, with more arguments for it, on a DevTools port that it picks; it returns
+;; #f with the reason at err when Chromium cannot run, and otherwise calls started once Chromium gives its DevTools
+;; address, or once Chromium ends or has not started within 30 s, with the address empty and the reason in why.
+;; chromium-stop stops it and calls stopped once it has ended.
+(require-unqualified events host/events)
+(require-unqualified timer host/modules/timer)
+(require-unqualified process host/node/process)
+(require-unqualified streams host/stream)
+
+(provide chromium chromium-start chromium-stop)
+
+(struct chromium [head event-head] [clock event-head] [id u32] [timer u32] [said buffer] [chunk (array u8 4096)]
+                 [address string] [why string] [running bool] [started (fn ((ptr chromium)))]
+                 [stopped (fn ((ptr chromium)))])
+
+(define (chromium-start [c (ptr chromium)] [file string] [profile string] [args (slice string)]
+                        [started (fn ((ptr chromium)))] [err (ptr string)]) -> bool
+  (let ([argv (make-buffer)] [o process-options] [profile-flag (make-buffer)]
+        [fixed (slice (array-of string "--headless=new" "--remote-debugging-port=0" "--no-first-run"
+                                "--no-default-browser-check" "--no-sandbox" "--mute-audio"
+                                "--disable-background-timer-throttling" "--disable-renderer-backgrounding"
+                                "--disable-backgrounding-occluded-windows" "--enable-unsafe-webgpu"))])
+    (set! (-> c head handle) heard)
+    (set! (-> c clock handle) waited)
+    (set! (-> c said) (make-buffer))
+    (set! (-> c address) "")
+    (set! (-> c why) "")
+    (set! (-> c running) #f)
+    (set! (-> c started) started)
+    (set! (-> c stopped) (cast (fn ((ptr chromium))) 0))
+    (buffer-add-string! (& profile-flag) "--user-data-dir=")
+    (buffer-add-string! (& profile-flag) profile)
+    (for ([i u32 0]) (< i (-> fixed length)) (+= i 1) (pushed! (& argv) (@ fixed i)))
+    (pushed! (& argv) (buffer-string (& profile-flag)))
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (pushed! (& argv) (@ args i)))
+    (pushed! (& argv) "about:blank")
+    (process-options-init! (& o))
+    (set! (-> o stdin) process-ignore)
+    (set! (-> o stdout) process-ignore)
+    (set! (-> c id) (process-spawn file (strings-in (& argv)) (& o) (cast (ptr void) (& (-> c head))) err))
+    (buffer-free! (& argv))
+    (when (== (-> c id) 0) (return #f))
+    (set! (-> c running) #t)
+    (stream-tag! (process-stderr (-> c id)) (cast (ptr void) (& (-> c head))))
+    (stream-read! (process-stderr (-> c id)) (slice (-> c chunk)))
+    (set! (-> c timer) (timer-after 30000.0 (cast (ptr void) (& (-> c clock)))))
+    #t))
+
+(define (chromium-stop [c (ptr chromium)] [stopped (fn ((ptr chromium)))])
+  (timer-cancel (-> c timer))
+  (if (-> c running)
+      (begin
+        (set! (-> c stopped) stopped)
+        (process-kill (-> c id) 15))
+      (stopped c)))
+
+(define (heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([c (cast (ptr chromium) tag)])
+    (cond [(and (== source stream-source) (== kind stream-read) (> value 0))
+           (said! c (slice (-> c chunk) (cast u32 value)))
+           (stream-read! id (slice (-> c chunk)))]
+          [(== source process-source)
+           (set! (-> c running) #f)
+           (cond [(and (== (-> c address length) 0) (== (-> c why length) 0))
+                  (timer-cancel (-> c timer))
+                  (let ([b (make-buffer)])
+                    (buffer-add-string! (& b) "Chromium ended before giving its DevTools address")
+                    (if (== kind process-exit)
+                        (begin
+                          (buffer-add-string! (& b) ", with status ")
+                          (write-digits (& b) (cast u64 value) 10))
+                        (begin
+                          (buffer-add-string! (& b) ": ")
+                          (buffer-add-string! (& b) (events-take-text))))
+                    (failed! c (buffer-string (& b))))]
+                 [(!= (cast u32 (-> c stopped)) 0) ((-> c stopped) c)])])))
+
+(define (waited [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([c (cast (ptr chromium) (- (cast u32 tag) (offsetof chromium clock)))])
+    (when (and (== (-> c address length) 0) (== (-> c why length) 0))
+      (process-kill (-> c id) 9)
+      (failed! c "Chromium did not give its DevTools address within 30 s"))))
+
+;; Keeps what Chromium prints, all of it until it gives its address and then its last 4000 bytes, and looks for the
+;; address.
+(define (said! [c (ptr chromium)] [bytes (slice u8)])
+  (let ([s (& (-> c said))] [mark "DevTools listening on "])
+    (buffer-add! s bytes)
+    (when (== (-> c address length) 0)
+      (let ([text (buffer-string s)])
+        (for ([i u32 0]) (<= (+ i (-> mark length)) (-> text length)) (+= i 1)
+          (when (== (slice text i (+ i (-> mark length))) mark)
+            (let* ([start (+ i (-> mark length))] [end start])
+              (while (and (< end (-> text length)) (> (@ text end) 32)) (+= end 1))
+              (when (< end (-> text length))
+                (set! (-> c address) (kept-text (slice text start end)))
+                (timer-cancel (-> c timer))
+                ((-> c started) c)
+                (return)))))))
+    (when (and (> (-> c address length) 0) (> (-> s length) 8000))
+      (let ([n (-> s length)])
+        (memcpy (-> s bytes) (+ (-> s bytes) (- n 4000)) 4000)
+        (set! (-> s length) 4000)))))
+
+(define (failed! [c (ptr chromium)] [why string])
+  (let ([b (make-buffer)] [said (buffer-string (& (-> c said)))])
+    (buffer-add-string! (& b) why)
+    (when (> (-> said length) 0)
+      (buffer-add-byte! (& b) 10)
+      (buffer-add-string! (& b) (if (> (-> said length) 4000) (slice said (- (-> said length) 4000) (-> said length)) said)))
+    (set! (-> c why) (buffer-string (& b)))
+    ((-> c started) c)))
+
+(define (kept-text [s string]) -> string
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) s)
+    (buffer-string (& b))))
+
+(define (pushed! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+(define (strings-in [b (ptr buffer)]) -> (slice string)
+  (slice (cast (ptr string) (-> b bytes)) (/ (-> b length) (sizeof string))))

@@ -1,12 +1,8 @@
 // The host module "worker" on Node. A worker is a worker thread set up like its parent's host: it keeps the parent's
-// fakes and adds those its grants ask for, and TLS files its grants name replace the parent's. A worker that opens a
-// site borrows a connection to this thread's Chromium (browser.mjs).
+// fakes and adds those its grants ask for, and TLS files its grants name replace the parent's.
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
 import { MessageChannel, Worker, receiveMessageOnPort } from 'node:worker_threads';
 import { workerModule } from '../worker.mjs';
-
-const require = createRequire(import.meta.url);
 
 const read = (file) => {
   try {
@@ -15,45 +11,6 @@ const read = (file) => {
     throw new Error(`worker.start: cannot read ${file}`);
   }
 };
-
-let lent = false;
-
-const lend = (m) => {
-  try {
-    const c = require('./browser.mjs').connection(m.file, m.files, m.args);
-    lent = true;
-    m.reply.postMessage({ ok: true, port: c.port, signal: c.signal }, [c.port]);
-  } catch (e) {
-    m.reply.postMessage({ ok: false, message: e.message });
-  }
-  Atomics.store(m.signal, 0, 1);
-  Atomics.notify(m.signal, 0);
-};
-
-export function workerThread(setup, plan, transfer = []) {
-  const tls = plan.tls ? { cert: read(plan.tls.cert), key: read(plan.tls.key) } : setup.tls;
-  const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url));
-  thread.on('message', (m) => {
-    if (m.type === 'browser') lend(m);
-  });
-  thread.postMessage({
-    type: 'start',
-    modules: plan.modules,
-    entry: plan.entry,
-    argument: plan.argument,
-    grants: plan.grants,
-    fakes: [...setup.fakes, ...plan.fakes],
-    tls,
-    loader: setup.loader,
-    pages: plan.pages,
-    heard: plan.heard,
-    ends: plan.ends,
-    args: plan.args,
-    address: plan.address,
-    reply: plan.reply,
-  }, transfer);
-  return thread;
-}
 
 // The next message on port, which the thread posting to it counts in signal, waiting up to ms for one.
 function receivedOn(port, signal, ms) {
@@ -69,34 +26,57 @@ function receivedOn(port, signal, ms) {
 }
 
 export function workers(setup) {
-  const made = workerModule({
+  return workerModule({
     spawn(plan) {
       const { port1, port2 } = new MessageChannel();
       const signal = new Int32Array(new SharedArrayBuffer(4));
-      const thread = workerThread(setup, { ...plan, reply: { port: port2, signal } }, [port2]);
+      const tls = plan.tls ? { cert: read(plan.tls.cert), key: read(plan.tls.key) } : setup.tls;
+      const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url));
+      // The messages a thread posted before it ended, which can still wait on the port when its exit is heard.
+      let heard = null;
+      let closed = false;
+      const drained = () => {
+        if (closed || !heard) return;
+        for (let got = receiveMessageOnPort(port1); got; got = receiveMessageOnPort(port1)) heard(got.message);
+      };
+      thread.postMessage({
+        type: 'start',
+        modules: plan.modules,
+        entry: plan.entry,
+        argument: plan.argument,
+        grants: plan.grants,
+        fakes: [...setup.fakes, ...plan.fakes],
+        tls,
+        loader: setup.loader,
+        pages: plan.pages,
+        heard: plan.heard,
+        ends: plan.ends,
+        args: plan.args,
+        reply: { port: port2, signal },
+      }, [port2]);
       return {
         post: (m, transfer) => thread.postMessage(m, transfer),
         terminate: () => {
+          closed = true;
           thread.terminate();
           port1.close();
         },
         receive: (ms) => receivedOn(port1, signal, ms),
-        onMessage: (f) => port1.on('message', f),
+        onMessage: (f) => {
+          heard = f;
+          port1.on('message', f);
+        },
         onError: (f) => {
-          thread.on('error', (e) => f(`error: ${e.message || 'the thread failed'}`));
-          thread.on('exit', (code) => f(`the thread ended with ${code}`, code));
+          thread.on('error', (e) => {
+            drained();
+            f(`error: ${e.message || 'the thread failed'}`);
+          });
+          thread.on('exit', (code) => {
+            drained();
+            f(`the thread ended with ${code}`, code);
+          });
         },
       };
     },
   });
-  return (caller, app) => {
-    const m = made(caller, app);
-    return {
-      ...m,
-      end() {
-        m.end();
-        if (lent) require('./browser.mjs').endShared();
-      },
-    };
-  };
 }

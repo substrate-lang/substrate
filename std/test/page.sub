@@ -1,0 +1,935 @@
+;; The browsers that browser tests open (browser.sub), driven over the DevTools protocol (std/browser/devtools.sub) in
+;; the run's Chromium, which substrate test starts and whose address it gives in SUBSTRATE_CHROMIUM. Each page has a
+;; browser context of its own and runs page/install.js before its own scripts; its requests for the site's files and
+;; for page/agent.mjs, which reads and checks the page from inside, are answered here. A test's server runs on a worker,
+;; and the page reaches only the site, the answers the test gives, and the server's host.
+(require-unqualified fs host/fs)
+(require-unqualified env host/node/env)
+(require-unqualified worker host/worker)
+(require-unqualified clock host/modules/clock)
+(require-unqualified json "../encoding/json.sub")
+(require-unqualified base64 "../encoding/base64.sub")
+(require-unqualified url "../http/url.sub")
+(require-unqualified paths "../package/path.sub")
+(require-unqualified devtools "../browser/devtools.sub")
+
+(provide page-open page-request page-close)
+
+(exception page-failed string)
+
+(struct download [guid string] [name string] [state string])
+
+(struct answer [url string] [status u32] [body string])
+
+(struct page [id u32] [context string] [target string] [session string] [sessions buffer] [downloads-dir string]
+             [site string] [server u32] [server-host string] [answers buffer] [downloads buffer] [lines buffer]
+             [thrown bool] [errors buffer] [chosen (slice string)] [choosing bool] [held u32] [mouse-x f64]
+             [mouse-y f64] [home string] [documents u32] [stops u32] [landed string] [unreachable string])
+
+(struct point [x f64] [y f64] [locked bool])
+
+(define origin string "http://localhost")
+(define reserved string "/.substrate-testing/")
+(define connection devtools)
+(define connected bool #f)
+(define pages buffer)
+(define opened u32 0)
+(define work arena)
+(define scripts string "")
+(define install string "")
+
+;; ---- opening and closing ----
+
+(define (page-open [dir string] [url string] [address string] [server (fn ())] [err (ptr string)]) -> u32
+  (let ([id u32 0])
+    (try (set! id (opened! dir url address server))
+      [catch page-failed (why) (set! (@ err) why)])
+    (arena-free (& work))
+    id))
+
+(define (page-close [id u32])
+  (let ([b (page-of id)])
+    (unless (== b 0) (closed! b))
+    (arena-free (& work))))
+
+(define (opened! [dir string] [url string] [address string] [server (fn ())]) -> u32
+  (unless connected
+    (let ([why string])
+      (unless (devtools-connect (& connection) address heard 0 (& why)) (throw page-failed why))
+      (set! connected #t)))
+  (let ([b (cast (ptr page) (calloc 1 (sizeof page)))])
+    (+= opened 1)
+    (set! (-> b id) opened)
+    (set! (-> b site) (kept dir))
+    (pushed! (& pages) (cast u32 b))
+    (try (set-up! b url server)
+      [catch page-failed (why)
+        (closed! b)
+        (throw page-failed why)])
+    (-> b id)))
+
+(define (set-up! [b (ptr page)] [url string] [server (fn ())])
+  (let ([base (if (== (cast u32 server) 0) "http://localhost/index.html" (served-from! b server))] [p (params-of)]
+        [r (ptr json-value) 0] [start string] [dir string])
+    (param-bool! (& p) "disposeOnDetach" #t)
+    (set! r (call "Target.createBrowserContext" (params-text (& p)) ""))
+    (set! (-> b context) (kept (text-at r "browserContextId")))
+    (set! p (params-of))
+    (param-string! (& p) "url" "about:blank")
+    (param-string! (& p) "browserContextId" (-> b context))
+    (set! r (call "Target.createTarget" (params-text (& p)) ""))
+    (set! (-> b target) (kept (text-at r "targetId")))
+    (set! p (params-of))
+    (param-string! (& p) "targetId" (-> b target))
+    (param-bool! (& p) "flatten" #t)
+    (set! r (call "Target.attachToTarget" (params-text (& p)) ""))
+    (set! (-> b session) (kept (text-at r "sessionId")))
+    (set! dir (joined-path (scratch) (cat "downloads-" (digits (-> b id)))))
+    (fs-make-dir dir 0)
+    (set! (-> b downloads-dir) dir)
+    (set! start (kept (resolved b url base)))
+    (set! (-> b home) (origin-of start))
+    (page-call b "Fetch.enable" "{\"patterns\":[{\"urlPattern\":\"*\"}]}")
+    (page-call b "Runtime.enable" "")
+    (page-call b "Page.enable" "")
+    (page-call b "Page.setInterceptFileChooserDialog" "{\"enabled\":true}")
+    (page-call b "Target.setAutoAttach" "{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":true}")
+    (page-call b "Emulation.setFocusEmulationEnabled" "{\"enabled\":true}")
+    (page-call b "Emulation.setDeviceMetricsOverride" "{\"width\":1280,\"height\":800,\"deviceScaleFactor\":1,\"mobile\":false}")
+    (set! p (params-of))
+    (param-string! (& p) "source" (install-script))
+    (page-call b "Page.addScriptToEvaluateOnNewDocument" (params-text (& p)))
+    (set! p (params-of))
+    (param-raw! (& p) "permissions" "[\"clipboardReadWrite\",\"clipboardSanitizedWrite\"]")
+    (param-string! (& p) "browserContextId" (-> b context))
+    (call "Browser.grantPermissions" (params-text (& p)) "")
+    (set! p (params-of))
+    (param-string! (& p) "behavior" "allowAndName")
+    (param-string! (& p) "downloadPath" (absolute dir))
+    (param-string! (& p) "browserContextId" (-> b context))
+    (param-bool! (& p) "eventsEnabled" #t)
+    (call "Browser.setDownloadBehavior" (params-text (& p)) "")
+    (set! p (params-of))
+    (param-string! (& p) "url" start)
+    (loaded! b "Page.navigate" (params-text (& p)))))
+
+(define (closed! [b (ptr page)])
+  (let ([all (opened-pages)] [r (ptr json-value) 0] [why string] [p (params-of)])
+    (for ([i u32 0]) (< i (-> all length)) (+= i 1)
+      (when (== (@ all i) (cast u32 b))
+        (memcpy (cast (ptr u8) (+ (-> all items) i)) (cast (ptr u8) (+ (-> all items) (+ i 1))) (* (- (-> all length) (+ i 1)) 4))
+        (-= (-> pages length) 4)
+        (break)))
+    (when (and connected (> (-> b context length) 0))
+      (param-string! (& p) "browserContextId" (-> b context))
+      (devtools-call (& connection) (& work) "Target.disposeBrowserContext" (params-text (& p)) "" (& r) (& why)))
+    (when (> (-> b downloads-dir length) 0) (fs-remove (-> b downloads-dir) #t 0))
+    (unless (== (-> b server) 0) (worker-stop (-> b server)))
+    (when (and connected (== (-> pages length) 0))
+      (devtools-close (& connection))
+      (set! connected #f))))
+
+;; ---- a test's server ----
+
+(define server-head event-head)
+
+(define (unheard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32]) (begin))
+
+;; Starts the server on a worker with the site's directory as its argument, and gives the first line it prints, its
+;; address, with index.html after it.
+(define (served-from! [b (ptr page)] [server (fn ())]) -> string
+  (let ([o worker-options] [why string] [line (make-buffer)] [said (make-buffer)] [until (+ (clock-monotonic) 60000.0)])
+    (worker-options-init! (& o))
+    (set! (-> o output) #t)
+    (set! (-> server-head handle) unheard)
+    (set! (-> b server) (worker-start server (cast (slice u8) (-> b site)) (& o) (cast (ptr void) (& server-head)) (& why)))
+    (when (== (-> b server) 0) (throw page-failed why))
+    (while #t
+      (let ([left (- until (clock-monotonic))] [value i32 0] [bytes (slice u8)] [kind i32 0] [ended string ""])
+        (when (<= left 0.0) (throw page-failed "the server did not print its address within 60 s"))
+        (set! kind (worker-wait (-> b server) (cast u32 left) (& value) (& bytes)))
+        (cond [(== kind (cast i32 worker-stdout))
+               (buffer-add! (& line) bytes)
+               (let ([text (buffer-string (& line))])
+                 (for ([i u32 0]) (< i (-> text length)) (+= i 1)
+                   (when (== (@ text i) 10)
+                     (let ([address (trimmed (slice text 0 i))])
+                       (set! (-> b server-host) (kept (host-of (origin-of address))))
+                       (return (cat address "index.html"))))))]
+              [(== kind (cast i32 worker-stderr)) (buffer-add! (& said) bytes)]
+              [(and (== kind (cast i32 worker-done)) (> (-> bytes length) 0)) (set! ended (cast string bytes))]
+              [(== kind (cast i32 worker-ended))
+               (set! ended (if (> (-> bytes length) 0) (cast string bytes) (cat "exit " (signed-digits value))))
+               (set! (-> b server) 0)]
+              [(== kind 0) (throw page-failed "the server did not print its address within 60 s")]
+              [(== kind -1)
+               (set! (-> b server) 0)
+               (set! ended "it stopped")])
+        (when (> (-> ended length) 0)
+          (let ([out (make-buffer)] [tail (trimmed (buffer-string (& said)))])
+            (buffer-add-string! (& out) "the server ended before printing its address: ")
+            (buffer-add-string! (& out) ended)
+            (when (> (-> tail length) 0)
+              (buffer-add-byte! (& out) 10)
+              (buffer-add-string! (& out) (if (> (-> tail length) 4000) (slice tail (- (-> tail length) 4000) (-> tail length)) tail)))
+            (throw page-failed (buffer-string (& out)))))))
+    ""))
+
+;; ---- requests ----
+
+(define (page-request [id u32] [fields string] [out (ptr string)] [err (ptr string)]) -> i32
+  (let ([b (page-of id)] [code i32 0])
+    (when (== b 0)
+      (set! (@ err) (cat (cat "no browser " (digits id)) " is open"))
+      (return -1))
+    (try (set! (@ out) (kept (cast string (handled b (fields-of fields)))))
+      [catch page-failed (why)
+        (set! (@ err) (with-console b why))
+        (set! code -1)])
+    (arena-free (& work))
+    code))
+
+;; handled carries out a request, which fails when the page has thrown an error that nothing caught.
+(define (handled [b (ptr page)] [fields (slice string)]) -> (slice u8)
+  (let ([value (carried b fields)] [errors (strings-in (& (-> b errors)))])
+    (when (> (-> errors length) 0)
+      (let ([first (@ errors 0)])
+        (set! (-> b errors length) 0)
+        (throw page-failed (cat "the page has an uncaught error: " (slice first 10 (-> first length))))))
+    value))
+
+(define (carried [b (ptr page)] [fields (slice string)]) -> (slice u8)
+  (let ([kind (@ fields 0)])
+    (cond [(== kind "click") (text-bytes (acted! b click-act fields))]
+          [(== kind "right-click") (text-bytes (acted! b right-click-act fields))]
+          [(== kind "double-click") (text-bytes (acted! b double-click-act fields))]
+          [(== kind "hover") (text-bytes (acted! b hover-act fields))]
+          [(== kind "wheel") (text-bytes (acted! b wheel-act fields))]
+          [(or (== kind "select") (== kind "focus") (== kind "fire")) (text-bytes (acted! b agent-act fields))]
+          [(== kind "type") (text-bytes (acted! b type-act fields))]
+          [(== kind "press") (text-bytes (acted! b press-act fields))]
+          [(or (== kind "key-down") (== kind "key-up")) (text-bytes (acted! b key-act fields))]
+          [(== kind "move-mouse")
+           (+= (-> b mouse-x) (number-of (@ fields 1)))
+           (+= (-> b mouse-y) (number-of (@ fields 2)))
+           (text-bytes (acted! b move-act fields))]
+          [(== kind "resize")
+           (let ([p (params-of)])
+             (param-number! (& p) "width" (number-of (@ fields 1)))
+             (param-number! (& p) "height" (number-of (@ fields 2)))
+             (param-number! (& p) "deviceScaleFactor" 1.0)
+             (param-bool! (& p) "mobile" #f)
+             (page-call b "Emulation.setDeviceMetricsOverride" (params-text (& p)))
+             (text-bytes (agent-text b (one-field "settle"))))]
+          [(== kind "go")
+           (let ([p (params-of)])
+             (param-string! (& p) "url" (resolved b (@ fields 1) (agent-text b (one-field "url"))))
+             (loaded! b "Page.navigate" (params-text (& p)))
+             (text-bytes ""))]
+          [(== kind "reload")
+           (loaded! b "Page.reload" "")
+           (text-bytes "")]
+          [(== kind "console")
+           (agent b (one-field "settle"))
+           (text-bytes (lines-text b))]
+          [(== kind "choose-files")
+           (set! (-> b chosen) (chosen-files (slice fields 1 (-> fields length))))
+           (set! (-> b choosing) #t)
+           (text-bytes "")]
+          [(== kind "downloaded") (downloaded b (@ fields 1))]
+          [(== kind "pixels") (decoded (text-at (agent b fields) "pixels"))]
+          [(== kind "screenshot")
+           (agent b (one-field "settle"))
+           (decoded (text-at (page-call b "Page.captureScreenshot" "{\"format\":\"png\"}") "data"))]
+          [(== kind "respond")
+           (let ([a answer] [status u64 0])
+             (digits-integer (@ fields 2) 10 #f (& status))
+             (set! a (answer #:url (kept (resolved b (@ fields 1) (agent-text b (one-field "url")))) #:status (cast u32 status)
+                             #:body (kept (@ fields 3))))
+             (buffer-add! (& (-> b answers)) (slice (cast (ptr u8) (& a)) (sizeof answer)))
+             (text-bytes ""))]
+          [(starts? kind "expect-") (text-bytes (value-text (retried b fields)))]
+          [else (text-bytes (value-text (agent b fields)))])))
+
+;; ---- what a user does ----
+
+;; acted carries out an action and follows the page wherever it goes.
+(define (acted! [b (ptr page)] [act (fn ((ptr page) (slice string)))] [fields (slice string)]) -> string
+  (let ([documents (-> b documents)] [stops (-> b stops)])
+    (try (act b fields)
+      [catch page-failed (why)
+        (when (and (== (-> b documents) documents) (not (navigated-away? why))) (throw page-failed why))])
+    (followed! b documents stops)))
+
+;; followed settles the page and, when it has started going to another page, waits for that page's program to start.
+;; A page of another site only has to settle, and a navigation that ends without a new page, as a download does, ends
+;; the wait.
+(define (followed! [b (ptr page)] [documents u32] [stops u32]) -> string
+  (let ([leaving #f] [until f64 0.0])
+    (try (set! leaving (== (agent-text b (one-field "settle")) "leaving"))
+      [catch page-failed (why)
+        (when (and (== (-> b documents) documents) (not (navigated-away? why))) (throw page-failed why))
+        (set! leaving #t)])
+    (when (and (not leaving) (== (-> b documents) documents)) (return ""))
+    (set! until (+ (clock-monotonic) 30000.0))
+    (while (== (-> b documents) documents)
+      (when (!= (-> b stops) stops) (return ""))
+      (when (>= (clock-monotonic) until)
+        (throw page-failed (cat "the page did not reach the page it went to within 30 s\n" (lines-text b))))
+      (devtools-pump (& connection) 20.0))
+    (when (> (-> b unreachable length) 0)
+      (throw page-failed (cat (cat "the page went to " (-> b unreachable)) ", which the browser cannot open")))
+    (unless (== (origin-of (-> b landed)) (-> b home)) (return (agent-text b (one-field "settle"))))
+    (set! (-> b thrown) #f)
+    (started! b)
+    ""))
+
+(define (click-act [b (ptr page)] [fields (slice string)])
+  (clicked! b (pointed b fields (-> fields length)) "left" 1))
+
+(define (right-click-act [b (ptr page)] [fields (slice string)])
+  (clicked! b (pointed b fields (-> fields length)) "right" 1))
+
+(define (double-click-act [b (ptr page)] [fields (slice string)])
+  (clicked! b (pointed b fields (-> fields length)) "left" 2))
+
+(define (hover-act [b (ptr page)] [fields (slice string)])
+  (let ([at (pointed b fields (-> fields length))])
+    (unless (-> at locked) (moved! b (-> at x) (-> at y)))))
+
+(define (wheel-act [b (ptr page)] [fields (slice string)])
+  (let* ([k (finder-end fields 1)] [found (pointed b fields k)] [p (params-of)]
+         [x (if (-> found locked) (-> b mouse-x) (-> found x))] [y (if (-> found locked) (-> b mouse-y) (-> found y))])
+    (param-string! (& p) "type" "mouseWheel")
+    (param-number! (& p) "x" x)
+    (param-number! (& p) "y" y)
+    (param-number! (& p) "deltaX" (number-of (@ fields k)))
+    (param-number! (& p) "deltaY" (number-of (@ fields (+ k 1))))
+    (param-number! (& p) "modifiers" (cast f64 (-> b held)))
+    (page-call b "Input.dispatchMouseEvent" (params-text (& p)))
+    (set! (-> b mouse-x) x)
+    (set! (-> b mouse-y) y)))
+
+(define (agent-act [b (ptr page)] [fields (slice string)]) (retried b fields))
+
+(define (type-act [b (ptr page)] [fields (slice string)])
+  (let* ([k (finder-end fields 1)] [focus (make-buffer)] [text (@ fields k)] [i u32 0])
+    (pushed-text! (& focus) "focus")
+    (for ([j u32 1]) (< j k) (+= j 1) (pushed-text! (& focus) (@ fields j)))
+    (retried b (strings-of (& focus)))
+    (while (< i (-> text length))
+      (let ([n (code-point-length (@ text i))])
+        (pressed! b (if (== (@ text i) 10) "Enter" (slice text i (+ i n))) 0)
+        (+= i n)))))
+
+(define (press-act [b (ptr page)] [fields (slice string)])
+  (let* ([held u32 0] [name (key-of (@ fields 1) (& held))]) (pressed! b name held)))
+
+(define (key-act [b (ptr page)] [fields (slice string)])
+  (let* ([held u32 0] [name (key-of (@ fields 1) (& held))] [bit (modifier-bit name)])
+    (when (> bit 0)
+      (set! (-> b held) (if (== (@ fields 0) "key-down") (bit-or (-> b held) bit) (bit-and (-> b held) (bit-not bit)))))
+    (key! b (if (== (@ fields 0) "key-down") "keyDown" "keyUp") name (bit-or (-> b held) held))))
+
+(define (move-act [b (ptr page)] [fields (slice string)]) (moved! b (-> b mouse-x) (-> b mouse-y)))
+
+;; The point to click on the element that the finder in fields from 1 to end finds, as the page gives it.
+(define (pointed [b (ptr page)] [fields (slice string)] [end u32]) -> point
+  (let ([asked (make-buffer)] [v (ptr json-value) 0] [locked #f])
+    (pushed-text! (& asked) "point")
+    (for ([i u32 1]) (< i end) (+= i 1) (pushed-text! (& asked) (@ fields i)))
+    (set! v (retried b (strings-of (& asked))))
+    (let ([l (get v "locked")]) (unless (== l 0) (json-as-bool l (& locked))))
+    (point #:x (number-at v "x") #:y (number-at v "y") #:locked locked)))
+
+;; clicked moves the mouse to the point and clicks the button count times, each click counting up from 1. A locked
+;; pointer stays where it is.
+(define (clicked! [b (ptr page)] [at point] [button string] [count u32])
+  (let ([x (if (-> at locked) (-> b mouse-x) (-> at x))] [y (if (-> at locked) (-> b mouse-y) (-> at y))])
+    (unless (-> at locked) (moved! b x y))
+    (for ([n u32 1]) (<= n count) (+= n 1)
+      (pressed-mouse! b "mousePressed" x y button (if (== button "right") 2 1) n)
+      (pressed-mouse! b "mouseReleased" x y button 0 n))
+    (set! (-> b mouse-x) x)
+    (set! (-> b mouse-y) y)))
+
+(define (moved! [b (ptr page)] [x f64] [y f64])
+  (let ([p (params-of)])
+    (param-string! (& p) "type" "mouseMoved")
+    (param-number! (& p) "x" x)
+    (param-number! (& p) "y" y)
+    (param-number! (& p) "modifiers" (cast f64 (-> b held)))
+    (page-call b "Input.dispatchMouseEvent" (params-text (& p)))
+    (set! (-> b mouse-x) x)
+    (set! (-> b mouse-y) y)))
+
+(define (pressed-mouse! [b (ptr page)] [type string] [x f64] [y f64] [button string] [buttons u32] [count u32])
+  (let ([p (params-of)])
+    (param-string! (& p) "type" type)
+    (param-number! (& p) "x" x)
+    (param-number! (& p) "y" y)
+    (param-string! (& p) "button" button)
+    (param-number! (& p) "buttons" (cast f64 buttons))
+    (param-number! (& p) "clickCount" (cast f64 count))
+    (param-number! (& p) "modifiers" (cast f64 (-> b held)))
+    (page-call b "Input.dispatchMouseEvent" (params-text (& p)))))
+
+;; ---- keys ----
+
+(define (key-name? [k string]) -> bool
+  (let ([names (slice (array-of string "Enter" "Tab" "Escape" "Backspace" "Delete" "Insert" "Home" "End" "PageUp"
+                                "PageDown" "ArrowUp" "ArrowDown" "ArrowLeft" "ArrowRight" "Shift" "Control" "Alt" "Meta"
+                                "CapsLock" "ContextMenu" "F1" "F2" "F3" "F4" "F5" "F6" "F7" "F8" "F9" "F10" "F11" "F12"))])
+    (for ([i u32 0]) (< i (-> names length)) (+= i 1) (when (== (@ names i) k) (return #t)))
+    #f))
+
+(define (modifier-bit [name string]) -> u32
+  (cond [(== name "Shift") 8] [(== name "Control") 2] [(== name "Alt") 1] [(== name "Meta") 4] [else 0]))
+
+;; key-of reads a key as browser-press! takes it: a key's name or one character, after any of Shift+, Control+, Alt+ and
+;; Meta+, as in "Shift+Enter", and gives the key, with the modifiers it names in held.
+(define (key-of [spec string] [held (ptr u32)]) -> string
+  (let ([rest spec] [going #t] [key string])
+    (when (== (-> spec length) 0) (throw page-failed (cat (quoted spec) " is not a key")))
+    (while going
+      (set! going #f)
+      (for ([m u32 0]) (< m 4) (+= m 1)
+        (let ([name (@ (slice (array-of string "Shift" "Control" "Alt" "Meta")) m)])
+          (when (and (> (-> rest length) (+ (-> name length) 1)) (starts? rest name) (== (@ rest (-> name length)) #\+))
+            (set! (@ held) (bit-or (@ held) (modifier-bit name)))
+            (set! rest (slice rest (+ (-> name length) 1) (-> rest length)))
+            (set! going #t)
+            (break)))))
+    (set! key (if (== rest "Space") " " rest))
+    (unless (or (key-name? key) (single? key))
+      (throw page-failed (cat (quoted spec) " is not a key: a key is a name such as Enter, or one character")))
+    (if (and (!= (bit-and (@ held) 8) 0) (== (-> key length) 1) (>= (@ key 0) #\a) (<= (@ key 0) #\z))
+        (let ([b (make-buffer)])
+          (buffer-add-byte! (& b) (- (cast i32 (@ key 0)) 32))
+          (buffer-string (& b)))
+        key)))
+
+(define (pressed! [b (ptr page)] [name string] [held u32])
+  (let ([order (slice (array-of string "Shift" "Control" "Alt" "Meta"))] [mods (-> b held)])
+    (for ([i u32 0]) (< i 4) (+= i 1)
+      (let ([m (@ order i)])
+        (when (and (!= (bit-and held (modifier-bit m)) 0) (!= name m))
+          (set! mods (bit-or mods (modifier-bit m)))
+          (key! b "keyDown" m mods))))
+    (key! b "keyDown" name mods)
+    (key! b "keyUp" name mods)
+    (for ([i u32 4]) (> i 0) (-= i 1)
+      (let ([m (@ order (- i 1))])
+        (when (and (!= (bit-and held (modifier-bit m)) 0) (!= name m))
+          (set! mods (bit-and mods (bit-not (modifier-bit m))))
+          (key! b "keyUp" m mods))))))
+
+(define (key! [b (ptr page)] [type string] [name string] [mods u32])
+  (let* ([text (cond [(== name "Enter") "\r"] [(single? name) name] [else ""])]
+         [typing (and (== type "keyDown") (> (-> text length) 0) (== (bit-and mods 7) 0))] [p (params-of)])
+    (param-string! (& p) "type" (if (and (== type "keyDown") (not typing)) "rawKeyDown" type))
+    (param-string! (& p) "key" name)
+    (param-string! (& p) "code" (code-of name))
+    (param-number! (& p) "windowsVirtualKeyCode" (cast f64 (key-code name)))
+    (param-number! (& p) "modifiers" (cast f64 mods))
+    (when typing
+      (param-string! (& p) "text" text)
+      (param-string! (& p) "unmodifiedText" text))
+    (page-call b "Input.dispatchKeyEvent" (params-text (& p)))))
+
+(define (code-of [key string]) -> string
+  (let ([c (if (== (-> key length) 1) (@ key 0) 0)])
+    (cond [(or (and (>= c #\a) (<= c #\z)) (and (>= c #\A) (<= c #\Z)))
+           (let ([b (make-buffer)])
+             (buffer-add-string! (& b) "Key")
+             (buffer-add-byte! (& b) (if (>= c #\a) (- (cast i32 c) 32) (cast i32 c)))
+             (buffer-string (& b)))]
+          [(and (>= c #\0) (<= c #\9)) (cat "Digit" key)]
+          [(== key " ") "Space"]
+          [(key-name? key) key]
+          [(== key "-") "Minus"] [(== key "=") "Equal"] [(== key "[") "BracketLeft"] [(== key "]") "BracketRight"]
+          [(== key "\\") "Backslash"] [(== key ";") "Semicolon"] [(== key "'") "Quote"] [(== key ",") "Comma"]
+          [(== key ".") "Period"] [(== key "/") "Slash"] [(== key "`") "Backquote"]
+          [else ""])))
+
+(define (key-code [key string]) -> u32
+  (let ([c (if (== (-> key length) 1) (@ key 0) 0)] [n u64 0])
+    (cond [(== key "Enter") 13] [(== key "Tab") 9] [(== key "Escape") 27] [(== key "Backspace") 8] [(== key "Delete") 46]
+          [(== key "Insert") 45] [(== key "Home") 36] [(== key "End") 35] [(== key "PageUp") 33] [(== key "PageDown") 34]
+          [(== key "ArrowLeft") 37] [(== key "ArrowUp") 38] [(== key "ArrowRight") 39] [(== key "ArrowDown") 40]
+          [(== key "Shift") 16] [(== key "Control") 17] [(== key "Alt") 18] [(== key "Meta") 91] [(== key "CapsLock") 20]
+          [(== key "ContextMenu") 93] [(== key " ") 32] [(== key "-") 189] [(== key "=") 187] [(== key "[") 219]
+          [(== key "]") 221] [(== key "\\") 220] [(== key ";") 186] [(== key "'") 222] [(== key ",") 188]
+          [(== key ".") 190] [(== key "/") 191] [(== key "`") 192]
+          [(and (>= c #\a) (<= c #\z)) (- (cast u32 c) 32)]
+          [(or (and (>= c #\A) (<= c #\Z)) (and (>= c #\0) (<= c #\9))) (cast u32 c)]
+          [(and (> (-> key length) 1) (== (@ key 0) #\F) (digits-integer (slice key 1 (-> key length)) 10 #f (& n))
+                (>= n 1) (<= n 12))
+           (+ 111 (cast u32 n))]
+          [else 0])))
+
+(define (single? [s string]) -> bool (and (> (-> s length) 0) (== (code-point-length (@ s 0)) (-> s length))))
+
+(define (code-point-length [first u8]) -> u32
+  (cond [(< first #x80) 1] [(< first #xE0) 2] [(< first #xF0) 3] [else 4]))
+
+;; ---- the page ----
+
+(define (started! [b (ptr page)])
+  (let ([until (+ (clock-monotonic) 30000.0)] [going #t])
+    (while going
+      (let ([state (ptr json-value) 0] [code i64 0] [reason string])
+        (try (set! state (evaluated b "window.ready === true ? [typeof window.ended === 'number' ? window.ended : 0, window.endReason || ''] : null"))
+          [catch page-failed (why) (set! state 0)])
+        (cond [(and (!= state 0) (== (json-count state) 2))
+               (json-as-i64 (json-at state 0) (& code))
+               (json-as-string (json-at state 1) (& reason))
+               (if (== code 0)
+                   (set! going #f)
+                   (throw page-failed (cat (cat (ending code reason) "\n") (lines-text b))))]
+              [(-> b thrown) (throw page-failed (cat "the page did not start\n" (lines-text b)))]
+              [(>= (clock-monotonic) until) (throw page-failed (cat "the page did not start within 30 s\n" (lines-text b)))]
+              [else (devtools-pump (& connection) 20.0)]))))
+  (agent b (one-field "settle")))
+
+(define (loaded! [b (ptr page)] [method string] [parameters string])
+  (try (evaluated b "window.ready = false") [catch page-failed (why) (begin)])
+  (set! (-> b thrown) #f)
+  (set! (-> b errors length) 0)
+  (let ([error (text-at (page-call b method parameters) "errorText")])
+    (when (> (-> error length) 0) (throw page-failed (cat "the browser cannot open the page: " error))))
+  (started! b))
+
+;; Asks the agent in the page to carry out the request in fields, and gives its answer.
+(define (agent [b (ptr page)] [fields (slice string)]) -> (ptr json-value)
+  (let ([e (make-buffer)] [answer (ptr json-value) 0] [ok #f])
+    (buffer-add-string! (& e) "import(")
+    (quoted! (& e) (cat reserved "agent.mjs"))
+    (buffer-add-string! (& e) ").then((a) => a.request([")
+    (for ([i u32 0]) (< i (-> fields length)) (+= i 1)
+      (when (> i 0) (buffer-add-byte! (& e) #\,))
+      (quoted! (& e) (@ fields i)))
+    (buffer-add-string! (& e) "]))")
+    (set! answer (evaluated b (buffer-string (& e))))
+    (let ([o (get answer "ok")]) (unless (== o 0) (json-as-bool o (& ok))))
+    (unless ok (throw page-failed (text-at answer "message")))
+    (get answer "value")))
+
+(define (agent-text [b (ptr page)] [fields (slice string)]) -> string (value-text (agent b fields)))
+
+;; retried repeats a request for up to 5 seconds until the page can answer it, since a real browser takes its own time.
+;; A request that a navigation interrupts is not repeated, since it may have done what it does.
+(define (retried [b (ptr page)] [fields (slice string)]) -> (ptr json-value)
+  (let ([until (+ (clock-monotonic) 5000.0)] [v (ptr json-value) 0] [done #f])
+    (while (not done)
+      (try (begin
+             (set! v (agent b fields))
+             (set! done #t))
+        [catch page-failed (why)
+          (when (or (>= (clock-monotonic) until) (navigated-away? why)) (throw page-failed why))])
+      (unless done (devtools-pump (& connection) 20.0)))
+    v))
+
+(define (evaluated [b (ptr page)] [expression string]) -> (ptr json-value)
+  (let ([p (params-of)] [r (ptr json-value) 0])
+    (param-string! (& p) "expression" expression)
+    (param-bool! (& p) "awaitPromise" #t)
+    (param-bool! (& p) "returnByValue" #t)
+    (set! r (page-call b "Runtime.evaluate" (params-text (& p))))
+    (let ([ex (get r "exceptionDetails")]) (unless (== ex 0) (throw page-failed (described ex))))
+    (get (get r "result") "value")))
+
+;; url resolved against base, as the page resolves it.
+(define (resolved [b (ptr page)] [url string] [base string]) -> string
+  (let ([e (make-buffer)])
+    (buffer-add-string! (& e) "new URL(")
+    (quoted! (& e) url)
+    (buffer-add-string! (& e) ", ")
+    (quoted! (& e) base)
+    (buffer-add-string! (& e) ").href")
+    (value-text (evaluated b (buffer-string (& e))))))
+
+(define (downloaded [b (ptr page)] [name string]) -> (slice u8)
+  (let ([until (+ (clock-monotonic) 5000.0)])
+    (while #t
+      (let ([all (cast (ptr download) (-> b downloads bytes))] [n (/ (-> b downloads length) (sizeof download))])
+        (for ([i u32 0]) (< i n) (+= i 1)
+          (let ([d (+ all i)] [bytes (slice u8)] [why string])
+            (when (and (== (-> d name) name) (== (-> d state) "completed"))
+              (when (< (fs-read-file (joined-path (-> b downloads-dir) (-> d guid)) (& bytes) (& why)) 0)
+                (throw page-failed why))
+              (return bytes)))))
+      (when (>= (clock-monotonic) until) (throw page-failed (cat (cat "no file named " (quoted name)) " was downloaded")))
+      (devtools-pump (& connection) 20.0))
+    (slice (cast (ptr u8) 0) 0)))
+
+;; The files that the next file picker gives, made absolute; reading each must be granted.
+(define (chosen-files [paths (slice string)]) -> (slice string)
+  (let ([out (make-buffer)] [info fs-info] [why string])
+    (for ([i u32 0]) (< i (-> paths length)) (+= i 1)
+      (when (< (fs-stat (@ paths i) (& info) (& why)) 0) (throw page-failed why))
+      (pushed-text! (& out) (absolute (@ paths i))))
+    (strings-of (& out))))
+
+;; ---- events ----
+
+(define (heard [d (ptr devtools)] [method string] [p (ptr json-value)] [session string])
+  (cond [(== method "Browser.downloadWillBegin")
+         (let ([b (page-of-target (text-at p "frameId"))])
+           (unless (== b 0)
+             (let ([w (download #:guid (kept (text-at p "guid")) #:name (kept (text-at p "suggestedFilename"))
+                                #:state "inProgress")])
+               (buffer-add! (& (-> b downloads)) (slice (cast (ptr u8) (& w)) (sizeof download))))))]
+        [(== method "Browser.downloadProgress") (progressed! (text-at p "guid") (text-at p "state"))]
+        [else
+         (let ([b (page-of-session session)])
+           (unless (== b 0)
+             (cond [(== method "Target.attachedToTarget")
+                    (let ([child (kept (text-at p "sessionId"))])
+                      (pushed-text! (& (-> b sessions)) child)
+                      (devtools-send d "Runtime.enable" "" child)
+                      (devtools-send d "Runtime.runIfWaitingForDebugger" "" child))]
+                   [(== method "Fetch.requestPaused") (served! b p session)]
+                   [(== method "Runtime.consoleAPICalled")
+                    (let ([args (get p "args")] [line (make-buffer)])
+                      (for ([i u32 0]) (< i (if (== args 0) 0 (json-count args))) (+= i 1)
+                        (when (> i 0) (buffer-add-byte! (& line) 32))
+                        (buffer-add-string! (& line) (console-text (json-at args i))))
+                      (pushed-text! (& (-> b lines)) (buffer-string (& line))))]
+                   [(== method "Runtime.exceptionThrown")
+                    (let ([line (cat "uncaught: " (described (get p "exceptionDetails")))])
+                      (pushed-text! (& (-> b lines)) line)
+                      (set! (-> b thrown) #t)
+                      (pushed-text! (& (-> b errors)) line))]
+                   [(== method "Page.fileChooserOpened") (chose! b (number-at p "backendNodeId"))]
+                   [(== method "Page.frameNavigated")
+                    (let ([frame (get p "frame")])
+                      (when (== (get frame "parentId") 0)
+                        (+= (-> b documents) 1)
+                        (set! (-> b landed) (kept (text-at frame "url")))
+                        (set! (-> b unreachable) (kept (text-at frame "unreachableUrl")))))]
+                   [(== method "Page.frameStoppedLoading")
+                    (when (== (text-at p "frameId") (-> b target)) (+= (-> b stops) 1))])))]))
+
+(define (progressed! [guid string] [state string])
+  (let ([all (opened-pages)])
+    (for ([i u32 0]) (< i (-> all length)) (+= i 1)
+      (let* ([b (cast (ptr page) (@ all i))] [ds (cast (ptr download) (-> b downloads bytes))]
+             [n (/ (-> b downloads length) (sizeof download))])
+        (for ([j u32 0]) (< j n) (+= j 1)
+          (when (== (-> (+ ds j) guid) guid) (set! (-> (+ ds j) state) (kept state))))))))
+
+;; served answers a page's request with, in order: the agent's modules, a test's answers, the site's files, and for a
+;; site opened through a test's server, whatever listens on the server's host. Any other request fails.
+(define (served! [b (ptr page)] [p (ptr json-value)] [session string])
+  (let* ([request (text-at p "requestId")] [href (text-at (get p "request") "url")] [from (origin-of href)]
+         [a (make-arena)] [path (url-unescape (& a) (path-of-url href) #f)] [found (answer-of b href)])
+    (cond [(and (starts? path reserved) (agent-module? (slice path (-> reserved length) (-> path length))))
+           (fulfilled! session request 200 "text/javascript"
+                       (file-bytes (joined-path (page-scripts) (slice path (-> reserved length) (-> path length)))) #f)]
+          [(!= found 0) (fulfilled! session request (-> found status) (type-of path) (cast (slice u8) (-> found body)) #t)]
+          [(== from origin)
+           (let ([file (if (== path "/") "/index.html" path)] [bytes (slice u8)])
+             (if (and (not (contains? file "/..")) (not (contains? file "\\"))
+                      (>= (fs-read-file (cat (-> b site) file) (& bytes) 0) 0))
+                 (fulfilled! session request 200 (type-of file) bytes #f)
+                 (fulfilled! session request 404 "text/plain" (cast (slice u8) "not found") #f)))]
+          [(and (> (-> b server-host length) 0) (== (host-of from) (-> b server-host)))
+           (let ([q (params-of)])
+             (param-string! (& q) "requestId" request)
+             (devtools-send (& connection) "Fetch.continueRequest" (params-text (& q)) session))]
+          [else
+           (let ([q (params-of)])
+             (param-string! (& q) "requestId" request)
+             (param-string! (& q) "errorReason" "Failed")
+             (devtools-send (& connection) "Fetch.failRequest" (params-text (& q)) session))])
+    (arena-free (& a))))
+
+(define (fulfilled! [session string] [request string] [status u32] [type string] [body (slice u8)] [anyone bool])
+  (let ([q (params-of)] [encoded (make-buffer)] [headers (make-buffer)])
+    (buffer-add-byte! (& encoded) 34)
+    (base64-encode! (& encoded) body)
+    (buffer-add-byte! (& encoded) 34)
+    (buffer-add-string! (& headers) "[{\"name\":\"Content-Type\",\"value\":")
+    (quoted! (& headers) type)
+    (buffer-add-string! (& headers) "},{\"name\":\"Cache-Control\",\"value\":\"no-store\"}")
+    (when anyone (buffer-add-string! (& headers) ",{\"name\":\"Access-Control-Allow-Origin\",\"value\":\"*\"}"))
+    (buffer-add-byte! (& headers) #\])
+    (param-string! (& q) "requestId" request)
+    (param-number! (& q) "responseCode" (cast f64 status))
+    (param-raw! (& q) "body" (buffer-string (& encoded)))
+    (param-raw! (& q) "responseHeaders" (buffer-string (& headers)))
+    (devtools-send (& connection) "Fetch.fulfillRequest" (params-text (& q)) session)
+    (buffer-free! (& encoded))))
+
+;; A file picker that opened gives the files the test chose, or else is cancelled.
+(define (chose! [b (ptr page)] [node f64])
+  (let ([q (params-of)] [a (make-arena)] [r (ptr json-value) 0] [why string])
+    (param-number! (& q) "backendNodeId" node)
+    (if (-> b choosing)
+        (let ([files (make-buffer)])
+          (set! (-> b choosing) #f)
+          (buffer-add-byte! (& files) #\[)
+          (for ([i u32 0]) (< i (-> b chosen length)) (+= i 1)
+            (when (> i 0) (buffer-add-byte! (& files) #\,))
+            (quoted! (& files) (@ (-> b chosen) i)))
+          (buffer-add-byte! (& files) #\])
+          (param-raw! (& q) "files" (buffer-string (& files)))
+          (unless (devtools-call (& connection) (& a) "DOM.setFileInputFiles" (params-text (& q)) (-> b session) (& r) (& why))
+            (pushed-text! (& (-> b lines)) (cat "files: " why))))
+        (if (devtools-call (& connection) (& a) "DOM.resolveNode" (params-text (& q)) (-> b session) (& r) (& why))
+            (let ([p (params-of)])
+              (param-string! (& p) "objectId" (text-at (get r "object") "objectId"))
+              (param-string! (& p) "functionDeclaration" "function () { this.dispatchEvent(new Event('cancel')); }")
+              (unless (devtools-call (& connection) (& a) "Runtime.callFunctionOn" (params-text (& p)) (-> b session) (& r) (& why))
+                (pushed-text! (& (-> b lines)) (cat "files: " why))))
+            (pushed-text! (& (-> b lines)) (cat "files: " why))))
+    (arena-free (& a))))
+
+;; ---- helpers ----
+
+(define (call [method string] [parameters string] [session string]) -> (ptr json-value)
+  (let ([r (ptr json-value) 0] [why string])
+    (unless (devtools-call (& connection) (& work) method parameters session (& r) (& why)) (throw page-failed why))
+    r))
+
+(define (page-call [b (ptr page)] [method string] [parameters string]) -> (ptr json-value)
+  (call method parameters (-> b session)))
+
+;; The errors Chromium gives for a request to a page that a navigation has replaced.
+(define (navigated-away? [why string]) -> bool
+  (or (contains? why "Execution context was destroyed") (contains? why "Cannot find context with specified id")
+      (contains? why "Inspected target navigated or closed")))
+
+(define (ending [code i64] [reason string]) -> string
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) "the program ended with ")
+    (when (< code 0) (buffer-add-byte! (& b) #\-))
+    (write-digits (& b) (cast u64 (if (< code 0) (- 0 code) code)) 10)
+    (when (> (-> reason length) 0)
+      (buffer-add-string! (& b) ": ")
+      (buffer-add-string! (& b) (first-line reason)))
+    (buffer-string (& b))))
+
+(define (described [d (ptr json-value)]) -> string
+  (let ([description (text-at (get d "exception") "description")])
+    (if (> (-> description length) 0) (first-line description) (text-at d "text"))))
+
+(define (with-console [b (ptr page)] [why string]) -> string
+  (let ([lines (strings-in (& (-> b lines)))] [out (make-buffer)])
+    (buffer-add-string! (& out) why)
+    (when (> (-> lines length) 0)
+      (buffer-add-string! (& out) "\n  the console ends with:")
+      (for ([i u32 (if (> (-> lines length) 10) (- (-> lines length) 10) 0)]) (< i (-> lines length)) (+= i 1)
+        (buffer-add-string! (& out) "\n    ")
+        (buffer-add-string! (& out) (@ lines i))))
+    (buffer-string (& out))))
+
+(define (lines-text [b (ptr page)]) -> string
+  (let ([lines (strings-in (& (-> b lines)))] [out (make-buffer)])
+    (for ([i u32 0]) (< i (-> lines length)) (+= i 1)
+      (when (> i 0) (buffer-add-byte! (& out) 10))
+      (buffer-add-string! (& out) (@ lines i)))
+    (buffer-string (& out))))
+
+;; A console argument as the console shows it.
+(define (console-text [a (ptr json-value)]) -> string
+  (let ([v (get a "value")])
+    (if (!= v 0)
+        (value-text v)
+        (let ([u (text-at a "unserializableValue")]) (if (> (-> u length) 0) u (text-at a "description"))))))
+
+(define (value-text [v (ptr json-value)]) -> string
+  (match v
+    [0 ""]
+    [(json-null) "null"]
+    [(json-boolean x) (if x "true" "false")]
+    [(json-number x text) text]
+    [(json-string text) text]
+    [_ (let ([b (make-buffer)]) (json-write! (& b) v "") (buffer-string (& b)))]))
+
+(define (get [v (ptr json-value)] [key string]) -> (ptr json-value) (if (== v 0) 0 (json-get v key)))
+
+(define (text-at [v (ptr json-value)] [key string]) -> string
+  (let ([s string] [x (get v key)]) (if (and (!= x 0) (json-as-string x (& s))) s "")))
+
+(define (number-at [v (ptr json-value)] [key string]) -> f64
+  (let ([n f64 0.0] [x (get v key)]) (if (and (!= x 0) (json-as-f64 x (& n))) n 0.0)))
+
+(define (number-of [s string]) -> f64
+  (let ([negative (and (> (-> s length) 0) (== (@ s 0) #\-))] [n u64 0])
+    (digits-integer (slice s (if negative 1 0) (-> s length)) 10 #f (& n))
+    (if negative (- 0.0 (cast f64 n)) (cast f64 n))))
+
+(define (decoded [text string]) -> (slice u8)
+  (let ([b (make-buffer)])
+    (unless (base64-decode! (& b) text) (throw page-failed "the browser gave bytes that are not Base64"))
+    (buffer-bytes (& b))))
+
+(define (text-bytes [s string]) -> (slice u8) (cast (slice u8) s))
+
+;; The index of the field after the finder that starts at fields[k] (find.mjs).
+(define (finder-end [fields (slice string)] [k u32]) -> u32
+  (when (>= k (-> fields length)) (throw page-failed "a finder is incomplete"))
+  (let ([kind (@ fields k)])
+    (cond [(== kind "within") (finder-end fields (finder-end fields (+ k 1)))]
+          [(== kind "nth") (+ (finder-end fields (+ k 1)) 1)]
+          [(== kind "role") (+ k 3)]
+          [else (+ k 2)])))
+
+(define (one-field [s string]) -> (slice string)
+  (let ([b (make-buffer)]) (pushed-text! (& b) s) (strings-of (& b))))
+
+;; The fields of a request, each of which ends in a zero byte.
+(define (fields-of [s string]) -> (slice string)
+  (let ([b (make-buffer)] [start u32 0])
+    (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+      (when (== (@ s i) 0)
+        (pushed-text! (& b) (slice s start i))
+        (set! start (+ i 1))))
+    (strings-of (& b))))
+
+(define (answer-of [b (ptr page)] [href string]) -> (ptr answer)
+  (let ([all (cast (ptr answer) (-> b answers bytes))] [n (/ (-> b answers length) (sizeof answer))])
+    (for ([i u32 0]) (< i n) (+= i 1) (when (== (-> (+ all i) url) href) (return (+ all i))))
+    0))
+
+(define (opened-pages) -> (slice u32) (slice (cast (ptr u32) (-> pages bytes)) (/ (-> pages length) 4)))
+
+(define (page-of [id u32]) -> (ptr page)
+  (let ([all (opened-pages)])
+    (for ([i u32 0]) (< i (-> all length)) (+= i 1)
+      (when (== (-> (cast (ptr page) (@ all i)) id) id) (return (cast (ptr page) (@ all i)))))
+    0))
+
+(define (page-of-target [target string]) -> (ptr page)
+  (let ([all (opened-pages)])
+    (for ([i u32 0]) (< i (-> all length)) (+= i 1)
+      (when (== (-> (cast (ptr page) (@ all i)) target) target) (return (cast (ptr page) (@ all i)))))
+    0))
+
+(define (page-of-session [session string]) -> (ptr page)
+  (let ([all (opened-pages)])
+    (for ([i u32 0]) (< i (-> all length)) (+= i 1)
+      (let ([b (cast (ptr page) (@ all i))])
+        (when (== (-> b session) session) (return b))
+        (let ([children (strings-in (& (-> b sessions)))])
+          (for ([j u32 0]) (< j (-> children length)) (+= j 1) (when (== (@ children j) session) (return b))))))
+    0))
+
+(define (agent-module? [name string]) -> bool
+  (and (> (-> name length) 4) (ends? name ".mjs")
+       (let ([stem (slice name 0 (- (-> name length) 4))])
+         (for ([i u32 0]) (< i (-> stem length)) (+= i 1)
+           (unless (and (>= (@ stem i) #\a) (<= (@ stem i) #\z)) (return #f)))
+         #t)))
+
+;; The directory of page/install.js and the agent's modules, beside this module in the toolchain's std.
+(define (page-scripts) -> string
+  (when (== (-> scripts length) 0)
+    (let ([toolchain string]) (env-get "SUBSTRATE_TOOLCHAIN" (& toolchain) 0)
+      (set! scripts (joined-path (parent-of toolchain) "std/test/page"))))
+  scripts)
+
+(define (install-script) -> string
+  (when (== (-> install length) 0) (set! install (cast string (file-bytes (joined-path (page-scripts) "install.js")))))
+  install)
+
+(define (file-bytes [path string]) -> (slice u8)
+  (let ([bytes (slice u8)] [why string])
+    (when (< (fs-read-file path (& bytes) (& why)) 0) (throw page-failed why))
+    bytes))
+
+(define (scratch) -> string (let ([s string]) (env-get "SUBSTRATE_SCRATCH" (& s) 0) s))
+
+(define (absolute [path string]) -> string
+  (let ([here string]) (fs-cwd (& here) 0) (resolved-path here path)))
+
+;; The scheme, host and port of an absolute URL.
+(define (origin-of [u string]) -> string
+  (let ([i u32 0])
+    (while (and (< (+ i 2) (-> u length)) (not (and (== (@ u i) #\:) (== (@ u (+ i 1)) #\/) (== (@ u (+ i 2)) #\/))))
+      (+= i 1))
+    (when (>= (+ i 2) (-> u length)) (return u))
+    (+= i 3)
+    (while (and (< i (-> u length)) (!= (@ u i) #\/) (!= (@ u i) #\?) (!= (@ u i) #\#)) (+= i 1))
+    (slice u 0 i)))
+
+;; The host of an origin, without its scheme or port.
+(define (host-of [o string]) -> string
+  (let ([start u32 0] [end u32 0])
+    (while (and (< (+ start 2) (-> o length)) (not (and (== (@ o start) #\:) (== (@ o (+ start 1)) #\/))))
+      (+= start 1))
+    (set! start (if (< (+ start 2) (-> o length)) (+ start 3) 0))
+    (set! end start)
+    (if (and (< end (-> o length)) (== (@ o end) #\[))
+        (while (and (< end (-> o length)) (!= (@ o end) #\])) (+= end 1))
+        (while (and (< end (-> o length)) (!= (@ o end) #\:)) (+= end 1)))
+    (slice o start (if (and (< end (-> o length)) (== (@ o end) #\])) (+ end 1) end))))
+
+;; The path of an absolute URL, without its query or fragment.
+(define (path-of-url [u string]) -> string
+  (let* ([start (-> (origin-of u) length)] [end start])
+    (while (and (< end (-> u length)) (!= (@ u end) #\?) (!= (@ u end) #\#)) (+= end 1))
+    (if (== start end) "/" (slice u start end))))
+
+(define (type-of [path string]) -> string
+  (let ([dot (-> path length)] [ext string])
+    (for ([i u32 0]) (< i (-> path length)) (+= i 1)
+      (cond [(== (@ path i) #\.) (set! dot i)] [(== (@ path i) #\/) (set! dot (-> path length))]))
+    (set! ext (lowered (slice path dot (-> path length))))
+    (cond [(== ext ".html") "text/html"] [(or (== ext ".mjs") (== ext ".js")) "text/javascript"]
+          [(== ext ".json") "application/json"] [(== ext ".css") "text/css"] [(== ext ".wasm") "application/wasm"]
+          [(== ext ".png") "image/png"] [(== ext ".gif") "image/gif"] [(or (== ext ".jpg") (== ext ".jpeg")) "image/jpeg"]
+          [(== ext ".webp") "image/webp"] [(== ext ".bmp") "image/bmp"] [(== ext ".svg") "image/svg+xml"]
+          [(== ext ".wav") "audio/wav"] [(== ext ".mp3") "audio/mpeg"] [(== ext ".ogg") "audio/ogg"]
+          [(== ext ".txt") "text/plain"] [else "application/octet-stream"])))
+
+(define (lowered [s string]) -> string
+  (let ([b (make-buffer)])
+    (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+      (let ([c (@ s i)]) (buffer-add-byte! (& b) (cast i32 (if (and (>= c #\A) (<= c #\Z)) (+ c 32) c)))))
+    (buffer-string (& b))))
+
+(define (first-line [s string]) -> string
+  (let ([i u32 0]) (while (and (< i (-> s length)) (!= (@ s i) 10)) (+= i 1)) (slice s 0 i)))
+
+(define (trimmed [s string]) -> string
+  (let ([start u32 0] [end (-> s length)])
+    (while (and (< start end) (<= (@ s start) 32)) (+= start 1))
+    (while (and (> end start) (<= (@ s (- end 1)) 32)) (-= end 1))
+    (slice s start end)))
+
+(define (contains? [s string] [part string]) -> bool
+  (for ([i u32 0]) (<= (+ i (-> part length)) (-> s length)) (+= i 1)
+    (when (== (slice s i (+ i (-> part length))) part) (return #t)))
+  #f)
+
+(define (quoted [s string]) -> string (let ([b (make-buffer)]) (quoted! (& b) s) (buffer-string (& b))))
+
+(define (quoted! [b (ptr buffer)] [s string]) (let ([v (json-string s)]) (json-write! b (& v) "")))
+
+(define (cat [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+(define (digits [n u32]) -> string (let ([b (make-buffer)]) (write-digits (& b) (cast u64 n) 10) (buffer-string (& b))))
+
+(define (signed-digits [n i32]) -> string
+  (let ([b (make-buffer)])
+    (when (< n 0) (buffer-add-byte! (& b) #\-))
+    (write-digits (& b) (cast u64 (if (< n 0) (- 0 n) n)) 10)
+    (buffer-string (& b))))
+
+(define (kept [s string]) -> string (let ([b (make-buffer)]) (buffer-add-string! (& b) s) (buffer-string (& b))))
+
+(define (pushed! [b (ptr buffer)] [x u32]) (buffer-add-u32! b x))
+
+(define (pushed-text! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+(define (strings-in [b (ptr buffer)]) -> (slice string)
+  (slice (cast (ptr string) (-> b bytes)) (/ (-> b length) (sizeof string))))
+
+(define (strings-of [b (ptr buffer)]) -> (slice string) (strings-in b))
