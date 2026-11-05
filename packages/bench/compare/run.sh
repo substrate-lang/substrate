@@ -2,7 +2,7 @@
 # The same programs in Substrate, Bend and Scheme, timed on V8.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
+root="$(cd "$here/../../.." && pwd)"
 out="$root/build/bench/compare"
 n="${1:-3}"
 shift || true

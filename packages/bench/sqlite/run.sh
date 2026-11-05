@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # packages/sqlite against SQLite built natively, on the SQL of speedtest1's tests but rtree and app, with the database in a
-# file and in memory. In the dev shell: nix develop -c bench/sqlite/run.sh [SIZE [REPS]]
+# file and in memory. In the dev shell: nix develop -c packages/bench/sqlite/run.sh [SIZE [REPS]]
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
+root="$(cd "$here/../../.." && pwd)"
 out="$root/build/bench/sqlite"
 size="${1:-100}"
 reps="${2:-1}"

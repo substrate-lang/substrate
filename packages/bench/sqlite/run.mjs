@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const [out, reps] = process.argv.slice(2);
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..');
+const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../..');
 const script = `${out}/script.sql`;
 const file = `${out}/test.db`;
 

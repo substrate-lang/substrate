@@ -2,7 +2,7 @@
 # Times checking and compiling the module proofs.sh writes.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd "$here/../../.." && pwd)"
+root="$(cd "$here/../../../.." && pwd)"
 n="${1:-3200}"
 out="$root/build/bench/bend"
 mkdir -p "$out"
