@@ -11,7 +11,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // served starts `sub serve` on dir at any free port, and gives the server and its URL. Its stderr is passed on but for
 // its log of requests.
 export async function served(dir) {
-  const server = spawn(path.join(here, '../../bin/substrate'), ['serve', dir, '0'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const server = spawn(path.join(here, '../../../bin/substrate'), ['serve', dir, '0'], { stdio: ['ignore', 'pipe', 'pipe'] });
   readline.createInterface({ input: server.stderr }).on('line', (line) => {
     if (!line.includes(' msg=request ')) process.stderr.write(`${line}\n`);
   });
