@@ -83,6 +83,9 @@ export function workerSide(post) {
       return 0;
     },
     stop() {},
+    wait() {
+      return -1;
+    },
   });
 
   function done(result) {
@@ -98,6 +101,7 @@ export function workerSide(post) {
       out.output(2, utf8.encode(`error: ${message}\n`));
     },
     ended(code, reason) {
+      if (ended) return;
       ended = true;
       out.flush();
       post({ type: 'ended', code, reason });

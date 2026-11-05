@@ -12,7 +12,7 @@ const DONE = 4;
 const ENDED = 5;
 
 // spawn(plan, app) starts a thread running the plan, and returns it with post(message, transfer), terminate(),
-// onMessage(f) and onError(f).
+// onMessage(f) and onError(f), and on Node receive(ms), which waits up to ms for the thread's next message.
 export function workerModule({ spawn }) {
   let caller = null;
   const alive = new Map();
@@ -23,15 +23,18 @@ export function workerModule({ spawn }) {
     if (caller) caller.event(kind, w, tag, value, bytes);
   };
 
-  // end takes the worker's exit code, or -1 and the reason; with a null reason, no event is sent.
-  const end = (w, code, reason) => {
+  // end takes the worker's exit code, or -1 and the reason, and gives its ended event to give; with a null reason,
+  // there is no event.
+  const end = (w, code, reason, give = null) => {
     const worker = alive.get(w);
     if (!worker) return;
     alive.delete(w);
     clearTimeout(worker.timer);
     worker.thread.terminate();
     caller.forget(w);
-    if (reason !== null) deliver(w, worker.tag, ENDED, code, utf8.encode(reason));
+    if (reason === null) return;
+    if (give) give(ENDED, code, utf8.encode(reason));
+    else deliver(w, worker.tag, ENDED, code, utf8.encode(reason));
   };
 
   // The time limit starts again each time the worker becomes busy.
@@ -40,6 +43,21 @@ export function workerModule({ spawn }) {
     worker.timer = worker.time > 0
       ? setTimeout(() => end(w, -1, `time limit exceeded (${worker.time} ms)`), worker.time)
       : null;
+  };
+
+  // received takes a message from worker w's thread, and gives the event it makes, if any, to give(kind, value, bytes).
+  const received = (w, worker, m, give) => {
+    if (m.type === 'busy' && worker.owed > 0) {
+      worker.owed--;
+      started++;
+    }
+    if (m.type === 'output' && !worker.heard) caller.write(m.fd, m.bytes);
+    else if (m.type === 'output') give(m.fd === 2 ? STDERR : STDOUT, 0, m.bytes);
+    else if (m.type === 'message') give(MESSAGE, 0, m.bytes);
+    else if (m.type === 'done') give(DONE, 0, utf8.encode(m.trap));
+    else if (m.type === 'busy') limit(w, worker);
+    else if (m.type === 'idle') clearTimeout(worker.timer);
+    else if (m.type === 'ended') end(w, m.code, m.reason, give);
   };
 
   function start(entry, argument, time, pages, heard, tag, app, err, grants, setup) {
@@ -53,21 +71,10 @@ export function workerModule({ spawn }) {
       return 0;
     }
     const w = nextNumber++;
-    const worker = { thread, tag, time, timer: null, owed: 1 };
+    const worker = { thread, tag, heard, time, timer: null, owed: 1 };
     alive.set(w, worker);
     thread.onMessage((m) => {
-      if (alive.get(w) !== worker) return;
-      if (m.type === 'busy' && worker.owed > 0) {
-        worker.owed--;
-        started++;
-      }
-      if (m.type === 'output' && !heard) caller.write(m.fd, m.bytes);
-      else if (m.type === 'output') deliver(w, tag, m.fd === 2 ? STDERR : STDOUT, 0, m.bytes);
-      else if (m.type === 'message') deliver(w, tag, MESSAGE, 0, m.bytes);
-      else if (m.type === 'done') deliver(w, tag, DONE, 0, utf8.encode(m.trap));
-      else if (m.type === 'busy') limit(w, worker);
-      else if (m.type === 'idle') clearTimeout(worker.timer);
-      else if (m.type === 'ended') end(w, m.code, m.reason);
+      if (alive.get(w) === worker) received(w, worker, m, (kind, value, bytes) => deliver(w, tag, kind, value, bytes));
     });
     thread.onError((reason, code) => (setup.ends && code === 0 ? end(w, 0, '') : end(w, -1, reason)));
     limit(w, worker);
@@ -121,6 +128,25 @@ export function workerModule({ spawn }) {
       },
       stop(w) {
         end(w, -1, null);
+      },
+      wait(w, ms, vp, bp) {
+        const worker = alive.get(w);
+        if (!worker || !worker.thread.receive) return -1;
+        const until = Date.now() + (ms >>> 0);
+        let got = null;
+        while (got === null) {
+          const m = worker.thread.receive(Math.max(0, until - Date.now()));
+          if (m === undefined) return 0;
+          received(w, worker, m, (kind, value, bytes) => {
+            got = { kind, value, bytes };
+          });
+        }
+        const p = got.bytes.length > 0 ? caller.give(got.bytes, caller.u(bp) + 4) : 0;
+        const view = new DataView(caller.memory().buffer);
+        view.setUint32(caller.u(bp), p, true);
+        if (p === 0) view.setUint32(caller.u(bp) + 4, 0, true);
+        view.setInt32(caller.u(vp), got.value, true);
+        return got.kind;
       },
     };
   };
