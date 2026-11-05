@@ -14,13 +14,9 @@ bootstrap:
 seed:
 	bin/bootstrap seed
 
-repl:
-	cd packages/web && ../../bin/substrate site -c $(abspath build/cache) repl -o $(abspath $(OUT)/web/repl)
-
 docs:
 	rm -rf $(OUT)/doc
-	bin/substrate doc --html -o $(OUT)/doc substrate std cmd packages/web packages/scheme packages/bend packages/nodes \
-	  packages/sqlite
+	bin/substrate doc --html -o $(OUT)/doc substrate std cmd
 
 npm:
 	npm/pack.sh
@@ -29,4 +25,4 @@ npm:
 clean:
 	rm -rf build
 
-.PHONY: build/sub check bootstrap seed repl docs npm clean
+.PHONY: build/sub check bootstrap seed docs npm clean

@@ -23,8 +23,8 @@ fail=0
 built=0
 unbuilt=0
 
-# The packages' tests, given every grant.
-packages=(./std ./cmd ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite ./tests ./tests/web)
+# The packages' tests, given every grant: the toolchain's, then those of packages/.
+packages=(./std ./cmd ./tests ./tests/web ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite)
 if bin/substrate test -c "$cache" -A "$@" "${packages[@]}"; then
   pass=$((pass + 1))
 else
