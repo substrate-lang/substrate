@@ -1,8 +1,7 @@
-// The host for a web page: runs a program in a browser, its files kept in memory, with the grants and fakes it is
-// given, by default every grant and no fakes. Its workers keep its fakes and may be given fewer grants.
+// The host for a web page: runs a program in a browser, its files kept in memory. A page has every grant, and its
+// workers may be given fewer, and fakes (worker-script.mjs).
 import { createHost } from '../subhost-core.mjs';
 import { fsModule } from '../fs.mjs';
-import { fakeModules } from '../modules/fake.mjs';
 import { allGrants, pairsFrom, requestOf } from '../grants.mjs';
 import { pageFiles, resolvePath } from './fs.mjs';
 
@@ -118,12 +117,6 @@ export function run(options, names, wasm) {
   const cwd = options.cwd || '/';
   const files = options.files || new Map();
   const grants = options.grants || allGrants();
-  const fakes = new Map(options.fakes || []);
-  const read = (dir, path) => {
-    const bytes = files.get(resolvePath(cwd, `${dir}/${path}`));
-    if (!bytes) throw new Error('No such file or directory');
-    return bytes;
-  };
 
   const out = lines((l) => console.log(l));
   const err = lines((l) => console.error(l));
@@ -131,11 +124,10 @@ export function run(options, names, wasm) {
   const decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 
-  const app = { files, cwd, fakes, entry: null, ended: false, realTime: [] };
+  const app = { files, cwd, entry: null, ended: false, realTime: [] };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
   if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd, grants)));
-  for (const [name, make] of fakeModules({ grants, fakes }, read)) modules.set(name, make);
   const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
   const ended = (code, reason) => {
     app.ended = true;

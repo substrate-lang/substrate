@@ -2,7 +2,7 @@
 // worker can have, within the worker's grants and with its fakes. Its files are a read-only copy of the page's.
 import { run } from './subhost-web.mjs';
 import { fsModule } from '../fs.mjs';
-import { pageFiles } from './fs.mjs';
+import { pageFiles, resolvePath } from './fs.mjs';
 import { workerSide } from '../worker-side.mjs';
 
 const loaders = {
@@ -32,6 +32,17 @@ function readOnly(files) {
   };
 }
 
+async function fakesOf(m) {
+  if (m.fakes.length === 0) return new Map();
+  const { fakeModules } = await import('../modules/fake.mjs');
+  const read = (dir, path) => {
+    const bytes = m.files.get(resolvePath(m.cwd, `${dir}/${path}`));
+    if (!bytes) throw new Error('No such file or directory');
+    return bytes;
+  };
+  return fakeModules({ grants: m.grants, fakes: new Map(m.fakes) }, read);
+}
+
 const side = workerSide((m, transfer) => self.postMessage(m, transfer));
 
 self.onmessage = async (e) => {
@@ -41,9 +52,11 @@ self.onmessage = async (e) => {
     const wasm = new Map(m.modules);
     const modules = { worker: side.worker, fs: fsModule(readOnly(pageFiles(m.files, m.cwd, m.grants))) };
     const absent = new Set();
+    const fakes = await fakesOf(m);
     for (const name of m.names) {
       if (name in modules) continue;
-      if (loaders[name]) modules[name] = await loaders[name](m.grants);
+      if (fakes.has(name)) modules[name] = fakes.get(name);
+      else if (loaders[name]) modules[name] = await loaders[name](m.grants);
       else absent.add(name);
     }
     const app = run({
@@ -55,7 +68,6 @@ self.onmessage = async (e) => {
       modules,
       absent,
       grants: m.grants,
-      fakes: m.fakes,
       entry: m.entry,
       onEnd: side.ended,
       delivered: side.delivered,

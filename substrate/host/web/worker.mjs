@@ -1,5 +1,5 @@
-// The host module "worker" in a browser: the thread is a Web Worker, given a copy of the page's files and the page's
-// fakes with those its grants ask for.
+// The host module "worker" in a browser: the thread is a Web Worker, given a copy of the page's files and the fakes its
+// grants ask for.
 import { workerModule } from '../worker.mjs';
 
 export function workers() {
@@ -16,7 +16,7 @@ export function workers() {
         files: app.files,
         cwd: app.cwd,
         grants: plan.grants,
-        fakes: [...app.fakes, ...plan.fakes],
+        fakes: [...plan.fakes],
         names: plan.names,
         pages: plan.pages,
         heard: plan.heard,
