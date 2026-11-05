@@ -1,6 +1,6 @@
 // The host module "worker" (worker.sub). The browser and Node each give spawn, their way of starting a thread.
 import { entries } from './entries.mjs';
-import { askedOf, within } from './grants.mjs';
+import { askedOf, mayTree, within } from './grants.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -108,8 +108,12 @@ export function workerModule({ spawn }) {
           request = caller.parseGrants(entries(string(gp, gl)));
           const read = [...request.fakes].filter(([name]) => name === 'fetch').map(([, dir]) => dir || '.');
           if (request.tls) read.push(request.tls.cert, request.tls.key);
-          within(caller.parseGrants(read.flatMap((file) => ['read', file])).grants, caller.grants());
-          grants = within(askedOf(request, caller.grants()), caller.grants());
+          const parent = caller.grants();
+          const files = caller.parseGrants(read.flatMap((file) => ['read', file])).grants.read.items;
+          for (const file of files) {
+            if (!mayTree(parent.read, file)) throw new Error(`read ${file} reaches beyond the parent's grants`);
+          }
+          grants = within(askedOf(request, parent), parent);
         } catch (e) {
           caller.fail(err, `worker.start: ${e.message}`);
           return 0;

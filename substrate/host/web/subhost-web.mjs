@@ -1,5 +1,5 @@
-// The host for a web page: runs a program in a browser, its files kept in memory. A page has every grant, and its
-// workers may be given fewer.
+// The host for a web page: runs a program in a browser, with its files kept in memory. A page has every grant and
+// no fakes. Its workers can be given fewer grants and some fakes (worker-script.mjs).
 import { createHost } from '../subhost-core.mjs';
 import { fsModule } from '../fs.mjs';
 import { allGrants, pairsFrom, requestOf } from '../grants.mjs';
@@ -116,6 +116,7 @@ export async function boot(options) {
 export function run(options, names, wasm) {
   const cwd = options.cwd || '/';
   const files = options.files || new Map();
+  const grants = options.grants || allGrants();
 
   const out = lines((l) => console.log(l));
   const err = lines((l) => console.error(l));
@@ -126,7 +127,7 @@ export function run(options, names, wasm) {
   const app = { files, cwd, entry: null, ended: false, realTime: [] };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
-  if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd)));
+  if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd, grants)));
   const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
   const ended = (code, reason) => {
     app.ended = true;
@@ -144,7 +145,7 @@ export function run(options, names, wasm) {
     active: options.active,
     modules,
     absent: options.absent,
-    grants: options.grants || allGrants(),
+    grants,
     parseGrants: (list) => requestOf(pairsFrom(list), (p) => resolvePath(cwd, p)),
     memoryPages: options.memoryPages || 0,
   });

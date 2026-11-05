@@ -2,8 +2,10 @@
 // the host modules it imports. It sets window.modules, sets window.ready once the program has started, and sets
 // window.ended to the program's exit status and window.endReason to why it ended.
 import { boot } from './subhost-web.mjs';
+import { allGrants } from '../grants.mjs';
 
 const query = new URLSearchParams(location.search);
+const grants = allGrants();
 const root = document.getElementById('root');
 const made = {};
 const makers = {
@@ -18,8 +20,8 @@ const makers = {
   clock: async () => (await import('../modules/clock.mjs')).clock(),
   random: async () => (await import('../modules/random.mjs')).random(),
   timer: async () => (await import('../modules/timer.mjs')).timer(),
-  fetch: async () => (await import('../modules/fetch.mjs')).fetchModule(),
-  websocket: async () => (await import('../modules/websocket.mjs')).websocket(),
+  fetch: async () => (await import('../modules/fetch.mjs')).fetchModule(grants),
+  websocket: async () => (await import('../modules/websocket.mjs')).websocket(grants),
 };
 const make = (name) => (made[name] ||= makers[name]());
 
@@ -28,6 +30,7 @@ window.app = await boot({
   lists: [['assets.list', '/']],
   packs: [['files.pack', '/']],
   args: query.getAll('arg'),
+  grants,
   onEnd: (code, reason) => {
     window.ended = code;
     window.endReason = reason;

@@ -1,5 +1,5 @@
-// A page's files for fs.mjs, kept in memory under the program's working directory, within the grants if given. A
-// directory is there while a file is in it, and there are no links or modes.
+// A page's files for fs.mjs, kept in memory under the program's working directory and checked against the program's
+// grants. A directory exists as long as it has a file in it, and there are no links or modes.
 import { mayPath, mayTree, pathDenied, unlimited } from '../grants.mjs';
 import { sameFile, tempName } from '../fs.mjs';
 
@@ -21,7 +21,7 @@ export function pageFiles(files, cwd, grants) {
   const times = new Map();
   const at = (k, p, tree = false) => {
     const key = resolvePath(cwd, p);
-    if (grants && !unlimited(grants[k]) && !(tree ? mayTree : mayPath)(grants[k], key)) throw pathDenied(k);
+    if (!unlimited(grants[k]) && !(tree ? mayTree : mayPath)(grants[k], key)) throw pathDenied(k);
     return key;
   };
   const read = (p) => {

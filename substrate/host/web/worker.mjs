@@ -1,10 +1,11 @@
-// The host module "worker" in a browser: the thread is a Web Worker, given a copy of the page's files.
+// The host module "worker" in a browser. Each worker runs in a Web Worker, which gets a copy of the page's files and
+// the fakes the worker's grants ask for.
 import { workerModule } from '../worker.mjs';
 
 export function workers() {
   return workerModule({
     spawn(plan, app) {
-      if (plan.fakes.size > 0 || plan.tls) throw new Error('worker.start: a page gives its workers no fakes or TLS files');
+      if (plan.tls) throw new Error('worker.start: a page\'s workers cannot have TLS files');
       if (plan.ends) throw new Error('worker.start: a page\'s workers do not end on their own');
       const thread = new Worker(new URL('./worker-script.mjs', import.meta.url), { type: 'module' });
       thread.postMessage({
@@ -15,6 +16,7 @@ export function workers() {
         files: app.files,
         cwd: app.cwd,
         grants: plan.grants,
+        fakes: [...plan.fakes],
         names: plan.names,
         pages: plan.pages,
         heard: plan.heard,

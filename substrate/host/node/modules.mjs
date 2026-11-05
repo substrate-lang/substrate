@@ -1,20 +1,20 @@
-// The host modules of a program on Node, each made when first needed, with the program's grants and the fakes
-// and certificate the host was set up with.
+// The host modules of a program on Node, each made the first time it is needed. They use the program's grants and
+// TLS certificate, and each module the program was given a fake for is replaced by that fake (modules/fake.mjs).
+import fs from 'node:fs';
+import path from 'node:path';
 import { createRequire } from 'node:module';
 import { isLoaderVariable } from '../grants.mjs';
 
 const require = createRequire(import.meta.url);
 
 const loaders = {
-  clock: (s) => (s.fakes.has('clock') ? require('./fake.mjs').fakeClock() : require('../modules/clock.mjs').clock()),
+  clock: () => require('../modules/clock.mjs').clock(),
   random: () => require('../modules/random.mjs').random(),
-  timer: (s) => (s.fakes.has('timer') ? require('./fake.mjs').fakeTimer() : require('../modules/timer.mjs').timer()),
-  fetch: (s) => (s.fakes.has('fetch')
-    ? require('./fake.mjs').fakeFetch(s.fakes.get('fetch') || '.', s.grants)
-    : require('../modules/fetch.mjs').fetchModule(s.grants, true, require('./resolve.mjs').dispatchers(s.grants))),
-  websocket: (s) => (s.fakes.has('websocket')
-    ? require('./fake.mjs').fakeWebsocket(s.grants)
-    : require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants), true)),
+  timer: () => require('../modules/timer.mjs').timer(),
+  fetch: (s) => require('../modules/fetch.mjs').fetchModule(s.grants, true,
+    require('./resolve.mjs').dispatchers(s.grants)),
+  websocket: (s) => require('../modules/websocket.mjs').websocket(s.grants, require('./resolve.mjs').guards(s.grants),
+    true),
   worker: (s) => require('./worker.mjs').workers(s),
   net: (s) => require('./net.mjs').netModule(s.grants, s.tls),
   process: (s) => require('./process.mjs').processes(s.grants, s.loader, s),
@@ -33,12 +33,27 @@ export const setupOf = (grants) => ({
   loader: Object.fromEntries(Object.entries(process.env).filter(([name]) => isLoaderVariable(name))),
 });
 
+const read = (dir, p) => {
+  const root = fs.realpathSync.native(dir);
+  const file = fs.realpathSync.native(path.join(root, p));
+  const inside = path.relative(root, file);
+  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+    throw new Error('outside the directory');
+  }
+  return fs.readFileSync(file);
+};
+
 export function hostModules(setup, own = new Map()) {
   const made = new Map(own);
+  let fakes = null;
+  const fake = (name) => {
+    fakes ||= require('../modules/fake.mjs').fakeModules(setup, read);
+    return fakes.get(name);
+  };
   return {
     has: (name) => made.has(name) || Object.hasOwn(loaders, name),
     get(name) {
-      if (!made.has(name)) made.set(name, loaders[name](setup));
+      if (!made.has(name)) made.set(name, setup.fakes.has(name) ? fake(name) : loaders[name](setup));
       return made.get(name);
     },
     keys: () => Object.keys(loaders),
