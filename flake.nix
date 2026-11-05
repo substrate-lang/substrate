@@ -44,6 +44,7 @@
             pkgs.nodejs        # V8: the host (substrate/host/subhost.mjs), and the web tests' driver
             pkgs.openssl       # certificates for the proxy tests
             pkgs.git           # repositories for the package tests
+            pkgs.git-filter-repo   # substrate-packages' history, taken from this repository's
             pkgs.gh            # GitHub: the CI runs
             (chromium pkgs)    # the headless browser of the web tests (above)
           ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
