@@ -1,5 +1,5 @@
 // A worker's Web Worker runs the worker's modules, with the worker module's own side and the page's modules that a
-// worker can have, within the worker's grants. Its files are a read-only copy of the page's.
+// worker can have, within the worker's grants and with its fakes. Its files are a read-only copy of the page's.
 import { run } from './subhost-web.mjs';
 import { fsModule } from '../fs.mjs';
 import { pageFiles } from './fs.mjs';
@@ -55,6 +55,7 @@ self.onmessage = async (e) => {
       modules,
       absent,
       grants: m.grants,
+      fakes: m.fakes,
       entry: m.entry,
       onEnd: side.ended,
       delivered: side.delivered,

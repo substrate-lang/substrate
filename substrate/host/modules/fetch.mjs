@@ -55,8 +55,7 @@ async function fetchChecked(net, url, init, redirects, dispatcherFor) {
   }
 }
 
-// grants is undefined for a page, which may fetch anything; on Node, redirects is true and dispatcherFor gives a
-// port's dispatcher (node/resolve.mjs).
+// On Node, redirects is true and dispatcherFor gives a port's dispatcher (node/resolve.mjs).
 export function fetchModule(grants, redirects = false, dispatcherFor = () => undefined) {
   return (caller) => ({
     source: SOURCE,
@@ -87,7 +86,7 @@ export function fetchModule(grants, redirects = false, dispatcherFor = () => und
       const id = caller.streams.add(tag, source);
       const init = { method, headers, body, signal: controller.signal };
       const target = URL.canParse(url, base) ? new URL(url, base) : null;
-      const request = grants && !unlimited(grants.net) && target && /^https?:$/.test(target.protocol)
+      const request = !unlimited(grants.net) && target && /^https?:$/.test(target.protocol)
         ? fetchChecked(grants.net, target, init, redirects, dispatcherFor)
         : fetch(url, init);
       request

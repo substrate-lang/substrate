@@ -17,8 +17,8 @@ const BINARY = 2;
 
 const full = 1 << 20;
 
-// grants is undefined for a page, which may connect anywhere; on Node, guard gives a socket's dispatcher
-// (node/resolve.mjs), and node is set, as only Node's WebSocket can send headers.
+// On Node, guard gives a socket's dispatcher (node/resolve.mjs), and node is set, as only Node's WebSocket can send
+// headers.
 export function websocket(grants, guard, node = false) {
   const sockets = new Map();
   let next = 1;
@@ -45,7 +45,7 @@ export function websocket(grants, guard, node = false) {
       },
       connect(up, ul, pp, pl, hp, hl, tag, err) {
         const url = caller.string(up, ul);
-        if (grants && URL.canParse(url) && !mayUrl(grants.net, new URL(url))) {
+        if (URL.canParse(url) && !mayUrl(grants.net, new URL(url))) {
           caller.fail(err, `websocket.connect: ${new URL(url).host} is not granted (--allow-net)`);
           return 0;
         }

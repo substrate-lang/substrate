@@ -1,56 +1,65 @@
-// Fake clock, timer, fetch and websocket modules for tests. Fetch answers from a directory, a connection echoes
-// what it is sent, and time moves to the earliest timer once no other work is left. The grants still apply.
-import fs from 'node:fs';
-import path from 'node:path';
+// Fake clock, timer, fetch and websocket modules for tests, on any host. Fetch answers from a directory, a connection
+// echoes what it is sent, and time moves to the earliest timer once no other work is left. The grants still apply.
 import { errors } from '../errors.mjs';
 import { entries } from '../entries.mjs';
 import { mayUrl } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
 
-let now = 0;
-const work = [];
-const timers = new Map();
-let scheduled = false;
+// later runs f after the work the host has waiting: by setImmediate on Node, and in a browser by a message to itself.
+const later = globalThis.setImmediate ? (f) => globalThis.setImmediate(f) : (() => {
+  const channel = new MessageChannel();
+  const queue = [];
+  channel.port1.onmessage = () => queue.shift()();
+  return (f) => {
+    queue.push(f);
+    channel.port2.postMessage(null);
+  };
+})();
 
-function schedule() {
-  if (scheduled) return;
-  scheduled = true;
-  setImmediate(run);
-}
+// fakeModules gives the fakes setup.fakes asks for, on one clock. read(dir, path) gives the bytes of a file the fake
+// fetch answers with, read as the host reads its own files.
+export function fakeModules(setup, read) {
+  let now = 0;
+  const work = [];
+  const timers = new Map();
+  let scheduled = false;
 
-function run() {
-  scheduled = false;
-  if (work.length > 0) {
-    work.shift()();
-  } else {
-    let first = null;
-    for (const [id, t] of timers) if (first === null || t.due < timers.get(first).due) first = id;
-    if (first === null) return;
-    const t = timers.get(first);
-    timers.delete(first);
-    if (t.due > now) now = t.due;
-    t.fire();
+  const schedule = () => {
+    if (scheduled) return;
+    scheduled = true;
+    later(run);
+  };
+
+  function run() {
+    scheduled = false;
+    if (work.length > 0) {
+      work.shift()();
+    } else {
+      let first = null;
+      for (const [id, t] of timers) if (first === null || t.due < timers.get(first).due) first = id;
+      if (first === null) return;
+      const t = timers.get(first);
+      timers.delete(first);
+      if (t.due > now) now = t.due;
+      t.fire();
+    }
+    if (work.length > 0 || timers.size > 0) schedule();
   }
-  if (work.length > 0 || timers.size > 0) schedule();
-}
 
-const soon = (f) => {
-  work.push(f);
-  schedule();
-};
+  const soon = (f) => {
+    work.push(f);
+    schedule();
+  };
 
-export function fakeClock() {
-  return () => ({
+  const clock = () => () => ({
     now: () => 1700000000000 + now,
     monotonic: () => now,
   });
-}
 
-export function fakeTimer() {
-  let next = 1;
-  return (caller) => {
-    return {
+  const timer = () => {
+    let next = 1;
+    return (caller) => ({
       source: 5,
       end() {
         timers.clear();
@@ -65,16 +74,14 @@ export function fakeTimer() {
         timers.delete(id);
         caller.forget(id);
       },
-    };
+    });
   };
-}
 
-export function fakeFetch(root, grants) {
-  return (caller) => ({
+  const fetch = (root) => (caller) => ({
     source: 6,
     start(mp, ml, up, ul, hp, hl, bp, bl, tag) {
       const url = new URL(caller.string(up, ul), 'http://fake/');
-      if (!mayUrl(grants.net, url)) {
+      if (!mayUrl(setup.grants.net, url)) {
         const id = caller.streams.add(tag, { pull: async () => null, close() {} });
         caller.streams.drop(id);
         const why = utf8.encode(`fetch: ${url.host} is not granted (--allow-net)`);
@@ -84,7 +91,7 @@ export function fakeFetch(root, grants) {
       let status = 200;
       let body;
       try {
-        body = fs.readFileSync(path.join(root, url.pathname));
+        body = read(root, url.pathname);
       } catch (e) {
         status = 404;
         body = utf8.encode('not found');
@@ -103,20 +110,18 @@ export function fakeFetch(root, grants) {
       return id;
     },
   });
-}
 
-export function fakeWebsocket(grants) {
-  const open = new Map();
-  let next = 1;
-  return (caller) => {
-    return {
+  const websocket = () => {
+    const open = new Map();
+    let next = 1;
+    return (caller) => ({
       source: 7,
       end() {
         open.clear();
       },
       connect(up, ul, pp, pl, hp, hl, tag, err) {
         const url = new URL(caller.string(up, ul));
-        if (!mayUrl(grants.net, url)) {
+        if (!mayUrl(setup.grants.net, url)) {
           caller.fail(err, `websocket.connect: ${url.host} is not granted (--allow-net)`);
           return 0;
         }
@@ -140,6 +145,9 @@ export function fakeWebsocket(grants) {
         open.delete(id);
         caller.forget(id);
       },
-    };
+    });
   };
+
+  const made = { clock, timer, fetch, websocket };
+  return new Map([...setup.fakes].map(([name, item]) => [name, made[name](item || '.')]));
 }
