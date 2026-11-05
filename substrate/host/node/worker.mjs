@@ -1,5 +1,5 @@
-// The host module "worker" on Node. A worker is a worker thread set up like its parent's host: it keeps the parent's
-// fakes and adds those its grants ask for, and TLS files its grants name replace the parent's.
+// The host module "worker" on Node. A worker is a worker thread set up like its parent's host. It keeps its parent's
+// fakes and adds the fakes its grants ask for, and TLS files named in its grants replace the parent's TLS files.
 import fs from 'node:fs';
 import { MessageChannel, Worker, receiveMessageOnPort } from 'node:worker_threads';
 import { workerModule } from '../worker.mjs';

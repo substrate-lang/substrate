@@ -17,8 +17,8 @@ const BINARY = 2;
 
 const full = 1 << 20;
 
-// On Node, guard gives a socket's dispatcher (node/resolve.mjs), and node is set, as only Node's WebSocket can send
-// headers.
+// On Node, guard gives the dispatcher for each socket (node/resolve.mjs), and node is true, since only Node's
+// WebSocket can send headers.
 export function websocket(grants, guard, node = false) {
   const sockets = new Map();
   let next = 1;

@@ -1,12 +1,12 @@
-// Fake clock, timer, fetch and websocket modules for tests, on any host. Fetch answers from a directory, a connection
-// echoes what it is sent, and time moves to the earliest timer once no other work is left. The grants still apply.
+// Fake clock, timer, fetch and websocket modules for tests, on any host. The fake fetch answers with files from a
+// directory, and the fake websocket sends back each message it gets. Time jumps to the next timer once there is no
+// other work to do. Fetches and connections still need the program's net grants.
 import { errors } from '../errors.mjs';
 import { entries } from '../entries.mjs';
 import { mayUrl } from '../grants.mjs';
 
 const utf8 = new TextEncoder();
 
-// later runs f after the work the host has waiting: by setImmediate on Node, and in a browser by a message to itself.
 const later = globalThis.setImmediate ? (f) => globalThis.setImmediate(f) : (() => {
   const channel = new MessageChannel();
   const queue = [];
@@ -17,8 +17,8 @@ const later = globalThis.setImmediate ? (f) => globalThis.setImmediate(f) : (() 
   };
 })();
 
-// fakeModules gives the fakes setup.fakes asks for, on one clock. read(dir, path) gives the bytes of a file the fake
-// fetch answers with, read as the host reads its own files.
+// fakeModules makes the fakes a program was set up with, which share one clock. read(dir, path) gives the bytes of
+// the file the fake fetch answers with, and throws when there is no such file.
 export function fakeModules(setup, read) {
   let now = 0;
   const work = [];

@@ -1,5 +1,5 @@
-// The host for a web page: runs a program in a browser, its files kept in memory. A page has every grant, and its
-// workers may be given fewer, and fakes (worker-script.mjs).
+// The host for a web page: runs a program in a browser, with its files kept in memory. A page has every grant and
+// no fakes. Its workers can be given fewer grants and some fakes (worker-script.mjs).
 import { createHost } from '../subhost-core.mjs';
 import { fsModule } from '../fs.mjs';
 import { allGrants, pairsFrom, requestOf } from '../grants.mjs';

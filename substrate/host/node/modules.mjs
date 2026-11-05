@@ -1,5 +1,5 @@
-// The host modules of a program on Node, each made when first needed, with the program's grants and certificate, and
-// with the fakes it was set up with (modules/fake.mjs) in place of the modules they fake.
+// The host modules of a program on Node, each made the first time it is needed. They use the program's grants and
+// TLS certificate, and each module the program was given a fake for is replaced by that fake (modules/fake.mjs).
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -33,7 +33,6 @@ export const setupOf = (grants) => ({
   loader: Object.fromEntries(Object.entries(process.env).filter(([name]) => isLoaderVariable(name))),
 });
 
-// A file a fake fetch serves: one inside dir once links are followed.
 const read = (dir, p) => {
   const root = fs.realpathSync.native(dir);
   const file = fs.realpathSync.native(path.join(root, p));

@@ -55,7 +55,7 @@ async function fetchChecked(net, url, init, redirects, dispatcherFor) {
   }
 }
 
-// On Node, redirects is true and dispatcherFor gives a port's dispatcher (node/resolve.mjs).
+// On Node, redirects is true, and dispatcherFor gives the dispatcher for each port (node/resolve.mjs).
 export function fetchModule(grants, redirects = false, dispatcherFor = () => undefined) {
   return (caller) => ({
     source: SOURCE,
