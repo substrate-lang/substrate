@@ -18,8 +18,8 @@ check "sub version" "substrate $version" "$(sub version | cut -d' ' -f1-2)"
 mkdir -p "$tmp/hello/tests"
 cd "$tmp/hello"
 printf '(package hello (version "0.1.0"))\n' > package.sub
-printf '(require-unqualified b64 std/encoding/base64)\n(provide greeting)\n(define (greeting) -> string "hi")\n(define (main) (let ([b (make-buffer)]) (base64-encode! (& b) (cast (slice u8) (greeting))) (printf "~a~n" (buffer-string (& b)))))\n' > hello.sub
-printf '(require-unqualified hello hello)\n(test greets (expect-equal (greeting) "hi"))\n' > tests/hello.sub
+printf '(require-unqualified std/encoding/base64)\n(provide greeting)\n(define (greeting) -> string "hi")\n(define (main) (let ([b (make-buffer)]) (base64-encode! (& b) (cast (slice u8) (greeting))) (printf "~a~n" (buffer-string (& b)))))\n' > hello.sub
+printf '(require-unqualified hello)\n(test greets (expect-equal (greeting) "hi"))\n' > tests/hello.sub
 check "substrate run" "aGk=" "$(substrate run hello.sub)"
 substrate build hello.sub -o out > /dev/null
 check "substrate run DIR" "aGk=" "$(substrate run out)"

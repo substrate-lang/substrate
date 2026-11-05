@@ -1,0 +1,129 @@
+;; Changes to the page, written as patches for the host module "dom". dom.sub sends them. A template is HTML in which
+;; the nodes a program will change are marked: elements with a data-n attribute, <!--t--> for a text node, and <!--a-->
+;; for a place that other pieces can be put before. dom-add! puts a piece, a copy of a template, on the page and returns
+;; the piece's number; its marked nodes are numbered after it, in document order. The strings these functions take are
+;; copied, and the copies last until the patches are sent or dom-discard! drops them.
+(provide dom-template dom-add! dom-remove! dom-forget! dom-move! dom-set-text! dom-set-attr! dom-remove-attr! dom-listen!
+         dom-listen-window! dom-focus! dom-scroll-to-end! dom-pointer-lock! dom-image! dom-discard! dom-patches
+         dom-frame-alloc dom-flushes)
+
+(define patches buffer)
+(define frame arena)
+(define next-id u32 1)
+(define next-template u32 1)
+(define flushes u32 0)
+(define counts buffer)
+
+(define (dom-patches) -> (ptr buffer) (& patches))
+
+(define (dom-frame-alloc [n u32]) -> (ptr void) (arena-alloc (& frame) n))
+
+;; How many times the patches have been sent or dropped.
+(define (dom-flushes) -> u32 flushes)
+
+(define (words! [w (slice u32)]) (buffer-add! (& patches) (slice (cast (ptr u8) (-> w items)) (* 4 (-> w length)))))
+
+(define (kept [s string]) -> string
+  (let ([copy (cast (ptr u8) (dom-frame-alloc (-> s length)))])
+    (memcpy copy (-> s bytes) (-> s length))
+    (cast string (slice copy (-> s length)))))
+
+;; ---- templates and pieces ----
+
+(define (dom-template [html string]) -> u32
+  (let ([t next-template] [n (marked html)] [h (kept html)])
+    (+= next-template 1)
+    (buffer-add! (& counts) (slice (cast (ptr u8) (& n)) 4))
+    (words! (slice (array-of u32 1 t (cast u32 (-> h bytes)) (-> h length))))
+    t))
+
+(define (size-of [template u32]) -> u32 (@ (cast (ptr u32) (-> counts bytes)) (- template 1)))
+
+(define (dom-add! [template u32] [parent u32] [before u32]) -> u32
+  (let ([first next-id] [n (size-of template)])
+    (+= next-id (+ n 1))
+    (words! (slice (array-of u32 2 template first n parent before)))
+    first))
+
+;; dom-remove! takes a piece off the page and forgets its nodes. dom-forget! only forgets them, for a piece that was
+;; inside one taken off.
+(define (dom-remove! [first u32] [template u32]) (words! (slice (array-of u32 3 first (size-of template)))))
+(define (dom-forget! [first u32] [template u32]) (words! (slice (array-of u32 4 first (size-of template)))))
+
+(define (dom-move! [first u32] [parent u32] [before u32]) (words! (slice (array-of u32 5 first parent before))))
+
+(define (marked [html string]) -> u32
+  (let ([n u32 0] [i u32 0])
+    (while (< i (-> html length))
+      (cond [(at? html i "<!--")
+             (when (or (at? html (+ i 4) "t-->") (at? html (+ i 4) "a-->")) (+= n 1))
+             (set! i (after html (+ i 4) "-->"))]
+            [(== (@ html i) #\<)
+             (let ([end (tag-end html (+ i 1))])
+               (when (data-n? html (+ i 1) end) (+= n 1))
+               (set! i end))]
+            [else (+= i 1)]))
+    n))
+
+(define (at? [s string] [i u32] [part string]) -> bool
+  (and (<= (+ i (-> part length)) (-> s length)) (== (slice s i (+ i (-> part length))) part)))
+
+(define (after [s string] [i u32] [part string]) -> u32
+  (let ([j i])
+    (while (and (< j (-> s length)) (not (at? s j part))) (+= j 1))
+    (if (< j (-> s length)) (+ j (-> part length)) j)))
+
+(define (tag-end [s string] [i u32]) -> u32
+  (let ([j i] [q u8 0])
+    (while (and (< j (-> s length)) (or (!= q 0) (!= (@ s j) #\>)))
+      (cond [(!= q 0) (when (== (@ s j) q) (set! q 0))]
+            [(or (== (@ s j) 34) (== (@ s j) 39)) (set! q (@ s j))])
+      (+= j 1))
+    (if (< j (-> s length)) (+ j 1) j)))
+
+(define (data-n? [s string] [from u32] [to u32]) -> bool
+  (let ([q u8 0])
+    (for ([j u32 from]) (< j to) (+= j 1)
+      (cond [(!= q 0) (when (== (@ s j) q) (set! q 0))]
+            [(or (== (@ s j) 34) (== (@ s j) 39)) (set! q (@ s j))]
+            [(and (space? (@ s (- j 1))) (at? s j "data-n") (< (+ j 6) to)
+                  (let ([c (@ s (+ j 6))]) (or (space? c) (== c #\=) (== c #\/) (== c #\>))))
+             (return #t)]))
+    #f))
+
+(define (space? [c u8]) -> bool (or (== c 32) (== c 9) (== c 10) (== c 13) (== c 12)))
+
+;; ---- nodes ----
+
+(define (dom-set-text! [node u32] [s string])
+  (let ([k (kept s)]) (words! (slice (array-of u32 6 node (cast u32 (-> k bytes)) (-> k length))))))
+
+(define (dom-set-attr! [node u32] [name string] [value string])
+  (let ([n (kept name)] [v (kept value)])
+    (words! (slice (array-of u32 7 node (cast u32 (-> n bytes)) (-> n length) (cast u32 (-> v bytes)) (-> v length))))))
+
+(define (dom-remove-attr! [node u32] [name string])
+  (let ([n (kept name)]) (words! (slice (array-of u32 8 node (cast u32 (-> n bytes)) (-> n length))))))
+
+;; dom-listen! sends the node's event to tag's handler, and dom-listen-window! sends the window's event there while the
+;; node is on the page.
+(define (dom-listen! [node u32] [event string] [tag (ptr void)])
+  (let ([e (kept event)]) (words! (slice (array-of u32 9 node (cast u32 (-> e bytes)) (-> e length) (cast u32 tag))))))
+
+(define (dom-listen-window! [node u32] [event string] [tag (ptr void)])
+  (let ([e (kept event)]) (words! (slice (array-of u32 12 node (cast u32 (-> e bytes)) (-> e length) (cast u32 tag))))))
+
+(define (dom-focus! [node u32]) (words! (slice (array-of u32 10 node))))
+
+(define (dom-scroll-to-end! [node u32]) (words! (slice (array-of u32 11 node))))
+
+(define (dom-pointer-lock! [node u32] [on bool]) (words! (slice (array-of u32 15 node (if on 1 0)))))
+
+;; dom-image! loads the image at path under the number id, for canvas-load-image! (canvas.sub).
+(define (dom-image! [id u32] [path string])
+  (let ([p (kept path)]) (words! (slice (array-of u32 14 id (cast u32 (-> p bytes)) (-> p length))))))
+
+(define (dom-discard!)
+  (set! (-> patches length) 0)
+  (+= flushes 1)
+  (arena-free (& frame)))

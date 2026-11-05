@@ -1,0 +1,191 @@
+;; Running programs in tests. sub runs the substrate command, host runs the host on a built program, program runs any
+;; program, and built-run builds a file and runs it. Each returns a ran, which holds the exit code and the output.
+;; expect-ran checks that a ran exited with 0, and its output if asked; with #:fails, it checks that the run failed.
+;; printed returns the output without its final newlines.
+(require-unqualified host/fs)
+(require-unqualified host/node/process)
+(require-unqualified host/node/env)
+(require-unqualified host/grants)
+(require-unqualified std/package/path)
+(require-unqualified std/test/test)
+
+(provide ran root shared-cache built-run sub sub-run host program expect-ran printed)
+
+;; output is stdout and stderr, in order.
+(struct ran [code i32] [output string])
+
+(define (root) -> string (let ([t string]) (env-get "SUBSTRATE_TOOLCHAIN" (& t) 0) (parent-of t)))
+
+(define (shared-cache) -> string (let ([d string]) (env-get "SUBSTRATE_CACHE" (& d) 0) d))
+
+;; ---- running ----
+
+(define (program-in [dir string] [program string] [env (slice string)] [args (slice string)] [input (slice u8)]) -> ran
+  (let ([o process-options] [r ran] [bytes (slice u8)] [why string])
+    (process-options-init! (& o))
+    (set! (-> o dir) dir)
+    (set! (-> o env) env)
+    (set! (-> r code) (process-run program args (& o) input 60000 (& bytes) (& why)))
+    (when (< (-> r code) 0) (throw test-failed (joined (joined program ": ") why)))
+    (set! (-> r output) (cast string bytes))
+    r))
+
+(define (granted [clauses (slice (slice string))]) -> grants
+  (let ([g (make-grants)] [why string])
+    (for ([i u32 0]) (< i (-> clauses length)) (+= i 1)
+      (let ([c (@ clauses i)])
+        (unless (grants-add! (& g) (@ c 0) (slice c 1 (-> c length)) (& why)) (throw test-failed why))))
+    g))
+
+(define (host-in [dir string] [env (slice string)] [g (ptr grants)] [args (slice string)] [input (slice u8)]) -> ran
+  (program-in dir (joined-path (root) "substrate/host/subhost.mjs") env
+              (grants-arguments g (@ args 0) (slice args 1 (-> args length))) input))
+
+(define (sub-in [dir string] [clauses (slice (slice string))] [env (slice string)] [args (slice string)]
+                [input (slice u8)]) -> ran
+  (let ([argv (make-buffer)] [g (granted clauses)])
+    (grants-all! (& g))
+    (push! (& argv) (joined-path (root) "build/sub"))
+    (push! (& argv) (root))
+    (for ([i u32 0]) (< i (-> args length)) (+= i 1) (push! (& argv) (@ args i)))
+    (host-in dir env (& g) (strings-of (& argv)) input)))
+
+(define (no-clauses) -> (slice (slice string)) (slice (cast (ptr (slice string)) 0) 0))
+
+(define (no-input) -> (slice u8) (slice (cast (ptr u8) 0) 0))
+
+(define (built-run [dir string] [file string] [out string] [cache string]) -> ran
+  (let ([b (sub-in dir (no-clauses) (slice (cast (ptr string) 0) 0)
+                   (slice (array-of string "build" file "-o" out "-c" cache)) (no-input))]
+        [none (make-grants)])
+    (when (!= (-> b code) 0) (return b))
+    (let ([r (host-in dir (slice (cast (ptr string) 0) 0) (& none) (slice (array-of string out)) (no-input))])
+      (set! (-> r output) (joined (-> b output) (-> r output)))
+      r)))
+
+(define (ran-check! [r (ptr ran)] [fails string] [compare bool] [expected string] [message string])
+  (cond [(> (-> fails length) 0)
+         (when (== (-> r code) 0) (failure! message "the run exited with 0, and its output is" (-> r output)))
+         (unless (contains? (-> r output) fails) (failure! message "the run failed, and its output is" (-> r output)))]
+        [(!= (-> r code) 0)
+         (failure! message (joined (joined "the run exited with " (digits (-> r code))) ", and its output is") (-> r output))]
+        [compare (compare-output! (-> r output) expected message)]))
+
+(define (expected-text [path string]) -> string
+  (let ([bytes (slice u8)] [why string])
+    (when (< (fs-read-file path (& bytes) (& why)) 0) (throw test-failed (joined (joined path ": ") why)))
+    (cast string bytes)))
+
+(define (sub-run-in [dir string] [name string] [grants (slice string)]) -> ran
+  (let ([argv (make-buffer)])
+    (push! (& argv) "run")
+    (for ([i u32 0]) (< i (-> grants length)) (+= i 1) (push! (& argv) (@ grants i)))
+    (push! (& argv) (joined name ".sub"))
+    (sub-in dir (no-clauses) (slice (cast (ptr string) 0) 0) (strings-of (& argv)) (no-input))))
+
+(define (failure! [message string] [what string] [output string])
+  (throw test-failed (joined (joined (joined (joined message "\n") what) "\n") output)))
+
+;; ---- text ----
+
+(define (contains? [s string] [part string]) -> bool
+  (for ([i u32 0]) (<= (+ i (-> part length)) (-> s length)) (+= i 1)
+    (when (== (slice s i (+ i (-> part length))) part) (return #t)))
+  #f)
+
+(define (joined [a string] [b string]) -> string
+  (let ([out (make-buffer)])
+    (buffer-add-string! (& out) a)
+    (buffer-add-string! (& out) b)
+    (buffer-string (& out))))
+
+(define (trimmed [s string]) -> string
+  (let ([n (-> s length)]) (while (and (> n 0) (== (@ s (- n 1)) 10)) (-= n 1)) (slice s 0 n)))
+
+(define (digits [n i32]) -> string
+  (let ([b (make-buffer)])
+    (when (< n 0) (buffer-add-byte! (& b) #\-))
+    (write-digits (& b) (cast u64 (if (< n 0) (- 0 n) n)) 10)
+    (buffer-string (& b))))
+
+(define (push! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+
+(define (strings-of [b (ptr buffer)]) -> (slice string)
+  (slice (cast (ptr string) (-> b bytes)) (/ (-> b length) (sizeof string))))
+
+;; ---- the forms ----
+
+(begin-for-syntax
+  (require-unqualified compiler/macros)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+
+  (define (strings [items datum]) -> datum
+    (if (null? items) #'(slice (cast (ptr string) 0) 0) #`(slice (array-of string #,@items))))
+
+  (define (clause-code [c datum]) -> datum
+    (let ([parts (syntax->list c)] [head ""] [texts nil])
+      (unless (and (!= parts 0) (pair? parts) (symbol? (syntax-e (car parts))))
+        (raise-syntax-error 'sub "a grant is a kind and its items, as (read \"data\") or (all net)" c))
+      (set! head (symbol->string (syntax-e (car parts))))
+      (for/each ([p (cdr parts)])
+        (set! texts (cons (if (and (or (== head "all") (== head "fake")) (symbol? (syntax-e p)))
+                              (literal (string->datum (symbol->string (syntax-e p))))
+                              p)
+                          texts)))
+      #`(slice (array-of string #,(literal (string->datum head)) #,@(reverse texts)))))
+
+  (define (clauses [items datum]) -> datum
+    (let ([codes nil])
+      (for/each ([c items]) (set! codes (cons (clause-code c) codes)))
+      (if (null? items)
+          #'(slice (cast (ptr (slice string)) 0) 0)
+          #`(slice (array-of (slice string) #,@(reverse codes))))))
+
+  (define (sub-form [s datum]) -> datum
+    (let* ([l (cdr (syntax->list s))] [rest (cdr l)] [grant-items nil] [env nil] [input #'(no-input)])
+      (while (and (pair? rest) (keyword? (syntax-e (car rest))) (pair? (cdr rest)))
+        (let ([key (keyword->string (syntax-e (car rest)))])
+          (cond [(== key "grants") (set! grant-items (syntax->list (cadr rest)))]
+                [(== key "env") (set! env (syntax->list (cadr rest)))]
+                [(== key "stdin") (set! input #`(cast (slice u8) #,(cadr rest)))]
+                [else (raise-syntax-error 'sub "the options are #:grants, #:env and #:stdin" (car rest))]))
+        (set! rest (cddr rest)))
+      #`(sub-in #,(car l) #,(clauses grant-items) #,(strings env) #,(strings rest) #,input)))
+
+  (define (sub-run-form [s datum]) -> datum
+    (syntax-match s [(_ dir name grant ...) #`(sub-run-in #,dir #,name #,(strings grant))]))
+
+  (define (host-form [s datum]) -> datum
+    (let* ([l (cdr (syntax->list s))] [rest (cdr l)] [grant-items nil])
+      (when (and (pair? rest) (keyword? (syntax-e (car rest))) (pair? (cdr rest)))
+        (unless (== (keyword->string (syntax-e (car rest))) "grants")
+          (raise-syntax-error 'host "the option is #:grants" (car rest)))
+        (set! grant-items (syntax->list (cadr rest)))
+        (set! rest (cddr rest)))
+      #`(let ([host-grants (granted #,(clauses grant-items))])
+          (host-in #,(car l) #,(strings nil) (& host-grants) #,(strings rest) (no-input)))))
+
+  (define (program-form [s datum]) -> datum
+    (syntax-match s [(_ dir name arg ...) #`(program-in #,dir #,name #,(strings nil) #,(strings arg) (no-input))]))
+
+  (define (expect-ran-form [s datum]) -> datum
+    (let ([message (literal (format "~a:~a: ~s" `(,(syntax-source s) ,(syntax-line s) ,(syntax->datum s))))])
+      (syntax-match s
+        [(_ run) #`(let ([r #,run]) (ran-check! (& r) "" #f "" #,message))]
+        [(_ run k text)
+         (let ([key (if (keyword? (syntax-e k)) (keyword->string (syntax-e k)) "")])
+           (cond [(== key "output") #`(let ([r #,run]) (ran-check! (& r) "" #t #,text #,message))]
+                 [(== key "output-file") #`(let ([r #,run]) (ran-check! (& r) "" #t (expected-text #,text) #,message))]
+                 [(== key "fails") #`(let ([r #,run]) (ran-check! (& r) #,text #f "" #,message))]
+                 [else (raise-syntax-error 'expect-ran "the options are #:output, #:output-file and #:fails" k)]))]
+        [_ (raise-syntax-error 'expect-ran "expected (expect-ran run [#:output text | #:output-file path | #:fails text])" s)])))
+
+  (define (printed-form [s datum]) -> datum (syntax-match s [(_ run) #`(let ([r #,run]) (trimmed (-> r output)))])))
+
+(define-syntax sub sub-form)
+(define-syntax sub-run sub-run-form)
+(define-syntax host host-form)
+(define-syntax program program-form)
+(define-syntax expect-ran expect-ran-form)
+(define-syntax printed printed-form)

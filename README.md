@@ -24,14 +24,15 @@ compiler is written in it, builds itself, and runs in a browser.
   `compress/` and `log/` hold hashes and passwords, DEFLATE and gzip, and
   logs. `meta/` reads types at compile time, for code that writes code;
   `encoding/` holds UTF-8, Base64, JSON and wire (postcard). `package/` reads
-  packages and `archive/` tar archives.
+  packages and `archive/` tar archives. `web/` is for programs in a web page:
+  changing the page, drawing on a canvas, and WebGPU.
 - `packages/`: packages outside the standard library. `scheme/`, a Scheme,
   and `bend/`, a dependently typed language, are languages built on
   Substrate, with `nodes/`, the run-time nodes they share. `web/`
-  (experimental) holds programs in a web page: a UI library, WebGPU and
-  `shade/` for GPU programs compiled to WGSL, a game library, examples and a
-  REPL. `sqlite/` is SQLite as a wasm module, with its file layer and API in
-  Substrate.
+  (experimental) holds a UI library for web pages, `shade/` for GPU programs
+  compiled to WGSL, a game library, examples and a REPL. `sqlite/` is SQLite
+  as a wasm module, with its file layer and API in Substrate. `bench/` holds
+  their benchmarks.
 - `cmd/`: a package holding substrate, the command `bin/substrate` runs, which
   reads packages and runs the compiler, and the server that `substrate serve`
   runs.
@@ -64,7 +65,7 @@ In the dev shell (`nix develop`), where `bin/sub` is short for `bin/substrate`:
     make check                                   # the tests, then make docs when they pass
     make bootstrap                               # the compiler builds itself into the same bytes
     make seed                                    # the bootstrap check, then the compiler and substrate become the seed
-    make repl                                    # the REPL's site, in build/web/repl
-    make docs                                    # documentation of the toolchain and the packages, as HTML in build/doc
+    make docs                                    # documentation of the toolchain, as HTML in build/doc
     make npm                                     # the npm package, packed into build and tried in a temporary install
     bench/*/run.sh                               # benchmarks
+    packages/bench/*/run.sh                      # the packages' benchmarks

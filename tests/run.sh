@@ -24,7 +24,7 @@ built=0
 unbuilt=0
 
 # The packages' tests, given every grant.
-packages=(./std ./cmd ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite ./tests ./tests/web)
+packages=(./std ./cmd ./tests ./tests/web ./packages/web ./packages/scheme ./packages/bend ./packages/nodes ./packages/sqlite)
 if bin/substrate test -c "$cache" -A "$@" "${packages[@]}"; then
   pass=$((pass + 1))
 else
@@ -45,10 +45,10 @@ for p in "${packages[@]}"; do
     echo "FAIL $p: its test program, built again from the cache, differs"
   fi
 done
-# Each module of bench, substrate/host and tests/proxy builds, and so does each one-file package.
+# Each module of bench, packages/bench, substrate/host and tests/proxy builds, and so does each one-file package.
 one_file() { awk 'NF && !/^[[:space:]]*;/ { found = 1; code = !/^[[:space:]]*\(package([[:space:]]|$)/; exit } END { exit found ? code : 1 }' "$1"; }
-mapfile -t modules < <( (find bench substrate/host tests/proxy -name '*.sub' -not -name package.sub \
-                           -not -path 'bench/bend/compile/*' -not -path '*/build/*'
+mapfile -t modules < <( (find bench packages/bench substrate/host tests/proxy -name '*.sub' -not -name package.sub \
+                           -not -path 'packages/bench/bend/compile/*' -not -path '*/build/*'
                          find cmd std packages tests/web -name '*.sub' -not -name package.sub -not -path '*/build/*' \
                            -not -path '*/tests/*' | while read -r f; do if one_file "$f"; then echo "$f"; fi; done) | sort)
 for m in "${modules[@]}"; do
