@@ -33,7 +33,16 @@ export const setupOf = (grants) => ({
   loader: Object.fromEntries(Object.entries(process.env).filter(([name]) => isLoaderVariable(name))),
 });
 
-const read = (dir, p) => fs.readFileSync(path.join(dir, p));
+// A file a fake fetch serves: one inside dir once links are followed.
+const read = (dir, p) => {
+  const root = fs.realpathSync.native(dir);
+  const file = fs.realpathSync.native(path.join(root, p));
+  const inside = path.relative(root, file);
+  if (inside === '..' || inside.startsWith(`..${path.sep}`) || path.isAbsolute(inside)) {
+    throw new Error('outside the directory');
+  }
+  return fs.readFileSync(file);
+};
 
 export function hostModules(setup, own = new Map()) {
   const made = new Map(own);
