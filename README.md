@@ -12,7 +12,7 @@ self-hosted, and runs in the browser.
 npm install -g substrate-lang
 ```
 
-This installs the `substrate` command. It needs Node 24 or newer.
+This installs the `substrate` command.
 
 ## Running Substrate
 
@@ -354,9 +354,10 @@ how to run the benchmarks.
 
 ## Supported Platforms
 
-Substrate runs on macOS, Linux and Windows, with Node 24 as its host, and CI
-runs its tests on all three. We chose Node (V8) as the first host, but nothing
-blocks a Wasmtime host in the future.
+Substrate runs on macOS, Linux and Windows, and CI runs its tests on all three.
+Its host is Node 22 (22.22.3 or newer), Node 24 (24.15 or newer) or Node 25 or
+newer. We chose Node (V8) as the first host, but nothing blocks a Wasmtime host
+in the future.
 
 ## Contributing
 

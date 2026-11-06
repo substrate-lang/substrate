@@ -6,8 +6,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-if (Number(process.versions.node.split('.')[0]) < 24) {
-  process.stderr.write(`substrate: Node 24 or newer runs substrate, and this is ${process.version}\n`);
+const [major, minor, patch] = process.versions.node.split('.').map(Number);
+if (major === 22 ? minor < 22 || (minor === 22 && patch < 3) : major === 24 ? minor < 15 : major < 25) {
+  process.stderr.write('substrate: Node 22 (22.22.3 or newer), Node 24 (24.15 or newer) or Node 25 or newer runs substrate,'
+    + ` and this is ${process.version}\n`);
   process.exit(1);
 }
 

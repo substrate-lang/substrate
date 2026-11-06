@@ -8,8 +8,8 @@ self-hosted, and runs in the browser.
 
     npm install -g substrate-lang
 
-installs the `substrate` command, and `sub`, short for it. It needs Node 24
-or newer.
+installs the `substrate` command, and `sub`, short for it. It needs Node 22
+(22.22.3 or newer), Node 24 (24.15 or newer) or Node 25 or newer.
 
     substrate build FILE -o DIR              # FILE's program, into DIR
     substrate run [GRANT ...] DIR [ARG ...]  # run it, granted -R, -W, -N, -E, --allow-run or -A
