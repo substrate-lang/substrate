@@ -88,8 +88,8 @@ These examples are in [examples/hello](examples/hello).
 
 ## Core Language
 
-[examples/core.sub](examples/core.sub) uses structs, variants, strings, slices
-and generics:
+[examples/core.sub](examples/core.sub) uses structs, variants, numbers,
+booleans, strings, slices, generics and closures:
 
 ```racket
 (struct point [x i32] [y i32])
@@ -107,28 +107,50 @@ and generics:
       (when (> (@ items i) best) (set! best (@ items i))))
     best))
 
+(define #:forall (T) (count-if [items (slice T)] [keep (closure (T) -> bool)]) -> u32
+  (let ([n u32 0])
+    (for ([i u32 0]) (< i (-> items length)) (+= i 1)
+      (when (keep (@ items i)) (+= n 1)))
+    n))
+
 (define (main)
   (let ([p (point #:x 3 #:y 4)])
     (printf "point: ~a, ~a\n" (-> p x) (-> p y)))
   (printf "areas: ~a, ~a\n" (area (square 3)) (area (rect 6 7)))
+  (let ([ok bool #t] [half f32 0.5] [third f64 (/ 1.0 3.0)] [byte u8 255])
+    (+= byte 1)
+    (printf "bool: ~a, f32: ~a, f64: ~a, u8 255 + 1: ~a\n" ok half third byte))
   (let ([name "Substrate"])
     (printf "~a has ~a bytes and starts with ~a\n" name (-> name length) (slice name 0 3)))
   (printf "largest: ~a, ~a\n" (largest (slice (array-of i32 3 9 4))) (largest (slice (array-of f64 1.5 0.5))))
+  (let* ([limit 4] [above (lambda ([x i32]) -> bool (> x limit))] [xs (slice (array-of i32 3 9 4 7))])
+    (printf "above 4: ~a, " (count-if xs above))
+    (set! limit 8)
+    (printf "above 8: ~a\n" (count-if xs above)))
   (let ([xs (slice (array-of i32 1 2 3))])
     (printf "~a\n" (@ xs 3))))
 ```
 
-Its last line reads past the end of a slice, so the program traps there:
+Integers wrap around when they overflow, as Wasm's do, so the `u8` holding 255
+holds 0 after `(+= byte 1)`. Dividing an integer by zero traps.
+
+Closures (`lambda`) can access the variables of their enclosing functions.
+A closure can be passed down to a call or
+kept in a local, but can't be returned or stored in memory.
+
+The program's last line reads past the end of a slice, so it traps there:
 
 ```console
 $ substrate run core.sub
 point: 3, 4
 areas: 9, 42
+bool: #t, f32: 0.5, f64: 0.3333333333333333, u8 255 + 1: 0
 Substrate has 9 bytes and starts with Sub
 largest: 9, 1.5
+above 4: 2, above 8: 1
 error: trap: index 3 is out of range for length 3
     at index-trap compiler/substrate.sub:201:5
-    at main ./core.sub:24:20
+    at main ./core.sub:37:20
 ```
 
 ## Standard Library
