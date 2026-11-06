@@ -3,8 +3,9 @@
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
 (modernized with generics, variants, bounds-checked slices), combined with
 Racket-style hygienic macros and module hooks for defining new languages and
-DSLs. Its compiler is small (~11k LOC, <600 KiB of Wasm), very fast,
-self-hosted, and runs in the browser.
+DSLs. Its compiler is small (~11k LOC, <600 KiB of Wasm), very fast, and
+runs in the browser. Substrate's compiler, dev tooling, package manager, and
+standard library are entirely written in Substrate.
 
 ## Install
 
@@ -130,6 +131,56 @@ error: trap: index 3 is out of range for length 3
     at main ./core.sub:24:20
 ```
 
+## Standard Library
+
+The standard library mostly holds modules useful for developing Substrate
+itself, and it will evolve before 1.0. Its modules, by directory:
+
+- `std/encoding`: Base64, JSON, UTF-8 and postcard wire messages
+- `std/crypto`: SHA-1, SHA-256, SHA-512, HMAC, HKDF and PBKDF2
+- `std/compress`: DEFLATE and gzip
+- `std/archive`: reading tar archives
+- `std/http`: an HTTP/1.1 server, with routes, cookies, forms, sessions,
+  server-sent events and WebSockets
+- `std/web`: the page's DOM, canvas drawing and WebGPU
+- `std/html`: writing HTML
+- `std/log`: structured logs
+- `std/meta`: types as data at compile time, for macros that write code from
+  them
+- `std/test`: the test runner, and tests in a browser
+- `std/browser`: Chromium, driven over the DevTools protocol
+- `std/package`: manifests, package hashes and the package store
+- `std/doc`: documentation from source, as text or HTML
+
+[examples/json.sub](examples/json.sub) uses `std/encoding/json`, whose `json`
+macro gives a struct a JSON reader and writer:
+
+```racket
+(require-unqualified std/encoding/json)
+
+(struct release [name string] [version string] [tags (slice string)])
+
+;; Derive JSON from the struct, using the standard library's json macro
+(json release)
+
+(define (main)
+  (let ([a (make-arena)] [r release] [err json-error] [b (make-buffer)])
+    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.9.1\", \"tags\": [\"lisp\", \"wasm\"]}"
+                           (& r) (& err))
+        (begin
+          (printf "~a ~a has ~a tags\n" (-> r name) (-> r version) (-> r tags length))
+          (set! (-> r version) "1.0.0")
+          (release.json-write! (& b) (& r))
+          (printf "~a\n" (buffer-string (& b))))
+        (printf "~a\n" (-> err message)))))
+```
+
+```console
+$ substrate run json.sub
+substrate 0.9.1 has 2 tags
+{"name":"substrate","version":"1.0.0","tags":["lisp","wasm"]}
+```
+
 ## Packages
 
 A package is a folder with a `package.sub`, or a program whose first form is
@@ -172,7 +223,8 @@ $ substrate run build/greeting
 
 A macro is a function that runs at compile time and turns syntax into syntax.
 Macros are hygienic: the `tmp` that `swap!` introduces is not the caller's
-`tmp`. [examples/swap.sub](examples/swap.sub):
+`tmp`. They are also sandboxed at compile time, which ensures compiler
+determinism and system safety. [examples/swap.sub](examples/swap.sub):
 
 ```racket
 (require-unqualified compiler/macros)
@@ -195,8 +247,10 @@ $ substrate run swap.sub
 
 Languages are packages too. [examples/bend2/proof.sub](examples/bend2/proof.sub)
 is written in bend2, a port of [Bend 2](https://github.com/bendlang/bend) whose
-type checker runs at compile time. It proves by induction that adding zero to a
-number gives the number back:
+type checker runs at compile time. Like the original, bend2's values are
+affine, and its runtime frees them by reference counting, without a tracing
+garbage collector. Here, we prove by induction that adding zero to a number
+gives the number back:
 
 ```racket
 (package proof
@@ -286,6 +340,11 @@ The core also has `calloc`, `realloc`, `memcpy`, `memset`, `memcmp` and hash
 tables. `malloc` traps when memory runs out, where `try-malloc` gives 0, and
 freeing a block twice traps.
 
+Note that languages built as libraries on top of Substrate do not necessarily
+need to manage memory manually (e.g.,
+[bend2](https://github.com/substrate-lang/substrate-bend2)) as they can
+implement their own runtimes.
+
 ## Testing
 
 `substrate test` runs a package's tests. [examples/hello](examples/hello) is a
@@ -336,8 +395,8 @@ them.
 
 On realistic workloads, Substrate takes 0.35–1.4× the time of C compiled to
 Wasm with clang -O2, though its compiler is much faster: it compiles about
-47,000 lines a second, its own 11,000 in 0.24 s, where clang compiles C to Wasm
-at 9,000–17,000 lines a second at -O2.
+47,000 lines a second, its own 11,000 in 0.24 s (without the cache), where clang
+compiles C to Wasm at 9,000–17,000 lines a second at -O2.
 
 Substrate's libraries against C libraries, as Substrate's time over C's, on an
 AMD Ryzen 9 9950X with Node 24 on Linux:
