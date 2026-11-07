@@ -24,7 +24,7 @@ built=0
 unbuilt=0
 
 # The packages' tests, given every grant.
-packages=(./std ./cmd ./tests ./tests/web)
+packages=(./std ./cmd ./tests ./tests/web ./examples/hello)
 if bin/substrate test -c "$cache" -A "$@" "${packages[@]}"; then
   pass=$((pass + 1))
 else
