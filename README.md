@@ -187,7 +187,7 @@ macro gives a struct a JSON reader and writer:
 
 (define (main)
   (let ([a (make-arena)] [r release] [err json-error] [b (make-buffer)])
-    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.9.1\", \"tags\": [\"lisp\", \"wasm\"]}"
+    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.9.2\", \"tags\": [\"lisp\", \"wasm\"]}"
                            (& r) (& err))
         (begin
           (printf "~a ~a has ~a tags\n" (-> r name) (-> r version) (-> r tags length))
@@ -199,7 +199,7 @@ macro gives a struct a JSON reader and writer:
 
 ```console
 $ substrate run json.sub
-substrate 0.9.1 has 2 tags
+substrate 0.9.2 has 2 tags
 {"name":"substrate","version":"1.0.0","tags":["lisp","wasm"]}
 ```
 
@@ -455,6 +455,3 @@ make seed        # the bootstrap check, then the compiler and substrate become t
 make docs        # documentation of the toolchain, as HTML in build/doc
 make npm         # the npm package, packed into build and tried in a temporary install
 ```
-
-[docs/README.md](docs/README.md) describes the repository's layout and lists
-every command.
