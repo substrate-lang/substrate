@@ -45,10 +45,14 @@ network without grants. `cat.sub` prints a file:
 (require-unqualified host/fs)
 
 (define (main)
-  (let ([text (slice u8)] [why string])
-    (when (< (fs-read-file (@ (host-args) 0) (& text) (& why)) 0) (host-exit 1 why))
-    (printf "~a" (cast string text))))
+  (let ([path (@ (host-args) 0)] [contents (slice u8)] [err string])
+    (when (< (fs-read-file path (& contents) (& err)) 0)
+      (host-exit 1 err))
+    (printf "~a" (cast string contents))))
 ```
+
+`@` reads an element of a slice, or what a pointer points to, `&` takes a
+variable's address, and `when` runs its body only if its test is true.
 
 ```console
 $ substrate run cat.sub hello.sub
