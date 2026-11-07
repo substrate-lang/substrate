@@ -12,6 +12,8 @@ These rules keep an agent's context and actions under the user's control.
   unless the user asks.
 - Do not write agent memory files. Project rules belong in this file.
 - Non-trivial English entering the repository must be approved by the user.
+- Any English in comments, docs, or commits should be human-like: avoid
+  chained clauses, recursive statements, elided verbs or objects, etc.
 - Avoid comments in most code. A comment is a short, concrete label: what a
   file, section or value is, or where related code lives. No explanations in
   comments unless the user asks.
