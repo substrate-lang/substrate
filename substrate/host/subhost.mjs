@@ -61,7 +61,8 @@ const names = read(`${dir}/program`).toString().split(/\r?\n/).filter((n) => n !
 const outside = names.find((name) => /[/\\]/.test(name));
 if (outside !== undefined) fail(`${dir}/program lists ${outside}, which is not in ${dir}`);
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
-// The compiled modules the build wrote: compiled lists them, each a hash.subc, with the module map in compiled.map.
+// The compiled modules for sessions: the compiled file lists them, each one is in <hash>.subc, and compiled.map holds
+// their module map.
 const compiled = new Map();
 if (fs.existsSync(`${dir}/compiled`)) {
   const list = read(`${dir}/compiled`);

@@ -110,7 +110,8 @@ export async function boot(options) {
     for (const bytes of wasm.values()) for (const name of importedModules(bytes)) wanted.add(name);
     modules = await modules(wanted);
   }
-  // The compiled modules the build wrote: compiled lists them, each a hash.subc, with the module map in compiled.map.
+  // The compiled modules for sessions: the compiled file lists them, each one is in <hash>.subc, and compiled.map holds
+  // their module map.
   const compiled = new Map();
   const listed = await fetch(`${base}compiled`);
   if (listed.ok) {
