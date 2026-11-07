@@ -16,14 +16,14 @@
 (provide install-core!
          compile-module-file
          expand-module-file
-         content-hash wasm-module program-wasm-modules trap-report
-         set-cache-directory!
+         content-hash wasm-module program-wasm-modules program-compiled-modules sealed! trap-report
+         set-cache-directory! use-compiled-modules!
          session-open! session-eval! session-eval-text! session-eval-file! session-error session-recover!)
 
 (define core-forms datum
   '(func global import supply memory table tag define-syntax begin-for-syntax
-           begin require require-unqualified language provide set! let let* if block loop br br-if br-table
-           return
+           begin require require-unqualified runtime-require language provide set! let let* if block loop br br-if
+           br-table return
            call-indirect func-index select drop values unreachable nop
            throw throw-ref try
            i32.const i64.const f32.const f64.const
@@ -31,7 +31,7 @@
            #%app #%datum #%fact #%checked))
 
 (define visible-core-forms datum
-  '(define-syntax begin-for-syntax begin require require-unqualified language provide
+  '(define-syntax begin-for-syntax begin require require-unqualified runtime-require language provide
            quote quote-syntax include-text #%app #%datum #%fact))
 
 (define wasm-forms datum
@@ -79,7 +79,8 @@
 
 (struct unit [self datum] [path datum] [name datum] [hash datum] [state datum] [requires datum] [provides datum]
         [entries (ptr module-entry)] [code datum] [scope u32] [infos datum] [facts datum]
-        [wasm-modules (ptr wasm-module)] [scope-count u32] [memories datum] [resolved datum] [included datum])
+        [wasm-modules (ptr wasm-module)] [scope-count u32] [memories datum] [resolved datum] [included datum]
+        [runtime-requires datum])
 
 (struct module-entry [symbol datum] [scopes (ptr scope-set)] [phase i32] [binding (ptr binding)] [next (ptr module-entry)])
 
@@ -104,6 +105,7 @@
     (set! (-> m scope-count) 0)
     (set! (-> m resolved) nil)
     (set! (-> m included) nil)
+    (set! (-> m runtime-requires) nil)
     (-> m self)))
 
 (define (unit-of [m datum]) -> (ptr unit) (cast (ptr unit) (record-pointer m)))
@@ -643,6 +645,11 @@
     (cond [(and (!= known 0) (== (-> (unit-of known) state) 'done)) known]
           [(!= known 0) (fail-at 0 "cyclic require: ~a requires itself" (list1 path))]
           [(begin (set! cached (load-cached path)) (!= cached 0)) cached]
+          [(compiled-root? path)
+           (fail-at where (if (== (compiled-module path) 0)
+                              "~a is not one of the modules the program compiled for its sessions"
+                              "the program's compiled ~a does not agree with its other compiled modules")
+                    (list1 path))]
           [(wasm-file? path) (wasm-file-unit path key)]
           [else
            (let* ([text (source-text path)] [m (new-unit path (provisional-name path))] [saved current])
@@ -926,6 +933,27 @@
     (set! out (visit-wasm-modules m seen out))
     (reverse out)))
 
+;; program-compiled-modules gives what a program's modules file holds, or 0 when the program has none: the modules its
+;; modules name with runtime-require and the modules those require, each as the cache keeps it, and the module map.
+(define (program-compiled-modules [m datum]) -> datum
+  (let ([todo nil] [seen nil] [out nil])
+    (for-each (lambda ([l datum])
+                (let ([u (instance-unit (car l))])
+                  (unless (== u 0) (set! todo (append (-> (unit-of u) runtime-requires) todo)))))
+              (program-wasm-modules m))
+    (when (null? todo) (return 0))
+    (while (pair? todo)
+      (let ([id (car todo)])
+        (set! todo (cdr todo))
+        (when (== (member id seen) 0)
+          (let ([u (unit-of (module-at id 0))])
+            (set! seen (cons id seen))
+            (set! out (cons `(,id ,(-> u hash) ,(data-bytes (list1 (cache-form (-> u self))))) out))
+            (set! todo (append (map (lambda ([r datum]) -> datum (-> (unit-of (car r)) path)) (-> u requires))
+                               (append (-> u runtime-requires) todo)))))))
+    `((format . ,(make-integer cache-format)) (compiler . ,compiler-hash) (map . ,(compiled-module-map))
+      (modules . ,(reverse out)))))
+
 (define (visit-wasm-modules [m datum] [seen (ptr hash-table)] [out datum]) -> datum
   (let ([name (wasm-module-name m 0 0)] [l nil])
     (when (!= (datum-get seen name) 0) (return out))
@@ -1018,10 +1046,15 @@
       (set! h (* (bit-xor h (@ p i)) 1099511628211)))
     h))
 
+;; sealed! adds data's bytes to b, followed by their hash, which read-data checks.
+(define (sealed! [b (ptr buffer)] [d datum])
+  (let* ([data (datum->bytes (data-bytes d))] [h (data-hash data)])
+    (buffer-add! b data)
+    (for ([i u64 0]) (< i 64) (+= i 8) (buffer-add-byte! b (cast i32 (bit-and (>> h i) 255))))))
+
 (define (write-data [path datum] [d datum]) -> bool
-  (let* ([data (datum->bytes (data-bytes d))] [h (data-hash data)] [b (make-buffer)] [temp string] [ok #f])
-    (buffer-add! (& b) data)
-    (for ([i u64 0]) (< i 64) (+= i 8) (buffer-add-byte! (& b) (cast i32 (bit-and (>> h i) 255))))
+  (let ([b (make-buffer)] [temp string] [ok #f])
+    (sealed! (& b) d)
     (when (>= (fs-make-temp-file (datum->string cache-directory) "" ".tmp" (& temp) 0) 0)
       (set! ok (and (>= (fs-write-file temp (buffer-bytes (& b)) 0) 0) (>= (fs-rename temp (datum->string path) 0) 0)))
       (unless ok (fs-remove temp #f 0))
@@ -1048,8 +1081,9 @@
        (equal? (section d 'format) (make-integer cache-format))
        (equal? (section d 'compiler) compiler-hash)))
 
+;; load-cached loads a module from the cache, or one of a program's compiled modules, which have no sources.
 (define (load-cached [path datum]) -> datum
-  (if (== (cache-compiler) 0)
+  (if (if (compiled-root? path) (== (compiled-module path) 0) (== (cache-compiler) 0))
       0
       (begin
         (begin-module-arena)
@@ -1058,20 +1092,24 @@
           m))))
 
 (define (load-cached-in [path datum]) -> datum
-  (let* ([ds (read-data (cache-file (cache-name path)))]
+  (let* ([shipped (compiled-module path)]
+         [ds (if (!= shipped 0) (data-of (caddr shipped)) (read-data (cache-file (cache-name path))))]
          [d (if (pair? ds) (car ds) 0)]
          [key (cast u64 (symbol-of path))]
          [hash datum 0] [requires datum 0] [included datum 0] [known datum 0] [m datum 0])
     (unless (current-cache? d) (return 0))
     (set! hash (section d 'hash))
     (set! requires (section d 'requires))
-    (set! included (included-again (section d 'included)))
-    (unless (and (string? hash) (!= included 0)
-                 (equal? (module-hash path (source-text path)
-                                      (map (lambda ([r datum]) -> datum (cdr r)) requires)
-                                      included)
-                         hash))
-      (return 0))
+    (unless (string? hash) (return 0))
+    (if (!= shipped 0)
+        (unless (equal? hash (cadr shipped)) (return 0))
+        (begin
+          (set! included (included-again (section d 'included)))
+          (unless (and (!= included 0)
+                       (equal? (module-hash path (source-text path) (map (lambda ([r datum]) -> datum (cdr r)) requires)
+                                            included)
+                               hash))
+            (return 0))))
     (unless (resolved-again? (section d 'resolved)) (return 0))
     (hash-set! (& registry) key (cast u32 (new-unit path path)))
     (while (pair? requires)
@@ -1240,6 +1278,7 @@
       `((format . ,(make-integer cache-format)) (compiler . ,compiler-hash) (hash . ,(-> u hash))
         (definitions . ,(make-integer (length (-> u infos)))) (requires . ,require-forms) (resolved . ,(-> u resolved))
         (included . ,(map (lambda ([i datum]) -> datum (car i)) (-> u included))) (name . ,(-> u name))
+        (runtime-requires . ,(-> u runtime-requires))
         (infos . ,infos) (provides . ,provides) (entries . ,entries)
         (inlines . ,inline-forms) (macros . ,macro-forms) (facts . ,fact-forms) (wasm-modules . ,wasm-modules)
         (memories . ,(-> u memories))))))
@@ -1367,6 +1406,9 @@
          [definitions (cast u32 (integer-value (section d 'definitions)))])
     (set! (-> u name) (keep (section d 'name)))
     (set! (-> u hash) (keep (section d 'hash)))
+    (set! (-> u resolved) (keep (section d 'resolved)))
+    (set! (-> u included) (keep (map (lambda ([i datum]) -> datum (cons i 0)) (section d 'included))))
+    (set! (-> u runtime-requires) (keep (section d 'runtime-requires)))
     (note-hash! m)
     (set! (-> u scope) (new-run-scope!))
     (hash-set! (& module-scope-origins) (scope-key (-> u scope)) (cast u32 (keep (cons m (make-integer 0)))))
@@ -1515,7 +1557,9 @@
 (define (declare-form! [f0 datum] [b (ptr body)] [only datum])
   (let* ([phase (-> b phase)] [f (head-expand f0 phase)] [kind (core-head f phase)])
     (when (and (!= only 0)
-               (!= (memq kind '(require require-unqualified language provide memory table define-syntax begin-for-syntax)) 0))
+               (!= (memq kind '(require require-unqualified runtime-require language provide memory table define-syntax
+                                begin-for-syntax))
+                   0))
       (fail-at f "~a (~a ...), but only func, global, import, tag, data and #%fact forms and expressions are allowed there"
                `(,only ,kind)))
     (case kind
@@ -1524,6 +1568,7 @@
          (for-each (lambda ([g datum]) (declare-form! (at-use f g) b only)) forms))]
       [('require) (require! f phase 0)]
       [('require-unqualified) (require! f phase 1)]
+      [('runtime-require) (runtime-require! f phase)]
       [('language) (if (in-session?) (require! f phase 2) (fail-at f "the language must be the module's first form" nil))]
       [('provide) (provide! f phase)]
       [('func) (item! b (declare-func f phase))]
@@ -1805,6 +1850,21 @@
 (define (note-resolved! [from datum] [given datum] [path datum])
   (let ([me (the-module)] [r `(,(if (== from 0) '#f from) ,given ,path)])
     (when (== (member r (-> me resolved)) 0) (set! (-> me resolved) (keep (append (-> me resolved) (list1 r)))))))
+
+;; (runtime-require source ...) names modules that sessions in the program may load. They are resolved and checked as
+;; a require's are, and a build of the program compiles them and writes them with it.
+(define (runtime-require! [f datum] [phase i32])
+  (let ([l (syntax->list f)] [me (the-module)])
+    (unless (and (!= l 0) (andmap (lambda ([s datum]) -> bool (module-source? s)) (cdr l)))
+      (no-match f "(runtime-require source ...)"))
+    (when (or (!= phase 0) (in-session?)) (fail-at f "runtime-require belongs at phase 0 of a module" nil))
+    (for-each (lambda ([spec datum])
+                (let* ([from (module-source-file f spec)] [path (module-path-from from spec)])
+                  (note-resolved! from (syntax-e spec) path)
+                  (check-module! (-> me path) path spec)
+                  (when (== (member path (-> me runtime-requires)) 0)
+                    (set! (-> me runtime-requires) (keep (append (-> me runtime-requires) (list1 path)))))))
+              (cdr l))))
 
 ;; (include-text "file") is the file's text as a string literal. Its path is resolved as a require's is, and the
 ;; module's hash covers the file.
@@ -2363,6 +2423,16 @@
 (define interacting bool #f)
 
 (define (in-session?) -> bool (and (!= session 0) (== current session)))
+
+;; use-compiled-modules! has sessions load the compiled modules that the program's build wrote with it, found by the
+;; module map they were compiled with.
+(define (use-compiled-modules!)
+  (let ([b (host-compiled-modules)] [d datum 0])
+    (when (and (> (-> b length) 0) (sealed? b)) (set! d (data-of (bytes->datum b))))
+    (free (-> b items))
+    (when (== d 0) (fail-at 0 "the program has no compiled modules; a build writes them when the program uses runtime-require" nil))
+    (unless (current-cache? d) (fail-at 0 "the program's compiled modules are from another compiler" nil))
+    (set-compiled-module-map! (section d 'map) (section d 'modules))))
 
 (define (module-source) -> datum (if (in-session?) session-source (symbol-of (-> (the-module) path))))
 

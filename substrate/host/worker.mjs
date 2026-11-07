@@ -63,9 +63,11 @@ export function workerModule({ spawn }) {
   function start(entry, argument, time, pages, heard, tag, app, err, grants, setup) {
     const program = caller.program();
     const modules = program.names.map((name) => [name, program.bytes(name)]);
+    const { compiled } = program;
     let thread;
     try {
-      thread = spawn({ modules, entry, argument, grants, names: caller.moduleNames(), pages, heard, ...setup }, app);
+      thread = spawn({ modules, compiled, entry, argument, grants, names: caller.moduleNames(), pages, heard, ...setup },
+                     app);
     } catch (e) {
       caller.fail(err, e.message);
       return 0;

@@ -42,6 +42,7 @@ export function workers(setup) {
       thread.postMessage({
         type: 'start',
         modules: plan.modules,
+        compiled: plan.compiled,
         entry: plan.entry,
         argument: plan.argument,
         grants: plan.grants,

@@ -44,7 +44,7 @@ parentPort.on('message', (m) => {
       absent: new Set(['stdin', 'signal']),
       memoryPages: m.pages,
     });
-    const entry = host.load([...wasm.keys()], (name) => wasm.get(name));
+    const entry = host.load([...wasm.keys()], (name) => wasm.get(name), m.compiled);
     if (!entry) {
       side.ended(2, host.lastError);
       return;

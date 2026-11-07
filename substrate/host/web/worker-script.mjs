@@ -62,6 +62,7 @@ self.onmessage = async (e) => {
     }
     const app = run({
       args: m.args ?? [m.argument],
+      compiled: m.compiled,
       files: m.files,
       cwd: m.cwd,
       output: side.write,

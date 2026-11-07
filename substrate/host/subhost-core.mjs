@@ -174,9 +174,11 @@ export function createHost(platform) {
   // A memory's malloc, from the module that exports both.
   const allocators = new WeakMap();
   let lastError = '';
-  // The running program: its modules' names in load order, and how to get one's bytes.
+  // The running program: its modules' names in load order, how to get one's bytes, and its compiled modules, the bytes
+  // of the modules file its build wrote, or null.
   let programNames = [];
   let programBytes = null;
+  let programCompiled = null;
   let entry = null;
   let onEvent = null;
   let onTrap = null;
@@ -344,7 +346,7 @@ export function createHost(platform) {
       parseGrants: (list) => platform.parseGrants(list),
       moduleNames: () => (platform.modules ? [...platform.modules.keys()] : []),
       module: (name) => (platform.modules ? platform.modules.get(name) : undefined),
-      program: () => ({ names: programNames, bytes: programBytes }),
+      program: () => ({ names: programNames, bytes: programBytes, compiled: programCompiled }),
       // named gives the module and the export name of the program's function at the index in the table, or null.
       named(index) {
         const table = self.exports.table;
@@ -411,6 +413,9 @@ export function createHost(platform) {
       module_bytes(np, nl, out) {
         const name = string(np, nl);
         return programNames.includes(name) ? give(programBytes(name), out) : 0;
+      },
+      compiled_modules(out) {
+        return programCompiled ? give(programCompiled, out) : 0;
       },
     };
   }
@@ -499,9 +504,10 @@ export function createHost(platform) {
     return true;
   }
 
-  function load(names, bytesOf) {
+  function load(names, bytesOf, compiled = null) {
     programNames = names;
     programBytes = bytesOf;
+    programCompiled = compiled;
     running = true;
     try {
       for (const name of names) {

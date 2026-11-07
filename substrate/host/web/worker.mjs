@@ -11,6 +11,7 @@ export function workers() {
       thread.postMessage({
         type: 'start',
         modules: plan.modules,
+        compiled: plan.compiled,
         entry: plan.entry,
         argument: plan.argument,
         files: app.files,

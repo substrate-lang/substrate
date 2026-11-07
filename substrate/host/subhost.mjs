@@ -61,6 +61,7 @@ const names = read(`${dir}/program`).toString().split(/\r?\n/).filter((n) => n !
 const outside = names.find((name) => /[/\\]/.test(name));
 if (outside !== undefined) fail(`${dir}/program lists ${outside}, which is not in ${dir}`);
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
+const compiled = fs.existsSync(`${dir}/modules`) ? read(`${dir}/modules`) : null;
 
 // The program process.exec_at_end kept (node/process.mjs).
 const atEnd = () => {
@@ -93,7 +94,7 @@ const host = createHost({
   keyOf: (bytes) => crypto.createHash('sha256').update(bytes).digest('hex'),
 });
 
-const entry = host.load(names, (name) => bytes.get(name));
+const entry = host.load(names, (name) => bytes.get(name), compiled);
 if (!entry) {
   process.stderr.write(`error: ${host.lastError}\n`);
   process.exit(2);
