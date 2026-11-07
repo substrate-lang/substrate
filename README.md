@@ -434,7 +434,7 @@ AMD Ryzen 9 9950X with Node 24 on Linux:
 | Deflate and inflate   | zlib    |     0.74–1.23 |
 
 On 12 small programs written the same way in both languages, Substrate's
-median is 1.4× C's time. [docs/bench.md](docs/bench.md) has every result and
+median is 1.4× C's time. [bench/bench.md](bench/bench.md) has every result and
 how to run the benchmarks.
 
 ## Supported Platforms
