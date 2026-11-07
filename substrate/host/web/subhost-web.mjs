@@ -47,12 +47,7 @@ function lines(line) {
 }
 
 export function importedModules(bytes) {
-  return new Set(imports(bytes).map(([module]) => module));
-}
-
-// imports gives each import of a wasm module as its module and field names.
-function imports(bytes) {
-  const pairs = [];
+  const names = new Set();
   let at = 8;
   const u32 = () => {
     let n = 0;
@@ -76,10 +71,9 @@ function imports(bytes) {
     }
     for (let count = u32(); count > 0; count--) {
       const length = u32();
-      const module = text.decode(bytes.subarray(at, at + length));
+      names.add(text.decode(bytes.subarray(at, at + length)));
       at += length;
       const field = u32();
-      pairs.push([module, text.decode(bytes.subarray(at, at + field))]);
       at += field;
       const kind = bytes[at++];
       if (kind === 0) u32();
@@ -95,7 +89,7 @@ function imports(bytes) {
     }
     break;
   }
-  return pairs;
+  return names;
 }
 
 // options.modules is the modules, or a function that takes the names the program imports and gives the modules.
@@ -116,10 +110,16 @@ export async function boot(options) {
     for (const bytes of wasm.values()) for (const name of importedModules(bytes)) wanted.add(name);
     modules = await modules(wanted);
   }
-  // The program's compiled modules: its modules file, when it can ask for them and has one.
-  const asks = [...wasm.values()].some((b) => imports(b).some(([m, f]) => m === 'host' && f === 'compiled_modules'));
-  const response = asks ? await fetch(`${base}modules`) : null;
-  const compiled = response && response.ok ? new Uint8Array(await response.arrayBuffer()) : null;
+  // The compiled modules the build wrote: compiled lists them, each a hash.subc, with the module map in compiled.map.
+  const compiled = new Map();
+  const listed = await fetch(`${base}compiled`);
+  if (listed.ok) {
+    const list = new Uint8Array(await listed.arrayBuffer());
+    const hashes = text.decode(list).split('\n').filter((l) => l !== '').map((l) => l.slice(0, l.indexOf(' ')));
+    compiled.set('compiled', list);
+    if (hashes.length > 0) compiled.set('compiled.map', await fetchBytes(`${base}compiled.map`));
+    await Promise.all(hashes.map(async (h) => compiled.set(`${h}.subc`, await fetchBytes(`${base}${h}.subc`))));
+  }
   return run({ ...options, files, modules, compiled }, names, wasm);
 }
 

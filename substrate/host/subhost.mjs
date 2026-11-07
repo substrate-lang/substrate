@@ -61,7 +61,17 @@ const names = read(`${dir}/program`).toString().split(/\r?\n/).filter((n) => n !
 const outside = names.find((name) => /[/\\]/.test(name));
 if (outside !== undefined) fail(`${dir}/program lists ${outside}, which is not in ${dir}`);
 const bytes = new Map(names.map((name) => [name, read(`${dir}/${name}.wasm`)]));
-const compiled = fs.existsSync(`${dir}/modules`) ? read(`${dir}/modules`) : null;
+// The compiled modules the build wrote: compiled lists them, each a hash.subc, with the module map in compiled.map.
+const compiled = new Map();
+if (fs.existsSync(`${dir}/compiled`)) {
+  const list = read(`${dir}/compiled`);
+  const hashes = list.toString().split(/\r?\n/).filter((l) => l !== '').map((l) => l.slice(0, l.indexOf(' ')));
+  const bad = hashes.find((h) => !/^[0-9a-f]+$/.test(h));
+  if (bad !== undefined) fail(`${dir}/compiled lists ${bad}, which is not a hash`);
+  compiled.set('compiled', list);
+  if (hashes.length > 0) compiled.set('compiled.map', read(`${dir}/compiled.map`));
+  for (const h of hashes) compiled.set(`${h}.subc`, read(`${dir}/${h}.subc`));
+}
 
 // The program process.exec_at_end kept (node/process.mjs).
 const atEnd = () => {

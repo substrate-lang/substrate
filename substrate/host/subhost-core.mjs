@@ -174,8 +174,8 @@ export function createHost(platform) {
   // A memory's malloc, from the module that exports both.
   const allocators = new WeakMap();
   let lastError = '';
-  // The running program: its modules' names in load order, how to get one's bytes, and its compiled modules, the bytes
-  // of the modules file its build wrote, or null.
+  // The running program: its modules' names in load order, how to get one's bytes, and the files of the compiled
+  // modules its build wrote, by name, or null.
   let programNames = [];
   let programBytes = null;
   let programCompiled = null;
@@ -414,8 +414,9 @@ export function createHost(platform) {
         const name = string(np, nl);
         return programNames.includes(name) ? give(programBytes(name), out) : 0;
       },
-      compiled_modules(out) {
-        return programCompiled ? give(programCompiled, out) : 0;
+      compiled_file(np, nl, out) {
+        const bytes = programCompiled && programCompiled.get(string(np, nl));
+        return bytes ? give(bytes, out) : 0;
       },
     };
   }
