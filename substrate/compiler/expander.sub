@@ -11,6 +11,7 @@
 (require-unqualified "checker.sub")
 (require-unqualified "link.sub")
 (require-unqualified "roots.sub")
+(require-unqualified "sha256.sub")
 
 (provide install-core!
          compile-module-file
@@ -72,6 +73,7 @@
 (define scope-counter u32 2)
 (define registry hash-table)
 (define units-by-hash hash-table)
+(define units-by-name hash-table)
 
 (struct wasm-module [phase i32] [bytes datum] [imports datum] [scopes datum] [next (ptr wasm-module)])
 
@@ -224,16 +226,14 @@
     out))
 
 (define (group-instance [name datum]) -> datum
-  (let* ([b (datum->string name)] [n (-> b length)] [i u32 0] [dot u32 0] [l running-group] [m datum 0])
+  (let* ([b (datum->string name)] [n (-> b length)] [i u32 0] [l running-group] [m datum 0])
     (while (and (< i n) (!= (@ b i) #\@)) (+= i 1))
     (unless (and (< (+ i 2) n) (== (@ b (+ i 1)) #\0) (== (@ b (+ i 2)) #\+)) (return 0))
     (while (pair? l)
       (let ([g (datum->string (car l))])
         (when (and (== (-> g length) (+ i 4)) (== (slice g 0 (+ i 1)) (slice b 0 (+ i 1)))) (return (car l))))
       (set! l (cdr l)))
-    (while (and (< dot i) (!= (@ b dot) #\.)) (+= dot 1))
-    (when (>= dot i) (return 0))
-    (set! m (cast datum (hash-ref (& units-by-hash) (cast u64 (string->symbol (slice b (+ dot 1) i))))))
+    (set! m (cast datum (hash-ref (& units-by-name) (cast u64 (string->symbol (slice b 0 i))))))
     (if (== m 0) 0 (agreeing-instance name m))))
 
 (define agreements hash-table)
@@ -595,6 +595,22 @@
         (set! (@ digits k) (if (< d 10) (+ 48 d) (+ 87 d)))))
     (string->datum (cast string (slice digits)))))
 
+;; digest is the SHA-256 of the strings, each after its length, in hex.
+(define (digest [ss datum]) -> datum
+  (let ([s sha256] [n (array u8 8)] [out (array u8 32)] [hex (array u8 64)])
+    (sha256-init! (& s))
+    (while (pair? ss)
+      (let ([b (cast (slice u8) (datum->string (car ss)))])
+        (for ([i u32 0]) (< i 8) (+= i 1) (set! (@ n i) (cast u8 (>> (cast u64 (-> b length)) (* 8 i)))))
+        (sha256-add! (& s) (slice n))
+        (sha256-add! (& s) b))
+      (set! ss (cdr ss)))
+    (sha256-end! (& s) (slice out))
+    (for ([i u32 0]) (< i 64) (+= i 1)
+      (let* ([b (cast i32 (@ out (/ i 2)))] [d (if (== (% i 2) 0) (>> b 4) (bit-and b 15))])
+        (set! (@ hex i) (if (< d 10) (+ 48 d) (+ 87 d)))))
+    (string->datum (cast string (slice hex)))))
+
 (define (module-hash [path datum] [text datum] [requires datum] [included datum]) -> datum
   (let ([parts (if (root-under-test? (identity-label path)) `(,path ,text "test") `(,path ,text))])
     (while (pair? requires)
@@ -604,7 +620,11 @@
     (while (pair? included)
       (set! parts (append parts `(,(car (car included)) ,(cdr (car included)))))
       (set! included (cdr included)))
-    (content-hash parts)))
+    (digest parts)))
+
+;; A module's name is its file's stem and the first 12 digits of its hash.
+(define (module-name [path datum] [hash datum]) -> datum
+  (format "~a.~a" `(,(file-stem path) ,(substring hash 0 12))))
 
 (define (source-text [id datum]) -> datum (file-text (host-file id)))
 
@@ -661,7 +681,7 @@
     (set! (-> u requires) (keep (list1 (cons prelude (make-integer 0)))))
     (set! (-> u hash) (keep (module-hash path (string->datum (cast string (datum->bytes bytes)))
                                          (list1 `(,(-> (unit-of prelude) hash) ,(make-integer 0))) nil)))
-    (set! (-> u name) (keep (format "~a.~a" `(,(file-stem path) ,(-> u hash)))))
+    (set! (-> u name) (keep (module-name path (-> u hash))))
     (note-hash! m)
     (set! instance (wasm-module-name m 0 0))
     (set! linked (link-side-module path bytes (wasm-module-name prelude 0 0)))
@@ -760,7 +780,7 @@
                                          (map (lambda ([r datum]) -> datum `(,(-> (unit-of (car r)) hash) ,(cdr r)))
                                               (-> m requires))
                                          (-> m included))))
-    (set! (-> m name) (keep (format "~a.~a" `(,(file-stem (-> m path)) ,(-> m hash)))))
+    (set! (-> m name) (keep (module-name (-> m path) (-> m hash))))
     (note-hash! (-> m self))
     (compile-wasm-modules!)))
 
@@ -971,7 +991,7 @@
 (define cache-directory datum 0)
 (define (set-cache-directory! [dir datum]) (set! cache-directory (keep dir)))
 
-(const cache-format i64 7)
+(const cache-format i64 8)
 
 (define compiler-hash datum 0)
 
@@ -1096,10 +1116,14 @@
     (concat (content-hash (if (root-under-test? (identity-label path)) `(,file "test") (list1 file))) '".subc")))
 
 (define (note-hash! [m datum])
-  (let* ([u (unit-of m)] [key (cast u64 (symbol-of (-> u hash)))] [known (cast datum (hash-ref (& units-by-hash) key))])
+  (let* ([u (unit-of m)] [key (cast u64 (symbol-of (-> u hash)))] [known (cast datum (hash-ref (& units-by-hash) key))]
+         [name-key (cast u64 (symbol-of (-> u name)))] [named (cast datum (hash-ref (& units-by-name) name-key))])
     (cond [(== known 0) (hash-set! (& units-by-hash) key (cast u32 m))]
           [(not (equal? (-> (unit-of known) path) (-> u path)))
-           (fail-at 0 "~a and ~a have the same hash, ~a" `(,(-> (unit-of known) path) ,(-> u path) ,(-> u hash)))])))
+           (fail-at 0 "~a and ~a have the same hash, ~a" `(,(-> (unit-of known) path) ,(-> u path) ,(-> u hash)))])
+    (cond [(== named 0) (hash-set! (& units-by-name) name-key (cast u32 m))]
+          [(not (equal? (-> (unit-of named) path) (-> u path)))
+           (fail-at 0 "~a and ~a have the same name, ~a" `(,(-> (unit-of named) path) ,(-> u path) ,(-> u name)))])))
 
 (define (load-compiled-module [d datum] [path datum]) -> datum
   (let ([m (new-unit path (section d 'name))])
@@ -1343,7 +1367,7 @@
          [definitions (cast u32 (integer-value (section d 'definitions)))])
     (set! (-> u name) (keep (section d 'name)))
     (set! (-> u hash) (keep (section d 'hash)))
-    (hash-set! (& units-by-hash) (cast u64 (symbol-of (-> u hash))) (cast u32 m))
+    (note-hash! m)
     (set! (-> u scope) (new-run-scope!))
     (hash-set! (& module-scope-origins) (scope-key (-> u scope)) (cast u32 (keep (cons m (make-integer 0)))))
     (set! loading m)
@@ -1799,7 +1823,7 @@
         (set! (-> me included) (keep (append (-> me included) (list1 (cons id (text-hash text)))))))
       (datum->syntax spec text spec))))
 
-(define (text-hash [text datum]) -> datum (content-hash (list1 text)))
+(define (text-hash [text datum]) -> datum (digest (list1 text)))
 
 (define (require-unit! [name datum] [m datum] [phase i32]) -> datum
   (let ([me (the-module)] [req (cons m (make-integer phase))])
