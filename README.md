@@ -191,7 +191,7 @@ macro gives a struct a JSON reader and writer:
 
 (define (main)
   (let ([a (make-arena)] [r release] [err json-error] [b (make-buffer)])
-    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.9.3\", \"tags\": [\"lisp\", \"wasm\"]}"
+    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.9.4\", \"tags\": [\"lisp\", \"wasm\"]}"
                            (& r) (& err))
         (begin
           (printf "~a ~a has ~a tags\n" (-> r name) (-> r version) (-> r tags length))
@@ -203,7 +203,7 @@ macro gives a struct a JSON reader and writer:
 
 ```console
 $ substrate run json.sub
-substrate 0.9.3 has 2 tags
+substrate 0.9.4 has 2 tags
 {"name":"substrate","version":"1.0.0","tags":["lisp","wasm"]}
 ```
 
