@@ -198,7 +198,7 @@ macro gives a struct a JSON reader and writer:
           (set! (-> r version) "1.0.0")
           (release.json-write! (& b) (& r))
           (printf "~a\n" (buffer-string (& b))))
-        (printf "~a\n" (-> err message)))))
+        (printf "~a\n" (error-text (& (-> err error)))))))
 ```
 
 ```console
