@@ -330,10 +330,12 @@ export function createHost(platform) {
       trap: hostTrap,
       write: (fd, bytes) => platform.write(fd === 2 ? 2 : 1, bytes),
       give,
-      fail(err, message) {
+      fail(err, message, code) {
         if (!err) return;
         const p = give(utf8.encode(message), u(err) + 4);
-        new DataView(memory().buffer).setUint32(u(err), p, true);
+        const view = new DataView(memory().buffer);
+        view.setUint32(u(err), p, true);
+        if (code !== undefined) view.setInt32(u(err) + 8, code, true);
       },
       event(kind, id, tag, value, bytes, data) {
         event(made.source, kind, id, tag, value, bytes, data);
