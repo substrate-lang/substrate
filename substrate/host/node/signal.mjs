@@ -1,5 +1,6 @@
 // The host module "signal" (signal.sub) on Node.
 import os from 'node:os';
+import { errors } from '../errors.mjs';
 
 const SOURCE = 16;
 const RECEIVED = 1;
@@ -18,11 +19,11 @@ export function signals() {
     listen(np, nl, tag, err) {
       const name = caller.string(np, nl);
       if (!Object.hasOwn(os.constants.signals, name)) {
-        caller.fail(err, `signal.listen: ${name} is not a signal`);
+        caller.fail(err, `signal.listen: ${name} is not a signal`, errors.invalid);
         return 0;
       }
       if (forbidden.has(name)) {
-        caller.fail(err, `signal.listen: ${name} cannot be listened for`);
+        caller.fail(err, `signal.listen: ${name} cannot be listened for`, errors.invalid);
         return 0;
       }
       const id = next++;

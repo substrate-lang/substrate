@@ -1,5 +1,7 @@
 // The worker module's side inside a worker, in a browser or on Node. It batches output, delivers the parent's
 // messages as events, and reports back.
+import { errors } from './errors.mjs';
+
 const utf8 = new TextEncoder();
 
 const SOURCE = 3;
@@ -72,7 +74,7 @@ export function workerSide(post) {
   const worker = (caller) => ({
     source: SOURCE,
     start(f, bp, bl, time, size, heard, tag, gp, gl, err) {
-      caller.fail(err, 'worker.start: a worker cannot start workers');
+      caller.fail(err, 'worker.start: a worker cannot start workers', errors.invalid);
       return 0;
     },
     send(w, ptr, length) {

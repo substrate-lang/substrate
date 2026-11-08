@@ -1,5 +1,5 @@
 // The host module "clipboard" (clipboard.sub).
-import { errorOf, reasonOf } from '../errors.mjs';
+import { errors, errorOf, reasonOf } from '../errors.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -14,7 +14,7 @@ export function clipboard() {
     let ended = false;
     const attempt = (tag, err, ask, answer) => {
       if (!navigator.clipboard) {
-        caller.fail(err, 'clipboard: none');
+        caller.fail(err, 'clipboard: none', errors.other);
         return 0;
       }
       const id = next++;

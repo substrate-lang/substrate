@@ -122,7 +122,7 @@ export function fakeModules(setup, read) {
       connect(up, ul, pp, pl, hp, hl, tag, err) {
         const url = new URL(caller.string(up, ul));
         if (!mayUrl(setup.grants.net, url)) {
-          caller.fail(err, `websocket.connect: ${url.host} is not granted (--allow-net)`);
+          caller.fail(err, `websocket.connect: ${url.host} is not granted (--allow-net)`, errors.notGranted);
           return 0;
         }
         const [protocol = ''] = entries(caller.string(pp, pl));

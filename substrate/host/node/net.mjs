@@ -50,7 +50,7 @@ export function netModule(grants, certificate) {
             });
           } else server.listen(port, host);
         } catch (e) {
-          caller.fail(err, e.message);
+          caller.fail(err, e.message, errorOf(e));
           return 0;
         }
         id = next++;
@@ -81,7 +81,7 @@ export function netModule(grants, certificate) {
             ? tls.connect({ host, port, servername, ca, allowHalfOpen: true, lookup })
             : net.connect({ host, port, allowHalfOpen: true, lookup });
         } catch (e) {
-          caller.fail(err, e.message);
+          caller.fail(err, e.message, errorOf(e));
           return 0;
         }
         let connected = false;

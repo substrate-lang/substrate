@@ -60,7 +60,7 @@ export function watchModule(grants) {
         return id;
       } catch (e) {
         close(w);
-        caller.fail(err, `watch.start: ${at}: ${plainMessage(e)}`);
+        caller.fail(err, `watch.start: ${at}: ${plainMessage(e)}`, errorOf(e));
         return 0;
       }
     },

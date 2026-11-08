@@ -1,6 +1,7 @@
 // The host module "worker" (worker.sub). The browser and Node each give spawn, their way of starting a thread.
 import { entries } from './entries.mjs';
-import { askedOf, mayTree, within } from './grants.mjs';
+import { errors, errorOf } from './errors.mjs';
+import { askedOf, mayTree, notGranted, within } from './grants.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -69,7 +70,7 @@ export function workerModule({ spawn }) {
       thread = spawn({ modules, compiled, entry, argument, grants, names: caller.moduleNames(), pages, heard, ...setup },
                      app);
     } catch (e) {
-      caller.fail(err, e.message);
+      caller.fail(err, e.message, errorOf(e));
       return 0;
     }
     const w = nextNumber++;
@@ -100,7 +101,7 @@ export function workerModule({ spawn }) {
       start(f, bp, bl, time, size, heard, tag, gp, gl, err, ends, ap, al) {
         const entry = caller.named(f >>> 0);
         if (!entry) {
-          caller.fail(err, 'worker.start: a function of code the program loaded');
+          caller.fail(err, 'worker.start: a function of code the program loaded', errors.invalid);
           return 0;
         }
         const pages = Math.ceil((size >>> 0) / 65536);
@@ -113,11 +114,11 @@ export function workerModule({ spawn }) {
           const parent = caller.grants();
           const files = caller.parseGrants(read.flatMap((file) => ['read', file])).grants.read.items;
           for (const file of files) {
-            if (!mayTree(parent.read, file)) throw new Error(`read ${file} reaches beyond the parent's grants`);
+            if (!mayTree(parent.read, file)) throw notGranted(`read ${file} reaches beyond the parent's grants`);
           }
           grants = within(askedOf(request, parent), parent);
         } catch (e) {
-          caller.fail(err, `worker.start: ${e.message}`);
+          caller.fail(err, `worker.start: ${e.message}`, errorOf(e));
           return 0;
         }
         const args = al > 0 ? entries(string(ap, al)) : null;

@@ -1,5 +1,5 @@
 // The host module "websocket" (websocket.sub).
-import { errors } from '../errors.mjs';
+import { errors, errorOf } from '../errors.mjs';
 import { entries } from '../entries.mjs';
 import { mayUrl, portOfUrl } from '../grants.mjs';
 
@@ -46,7 +46,7 @@ export function websocket(grants, guard, node = false) {
       connect(up, ul, pp, pl, hp, hl, tag, err) {
         const url = caller.string(up, ul);
         if (URL.canParse(url) && !mayUrl(grants.net, new URL(url))) {
-          caller.fail(err, `websocket.connect: ${new URL(url).host} is not granted (--allow-net)`);
+          caller.fail(err, `websocket.connect: ${new URL(url).host} is not granted (--allow-net)`, errors.notGranted);
           return 0;
         }
         const protocols = entries(caller.string(pp, pl));
@@ -54,7 +54,7 @@ export function websocket(grants, guard, node = false) {
         const headers = [];
         for (let i = 0; i + 1 < list.length; i += 2) headers.push([list[i], list[i + 1]]);
         if (headers.length > 0 && !node) {
-          caller.fail(err, 'websocket.connect: a page cannot send headers');
+          caller.fail(err, 'websocket.connect: a page cannot send headers', errors.invalid);
           return 0;
         }
         const s = { ws: null, tag, polling: false, opened: false, denied: null };
@@ -65,7 +65,7 @@ export function websocket(grants, guard, node = false) {
           const dispatcher = guard && URL.canParse(url) ? guard(portOfUrl(new URL(url)), denied) : undefined;
           s.ws = node ? new WebSocket(url, { protocols, headers, dispatcher }) : new WebSocket(url, protocols);
         } catch (e) {
-          caller.fail(err, e.message);
+          caller.fail(err, e.message, errorOf(e));
           return 0;
         }
         const id = next++;

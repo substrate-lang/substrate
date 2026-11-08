@@ -1,4 +1,6 @@
 // The host module "location" (location.sub).
+import { errorOf } from '../errors.mjs';
+
 const utf8 = new TextEncoder();
 
 const SOURCE = 12;
@@ -13,7 +15,7 @@ export function locationModule() {
         go(caller.string(ptr, len));
         return 0;
       } catch (e) {
-        caller.fail(err, e.message);
+        caller.fail(err, e.message, errorOf(e));
         return -1;
       }
     };

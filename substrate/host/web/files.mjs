@@ -1,5 +1,5 @@
 // The host module "files" (files.sub).
-import { errors } from '../errors.mjs';
+import { errors, errorOf } from '../errors.mjs';
 import { readerSource } from '../streams.mjs';
 
 const utf8 = new TextEncoder();
@@ -43,7 +43,7 @@ export function files() {
           input.showPicker();
         } catch (e) {
           input.remove();
-          caller.fail(err, e.message);
+          caller.fail(err, e.message, errorOf(e));
           return 0;
         }
         return id;

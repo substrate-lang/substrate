@@ -84,7 +84,7 @@ export function processes(grants, loader, setup = {}) {
           const l = launched(file ?? program, entries(caller.string(ap, al)));
           process = child.spawn(l.command, l.args, { cwd, env, stdio: modes });
         } catch (e) {
-          caller.fail(err, e.message);
+          caller.fail(err, e.message, errorOf(e));
           return 0;
         }
         const id = next++;
@@ -130,7 +130,7 @@ export function processes(grants, loader, setup = {}) {
           new DataView(caller.memory().buffer).setUint32(caller.u(op), p, true);
           return r.status !== null ? r.status : 128 + (os.constants.signals[r.signal] || 0);
         } catch (e) {
-          caller.fail(err, e.message);
+          caller.fail(err, e.message, errorOf(e));
           return -1;
         } finally {
           if (dir) fs.rmSync(dir, { recursive: true, force: true });
@@ -146,7 +146,7 @@ export function processes(grants, loader, setup = {}) {
           const l = launched(file ?? program, entries(caller.string(ap, al)), program);
           become(l.command, [l.argv0, ...l.args], env);
         } catch (e) {
-          caller.fail(err, e.message);
+          caller.fail(err, e.message, errorOf(e));
         }
         return -1;
       },
@@ -161,7 +161,7 @@ export function processes(grants, loader, setup = {}) {
           const l = launched(file ?? program, entries(caller.string(ap, al)), program);
           setup.atEnd = { file: l.command, argv: [l.argv0, ...l.args], env };
         } catch (e) {
-          caller.fail(err, e.message);
+          caller.fail(err, e.message, errorOf(e));
           return -1;
         }
         return 0;
