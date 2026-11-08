@@ -45,7 +45,7 @@ The median ratio to C's Wasm is 1.41.
 - sieve: the primes below 100 million.
 - sort: quicksort of 5 million integers, comparing through a function pointer.
 - trees: the Benchmarks Game's binary trees.
-- vec: a generic array that grows, at i32 and at a struct: 10 million items.
+- vec: a growable array from std/vector, at i32 and at a struct: 10 million items.
 
 ## JSON
 

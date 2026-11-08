@@ -1,7 +1,7 @@
 # substrate-lang
 
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
-(modernized with generics, variants, bounds-checked slices), combined with
+(modernized with variants and bounds-checked slices), combined with
 Racket-style hygienic macros and module hooks for defining new languages and
 DSLs. Its compiler is small (~11k LOC, <600 KiB of Wasm), very fast,
 self-hosted, and runs in the browser.

@@ -1,7 +1,7 @@
 # substrate
 
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
-(modernized with generics, variants, bounds-checked slices), combined with
+(modernized with variants and bounds-checked slices), combined with
 Racket-style hygienic macros and module hooks for defining new languages and
 DSLs. Its compiler is small (~11k LOC, <600 KiB of Wasm), very fast, and
 runs in the browser. Substrate's compiler, dev tooling, package manager, and
@@ -93,7 +93,7 @@ These examples are in [examples/hello](examples/hello).
 ## Core Language
 
 [examples/core.sub](examples/core.sub) uses structs, variants, numbers,
-booleans, strings, slices, generics and closures:
+booleans, strings, slices and closures:
 
 ```racket
 (struct point [x i32] [y i32])
@@ -105,13 +105,13 @@ booleans, strings, slices, generics and closures:
     [(square side) (* side side)]
     [(rect w h) (* w h)]))
 
-(define #:forall (T) (largest [items (slice T)]) -> T
+(define (largest [items (slice i32)]) -> i32
   (let ([best (@ items 0)])
     (for ([i u32 1]) (< i (-> items length)) (+= i 1)
       (when (> (@ items i) best) (set! best (@ items i))))
     best))
 
-(define #:forall (T) (count-if [items (slice T)] [keep (closure (T) -> bool)]) -> u32
+(define (count-if [items (slice i32)] [keep (closure (i32) -> bool)]) -> u32
   (let ([n u32 0])
     (for ([i u32 0]) (< i (-> items length)) (+= i 1)
       (when (keep (@ items i)) (+= n 1)))
@@ -126,7 +126,7 @@ booleans, strings, slices, generics and closures:
     (printf "bool: ~a, f32: ~a, f64: ~a, u8 255 + 1: ~a\n" ok half third byte))
   (let ([name "Substrate"])
     (printf "~a has ~a bytes and starts with ~a\n" name (-> name length) (slice name 0 3)))
-  (printf "largest: ~a, ~a\n" (largest (slice (array-of i32 3 9 4))) (largest (slice (array-of f64 1.5 0.5))))
+  (printf "largest: ~a\n" (largest (slice (array-of i32 3 9 4))))
   (let* ([limit 4] [above (lambda ([x i32]) -> bool (> x limit))] [xs (slice (array-of i32 3 9 4 7))])
     (printf "above 4: ~a, " (count-if xs above))
     (set! limit 8)
@@ -150,7 +150,7 @@ point: 3, 4
 areas: 9, 42
 bool: #t, f32: 0.5, f64: 0.3333333333333333, u8 255 + 1: 0
 Substrate has 9 bytes and starts with Sub
-largest: 9, 1.5
+largest: 9
 above 4: 2, above 8: 1
 error: trap: index 3 is out of range for length 3
     at index-trap compiler/substrate.sub:201:5
