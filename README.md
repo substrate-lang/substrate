@@ -142,6 +142,10 @@ Closures (`lambda`) can access the variables of their enclosing functions.
 A closure can be passed down to a call or
 kept in a local, but can't be returned or stored in memory.
 
+`enum` declares cases numbered from 0, as C does: `(enum color red green blue)`.
+Unlike a C enum, an enum is its own type. Its cases compare by number, and
+`cast` converts between an enum and integers.
+
 The program's last line reads past the end of a slice, so it traps there:
 
 ```console
@@ -328,24 +332,23 @@ false.sub:18:21: error: bend: expected (S (S (S Z)))
 ## Memory Management
 
 Memory is managed by hand, as in C. Locals live on the stack, and `&` gives
-their address. `malloc` and `free` manage the heap, arenas free many
-allocations at once, and buffers grow as they are written.
+their address. `new` allocates from an arena, or from the heap when the arena
+is 0. `(new a T)` gives a zeroed object, `(new a T n)` gives a zeroed slice of
+`n` items, and `(new a value)` gives an object that holds the value. `copy`
+copies a string or a slice in the same way. `free` returns memory to the heap,
+arenas free many allocations at once, and buffers grow as they are written.
 [examples/memory.sub](examples/memory.sub):
 
 ```racket
 (struct node [value i32] [next (ptr node)])
 
 (define (main)
-  (let ([n (cast (ptr node) (malloc (sizeof node)))])
-    (set! (-> n value) 7)
-    (printf "malloc: ~a\n" (-> n value))
+  (let ([n (new 0 (node #:value 7 #:next 0))])
+    (printf "heap: ~a\n" (-> n value))
     (free n))
   (let ([a (make-arena)] [list (ptr node) 0])
     (for ([i 1]) (<= i 1000) (+= i 1)
-      (let ([cell (new (& a) node)])
-        (set! (-> cell value) i)
-        (set! (-> cell next) list)
-        (set! list cell)))
+      (set! list (new (& a) (node #:value i #:next list))))
     (printf "arena: ~a ~a ~a\n" (-> list value) (-> list next value) (-> list next next value))
     (arena-free (& a)))
   (let ([b (make-buffer)])
@@ -357,14 +360,14 @@ allocations at once, and buffers grow as they are written.
 
 ```console
 $ substrate run memory.sub
-malloc: 7
+heap: 7
 arena: 1000 999 998
 buffer: grows as needed
 ```
 
-The core also has `calloc`, `realloc`, `memcpy`, `memset`, `memcmp` and hash
-tables. `malloc` traps when memory runs out, where `try-malloc` gives 0, and
-freeing a block twice traps.
+The core also has `malloc`, `calloc`, `realloc`, `memcpy`, `memset`, `memcmp`
+and hash tables. Allocation traps when memory runs out, where `try-malloc`
+gives 0, and freeing a block twice traps.
 
 Note that languages built as libraries on top of Substrate do not necessarily
 need to manage memory manually (e.g.,
