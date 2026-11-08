@@ -45,14 +45,14 @@ network without grants. `cat.sub` prints a file:
 (require-unqualified host/fs)
 
 (define (main)
-  (let ([path (@ (host-args) 0)] [contents (slice u8)] [err string])
-    (when (< (fs-read-file path (& contents) (& err)) 0)
-      (host-exit 1 err))
+  (let ([path (@ (host-args) 0)] [contents (slice u8)] [err error])
+    (unless (fs-read-file path (& contents) (& err))
+      (host-exit 1 (error-text (& err))))
     (printf "~a" (cast string contents))))
 ```
 
 `@` reads an element of a slice, or what a pointer points to, `&` takes a
-variable's address, and `when` runs its body only if its test is true.
+variable's address, and `unless` runs its body only if its test is false.
 
 ```console
 $ substrate run cat.sub hello.sub
@@ -153,7 +153,7 @@ Substrate has 9 bytes and starts with Sub
 largest: 9
 above 4: 2, above 8: 1
 error: trap: index 3 is out of range for length 3
-    at index-trap compiler/substrate.sub:201:5
+    at index-trap compiler/substrate.sub:246:5
     at main ./core.sub:37:20
 ```
 

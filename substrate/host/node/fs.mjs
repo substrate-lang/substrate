@@ -20,7 +20,7 @@ const plain = (f) => (...args) => {
     return f(...args);
   } catch (e) {
     if (typeof e.errno !== 'number') throw e;
-    throw new Error(plainMessage(e));
+    throw Object.assign(new Error(plainMessage(e)), { code: e.code });
   }
 };
 

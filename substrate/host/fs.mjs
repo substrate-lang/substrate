@@ -1,5 +1,6 @@
 // The host module "fs" (fs.sub), over the files that node/fs.mjs or web/fs.mjs gives.
 import { joined } from './entries.mjs';
+import { errors, errorOf } from './errors.mjs';
 
 const utf8 = new TextEncoder();
 
@@ -22,7 +23,7 @@ export function fsModule(files) {
         return f();
       } catch (e) {
         if (e instanceof WebAssembly.RuntimeError) throw e;
-        caller.fail(err, `${path}: ${e.message}`);
+        caller.fail(err, `${path}: ${e.message}`, errorOf(e));
         return failed;
       }
     };
@@ -31,7 +32,7 @@ export function fsModule(files) {
     const using = (h, err, f, failed = -1) => {
       const open = handles.get(h);
       if (open) return attempt(open.path, err, () => f(open.file), failed);
-      caller.fail(err, `file ${h}: Bad file descriptor`);
+      caller.fail(err, `file ${h}: Bad file descriptor`, errors.invalid);
       return failed;
     };
     const bytesAt = (ptr, len) => caller.memory().subarray(caller.u(ptr), caller.u(ptr) + len);
@@ -81,7 +82,7 @@ export function fsModule(files) {
       file_stream(h, write, start, tag, err) {
         const open = handles.get(h);
         if (!open) {
-          caller.fail(err, `file ${h}: Bad file descriptor`);
+          caller.fail(err, `file ${h}: Bad file descriptor`, errors.invalid);
           return 0;
         }
         handles.delete(h);
@@ -90,7 +91,7 @@ export function fsModule(files) {
         } catch (e) {
           if (e instanceof WebAssembly.RuntimeError) throw e;
           attempt(open.path, 0, () => open.file.close());
-          caller.fail(err, `${open.path}: ${e.message}`);
+          caller.fail(err, `${open.path}: ${e.message}`, errorOf(e));
           return 0;
         }
       },

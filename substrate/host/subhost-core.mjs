@@ -1,6 +1,7 @@
 // The JavaScript host, shared by Node (subhost.mjs) and the browser (web/subhost-web.mjs).
 import { createStreams, STREAM } from './streams.mjs';
 import { joined } from './entries.mjs';
+import { errors } from './errors.mjs';
 
 const utf8 = new TextEncoder();
 const text = new TextDecoder();
@@ -174,6 +175,7 @@ export function createHost(platform) {
   // A memory's malloc, from the module that exports both.
   const allocators = new WeakMap();
   let lastError = '';
+  let failureCode = errors.other;
   // The running program: its module names in load order, a function that returns a module's bytes, and the files of
   // the compiled modules its build wrote, keyed by file name (null if it wrote none).
   let programNames = [];
@@ -330,12 +332,11 @@ export function createHost(platform) {
       trap: hostTrap,
       write: (fd, bytes) => platform.write(fd === 2 ? 2 : 1, bytes),
       give,
-      fail(err, message, code) {
+      fail(err, message, code = errors.other) {
+        failureCode = code;
         if (!err) return;
         const p = give(utf8.encode(message), u(err) + 4);
-        const view = new DataView(memory().buffer);
-        view.setUint32(u(err), p, true);
-        if (code !== undefined) view.setInt32(u(err) + 8, code, true);
+        new DataView(memory().buffer).setUint32(u(err), p, true);
       },
       event(kind, id, tag, value, bytes, data) {
         event(made.source, kind, id, tag, value, bytes, data);
@@ -378,6 +379,11 @@ export function createHost(platform) {
       write(fd, ptr, len) {
         platform.write(fd === 2 ? 2 : 1, memory().subarray(u(ptr), u(ptr) + len));
         return len;
+      },
+      failure_code() {
+        const code = failureCode;
+        failureCode = errors.other;
+        return code;
       },
       trap(ptr, len) {
         hostTrap(string(ptr, len));

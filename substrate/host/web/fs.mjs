@@ -13,7 +13,7 @@ export function resolvePath(cwd, path) {
   return `/${out.join('/')}`;
 }
 
-const missing = () => new Error('No such file or directory');
+const missing = () => Object.assign(new Error('No such file or directory'), { code: 'ENOENT' });
 const unsupported = () => new Error('Operation not supported');
 const under = (dir) => (dir === '/' ? '/' : `${dir}/`);
 
@@ -142,7 +142,7 @@ export function pageFiles(files, cwd, grants) {
     },
     readLink(p) {
       info(at('read', p));
-      throw new Error('Invalid argument');
+      throw Object.assign(new Error('Invalid argument'), { code: 'EINVAL' });
     },
     realPath(p) {
       const key = at('read', p);
@@ -180,7 +180,7 @@ export function pageFiles(files, cwd, grants) {
       const key = at(changes ? 'write' : 'read', p);
       if (how.read && changes) at('read', p);
       if (files.has(key)) {
-        if (how.createNew) throw new Error('File already exists');
+        if (how.createNew) throw Object.assign(new Error('File already exists'), { code: 'EEXIST' });
       } else if (inside(key).length > 0) {
         throw new Error('Illegal operation on a directory');
       } else if (how.create || how.createNew) {
