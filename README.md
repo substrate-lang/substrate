@@ -142,10 +142,6 @@ Closures (`lambda`) can access the variables of their enclosing functions.
 A closure can be passed down to a call or
 kept in a local, but can't be returned or stored in memory.
 
-`enum` declares cases numbered from 0, as C does: `(enum color red green blue)`.
-Unlike a C enum, an enum is its own type. Its cases compare by number, and
-`cast` converts between an enum and integers.
-
 The program's last line reads past the end of a slice, so it traps there:
 
 ```console
