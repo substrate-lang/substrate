@@ -171,8 +171,8 @@ itself, and it will evolve before 1.0. Its modules, by directory:
 - `std/web`: the page's DOM, canvas drawing and WebGPU
 - `std/html`: writing HTML
 - `std/log`: structured logs
-- `std/meta`: types as data at compile time, for macros that write code from
-  them
+- `std/vector`: growable arrays
+- `std/meta`: types as data at compile time
 - `std/test`: the test runner, and tests in a browser
 - `std/browser`: Chromium, driven over the DevTools protocol
 - `std/package`: manifests, package hashes and the package store
