@@ -328,19 +328,19 @@ false.sub:18:21: error: bend: expected (S (S (S Z)))
 ## Memory Management
 
 Memory is managed by hand, as in C. Locals live on the stack, and `&` gives
-their address. `new` allocates from an arena, or from the heap when the arena
-is 0. `(new a T)` gives a zeroed object, `(new a T n)` gives a zeroed slice of
-`n` items, and `(new a value)` gives an object that holds the value. `copy`
-copies a string or a slice in the same way. `free` returns memory to the heap,
-arenas free many allocations at once, and buffers grow as they are written.
+their address. `malloc` and `free` manage the heap, arenas free many
+allocations at once, and buffers grow as they are written. `new` allocates
+from an arena: `(new a T)` gives a zeroed object, and `(new a value)` gives an
+object that holds the value. `copy` copies a string or a slice into an arena.
 [examples/memory.sub](examples/memory.sub):
 
 ```racket
 (struct node [value i32] [next (ptr node)])
 
 (define (main)
-  (let ([n (new 0 (node #:value 7 #:next 0))])
-    (printf "heap: ~a\n" (-> n value))
+  (let ([n (cast (ptr node) (malloc (sizeof node)))])
+    (set! (-> n value) 7)
+    (printf "malloc: ~a\n" (-> n value))
     (free n))
   (let ([a (make-arena)] [list (ptr node) 0])
     (for ([i 1]) (<= i 1000) (+= i 1)
@@ -356,14 +356,14 @@ arenas free many allocations at once, and buffers grow as they are written.
 
 ```console
 $ substrate run memory.sub
-heap: 7
+malloc: 7
 arena: 1000 999 998
 buffer: grows as needed
 ```
 
-The core also has `malloc`, `calloc`, `realloc`, `memcpy`, `memset`, `memcmp`
-and hash tables. Allocation traps when memory runs out, where `try-malloc`
-gives 0, and freeing a block twice traps.
+The core also has `calloc`, `realloc`, `memcpy`, `memset`, `memcmp` and hash
+tables. `malloc` traps when memory runs out, where `try-malloc` gives 0, and
+freeing a block twice traps.
 
 Note that languages built as libraries on top of Substrate do not necessarily
 need to manage memory manually (e.g.,
