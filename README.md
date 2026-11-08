@@ -153,7 +153,7 @@ Substrate has 9 bytes and starts with Sub
 largest: 9
 above 4: 2, above 8: 1
 error: trap: index 3 is out of range for length 3
-    at index-trap compiler/substrate.sub:246:5
+    at index-trap compiler/substrate.sub:243:5
     at main ./core.sub:37:20
 ```
 
