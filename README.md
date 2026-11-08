@@ -3,9 +3,9 @@
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
 (modernized with variants and bounds-checked slices), combined with
 Racket-style hygienic macros and module hooks for defining new languages and
-DSLs. Its compiler is small (~11k LOC, <600 KiB of Wasm), very fast, and
-runs in the browser. Substrate's compiler, dev tooling, package manager, and
-standard library are entirely written in Substrate.
+DSLs. Its compiler is self-hosted (~11k LOC, <600 KiB of Wasm), fast, and
+runs in the browser. Substrate's dev tooling, package manager, and standard 
+library are also entirely written in Substrate.
 
 ## Install
 
@@ -38,8 +38,8 @@ $ substrate run build/hello
 Hello, world!
 ```
 
-Substrate code is sandboxed by default and cannot access your filesystem or
-network without grants. `cat.sub` prints a file:
+Substrate code is sandboxed and cannot access your filesystem or network 
+without grants. `cat.sub` prints a file:
 
 ```racket
 (require-unqualified host/fs)
@@ -52,7 +52,7 @@ network without grants. `cat.sub` prints a file:
 ```
 
 `@` reads an element of a slice, or what a pointer points to, `&` takes a
-variable's address, and `unless` runs its body only if its test is false.
+variable's address, and `unless` runs its body if its test is false.
 
 ```console
 $ substrate run cat.sub hello.sub
@@ -63,13 +63,13 @@ $ substrate run -A cat.sub hello.sub
 (define (main) (printf "Hello, world!\n"))
 ```
 
-The grants are like Deno's. `-R`, `-W`, `-N` and `-E` grant reading, writing,
+The grants are similar to Deno's. `-R`, `-W`, `-N` and `-E` grant reading, writing,
 the network and environment variables, and `--allow-run` grants running
 programs. Each can be limited to a list after `=`, as in `-R=hello.sub`. `-A`
 grants everything.
 
-A program can also run in a browser. `page.sub` puts a heading on the page with
-`std/web`:
+A program can also run in a browser. For example, here `page.sub` puts a heading on 
+the page with `std/web`:
 
 ```racket
 (require-unqualified std/web/dom)
@@ -79,8 +79,7 @@ A program can also run in a browser. `page.sub` puts a heading on the page with
   (dom-flush!))
 ```
 
-`substrate site` builds a site for it, and `substrate serve` serves the site
-locally:
+`substrate site` builds a site which `substrate serve` can serve locally:
 
 ```console
 $ substrate site page.sub -o build/page
@@ -135,14 +134,14 @@ booleans, strings, slices and closures:
     (printf "~a\n" (@ xs 3))))
 ```
 
-Integers wrap around when they overflow, as Wasm's do, so the `u8` holding 255
+Integers wrap around when they overflow (like Wasm) so the `u8` holding 255
 holds 0 after `(+= byte 1)`. Dividing an integer by zero traps.
 
-Closures (`lambda`) can access the variables of their enclosing functions.
-A closure can be passed down to a call or
-kept in a local, but can't be returned or stored in memory.
+Closures (`lambda`) can access the variables of enclosing functions.
+A closure can be passed to a call or kept in a local, but can't be returned 
+or stored in memory.
 
-The program's last line reads past the end of a slice, so it traps there:
+Above, the last line reads past the end of a slice, so the program traps there:
 
 ```console
 $ substrate run core.sub
@@ -160,7 +159,7 @@ error: trap: index 3 is out of range for length 3
 ## Standard Library
 
 The standard library mostly holds modules useful for developing Substrate
-itself, and it will evolve before 1.0. Its modules, by directory:
+itself, which may evolve before 1.0. Its modules, by directory:
 
 - `std/encoding`: Base64, JSON, UTF-8 and postcard wire messages
 - `std/crypto`: SHA-1, SHA-256, SHA-512, HMAC, HKDF and PBKDF2
