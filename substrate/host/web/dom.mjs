@@ -10,6 +10,10 @@ const HEARD = 1;
 const IMAGE_LOADED = 2;
 const IMAGE_FAILED = 3;
 
+// The node numbers of the document and of the current event (std/web/patches.sub).
+const DOCUMENT = 0xffffffff;
+const EVENT = 0xfffffffe;
+
 const imageTypes = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
   avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml',
@@ -17,7 +21,7 @@ const imageTypes = {
 
 export function dom(root) {
   const templates = new Map();
-  const nodes = new Map([[0, root]]);
+  const nodes = new Map([[0, root], [DOCUMENT, root.ownerDocument]]);
   const images = new Map();
   // How many images each tag has loading.
   const loading = new Map();
@@ -34,6 +38,69 @@ export function dom(root) {
   const event = () => {
     const e = caller && caller.current();
     return e && e.source === SOURCE ? e.data : null;
+  };
+
+  // Names walk from a node or the current event through DOM objects only, and end at a number, text, or true or false.
+  const kinds = ['Node', 'Event', 'NodeList', 'HTMLCollection', 'DOMRectReadOnly', 'DOMTokenList', 'CSSStyleDeclaration',
+    'DOMStringMap', 'ValidityState', 'FileList', 'Blob', 'DataTransfer', 'TouchList', 'Touch',
+    'IntersectionObserverEntry'].map((name) => globalThis[name]).filter((kind) => kind !== undefined);
+  const reachable = (x) => kinds.some((kind) => x instanceof kind);
+
+  function guarded(path, f) {
+    try {
+      return f();
+    } catch (e) {
+      caller.trap(`dom: ${path}: ${e.message}`);
+    }
+  }
+
+  function step(x, name, path) {
+    if (!(name in Object(x))) caller.trap(`dom: ${path}: there is no ${name}`);
+    return guarded(path, () => x[name]);
+  }
+
+  // The object that the path's last name belongs to, or null when a step before it is missing, and that name.
+  function owner(root, path) {
+    const parts = path.split('.');
+    let x = root;
+    for (let k = 0; k < parts.length - 1; k++) {
+      x = step(x, parts[k], path);
+      if (x === null || x === undefined) return [null, ''];
+      if (!reachable(x)) caller.trap(`dom: ${path}: ${parts.slice(0, k + 1).join('.')} is out of reach`);
+    }
+    return [x, parts[parts.length - 1]];
+  }
+
+  function read(root, path) {
+    const [x, last] = owner(root, path);
+    if (x === null) return null;
+    const v = step(x, last, path);
+    const plain = v === null || v === undefined || ['number', 'string', 'boolean'].includes(typeof v);
+    if (!plain) caller.trap(`dom: ${path} is not a number, text, or true or false`);
+    return v;
+  }
+
+  function write(root, path, value) {
+    const [x, last] = owner(root, path);
+    if (x === null || !(last in x)) caller.trap(`dom: ${path}: there is nothing to set`);
+    guarded(path, () => { x[last] = value; });
+  }
+
+  function call(root, path, args) {
+    const [x, last] = owner(root, path);
+    if (x === null || typeof x[last] !== 'function') caller.trap(`dom: ${path} is not a method`);
+    const result = guarded(path, () => x[last](...args));
+    if (result && typeof result.catch === 'function') result.catch(() => {});
+  }
+
+  const numberOf = (v) => (v === null || v === undefined ? 0 : Number(v));
+  const textOf = (v) => (v === null || v === undefined ? '' : String(v));
+
+  const bits = new DataView(new ArrayBuffer(8));
+  const float64 = (low, high) => {
+    bits.setUint32(0, low, true);
+    bits.setUint32(4, high, true);
+    return bits.getFloat64(0, true);
   };
 
   const listener = (e) => {
@@ -287,30 +354,28 @@ export function dom(root) {
           i += 5;
           break;
         }
-        case 10: {
-          const node = nodes.get(w[i + 1]);
-          after.push(() => node.focus());
-          i += 2;
-          break;
-        }
-        case 11: {
-          const node = nodes.get(w[i + 1]);
-          after.push(() => { node.scrollTop = node.scrollHeight; });
-          i += 2;
-          break;
-        }
         case 12:
           listenWindow(w[i + 1], string(i + 2), w[i + 4]);
           i += 5;
           break;
-        case 15: {
-          const node = nodes.get(w[i + 1]);
-          if (w[i + 2] !== 0) {
-            after.push(() => { const p = node.requestPointerLock(); if (p && p.catch) p.catch(() => {}); });
-          } else {
-            after.push(() => document.exitPointerLock());
+        case 17: {
+          const node = nodeOf(w[i + 1]);
+          const path = string(i + 2);
+          const value = w[i + 4] === 0 ? float64(w[i + 5], w[i + 6]) : string(i + 5);
+          after.push(() => write(node, path, value));
+          i += 7;
+          break;
+        }
+        case 18: {
+          const node = nodeOf(w[i + 1]);
+          const path = string(i + 2);
+          const args = [];
+          for (let k = 0; k < w[i + 4]; k++) {
+            const at = i + 5 + 3 * k;
+            args.push(w[at] === 0 ? float64(w[at + 1], w[at + 2]) : string(at + 1));
           }
-          i += 3;
+          after.push(() => call(node, path, args));
+          i += 5 + 3 * w[i + 4];
           break;
         }
         case 14: {
@@ -371,50 +436,39 @@ export function dom(root) {
     caller = theCaller;
     app = theApp;
     const given = (s, out) => caller.give(utf8.encode(s), out);
+    const current = () => {
+      const e = event();
+      if (!e) caller.trap('dom: there is no current event');
+      return e;
+    };
+    const known = (n) => {
+      const id = n >>> 0;
+      if (id === EVENT) return current();
+      if (!nodes.has(id)) caller.trap(`dom: there is no node ${id}`);
+      return nodeOf(id);
+    };
     return {
       source: SOURCE,
       apply(ptr, length) {
         apply(caller.memory(), caller.u(ptr), length);
       },
-      event_value(out) {
-        const e = event();
-        const target = e && e.target;
-        return given(target && typeof target.value === 'string' ? target.value : '', out);
+      read_number(node, ptr, length) {
+        return numberOf(read(known(node), caller.string(ptr, length)));
       },
-      event_key(out) {
-        const e = event();
-        return given(e && typeof e.key === 'string' ? e.key : '', out);
+      read_text(node, ptr, length, out) {
+        return given(textOf(read(known(node), caller.string(ptr, length))), out);
       },
-      event_flags() {
-        const e = event();
-        if (!e) return 0;
-        return (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0) |
-          (e.target && e.target.checked === true ? 16 : 0) | (document.pointerLockElement ? 32 : 0) |
-          (e.isIntersecting === true ? 64 : 0);
+      is(node, ptr, length) {
+        const name = caller.string(ptr, length);
+        const document = root.ownerDocument;
+        if (!(name in document)) caller.trap(`dom: the document has no ${name}`);
+        return document[name] === known(node) ? 1 : 0;
       },
-      event_number(which) {
-        const e = event();
-        if (!e) return 0;
-        switch (which) {
-          case 0: return e.timeStamp || 0;
-          case 1: return e.offsetX || 0;
-          case 2: return e.offsetY || 0;
-          case 3: return e.movementX || 0;
-          case 4: return e.movementY || 0;
-          case 5: return e.button || 0;
-          default: return 0;
-        }
+      event_call(ptr, length) {
+        call(current(), caller.string(ptr, length), []);
       },
       images_loading(tag) {
         return loading.get(tag) || 0;
-      },
-      prevent_default() {
-        const e = event();
-        if (e && e.preventDefault) e.preventDefault();
-      },
-      stop_propagation() {
-        const e = event();
-        if (e && e.stopPropagation) e.stopPropagation();
       },
       element(ptr, length, node) {
         const found = root.ownerDocument.getElementById(caller.string(ptr, length));
