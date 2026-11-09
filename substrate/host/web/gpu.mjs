@@ -75,13 +75,38 @@ export async function gpu(options = {}) {
 
   let app = null;
   let caller = null;
-  function event(kind, id, data) {
-    if (caller) caller.event(kind, id, 0, kind === ERROR ? errors.invalid : 0, data);
+  function event(kind, id, data, to = 0) {
+    if (caller) caller.event(kind, id, to, kind === ERROR ? errors.invalid : 0, data);
   }
-  const error = (id, message) => event(ERROR, id, utf8.encode(message));
+  const error = (id, message, to = 0) => event(ERROR, id, utf8.encode(message), to);
 
-  device.addEventListener('uncapturederror', (e) => error(0, e.error.message));
-  device.lost.then((info) => error(0, `the device was lost (${info.reason}): ${info.message}`));
+  // The tag that gpu-tag! gave the commands being run, each resource's tag, and how many resources each tag has.
+  let tag = 0;
+  const tagOf = new Map();
+  const owners = new Map();
+
+  function made(kind, id) {
+    if (tag === 0) return;
+    tagOf.set(`${kind} ${id}`, tag);
+    owners.set(tag, (owners.get(tag) || 0) + 1);
+  }
+
+  function destroyed(kind, id) {
+    const key = `${kind} ${id}`;
+    const t = tagOf.get(key);
+    if (t === undefined) return;
+    tagOf.delete(key);
+    if (owners.get(t) === 1) owners.delete(t);
+    else owners.set(t, owners.get(t) - 1);
+  }
+
+  function deviceError(message) {
+    if (owners.size === 0) error(0, message);
+    for (const t of owners.keys()) error(0, message, t);
+  }
+
+  device.addEventListener('uncapturederror', (e) => deviceError(e.error.message));
+  device.lost.then((info) => deviceError(`the device was lost (${info.reason}): ${info.message}`));
 
   function get(kind, id) {
     const r = tables[kind].get(id);
@@ -110,6 +135,7 @@ export async function gpu(options = {}) {
       if (!pass) caller.trap(`gpu: ${what} outside a pass`);
       if (compute !== undefined && compute !== computing) caller.trap(`gpu: ${what} in the wrong kind of pass`);
     };
+    tag = 0;
     let i = 0;
     while (i < w.length) {
       const op = w[i];
@@ -125,6 +151,7 @@ export async function gpu(options = {}) {
               usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
             });
             surfaces.set(id, { canvas: node, texture });
+            made(1, id);
             i += 3;
             break;
           }
@@ -132,19 +159,22 @@ export async function gpu(options = {}) {
           if (!context) caller.trap(`gpu: surface ${id}: the canvas cannot be used by WebGPU (it may already be used by a 2D context)`);
           context.configure({ device, format: canvasFormat, alphaMode: 'premultiplied', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
           surfaces.set(id, { canvas: node, context });
+          made(1, id);
           i += 3;
           break;
         }
         case 2: {
           const id = w[i + 1];
+          const to = tag;
           device.pushErrorScope('validation');
           const module = device.createShaderModule({ label: `shader ${id}`, code: string(i + 2) });
           shaders.set(id, module);
+          made(2, id);
           device.popErrorScope().then(async (e) => {
             if (!e) return;
             const errors = (await module.getCompilationInfo()).messages.filter((m) => m.type === 'error');
             error(id, errors.length === 0 ? e.message : `shader ${id} does not compile:\n` +
-              errors.map((m) => `  line ${m.lineNum}, column ${m.linePos}: ${m.message}`).join('\n'));
+              errors.map((m) => `  line ${m.lineNum}, column ${m.linePos}: ${m.message}`).join('\n'), to);
           });
           i += 4;
           break;
@@ -191,6 +221,7 @@ export async function gpu(options = {}) {
           if (fragmentEntry.length > 0) description.fragment = { module, entryPoint: fragmentEntry, targets };
           if (depthFormat) description.depthStencil = { format: depthFormat, depthWriteEnabled: depthWrite, depthCompare };
           pipelines.set(id, { pipeline: checked(`pipeline ${id}`, id, () => device.createRenderPipeline(description)), compute: false });
+          made(3, id);
           break;
         }
         case 4: {
@@ -207,6 +238,7 @@ export async function gpu(options = {}) {
             compute: { module, entryPoint },
           }));
           pipelines.set(id, { pipeline, compute: true });
+          made(3, id);
           break;
         }
         case 5: {
@@ -220,6 +252,7 @@ export async function gpu(options = {}) {
           if (bits & 8) usage |= GPUBufferUsage.STORAGE;
           if (bits & 16) usage |= GPUBufferUsage.INDIRECT;
           buffers.set(id, device.createBuffer({ label: `buffer ${id}`, size, usage }));
+          made(4, id);
           i += 4;
           break;
         }
@@ -235,6 +268,7 @@ export async function gpu(options = {}) {
           if (format.startsWith('depth')) usage |= GPUTextureUsage.RENDER_ATTACHMENT;
           const texture = device.createTexture({ label: `texture ${id}`, size: [width, height, layers], format, usage, mipLevelCount: mips });
           textures.set(id, { texture, format, width, height, layers });
+          made(5, id);
           i += 8;
           break;
         }
@@ -246,7 +280,8 @@ export async function gpu(options = {}) {
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
           });
           textures.set(id, { texture: placeholder, format: 'rgba8unorm', width: 1, height: 1, layers: 1 });
-          loadTexture(id, name);
+          made(5, id);
+          loadTexture(id, name, tag);
           i += 4;
           break;
         }
@@ -261,6 +296,7 @@ export async function gpu(options = {}) {
           if (w[i + 4] !== 0) description.compare = choose(comparisons, w[i + 4], 'comparison');
           description.label = `sampler ${id}`;
           samplers.set(id, device.createSampler(description));
+          made(6, id);
           i += 5;
           break;
         }
@@ -296,6 +332,7 @@ export async function gpu(options = {}) {
           }
           layouts.set(id, checked(`layout ${id}`, id, () => device.createBindGroupLayout({ label: `layout ${id}`, entries })));
           layered.set(id, new Set(entries.filter((e) => e.texture && e.texture.viewDimension === '2d-array').map((e) => e.binding)));
+          made(7, id);
           break;
         }
         case 10: {
@@ -311,9 +348,10 @@ export async function gpu(options = {}) {
             entries.push({ binding: w[i], kind, id: w[i + 2], offset: w[i + 3], size: w[i + 4] });
             i += 5;
           }
-          const description = { id, layout, entries, layers: layoutId !== 0 ? layered.get(layoutId) : new Set() };
+          const description = { id, layout, entries, layers: layoutId !== 0 ? layered.get(layoutId) : new Set(), tag };
           description.group = makeBindGroup(description);
           bindGroups.set(id, description);
+          made(8, id);
           break;
         }
         case 11: {
@@ -327,6 +365,7 @@ export async function gpu(options = {}) {
             else if (kind === 4) r.destroy();
             else if (kind === 5) r.texture.destroy();
             table.delete(id);
+            destroyed(kind, id);
           }
           i += 3;
           break;
@@ -347,17 +386,19 @@ export async function gpu(options = {}) {
         }
         case 14: {
           const id = w[i + 1];
+          const to = tag;
           const read = readTexture(encoder, id, w[i + 2], w[i + 3], w[i + 4], w[i + 5], w[i + 6], w[i + 7]);
-          reads.push(() => read().then((bytes) => event(PIXELS, id, bytes), (e) => error(id, e.message)));
+          reads.push(() => read().then((bytes) => event(PIXELS, id, bytes, to), (e) => error(id, e.message, to)));
           i += 8;
           break;
         }
         case 15: {
           const id = w[i + 1];
+          const to = tag;
           const len = w[i + 3];
           const staging = device.createBuffer({ size: (len + 3) & ~3, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
           encoder.copyBufferToBuffer(get(4, id), w[i + 2], staging, 0, (len + 3) & ~3);
-          reads.push(() => readStaging(staging, len).then((bytes) => event(BYTES, id, bytes), (e) => error(id, e.message)));
+          reads.push(() => readStaging(staging, len).then((bytes) => event(BYTES, id, bytes, to), (e) => error(id, e.message, to)));
           i += 4;
           break;
         }
@@ -471,6 +512,10 @@ export async function gpu(options = {}) {
           pass.setScissorRect(w[i + 1], w[i + 2], w[i + 3], w[i + 4]);
           i += 5;
           break;
+        case 28:
+          tag = w[i + 1];
+          i += 2;
+          break;
         default:
           caller.trap(`gpu: there is no command ${op}`);
       }
@@ -499,10 +544,10 @@ export async function gpu(options = {}) {
     for (const read of reads) read();
   }
 
-  function checked(what, id, make) {
+  function checked(what, id, make, to = tag) {
     device.pushErrorScope('validation');
     const resource = make();
-    device.popErrorScope().then((e) => { if (e) error(id, `${what} is invalid: ${e.message}`); });
+    device.popErrorScope().then((e) => { if (e) error(id, `${what} is invalid: ${e.message}`, to); });
     return resource;
   }
 
@@ -529,7 +574,7 @@ export async function gpu(options = {}) {
     });
   }
 
-  async function loadTexture(id, name) {
+  async function loadTexture(id, name, to) {
     loading++;
     try {
       const bytes = app && app.files.get(resolvePath(app.cwd, name));
@@ -564,15 +609,15 @@ export async function gpu(options = {}) {
         if (description.entries.some((e) => e.kind === 3 && e.id === id)) description.group = makeBindGroup(description);
       }
       t.texture.destroy();
-      event(LOADED, id, new Uint8Array(0));
+      event(LOADED, id, new Uint8Array(0), to);
     } catch (e) {
-      error(id, `cannot load the texture ${name}: ${e.message}`);
+      error(id, `cannot load the texture ${name}: ${e.message}`, to);
     } finally {
       loading--;
     }
   }
 
-  function makeBindGroup({ id, layout, entries, layers }) {
+  function makeBindGroup({ id, layout, entries, layers, tag: to }) {
     return checked(`bind group ${id}`, id, () => device.createBindGroup({
       label: `bind group ${id}`,
       layout,
@@ -590,7 +635,7 @@ export async function gpu(options = {}) {
         }
         return { binding: e.binding, resource };
       }),
-    }));
+    }), to);
   }
 
   function readTexture(encoder, id, mip, layer, x, y, width, height) {

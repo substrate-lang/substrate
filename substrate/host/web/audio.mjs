@@ -14,6 +14,7 @@ export function audio() {
   let started = 0;
 
   const sounds = new Map();
+  let nextSound = 1;
   let loading = 0;
   let decoder = null;
 
@@ -60,7 +61,8 @@ export function audio() {
 
   const module = (caller, app) => ({
     source: SOURCE,
-    load(id, ptr, length) {
+    load(ptr, length, tag) {
+      const id = nextSound++;
       const name = caller.string(ptr, length);
       const bytes = app.files.get(resolvePath(app.cwd, name));
       if (!decoder) decoder = new OfflineAudioContext(1, 1, 44100);
@@ -76,16 +78,17 @@ export function audio() {
           sounds.set(id, decoded);
           loading--;
           startWaiting();
-          caller.event(LOADED, id, 0, 0);
+          caller.event(LOADED, id, tag, 0);
         },
         (e) => {
           console.error(`audio: cannot load the sound ${name}: ${e.message}`);
           loading--;
           startWaiting();
-          caller.event(FAILED, id, 0, e.name === 'EncodingError' ? errors.invalid : errors.missing,
+          caller.event(FAILED, id, tag, e.name === 'EncodingError' ? errors.invalid : errors.missing,
             utf8.encode(`cannot load the sound ${name}: ${e.message}`));
         },
       );
+      return id;
     },
     loading() {
       return loading;

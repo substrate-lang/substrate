@@ -8,7 +8,12 @@ const CHANGED = 1;
 
 export function locationModule() {
   return (caller) => {
-    const popped = () => caller.event(CHANGED, 0, 0, 0, utf8.encode(globalThis.location.href));
+    const listeners = new Map();
+    let next = 1;
+    const popped = () => {
+      const url = utf8.encode(globalThis.location.href);
+      for (const [id, tag] of listeners) caller.event(CHANGED, id, tag, 0, url);
+    };
     addEventListener('popstate', popped);
     const move = (go, ptr, len, err) => {
       try {
@@ -29,6 +34,15 @@ export function locationModule() {
       replace: (ptr, len, err) => move((url) => history.replaceState(null, '', url), ptr, len, err),
       back() {
         history.back();
+      },
+      listen(tag) {
+        const id = next++;
+        listeners.set(id, tag);
+        return id;
+      },
+      unlisten(id) {
+        listeners.delete(id);
+        caller.forget(id);
       },
     };
   };

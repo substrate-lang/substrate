@@ -66,11 +66,27 @@ export function dom(root) {
 
   const windowTarget = (type) => (type === 'pointerlockchange' || type === 'pointerlockerror' ? document : window);
 
+  // Elements with a visibility listener.
+  const watched = new Map();
+  let observer = null;
+
+  function watch(node, message) {
+    observer ||= new IntersectionObserver((entries) => {
+      for (const entry of entries) if (watched.has(entry.target)) give(entry, watched.get(entry.target));
+    });
+    watched.set(node, message);
+    observer.observe(node);
+  }
+
   const unlisten = (id) => {
     const n = nodes.get(id);
     if (n instanceof Node && n.subListeners) {
       for (const message of Object.values(n.subListeners)) caller.forget(message);
       n.subListeners = null;
+    }
+    if (watched.has(n)) {
+      observer.unobserve(n);
+      watched.delete(n);
     }
     for (const { type, message, handler } of windowListeners.get(id) || []) {
       windowTarget(type).removeEventListener(type, handler);
@@ -260,7 +276,8 @@ export function dom(root) {
           const node = nodes.get(w[i + 1]);
           const type = string(i + 2);
           (node.subListeners ||= {})[type] = w[i + 4];
-          node.addEventListener(type, listener);
+          if (type === 'visibility') watch(node, w[i + 4]);
+          else node.addEventListener(type, listener);
           i += 5;
           break;
         }
@@ -297,6 +314,7 @@ export function dom(root) {
           const type = imageTypes[name.slice(name.lastIndexOf('.') + 1).toLowerCase()] || '';
           const url = bytes ? URL.createObjectURL(new Blob([bytes], { type })) : name;
           const id = w[i + 1];
+          const tag = w[i + 4];
           const finished = () => {
             loading--;
             if (bytes) URL.revokeObjectURL(url);
@@ -304,16 +322,23 @@ export function dom(root) {
           loading++;
           image.onload = () => {
             finished();
-            caller.event(IMAGE_LOADED, id, 0, 0);
+            caller.event(IMAGE_LOADED, id, tag, 0);
           };
           image.onerror = () => {
             finished();
             console.error(`dom: cannot load the image ${name}`);
-            caller.event(IMAGE_FAILED, id, 0, errors.missing, utf8.encode(`cannot load the image ${name}`));
+            caller.event(IMAGE_FAILED, id, tag, errors.missing, utf8.encode(`cannot load the image ${name}`));
           };
           image.src = url;
           images.set(w[i + 1], image);
-          i += 4;
+          i += 5;
+          break;
+        }
+        case 16: {
+          const style = document.createElement('style');
+          style.textContent = string(i + 1);
+          root.ownerDocument.head.appendChild(style);
+          i += 3;
           break;
         }
         case 13: {
@@ -358,7 +383,8 @@ export function dom(root) {
         const e = event();
         if (!e) return 0;
         return (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0) |
-          (e.target && e.target.checked === true ? 16 : 0) | (document.pointerLockElement ? 32 : 0);
+          (e.target && e.target.checked === true ? 16 : 0) | (document.pointerLockElement ? 32 : 0) |
+          (e.isIntersecting === true ? 64 : 0);
       },
       event_number(which) {
         const e = event();
@@ -379,6 +405,16 @@ export function dom(root) {
       prevent_default() {
         const e = event();
         if (e && e.preventDefault) e.preventDefault();
+      },
+      stop_propagation() {
+        const e = event();
+        if (e && e.stopPropagation) e.stopPropagation();
+      },
+      element(ptr, length, node) {
+        const found = root.ownerDocument.getElementById(caller.string(ptr, length));
+        if (!found) return 0;
+        nodes.set(node, found);
+        return 1;
       },
     };
   };
