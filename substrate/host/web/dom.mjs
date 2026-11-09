@@ -10,9 +10,8 @@ const HEARD = 1;
 const IMAGE_LOADED = 2;
 const IMAGE_FAILED = 3;
 
-// The node numbers of the document and of the current event (std/web/patches.sub).
-const DOCUMENT = 0xffffffff;
-const EVENT = 0xfffffffe;
+// The document's node number (std/web/patches.sub).
+const DOCUMENT = 1;
 
 const imageTypes = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
@@ -441,9 +440,7 @@ export function dom(root) {
       if (!e) caller.trap('dom: there is no current event');
       return e;
     };
-    const known = (n) => {
-      const id = n >>> 0;
-      if (id === EVENT) return current();
+    const known = (id) => {
       if (!nodes.has(id)) caller.trap(`dom: there is no node ${id}`);
       return nodeOf(id);
     };
@@ -451,6 +448,15 @@ export function dom(root) {
       source: SOURCE,
       apply(ptr, length) {
         apply(caller.memory(), caller.u(ptr), length);
+      },
+      event_number(ptr, length) {
+        return numberOf(read(current(), caller.string(ptr, length)));
+      },
+      event_text(ptr, length, out) {
+        return given(textOf(read(current(), caller.string(ptr, length))), out);
+      },
+      event_call(ptr, length) {
+        call(current(), caller.string(ptr, length), []);
       },
       read_number(node, ptr, length) {
         return numberOf(read(known(node), caller.string(ptr, length)));
@@ -463,9 +469,6 @@ export function dom(root) {
         const document = root.ownerDocument;
         if (!(name in document)) caller.trap(`dom: the document has no ${name}`);
         return document[name] === known(node) ? 1 : 0;
-      },
-      event_call(ptr, length) {
-        call(current(), caller.string(ptr, length), []);
       },
       images_loading(tag) {
         return loading.get(tag) || 0;
