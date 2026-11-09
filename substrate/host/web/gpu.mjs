@@ -39,6 +39,8 @@ function unavailable(reason) {
     source: SOURCE,
     apply() { caller.trap(`gpu: WebGPU is not available: ${reason}`); },
     loading() { return 0; },
+    listen() { return 0; },
+    unlisten() {},
   });
   module.available = false;
   module.adapter = {};
@@ -86,29 +88,14 @@ export async function gpu(options = {}) {
   }
   const error = (id, message, to = 0) => event(ERROR, id, utf8.encode(message), to);
 
-  // The tag that gpu-tag! gave the commands being run, each resource's tag, and how many resources each tag has.
+  // The tag of the batch being run, and the listeners for events about the whole device.
   let tag = 0;
-  const tagOf = new Map();
-  const owners = new Map();
-
-  function made(kind, id) {
-    if (tag === 0) return;
-    tagOf.set(`${kind} ${id}`, tag);
-    owners.set(tag, (owners.get(tag) || 0) + 1);
-  }
-
-  function destroyed(kind, id) {
-    const key = `${kind} ${id}`;
-    const t = tagOf.get(key);
-    if (t === undefined) return;
-    tagOf.delete(key);
-    if (owners.get(t) === 1) owners.delete(t);
-    else owners.set(t, owners.get(t) - 1);
-  }
+  const listeners = new Map();
+  let nextListener = 1;
 
   function deviceError(message) {
-    if (owners.size === 0) error(0, message);
-    for (const t of owners.keys()) error(0, message, t);
+    if (listeners.size === 0) error(0, message);
+    for (const [id, t] of listeners) error(id, message, t);
   }
 
   device.addEventListener('uncapturederror', (e) => deviceError(e.error.message));
@@ -131,7 +118,19 @@ export async function gpu(options = {}) {
     return v;
   };
 
-  function run(memory, w, f, string) {
+  // A batch's events go to its tag, and so do the validation errors that no resource's own scope catches.
+  function run(memory, w, f, string, batchTag) {
+    tag = batchTag;
+    device.pushErrorScope('validation');
+    try {
+      commands(memory, w, f, string);
+    } finally {
+      const to = tag;
+      device.popErrorScope().then((e) => { if (e) error(0, e.message, to); });
+    }
+  }
+
+  function commands(memory, w, f, string) {
     const encoder = device.createCommandEncoder();
     let pass = null;
     let computing = false;
@@ -141,7 +140,6 @@ export async function gpu(options = {}) {
       if (!pass) caller.trap(`gpu: ${what} outside a pass`);
       if (compute !== undefined && compute !== computing) caller.trap(`gpu: ${what} in the wrong kind of pass`);
     };
-    tag = 0;
     let i = 0;
     while (i < w.length) {
       const op = w[i];
@@ -157,7 +155,6 @@ export async function gpu(options = {}) {
               usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
             });
             surfaces.set(id, { canvas: node, texture });
-            made(1, id);
             i += 3;
             break;
           }
@@ -165,7 +162,6 @@ export async function gpu(options = {}) {
           if (!context) caller.trap(`gpu: surface ${id}: the canvas cannot be used by WebGPU (it may already be used by a 2D context)`);
           context.configure({ device, format: canvasFormat, alphaMode: 'premultiplied', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
           surfaces.set(id, { canvas: node, context });
-          made(1, id);
           i += 3;
           break;
         }
@@ -175,7 +171,6 @@ export async function gpu(options = {}) {
           device.pushErrorScope('validation');
           const module = device.createShaderModule({ label: `shader ${id}`, code: string(i + 2) });
           shaders.set(id, module);
-          made(2, id);
           device.popErrorScope().then(async (e) => {
             if (!e) return;
             const errors = (await module.getCompilationInfo()).messages.filter((m) => m.type === 'error');
@@ -227,7 +222,6 @@ export async function gpu(options = {}) {
           if (fragmentEntry.length > 0) description.fragment = { module, entryPoint: fragmentEntry, targets };
           if (depthFormat) description.depthStencil = { format: depthFormat, depthWriteEnabled: depthWrite, depthCompare };
           pipelines.set(id, { pipeline: checked(`pipeline ${id}`, id, () => device.createRenderPipeline(description)), compute: false });
-          made(3, id);
           break;
         }
         case 4: {
@@ -244,7 +238,6 @@ export async function gpu(options = {}) {
             compute: { module, entryPoint },
           }));
           pipelines.set(id, { pipeline, compute: true });
-          made(3, id);
           break;
         }
         case 5: {
@@ -258,7 +251,6 @@ export async function gpu(options = {}) {
           if (bits & 8) usage |= GPUBufferUsage.STORAGE;
           if (bits & 16) usage |= GPUBufferUsage.INDIRECT;
           buffers.set(id, device.createBuffer({ label: `buffer ${id}`, size, usage }));
-          made(4, id);
           i += 4;
           break;
         }
@@ -274,7 +266,6 @@ export async function gpu(options = {}) {
           if (format.startsWith('depth')) usage |= GPUTextureUsage.RENDER_ATTACHMENT;
           const texture = device.createTexture({ label: `texture ${id}`, size: [width, height, layers], format, usage, mipLevelCount: mips });
           textures.set(id, { texture, format, width, height, layers });
-          made(5, id);
           i += 8;
           break;
         }
@@ -286,7 +277,6 @@ export async function gpu(options = {}) {
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
           });
           textures.set(id, { texture: placeholder, format: 'rgba8unorm', width: 1, height: 1, layers: 1 });
-          made(5, id);
           loadTexture(id, name, tag);
           i += 4;
           break;
@@ -302,7 +292,6 @@ export async function gpu(options = {}) {
           if (w[i + 4] !== 0) description.compare = choose(comparisons, w[i + 4], 'comparison');
           description.label = `sampler ${id}`;
           samplers.set(id, device.createSampler(description));
-          made(6, id);
           i += 5;
           break;
         }
@@ -338,7 +327,6 @@ export async function gpu(options = {}) {
           }
           layouts.set(id, checked(`layout ${id}`, id, () => device.createBindGroupLayout({ label: `layout ${id}`, entries })));
           layered.set(id, new Set(entries.filter((e) => e.texture && e.texture.viewDimension === '2d-array').map((e) => e.binding)));
-          made(7, id);
           break;
         }
         case 10: {
@@ -357,7 +345,6 @@ export async function gpu(options = {}) {
           const description = { id, layout, entries, layers: layoutId !== 0 ? layered.get(layoutId) : new Set(), tag };
           description.group = makeBindGroup(description);
           bindGroups.set(id, description);
-          made(8, id);
           break;
         }
         case 11: {
@@ -371,7 +358,6 @@ export async function gpu(options = {}) {
             else if (kind === 4) r.destroy();
             else if (kind === 5) r.texture.destroy();
             table.delete(id);
-            destroyed(kind, id);
           }
           i += 3;
           break;
@@ -517,10 +503,6 @@ export async function gpu(options = {}) {
           inPass('scissor', false);
           pass.setScissorRect(w[i + 1], w[i + 2], w[i + 3], w[i + 4]);
           i += 5;
-          break;
-        case 28:
-          tag = w[i + 1];
-          i += 2;
           break;
         default:
           caller.trap(`gpu: there is no command ${op}`);
@@ -675,17 +657,26 @@ export async function gpu(options = {}) {
     app = theApp;
     return {
       source: SOURCE,
-      apply(ptr, len) {
+      apply(ptr, len, t) {
         const memory = caller.memory();
         const w = ptr % 4 === 0
           ? new Uint32Array(memory.buffer, memory.byteOffset + ptr, len >>> 2)
           : new Uint32Array(memory.slice(ptr, ptr + len).buffer);
         const f = new Float32Array(w.buffer, w.byteOffset, w.length);
         const string = (at) => text.decode(memory.subarray(w[at], w[at] + w[at + 1]));
-        run(memory, w, f, string);
+        run(memory, w, f, string, t);
       },
       loading(t) {
         return loading.get(t) || 0;
+      },
+      listen(t) {
+        const id = nextListener++;
+        listeners.set(id, t);
+        return id;
+      },
+      unlisten(id) {
+        listeners.delete(id);
+        caller.forget(id);
       },
     };
   };
