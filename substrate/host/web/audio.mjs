@@ -15,7 +15,13 @@ export function audio() {
 
   const sounds = new Map();
   let nextSound = 1;
-  let loading = 0;
+  // How many sounds each tag has loading.
+  const loading = new Map();
+  const counted = (tag, n) => {
+    const k = (loading.get(tag) || 0) + n;
+    if (k === 0) loading.delete(tag);
+    else loading.set(tag, k);
+  };
   let decoder = null;
 
   const voices = new Map();
@@ -66,7 +72,7 @@ export function audio() {
       const name = caller.string(ptr, length);
       const bytes = app.files.get(resolvePath(app.cwd, name));
       if (!decoder) decoder = new OfflineAudioContext(1, 1, 44100);
-      loading++;
+      counted(tag, 1);
       const data = bytes
         ? Promise.resolve(bytes.slice().buffer)
         : fetch(name).then((response) => {
@@ -76,13 +82,13 @@ export function audio() {
       data.then((buffer) => decoder.decodeAudioData(buffer)).then(
         (decoded) => {
           sounds.set(id, decoded);
-          loading--;
+          counted(tag, -1);
           startWaiting();
           caller.event(LOADED, id, tag, 0);
         },
         (e) => {
           console.error(`audio: cannot load the sound ${name}: ${e.message}`);
-          loading--;
+          counted(tag, -1);
           startWaiting();
           caller.event(FAILED, id, tag, e.name === 'EncodingError' ? errors.invalid : errors.missing,
             utf8.encode(`cannot load the sound ${name}: ${e.message}`));
@@ -90,8 +96,8 @@ export function audio() {
       );
       return id;
     },
-    loading() {
-      return loading;
+    loading(tag) {
+      return loading.get(tag) || 0;
     },
     play(id, volume, rate, loop) {
       played++;

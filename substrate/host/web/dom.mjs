@@ -19,7 +19,13 @@ export function dom(root) {
   const templates = new Map();
   const nodes = new Map([[0, root]]);
   const images = new Map();
-  let loading = 0;
+  // How many images each tag has loading.
+  const loading = new Map();
+  const counted = (tag, n) => {
+    const k = (loading.get(tag) || 0) + n;
+    if (k === 0) loading.delete(tag);
+    else loading.set(tag, k);
+  };
   let app = null;
   let caller = null;
 
@@ -316,10 +322,10 @@ export function dom(root) {
           const id = w[i + 1];
           const tag = w[i + 4];
           const finished = () => {
-            loading--;
+            counted(tag, -1);
             if (bytes) URL.revokeObjectURL(url);
           };
-          loading++;
+          counted(tag, 1);
           image.onload = () => {
             finished();
             caller.event(IMAGE_LOADED, id, tag, 0);
@@ -399,8 +405,8 @@ export function dom(root) {
           default: return 0;
         }
       },
-      images_loading() {
-        return loading;
+      images_loading(tag) {
+        return loading.get(tag) || 0;
       },
       prevent_default() {
         const e = event();

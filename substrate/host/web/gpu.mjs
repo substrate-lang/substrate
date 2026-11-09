@@ -71,7 +71,13 @@ export async function gpu(options = {}) {
   const layered = new Map();
   const bindGroups = new Map();
   const tables = { 1: surfaces, 2: shaders, 3: pipelines, 4: buffers, 5: textures, 6: samplers, 7: layouts, 8: bindGroups };
-  let loading = 0;
+  // How many texture files each tag has loading.
+  const loading = new Map();
+  const counted = (t, n) => {
+    const k = (loading.get(t) || 0) + n;
+    if (k === 0) loading.delete(t);
+    else loading.set(t, k);
+  };
 
   let app = null;
   let caller = null;
@@ -575,7 +581,7 @@ export async function gpu(options = {}) {
   }
 
   async function loadTexture(id, name, to) {
-    loading++;
+    counted(to, 1);
     try {
       const bytes = app && app.files.get(resolvePath(app.cwd, name));
       const blob = bytes ? new Blob([bytes]) : await fetch(name).then((r) => {
@@ -613,7 +619,7 @@ export async function gpu(options = {}) {
     } catch (e) {
       error(id, `cannot load the texture ${name}: ${e.message}`, to);
     } finally {
-      loading--;
+      counted(to, -1);
     }
   }
 
@@ -678,8 +684,8 @@ export async function gpu(options = {}) {
         const string = (at) => text.decode(memory.subarray(w[at], w[at] + w[at + 1]));
         run(memory, w, f, string);
       },
-      loading() {
-        return loading;
+      loading(t) {
+        return loading.get(t) || 0;
       },
     };
   };
