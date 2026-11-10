@@ -73,7 +73,6 @@ export async function gpu(options = {}) {
   const layered = new Map();
   const bindGroups = new Map();
   const tables = { 1: surfaces, 2: shaders, 3: pipelines, 4: buffers, 5: textures, 6: samplers, 7: layouts, 8: bindGroups };
-  // How many texture files each tag has loading.
   const loading = new Map();
   const counted = (t, n) => {
     const k = (loading.get(t) || 0) + n;
@@ -88,7 +87,6 @@ export async function gpu(options = {}) {
   }
   const error = (id, message, to = 0) => event(ERROR, id, utf8.encode(message), to);
 
-  // The tag of the batch being run, and the listeners for events about the whole device.
   let tag = 0;
   const listeners = new Map();
   let nextListener = 1;
@@ -118,7 +116,6 @@ export async function gpu(options = {}) {
     return v;
   };
 
-  // A batch's events go to its tag, and so do the validation errors that no resource's own scope catches.
   function run(memory, w, f, string, batchTag) {
     tag = batchTag;
     device.pushErrorScope('validation');

@@ -22,7 +22,6 @@ export function dom(root) {
   const templates = new Map();
   const nodes = new Map([[0, root], [DOCUMENT, root.ownerDocument]]);
   const images = new Map();
-  // How many images each tag has loading.
   const loading = new Map();
   const counted = (tag, n) => {
     const k = (loading.get(tag) || 0) + n;
@@ -39,9 +38,8 @@ export function dom(root) {
     return e && e.source === SOURCE ? e.data : null;
   };
 
-  // Names walk from a node or the current event through DOM objects only, and end at a number, text, or true or false.
-  const kinds = ['Node', 'Event', 'NodeList', 'HTMLCollection', 'DOMRectReadOnly', 'DOMTokenList', 'CSSStyleDeclaration',
-    'DOMStringMap', 'ValidityState', 'FileList', 'Blob', 'DataTransfer', 'TouchList', 'Touch',
+  const kinds = ['Node', 'Event', 'NodeList', 'HTMLCollection', 'DOMRectReadOnly', 'DOMTokenList',
+    'CSSStyleDeclaration', 'DOMStringMap', 'ValidityState', 'FileList', 'Blob', 'DataTransfer', 'TouchList', 'Touch',
     'IntersectionObserverEntry'].map((name) => globalThis[name]).filter((kind) => kind !== undefined);
   const reachable = (x) => kinds.some((kind) => x instanceof kind);
 
@@ -58,16 +56,18 @@ export function dom(root) {
     return guarded(path, () => x[name]);
   }
 
-  // The object that the path's last name belongs to, or null when a step before it is missing, and that name.
   function owner(root, path) {
     const parts = path.split('.');
+    const last = parts.pop();
     let x = root;
-    for (let k = 0; k < parts.length - 1; k++) {
+    for (let k = 0; k < parts.length; k++) {
       x = step(x, parts[k], path);
-      if (x === null || x === undefined) return [null, ''];
-      if (!reachable(x)) caller.trap(`dom: ${path}: ${parts.slice(0, k + 1).join('.')} is out of reach`);
+      if (x === null || x === undefined) return [null, last];
+      if (!reachable(x)) {
+        caller.trap(`dom: ${path}: ${parts.slice(0, k + 1).join('.')} is not one of the page's objects`);
+      }
     }
-    return [x, parts[parts.length - 1]];
+    return [x, last];
   }
 
   function walk(root, path) {
@@ -84,7 +84,7 @@ export function dom(root) {
 
   function write(root, path, value) {
     const [x, last] = owner(root, path);
-    if (x === null || !(last in x)) caller.trap(`dom: ${path}: there is nothing to set`);
+    if (x === null || !(last in x)) caller.trap(`dom: ${path}: there is no ${last} to set`);
     guarded(path, () => { x[last] = value; });
   }
 
@@ -141,7 +141,6 @@ export function dom(root) {
 
   const windowTarget = (type) => (type === 'pointerlockchange' || type === 'pointerlockerror' ? document : window);
 
-  // Elements with a visibility listener.
   const watched = new Map();
   let observer = null;
 

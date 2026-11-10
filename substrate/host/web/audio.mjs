@@ -15,7 +15,6 @@ export function audio() {
 
   const sounds = new Map();
   let nextSound = 1;
-  // How many sounds each tag has loading.
   const loading = new Map();
   const counted = (tag, n) => {
     const k = (loading.get(tag) || 0) + n;
