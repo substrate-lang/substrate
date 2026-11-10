@@ -95,7 +95,7 @@ export async function gpu(options = {}) {
 
   function deviceError(message) {
     if (listeners.size === 0) error(0, message);
-    for (const [id, t] of listeners) error(id, message, t);
+    for (const t of listeners.values()) error(0, message, t);
   }
 
   device.addEventListener('uncapturederror', (e) => deviceError(e.error.message));
@@ -125,8 +125,8 @@ export async function gpu(options = {}) {
     try {
       commands(memory, w, f, string);
     } finally {
-      const to = tag;
-      device.popErrorScope().then((e) => { if (e) error(0, e.message, to); });
+      tag = 0;
+      device.popErrorScope().then((e) => { if (e) error(0, e.message, batchTag); });
     }
   }
 
@@ -676,7 +676,6 @@ export async function gpu(options = {}) {
       },
       unlisten(id) {
         listeners.delete(id);
-        caller.forget(id);
       },
     };
   };
