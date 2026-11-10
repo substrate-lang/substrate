@@ -1,12 +1,14 @@
 // Starts a site's program with the files in assets.list and files.pack, the URL's arg parameters as its arguments, and
-// the host modules it imports. It sets window.modules, sets window.ready once the program has started, and sets
-// window.ended to the program's exit status and window.endReason to why it ended.
+// the host modules it imports. The program and files.pack are beside the host directory, and assets.list is beside the
+// document. It sets window.modules, sets window.ready once the program has started, and sets window.ended to the
+// program's exit status and window.endReason to why it ended.
 import { boot } from './subhost-web.mjs';
 import { allGrants } from '../grants.mjs';
 
 const query = new URLSearchParams(location.search);
 const grants = allGrants();
 const root = document.getElementById('root');
+const built = new URL('../../', import.meta.url);
 const made = {};
 const makers = {
   dom: async () => (await import('./dom.mjs')).dom(root),
@@ -26,9 +28,9 @@ const makers = {
 const make = (name) => (made[name] ||= makers[name]());
 
 window.app = await boot({
-  program: 'program/',
+  program: new URL('program/', built).href,
   lists: [['assets.list', '/']],
-  packs: [['files.pack', '/']],
+  packs: [[new URL('files.pack', built).href, '/']],
   args: query.getAll('arg'),
   grants,
   onEnd: (code, reason) => {
@@ -36,8 +38,9 @@ window.app = await boot({
     window.endReason = reason;
   },
   async modules(wanted) {
-    const modules = {};
-    for (const name of wanted) if (Object.hasOwn(makers, name)) modules[name] = await make(name);
+    const names = [...wanted].filter((name) => Object.hasOwn(makers, name));
+    const given = await Promise.all(names.map(make));
+    const modules = Object.fromEntries(names.map((name, i) => [name, given[i]]));
     window.modules = modules;
     return modules;
   },

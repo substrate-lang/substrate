@@ -92,36 +92,50 @@ export function importedModules(bytes) {
   return names;
 }
 
-// options.modules is the modules, or a function that takes the names the program imports and gives the modules.
-export async function boot(options) {
-  const base = options.program.endsWith('/') ? options.program : `${options.program}/`;
-  const files = options.files || new Map();
-  for (const [url, dir] of options.lists || []) await fetchListed(url, dir, files);
-  for (const [url, dir] of options.packs || []) unpack(await fetchBytes(url), dir, files);
-
+async function fetchProgram(base, wasm) {
   const names = text.decode(await fetchBytes(`${base}program`)).split('\n').filter((n) => n !== '');
-  const wasm = new Map();
   await Promise.all(names.map(async (name) => {
     wasm.set(name, await fetchBytes(`${base}${encodeURIComponent(name)}.wasm`));
   }));
-  let { modules } = options;
-  if (typeof modules === 'function') {
-    const wanted = new Set();
-    for (const bytes of wasm.values()) for (const name of importedModules(bytes)) wanted.add(name);
-    modules = await modules(wanted);
-  }
-  // The compiled modules for sessions: the compiled file lists them, each one is in <hash>.subc, and compiled.map holds
-  // their module map.
+  return names;
+}
+
+// The compiled modules for sessions: the compiled file lists them, each one is in <hash>.subc, and compiled.map holds
+// their module map.
+async function fetchCompiled(base) {
   const compiled = new Map();
   const listed = await fetch(`${base}compiled`);
-  if (listed.ok) {
-    const list = new Uint8Array(await listed.arrayBuffer());
-    const hashes = text.decode(list).split('\n').filter((l) => l !== '').map((l) => l.slice(0, l.indexOf(' ')));
-    compiled.set('compiled', list);
-    if (hashes.length > 0) compiled.set('compiled.map', await fetchBytes(`${base}compiled.map`));
-    await Promise.all(hashes.map(async (h) => compiled.set(`${h}.subc`, await fetchBytes(`${base}${h}.subc`))));
-  }
-  return run({ ...options, files, modules, compiled }, names, wasm);
+  if (!listed.ok) return compiled;
+  const list = new Uint8Array(await listed.arrayBuffer());
+  const hashes = text.decode(list).split('\n').filter((l) => l !== '').map((l) => l.slice(0, l.indexOf(' ')));
+  const fetched = async (name) => compiled.set(name, await fetchBytes(`${base}${name}`));
+  const names = hashes.map((h) => `${h}.subc`);
+  compiled.set('compiled', list);
+  await Promise.all((hashes.length > 0 ? ['compiled.map', ...names] : []).map(fetched));
+  return compiled;
+}
+
+// options.modules is the modules, or a function that takes the names the program imports and gives the modules. Every
+// file is fetched at once.
+export async function boot(options) {
+  const base = options.program.endsWith('/') ? options.program : `${options.program}/`;
+  const files = options.files || new Map();
+  const wasm = new Map();
+  const names = fetchProgram(base, wasm);
+  const ask = options.modules;
+  const modules = typeof ask !== 'function' ? ask : names.then(() => {
+    const wanted = new Set();
+    for (const bytes of wasm.values()) for (const name of importedModules(bytes)) wanted.add(name);
+    return ask(wanted);
+  });
+  const [listed, given, compiled] = await Promise.all([
+    names,
+    modules,
+    fetchCompiled(base),
+    ...(options.lists || []).map(([url, dir]) => fetchListed(url, dir, files)),
+    ...(options.packs || []).map(async ([url, dir]) => unpack(await fetchBytes(url), dir, files)),
+  ]);
+  return run({ ...options, files, modules: given, compiled }, listed, wasm);
 }
 
 export function run(options, names, wasm) {

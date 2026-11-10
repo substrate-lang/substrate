@@ -87,6 +87,11 @@ $ substrate serve build/page
 http://127.0.0.1:8000/
 ```
 
+`substrate site --release` builds a site to deploy. Its program has no debug
+information and sits in a directory named by its hash, so browsers can keep it
+for good. Its files come with gzipped copies, which `substrate serve` sends to
+browsers that accept gzip.
+
 These examples are in [examples/hello](examples/hello).
 
 ## Core Language

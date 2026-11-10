@@ -1,15 +1,17 @@
 ;; Files: http-send-file! answers with a file under the root, as Flask's send_from_directory does, and http-static! with
 ;; the file at the request's path, a directory's index.html, or a redirect adding a final slash. Answers carry
 ;; Last-Modified and an ETag, are 304 or 412 as preconditions require, hold one range when asked, and have Cache-Control
-;; no-cache unless cache gives another value for the path. A part that is . or .., or that starts with a dot other than
-;; .well-known, is not found. An empty root is the current directory.
+;; no-cache unless cache gives another value for the path. A file with a gzipped copy beside it, as name.gz, is answered
+;; with the copy when the request takes gzip. A part that is . or .., or that starts with a dot other than .well-known,
+;; is not found. An empty root is the current directory. http-hashed-cache is a cache for sites from substrate site
+;; --release: a year for a path in a directory named by 16 hex digits.
 (require-unqualified host/fs)
 (require-unqualified "http.sub")
 (require-unqualified "server.sub")
 (require-unqualified "conditional.sub")
 (require-unqualified "url.sub")
 
-(provide http-files http-static! http-send-file!)
+(provide http-files http-static! http-send-file! http-hashed-cache)
 
 (struct http-files [root string] [cache (fn (string) -> string)])
 
@@ -185,53 +187,89 @@
   (let ([value (if (== (-> files cache) 0) "" ((-> files cache) path))])
     (if (== (-> value length) 0) "no-cache" value)))
 
-(define (head-of! [r (ptr http-request)] [name string] [partial bool] [s (ptr span)] [size i64])
+(define (hex-digit? [c u8]) -> bool (or (and (>= c #\0) (<= c #\9)) (and (>= c #\a) (<= c #\f))))
+
+(define (hash-part? [part string]) -> bool
+  (when (!= (-> part length) 16) (return #f))
+  (for ([i u32 0]) (< i 16) (+= i 1) (unless (hex-digit? (@ part i)) (return #f)))
+  #t)
+
+(define (http-hashed-cache [path string]) -> string
+  (let ([start u32 0])
+    (for ([i u32 0]) (< i (-> path length)) (+= i 1)
+      (when (== (@ path i) #\/)
+        (when (hash-part? (slice path start i)) (return "public, max-age=31536000, immutable"))
+        (set! start (+ i 1))))
+    ""))
+
+;; A file's gzipped copy and its information, which answer a request that takes gzip in place of the file.
+(struct zipped [name string] [info fs-info] [found bool])
+
+(define (zipped! [z (ptr zipped)] [name string])
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) name)
+    (buffer-add-string! (& b) ".gz")
+    (set! (-> z name) (buffer-string (& b)))
+    (set! (-> z found) (and (fs-stat (-> z name) (& (-> z info)) 0) (== (-> z info kind) fs-file)))))
+
+(define (head-of! [r (ptr http-request)] [name string] [encoded bool] [partial bool] [s (ptr span)] [size i64])
   (http-respond! r (if partial 206 200))
   (when partial (content-range! r s size))
-  (http-header! r "content-type" (content-type name)))
+  (http-header! r "content-type" (content-type name))
+  (when encoded (http-header! r "content-encoding" "gzip")))
 
 (define (failed! [r (ptr http-request)]) (http-answer-text! r 500 "cannot read the file"))
 
-(define (body! [r (ptr http-request)] [name string] [partial bool] [s (ptr span)] [size i64])
+;; body! sends the bytes of file: the file at name, or its gzipped copy when encoded.
+(define (body! [r (ptr http-request)] [name string] [file string] [encoded bool] [partial bool] [s (ptr span)]
+               [size i64])
   (let ([n (- (-> s end) (-> s start))])
     (cond [(== (-> r method) "HEAD")
-           (head-of! r name partial s size)
+           (head-of! r name encoded partial s size)
            (http-length! r n)
            (http-finish! r)]
           [(<= size whole)
            (let ([f (slice u8)])
-             (if (not (fs-read-file name (& f) 0))
+             (if (not (fs-read-file file (& f) 0))
                  (failed! r)
                  (begin
-                   (head-of! r name partial s size)
+                   (head-of! r name encoded partial s size)
                    (http-send! r (slice f (cast u32 (-> s start)) (cast u32 (-> s end))))
                    (free (-> f items)))))]
           [else
-           (let ([h u32 0] [file u32 0])
-             (if (not (and (fs-open-file name fs-read-flag (& h) 0) (fs-read-stream h (-> s start) 0 (& file) 0)))
+           (let ([h u32 0] [stream u32 0])
+             (if (not (and (fs-open-file file fs-read-flag (& h) 0) (fs-read-stream h (-> s start) 0 (& stream) 0)))
                  (failed! r)
                  (begin
-                   (head-of! r name partial s size)
-                   (http-send-stream! r file n))))])))
+                   (head-of! r name encoded partial s size)
+                   (http-send-stream! r stream n))))])))
 
-;; send! answers with the file at name, whose path under the root is path.
+;; send! answers with the file at name, whose path under the root is path, or with its gzipped copy, which goes whole.
+;; When there is a copy, the answer varies by Accept-Encoding, and the server neither compresses it nor adds Vary.
 (define (send! [r (ptr http-request)] [files (ptr http-files)] [name string] [path string] [info (ptr fs-info)])
-  (let ([size (-> info size)] [tag (make-buffer)] [s span] [partial i32 0])
-    (span! (& s) 0 size)
-    (etag! (& tag) info)
-    (http-add-header! r "cache-control" (cache-of files path))
-    (unless (http-conditional! r (buffer-string (& tag)) (-> info modified))
-      (set! partial (ranges! r size (buffer-string (& tag)) (-> info modified) (& s)))
-      (if (< partial 0)
-          (let ([all span])
-            (span! (& all) -1 0)
-            (http-respond! r 416)
-            (content-range! r (& all) size)
-            (http-header! r "content-type" "text/plain; charset=utf-8")
-            (http-send-text! r "range not satisfiable"))
-          (begin
-            (set! (-> r ranges) #t)
-            (body! r name (> partial 0) (& s) size))))
+  (let* ([z zipped] [tag (make-buffer)] [s span] [partial i32 0])
+    (zipped! (& z) name)
+    (let* ([encoded (and (-> z found) (http-accepts-gzip? r))] [sent (if encoded (& (-> z info)) info)]
+           [size (-> sent size)])
+      (span! (& s) 0 size)
+      (etag! (& tag) sent)
+      (http-add-header! r "cache-control" (cache-of files path))
+      (when (-> z found)
+        (http-add-header! r "vary" "accept-encoding")
+        (set! (-> r encoded) #t))
+      (unless (http-conditional! r (buffer-string (& tag)) (-> sent modified))
+        (set! partial (if encoded 0 (ranges! r size (buffer-string (& tag)) (-> sent modified) (& s))))
+        (if (< partial 0)
+            (let ([all span])
+              (span! (& all) -1 0)
+              (http-respond! r 416)
+              (content-range! r (& all) size)
+              (http-header! r "content-type" "text/plain; charset=utf-8")
+              (http-send-text! r "range not satisfiable"))
+            (begin
+              (set! (-> r ranges) (not encoded))
+              (body! r name (if encoded (-> z name) name) encoded (> partial 0) (& s) size)))))
+    (free (-> (-> z name) bytes))
     (buffer-free! (& tag))))
 
 (define (not-found! [r (ptr http-request)]) (http-answer-text! r 404 "not found"))
