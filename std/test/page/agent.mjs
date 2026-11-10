@@ -71,11 +71,18 @@ export async function settle() {
 let assets = null;
 const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-// nameOf names drawn images and sounds by the path of the site's asset with the same bytes.
+// nameOf names drawn images and sounds by the path of the site's asset with the same bytes. assets.list is beside the
+// host directory, and gives an asset's URL after a tab when it is not the asset's path.
 async function nameOf(bytes, otherwise) {
   if (!assets) {
-    const listed = (await (await fetch('/assets.list')).text()).split('\n').filter((p) => p !== '');
-    assets = await Promise.all(listed.map(async (p) => [`/${p}`, new Uint8Array(await (await fetch(`/${p}`)).arrayBuffer())]));
+    const start = document.querySelector('script[src$="host/web/start.mjs"]');
+    const list = start ? new URL('../../assets.list', start.src) : new URL('/assets.list', location.href);
+    const lines = (await (await fetch(list)).text()).split('\n').filter((l) => l !== '');
+    assets = await Promise.all(lines.map(async (line) => {
+      const [path, url = path] = line.split('\t');
+      const from = new URL(url.split('/').map(encodeURIComponent).join('/'), location.href);
+      return [`/${path}`, new Uint8Array(await (await fetch(from)).arrayBuffer())];
+    }));
   }
   const found = assets.find(([, b]) => same(b, bytes));
   return found ? found[0] : otherwise;

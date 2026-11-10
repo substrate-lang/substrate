@@ -372,7 +372,7 @@ export function dom(root) {
           const image = new Image();
           const bytes = app.files.get(resolvePath(app.cwd, name));
           const type = imageTypes[name.slice(name.lastIndexOf('.') + 1).toLowerCase()] || '';
-          const url = bytes ? URL.createObjectURL(new Blob([bytes], { type })) : name;
+          const url = bytes ? URL.createObjectURL(new Blob([bytes], { type })) : app.url(name);
           const id = w[i + 1];
           const tag = w[i + 4];
           const finished = () => {

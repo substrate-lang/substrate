@@ -1,7 +1,7 @@
-// Starts a site's program with the files in assets.list and files.pack, the URL's arg parameters as its arguments, and
-// the host modules it imports. The program and files.pack are beside the host directory, and assets.list is beside the
-// document. It sets window.modules, sets window.ready once the program has started, and sets window.ended to the
-// program's exit status and window.endReason to why it ended.
+// Starts a site's program with the files in files.pack, the URL's arg parameters as its arguments, and the host modules
+// it imports. The program, files.pack and assets.list are beside the host directory, and the assets load from the site
+// when the program asks for them. It sets window.modules, sets window.ready once the program has started, and sets
+// window.ended to the program's exit status and window.endReason to why it ended.
 import { boot } from './subhost-web.mjs';
 import { allGrants } from '../grants.mjs';
 
@@ -29,8 +29,9 @@ const make = (name) => (made[name] ||= makers[name]());
 
 window.app = await boot({
   program: new URL('program/', built).href,
-  lists: [['assets.list', '/']],
   packs: [[new URL('files.pack', built).href, '/']],
+  assets: new URL('assets.list', built).href,
+  site: document.baseURI,
   args: query.getAll('arg'),
   grants,
   onEnd: (code, reason) => {

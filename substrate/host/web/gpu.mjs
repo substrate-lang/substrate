@@ -563,7 +563,7 @@ export async function gpu(options = {}) {
     counted(to, 1);
     try {
       const bytes = app && app.files.get(resolvePath(app.cwd, name));
-      const blob = bytes ? new Blob([bytes]) : await fetch(name).then((r) => {
+      const blob = bytes ? new Blob([bytes]) : await fetch(app ? app.url(name) : name).then((r) => {
         if (!r.ok) throw new Error(`the server answered ${r.status}`);
         return r.blob();
       });

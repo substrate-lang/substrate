@@ -74,7 +74,7 @@ export function audio() {
       counted(tag, 1);
       const data = bytes
         ? Promise.resolve(bytes.slice().buffer)
-        : fetch(name).then((response) => {
+        : fetch(app.url(name)).then((response) => {
           if (!response.ok) throw new Error(`the server answered ${response.status}`);
           return response.arrayBuffer();
         });

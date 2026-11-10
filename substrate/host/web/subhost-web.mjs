@@ -26,13 +26,17 @@ async function fetchBytes(url) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
-async function fetchListed(url, dir, files) {
-  const list = new URL(url, globalThis.document ? document.baseURI : globalThis.location.href);
-  const paths = text.decode(await fetchBytes(list)).split('\n').filter((p) => p !== '');
-  await Promise.all(paths.map(async (path) => {
-    const from = new URL(path.split('/').map(encodeURIComponent).join('/'), list);
-    files.set(resolvePath(dir, path), await fetchBytes(from));
-  }));
+// The URLs of the assets whose names differ from their paths: each line of the list is a path, then a tab and its URL
+// when it has one.
+async function fetchAssets(url) {
+  const urls = new Map();
+  const listed = await fetch(url);
+  if (!listed.ok) return urls;
+  for (const line of (await listed.text()).split('\n')) {
+    const tab = line.indexOf('\t');
+    if (tab >= 0) urls.set(resolvePath('/', line.slice(0, tab)), line.slice(tab + 1));
+  }
+  return urls;
 }
 
 function lines(line) {
@@ -115,8 +119,8 @@ async function fetchCompiled(base) {
   return compiled;
 }
 
-// options.modules is the modules, or a function that takes the names the program imports and gives the modules. Every
-// file is fetched at once.
+// options.modules is the modules, or a function that takes the names the program imports and gives the modules, and
+// options.assets is the URL of the site's assets.list. Every file is fetched at once.
 export async function boot(options) {
   const base = options.program.endsWith('/') ? options.program : `${options.program}/`;
   const files = options.files || new Map();
@@ -128,14 +132,14 @@ export async function boot(options) {
     for (const bytes of wasm.values()) for (const name of importedModules(bytes)) wanted.add(name);
     return ask(wanted);
   });
-  const [listed, given, compiled] = await Promise.all([
+  const [listed, given, compiled, urls] = await Promise.all([
     names,
     modules,
     fetchCompiled(base),
-    ...(options.lists || []).map(([url, dir]) => fetchListed(url, dir, files)),
+    options.assets ? fetchAssets(options.assets) : new Map(),
     ...(options.packs || []).map(async ([url, dir]) => unpack(await fetchBytes(url), dir, files)),
   ]);
-  return run({ ...options, files, modules: given, compiled }, listed, wasm);
+  return run({ ...options, files, modules: given, compiled, urls }, listed, wasm);
 }
 
 export function run(options, names, wasm) {
@@ -150,6 +154,13 @@ export function run(options, names, wasm) {
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 
   const app = { files, cwd, entry: null, ended: false, realTime: [] };
+  // app.url gives the URL that a file not in memory loads from: its path under the site, or the URL assets.list gives.
+  const site = options.site || (globalThis.document ? document.baseURI : globalThis.location.href);
+  const urls = options.urls || new Map();
+  app.url = (name) => {
+    const path = resolvePath(cwd, name);
+    return new URL((urls.get(path) || path.slice(1)).split('/').map(encodeURIComponent).join('/'), site).href;
+  };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
   if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd, grants)));
