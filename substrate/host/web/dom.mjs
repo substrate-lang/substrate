@@ -356,31 +356,19 @@ export function dom(root) {
           i += 5;
           break;
         }
-        case 12:
+        case 10:
           listenWindow(w[i + 1], string(i + 2), w[i + 4]);
           i += 5;
           break;
-        case 17: {
-          const node = nodeOf(w[i + 1]);
-          const path = string(i + 2);
-          const value = w[i + 4] === 0 ? float64(w[i + 5], w[i + 6]) : string(i + 5);
-          after.push(() => write(node, path, value));
-          i += 7;
+        case 11: {
+          const canvas = nodes.get(w[i + 1]);
+          const count = w[i + 2];
+          const f = new Float32Array(w.buffer, w.byteOffset, w.length);
+          draw(canvas.getContext('2d'), w, f, i + 3, i + 3 + count, string);
+          i += 3 + count;
           break;
         }
-        case 18: {
-          const node = nodeOf(w[i + 1]);
-          const path = string(i + 2);
-          const args = [];
-          for (let k = 0; k < w[i + 4]; k++) {
-            const at = i + 5 + 3 * k;
-            args.push(w[at] === 0 ? float64(w[at + 1], w[at + 2]) : string(at + 1));
-          }
-          after.push(() => call(node, path, args));
-          i += 5 + 3 * w[i + 4];
-          break;
-        }
-        case 14: {
+        case 12: {
           const name = string(i + 2);
           const image = new Image();
           const bytes = app.files.get(resolvePath(app.cwd, name));
@@ -407,19 +395,31 @@ export function dom(root) {
           i += 5;
           break;
         }
-        case 16: {
+        case 13: {
           const style = document.createElement('style');
           style.textContent = string(i + 1);
           root.ownerDocument.head.appendChild(style);
           i += 3;
           break;
         }
-        case 13: {
-          const canvas = nodes.get(w[i + 1]);
-          const count = w[i + 2];
-          const f = new Float32Array(w.buffer, w.byteOffset, w.length);
-          draw(canvas.getContext('2d'), w, f, i + 3, i + 3 + count, string);
-          i += 3 + count;
+        case 14: {
+          const node = nodeOf(w[i + 1]);
+          const path = string(i + 2);
+          const value = w[i + 4] === 0 ? float64(w[i + 5], w[i + 6]) : string(i + 5);
+          after.push(() => write(node, path, value));
+          i += 7;
+          break;
+        }
+        case 15: {
+          const node = nodeOf(w[i + 1]);
+          const path = string(i + 2);
+          const args = [];
+          for (let k = 0; k < w[i + 4]; k++) {
+            const at = i + 5 + 3 * k;
+            args.push(w[at] === 0 ? float64(w[at + 1], w[at + 2]) : string(at + 1));
+          }
+          after.push(() => call(node, path, args));
+          i += 5 + 3 * w[i + 4];
           break;
         }
         default:
