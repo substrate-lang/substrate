@@ -70,10 +70,13 @@ export function dom(root) {
     return [x, parts[parts.length - 1]];
   }
 
-  function read(root, path) {
+  function walk(root, path) {
     const [x, last] = owner(root, path);
-    if (x === null) return null;
-    const v = step(x, last, path);
+    return x === null ? null : step(x, last, path);
+  }
+
+  function read(root, path) {
+    const v = walk(root, path);
     const plain = v === null || v === undefined || ['number', 'string', 'boolean'].includes(typeof v);
     if (!plain) caller.trap(`dom: ${path} is not a number, text, or true or false`);
     return v;
@@ -458,17 +461,17 @@ export function dom(root) {
       event_call(ptr, length) {
         call(current(), caller.string(ptr, length), []);
       },
+      event_is(node, ptr, length) {
+        return walk(current(), caller.string(ptr, length)) === known(node) ? 1 : 0;
+      },
       read_number(node, ptr, length) {
         return numberOf(read(known(node), caller.string(ptr, length)));
       },
       read_text(node, ptr, length, out) {
         return given(textOf(read(known(node), caller.string(ptr, length))), out);
       },
-      is(node, ptr, length) {
-        const name = caller.string(ptr, length);
-        const document = root.ownerDocument;
-        if (!(name in document)) caller.trap(`dom: the document has no ${name}`);
-        return document[name] === known(node) ? 1 : 0;
+      is(node, from, ptr, length) {
+        return walk(known(from), caller.string(ptr, length)) === known(node) ? 1 : 0;
       },
       images_loading(tag) {
         return loading.get(tag) || 0;
