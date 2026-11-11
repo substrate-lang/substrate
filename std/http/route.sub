@@ -1,9 +1,12 @@
 ;; Routes after Go's ServeMux, written as s-expressions with typed parameters. (routes name [METHOD (segment ...)
-;; handler option ...] ...) defines name, a handler for http-serve!. A segment is a string; [name type], of type string
-;; or an integer type; or, last, [name string ...], the rest of the path. "" last is the empty segment after a final
-;; slash. The handler gets the request, the parameters, then a pointer to what (query T) reads, then a pointer to what
-;; (json T) or (form T) reads or the bytes (body) reads; (limit n) bounds the body. The most specific route wins, and
-;; routes that overlap with neither more specific are refused. A handler's first route defines handler.url!.
+;; handler option ...] ... [#:mount (segment ...) handler] ...) defines name, a handler for http-serve!. A segment is a
+;; string; [name type], of type string or an integer type; or, last, [name string ...], the rest of the path. "" last is
+;; the empty segment after a final slash. The handler gets the request, the parameters, then a pointer to what (query T)
+;; reads, then a pointer to what (json T) or (form T) reads or the bytes (body) reads; (limit n) bounds the body. A
+;; mount takes the requests of every method whose paths are under its own. Its handler gets the request and the
+;; parameters, after the mount's path moves from the request's target to its base, so another table of routes can be
+;; the handler. The most specific route wins, and routes that overlap with neither more specific are refused. A
+;; handler's first route defines handler.url!, which writes the path within the table; redirects put the base in front.
 (require-unqualified "http.sub")
 (require-unqualified "server.sub")
 (require-unqualified "url.sub")
@@ -24,6 +27,7 @@
 
 (define (route-moved! [r (ptr http-request)] [path string])
   (let ([b (make-buffer)] [target (-> r target)])
+    (buffer-add-string! (& b) (-> r base))
     (buffer-add-string! (& b) path)
     (when (< (-> (url-path target) length) (-> target length))
       (buffer-add-byte! (& b) #\?)
@@ -42,6 +46,13 @@
     (buffer-add-string! (& b) (url-path (-> r target)))
     (buffer-add-byte! (& b) #\/)
     (route-moved! r (buffer-string (& b)))
+    (buffer-free! (& b))))
+(define (route-mount! [r (ptr http-request)] [n u32])
+  (let* ([t (-> r target)] [i (path-after (url-path t) n)] [b (make-buffer)])
+    (buffer-add-string! (& b) (-> r base))
+    (buffer-add-string! (& b) (slice t 0 i))
+    (set! (-> r base) (copy (& (-> r arena)) (buffer-string (& b))))
+    (set! (-> r target) (slice t i))
     (buffer-free! (& b))))
 
 ;; allowed holds the methods of the routes matching the path.
@@ -150,6 +161,25 @@
       `(route ,(make-integer k) ,(syntax-e (car l)) ,(segments-read 'routes (cadr l)) ,(caddr l)
               ,(parse-options (cdddr l) e) ,e ,(cadr l))))
 
+  ;; A mount is (mount segments handler syntax given). It matches its segments, then the rest of the path.
+  (define (mount-segments [m datum]) -> datum (list-ref m 1))
+  (define (mount-handler [m datum]) -> datum (list-ref m 2))
+  (define (mount-syntax [m datum]) -> datum (list-ref m 3))
+  (define (mount-given [m datum]) -> datum (list-ref m 4))
+
+  (define rest-name datum 0)
+
+  (define (matched [m datum]) -> datum (append (mount-segments m) `((rest ,rest-name ,(mount-syntax m)))))
+
+  (define (parse-mount [e datum]) -> datum
+    (let ([l (syntax->list e)])
+      (unless (and (!= l 0) (== (length l) 3) (!= (syntax->list (cadr l)) 0) (identifier? (caddr l)))
+        (fail e "expected [#:mount (segment ...) handler]"))
+      (let ([read (segments-read 'routes (cadr l))])
+        (unless (segments-mountable? read)
+          (fail (cadr l) "a mount's path has segments, and neither the rest of a path nor a final slash"))
+        `(mount ,read ,(caddr l) ,e ,(cadr l)))))
+
   (define (parse-options [l datum] [where datum]) -> datum
     (let ([out nil] [bodies 0])
       (for/each ([o l])
@@ -181,11 +211,25 @@
   (define (route-text [r datum]) -> string
     (format-message "~a ~a" `(,(route-method r) ,(string->datum (segments-text (route-segments r))))))
 
-  (define (check-conflicts! [rs datum])
+  (define (mount-text [m datum]) -> string
+    (format-message "#:mount ~a" `(,(string->datum (segments-text (mount-segments m))))))
+
+  ;; A mount takes every method, so a route that overlaps it must be within it.
+  (define (check-conflicts! [rs datum] [ms datum])
     (segments-check! 'routes
                      (for/list ([r rs])
                        `(,(route-method r) ,(route-segments r) ,(route-syntax r) ,(string->datum (route-text r))))
-                     'requests))
+                     'requests)
+    (segments-check! 'routes
+                     (for/list ([m ms]) `(mount ,(matched m) ,(mount-syntax m) ,(string->datum (mount-text m))))
+                     'requests)
+    (for/each ([m ms])
+      (for/each ([r rs])
+        (when (and (segments-overlap? (route-segments r) (matched m))
+                   (not (segments-within? (route-segments r) (matched m))))
+          (fail (mount-syntax m)
+                (format-message "~a and ~a overlap, and neither is more specific"
+                                `(,(string->datum (route-text r)) ,(string->datum (mount-text m)))))))))
 
   ;; ---- code ----
 
@@ -279,16 +323,33 @@
     #`(define (#,(named (route-handler r) '".url!") [b (ptr buffer)] #,@(formals (params r)))
         (path-write! b #,(route-given r))))
 
+  (define (mount-code [m datum]) -> datum
+    #`(begin
+        (when probe (return #t))
+        (route-mount! r #,(number (length (mount-segments m))))
+        (#,(mount-handler m) r #,@(for/list ([p (segments-params (mount-segments m))]) (car p)))
+        (return #t)))
+
+  (define (mount-builder [m datum]) -> datum
+    #`(define (#,(named (mount-handler m) '".url!") [b (ptr buffer)] #,@(formals (segments-params (mount-segments m))))
+        (path-write! b #,(mount-given m))))
+
   (define (routes-form [s datum]) -> datum
     (syntax-match s
       [(_ (? identifier? name) entry ...)
        (set! context s)
-       (let ([rs nil] [k u32 0] [matcher (fresh 'match)] [built nil] [builders nil])
+       (set! rest-name (fresh 'rest))
+       (let ([rs nil] [ms nil] [k u32 0] [matcher (fresh 'match)] [built nil] [builders nil])
          (for/each ([e entry])
-           (set! rs (cons (parse-route e k) rs))
-           (+= k 1))
+           (let ([l (syntax->list e)])
+             (if (and (!= l 0) (pair? l) (== (syntax-e (car l)) '#:mount))
+                 (set! ms (cons (parse-mount e) ms))
+                 (begin
+                   (set! rs (cons (parse-route e k) rs))
+                   (+= k 1)))))
          (set! rs (reverse rs))
-         (check-conflicts! rs)
+         (set! ms (reverse ms))
+         (check-conflicts! rs ms)
          (set! methods nil)
          (for/each ([r rs])
            (when (== (memq (route-method r) methods) 0) (set! methods (append methods `(,(route-method r))))))
@@ -299,11 +360,18 @@
            (unless (!= (memq (syntax-e (route-handler r)) built) 0)
              (set! built (cons (syntax-e (route-handler r)) built))
              (set! builders (cons (builder-code r) builders))))
+         (for/each ([m ms])
+           (unless (!= (memq (syntax-e (mount-handler m)) built) 0)
+             (set! built (cons (syntax-e (mount-handler m)) built))
+             (set! builders (cons (mount-builder m) builders))))
          #`(begin
              #,@(apply-append (for/list ([r rs]) (route-definitions r)))
              (define (#,matcher [r (ptr http-request)] [segments (slice string)] [method u32] [allowed (ptr u32)]
                                 [probe bool]) -> bool
-               (path-match segments (& (-> r arena)) #,@(for/list ([x rs]) #`[#,(route-given x) #,(leaf-code rs x)]))
+               (path-match segments (& (-> r arena))
+                 #,@(for/list ([x rs]) #`[#,(route-given x) #,(leaf-code rs x)])
+                 #,@(for/list ([m ms])
+                      #`[(#,@(syntax->list (mount-given m)) [#,rest-name string ...]) #,(mount-code m)]))
                #f)
              (define (#,name [r (ptr http-request)])
                (let ([segments (slice string)] [allowed u32 0]
@@ -326,7 +394,7 @@
                            (route-slash! r)]
                           [else (http-answer-text! r 404 "not found")])])))
              #,@(reverse builders)))]
-      [_ (fail s "expected (routes name [METHOD (segment ...) handler option ...] ...)")]))
+      [_ (fail s "expected (routes name [METHOD (segment ...) handler option ...] ... [#:mount (segment ...) handler] ...)")]))
 
   (define (apply-append [ls datum]) -> datum
     (let ([out nil])
