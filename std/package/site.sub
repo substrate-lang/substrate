@@ -1,9 +1,11 @@
 ;; Sites: directories that a static server can serve. A site holds index.html, the web host, the program, and
 ;; files.pack with the files the site declares. It also holds the assets from beside the program, and assets.list lists
-;; them. The program reads the declared files as files and loads the assets by URL. site-write! writes all of it except
-;; a program given as a file. The caller builds that program into the site's program directory, as cmd/sub/site.sub and
+;; them. The program reads the declared files as files and loads the assets by URL. A site with a base has its page
+;; start with <base href="base">, and the sites it mounts go in its directories of their paths, with those paths as
+;; their bases. site-parts gives each with its directory and base. site-write! writes all of them except programs given
+;; as files. The caller builds each program into its part's program directory, as cmd/sub/site.sub and
 ;; std/test/browser.sub do. Files from a name need the program's module map in compiler/roots, so both callers load it
-;; first. site-release! makes a written site a release (below).
+;; first. site-release! makes a written part a release (below).
 (require-unqualified compiler/macros)
 (require-unqualified compiler/roots)
 (require-unqualified host/fs)
@@ -14,9 +16,12 @@
 (require-unqualified "pack.sub")
 (require-unqualified "path.sub")
 
-(provide site-plan site-named? site-declared site-write! site-release!)
+(provide site-plan site-mount site-part site-parts site-named? site-declared site-write! site-release!)
 
-(struct site-plan [name string] [program string] [html string] [files (slice site-files)] [base string])
+(struct site-mount [path string] [plan (ptr site-plan)])
+(struct site-plan [name string] [program string] [html string] [files (slice site-files)] [base string]
+  [url-base string] [mounts (slice site-mount)])
+(struct site-part [plan (ptr site-plan)] [out string] [url-base string])
 
 (exception site-failed string)
 
@@ -82,15 +87,42 @@
 (define (site-declared [a (ptr arena)] [dir string] [name string] [p (ptr site-plan)] [err (ptr buffer)]) -> bool
   (let ([m manifest])
     (unless (manifest-read a (joined-path dir "package.sub") (& m) err) (return #f))
-    (for ([i u32 0]) (< i (-> m sites length)) (+= i 1)
-      (let ([s (& (@ (-> m sites) i))])
-        (when (== (-> s name) name)
-          (set! (@ p 0) (site-plan #:name name #:program (resolved-path dir (-> s program))
-                                   #:html (if (== (-> s html length) 0) "" (resolved-path dir (-> s html)))
-                                   #:files (-> s files) #:base dir))
-          (return #t))))
+    (when (planned! a dir (& m) name p) (return #t))
     (buffer-add-string! err (joined (joined (joined "site: the package " (-> m name)) " has no site ") name))
     #f))
+
+(define (planned! [a (ptr arena)] [dir string] [m (ptr manifest)] [name string] [p (ptr site-plan)]) -> bool
+  (for ([i u32 0]) (< i (-> m sites length)) (+= i 1)
+    (let ([s (& (@ (-> m sites) i))])
+      (when (== (-> s name) name)
+        (let ([mounts (new a site-mount (-> s mounts length))])
+          (for ([k u32 0]) (< k (-> s mounts length)) (+= k 1)
+            (let ([plan (new a site-plan)])
+              (planned! a dir m (-> (@ (-> s mounts) k) site) plan)
+              (set! (@ mounts k) (site-mount #:path (-> (@ (-> s mounts) k) path) #:plan plan))))
+          (set! (@ p 0) (site-plan #:name name #:program (resolved-path dir (-> s program))
+                                   #:html (if (== (-> s html length) 0) "" (resolved-path dir (-> s html)))
+                                   #:files (-> s files) #:base dir #:url-base (-> s url-base) #:mounts mounts)))
+        (return #t))))
+  #f)
+
+(define (parts! [into (ptr buffer)] [p (ptr site-plan)] [out string] [url-base string])
+  (let ([part (site-part #:plan p #:out out #:url-base url-base)])
+    (buffer-add! into (slice (cast (ptr u8) (& part)) (sizeof site-part))))
+  (for ([i u32 0]) (< i (-> p mounts length)) (+= i 1)
+    (let ([m (& (@ (-> p mounts) i))])
+      (parts! into (-> m plan) (joined-path out (slice (-> m path) 1 (- (-> m path length) 1)))
+              (joined (if (== (-> url-base length) 0) "/" url-base) (slice (-> m path) 1))))))
+
+;; The parts of the site that p plans: the site itself in out, then the sites it mounts.
+(define (site-parts [a (ptr arena)] [p (ptr site-plan)] [out string]) -> (slice site-part)
+  (let* ([b (make-buffer)] [n u32 0] [parts (slice site-part)])
+    (parts! (& b) p out (-> p url-base))
+    (set! n (/ (-> b length) (sizeof site-part)))
+    (set! parts (new a site-part n))
+    (memcpy (cast (ptr u8) (-> parts items)) (-> b bytes) (-> b length))
+    (buffer-free! (& b))
+    parts))
 
 (define (star? [s string]) -> bool
   (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) #\*) (return #t)))
@@ -155,12 +187,35 @@
 ;; Writes p's site into out, replacing any site already there, with the web host from the toolchain. Returns #f with
 ;; the reason in err if it fails.
 (define (site-write! [p (ptr site-plan)] [out string] [toolchain string] [err (ptr buffer)]) -> bool
-  (try (begin (site-written! p out toolchain) #t)
-       [catch site-failed (why)
-        (buffer-add-string! err why)
-        #f]))
+  (let* ([a (make-arena)] [parts (site-parts (& a) p out)] [ok #t])
+    (try (for ([i u32 0]) (< i (-> parts length)) (+= i 1)
+           (let ([part (& (@ parts i))]) (site-written! (-> part plan) (-> part out) (-> part url-base) toolchain)))
+         [catch site-failed (why)
+          (buffer-add-string! err why)
+          (set! ok #f)])
+    (arena-free (& a))
+    ok))
 
-(define (site-written! [p (ptr site-plan)] [out string] [toolchain string])
+;; Writes <base href="url-base"> into the page at path, after its doctype.
+(define (based! [path string] [url-base string])
+  (let* ([html (cast string (read! path))] [b (make-buffer)] [lower (found html "<!doctype")]
+         [doctype (if (< lower 0) (found html "<!DOCTYPE") lower)] [at u32 0])
+    (when (>= (found html "<base") 0)
+      (throw site-failed "site: the page has a base element, and the site gives a base too"))
+    (when (== doctype 0)
+      (set! at (cast u32 (found html ">")))
+      (+= at 1)
+      (when (and (< at (-> html length)) (== (@ html at) 10)) (+= at 1)))
+    (buffer-add-string! (& b) (slice html 0 at))
+    (buffer-add-string! (& b) "<base href=\"")
+    (buffer-add-string! (& b) url-base)
+    (buffer-add-string! (& b) "\">\n")
+    (buffer-add-string! (& b) (slice html at (-> html length)))
+    (written! path (buffer-bytes (& b)))
+    (buffer-free! (& b))
+    (free (-> html bytes))))
+
+(define (site-written! [p (ptr site-plan)] [out string] [url-base string] [toolchain string])
   (let ([list (make-buffer)] [files (make-buffer)] [packed (make-buffer)] [err (make-buffer)] [why error])
     (when (and (!= (kind-of out) fs-none)
                (or (!= (kind-of out) fs-directory)
@@ -186,6 +241,7 @@
     (copy-modules! (joined-path toolchain "host/web") (joined-path out "host/web"))
     (copied! (if (== (-> p html length) 0) (joined-path toolchain "host/web/index.html") (-> p html))
              (joined-path out "index.html"))
+    (unless (== (-> url-base length) 0) (based! (joined-path out "index.html") url-base))
     (when (== (kind-of (-> p program)) fs-directory)
       (copy-tree! (-> p program) (joined-path out "program") "" (& files)))))
 
