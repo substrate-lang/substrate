@@ -30,7 +30,9 @@ export function workers(setup) {
     spawn(plan) {
       const { port1, port2 } = new MessageChannel();
       const signal = new Int32Array(new SharedArrayBuffer(4));
-      const tls = plan.tls ? { cert: read(plan.tls.cert), key: read(plan.tls.key) } : setup.tls;
+      const tls = plan.tls
+        ? { cert: read(plan.tls.cert), key: read(plan.tls.key), files: [plan.tls.cert, plan.tls.key] }
+        : setup.tls;
       const thread = new Worker(new URL('./worker-thread.mjs', import.meta.url));
       // The messages a thread posted before it ended, which can still wait on the port when its exit is heard.
       let heard = null;

@@ -1,4 +1,5 @@
-// The host module "net" (net.sub).
+// The host module "net" (net.sub). A TLS server takes its certificate again whenever the certificate's files change.
+import fs from 'node:fs';
 import net from 'node:net';
 import tls from 'node:tls';
 import { errorOf, reasonOf } from '../errors.mjs';
@@ -13,6 +14,21 @@ const LISTENING = 1;
 const ACCEPT = 2;
 const CONNECTED = 3;
 const FAILED = 4;
+
+function renewed(server, certificate) {
+  const [certFile, keyFile] = certificate.files;
+  const reload = () => {
+    try {
+      server.setSecureContext({ cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile) });
+    } catch {
+      // a pair caught halfway through being replaced waits for the next change
+    }
+  };
+  for (const file of certificate.files) fs.watchFile(file, { interval: 1000, persistent: false }, reload);
+  server.once('close', () => {
+    for (const file of certificate.files) fs.unwatchFile(file, reload);
+  });
+}
 
 export function netModule(grants, certificate) {
   const listeners = new Map();
@@ -42,6 +58,7 @@ export function netModule(grants, certificate) {
             ? tls.createServer({ ...certificate, allowHalfOpen: true })
             : net.createServer({ allowHalfOpen: true });
           if (most > 0) server.maxConnections = most;
+          if (secure && certificate.files) renewed(server, certificate);
           if (addressDenials(grants.net) && !net.isIP(host)) {
             lookupWithin(grants, 'net.listen', port)(host, {}, (e, address) => {
               if (listeners.get(id) !== server) return;

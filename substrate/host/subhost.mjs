@@ -42,7 +42,10 @@ try {
   if (request.inherit.size > 0) fail('inherit is only for workers');
   setup.grants = joinedGrants(setup.grants, request.grants);
   for (const [name, at] of request.fakes) setup.fakes.set(name, at);
-  if (request.tls) setup.tls = { cert: read(request.tls.cert), key: read(request.tls.key) };
+  if (request.tls) {
+    const files = [request.tls.cert, request.tls.key];
+    setup.tls = { cert: read(files[0]), key: read(files[1]), files };
+  }
 } catch (e) {
   fail(e.message);
 }

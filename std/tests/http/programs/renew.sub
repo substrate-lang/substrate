@@ -1,0 +1,94 @@
+;; A TLS server on a worker whose certificate files are replaced while it runs. A connection that trusts the first
+;; certificate is answered, and once the server has taken the renewed certificate, the same connection fails.
+(require-unqualified host/events)
+(require-unqualified host/stream)
+(require-unqualified host/fs)
+(require-unqualified host/worker)
+(require-unqualified host/grants)
+(require-unqualified host/node/net)
+(require-unqualified host/modules/timer)
+(require-unqualified std/http)
+(require-unqualified std/http/server)
+(provide main)
+
+(struct client [head event-head] [parser http-parser] [in (array u8 4096)])
+
+(define server http-server)
+(define asking client)
+(define waiting event-head)
+(define dir string)
+(define answers u32 0)
+
+(define (file [name string]) -> string
+  (let ([b (make-buffer)])
+    (buffer-add-string! (& b) dir)
+    (buffer-add-byte! (& b) #\/)
+    (buffer-add-string! (& b) name)
+    (buffer-string (& b))))
+
+(define (handle [r (ptr http-request)])
+  (http-respond! r 200)
+  (http-header! r "content-type" "text/plain")
+  (http-send-text! r "hello\n"))
+
+(define (head [p (ptr http-parser)]) (printf "answered: ~a\n" (-> p head status)))
+
+(define (body [p (ptr http-parser)] [b (slice u8)]) (begin))
+
+;; Once the first answer has ended, the renewed files replace the server's, and the client asks again later.
+(define (end [p (ptr http-parser)])
+  (+= answers 1)
+  (if (> answers 1)
+      (http-server-close! (& server))
+      (begin
+        (fs-rename (file "renewed-cert.pem") (file "cert.pem") 0)
+        (fs-rename (file "renewed-key.pem") (file "key.pem") 0)
+        (timer-after 2500.0 (cast (ptr void) (& waiting))))))
+
+(define (again [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (net-connect (-> server port) "127.0.0.1" #t (& asking) 0 0))
+
+(define (client-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (let ([c (cast (ptr client) tag)])
+    (cond [(and (== source net-source) (== kind net-connected))
+           (stream-write-text id "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+           (stream-read! id (slice (-> c in)))]
+          [(and (== source net-source) (== kind net-failed))
+           (printf "refused once renewed\n")
+           (http-server-close! (& server))]
+          [(and (== kind stream-read) (> value 0))
+           (http-feed! (& (-> c parser)) (slice (-> c in) (cast u32 value)))
+           (stream-read! id (slice (-> c in)))]
+          [(== kind stream-read) (stream-close id)])))
+
+(define (listening [s (ptr http-server)]) (net-connect (-> s port) "127.0.0.1" #t (& asking) 0 0))
+
+(define (serving)
+  (set! dir (@ (host-args) 0))
+  (set! (-> asking head handle) client-heard)
+  (set! (-> waiting handle) again)
+  (http-parser-init! (& (-> asking parser)) (cast (ptr void) (& asking)) head body end)
+  (set! (-> server secure) #t)
+  (set! (-> server listening) listening)
+  (http-serve! (& server) 0 handle 0))
+
+(define (copied! [from string] [to string])
+  (let ([b (slice u8)])
+    (fs-read-file from (& b) 0)
+    (fs-write-file (file to) b 0)
+    (free (-> b items))))
+
+(define (main [scratch string])
+  (let ([o worker-options] [w u32 0] [why error] [value i32 0] [bytes (slice u8)])
+    (fs-make-temp-dir scratch "renew" "" (& dir) 0)
+    (copied! "tests/http/tls/cert.pem" "cert.pem")
+    (copied! "tests/http/tls/key.pem" "key.pem")
+    (copied! "tests/http/tls/renewed-cert.pem" "renewed-cert.pem")
+    (copied! "tests/http/tls/renewed-key.pem" "renewed-key.pem")
+    (worker-options-init! (& o))
+    (set! (-> o ends) #t)
+    (grants-tls! (& (-> o grants)) (file "cert.pem") (file "key.pem"))
+    (unless (worker-start serving (cast (slice u8) dir) (& o) 0 (& w) (& why))
+      (printf "not started: ~a\n" (error-text (& why))))
+    (while (and (!= w 0) (!= (worker-wait w 10000 (& value) (& bytes)) worker-ended)) (begin))
+    (fs-remove dir #t 0)))
