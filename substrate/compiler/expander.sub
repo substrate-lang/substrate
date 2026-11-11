@@ -62,9 +62,8 @@
 ;; (none-slot if the set is empty). A binding only applies to an identifier that has all of the
 ;; binding's scopes, so to resolve an identifier we only need to look under the identifier's own
 ;; scopes.
-(struct binding [scopes (ptr scope-set)] [phase i32] [key datum] [meaning datum] [next (ptr binding)])
-
-(const all-phases i32 2147483647)
+(struct binding [scopes (ptr scope-set)] [phase i32] [every-phase bool] [key datum] [meaning datum]
+        [next (ptr binding)])
 
 (define bindings hash-table)
 (const none-slot u32 4294967295)
@@ -157,13 +156,11 @@
 (define (even-scopes [s (ptr scope-set)]) -> (ptr scope-set) (scopes-filter s even-scope?))
 (define (prune-local-scopes [x datum]) -> datum (map-scopes x even-scopes))
 
-;; A template's literal, as quote-syntax keeps it. A template at phase 0 makes code for phase -1, so the module gets
-;; its language at phase -1 too.
+;; A template's literal, as quote-syntax keeps it. A template makes code for the phase below its own, so the module
+;; gets its language at that phase too.
 (define (template-literal [x datum] [phase i32]) -> datum
-  (when (== phase 0) (use-language! -1))
+  (use-language! (- phase 1))
   (prune-local-scopes x))
-
-(define (template-pruned [x datum]) -> datum (template-literal x api-phase))
 
 (const core-scope u32 0)
 (const wasm-scope u32 2)
@@ -274,14 +271,14 @@
 (define (install-core!)
   (unless (== running-syntax 0) (return))
   (for-each (lambda ([name datum])
-              (bind-raw! name (if (memq name visible-core-forms) visible-scopes wasm-scopes) all-phases `(core ,name)))
+              (bind-every-phase! name (if (memq name visible-core-forms) visible-scopes wasm-scopes) `(core ,name)))
             core-forms)
-  (for-each (lambda ([name datum]) (bind-raw! name wasm-scopes all-phases `(prim ,name))) (prim-names))
+  (for-each (lambda ([name datum]) (bind-every-phase! name wasm-scopes `(prim ,name))) (prim-names))
   (set-queries! query-local-value query-free-identifier=? query-binding-kind query-local-expand query-lift
                 query-function-signature query-introduce query-local-facts query-identifier-name query-name-identifier
                 query-shape query-module-provides)
   (set-expander! query-meaning query-inline-call inline-copy query-expand-head query-scope-shape
-                 query-apply-form template-pruned query-facts-of query-datum-type query-syntax-function)
+                 query-apply-form template-literal query-facts-of query-datum-type query-syntax-function)
   (let* ([names (running-module-names)] [name (running-module-named names "syntax.")] [tools (running-module-named names "macros.")])
     (when (== name 0) (fail-at 0 "the running program has no syntax module" nil))
     (set! running-names (keep names))
@@ -360,10 +357,13 @@
 
 (define (bind-raw! [sym datum] [scopes (ptr scope-set)] [phase i32] [meaning datum]) -> (ptr binding)
   (let* ([k (slot-key sym (binding-slot scopes))]
-         [b (new (& run-arena) (binding #:scopes scopes #:phase phase #:key (keep (fresh-key!)) #:meaning (keep meaning)
-                                        #:next (cast (ptr binding) (hash-ref (& bindings) k))))])
+         [b (new (& run-arena) (binding #:scopes scopes #:phase phase #:every-phase #f #:key (keep (fresh-key!))
+                                        #:meaning (keep meaning) #:next (cast (ptr binding) (hash-ref (& bindings) k))))])
     (hash-set! (& bindings) k (cast u32 b))
     b))
+
+(define (bind-every-phase! [sym datum] [scopes (ptr scope-set)] [meaning datum])
+  (set! (-> (bind-raw! sym scopes 0 meaning) every-phase) #t))
 
 (define (bind-module-level! [sym datum] [scopes (ptr scope-set)] [phase i32] [meaning datum]) -> (ptr binding)
   (let ([b (bind-raw! sym scopes phase meaning)])
@@ -424,8 +424,7 @@
       (set! before e)
       (set! e (-> e next)))))
 
-(define (phase-matches? [b (ptr binding)] [phase i32]) -> bool
-  (or (== (-> b phase) all-phases) (== (-> b phase) phase)))
+(define (phase-matches? [b (ptr binding)] [phase i32]) -> bool (or (-> b every-phase) (== (-> b phase) phase)))
 
 (define (candidate? [b (ptr binding)] [phase i32] [scopes (ptr scope-set)]) -> bool
   (and (phase-matches? b phase) (scopes-subset? (-> b scopes) scopes)))
@@ -455,7 +454,8 @@
 
 ;; ---- phase shifting ----
 
-(define (shift-key [d datum] [k u32]) -> u64 (bit-or (<< (cast u64 d) 32) k))
+(define (shift-key [d datum] [k i32]) -> u64 (number-key d (cast u32 k)))
+(define (number-key [d datum] [n u32]) -> u64 (bit-or (<< (cast u64 d) 32) n))
 
 (define shifted-infos hash-table)
 
@@ -469,7 +469,7 @@
 (define (shift-info [info datum] [k i32]) -> datum
   (if (or (== k 0) (running-definition? info))
       info
-      (let ([hit (cast datum (hash-ref (& shifted-infos) (shift-key info (cast u32 k))))] [new datum 0]
+      (let ([hit (cast datum (hash-ref (& shifted-infos) (shift-key info k)))] [new datum 0]
             [o (cast datum (hash-ref (& shift-origins) (cast u64 info)))])
         (cond
           [(!= hit 0) hit]
@@ -487,7 +487,7 @@
                                (tag-info (tag-info-name info) (tag-info-params info) (shift-instance (tag-info-instance info) k)
                                          (tag-info-export info))]
                               [else info]))
-              (hash-set! (& shifted-infos) (shift-key info (cast u32 k)) (cast u32 new))
+              (hash-set! (& shifted-infos) (shift-key info k) (cast u32 new))
               (hash-set! (& shift-origins) (cast u64 new)
                          (cast u32 (keep (if (!= o 0) (cons (car o) (make-integer (+ (integer-value (cdr o)) k))) (cons info (make-integer k))))))
               new]))))
@@ -510,10 +510,10 @@
 (define (module-scope-at [m datum] [s i32]) -> u32
   (if (== s 0)
       (-> (unit-of m) scope)
-      (let ([sc (hash-ref (& shifted-scopes) (shift-key m (cast u32 s)))])
+      (let ([sc (hash-ref (& shifted-scopes) (shift-key m s))])
         (when (== sc 0)
           (set! sc (new-run-scope!))
-          (hash-set! (& shifted-scopes) (shift-key m (cast u32 s)) sc)
+          (hash-set! (& shifted-scopes) (shift-key m s) sc)
           (hash-set! (& module-scope-origins) (scope-key sc) (cast u32 (keep (cons m (make-integer s))))))
         sc)))
 
@@ -533,8 +533,8 @@
 (define installed hash-table)
 
 (define (install-module-bindings! [m datum] [s i32])
-  (when (== (hash-ref (& installed) (shift-key m (cast u32 s))) 0)
-    (hash-set! (& installed) (shift-key m (cast u32 s)) 1)
+  (when (== (hash-ref (& installed) (shift-key m s)) 0)
+    (hash-set! (& installed) (shift-key m s) 1)
     (unless (== s 0)
       (let ([entries nil] [e (-> (unit-of m) entries)])
         (while (!= e 0)
@@ -1181,16 +1181,16 @@
   (let ([u (unit-of m)])
     (hash-set! (& scope-owners) (scope-key sc) (cast u32 m))
     (hash-set! (& scope-numbers) (scope-key sc) (-> u scope-count))
-    (hash-set! (& module-scopes) (shift-key m (-> u scope-count)) sc)
+    (hash-set! (& module-scopes) (number-key m (-> u scope-count)) sc)
     (+= (-> u scope-count) 1)))
 
 (define (unit-scope-at [m datum] [i u32]) -> u32
-  (let ([sc (hash-ref (& module-scopes) (shift-key m i))])
+  (let ([sc (hash-ref (& module-scopes) (number-key m i))])
     (when (== sc 0)
       (set! sc (new-run-scope!))
       (hash-set! (& scope-owners) (scope-key sc) (cast u32 m))
       (hash-set! (& scope-numbers) (scope-key sc) i)
-      (hash-set! (& module-scopes) (shift-key m i) sc))
+      (hash-set! (& module-scopes) (number-key m i) sc))
     sc))
 
 (define (unit-with-hash [hash datum]) -> datum
@@ -1796,18 +1796,18 @@
                           "(require-unqualified source) or (require-unqualified name source)")))
         (unless (and (!= l 0) (>= (length l) 3) (identifier? (cadr l)) (source? (caddr l)))
           (no-match f "(require name source item ...)")))
-    (let* ([name datum (if (pair? (cddr l)) (cadr l) 0)] [given (required-source l)] [inner (template-source given)]
-           [source (if (== inner 0) given inner)] [phase (if (== inner 0) phase (- phase 1))]
-           [context (if (== name 0) source name)] [provided (require-module! f name source phase)])
+    (let* ([name datum (if (pair? (cddr l)) (cadr l) 0)] [given (required-source l)] [source (module-source-of given)]
+           [at (if (== source given) phase (- phase 1))]
+           [context (if (== name 0) source name)] [provided (require-module! f name source at)])
       (when (and (== all 1) (not (in-session?)) (!= (assq '#%module-begin provided) 0))
         (fail-at f "~a is a language: a module is in it when its first form is (language ~s)"
                  `(,(syntax-e source) ,(syntax-e source))))
       (unless (== name 0)
-        (for-each (lambda ([p datum]) (bind-import! (qualified name (car p)) phase (cdr p))) provided))
+        (for-each (lambda ([p datum]) (bind-import! (qualified name (car p)) at (cdr p))) provided))
       (when all
         (for-each (lambda ([p datum])
                     (hash-set! (& unqualified-imports)
-                               (cast u64 (bind-import! (datum->syntax context (car p) context) phase (cdr p)))
+                               (cast u64 (bind-import! (datum->syntax context (car p) context) at (cdr p)))
                                1))
                   provided))
       (let ([items (if (== all 0) (cdddr l) nil)])
@@ -1819,19 +1819,10 @@
                  [old (cdr names)]
                  [ps (filter (lambda ([p datum]) -> bool (== (car p) (syntax-e old))) provided)])
             (when (null? ps) (fail-at old "~a does not provide ~a" `(,(syntax-e source) ,(syntax-e old))))
-            (for-each (lambda ([p datum]) (bind-import! (car names) phase (cdr p))) ps))
+            (for-each (lambda ([p datum]) (bind-import! (car names) at (cdr p))) ps))
           (set! items (cdr items)))))))
 
-(define (required-source [l datum]) -> datum (if (pair? (cddr l)) (caddr l) (cadr l)))
-
-(define (template-source [s datum]) -> datum
-  (let ([l (syntax->list s)])
-    (if (and (!= l 0) (== (length l) 2) (identifier? (car l)) (== (syntax-e (car l)) 'for-template)
-             (module-source? (cadr l)))
-        (cadr l)
-        0)))
-
-(define (required-source? [s datum]) -> bool (or (module-source? s) (!= (template-source s) 0)))
+(define (required-source? [s datum]) -> bool (!= (module-source-of s) 0))
 
 (define (qualified [name datum] [sym datum]) -> datum
   (datum->syntax name (string->symbol (format-message "~a:~a" `(,(syntax-e name) ,sym))) name))
@@ -2800,15 +2791,15 @@
       (let ([saved (use-arena (& run-arena))] [l dependencies-list] [i u32 1])
         (set! dependency-places (make-table))
         (while (pair? l)
-          (hash-set! dependency-places (shift-key (car (car l)) (cast u32 (cast i32 (integer-value (cdr (car l)))))) i)
+          (hash-set! dependency-places (shift-key (car (car l)) (cast i32 (integer-value (cdr (car l))))) i)
           (+= i 1)
           (set! l (cdr l)))
         (use-arena saved)))
     dependencies-list))
 
 (define (visit-dependencies [m datum] [shift i32] [seen (ptr hash-table)] [out datum]) -> datum
-  (when (!= (hash-ref seen (shift-key m (cast u32 shift))) 0) (return out))
-  (hash-set! seen (shift-key m (cast u32 shift)) 1)
+  (when (!= (hash-ref seen (shift-key m shift)) 0) (return out))
+  (hash-set! seen (shift-key m shift) 1)
   (let ([rs (-> (unit-of m) requires)])
     (while (pair? rs)
       (set! out (visit-dependencies (car (car rs)) (+ shift (cast i32 (integer-value (cdr (car rs))))) seen out))
@@ -2834,7 +2825,7 @@
     (when (pair? facts) (dependencies))
     (while (pair? facts)
       (let* ([f (car facts)] [shift (- api-phase (cast i32 (integer-value (cadr f))))]
-             [place (hash-ref dependency-places (shift-key (car f) (cast u32 shift)))])
+             [place (hash-ref dependency-places (shift-key (car f) shift))])
         (when (!= place 0)
           (set! found (by-place (cons (make-integer place)
                                       `(,(symbol-of (-> (unit-of (car f)) path)) ,(cadr f) ,(shift-fact (caddr f) shift)))
