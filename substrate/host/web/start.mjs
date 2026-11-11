@@ -16,6 +16,7 @@ const makers = {
   gpu: async () => (await import('./gpu.mjs')).gpu({ dom: await make('dom') }),
   storage: async () => (await import('./storage.mjs')).storage(location.pathname.replace(/[^/]*$/, '')),
   location: async () => (await import('./location.mjs')).locationModule(),
+  history: async () => (await import('./history.mjs')).historyModule(),
   clipboard: async () => (await import('./clipboard.mjs')).clipboard(),
   files: async () => (await import('./files.mjs')).files(),
   worker: async () => (await import('./worker.mjs')).workers(),
