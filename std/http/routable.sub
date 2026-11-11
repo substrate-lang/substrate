@@ -5,11 +5,12 @@
 ;; U that the rest of the path and the query read as. Segments, precedence and conflicts work as in route.sub. A
 ;; #:moved path matches as a route does and stands for the case it names. It gives that case's parameters by name.
 ;;
-;; T.url-read reads a URL or a target into a T, keeping its strings in an arena, and answers how it went. url-found
-;; means a route matched. url-missing means no route matched, and url-bad means the path or query could not be read.
-;; For both, the T is m, or a mount's case when the mounted U is missing. url-moved means the path is not canonical or
-;; a #:moved path matched. Then the target to go to is written to the buffer, unless the buffer is 0. T.url-check
-;; answers the same without the T. T.url-write! writes a value's target, and T.url-missing! sets a T to m.
+;; T.url-read reads a URL or a target into a T, keeping its strings in an arena, and answers how it went. The routes
+;; read the path after a base: a path without its final slash, or "" for none. url-found means a route matched.
+;; url-missing means no route matched or the path is not under the base. url-bad means the path or query could not be
+;; read. For both, the T is m, or the mount's case when the path is under a mount. url-moved means the path is not
+;; canonical or a #:moved path matched. Then the whole target to go to, with the base, is written to the buffer, unless
+;; the buffer is 0. T.url-check answers the same without the T. T.url-write! writes a value's target after the base.
 (require-unqualified "url.sub")
 (require-unqualified "multipart.sub")
 (require-unqualified "form.sub")
@@ -21,9 +22,6 @@
 (const url-moved u32 1)
 (const url-missing u32 2)
 (const url-bad u32 3)
-
-;; A mount's answer when its routes miss: url-missing, but with the mount's case already set.
-(const routable-inner u32 4)
 
 (define no-parts (slice multipart-part) 0)
 
@@ -38,9 +36,28 @@
     (set! (@ items n) "")
     items))
 
-;; The path after its first n segments, as it is written, or / when nothing is left.
-(define (routable-rest [path string] [n u32]) -> string
-  (let ([i (path-after path n)]) (if (< i (-> path length)) (slice path i) "/")))
+(define (routable-clean [a (ptr arena)] [segments (slice string)]) -> string
+  (let ([b (make-buffer)] [out string])
+    (url-add-clean! (& b) segments)
+    (set! out (copy a (buffer-string (& b))))
+    (buffer-free! (& b))
+    out))
+
+(define (routable-slash [a (ptr arena)] [path string]) -> string
+  (let ([b (make-buffer)] [out string])
+    (buffer-add-string! (& b) path)
+    (buffer-add-byte! (& b) #\/)
+    (set! out (copy a (buffer-string (& b))))
+    (buffer-free! (& b))
+    out))
+
+(define (routable-under? [path string] [base string]) -> bool
+  (let ([n (-> base length)])
+    (and (> (-> path length) n) (== (slice path 0 n) base) (== (@ path n) #\/))))
+
+;; The path through its first n segments after the base.
+(define (routable-prefix [path string] [base string] [n u32]) -> string
+  (let ([k (-> base length)]) (slice path 0 (+ k (path-after (slice path k) n)))))
 
 (begin-for-syntax
   (require-unqualified compiler/macros)
@@ -163,21 +180,18 @@
               (set! (@ r) #,(built (entry-case e) (append args `(,#'query))))
               #,status))))
 
-  ;; Code reading the rest of the path and the query as what the route e mounts, which r is set to.
+  ;; Code reading the path and the query as what the route e mounts, with the route's own path as the base, and setting
+  ;; r to the route's case.
   (define (mount-code [e datum]) -> datum
     (let ([args (for/list ([p (segments-params (entry-segments e))]) (car p))] [u (route-mount e)])
-      #`(let ([inner (new a #,u)] [rest (make-buffer)] [inner-to (make-buffer)] [answer u32 0])
-          (buffer-add-string! (& rest) (routable-rest path #,(literal (make-integer (length (entry-segments e))))))
-          (routable-query! (& rest) raw)
-          (set! answer (#,(derived u '"url-read" 'routable (entry-syntax e)) a (copy a (buffer-string (& rest))) inner
-                        (& inner-to)))
+      #`(let ([inner (new a #,u)] [url (make-buffer)] [answer u32 0])
+          (buffer-add-string! (& url) path)
+          (routable-query! (& url) raw)
+          (set! answer (#,(derived u '"url-read" 'routable (entry-syntax e)) a (buffer-string (& url))
+                        (routable-prefix path base #,(literal (make-integer (length (entry-segments e))))) inner to))
           (set! (@ r) #,(built (entry-case e) (append args `(,#'(@ inner)))))
-          (when (and (== answer url-moved) (!= to 0))
-            (path-write! to #,(entry-given e))
-            (buffer-add-string! to (buffer-string (& inner-to))))
-          (buffer-free! (& rest))
-          (buffer-free! (& inner-to))
-          (return (if (== answer url-missing) routable-inner answer)))))
+          (buffer-free! (& url))
+          (return answer))))
 
   (define (match-code [t datum] [rs datum] [e datum]) -> datum
     (cond [(!= (route-mount e) 0) #`(begin (when probe (return url-found)) #,(mount-code e))]
@@ -190,6 +204,7 @@
                  #,(value-code target
                                #`(begin
                                    (unless (== to 0)
+                                     (buffer-add-string! to base)
                                      (#,(named t '"url-write!") to r)
                                      #,@(if (== (route-query target) 0) `(,#'(routable-query! to raw)) nil))
                                    (return url-moved))
@@ -237,44 +252,38 @@
              (variant #,t
                #,@(for/list ([e es] #:when (== (car e) 'route)) #`[#,(entry-case e) #,@(fields e)])
                [#,missing])
-             (define (#,matcher [a (ptr arena)] [path string] [segments (slice string)] [raw string] [r (ptr #,t)]
-                                [to (ptr buffer)] [probe bool]) -> u32
+             (define (#,matcher [a (ptr arena)] [path string] [base string] [segments (slice string)] [raw string]
+                                [r (ptr #,t)] [to (ptr buffer)] [probe bool]) -> u32
                (path-match segments a #,@(for/list ([e es]) #`[#,(matched-given e) #,(match-code t es e)]))
                url-missing)
-             (define (#,(named t '"url-read") [a (ptr arena)] [url string] [r (ptr #,t)] [to (ptr buffer)]) -> u32
-               (let* ([target (copy a (url-target url))] [path (url-path target)] [raw (url-query target)]
-                      [segments (slice string)]
-                      [read (url-segments a (if (== (-> path length) 0) "/" path) (& segments))]
-                      [answer
-                       (cond [(== read -1) url-bad]
-                             [(== read 1)
-                              (let ([clean (make-buffer)] [cleaned (slice string)] [kept string])
-                                (url-add-clean! (& clean) segments)
-                                (unless (== to 0)
-                                  (buffer-add-string! to (buffer-string (& clean)))
-                                  (routable-query! to raw))
-                                (set! kept (copy a (buffer-string (& clean))))
-                                (url-segments a kept (& cleaned))
-                                (when (== (#,matcher a kept cleaned raw r 0 #f) url-missing) (set! (@ r) #,missing))
-                                (buffer-free! (& clean))
-                                url-moved)]
-                             [else
-                              (let ([found (#,matcher a path segments raw r to #f)] [n (-> segments length)])
-                                (cond [(!= found url-missing) found]
-                                      [(and (> n 0) (!= (@ segments (- n 1)) "")
-                                            (== (#,matcher a path (routable-slashed a segments) raw r 0 #t) url-found))
-                                       (#,matcher a path (routable-slashed a segments) raw r 0 #f)
-                                       (unless (== to 0)
-                                         (buffer-add-string! to path)
-                                         (buffer-add-byte! to #\/)
-                                         (routable-query! to raw))
-                                       url-moved]
-                                      [else url-missing]))])])
-                 (when (or (== answer url-missing) (== answer url-bad)) (set! (@ r) #,missing))
-                 (if (== answer routable-inner) url-missing answer)))
-             (define (#,(named t '"url-check") [a (ptr arena)] [url string] [to (ptr buffer)]) -> u32
-               (let ([r #,t #,missing]) (#,(named t '"url-read") a url (& r) to)))
-             (define (#,(named t '"url-missing!") [r (ptr #,t)]) (set! (@ r) #,missing))
+             (define (#,(named t '"url-read") [a (ptr arena)] [url string] [base string] [r (ptr #,t)] [to (ptr buffer)])
+               -> u32
+               (set! (@ r) #,missing)
+               (let* ([target (copy a (url-target url))] [path (if (== (url-path target) "") "/" (url-path target))]
+                      [raw (url-query target)] [segments (slice string)] [read (url-segments a path (& segments))])
+                 (when (== read -1) (return url-bad))
+                 (when (== read 1) (set! path (routable-clean a segments)))
+                 (unless (routable-under? path base) (return url-missing))
+                 (url-segments a (slice path (-> base length)) (& segments))
+                 (when (== read 1)
+                   (#,matcher a path base segments raw r 0 #f)
+                   (unless (== to 0)
+                     (buffer-add-string! to path)
+                     (routable-query! to raw))
+                   (return url-moved))
+                 (let ([found (#,matcher a path base segments raw r to #f)] [n (-> segments length)])
+                   (cond [(!= found url-missing) found]
+                         [(and (match r [#,missing #t] [_ #f]) (> n 0) (!= (@ segments (- n 1)) "")
+                               (== (#,matcher a path base (routable-slashed a segments) raw r 0 #t) url-found))
+                          (set! path (routable-slash a path))
+                          (#,matcher a path base (routable-slashed a segments) raw r 0 #f)
+                          (unless (== to 0)
+                            (buffer-add-string! to path)
+                            (routable-query! to raw))
+                          url-moved]
+                         [else url-missing]))))
+             (define (#,(named t '"url-check") [a (ptr arena)] [url string] [base string] [to (ptr buffer)]) -> u32
+               (let ([r #,t #,missing]) (#,(named t '"url-read") a url base (& r) to)))
              (define (#,(named t '"url-write!") [b (ptr buffer)] [r (ptr #,t)])
                (match r
                  #,@(for/list ([e es] #:when (== (car e) 'route)) (write-code e))
