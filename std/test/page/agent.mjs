@@ -71,8 +71,7 @@ export async function settle() {
 let assets = null;
 const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-// nameOf names drawn images and sounds by the path of the site's asset with the same bytes. assets.list is beside the
-// host directory, and gives an asset's URL after a tab when it is not the asset's path.
+// nameOf names drawn images and sounds by the path of the site's asset with the same bytes.
 async function nameOf(bytes, otherwise) {
   if (!assets) {
     const start = document.querySelector('script[src$="host/web/start.mjs"]');

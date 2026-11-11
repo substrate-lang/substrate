@@ -1,5 +1,5 @@
 // Starts a site's program with the files in files.pack, the URL's arg parameters as its arguments, and the host modules
-// it imports. The program, files.pack and assets.list are beside the host directory, and the assets load from the site
+// it imports. The program, files.pack and assets.list sit beside the host directory. The assets load from the site
 // when the program asks for them. It sets window.modules, sets window.ready once the program has started, and sets
 // window.ended to the program's exit status and window.endReason to why it ended.
 import { boot } from './subhost-web.mjs';

@@ -1,4 +1,4 @@
-// The host module "net" (net.sub). A TLS server takes its certificate again whenever the certificate's files change.
+// The host module "net" (net.sub). A TLS server reloads its certificate and key when their files change.
 import fs from 'node:fs';
 import net from 'node:net';
 import tls from 'node:tls';

@@ -26,8 +26,6 @@ async function fetchBytes(url) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
-// The URLs of the assets whose names differ from their paths: each line of the list is a path, then a tab and its URL
-// when it has one.
 async function fetchAssets(url) {
   const urls = new Map();
   for (const line of text.decode(await fetchBytes(url)).split('\n')) {
@@ -117,8 +115,8 @@ async function fetchCompiled(base) {
   return compiled;
 }
 
-// options.modules is the modules, or a function that takes the names the program imports and gives the modules, and
-// options.assets is the URL of the site's assets.list. Every file is fetched at once.
+// options.modules is the modules, or a function that takes the names the program imports and gives the modules.
+// options.assets is the URL of the site's assets.list.
 export async function boot(options) {
   const base = options.program.endsWith('/') ? options.program : `${options.program}/`;
   const files = options.files || new Map();
@@ -152,7 +150,7 @@ export function run(options, names, wasm) {
   const output = options.output || ((fd, bytes) => write(fd, decoders[fd].decode(bytes, { stream: true })));
 
   const app = { files, cwd, entry: null, ended: false, realTime: [] };
-  // app.url gives the URL that a file not in memory loads from: its path under the site, or the URL assets.list gives.
+  // app.url gives the URL to load a file from when it is not in memory.
   const site = options.site || (globalThis.document ? document.baseURI : globalThis.location.href);
   const urls = options.urls || new Map();
   app.url = (name) => {
