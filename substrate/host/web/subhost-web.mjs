@@ -30,9 +30,7 @@ async function fetchBytes(url) {
 // when it has one.
 async function fetchAssets(url) {
   const urls = new Map();
-  const listed = await fetch(url);
-  if (!listed.ok) return urls;
-  for (const line of (await listed.text()).split('\n')) {
+  for (const line of text.decode(await fetchBytes(url)).split('\n')) {
     const tab = line.indexOf('\t');
     if (tab >= 0) urls.set(resolvePath('/', line.slice(0, tab)), line.slice(tab + 1));
   }

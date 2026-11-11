@@ -20,9 +20,7 @@ function renewed(server, certificate) {
   const reload = () => {
     try {
       server.setSecureContext({ cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile) });
-    } catch {
-      // a pair caught halfway through being replaced waits for the next change
-    }
+    } catch {}
   };
   for (const file of certificate.files) fs.watchFile(file, { interval: 1000, persistent: false }, reload);
   server.once('close', () => {
@@ -55,7 +53,7 @@ export function netModule(grants, certificate) {
             throw new Error('net.listen: TLS needs the host started with --tls-cert and --tls-key');
           }
           server = secure
-            ? tls.createServer({ ...certificate, allowHalfOpen: true })
+            ? tls.createServer({ cert: certificate.cert, key: certificate.key, allowHalfOpen: true })
             : net.createServer({ allowHalfOpen: true });
           if (most > 0) server.maxConnections = most;
           if (secure && certificate.files) renewed(server, certificate);
