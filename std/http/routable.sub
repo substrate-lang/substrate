@@ -1,0 +1,218 @@
+;; Routes as a type. (routable T #:missing m [case (segment ...) option ...] ... [#:moved (segment ...) case] ...)
+;; defines the variant T, with a case for each route and m for a path that no route matches. A route's case holds its
+;; parameters, then, with the option (query Q), the Q its query reads, in a field named query. Segments, precedence and
+;; conflicts are route.sub's. A #:moved path matches as a route does, and stands for the case it names, whose parameters
+;; it gives by name.
+;;
+;; T.url-read reads a URL or a target into a T, with its strings in an arena. It answers url-found, url-missing, url-bad
+;; for a path or query it cannot read, or url-moved when the path is not canonical or a #:moved path matches; then it
+;; writes the target to go to into the buffer, unless the buffer is 0. T.url-check answers the same without the T, and
+;; T.url-write! writes a value's target.
+(require-unqualified "url.sub")
+(require-unqualified "multipart.sub")
+(require-unqualified "form.sub")
+(require-unqualified "paths.sub")
+
+(provide routable url-found url-moved url-missing url-bad)
+
+(const url-found u32 0)
+(const url-moved u32 1)
+(const url-missing u32 2)
+(const url-bad u32 3)
+
+(define no-parts (slice multipart-part) 0)
+
+(define (routable-query! [to (ptr buffer)] [query string])
+  (when (> (-> query length) 0)
+    (buffer-add-byte! to #\?)
+    (buffer-add-string! to query)))
+
+(define (routable-slashed [a (ptr arena)] [segments (slice string)]) -> (slice string)
+  (let* ([n (-> segments length)] [items (new a string (+ n 1))])
+    (for ([i u32 0]) (< i n) (+= i 1) (set! (@ items i) (@ segments i)))
+    (set! (@ items n) "")
+    items))
+
+(begin-for-syntax
+  (require-unqualified compiler/macros)
+  (require-unqualified "segments.sub")
+
+  (define context datum 0)
+  (define counter u32 0)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+  (define (fail [where datum] [message string]) -> datum (raise-syntax-error 'routable message where))
+
+  (define (fresh [base datum]) -> datum
+    (+= counter 1)
+    (datum->syntax #'here (string->symbol (format-message "~a~a" `(,base ,(make-integer counter)))) 0))
+
+  ;; T.what, in the form's scope.
+  (define (named [t datum] [what datum]) -> datum
+    (datum->syntax context (string->symbol (format-message "~a.~a" `(,(syntax-e t) ,what))) context))
+
+  ;; Q.what, which (form Q) defines and which must be bound before the routes.
+  (define (derived [q datum] [what datum] [where datum]) -> datum
+    (let ([d (datum->syntax q (string->symbol (format-message "~a.~a" `(,(syntax-e q) ,what))) q)])
+      (unless (== (identifier-binding-kind d) 'function)
+        (fail where (format-message "this route needs ~a, which (form ~a) defines: write it before the routes"
+                                    `(,(syntax-e d) ,(syntax-e q)))))
+      d))
+
+  ;; ---- reading the table ----
+
+  ;; An entry is (route case segments given query syntax) or (moved case segments given syntax), with its segments as
+  ;; segments.sub reads them and given as the entry writes them. query is the type the route's query reads, or 0.
+  (define (entry-case [e datum]) -> datum (list-ref e 1))
+  (define (entry-segments [e datum]) -> datum (list-ref e 2))
+  (define (entry-given [e datum]) -> datum (list-ref e 3))
+  (define (route-query [e datum]) -> datum (list-ref e 4))
+  (define (entry-syntax [e datum]) -> datum (if (== (car e) 'route) (list-ref e 5) (list-ref e 4)))
+
+  (define (parse-entry [e datum]) -> datum
+    (let ([l (syntax->list e)])
+      (cond [(and (!= l 0) (== (length l) 3) (== (syntax-e (car l)) '#:moved) (identifier? (caddr l)))
+             `(moved ,(caddr l) ,(segments-read 'routable (cadr l)) ,(cadr l) ,e)]
+            [(and (!= l 0) (>= (length l) 2) (identifier? (car l)) (!= (syntax->list (cadr l)) 0))
+             (let ([query datum 0])
+               (for/each ([o (cddr l)])
+                 (let ([parts (syntax->list o)])
+                   (unless (and (!= parts 0) (== (length parts) 2) (== (syntax-e (car parts)) 'query)
+                                (identifier? (cadr parts)))
+                     (fail o "expected an option: (query T)"))
+                   (unless (== query 0) (fail o "a route can have each option once"))
+                   (set! query (cadr parts))))
+               (let ([read (segments-read 'routable (cadr l))])
+                 (for/each ([p (segments-params read)])
+                   (when (== (syntax-e (car p)) 'query)
+                     (fail (car p) "a route's parameter cannot be named query, the field its query reads into")))
+                 `(route ,(car l) ,read ,(cadr l) ,query ,e)))]
+            [else (fail e "expected [case (segment ...) option ...] or [#:moved (segment ...) case]")])))
+
+  (define (route-named [rs datum] [name datum]) -> datum
+    (for/each ([e rs]) (when (and (== (car e) 'route) (== (syntax-e (entry-case e)) (syntax-e name))) (return e)))
+    0)
+
+  ;; The case's fields: its parameters, then its query.
+  (define (fields [e datum]) -> datum
+    (append (for/list ([p (segments-params (entry-segments e))]) #`[#,(car p) #,(literal (cdr p))])
+            (if (== (route-query e) 0) nil `(,#`[query #,(route-query e)]))))
+
+  (define (check-moved! [rs datum] [m datum])
+    (let ([target (route-named rs (entry-case m))] [given (segments-params (entry-segments m))])
+      (when (== target 0) (fail (entry-case m) "a #:moved path names the case of a route"))
+      (for/each ([p (segments-params (entry-segments target))])
+        (let ([found (ormap (lambda ([g datum]) -> bool (== (syntax-e (car g)) (syntax-e (car p)))) given)])
+          (unless found
+            (fail (entry-syntax m) (format-message "this path gives no ~a, which ~a takes"
+                                                   `(,(syntax-e (car p)) ,(syntax-e (entry-case m)))))))
+        (for/each ([g given])
+          (when (and (== (syntax-e (car g)) (syntax-e (car p))) (not (equal? (cdr g) (cdr p))))
+            (fail (car g) (format-message "~a is a ~a in the case ~a" `(,(syntax-e (car p)) ,(cdr p)
+                                                                       ,(syntax-e (entry-case m))))))))))
+
+  ;; ---- code ----
+
+  ;; A case with these values, or the case alone when it has none, as a value or a pattern.
+  (define (built [case datum] [values datum]) -> datum (if (null? values) case #`(#,case #,@values)))
+
+  ;; Code setting r to the value of the route e, its parameters bound to their values, then answering status.
+  (define (value-code [e datum] [status datum] [where datum]) -> datum
+    (let ([args (for/list ([p (segments-params (entry-segments e))]) (car p))] [q (route-query e)])
+      (if (== q 0)
+          #`(begin (set! (@ r) #,(built (entry-case e) args)) #,status)
+          #`(let ([query #,q] [refused form-error])
+              (unless (#,(derived q '"form-read" where) a (url-form-parse a raw) no-parts (& query) (& refused))
+                (error-free! (& (-> refused error)))
+                (return url-bad))
+              (set! (@ r) #,(built (entry-case e) (append args `(,#'query))))
+              #,status))))
+
+  (define (match-code [t datum] [rs datum] [e datum]) -> datum
+    (if (== (car e) 'route)
+        #`(begin (when probe (return url-found)) #,(value-code e #'(return url-found) (entry-syntax e)))
+        (let ([target (route-named rs (entry-case e))])
+          #`(begin
+              (when probe (return url-found))
+              #,(value-code target
+                            #`(begin
+                                (unless (== to 0)
+                                  (#,(named t '"url-write!") to r)
+                                  #,@(if (== (route-query target) 0) `(,#'(routable-query! to raw)) nil))
+                                (return url-moved))
+                            (entry-syntax e))))))
+
+  (define (write-code [e datum]) -> datum
+    (let ([args (for/list ([p (segments-params (entry-segments e))]) (car p))] [q (route-query e)]
+          [query (fresh 'query)] [mark (fresh 'mark)])
+      (if (== q 0)
+          #`[#,(built (entry-case e) args) (path-write! b #,(entry-given e))]
+          #`[#,(built (entry-case e) (append args `(,query)))
+             (path-write! b #,(entry-given e))
+             (let ([#,mark (-> b length)] [given #,q #,query])
+               (buffer-add-byte! b #\?)
+               (#,(derived q '"form-write!" (entry-syntax e)) b (& given))
+               (when (== (-> b length) (+ #,mark 1)) (set! (-> b length) #,mark)))])))
+
+  (define (routable-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? identifier? t) #:missing (? identifier? missing) entry ...)
+       (set! context s)
+       (let ([es (for/list ([e entry]) (parse-entry e))] [matcher (fresh 'match)] [names nil])
+         (for/each ([e es])
+           (when (== (car e) 'route)
+             (when (or (!= (memq (syntax-e (entry-case e)) names) 0) (== (syntax-e (entry-case e)) (syntax-e missing)))
+               (fail (entry-case e) "two routes have the same case"))
+             (set! names (cons (syntax-e (entry-case e)) names))))
+         (for/each ([e es]) (when (== (car e) 'moved) (check-moved! es e)))
+         (segments-check! 'routable
+                          (for/list ([e es])
+                            `(0 ,(entry-segments e) ,(entry-syntax e)
+                                ,(string->datum (segments-text (entry-segments e)))))
+                          'URLs)
+         #`(begin
+             (variant #,t
+               #,@(for/list ([e es] #:when (== (car e) 'route)) #`[#,(entry-case e) #,@(fields e)])
+               [#,missing])
+             (define (#,matcher [a (ptr arena)] [segments (slice string)] [raw string] [r (ptr #,t)] [to (ptr buffer)]
+                                [probe bool]) -> u32
+               (path-match segments a #,@(for/list ([e es]) #`[#,(entry-given e) #,(match-code t es e)]))
+               url-missing)
+             (define (#,(named t '"url-read") [a (ptr arena)] [url string] [r (ptr #,t)] [to (ptr buffer)]) -> u32
+               (let* ([target (copy a (url-target url))] [path (url-path target)] [raw (url-query target)]
+                      [segments (slice string)]
+                      [read (url-segments a (if (== (-> path length) 0) "/" path) (& segments))])
+                 (cond [(== read -1) url-bad]
+                       [(== read 1)
+                        (let ([clean (make-buffer)] [cleaned (slice string)])
+                          (url-add-clean! (& clean) segments)
+                          (unless (== to 0)
+                            (buffer-add-string! to (buffer-string (& clean)))
+                            (routable-query! to raw))
+                          (url-segments a (copy a (buffer-string (& clean))) (& cleaned))
+                          (when (== (#,matcher a cleaned raw r 0 #f) url-missing) (set! (@ r) #,missing))
+                          (buffer-free! (& clean))
+                          url-moved)]
+                       [else
+                        (let ([found (#,matcher a segments raw r to #f)] [n (-> segments length)])
+                          (cond [(!= found url-missing) found]
+                                [(and (> n 0) (!= (@ segments (- n 1)) "")
+                                      (== (#,matcher a (routable-slashed a segments) raw r 0 #t) url-found))
+                                 (#,matcher a (routable-slashed a segments) raw r 0 #f)
+                                 (unless (== to 0)
+                                   (buffer-add-string! to path)
+                                   (buffer-add-byte! to #\/)
+                                   (routable-query! to raw))
+                                 url-moved]
+                                [else
+                                 (set! (@ r) #,missing)
+                                 url-missing]))])))
+             (define (#,(named t '"url-check") [a (ptr arena)] [url string] [to (ptr buffer)]) -> u32
+               (let ([r #,t #,missing]) (#,(named t '"url-read") a url (& r) to)))
+             (define (#,(named t '"url-write!") [b (ptr buffer)] [r (ptr #,t)])
+               (match r
+                 #,@(for/list ([e es] #:when (== (car e) 'route)) (write-code e))
+                 [#,missing (begin)]))))]
+      [_ (fail s "expected (routable T #:missing case [case (segment ...) option ...] ... [#:moved (segment ...) case] ...)")])))
+
+(define-syntax routable routable-form)
