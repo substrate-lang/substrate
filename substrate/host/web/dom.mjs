@@ -463,6 +463,29 @@ export function dom(root) {
       event_is(node, ptr, length) {
         return walk(current(), caller.string(ptr, length)) === known(node) ? 1 : 0;
       },
+      event_attribute(ptr, length, namePtr, nameLength, out) {
+        const path = caller.string(ptr, length);
+        const element = walk(current(), path);
+        if (element === null || element === undefined) return -1;
+        const { Element } = root.ownerDocument.defaultView;
+        if (!(element instanceof Element)) caller.trap(`dom: ${path} is not an element`);
+        const value = Element.prototype.getAttribute.call(element, caller.string(namePtr, nameLength));
+        return value === null ? -1 : given(value, out);
+      },
+      event_form(ptr, length, out) {
+        const path = caller.string(ptr, length);
+        const form = walk(current(), path);
+        const { HTMLFormElement } = root.ownerDocument.defaultView;
+        if (!(form instanceof HTMLFormElement)) caller.trap(`dom: ${path} is not a form`);
+        const submitter = current().submitter;
+        const data = new FormData(form, submitter && submitter.form === form ? submitter : null);
+        const lines = (s) => s.replace(/\r\n|\r|\n/g, '\r\n');
+        const query = new URLSearchParams();
+        for (const [name, value] of data) {
+          query.append(lines(name), lines(typeof value === 'string' ? value : value.name));
+        }
+        return given(query.toString(), out);
+      },
       read_number(node, ptr, length) {
         return numberOf(read(known(node), caller.string(ptr, length)));
       },
