@@ -1,9 +1,9 @@
-// Runs a worker in a Web Worker. The worker can use its side of the worker module and the page's modules that a
+// Runs a worker in a Web Worker. The worker can use its side of the worker module and the web program's modules that a
 // worker may have, within its grants, with the fakes it was given in place of the modules they fake. Its files are a
-// read-only copy of the page's files.
+// read-only copy of the web program's files.
 import { run } from './subhost-web.mjs';
 import { fsModule } from '../fs.mjs';
-import { pageFiles, resolvePath } from './fs.mjs';
+import { memoryFiles, resolvePath } from './fs.mjs';
 import { workerSide } from '../worker-side.mjs';
 
 const loaders = {
@@ -51,7 +51,7 @@ self.onmessage = async (e) => {
   if (m.type === 'start') {
     if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
-    const modules = { worker: side.worker, fs: fsModule(readOnly(pageFiles(m.files, m.cwd, m.grants))) };
+    const modules = { worker: side.worker, fs: fsModule(readOnly(memoryFiles(m.files, m.cwd, m.grants))) };
     const absent = new Set();
     const fakes = await fakesOf(m);
     for (const name of m.names) {

@@ -86,7 +86,7 @@ export function workerModule({ spawn }) {
 
   return (theCaller, app) => {
     caller = theCaller;
-    // What workers have been sent and not yet started on, which browser tests wait for as they settle a page.
+    // What workers have been sent and not yet started on, which browser tests wait for as they settle a document.
     if (app && app.realTime) {
       app.realTime.push({ pending: () => [...alive.values()].reduce((n, x) => n + x.owed, 0), progress: () => started });
     }

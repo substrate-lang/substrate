@@ -144,7 +144,7 @@ export async function gpu(options = {}) {
         case 1: {
           const id = w[i + 1];
           const node = theDom && theDom.nodeOf ? theDom.nodeOf(w[i + 2]) : null;
-          if (!node) caller.trap(`gpu: surface ${id}: the page gave this module no dom, or node ${w[i + 2]} is not on the page`);
+          if (!node) caller.trap(`gpu: surface ${id}: this module has no dom, or node ${w[i + 2]} is not in the document`);
           if (!(node instanceof HTMLCanvasElement)) caller.trap(`gpu: surface ${id}: node ${w[i + 2]} is not a canvas`);
           if (options.offscreen) {
             const texture = device.createTexture({

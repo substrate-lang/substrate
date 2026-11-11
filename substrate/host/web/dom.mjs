@@ -1,4 +1,4 @@
-// The host module "dom": applies a program's patches to the page, and sends it the page's events.
+// The host module "dom": applies a program's patches to the document, and sends it the document's events.
 import { resolvePath } from './fs.mjs';
 import { errors } from '../errors.mjs';
 
@@ -64,7 +64,7 @@ export function dom(root) {
       x = step(x, parts[k], path);
       if (x === null || x === undefined) return [null, last];
       if (!reachable(x)) {
-        caller.trap(`dom: ${path}: ${parts.slice(0, k + 1).join('.')} is not one of the page's objects`);
+        caller.trap(`dom: ${path}: ${parts.slice(0, k + 1).join('.')} is not one of the document's objects`);
       }
     }
     return [x, last];

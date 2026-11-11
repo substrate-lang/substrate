@@ -1,9 +1,9 @@
-// The host for a web page: runs a program in a browser, with its files kept in memory. A page has every grant and
+// The web host: runs a program in a browser, with its files kept in memory. A web program has every grant and
 // no fakes. Its workers can be given fewer grants and some fakes (worker-script.mjs).
 import { createHost } from '../subhost-core.mjs';
 import { fsModule } from '../fs.mjs';
 import { allGrants, pairsFrom, requestOf } from '../grants.mjs';
-import { pageFiles, resolvePath } from './fs.mjs';
+import { memoryFiles, resolvePath } from './fs.mjs';
 
 const text = new TextDecoder();
 const utf8 = new TextEncoder();
@@ -163,7 +163,7 @@ export function run(options, names, wasm) {
   };
   const modules = new Map();
   for (const [name, make] of Object.entries(options.modules || {})) modules.set(name, (caller) => make(caller, app));
-  if (!modules.has('fs')) modules.set('fs', fsModule(pageFiles(files, cwd, grants)));
+  if (!modules.has('fs')) modules.set('fs', fsModule(memoryFiles(files, cwd, grants)));
   const report = (message) => output(2, utf8.encode(`error: ${message}\n`));
   const ended = (code, reason) => {
     app.ended = true;

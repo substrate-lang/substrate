@@ -1,7 +1,7 @@
 // What a program may do beyond computing: read and write files, reach hosts, read the environment and run
-// programs. The grants match Deno's permissions wherever the two overlap, except that the host never prompts, a page
-// cannot check where fetch is redirected or where names resolve, and a child may keep the dynamic loader's variables
-// the host started with.
+// programs. The grants match Deno's permissions wherever the two overlap, except that the host never prompts, a web
+// program cannot check where fetch is redirected or where names resolve, and a child may keep the dynamic loader's
+// variables the host started with.
 const kinds = ['read', 'write', 'net', 'env', 'run'];
 export const flags = {
   read: '--allow-read', write: '--allow-write', net: '--allow-net', env: '--allow-env', run: '--allow-run',

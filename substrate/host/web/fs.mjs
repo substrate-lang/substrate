@@ -1,5 +1,5 @@
-// A page's files for fs.mjs, kept in memory under the program's working directory and checked against the program's
-// grants. A directory exists as long as it has a file in it, and there are no links or modes.
+// A web program's files for fs.mjs, kept in memory under the program's working directory and checked against the
+// program's grants. A directory exists as long as it has a file in it, and there are no links or modes.
 import { mayPath, mayTree, pathDenied, unlimited } from '../grants.mjs';
 import { sameFile, tempName } from '../fs.mjs';
 
@@ -17,7 +17,7 @@ const missing = () => Object.assign(new Error('No such file or directory'), { co
 const unsupported = () => new Error('Operation not supported');
 const under = (dir) => (dir === '/' ? '/' : `${dir}/`);
 
-export function pageFiles(files, cwd, grants) {
+export function memoryFiles(files, cwd, grants) {
   const times = new Map();
   const at = (k, p, tree = false) => {
     const key = resolvePath(cwd, p);
