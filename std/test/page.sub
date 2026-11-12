@@ -17,7 +17,7 @@
 
 (provide page page-open page-close page-step! page-stepped page-ask page-act! page-check page-click! page-click-at!
          page-hover! page-wheel! page-type! page-press! page-key! page-move-mouse! page-resize! page-go! page-reload!
-         page-console page-choose-files! page-downloaded page-pixels page-screenshot page-respond!)
+         page-traversed! page-console page-choose-files! page-downloaded page-pixels page-screenshot page-respond!)
 
 (exception page-failed string)
 
@@ -28,7 +28,8 @@
 (struct page [context string] [target string] [session string] [sessions buffer] [downloads-dir string]
              [site string] [server u32] [server-host string] [answers buffer] [downloads buffer] [lines buffer]
              [thrown bool] [errors buffer] [chosen (slice string)] [choosing bool] [held u32] [mouse-x f64]
-             [mouse-y f64] [home string] [documents u32] [stops u32] [landed string] [unreachable string])
+             [mouse-y f64] [home string] [documents u32] [stops u32] [landed string] [unreachable string]
+             [restored bool])
 
 (struct point [x f64] [y f64] [locked bool])
 
@@ -366,6 +367,25 @@
 
 (define (page-reload! [b (ptr page)]) (guarded b (loaded! b "Page.reload" "")))
 
+(define (page-traversed! [b (ptr page)] [delta i32])
+  (guarded b
+    (let* ([m (marked b)] [h (page-call b "Page.getNavigationHistory" "")] [entries (json-get h "entries")]
+           [at (+ (cast i32 (number-at h "currentIndex")) delta)] [p (params-of)])
+      (when (or (< at 0) (>= at (cast i32 (json-count entries))))
+        (throw page-failed (if (< delta 0) "there is no page to go back to" "there is no page to go forward to")))
+      (param-number! (& p) "entryId" (number-at (json-at entries (cast u32 at)) "id"))
+      (try (page-call b "Page.navigateToHistoryEntry" (params-text (& p)))
+        [catch page-failed (why) (act-failed! b m why)])
+      (reached! b (cast f64 at))
+      (followed! b m))))
+
+(define (reached! [b (ptr page)] [index f64])
+  (let ([until (+ (clock-monotonic) 30000.0)])
+    (while (!= (number-at (page-call b "Page.getNavigationHistory" "") "currentIndex") index)
+      (when (>= (clock-monotonic) until)
+        (throw page-failed "the page did not reach that entry of its history within 30 s"))
+      (devtools-pump (& connection) 20.0))))
+
 (define (page-choose-files! [b (ptr page)] [paths (slice string)])
   (guarded b
     (let ([out (make-buffer)] [info fs-info] [why error])
@@ -398,6 +418,7 @@
     (if (== (origin-of (-> b landed)) (-> b home))
         (begin
           (set! (-> b thrown) #f)
+          (when (-> b restored) (evaluated b "window.ready = true"))
           (started! b))
         (agent b (one-field "settle")))))
 
@@ -668,6 +689,7 @@
                     (let ([frame (json-get p "frame")])
                       (when (== (json-get frame "parentId") 0)
                         (+= (-> b documents) 1)
+                        (set! (-> b restored) (== (text-at p "type") "BackForwardCacheRestore"))
                         (set! (-> b landed) (kept (text-at frame "url")))
                         (set! (-> b unreachable) (kept (text-at frame "unreachableUrl")))))]
                    [(== method "Page.frameStoppedLoading")
@@ -690,11 +712,14 @@
     (cond [(> (-> module length) 0) (fulfilled! session request 200 "text/javascript" (cast (slice u8) module) #f)]
           [(!= found 0) (fulfilled! session request (-> found status) (type-of path) (cast (slice u8) (-> found body)) #t)]
           [(== from origin)
-           (let* ([file (if (== path "/") "/index.html" path)] [bytes (slice u8)]
-                  [full (resolved-path (-> b site) (slice file 1 (-> file length)))])
-             (if (and (within? full (-> b site)) (fs-read-file full (& bytes) 0))
-                 (fulfilled! session request 200 (type-of file) bytes #f)
-                 (fulfilled! session request 404 "text/plain" (cast (slice u8) "not found") #f)))]
+           (let ([named (make-buffer)] [bytes (slice u8)])
+             (buffer-add-string! (& named) path)
+             (when (== (@ path (- (-> path length) 1)) #\/) (buffer-add-string! (& named) "index.html"))
+             (let* ([file (buffer-string (& named))] [full (resolved-path (-> b site) (slice file 1 (-> file length)))])
+               (if (and (within? full (-> b site)) (fs-read-file full (& bytes) 0))
+                   (fulfilled! session request 200 (type-of file) bytes #f)
+                   (fulfilled! session request 404 "text/plain" (cast (slice u8) "not found") #f)))
+             (buffer-free! (& named)))]
           [(and (> (-> b server-host length) 0) (== (host-of from) (-> b server-host)))
            (let ([q (params-of)])
              (param-string! (& q) "requestId" request)

@@ -3,7 +3,7 @@
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
 (modernized with variants and bounds-checked slices), combined with
 Racket-style hygienic macros and module hooks for defining new languages and
-DSLs. Its compiler is self-hosted (~11k LOC, <600 KiB of Wasm), fast, and
+DSLs. Its compiler is self-hosted (~11k LOC, ~600 KiB of Wasm), fast, and
 runs in the browser. Substrate's dev tooling, package manager, and standard 
 library are also entirely written in Substrate.
 
@@ -190,7 +190,7 @@ macro gives a struct a JSON reader and writer:
 
 (define (main)
   (let ([a (make-arena)] [r release] [err json-error] [b (make-buffer)])
-    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.10.2\", \"tags\": [\"lisp\", \"wasm\"]}"
+    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.11.0\", \"tags\": [\"lisp\", \"wasm\"]}"
                            (& r) (& err))
         (begin
           (printf "~a ~a has ~a tags\n" (-> r name) (-> r version) (-> r tags length))
@@ -202,7 +202,7 @@ macro gives a struct a JSON reader and writer:
 
 ```console
 $ substrate run json.sub
-substrate 0.10.2 has 2 tags
+substrate 0.11.0 has 2 tags
 {"name":"substrate","version":"1.0.0","tags":["lisp","wasm"]}
 ```
 
@@ -281,8 +281,8 @@ gives the number back:
 (package proof
   (version "0.1.0")
   (dependencies
-   (bend2 (url "https://github.com/substrate-lang/substrate-bend2/archive/refs/tags/v0.10.0.tar.gz")
-          (hash "sha256:3509d8b7c67efdc6e703b9dffb288bc833625595f9cb6181e1191d17da24a1d8"))))
+   (bend2 (url "https://github.com/substrate-lang/substrate-bend2/archive/refs/tags/v0.11.0.tar.gz")
+          (hash "sha256:15d07c4ff74c44ed3aacafd5535cda6bd6a71b1579f49be7a9909e14e99d51e1"))))
 
 (language bend2)
 
@@ -305,7 +305,7 @@ gives the number back:
 
 ```console
 $ substrate run proof.sub
-substrate: fetching https://github.com/substrate-lang/substrate-bend2/archive/refs/tags/v0.10.0.tar.gz
+substrate: fetching https://github.com/substrate-lang/substrate-bend2/archive/refs/tags/v0.11.0.tar.gz
 (S (S (S Z)))
 ```
 

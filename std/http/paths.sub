@@ -1,0 +1,147 @@
+;; Matching and writing paths, given as segments that segments.sub reads. (path-match segments arena [(segment ...)
+;; body ...] ...) runs the bodies of the paths that the decoded segments match, the most specific first. Each body sees
+;; its path's parameters bound to their values, and the rest of a path is joined in the arena. Paths of the same shape
+;; share one match, and their bodies run in order. (path-write! b (segment ...)) writes the path with its parameters'
+;; values, escaped.
+(require-unqualified "http.sub")
+(require-unqualified "url.sub")
+
+(provide path-match path-write! path-after)
+
+;; path-after gives the index of the slash before the path's segments that come after the first n.
+(define (path-after [path string] [n u32]) -> u32
+  (let ([i u32 0])
+    (for ([k u32 0]) (< k n) (+= k 1)
+      (+= i 1)
+      (while (and (< i (-> path length)) (!= (@ path i) #\/)) (+= i 1)))
+    i))
+
+(define (path-rest [a (ptr arena)] [segments (slice string)] [i u32]) -> string
+  (let ([n u32 0] [at u32 0])
+    (for ([k u32 i]) (< k (-> segments length)) (+= k 1) (+= n (+ (-> (@ segments k) length) 1)))
+    (let ([p (new a u8 n)])
+      (for ([k u32 i]) (< k (-> segments length)) (+= k 1)
+        (when (> k i)
+          (set! (@ p at) #\/)
+          (+= at 1))
+        (memcpy (+ (-> p items) at) (-> (@ segments k) bytes) (-> (@ segments k) length))
+        (+= at (-> (@ segments k) length)))
+      (cast string (slice p 0 at)))))
+
+(define (path-add-text! [b (ptr buffer)] [s string])
+  (buffer-add-byte! b #\/)
+  (url-add-segment! b s))
+
+(define (path-add-unsigned! [b (ptr buffer)] [n u64])
+  (buffer-add-byte! b #\/)
+  (write-digits b n 10))
+
+(define (path-add-signed! [b (ptr buffer)] [n i64])
+  (buffer-add-byte! b #\/)
+  (if (< n 0)
+      (begin (buffer-add-byte! b #\-) (write-digits b (- 0 (cast u64 n)) 10))
+      (write-digits b (cast u64 n) 10)))
+
+(define (path-add-rest! [b (ptr buffer)] [s string])
+  (let ([start u32 0])
+    (buffer-add-byte! b #\/)
+    (for ([i u32 0]) (<= i (-> s length)) (+= i 1)
+      (when (or (== i (-> s length)) (== (@ s i) #\/))
+        (url-add-segment! b (slice s start i))
+        (when (< i (-> s length)) (buffer-add-byte! b #\/))
+        (set! start (+ i 1))))))
+
+(begin-for-syntax
+  (require-unqualified compiler/macros)
+  (require-unqualified "segments.sub")
+
+  (define counter u32 0)
+  (define segments-var datum 0)
+  (define arena-var datum 0)
+
+  (define (literal [d datum]) -> datum (datum->syntax #'here d 0))
+  (define (number [n i64]) -> datum (literal (make-integer n)))
+
+  (define (fresh [base datum]) -> datum
+    (+= counter 1)
+    (datum->syntax #'here (string->symbol (format-message "~a~a" `(,base ,(make-integer counter)))) 0))
+
+  ;; An entry is (entry segments body). Its parameters take the values in order, and each value is (variable . type).
+  (define (entry-code [e datum] [values datum]) -> datum
+    (let ([bindings nil] [vs values])
+      (for/each ([p (segments-params (cadr e))])
+        (set! bindings
+              (cons (if (== (cdr p) 'string)
+                        #`[#,(car p) #,(car (car vs))]
+                        #`[#,(car p) #,(literal (cdr p)) (cast #,(literal (cdr p)) #,(car (car vs)))])
+                    bindings))
+        (set! vs (cdr vs)))
+      #`(let (#,@(reverse bindings)) #,@(caddr e))))
+
+  (define (entries-code [es datum] [values datum]) -> datum
+    #`(begin #,@(for/list ([e es]) (entry-code e values))))
+
+  (define (node-code [n datum] [i i64] [values datum]) -> datum
+    (let ([parts nil])
+      (unless (null? (cadr n))
+        (set! parts (cons #`(when (== count #,(number i)) #,(entries-code (cadr n) values)) parts)))
+      (for/each ([c (segments-ordered (caddr n))]) (set! parts (cons (child-code (car c) (cdr c) i values) parts)))
+      #`(begin #,@(reverse parts))))
+
+  (define (child-code [s datum] [n datum] [i i64] [values datum]) -> datum
+    (let ([at (number i)] [v (fresh 'v)] [segments segments-var])
+      (cond [(== (car s) 'text)
+             #`(when (and (> count #,at) (== (@ #,segments #,at) #,(literal (cadr s)))) #,(node-code n (+ i 1) values))]
+            [(== (car s) 'string)
+             #`(when (and (> count #,at) (> (-> (@ #,segments #,at) length) 0))
+                 (let ([#,v (@ #,segments #,at)])
+                   #,(node-code n (+ i 1) (append values (cons (cons v 'string) nil)))))]
+            [(== (car s) 'int)
+             (let* ([type (caddr s)] [info (assq type integer-types)] [more (append values (cons (cons v type) nil))])
+               (if (integer-signed? type)
+                   #`(let ([#,v i64 0])
+                       (when (and (> count #,at)
+                                  (http-signed (@ #,segments #,at) #,(literal (cadddr info)) #,(literal (list-ref info 4))
+                                               (& #,v)))
+                         #,(node-code n (+ i 1) more)))
+                   #`(let ([#,v u64 0])
+                       (when (and (> count #,at) (http-unsigned (@ #,segments #,at) #,(literal (cadddr info)) (& #,v)))
+                         #,(node-code n (+ i 1) more)))))]
+            [else
+             #`(when (> count #,at)
+                 (let ([#,v (path-rest #,arena-var #,segments #,at)])
+                   #,(entries-code (cadr n) (append values (cons (cons v 'string) nil)))))])))
+
+  (define (path-match-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (? identifier? segments) arena entry ...)
+       (let ([trie datum '(node () ())] [a (fresh 'arena)])
+         (for/each ([e entry])
+           (let ([l (syntax->list e)])
+             (unless (and (!= l 0) (pair? l)) (raise-syntax-error 'path-match "expected [(segment ...) body ...]" e))
+             (let ([read (segments-read 'path-match (car l))])
+               (set! trie (segments-insert trie read `(entry ,read ,(cdr l)))))))
+         (set! segments-var segments)
+         (set! arena-var a)
+         #`(let ([count (-> #,segments length)] [#,a #,arena]) #,(node-code trie 0 nil)))]
+      [_ (raise-syntax-error 'path-match "expected (path-match segments arena [(segment ...) body ...] ...)" s)]))
+
+  (define (path-write-form [s datum]) -> datum
+    (syntax-match s
+      [(_ b segments)
+       (let ([read (segments-read 'path-write! segments)] [out (fresh 'out)])
+         #`(let ([#,out #,b])
+             #,@(if (null? read)
+                    `(,#`(buffer-add-byte! #,out #\/))
+                    (for/list ([x read])
+                      (cond [(== (car x) 'text) #`(path-add-text! #,out #,(literal (cadr x)))]
+                            [(== (car x) 'string) #`(path-add-text! #,out #,(cadr x))]
+                            [(== (car x) 'int)
+                             (if (integer-signed? (caddr x))
+                                 #`(path-add-signed! #,out (cast i64 #,(cadr x)))
+                                 #`(path-add-unsigned! #,out (cast u64 #,(cadr x))))]
+                            [else #`(path-add-rest! #,out #,(cadr x))])))))]
+      [_ (raise-syntax-error 'path-write! "expected (path-write! buffer (segment ...))" s)])))
+
+(define-syntax path-match path-match-form)
+(define-syntax path-write! path-write-form)

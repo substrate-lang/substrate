@@ -10,8 +10,9 @@ const HEARD = 1;
 const IMAGE_LOADED = 2;
 const IMAGE_FAILED = 3;
 
-// The document's node number (std/web/patches.sub).
+// The node numbers of the document and of the current event (std/web/patches.sub).
 const DOCUMENT = 1;
+const EVENT = 2;
 
 const imageTypes = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
@@ -38,10 +39,38 @@ export function dom(root) {
     return e && e.source === SOURCE ? e.data : null;
   };
 
-  const kinds = ['Node', 'Event', 'NodeList', 'HTMLCollection', 'DOMRectReadOnly', 'DOMTokenList',
-    'CSSStyleDeclaration', 'DOMStringMap', 'ValidityState', 'FileList', 'Blob', 'DataTransfer', 'TouchList', 'Touch',
-    'IntersectionObserverEntry'].map((name) => globalThis[name]).filter((kind) => kind !== undefined);
+  const current = () => {
+    const e = event();
+    if (!e) caller.trap('dom: there is no current event');
+    return e;
+  };
+
+  // A piece that a program put in the document, from its first node to its last.
+  class Piece {
+    constructor(start, end) {
+      this.start = start;
+      this.end = end;
+    }
+  }
+
+  const nodeOf = (id) => {
+    if (id === EVENT) return current();
+    const n = nodes.get(id);
+    return n instanceof Piece ? n.start : n;
+  };
+
+  const known = (id) => {
+    if (id !== EVENT && !nodes.has(id)) caller.trap(`dom: there is no node ${id}`);
+    return nodeOf(id);
+  };
+
+  const kinds = ['Node', 'Event', 'NodeList', 'HTMLCollection', 'NamedNodeMap', 'DOMRectReadOnly', 'DOMRectList',
+    'DOMTokenList', 'CSSStyleDeclaration', 'DOMStringMap', 'ValidityState', 'FileList', 'Blob', 'DataTransfer',
+    'DataTransferItemList', 'DataTransferItem', 'TouchList', 'Touch', 'IntersectionObserverEntry', 'Selection',
+    'AbstractRange', 'TimeRanges', 'MediaError', 'Array']
+    .map((name) => globalThis[name]).filter((kind) => kind !== undefined);
   const reachable = (x) => kinds.some((kind) => x instanceof kind);
+  const plain = (v) => v === null || v === undefined || ['number', 'string', 'boolean'].includes(typeof v);
 
   function guarded(path, f) {
     try {
@@ -51,9 +80,22 @@ export function dom(root) {
     }
   }
 
+  // The browser's own property of x, which a form's controls or a document's named elements cannot hide: an accessor or
+  // a method on x's prototypes.
+  function builtin(x, name) {
+    if (x === null || (typeof x !== 'object' && typeof x !== 'function')) return null;
+    for (let p = Object.getPrototypeOf(x); p !== null; p = Object.getPrototypeOf(p)) {
+      const d = Object.getOwnPropertyDescriptor(p, name);
+      if (d) return d.get || d.set || typeof d.value === 'function' ? d : null;
+    }
+    return null;
+  }
+
   function step(x, name, path) {
-    if (!(name in Object(x))) caller.trap(`dom: ${path}: there is no ${name}`);
-    return guarded(path, () => x[name]);
+    const o = Object(x);
+    if (!(name in o)) caller.trap(`dom: ${path}: there is no ${name}`);
+    const d = builtin(o, name);
+    return guarded(path, () => (d === null ? o[name] : d.get ? d.get.call(o) : d.value));
   }
 
   function owner(root, path) {
@@ -61,38 +103,50 @@ export function dom(root) {
     const last = parts.pop();
     let x = root;
     for (let k = 0; k < parts.length; k++) {
-      x = step(x, parts[k], path);
       if (x === null || x === undefined) return [null, last];
-      if (!reachable(x)) {
+      x = step(x, parts[k], path);
+      if (x !== null && x !== undefined && !reachable(x)) {
         caller.trap(`dom: ${path}: ${parts.slice(0, k + 1).join('.')} is not one of the document's objects`);
       }
     }
-    return [x, last];
+    return [x === undefined ? null : x, last];
   }
 
   function walk(root, path) {
+    if (path === '') return root;
     const [x, last] = owner(root, path);
     return x === null ? null : step(x, last, path);
   }
 
   function read(root, path) {
     const v = walk(root, path);
-    const plain = v === null || v === undefined || ['number', 'string', 'boolean'].includes(typeof v);
-    if (!plain) caller.trap(`dom: ${path} is not a number, text, or true or false`);
+    if (!plain(v)) caller.trap(`dom: ${path} is not a number, text, or true or false`);
     return v;
   }
 
   function write(root, path, value) {
     const [x, last] = owner(root, path);
     if (x === null || !(last in x)) caller.trap(`dom: ${path}: there is no ${last} to set`);
-    guarded(path, () => { x[last] = value; });
+    const d = builtin(x, last);
+    guarded(path, () => {
+      if (d && d.set) d.set.call(x, value);
+      else x[last] = value;
+    });
   }
 
   function call(root, path, args) {
     const [x, last] = owner(root, path);
-    if (x === null || typeof x[last] !== 'function') caller.trap(`dom: ${path} is not a method`);
-    const result = guarded(path, () => x[last](...args));
+    const d = builtin(x, last);
+    const f = d && typeof d.value === 'function' ? d.value : x === null ? undefined : x[last];
+    if (typeof f !== 'function') caller.trap(`dom: ${path} is not a method`);
+    const result = guarded(path, () => f.apply(x, args));
     if (result && typeof result.catch === 'function') result.catch(() => {});
+    return result;
+  }
+
+  function keep(id, path, v) {
+    if (!plain(v) && !reachable(v)) caller.trap(`dom: ${path}: its result is not one of the document's objects`);
+    nodes.set(id, v === undefined ? null : v);
   }
 
   const numberOf = (v) => (v === null || v === undefined ? 0 : Number(v));
@@ -203,11 +257,6 @@ export function dom(root) {
     return { content, paths };
   }
 
-  const nodeOf = (id) => {
-    const n = nodes.get(id);
-    return n instanceof Node ? n : n.start;
-  };
-
   function place(what, parent, before) {
     if (before) {
       const next = nodeOf(before);
@@ -303,6 +352,10 @@ export function dom(root) {
       ? new Uint32Array(memory.buffer, memory.byteOffset + ptr, length >>> 2)
       : new Uint32Array(memory.slice(ptr, ptr + length).buffer);
     const string = (at) => text.decode(memory.subarray(w[at], w[at] + w[at + 1]));
+    const argument = (at) => {
+      if (w[at] === 0) return float64(w[at + 1], w[at + 2]);
+      return w[at] === 1 ? string(at + 1) : known(w[at + 1]);
+    };
     for (let i = 0; i < w.length; ) {
       switch (w[i]) {
         case 1:
@@ -318,7 +371,7 @@ export function dom(root) {
             for (const index of path) n = n.childNodes[index];
             nodes.set(first + 1 + k, n);
           });
-          nodes.set(first, { start: copy.firstChild, end: copy.lastChild });
+          nodes.set(first, new Piece(copy.firstChild, copy.lastChild));
           place(copy, w[i + 4], w[i + 5]);
           i += 6;
           break;
@@ -402,23 +455,38 @@ export function dom(root) {
           break;
         }
         case 14: {
-          const node = nodeOf(w[i + 1]);
+          const node = known(w[i + 1]);
           const path = string(i + 2);
-          const value = w[i + 4] === 0 ? float64(w[i + 5], w[i + 6]) : string(i + 5);
+          const value = argument(i + 4);
           after.push(() => write(node, path, value));
           i += 7;
           break;
         }
         case 15: {
-          const node = nodeOf(w[i + 1]);
+          const node = known(w[i + 1]);
           const path = string(i + 2);
           const args = [];
-          for (let k = 0; k < w[i + 4]; k++) {
-            const at = i + 5 + 3 * k;
-            args.push(w[at] === 0 ? float64(w[at + 1], w[at + 2]) : string(at + 1));
-          }
+          for (let k = 0; k < w[i + 4]; k++) args.push(argument(i + 5 + 3 * k));
           after.push(() => call(node, path, args));
           i += 5 + 3 * w[i + 4];
+          break;
+        }
+        case 16: {
+          const node = known(w[i + 1]);
+          const path = string(i + 2);
+          const id = w[i + 4];
+          const args = [];
+          for (let k = 0; k < w[i + 5]; k++) args.push(argument(i + 6 + 3 * k));
+          after.push(() => keep(id, path, call(node, path, args)));
+          i += 6 + 3 * w[i + 5];
+          break;
+        }
+        case 17: {
+          const node = known(w[i + 1]);
+          const path = string(i + 2);
+          const id = w[i + 4];
+          after.push(() => keep(id, path, walk(node, path)));
+          i += 5;
           break;
         }
         default:
@@ -437,31 +505,10 @@ export function dom(root) {
     caller = theCaller;
     app = theApp;
     const given = (s, out) => caller.give(utf8.encode(s), out);
-    const current = () => {
-      const e = event();
-      if (!e) caller.trap('dom: there is no current event');
-      return e;
-    };
-    const known = (id) => {
-      if (!nodes.has(id)) caller.trap(`dom: there is no node ${id}`);
-      return nodeOf(id);
-    };
     return {
       source: SOURCE,
       apply(ptr, length) {
         apply(caller.memory(), caller.u(ptr), length);
-      },
-      event_number(ptr, length) {
-        return numberOf(read(current(), caller.string(ptr, length)));
-      },
-      event_text(ptr, length, out) {
-        return given(textOf(read(current(), caller.string(ptr, length))), out);
-      },
-      event_call(ptr, length) {
-        call(current(), caller.string(ptr, length), []);
-      },
-      event_is(node, ptr, length) {
-        return walk(current(), caller.string(ptr, length)) === known(node) ? 1 : 0;
       },
       read_number(node, ptr, length) {
         return numberOf(read(known(node), caller.string(ptr, length)));
@@ -472,14 +519,21 @@ export function dom(root) {
       is(node, from, ptr, length) {
         return walk(known(from), caller.string(ptr, length)) === known(node) ? 1 : 0;
       },
+      form_data(node, ptr, length, submitter, out) {
+        const path = caller.string(ptr, length);
+        const form = walk(known(node), path);
+        const { HTMLFormElement } = root.ownerDocument.defaultView;
+        if (!(form instanceof HTMLFormElement)) caller.trap(`dom: ${path} is not a form`);
+        const data = guarded(path, () => new FormData(form, submitter === -1 ? null : known(submitter)));
+        const lines = (s) => s.replace(/\r\n|\r|\n/g, '\r\n');
+        const query = new URLSearchParams();
+        for (const [name, value] of data) {
+          query.append(lines(name), lines(typeof value === 'string' ? value : value.name));
+        }
+        return given(query.toString(), out);
+      },
       images_loading(tag) {
         return loading.get(tag) || 0;
-      },
-      element(ptr, length, node) {
-        const found = root.ownerDocument.getElementById(caller.string(ptr, length));
-        if (!found) return 0;
-        nodes.set(node, found);
-        return 1;
       },
     };
   };

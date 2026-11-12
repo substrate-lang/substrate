@@ -1,0 +1,166 @@
+;; Paths written as s-expressions, read and checked at compile time for route.sub and routable.sub. A segment is a
+;; string; [name type], of type string or an integer type; or, last, [name string ...], the rest of the path. "" last is
+;; the empty segment after a final slash. A segment read is (text "s" syntax), (int name type syntax), (string name
+;; syntax) or (rest name syntax).
+(require-unqualified compiler/macros)
+
+(provide integer-types integer-signed? integer-width segments-read segments-params segments-text segments-check!
+         segments-overlap? segments-within? segments-mountable? segments-key segments-insert segments-ordered)
+
+;; Each is (name width unsigned most) or (name width signed least most).
+(define integer-types datum
+  '((u8 8 unsigned 255) (u16 16 unsigned 65535) (u32 32 unsigned 4294967295) (u64 64 unsigned 18446744073709551615)
+    (i8 8 signed -128 127) (i16 16 signed -32768 32767) (i32 32 signed -2147483648 2147483647)
+    (i64 64 signed -9223372036854775808 9223372036854775807)))
+
+(define (integer-signed? [type datum]) -> bool (== (caddr (assq type integer-types)) 'signed))
+(define (integer-width [type datum]) -> i64 (integer-value (cadr (assq type integer-types))))
+
+(define (has-slash? [s string]) -> bool
+  (for ([i u32 0]) (< i (-> s length)) (+= i 1) (when (== (@ s i) #\/) (return #t)))
+  #f)
+
+(define (segments-read [who datum] [segments datum]) -> datum
+  (let ([l (syntax->list segments)] [out nil] [names nil])
+    (when (== l 0) (raise-syntax-error who "expected (segment ...)" segments))
+    (while (pair? l)
+      (let* ([x (car l)] [last (null? (cdr l))] [d (syntax-e x)] [parts (syntax->list x)])
+        (cond [(string? d)
+               (when (and (== (-> (datum->string d) length) 0) (not last))
+                 (raise-syntax-error who "only the last segment can be \"\", the empty one after a final slash" x))
+               (when (has-slash? (datum->string d)) (raise-syntax-error who "a segment cannot contain a slash" x))
+               (set! out (cons `(text ,d ,x) out))]
+              [(and (!= parts 0) (or (== (length parts) 2) (== (length parts) 3)) (identifier? (car parts))
+                    (identifier? (cadr parts)))
+               (let ([name (car parts)] [type (syntax-e (cadr parts))])
+                 (when (!= (memq (syntax-e name) names) 0)
+                   (raise-syntax-error who "two parameters of a route have the same name" name))
+                 (set! names (cons (syntax-e name) names))
+                 (cond [(== (length parts) 3)
+                        (unless (and (== type 'string) (identifier? (caddr parts)) (== (syntax-e (caddr parts)) '...))
+                          (raise-syntax-error who "expected [name string ...], the rest of the path" x))
+                        (unless last (raise-syntax-error who "the rest of the path, [name string ...], can only be last" x))
+                        (set! out (cons `(rest ,name ,x) out))]
+                       [(== type 'string) (set! out (cons `(string ,name ,x) out))]
+                       [(!= (assq type integer-types) 0) (set! out (cons `(int ,name ,type ,x) out))]
+                       [else (raise-syntax-error who "a parameter's type is string or an integer type" (cadr parts))]))]
+              [else (raise-syntax-error who "expected a segment: a string, [name type] or [name string ...]" x)]))
+      (set! l (cdr l)))
+    (reverse out)))
+
+;; The parameters, as (name . type).
+(define (segments-params [segments datum]) -> datum
+  (let ([out nil])
+    (for/each ([s segments])
+      (cond [(== (car s) 'int) (set! out (cons (cons (cadr s) (caddr s)) out))]
+            [(!= (car s) 'text) (set! out (cons (cons (cadr s) 'string) out))]))
+    (reverse out)))
+
+;; The path as Go writes its patterns, with each parameter's type.
+(define (segments-text [segments datum]) -> string
+  (let ([b (make-buffer)])
+    (when (null? segments) (buffer-add-byte! (& b) #\/))
+    (for/each ([s segments])
+      (buffer-add-byte! (& b) #\/)
+      (cond [(== (car s) 'text) (buffer-add-string! (& b) (datum->string (cadr s)))]
+            [(== (car s) 'int) (buffer-add-string! (& b) (format-message "{~a:~a}" `(,(syntax-e (cadr s)) ,(caddr s))))]
+            [(== (car s) 'string) (buffer-add-string! (& b) (format-message "{~a}" `(,(syntax-e (cadr s)))))]
+            [else (buffer-add-string! (& b) (format-message "{~a...}" `(,(syntax-e (cadr s)))))]))
+    (buffer-string (& b))))
+
+(define (integer-like? [s string] [signed bool]) -> bool
+  (let ([i u32 (if (and signed (> (-> s length) 1) (== (@ s 0) #\-)) 1 0)])
+    (when (>= i (-> s length)) (return #f))
+    (while (< i (-> s length))
+      (unless (and (>= (@ s i) #\0) (<= (@ s i) #\9)) (return #f))
+      (+= i 1))
+    #t))
+
+;; Whether b matches every segment a matches.
+(define (within? [a datum] [b datum]) -> bool
+  (let ([ka (car a)] [kb (car b)])
+    (cond [(== kb 'rest) #t]
+          [(== ka 'text)
+           (let ([s (datum->string (cadr a))])
+             (cond [(== kb 'text) (equal? (cadr a) (cadr b))]
+                   [(== kb 'int) (integer-like? s (integer-signed? (caddr b)))]
+                   [else (> (-> s length) 0)]))]
+          [(== ka 'int)
+           (cond [(== kb 'string) #t]
+                 [(== kb 'int)
+                  (let ([sa (integer-signed? (caddr a))] [sb (integer-signed? (caddr b))]
+                        [wa (integer-width (caddr a))] [wb (integer-width (caddr b))])
+                    (or (and (== sa sb) (<= wa wb)) (and (not sa) sb (< wa wb))))]
+                 [else #f])]
+          [(== ka 'string) (== kb 'string)]
+          [else #f])))
+
+(define (overlap? [a datum] [b datum]) -> bool
+  (or (within? a b) (within? b a) (and (== (car a) 'int) (== (car b) 'int))))
+
+(define (segments-overlap? [a datum] [b datum]) -> bool
+  (cond [(or (null? a) (null? b)) (and (null? a) (null? b))]
+        [(or (== (car (car a)) 'rest) (== (car (car b)) 'rest)) #t]
+        [else (and (overlap? (car a) (car b)) (segments-overlap? (cdr a) (cdr b)))]))
+
+;; Whether b matches every path a matches.
+(define (segments-within? [a datum] [b datum]) -> bool
+  (cond [(null? a) (null? b)]
+        [(null? b) #f]
+        [(== (car (car b)) 'rest) #t]
+        [(== (car (car a)) 'rest) #f]
+        [else (and (within? (car a) (car b)) (segments-within? (cdr a) (cdr b)))]))
+
+;; Refuses two entries of one group whose paths overlap when neither is more specific. An entry is (group segments
+;; syntax text). what is the word that the messages use for what a path matches, such as requests or URLs.
+(define (segments-check! [who datum] [entries datum] [what datum])
+  (let ([l entries])
+    (while (pair? l)
+      (for/each ([other (cdr l)])
+        (let ([a (car l)])
+          (when (and (equal? (car a) (car other)) (segments-overlap? (cadr a) (cadr other)))
+            (let ([ab (segments-within? (cadr a) (cadr other))] [ba (segments-within? (cadr other) (cadr a))])
+              (cond [(and ab ba)
+                     (raise-syntax-error who (format-message "~a matches the same ~a as ~a"
+                                                             `(,(cadddr other) ,what ,(cadddr a)))
+                                         (caddr other))]
+                    [(not (or ab ba))
+                     (raise-syntax-error who (format-message "~a and ~a overlap, and neither is more specific"
+                                                             `(,(cadddr other) ,(cadddr a)))
+                                         (caddr other))])))))
+      (set! l (cdr l)))))
+
+(define (segments-mountable? [segments datum]) -> bool
+  (unless (pair? segments) (return #f))
+  (let ([last (list-ref segments (- (length segments) 1))])
+    (not (or (== (car last) 'rest) (and (== (car last) 'text) (== (-> (datum->string (cadr last)) length) 0))))))
+
+;; ---- the tree of segments ----
+
+;; A node is (node entries children): the entries whose segments end there, and (segment . node) for each next segment.
+(define (segments-key [s datum]) -> datum
+  (cond [(== (car s) 'text) `(text ,(cadr s))]
+        [(== (car s) 'int) `(int ,(caddr s))]
+        [else `(,(car s))]))
+
+(define (segments-insert [n datum] [segments datum] [e datum]) -> datum
+  (if (null? segments)
+      `(node ,(append (cadr n) (cons e nil)) ,(caddr n))
+      (let ([k (segments-key (car segments))] [out nil] [found #f])
+        (for/each ([c (caddr n)])
+          (if (and (not found) (equal? (segments-key (car c)) k))
+              (begin
+                (set! found #t)
+                (set! out (cons (cons (car c) (segments-insert (cdr c) (cdr segments) e)) out)))
+              (set! out (cons c out))))
+        (unless found (set! out (cons (cons (car segments) (segments-insert '(node () ()) (cdr segments) e)) out)))
+        `(node ,(cadr n) ,(reverse out)))))
+
+(define (rank [s datum]) -> i64
+  (cond [(== (car s) 'text) 0]
+        [(== (car s) 'int) (+ (integer-width (caddr s)) (if (integer-signed? (caddr s)) 1 0))]
+        [(== (car s) 'string) 100]
+        [else 200]))
+
+(define (segments-ordered [children datum]) -> datum
+  (sort children (lambda ([a datum] [b datum]) -> bool (< (rank (car a)) (rank (car b))))))
