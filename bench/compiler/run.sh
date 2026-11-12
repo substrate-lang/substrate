@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The compiler compiling itself without a cache: the best and median of N runs (5 by default), in ms. Then the size of
-# its Wasm, pruned as builds write it, and again stripped of names.
+# Times the compiler as it compiles itself without a cache, and prints the best and the median of N runs (5 by
+# default) in ms. Then it prints the size of the compiler's Wasm, as builds write it and with names stripped.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"

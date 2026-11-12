@@ -45,7 +45,7 @@ export function dom(root) {
     return e;
   };
 
-  // A piece that a program put in the document: its first and last nodes.
+  // A piece that a program put in the document, from its first node to its last.
   class Piece {
     constructor(start, end) {
       this.start = start;
