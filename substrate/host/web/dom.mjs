@@ -14,6 +14,8 @@ const IMAGE_FAILED = 3;
 const DOCUMENT = 1;
 const EVENT = 2;
 
+const SVG = 'http://www.w3.org/2000/svg';
+
 const imageTypes = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp',
   avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml',
@@ -227,10 +229,18 @@ export function dom(root) {
     }
   };
 
-  function template(html) {
+  function template(html, svg) {
     const t = document.createElement('template');
-    t.innerHTML = html;
+    t.innerHTML = svg ? `<svg>${html}</svg>` : html;
     const content = t.content;
+    if (svg) {
+      const wrapper = content.firstChild;
+      if (content.childNodes.length !== 1) {
+        caller.trap('dom: an HTML element was put inside an SVG element');
+      }
+      while (wrapper.firstChild) content.insertBefore(wrapper.firstChild, wrapper);
+      wrapper.remove();
+    }
     const marked = [];
     const walker = document.createTreeWalker(content, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
     for (let n = walker.nextNode(); n; n = walker.nextNode()) {
@@ -359,11 +369,14 @@ export function dom(root) {
     for (let i = 0; i < w.length; ) {
       switch (w[i]) {
         case 1:
-          templates.set(w[i + 1], template(string(i + 2)));
+          templates.set(w[i + 1], { html: string(i + 2), parsed: [] });
           i += 4;
           break;
         case 2: {
-          const t = templates.get(w[i + 1]);
+          const into = w[i + 5] ? nodeOf(w[i + 5]).parentNode : nodeOf(w[i + 4]);
+          const svg = into !== null && into.namespaceURI === SVG && into.localName !== 'foreignObject';
+          const held = templates.get(w[i + 1]);
+          const t = (held.parsed[svg ? 1 : 0] ||= template(held.html, svg));
           const first = w[i + 2];
           const copy = t.content.cloneNode(true);
           t.paths.forEach((path, k) => {
