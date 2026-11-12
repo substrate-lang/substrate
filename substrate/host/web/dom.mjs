@@ -481,6 +481,14 @@ export function dom(root) {
           i += 6 + 3 * w[i + 5];
           break;
         }
+        case 17: {
+          const node = known(w[i + 1]);
+          const path = string(i + 2);
+          const id = w[i + 4];
+          after.push(() => keep(id, path, walk(node, path)));
+          i += 5;
+          break;
+        }
         default:
           throw new Error(`dom.apply: no patch ${w[i]}`);
       }
@@ -511,13 +519,12 @@ export function dom(root) {
       is(node, from, ptr, length) {
         return walk(known(from), caller.string(ptr, length)) === known(node) ? 1 : 0;
       },
-      form_data(node, ptr, length, out) {
+      form_data(node, ptr, length, submitter, out) {
         const path = caller.string(ptr, length);
         const form = walk(known(node), path);
         const { HTMLFormElement } = root.ownerDocument.defaultView;
         if (!(form instanceof HTMLFormElement)) caller.trap(`dom: ${path} is not a form`);
-        const e = event();
-        const data = new FormData(form, e && e.submitter && e.submitter.form === form ? e.submitter : null);
+        const data = guarded(path, () => new FormData(form, submitter === -1 ? null : known(submitter)));
         const lines = (s) => s.replace(/\r\n|\r|\n/g, '\r\n');
         const query = new URLSearchParams();
         for (const [name, value] of data) {
