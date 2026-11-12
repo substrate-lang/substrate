@@ -161,6 +161,7 @@ error: trap: index 3 is out of range for length 3
 The standard library mostly holds modules useful for developing Substrate
 itself, which may evolve before 1.0. Its modules, by directory:
 
+- `std/string`: searching, trimming and building strings
 - `std/encoding`: Base64, JSON, UTF-8 and postcard wire messages
 - `std/crypto`: SHA-1, SHA-256, SHA-512, HMAC, HKDF and PBKDF2
 - `std/compress`: DEFLATE and gzip
