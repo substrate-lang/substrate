@@ -163,3 +163,18 @@ a small program's build.
 | json      |                 202 |                        |       180 |
 | crypto    |                 143 |                        |       195 |
 | compress  |                 156 |                        |       555 |
+
+## The compiler
+
+`bench/compiler/run.sh [N]` times the compiler compiling itself with no cache,
+the best and median of N runs (5 here), and gives the size of its Wasm: pruned,
+as builds write it, and stripped of names. bend2's `bench/compile/run.sh [N]
+[RUNS]` times checking and compiling a generated Bend module of N proofs (3200),
+from a cache that holds bend2's own modules.
+
+| Build                  | Best    | Median  |
+| ---------------------- | ------: | ------: |
+| The compiler           |  245 ms |  250 ms |
+| bend2, 3200 proofs     |  2.59 s |  2.59 s |
+
+The compiler is 606.9 KiB of Wasm in 21 modules, and 432.0 KiB stripped.

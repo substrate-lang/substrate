@@ -3,7 +3,7 @@
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
 (modernized with variants and bounds-checked slices), combined with
 Racket-style hygienic macros and module hooks for defining new languages and
-DSLs. Its compiler is self-hosted (~11k LOC, <600 KiB of Wasm), fast, and
+DSLs. Its compiler is self-hosted (~11k LOC, ~600 KiB of Wasm), fast, and
 runs in the browser. Substrate's dev tooling, package manager, and standard 
 library are also entirely written in Substrate.
 
