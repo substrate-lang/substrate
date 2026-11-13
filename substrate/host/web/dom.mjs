@@ -256,15 +256,202 @@ export function dom(root) {
       }
     }
     const first = content.firstChild;
-    if (!first || (first.nodeType === Node.COMMENT_NODE && first.data === 'a')) {
-      content.insertBefore(document.createTextNode(''), first);
-    }
+    const padded = !first || (first.nodeType === Node.COMMENT_NODE && first.data === 'a');
+    if (padded) content.insertBefore(document.createTextNode(''), first);
     const paths = marked.map((n) => {
       const path = [];
       for (; n !== content; n = n.parentNode) path.unshift(Array.prototype.indexOf.call(n.parentNode.childNodes, n));
       return path;
     });
-    return { content, paths };
+    const kinds = marked.map(kindOf);
+    return { content, paths, padded, kinds };
+  }
+
+  // ---- claiming ----
+
+  // A claim takes a piece that a server rendered (app-render in web-ui) where a copy of its template would go: the
+  // template's HTML between <!--[DIGEST--> and <!--]-->, each text between <!--t--> and <!---->, and the pieces put in it
+  // at their places. DIGEST names the template. The claim numbers the piece's marked nodes as the copy's would be, and
+  // makes the piece what the copy would be. A flush's claims are checked before any is made. When one does not match,
+  // the rendered pieces are taken out, and each claim adds a copy instead.
+
+  const isComment = (n, data) => n !== null && n.nodeType === Node.COMMENT_NODE && n.data === data;
+  const isOpen = (n) => n !== null && n.nodeType === Node.COMMENT_NODE && n.data[0] === '[';
+
+  // The digest of a template's HTML, as the view macro writes it in a piece's <!--[DIGEST--> (ui.sub in web-ui).
+  function digest(html) {
+    let h = 2166136261;
+    for (const b of utf8.encode(html)) h = Math.imul(h ^ b, 16777619) >>> 0;
+    return h.toString(16).padStart(8, '0');
+  }
+
+  // What a marked node is: an element's name, a text, or a place.
+  function kindOf(n) {
+    if (n.nodeType === Node.ELEMENT_NODE) return n.localName;
+    return n.nodeType === Node.TEXT_NODE || n.data === 't' ? '#text' : '#place';
+  }
+
+  // The <!--]--> that ends the piece that open starts, or null.
+  function closeOf(open) {
+    let depth = 0;
+    for (let n = open.nextSibling; n; n = n.nextSibling) {
+      if (isOpen(n)) depth++;
+      else if (isComment(n, ']') && depth-- === 0) return n;
+    }
+    return null;
+  }
+
+  // The <!--[DIGEST--> that starts the piece that close ends, or null.
+  function openOf(close) {
+    let depth = 0;
+    for (let n = close.previousSibling; n; n = n.previousSibling) {
+      if (isComment(n, ']')) depth++;
+      else if (isOpen(n) && depth-- === 0) return n;
+    }
+    return null;
+  }
+
+  class Mismatch extends Error {}
+
+  // The marked nodes from n to end, in document order, without those of the pieces put among them.
+  function marksIn(n, end, marks) {
+    while (n !== end) {
+      if (n === null) throw new Mismatch();
+      if (isOpen(n)) {
+        const close = closeOf(n);
+        if (close === null) throw new Mismatch();
+        n = close.nextSibling;
+        continue;
+      }
+      if (n.nodeType === Node.ELEMENT_NODE) {
+        if (n.hasAttribute('data-n')) marks.push(n);
+        marksIn(n.firstChild, null, marks);
+      } else if (isComment(n, 't') || isComment(n, 'a')) {
+        marks.push(n);
+      }
+      n = n.nextSibling;
+    }
+    return marks;
+  }
+
+  // plan checks a flush's claims, and gives each claim's piece, or null when a claim does not match or a rendered piece
+  // is left over.
+  function plan(w, string) {
+    const plans = [];
+    const planned = new Map();
+    const appended = new Map();
+    const roots = new Set();
+    const later = new Map();
+    const resolve = (id) => (planned.has(id) ? planned.get(id) : nodes.has(id) ? nodeOf(id) : null);
+    for (let i = 0; i < w.length; i += size(w, i)) {
+      if (w[i] === 18 && w[i + 5]) later.set(w[i + 5], (later.get(w[i + 5]) || 0) + 1);
+    }
+    try {
+      for (let i = 0; i < w.length; i += size(w, i)) {
+        if (w[i] === 1) templates.set(w[i + 1], { html: string(i + 2), parsed: [] });
+        if (w[i] !== 18) continue;
+        const before = w[i + 5] ? resolve(w[i + 5]) : null;
+        const into = w[i + 5] ? before && before.parentNode : resolve(w[i + 4]);
+        if (into === null) throw new Mismatch();
+        if (!planned.has(w[i + 5] || w[i + 4])) roots.add(into);
+        let open;
+        if (before) {
+          // The piece as many pieces back from the node as there are claims before it from this one on.
+          const back = later.get(w[i + 5]);
+          later.set(w[i + 5], back - 1);
+          open = before;
+          for (let k = 0; k < back; k++) {
+            open = isComment(open.previousSibling, ']') ? openOf(open.previousSibling) : null;
+            if (open === null) throw new Mismatch();
+          }
+        } else {
+          open = appended.has(into) ? appended.get(into) : into.firstChild;
+          while (open !== null && !isOpen(open)) open = open.nextSibling;
+        }
+        if (!isOpen(open) || open.parentNode !== into) throw new Mismatch();
+        const close = closeOf(open);
+        if (close === null) throw new Mismatch();
+        const svg = into.namespaceURI === SVG && into.localName !== 'foreignObject';
+        const held = templates.get(w[i + 1]);
+        if (open.data !== `[${(held.digest ||= digest(held.html))}`) throw new Mismatch();
+        const t = (held.parsed[svg ? 1 : 0] ||= template(held.html, svg));
+        const marks = marksIn(open.nextSibling, close, []);
+        if (marks.length !== t.kinds.length || marks.some((m, k) => kindOf(m) !== t.kinds[k])) throw new Mismatch();
+        planned.set(w[i + 2], open);
+        marks.forEach((m, k) => planned.set(w[i + 2] + 1 + k, m));
+        plans.push({ open, close, marks, t, first: w[i + 2] });
+        if (!before) appended.set(into, close.nextSibling);
+      }
+    } catch (e) {
+      if (!(e instanceof Mismatch)) throw e;
+      return null;
+    }
+    let rendered = 0;
+    for (const root of roots) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_COMMENT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) if (n.data[0] === '[') rendered++;
+    }
+    return rendered === plans.length ? plans : null;
+  }
+
+  function claiming(w) {
+    for (let i = 0; i < w.length; i += size(w, i)) if (w[i] === 18) return true;
+    return false;
+  }
+
+  // The number of words in the patch at i.
+  const sizes = [0, 4, 6, 3, 3, 4, 4, 6, 4, 5, 5, 0, 5, 3, 7, 0, 0, 5, 6];
+  function size(w, i) {
+    if (w[i] === 11) return 3 + w[i + 2];
+    if (w[i] === 15) return 5 + 3 * w[i + 4];
+    if (w[i] === 16) return 6 + 3 * w[i + 5];
+    if (!sizes[w[i]]) throw new Error(`dom.apply: no patch ${w[i]}`);
+    return sizes[w[i]];
+  }
+
+  // Makes the planned piece what a copy of its template would be, and numbers its nodes.
+  function claim({ open, close, marks, t, first }) {
+    const made = marks.map((m) => {
+      if (m.nodeType === Node.ELEMENT_NODE) {
+        m.removeAttribute('data-n');
+        return m;
+      }
+      if (m.data === 'a') return m;
+      let text = m.nextSibling;
+      if (text === null || text.nodeType !== Node.TEXT_NODE) {
+        text = document.createTextNode('');
+        m.after(text);
+      }
+      m.remove();
+      if (isComment(text.nextSibling, '')) text.nextSibling.remove();
+      return text;
+    });
+    if (t.padded) open.after(document.createTextNode(''));
+    nodes.set(first, new Piece(open.nextSibling, close.previousSibling));
+    made.forEach((n, k) => nodes.set(first + 1 + k, n));
+    open.remove();
+    close.remove();
+  }
+
+  // Takes out the rendered pieces where the flush's claims would go, for copies to take their places.
+  function unrendered(w) {
+    for (let i = 0; i < w.length; i += size(w, i)) {
+      if (w[i] !== 18 || !nodes.has(w[i + 5] || w[i + 4])) continue;
+      const into = w[i + 5] ? nodeOf(w[i + 5]).parentNode : nodeOf(w[i + 4]);
+      for (let n = into.firstChild; n; ) {
+        if (!isOpen(n)) {
+          n = n.nextSibling;
+          continue;
+        }
+        const close = closeOf(n);
+        const stop = close === null ? null : close.nextSibling;
+        while (n !== stop) {
+          const after = n.nextSibling;
+          n.remove();
+          n = after;
+        }
+      }
+    }
   }
 
   function place(what, parent, before) {
@@ -366,12 +553,28 @@ export function dom(root) {
       if (w[at] === 0) return float64(w[at + 1], w[at + 2]);
       return w[at] === 1 ? string(at + 1) : known(w[at + 1]);
     };
+    let plans = null;
+    let claimed = 0;
+    if (claiming(w)) {
+      plans = plan(w, string);
+      if (plans === null) {
+        console.warn('dom: the rendered page does not match the program, so the program draws the page again');
+        unrendered(w);
+      }
+    }
     for (let i = 0; i < w.length; ) {
       switch (w[i]) {
         case 1:
           templates.set(w[i + 1], { html: string(i + 2), parsed: [] });
           i += 4;
           break;
+        case 18:
+          if (plans !== null) {
+            claim(plans[claimed++]);
+            i += 6;
+            break;
+          }
+        // falls through: without the rendered piece, a claim adds a copy
         case 2: {
           const into = w[i + 5] ? nodeOf(w[i + 5]).parentNode : nodeOf(w[i + 4]);
           const svg = into !== null && into.namespaceURI === SVG && into.localName !== 'foreignObject';
