@@ -14,20 +14,20 @@ inline" is the C compiled with -fno-inline.
 
 | Program  | Substrate | C native | C Wasm | C Wasm, no inline | / native | / C Wasm | / no inline |
 | -------- | --------: | -------: | -----: | ----------------: | -------: | -------: | ----------: |
-| callback |       451 |       32 |     73 |               380 |    13.88 |     6.16 |        1.19 |
-| complex  |        81 |       17 |     32 |                74 |     4.65 |     2.56 |        1.09 |
-| errors   |       116 |        6 |     23 |                27 |    20.03 |     4.94 |        4.32 |
-| expr     |       132 |       84 |    124 |               124 |     1.56 |     1.06 |        1.06 |
-| fib      |       102 |       60 |     55 |                55 |     1.70 |     1.84 |        1.85 |
-| hash     |       392 |      258 |    306 |               426 |     1.52 |     1.28 |        0.92 |
-| matmul   |        70 |       16 |     48 |                48 |     4.51 |     1.47 |        1.47 |
-| nbody    |       213 |      162 |    186 |               187 |     1.32 |     1.14 |        1.14 |
-| sieve    |       333 |      289 |    330 |               334 |     1.15 |     1.01 |        1.00 |
-| sort     |       639 |      280 |    319 |               314 |     2.28 |     2.00 |        2.04 |
-| trees    |       128 |       66 |     94 |               105 |     1.94 |     1.35 |        1.22 |
-| vec      |       121 |       65 |     94 |               127 |     1.86 |     1.28 |        0.95 |
+| callback |       446 |       32 |     73 |               384 |    13.82 |     6.12 |        1.16 |
+| complex  |        81 |       17 |     32 |                73 |     4.66 |     2.51 |        1.10 |
+| errors   |       117 |        6 |     23 |                25 |    20.20 |     5.08 |        4.63 |
+| expr     |       131 |       86 |    124 |               124 |     1.52 |     1.06 |        1.06 |
+| fib      |       102 |       60 |     56 |                56 |     1.68 |     1.82 |        1.82 |
+| hash     |       393 |      265 |    314 |               440 |     1.48 |     1.25 |        0.89 |
+| matmul   |        71 |       16 |     48 |                49 |     4.57 |     1.48 |        1.47 |
+| nbody    |       214 |      162 |    188 |               187 |     1.32 |     1.14 |        1.14 |
+| sieve    |       336 |      300 |    339 |               341 |     1.12 |     0.99 |        0.99 |
+| sort     |       636 |      280 |    318 |               315 |     2.27 |     2.00 |        2.02 |
+| trees    |       130 |       66 |     94 |               104 |     1.96 |     1.38 |        1.24 |
+| vec      |       112 |       60 |     91 |               123 |     1.86 |     1.23 |        0.91 |
 
-The median ratio to C's Wasm is 1.41.
+The median ratio to C's Wasm is 1.43.
 
 - callback: a sum and a count over 10 million integers, through a closure. In
   C, the closure is a function pointer and a context, and clang inlines the
@@ -122,8 +122,8 @@ Deflate at level 6, file by file, in MB/s and bytes:
 
 ## Compile times
 
-With no cache, Substrate's compiler compiles itself, 11,180 lines, in 0.235 s,
-the median of 7 runs: about 47,600 lines a second. Its sources are
+With no cache, Substrate's compiler compiles itself, 11,493 lines, in 0.247 s,
+the median of 7 runs: about 46,500 lines a second. Its sources are
 substrate/compiler and substrate/host/fs.sub, counting lines that are neither
 blank nor only a comment. The command is the compile step of `make bootstrap`:
 
@@ -167,7 +167,7 @@ a small program's build.
 ## The compiler
 
 `bench/compiler/run.sh [N]` times the compiler as it compiles itself with no
-cache, and reports the best and the median of N runs, 5 here. It also gives the
+cache, and reports the best and the median of N runs, 7 here. It also gives the
 size of the compiler's Wasm, both as builds write it and with names stripped.
 bend2's `bench/compile/run.sh [N] [RUNS]` times checking and compiling a
 generated Bend module of N proofs, 3200 by default. Each of its runs starts from
@@ -175,7 +175,7 @@ a cache that holds bend2's own modules.
 
 | Build              |   Best | Median |
 | ------------------ | -----: | -----: |
-| Self-compile       | 245 ms | 250 ms |
+| Self-compile       | 244 ms | 247 ms |
 | bend2, 3200 proofs | 2.59 s | 2.59 s |
 
 The compiler is 606.9 KiB of Wasm in 21 modules. With names stripped, it is
