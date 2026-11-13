@@ -67,9 +67,9 @@ export function dom(root) {
   };
 
   const kinds = ['Node', 'Event', 'NodeList', 'HTMLCollection', 'NamedNodeMap', 'DOMRectReadOnly', 'DOMRectList',
-    'DOMTokenList', 'CSSStyleDeclaration', 'DOMStringMap', 'ValidityState', 'FileList', 'Blob', 'DataTransfer',
-    'DataTransferItemList', 'DataTransferItem', 'TouchList', 'Touch', 'IntersectionObserverEntry', 'Selection',
-    'AbstractRange', 'TimeRanges', 'MediaError', 'Array']
+    'DOMMatrixReadOnly', 'SVGMatrix', 'DOMTokenList', 'CSSStyleDeclaration', 'DOMStringMap', 'ValidityState',
+    'FileList', 'Blob', 'DataTransfer', 'DataTransferItemList', 'DataTransferItem', 'TouchList', 'Touch',
+    'IntersectionObserverEntry', 'Selection', 'AbstractRange', 'TimeRanges', 'MediaError', 'Array']
     .map((name) => globalThis[name]).filter((kind) => kind !== undefined);
   const reachable = (x) => kinds.some((kind) => x instanceof kind);
   const plain = (v) => v === null || v === undefined || ['number', 'string', 'boolean'].includes(typeof v);
