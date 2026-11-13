@@ -1,42 +1,44 @@
 ;; Manifests: a package's package.sub, or a program's first form:
 ;;   (package name (version "major.minor.patch") (substrate "major.minor.patch") (one-copy) (exports module ...)
 ;;     (dependencies (name (path "directory") (hash "sha256:hex")) (name (url "address") (hash "sha256:hex")) ...)
-;;     (tests "path" ... (browser))
+;;     (programs (name "program.sub") ...)
 ;;     (sites (name "program.sub" (html "file.html") (base "/path/") (files "/dir" (from "directory") "path" ...)
-;;            (mount "/path/" site) ...) ...))
+;;            (mount "/path/" site) ...) ...)
+;;     (tests "path" ...)
+;;     (dev-dependencies (chromium)))
 ;; The substrate clause gives the oldest substrate the package builds with. (substrate "0.10.0") also takes later 0.10
 ;; releases, and (substrate "1.2.0") takes later 1.x releases. (one-copy) is for a package that keeps state for the
 ;; whole program, and a program holds at most one copy of such a package (map.sub). Every clause but version is
 ;; optional, and so are a path dependency's hash and a site's html, base, files and mounts. A files part gives the
 ;; program the files matching its paths, from its from directory, under the directory it names; * matches any text in
 ;; a name and ** any directories. (from name) takes them from the directory that name stands for in a require: a
-;; dependency, std, compiler or host. (browser) says that the package's tests open browsers with std/test/browser.sub.
+;; dependency, std, compiler or host. Programs and sites have different names, and a program's first form declares no
+;; programs. (chromium) says that the package's tests open Chromium with std/test/browser.sub.
 (require-unqualified "read.sub")
 (require-unqualified host/fs)
 (require-unqualified "path.sub")
 (require-unqualified "../string.sub")
 
-(provide manifest dependency declared-site declared-mount site-files manifest-read manifest-of-program manifest-find
-         package-holding
+(provide manifest dependency declared-program declared-site declared-mount site-files manifest-read manifest-of-program
+         manifest-find package-holding
          package-name? full-hash? version-before? version-compatible?)
 
 (struct dependency [name string] [path string] [url string] [hash string] [line u32] [column u32])
+(struct declared-program [name string] [program string] [line u32] [column u32])
 (struct site-files [dir string] [from string] [root string] [patterns (slice string)])
 (struct declared-mount [path string] [site string])
 (struct declared-site [name string] [program string] [html string] [files (slice site-files)] [url-base string]
   [mounts (slice declared-mount)] [line u32] [column u32])
 (struct manifest [name string] [version string] [major u32] [substrate string] [one-copy bool] [exports (slice string)]
-                 [dependencies (slice dependency)] [tests (slice string)]
-                 [test-browser bool] [sites (slice declared-site)])
-
-(define default-tests (array string 1))
+                 [dependencies (slice dependency)] [programs (slice declared-program)] [sites (slice declared-site)]
+                 [tests (slice string)] [chromium bool])
 
 (define (manifest-read [a (ptr arena)] [file string] [m (ptr manifest)] [err (ptr buffer)]) -> bool
   (let* ([forms (slice data)] [e data-error]
          [ok (cond [(not (read-forms a file #f (& forms) (& e) err)) #f]
                    [(!= (-> e line) 0) (failed! err file (-> e line) (-> e column) (error-text (& (-> e error))))]
                    [(!= (-> forms length) 1) (failed! err file 1 1 "a package.sub holds one form, (package ...)")]
-                   [else (manifest-of file (& (@ forms 0)) a m err)])])
+                   [else (manifest-of file (& (@ forms 0)) #f a m err)])])
     (error-free! (& (-> e error)))
     ok))
 
@@ -52,7 +54,7 @@
     (cond [(!= (data-head a (cast string text)) "package") (begin)]
           [(not (data-read a (cast string text) #t (& forms) (& e)))
            (set! ok (failed! err file (-> e line) (-> e column) (error-text (& (-> e error)))))]
-          [(manifest-of file (& (@ forms 0)) a m err) (set! (@ found) #t)]
+          [(manifest-of file (& (@ forms 0)) #t a m err) (set! (@ found) #t)]
           [else (set! ok #f)])
     (error-free! (& (-> e error)))
     (free (-> text items))
@@ -175,16 +177,17 @@
     (+= (@ at) 1)
     n))
 
-(define (manifest-of [file string] [f (ptr data)] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
-  (let ([items (items-of f)] [versioned #f] [needed #f] [exported #f] [listed #f] [tested #f] [sited #f] [major i64 0])
+(define (manifest-of [file string] [f (ptr data)] [own bool] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
+  (let ([items (items-of f)] [versioned #f] [needed #f] [exported #f] [listed #f] [programmed #f] [sited #f] [tested #f]
+        [developed #f] [major i64 0])
     (set! (-> m substrate) "")
     (set! (-> m one-copy) #f)
     (set! (-> m exports) (slice (cast (ptr string) 0) 0))
     (set! (-> m dependencies) (slice (cast (ptr dependency) 0) 0))
-    (set! (@ default-tests 0) "tests/*.sub")
-    (set! (-> m tests) (slice default-tests 1))
-    (set! (-> m test-browser) #f)
+    (set! (-> m programs) (slice (cast (ptr declared-program) 0) 0))
     (set! (-> m sites) (slice (cast (ptr declared-site) 0) 0))
+    (set! (-> m tests) (slice (cast (ptr string) 0) 0))
+    (set! (-> m chromium) #f)
     (unless (and (>= (-> items length) 2) (== (symbol-of (& (@ items 0))) "package"))
       (return (failed-at! err file f "expected (package name (version \"major.minor.patch\") (dependencies ...))")))
     (set! (-> m name) (symbol-of (& (@ items 1))))
@@ -205,22 +208,38 @@
                  (return (failed-at! err file c "a substrate version is major.minor.patch, as (substrate \"0.9.0\")")))
                (set! needed #t)]
               [(and (list-of? c "one-copy" 1) (not (-> m one-copy))) (set! (-> m one-copy) #t)]
-              [(and (> (-> (items-of c) length) 0) (== (symbol-of (& (@ (items-of c) 0))) "exports") (not exported))
+              [(and (headed? c "exports") (not exported))
                (unless (exports-of file c a m err) (return #f))
                (set! exported #t)]
-              [(and (> (-> (items-of c) length) 0) (== (symbol-of (& (@ (items-of c) 0))) "dependencies") (not listed))
+              [(and (headed? c "dependencies") (not listed))
                (unless (dependencies-of file c a m err) (return #f))
                (set! listed #t)]
-              [(and (> (-> (items-of c) length) 0) (== (symbol-of (& (@ (items-of c) 0))) "tests") (not tested))
-               (unless (tests-of file c a m err) (return #f))
-               (set! tested #t)]
-              [(and (> (-> (items-of c) length) 0) (== (symbol-of (& (@ (items-of c) 0))) "sites") (not sited))
+              [(and (headed? c "programs") (not programmed))
+               (when own (return (failed-at! err file c "a program's first form declares no programs, since it is one")))
+               (unless (programs-of file c a m err) (return #f))
+               (set! programmed #t)]
+              [(and (headed? c "sites") (not sited))
                (unless (sites-of file c a m err) (return #f))
                (set! sited #t)]
+              [(and (headed? c "tests") (not tested))
+               (unless (tests-of file c a m err) (return #f))
+               (set! tested #t)]
+              [(and (headed? c "dev-dependencies") (not developed))
+               (unless (dev-dependencies-of file c m err) (return #f))
+               (set! developed #t)]
               [else
                (return (failed-at! err file c
-                                   "a package's clauses are (version ...), (substrate ...), (one-copy), (exports ...), (dependencies ...), (tests ...) and (sites ...), each at most once"))])))
-    (if versioned #t (failed-at! err file f "the package has no (version \"major.minor.patch\")"))))
+                                   "a package's clauses are (version ...), (substrate ...), (one-copy), (exports ...), (dependencies ...), (programs ...), (sites ...), (tests ...) and (dev-dependencies ...), each at most once"))])))
+    (unless versioned (return (failed-at! err file f "the package has no (version \"major.minor.patch\")")))
+    (for ([i u32 0]) (< i (-> m programs length)) (+= i 1)
+      (let ([p (& (@ (-> m programs) i))])
+        (for ([k u32 0]) (< k (-> m sites length)) (+= k 1)
+          (when (== (-> (@ (-> m sites) k) name) (-> p name))
+            (return (failed! err file (-> p line) (-> p column) "this program has the name of a site in the package"))))))
+    #t))
+
+(define (headed? [c (ptr data)] [head string]) -> bool
+  (and (> (-> (items-of c) length) 0) (== (symbol-of (& (@ (items-of c) 0))) head)))
 
 (define (exports-of [file string] [c (ptr data)] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
   (let* ([items (items-of c)] [n (- (-> items length) 1)] [es (new a string n)])
@@ -234,16 +253,39 @@
     (set! (-> m exports) es)
     #t))
 
+(define (programs-of [file string] [c (ptr data)] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
+  (let* ([items (items-of c)] [n (- (-> items length) 1)] [ps (new a declared-program n)])
+    (for ([i u32 0]) (< i n) (+= i 1)
+      (let* ([d (& (@ items (+ i 1)))] [parts (items-of d)] [p (& (@ ps i))])
+        (match d [(data-list l line column) (set! (-> p line) line) (set! (-> p column) column)] [_ (begin)])
+        (unless (and (== (-> parts length) 2) (package-name? (symbol-of (& (@ parts 0))))
+                     (string-of (& (@ parts 1)) (& (-> p program))) (module-name? (-> p program)))
+          (return (failed-at! err file d "a program is (name \"program.sub\"), with a path in the package")))
+        (set! (-> p name) (symbol-of (& (@ parts 0))))
+        (for ([k u32 0]) (< k i) (+= k 1)
+          (when (== (-> (@ ps k) name) (-> p name)) (return (failed-at! err file d "this program's name is given twice"))))))
+    (set! (-> m programs) ps)
+    #t))
+
 (define (tests-of [file string] [c (ptr data)] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
   (let* ([items (items-of c)] [n u32 0] [ts (new a string (-> items length))])
     (for ([i u32 1]) (< i (-> items length)) (+= i 1)
       (let ([d (& (@ items i))])
-        (cond [(and (list-of? d "browser" 1) (not (-> m test-browser))) (set! (-> m test-browser) #t)]
-              [(and (string-of d (& (@ ts n))) (module-name? (@ ts n)) (not (string-prefix? (@ ts n) "/"))) (+= n 1)]
+        (cond [(list-of? d "browser" 1)
+               (return (failed-at! err file d "(browser) is now (chromium) in the package's dev-dependencies"))]
+              [(and (string-of d (& (@ ts n))) (module-name? (@ ts n))) (+= n 1)]
               [else
-               (return (failed-at! err file d
-                                   "a test module is a path in the package, with * for any text, as \"tests/*.sub\", and (browser) comes at most once"))])))
-    (when (> n 0) (set! (-> m tests) (slice ts 0 n)))
+               (return (failed-at! err file d "a test module is a path in the package, with * for any text, as \"tests/*.sub\""))])))
+    (set! (-> m tests) (slice ts 0 n))
+    #t))
+
+(define (dev-dependencies-of [file string] [c (ptr data)] [m (ptr manifest)] [err (ptr buffer)]) -> bool
+  (let ([items (items-of c)])
+    (for ([i u32 1]) (< i (-> items length)) (+= i 1)
+      (let ([d (& (@ items i))])
+        (unless (and (list-of? d "chromium" 1) (not (-> m chromium)))
+          (return (failed-at! err file d "a dev dependency is (chromium), for tests that open a browser, given at most once")))
+        (set! (-> m chromium) #t)))
     #t))
 
 (define (sites-of [file string] [c (ptr data)] [a (ptr arena)] [m (ptr manifest)] [err (ptr buffer)]) -> bool

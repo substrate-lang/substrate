@@ -24,7 +24,7 @@ built=0
 unbuilt=0
 
 # The packages' tests, given every grant.
-packages=(./std ./cmd ./tests ./tests/web ./examples/hello)
+packages=(./std ./cmd ./tests ./tests/web ./examples/testing)
 if bin/substrate test -c "$cache" -A "$@" "${packages[@]}"; then
   pass=$((pass + 1))
 else
@@ -45,15 +45,17 @@ for p in "${packages[@]}"; do
     echo "FAIL $p: its test program, built again from the cache, differs"
   fi
 done
-# Each module of bench, substrate/host and tests/proxy builds, and so does each one-file package.
+# Each module of bench and substrate/host builds, and so do each one-file package and the proxy tests' server.
 one_file() { awk 'NF && !/^[[:space:]]*;/ { found = 1; code = !/^[[:space:]]*\(package([[:space:]]|$)/; exit } END { exit found ? code : 1 }' "$1"; }
-mapfile -t modules < <( (find bench substrate/host tests/proxy -name '*.sub' -not -name package.sub -not -path '*/build/*'
+mapfile -t modules < <( (find bench substrate/host -name '*.sub' -not -name package.sub -not -path '*/build/*'
                          find cmd std tests/web -name '*.sub' -not -name package.sub -not -path '*/build/*' \
                            -not -path '*/tests/*' | while read -r f; do if one_file "$f"; then echo "$f"; fi; done) | sort)
-for m in "${modules[@]}"; do
-  target=node
-  case "$m" in substrate/host/web/*) target=web ;; esac
-  actual="$(cd "$(dirname "$m")" && "$root/bin/substrate" build "$(basename "$m")" --host "$target" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
+for m in "${modules[@]}" proxy; do
+  if [ "$m" = proxy ]; then
+    actual="$(cd tests && "$root/bin/substrate" build proxy -c "$cache" 2>&1)"
+  else
+    actual="$(cd "$(dirname "$m")" && "$root/bin/substrate" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
+  fi
   if [ $? -eq 0 ]; then
     built=$((built + 1))
   else
@@ -69,15 +71,15 @@ for t in tests/events/*.sub; do
   [ -f "tests/events/$name.real" ] || continue
   if [ -z "$server" ]; then
     : > "$builds/servers.url"
-    (cd tests/events/fixtures && "$root/bin/substrate" build servers.sub -o "$root/$builds/events/servers" -c "$cache")
-    "$host" --grant net 127.0.0.1 --grant read "$root/tests/events/files" "$root/$builds/events/servers" \
+    (cd tests && "$root/bin/substrate" build servers -c "$cache")
+    "$host" --grant net 127.0.0.1 --grant read "$root/tests/events/files" "$root/tests/build/programs/servers" \
       "$root/tests/events/files" \
       > "$builds/servers.url" & server=$!
     for i in $(seq 50); do [ -s "$builds/servers.url" ] && break; sleep 0.1; done
     url="$(cat "$builds/servers.url")"
   fi
-  actual="$(cd tests/events && "$root/bin/substrate" build "$name.sub" -o "$root/$builds/events/$name" -c "$cache" 2>&1 \
-              && cd .. && timeout 60 "$host" --grant net 127.0.0.1 --grant read events "$root/$builds/events/$name" "$url" \
+  actual="$(cd tests && "$root/bin/substrate" build "$name" -c "$cache" 2>&1 \
+              && timeout 60 "$host" --grant net 127.0.0.1 --grant read events "$root/tests/build/programs/$name" "$url" \
                             "ws${url#http}" 2>&1)"
   code=$?
   if [ $code -eq 0 ] && [ "$actual" = "$(cat "tests/events/$name.out")" ]; then

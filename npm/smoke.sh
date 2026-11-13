@@ -17,12 +17,12 @@ check "substrate version" "substrate $version" "$(substrate version | cut -d' ' 
 check "sub version" "substrate $version" "$(sub version | cut -d' ' -f1-2)"
 mkdir -p "$tmp/hello/tests"
 cd "$tmp/hello"
-printf '(package hello (version "0.1.0"))\n' > package.sub
+printf '(package hello (version "0.1.0") (programs (hello "hello.sub")) (tests "tests/hello.sub"))\n' > package.sub
 printf '(require-unqualified std/encoding/base64)\n(provide greeting)\n(define (greeting) -> string "hi")\n(define (main) (let ([b (make-buffer)]) (base64-encode! (& b) (cast (slice u8) (greeting))) (printf "~a~n" (buffer-string (& b)))))\n' > hello.sub
 printf '(require-unqualified hello)\n(test greets (expect-equal (greeting) "hi"))\n' > tests/hello.sub
-check "substrate run" "aGk=" "$(substrate run hello.sub)"
-substrate build hello.sub -o out > /dev/null
-check "substrate run DIR" "aGk=" "$(substrate run out)"
+check "substrate run" "aGk=" "$(substrate run hello)"
+substrate build hello > /dev/null
+check "substrate run DIR" "aGk=" "$(substrate run build/programs/hello)"
 substrate map hello.sub > hello.map
 substrate compile hello.sub -m hello.map -o compiled
 check "substrate compile" "aGk=" "$(substrate run compiled)"
@@ -70,6 +70,6 @@ upgraded="$(substrate upgrade)"
 check "substrate upgrade" "substrate $next is installed in" "${upgraded% *}"
 check "the upgrade's toolchain" "yes" "$([ -f "$HOME/.substrate/toolchains/$next/build/sub/program" ] && echo yes || echo no)"
 check "the upgraded version" "substrate $next" "$(substrate version | cut -d' ' -f1-2)"
-check "substrate run, upgraded" "aGk=" "$(substrate run hello.sub)"
+check "substrate run, upgraded" "aGk=" "$(substrate run hello)"
 check "substrate upgrade, again" "substrate $next is the newest" "$(substrate upgrade)"
 echo "npm smoke: substrate-lang $version installs, works and upgrades to $next"

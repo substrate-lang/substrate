@@ -1,4 +1,4 @@
-// run.mjs OUT: Caddy, then nginx, over TLS with OUT/cert.pem, in front of a fresh server (OUT/server) each: the
+// run.mjs OUT SERVER: Caddy, then nginx, over TLS with OUT/cert.pem, in front of a fresh SERVER each: the
 // client's address and scheme despite its own X-Forwarded-For; events arriving apart, as they are and gzipped; a
 // WebSocket kept open by pings past nginx's read timeout; and a request answered as the server shuts down.
 import { spawn } from 'node:child_process';
@@ -10,7 +10,7 @@ import path from 'node:path';
 import tls from 'node:tls';
 import zlib from 'node:zlib';
 
-const [out] = process.argv.slice(2);
+const [out, server] = process.argv.slice(2);
 const here = path.dirname(new URL(import.meta.url).pathname);
 const root = path.resolve(here, '../..');
 const cert = fs.readFileSync(`${out}/cert.pem`);
@@ -27,7 +27,7 @@ const freePort = async () => {
 };
 
 const startServer = () => new Promise((resolve, reject) => {
-  const p = spawn(`${root}/host/subhost.mjs`, ['--grant', 'net', '127.0.0.1', `${out}/server`],
+  const p = spawn(`${root}/host/subhost.mjs`, ['--grant', 'net', '127.0.0.1', server],
     { stdio: ['ignore', 'pipe', 'inherit'] });
   let text = '';
   p.stdout.on('data', (d) => {

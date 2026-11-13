@@ -70,10 +70,14 @@ the network and environment variables, and `--allow-run` grants running
 programs. Each can be limited to a list after `=`, as in `-R=hello.sub`. `-A`
 grants everything.
 
-A program can also run in a browser. For example:
+A program can also run in a browser. Its first form says that it is a site:
 
 ```racket
 ;; page.sub: put a heading on the page with std/web
+(package page
+  (version "0.1.0")
+  (sites (page "page.sub")))
+
 (require-unqualified std/web/dom)
 
 (define (main)
@@ -81,11 +85,11 @@ A program can also run in a browser. For example:
   (dom-flush!))
 ```
 
-`substrate site` builds a site which `substrate serve` can serve locally:
+`substrate build` builds the site, and `substrate serve` can serve it locally:
 
 ```console
-$ substrate site page.sub -o build/page
-$ substrate serve build/page
+$ substrate build page.sub
+$ substrate serve build/sites/page
 http://127.0.0.1:8000/
 ```
 
@@ -212,7 +216,22 @@ substrate 0.11.2 has 2 tags
 ## Packages
 
 A package is a folder with a `package.sub`, or a program whose first form is
-its manifest. A dependency is the path of a folder, or the URL of a tar.gz
+its manifest. The manifest declares everything the package builds and runs:
+
+```racket
+(package desk
+  (version "0.1.0")
+  (programs (serve "serve.sub"))
+  (sites (desk "desk.sub" (html "index.html")))
+  (tests "tests/*.sub"))
+```
+
+In the package's folder, `substrate build` builds each program into
+`build/programs` and each site into `build/sites`. `substrate build desk` builds
+one of them, and `substrate run serve` runs a program. Files outside packages
+run by themselves, as `hello.sub` does above.
+
+A dependency is the path of a folder, or the URL of a tar.gz
 archive, pinned by a hash of its files. `substrate fetch` prints the dependency
 for a URL, with its hash:
 
@@ -421,16 +440,17 @@ gives SQLite a file layer written in Substrate.
 
 ## Testing
 
-`substrate test` runs a package's tests. [examples/hello](examples/hello) is a
-package:
+`substrate test` runs a package's tests. [examples/testing](examples/testing) is
+a package:
 
 ```racket
-(package hello
+(package testing
   (version "0.1.0")
-  (tests "tests/*.sub" (browser)))
+  (tests "tests/*.sub")
+  (dev-dependencies (chromium)))
 ```
 
-`(browser)` says that some of its tests open a browser. `tests/square.sub`
+`(chromium)` says that some of its tests open Chromium. `tests/square.sub`
 tests the function in `square.sub`:
 
 ```racket
@@ -457,9 +477,9 @@ tests the function in `square.sub`:
 
 ```console
 $ substrate test -v
-ok hello/tests/page.sub:3 page
-ok hello/tests/square.sub:3 square
-hello: 2 passed (0.2 s)
+ok testing/tests/page.sub:3 page
+ok testing/tests/square.sub:3 square
+testing: 2 passed (0.2 s)
 ```
 
 Browser tests need Chrome or Chromium. Without either, `substrate test` skips

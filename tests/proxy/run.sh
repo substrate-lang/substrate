@@ -8,5 +8,5 @@ mkdir -p "$out"
 
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 -subj "/CN=localhost" \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -keyout "$out/key.pem" -out "$out/cert.pem" 2> /dev/null
-(cd "$root/tests/proxy" && "$root/bin/substrate" build server.sub -o "$out/server" -c "$root/build/tests/cache" > /dev/null)
-node "$root/tests/proxy/run.mjs" "$out"
+(cd "$root/tests" && "$root/bin/substrate" build proxy -c "$root/build/tests/cache" > /dev/null)
+node "$root/tests/proxy/run.mjs" "$out" "$root/tests/build/programs/proxy"
