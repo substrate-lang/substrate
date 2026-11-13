@@ -402,7 +402,11 @@ export function createHost(platform) {
         if (!table) hostTrap('host.export_index: the caller exports no table');
         const exports = registry.get(string(ip, il));
         const f = exports && exports[string(fp, fl)];
-        return typeof f === 'function' ? table.grow(1, f) : -1;
+        if (typeof f !== 'function') return -1;
+        // WebKit cannot call a function that grow puts in a table
+        const at = table.grow(1);
+        table.set(at, f);
+        return at;
       },
       arg(i, out) {
         if (i < 0 || i >= platform.args.length) return 0;
