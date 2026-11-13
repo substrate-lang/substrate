@@ -52,13 +52,11 @@ self.onmessage = async (e) => {
     if (m.heard) side.limitOutput();
     const wasm = new Map(m.modules);
     const modules = { worker: side.worker, fs: fsModule(readOnly(memoryFiles(m.files, m.cwd, m.grants))) };
-    const absent = new Set();
     const fakes = await fakesOf(m);
     for (const name of m.names) {
       if (name in modules) continue;
       if (fakes.has(name)) modules[name] = fakes.get(name);
       else if (loaders[name]) modules[name] = await loaders[name](m.grants);
-      else absent.add(name);
     }
     const app = run({
       args: m.args ?? [m.argument],
@@ -68,7 +66,6 @@ self.onmessage = async (e) => {
       output: side.write,
       memoryPages: m.pages,
       modules,
-      absent,
       grants: m.grants,
       entry: m.entry,
       onEnd: side.ended,

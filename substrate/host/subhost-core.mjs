@@ -208,6 +208,7 @@ export function createHost(platform) {
 
   const COMPILE_TIME_HOST = new Set(['write', 'trap']);
   const refused = (what, where = 'while compiling') => () => hostTrap(`${what} is not available ${where}`);
+  const absentWhere = platform.worker ? 'in a worker' : platform.os === 'web' ? 'in the browser' : 'on Node';
 
   function hostTrap(message) {
     trapMessage = message;
@@ -485,13 +486,13 @@ export function createHost(platform) {
         if (!made.has('stream')) made.set('stream', streams.imports(callerOf(self, 'stream')));
         value = made.get('stream')[imp.name];
         if (compileTime && value) value = refused(`stream.${imp.name}`);
-      } else if (platform.absent && platform.absent.has(from)) {
-        value = refused(`${from}.${imp.name}`, 'in a worker');
       } else if (platform.modules && platform.modules.has(from)) {
         value = compileTime ? refused(`${from}.${imp.name}`) : later(self, made, from, imp.name);
-      } else {
+      } else if (registry.has(from) || programNames.includes(from)) {
         const exports = registry.get(from);
         value = exports && exports[imp.name];
+      } else {
+        value = compileTime ? refused(`${from}.${imp.name}`) : refused(`${from}.${imp.name}`, absentWhere);
       }
       if (value === undefined) {
         lastError = `instantiate ${name}: no import ${from}.${imp.name}`;

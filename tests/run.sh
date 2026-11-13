@@ -51,7 +51,9 @@ mapfile -t modules < <( (find bench substrate/host tests/proxy -name '*.sub' -no
                          find cmd std tests/web -name '*.sub' -not -name package.sub -not -path '*/build/*' \
                            -not -path '*/tests/*' | while read -r f; do if one_file "$f"; then echo "$f"; fi; done) | sort)
 for m in "${modules[@]}"; do
-  actual="$(cd "$(dirname "$m")" && "$root/bin/substrate" build "$(basename "$m")" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
+  target=node
+  case "$m" in substrate/host/web/*) target=web ;; esac
+  actual="$(cd "$(dirname "$m")" && "$root/bin/substrate" build "$(basename "$m")" --host "$target" -o "$root/$builds/modules/${m%.sub}" -c "$cache" 2>&1)"
   if [ $? -eq 0 ]; then
     built=$((built + 1))
   else

@@ -43,7 +43,7 @@ const read = (dir, p) => {
   return fs.readFileSync(file);
 };
 
-export function hostModules(setup, own = new Map()) {
+export function hostModules(setup, own = new Map(), lacking = new Set()) {
   const made = new Map(own);
   let fakes = null;
   const fake = (name) => {
@@ -51,11 +51,11 @@ export function hostModules(setup, own = new Map()) {
     return fakes.get(name);
   };
   return {
-    has: (name) => made.has(name) || Object.hasOwn(loaders, name),
+    has: (name) => !lacking.has(name) && (made.has(name) || Object.hasOwn(loaders, name)),
     get(name) {
       if (!made.has(name)) made.set(name, setup.fakes.has(name) ? fake(name) : loaders[name](setup));
       return made.get(name);
     },
-    keys: () => Object.keys(loaders),
+    keys: () => Object.keys(loaders).filter((name) => !lacking.has(name)),
   };
 }
