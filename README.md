@@ -1,4 +1,4 @@
-# substrate
+# <img src=".github/logo.png" alt="substrate" width="347">
 
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
 combined with Racket-style hygienic macros and module hooks for defining
