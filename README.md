@@ -1,11 +1,12 @@
 # substrate
 
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
-(modernized with variants and bounds-checked slices), combined with
-Racket-style hygienic macros and module hooks for defining new languages and
-DSLs. Its compiler is self-hosted (~11k LOC, ~600 KiB of Wasm), fast, and
-runs in the browser. Substrate's dev tooling, package manager, and standard 
-library are also entirely written in Substrate.
+combined with Racket-style hygienic macros and module hooks for defining
+new languages and DSLs. Its compiler is self-hosted (~11k LOC, ~600 KiB
+of Wasm), fast, and runs in the browser. Substrate's dev tooling, package
+manager, and standard library are also entirely written in Substrate.
+
+Try Substrate on [substrate-lang.com](https://substrate-lang.com).
 
 ## Install
 
@@ -39,9 +40,10 @@ Hello, world!
 ```
 
 Substrate code is sandboxed and cannot access your filesystem or network 
-without grants. `cat.sub` prints a file:
+without grants. For example:
 
 ```racket
+;; cat.sub: a program that prints a file
 (require-unqualified host/fs)
 
 (define (main)
@@ -68,10 +70,10 @@ the network and environment variables, and `--allow-run` grants running
 programs. Each can be limited to a list after `=`, as in `-R=hello.sub`. `-A`
 grants everything.
 
-A program can also run in a browser. For example, here `page.sub` puts a heading on 
-the page with `std/web`:
+A program can also run in a browser. For example:
 
 ```racket
+;; page.sub: put a heading on the page with std/web
 (require-unqualified std/web/dom)
 
 (define (main)
@@ -248,8 +250,8 @@ $ substrate run build/greeting
 ## Languages and Metaprogramming
 
 A macro is a function that runs at compile time and turns syntax into syntax.
-Macros are hygienic: the `tmp` that `swap!` introduces is not the caller's
-`tmp`. They are also sandboxed at compile time, which ensures compiler
+Macros are hygienic: the `tmp` that `swap!` introduces is different from the
+caller's `tmp`. They are also sandboxed at compile time, which ensures compiler
 determinism and system safety. [examples/swap.sub](examples/swap.sub):
 
 ```racket
@@ -418,13 +420,15 @@ them.
 
 ## Performance
 
-On realistic workloads, Substrate takes 0.35–1.4× the time of C compiled to
-Wasm with clang -O2, though its compiler is much faster: it compiles about
-47,000 lines a second, its own 11,000 in 0.24 s (without the cache), where clang
-compiles C to Wasm at 9,000–17,000 lines a second at -O2.
+Substrate compiles code at ~47k lines per second, and its programs run within
+about 1.4× of C compiled to Wasm. The compiler builds itself in about
+a quarter of a second.
 
-Substrate's libraries against C libraries, as Substrate's time over C's, on an
-AMD Ryzen 9 9950X with Node 24 on Linux:
+On realistic workloads, Substrate takes 0.35–1.4× the time of C compiled to
+Wasm with clang -O2. Some of this is due to different algorithms and allocation
+strategies, but these are common C libraries. Here we show Substrate's libraries
+against C libraries, as Substrate's time over C's, on an AMD Ryzen 9 9950X with Node
+24 on Linux:
 
 | Workload              | Against | Substrate / C |
 | --------------------- | ------- | ------------: |
@@ -432,9 +436,7 @@ AMD Ryzen 9 9950X with Node 24 on Linux:
 | SHA-256, HMAC, PBKDF2 | mbedTLS |     0.79–1.39 |
 | Deflate and inflate   | zlib    |     0.74–1.23 |
 
-On 12 small programs written the same way in both languages, Substrate's
-median is 1.4× C's time. [bench/bench.md](bench/bench.md) has every result and
-how to run the benchmarks.
+[bench/bench.md](bench/bench.md) has every result and how to run the benchmarks.
 
 ## Supported Platforms
 
