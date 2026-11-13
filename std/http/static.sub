@@ -11,6 +11,13 @@
 ;; a route, 301 when the path moved, and 404 when no route matches. The routes take the app's path without its final
 ;; slash as their base, so an app at /notes/ reads /notes/7/ as /7/. When neither a file nor an app answers, fallback
 ;; can answer the request and return #t. sub serve gives one (cmd/serve.sub).
+;;
+;; A page can have a render (http-page), which http-static! calls whenever it sends that page: as a file, as a
+;; directory's index.html, and as an app's page. The render gets the request, the page as built, and the path that the
+;; page answers at: the app's path, or else the directory of the request's path. It writes the page's HTML into a
+;; buffer, or writes nothing, and then the page goes out as built. It returns what reading the request's target
+;; returned, as an app's routes do. url-moved is a redirect to the target that it writes, url-bad is 400, and a page
+;; written for url-missing is 404.
 (require-unqualified host/fs)
 (require-unqualified "http.sub")
 (require-unqualified "server.sub")
@@ -19,10 +26,11 @@
 (require-unqualified "routable.sub")
 (require-unqualified "../string.sub")
 
-(provide http-files http-app http-static! http-send-file! http-hashed-cache)
+(provide http-files http-app http-page http-static! http-send-file! http-hashed-cache)
 
 (struct http-app [path string] [page string] [routes (fn ((ptr arena) string string (ptr buffer)) -> u32)])
-(struct http-files [root string] [cache (fn (string) -> string)] [apps (slice http-app)]
+(struct http-page [path string] [render (fn ((ptr http-request) (ptr buffer) string string (ptr buffer)) -> u32)])
+(struct http-files [root string] [cache (fn (string) -> string)] [apps (slice http-app)] [pages (slice http-page)]
                    [fallback (fn ((ptr http-request) (ptr http-files)) -> bool)])
 
 ;; Files up to this size are read and sent whole; larger ones are piped.
@@ -303,10 +311,53 @@
     (arena-free (& a))
     same))
 
+(define (page-of [files (ptr http-files)] [path string]) -> (ptr http-page)
+  (for ([i u32 0]) (< i (-> files pages length)) (+= i 1)
+    (let ([p (+ (-> files pages items) i)]) (when (== (-> p path) path) (return p))))
+  0)
+
+;; The directory of the request's path, as URLs write it, with its final slash.
+(define (directory-of [r (ptr http-request)]) -> string
+  (let ([path (url-path (-> r target))] [cut u32 0])
+    (for ([i u32 0]) (< i (-> path length)) (+= i 1) (when (== (@ path i) #\/) (set! cut (+ i 1))))
+    (slice path 0 cut)))
+
+;; rendered? answers r with the page at path, under the root, as its render writes it for mount, and returns whether it
+;; answered. It does not answer when the page has no render or the render writes nothing.
+(define (rendered? [r (ptr http-request)] [files (ptr http-files)] [path string] [mount string] [status i32]) -> bool
+  (let ([p (page-of files path)] [name (make-buffer)] [bytes (slice u8)] [out (make-buffer)] [to (make-buffer)]
+        [answered #f])
+    (unless (== p 0)
+      (rooted! (& name) files)
+      (buffer-add-byte! (& name) #\/)
+      (buffer-add-string! (& name) path)
+      (when (fs-read-file (buffer-string (& name)) (& bytes) 0)
+        (let ([read ((-> p render) r (& out) (cast string bytes) mount (& to))])
+          (set! answered #t)
+          (cond [(== read url-moved)
+                 (let ([location (make-buffer)])
+                   (buffer-add-string! (& location) (-> r base))
+                   (buffer-add-string! (& location) (buffer-string (& to)))
+                   (http-redirect! r 301 (buffer-string (& location)))
+                   (buffer-free! (& location)))]
+                [(== read url-bad) (http-answer-text! r 400 "bad request")]
+                [(> (-> out length) 0)
+                 (http-respond! r (if (== read url-missing) 404 status))
+                 (http-header! r "content-type" (content-type path))
+                 (http-header! r "cache-control" "no-cache")
+                 (http-send-text! r (buffer-string (& out)))]
+                [else (set! answered #f)]))
+        (free (-> bytes items))))
+    (buffer-free! (& name))
+    (buffer-free! (& out))
+    (buffer-free! (& to))
+    answered))
+
 (define (app! [r (ptr http-request)] [files (ptr http-files)] [app (ptr http-app)])
   (let* ([base (slice (-> app path) 0 (- (-> app path length) 1))] [to (make-buffer)] [location (make-buffer)]
          [checked ((-> app routes) (& (-> r arena)) (-> r target) base (& to))])
-    (cond [(== checked url-found) (http-send-file! r files (-> app page))]
+    (cond [(== checked url-found)
+           (unless (rendered? r files (-> app page) (-> app path) 200) (http-send-file! r files (-> app page)))]
           [(== checked url-moved)
            (buffer-add-string! (& location) (-> r base))
            (buffer-add-string! (& location) (buffer-string (& to)))
@@ -317,6 +368,7 @@
     (buffer-free! (& location))))
 
 (define (app-missing! [r (ptr http-request)] [files (ptr http-files)] [app (ptr http-app)])
+  (when (rendered? r files (-> app page) (-> app path) 404) (return))
   (let ([name (make-buffer)] [bytes (slice u8)])
     (rooted! (& name) files)
     (buffer-add-byte! (& name) #\/)
@@ -385,6 +437,7 @@
                                         [(and (!= f 0) (f r files)) (begin)]
                                         [else (not-found! r)]))]
                                [else
-                                (send! r files (buffer-string (& name)) (slice (buffer-string (& name)) (+ prefix 1))
-                                       (& info))])))])))))
+                                (let ([path (slice (buffer-string (& name)) (+ prefix 1))])
+                                  (unless (rendered? r files path (directory-of r) 200)
+                                    (send! r files (buffer-string (& name)) path (& info))))])))])))))
     (buffer-free! (& name))))
