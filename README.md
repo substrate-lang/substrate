@@ -1,4 +1,4 @@
-# substrate
+# <img src=".github/logo.png" alt="substrate" width="347">
 
 Substrate is a Lisp for writing WebAssembly. It has C-like semantics
 combined with Racket-style hygienic macros and module hooks for defining
@@ -468,14 +468,14 @@ them.
 ## Performance
 
 Substrate compiles code at ~47k lines per second, and its programs run within
-about 1.4× of C compiled to Wasm. The compiler builds itself in about
-a quarter of a second.
+about 1.4× of C compiled to Wasm on like-for-like benchmarks. The compiler
+builds itself in about a quarter of a second.
 
-On realistic workloads, Substrate takes 0.35–1.4× the time of C compiled to
-Wasm with clang -O2. Some of this is due to different algorithms and allocation
-strategies, but these are common C libraries. Here we show Substrate's libraries
-against C libraries, as Substrate's time over C's, on an AMD Ryzen 9 9950X with Node
-24 on Linux:
+On larger workloads that we tested, Substrate takes 0.35–1.4× the time of C
+compiled to Wasm with clang -O2. Some of this is due to different algorithms and
+allocation strategies, but in each case we modeled our code after a common C
+library as a reference. Here we show a comparison on an AMD Ryzen 9 9950X with
+Node 24 on Linux.
 
 | Workload              | Against | Substrate / C |
 | --------------------- | ------- | ------------: |
