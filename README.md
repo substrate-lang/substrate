@@ -372,6 +372,53 @@ need to manage memory manually (e.g.,
 [bend2](https://github.com/substrate-lang/substrate-bend2)) as they can
 implement their own runtimes.
 
+## Concurrency
+
+A program runs on one thread, with an event loop: timers, network requests,
+sockets and streams report back as events, which the program handles one at a
+time. For parallel work, a program starts workers. A worker runs one of the
+program's own functions on its own thread, and it shares only messages with the
+program. A worker can be given fewer grants than the program, and limits on its
+time and memory. The playground on substrate-lang.com runs programs on workers.
+[examples/workers.sub](examples/workers.sub):
+
+```racket
+(require worker host/worker)
+(require events host/events)
+
+(define (fib [n i32]) -> i32 (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+
+(define (work) (printf "fib 32 = ~a\n" (fib 32)))
+
+(define (finished [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
+  (when (== kind worker:worker-done) (worker:worker-stop id)))
+
+(define (main)
+  (events:event-handler! worker:worker-source finished)
+  (worker:worker-start work (cast (slice u8) "") 0 0 0 0)
+  (printf "main goes on while the worker works\n"))
+```
+
+```console
+$ substrate run workers.sub
+main goes on while the worker works
+fib 32 = 2178309
+```
+
+## Linking Wasm Libraries
+
+A Substrate program can link a library that another language compiled to a Wasm
+side module, as clang and Emscripten produce. The library and the program's
+Substrate code share one memory, so each can hand the other a pointer instead of
+a copy. The library cannot call the host. It can call only Substrate's `malloc`,
+`calloc`, `realloc` and `free`, and the Substrate functions that the program
+gives it with `supply`. So it reaches files and the network only through
+Substrate code, under the program's grants.
+[substrate-sqlite](https://github.com/substrate-lang/substrate-sqlite) links
+SQLite this way: [sqlite.sub](https://github.com/substrate-lang/substrate-sqlite/blob/main/sqlite.sub)
+is the binding, and [vfs.sub](https://github.com/substrate-lang/substrate-sqlite/blob/main/vfs.sub)
+gives SQLite a file layer written in Substrate.
+
 ## Testing
 
 `substrate test` runs a package's tests. [examples/hello](examples/hello) is a
