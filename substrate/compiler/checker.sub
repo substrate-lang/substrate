@@ -10,7 +10,7 @@
 
 (struct checking [phase i32] [counter i32] [throwers (ptr hash-table)]
         [strings (ptr hash-table)] [copies (ptr hash-table)] [layouts (ptr hash-table)] [types (ptr hash-table)]
-        [rethrown datum] [datum datum] [next (ptr checking)])
+        [instances (ptr hash-table)] [rethrown datum] [datum datum] [next (ptr checking)])
 
 (define state (ptr checking) 0)
 
@@ -30,12 +30,14 @@
 (define facts-of (fn (datum) -> datum) 0)
 (define datum-type-of (fn () -> datum) 0)
 (define syntax-function-of (fn (datum i32) -> datum) 0)
+(define instance-of (fn (datum datum) -> datum) 0)
 
 (define (set-expander! [meaning (fn (datum) -> datum)]
                        [inline-call (fn (datum datum) -> datum)] [inline-copy (fn (datum) -> datum)]
                        [head (fn (datum) -> datum)] [shape (fn (datum) -> datum)]
                        [apply (fn (datum datum) -> datum)] [template (fn (datum i32) -> datum)]
-                       [facts (fn (datum) -> datum)] [quoted (fn () -> datum)] [syntax-function (fn (datum i32) -> datum)])
+                       [facts (fn (datum) -> datum)] [quoted (fn () -> datum)] [syntax-function (fn (datum i32) -> datum)]
+                       [instance (fn (datum datum) -> datum)])
   (set! meaning-of meaning)
   (set! inline-call-of inline-call)
   (set! inline-copy-of inline-copy)
@@ -46,6 +48,7 @@
   (set! facts-of facts)
   (set! datum-type-of quoted)
   (set! syntax-function-of syntax-function)
+  (set! instance-of instance)
   (set-type-query! local-type-of))
 
 (define (expand-head [s datum]) -> datum (expand-head-of s))
@@ -115,6 +118,7 @@
       (set! (-> s copies) (make-table))
       (set! (-> s layouts) (make-table))
       (set! (-> s types) (make-table))
+      (set! (-> s instances) (make-table))
       (set! (-> s rethrown) nil)
       (set! (-> s datum) 0)
       (set! (-> s next) (cast (ptr checking) (@ states)))
@@ -249,7 +253,7 @@
          `(,(car t) ,(for/list ([u (cadr t)]) (shown-as u full))
            ,@(if (== (caddr t) 'void) nil `(-> ,(shown-as (caddr t) full))))]
         [(array-type? t) `(array ,(shown-as (cadr t) full) ,(caddr t))]
-        [(or (struct-type? t) (enum-type? t)) (if full (cadr t) (caddr t))]
+        [(or (struct-type? t) (enum-type? t)) (if full (cadr t) (type-label (caddr t)))]
         [(values-type? t) (cons 'values (for/list ([u (cdr t)]) (shown-as u full)))]
         [(== t 'none) 'void]
         [else (settled-type t)]))
@@ -279,6 +283,7 @@
     [('values t ...)
      (when (null? t) (substrate-error s "expected a type" nil))
      `(values ,@(for/list ([u t]) (scalar! (parse-type u) u)))]
+    [((? type-function? f) a ...) (named-type (instance f a s))]
     [_ (substrate-error s "expected a type" nil)]))
 
 (define (numbers-of [v datum]) -> datum (if (> (length v) 4) (list-ref v 4) 0))
@@ -298,6 +303,7 @@
                     [('substrate-struct n fs k (x ...))
                      `(substrate-struct ,(syntax-e n) ,fs ,(syntax-e k) ,(for/list ([y x]) (syntax-e y)))]
                     [('substrate-typedef t) `(substrate-typedef ,(syntax->datum t))]
+                    [('substrate-type-function d _ ...) `(substrate-type-function ,d)]
                     [_ 0])])
           (when (!= t 0) (hash-set! (-> state types) (cast u64 v) (cast u32 t)))
           t))))
@@ -306,6 +312,8 @@
   (let ([v (type-binding x)])
     (when (== v 0) (substrate-error x "~a is not a type" `(,(syntax-e x))))
     (cond [(== (car v) 'substrate-typedef) (cadr v)]
+          [(== (car v) 'substrate-type-function)
+           (substrate-error x "~a is a type function: give it types, as in (~a T)" `(,(syntax-e x) ,(syntax-e x)))]
           [(!= (numbers-of v) 0) `(enum ,(identifier-name x) ,(cadr v))]
           [else `(struct ,(identifier-name x) ,(cadr v))])))
 
@@ -313,8 +321,55 @@
   (syntax-match s
     [(? identifier? x) (or (memq (syntax-e x) '(i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 bool string)) (type-binding x))]
     [('slice t) (type-syntax? t)]
-    [((? identifier? h) a ...) (!= (memq (syntax-e h) '(ptr array fn closure)) 0)]
+    [((? identifier? h) a ...) (or (!= (memq (syntax-e h) '(ptr array fn closure)) 0) (type-function? h))]
     [_ #f]))
+
+;; ---- type functions ----
+
+(define (type-function? [f datum]) -> bool
+  (and (identifier? f) (let ([v (type-binding f)]) (and (!= v 0) (== (car v) 'substrate-type-function)))))
+
+;; A type function's instance: what its definer defines for these types, under a name that every module gives it.
+;; Errors in what the definer writes come from s, the instance's use.
+(define (instance [f datum] [args datum] [s datum]) -> datum
+  (let* ([ts (for/list ([a args]) (kept! (parse-type a) a))]
+         [name (string->symbol (format-message "~a" `(,(cons (identifier-name f) (for/list ([t ts]) (type-key t))))))]
+         [known (cast datum (hash-ref (-> state instances) (cast u64 name)))])
+    (if (!= known 0)
+        known
+        (let* ([id (syn name)]
+               [form (at s (syn `(,(cadr (type-binding f)) ,f ,id ,@(for/list ([t ts]) (type-form t)))))]
+               [found (instance-of name (syntax-property-set form 'use s))]
+               [made (if (!= found 0) found (syntax-local-introduce id))])
+          (hash-set! (-> state instances) (cast u64 name) (cast u32 made))
+          made))))
+
+(define (type-key [t datum]) -> datum
+  (cond [(or (struct-type? t) (enum-type? t)) (cadr t)]
+        [(pair? t) (for/list ([u t]) (type-key u))]
+        [else t]))
+
+(define (type-form [t datum]) -> datum
+  (cond [(or (struct-type? t) (enum-type? t)) (name-identifier (cadr t))]
+        [(or (fn-type? t) (closure-type? t))
+         (syn `(,(car t) ,(for/list ([u (cadr t)]) (type-form u)) ,@(if (== (caddr t) 'void) nil `(-> ,(type-form (caddr t))))))]
+        [(pair? t) (syn (for/list ([u t]) (type-form u)))]
+        [else (syn t)]))
+
+;; An instance's name without module paths, as in (vector point).
+(define (type-label [name datum]) -> datum
+  (let ([s (symbol->string name)] [b (make-buffer)] [start u32 0] [out datum name])
+    (when (== (@ s 0) #\()
+      (for ([i u32 0]) (< i (-> s length)) (+= i 1)
+        (let ([c (@ s i)])
+          (if (== c #\:)
+              (set! (-> b length) start)
+              (begin
+                (buffer-add-byte! (& b) c)
+                (when (or (== c #\() (== c #\space)) (set! start (-> b length)))))))
+      (set! out (string->symbol (buffer-string (& b))))
+      (buffer-free! (& b)))
+    out))
 
 (define (scalar! [t datum] [where datum]) -> datum
   (unless (or (arithmetic? t) (address-type? t) (== t 'exnref) (== t 'bool) (view-type? t) (enum-type? t))
@@ -2631,7 +2686,7 @@
 (define (printed-struct [r datum] [t datum] [a datum] [display bool]) -> datum
   (let ([d (fresh-key!)])
     `(let ((,d i32 ,(cdr r) d))
-       ,(seq `(,(text-printed (format "(~a" `(,(caddr t))))
+       ,(seq `(,(text-printed (format "(~a" `(,(type-label (caddr t)))))
                ,@(for/list ([f (caddr (layout t))])
                    (seq `(,(text-printed (format " #:~a " `(,(car f)))) ,(printed-field d f a display))))
                ,(text-printed '")"))))))
