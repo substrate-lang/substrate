@@ -81,11 +81,10 @@ A program can also run in a browser. For example:
   (dom-flush!))
 ```
 
-`substrate site` builds a site which `substrate serve` can serve locally:
+`substrate serve` builds it as a site and serves it locally:
 
 ```console
-$ substrate site page.sub -o build/page
-$ substrate serve build/page
+$ substrate serve page.sub
 http://127.0.0.1:8000/
 ```
 
@@ -193,7 +192,7 @@ macro gives a struct a JSON reader and writer:
 
 (define (main)
   (let ([a (make-arena)] [r release] [err json-error] [b (make-buffer)])
-    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.11.2\", \"tags\": [\"lisp\", \"wasm\"]}"
+    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.12.0\", \"tags\": [\"lisp\", \"wasm\"]}"
                            (& r) (& err))
         (begin
           (printf "~a ~a has ~a tags\n" (-> r name) (-> r version) (-> r tags length))
@@ -205,7 +204,7 @@ macro gives a struct a JSON reader and writer:
 
 ```console
 $ substrate run json.sub
-substrate 0.11.2 has 2 tags
+substrate 0.12.0 has 2 tags
 {"name":"substrate","version":"1.0.0","tags":["lisp","wasm"]}
 ```
 
@@ -421,16 +420,17 @@ gives SQLite a file layer written in Substrate.
 
 ## Testing
 
-`substrate test` runs a package's tests. [examples/hello](examples/hello) is a
-package:
+`substrate test` runs a package's tests. [examples/testing](examples/testing) is
+a package:
 
 ```racket
-(package hello
+(package testing
   (version "0.1.0")
-  (tests "tests/*.sub" (browser)))
+  (tests "tests/*.sub")
+  (dev-dependencies (chromium)))
 ```
 
-`(browser)` says that some of its tests open a browser. `tests/square.sub`
+`(chromium)` says that some of its tests open Chromium. `tests/square.sub`
 tests the function in `square.sub`:
 
 ```racket
@@ -457,9 +457,9 @@ tests the function in `square.sub`:
 
 ```console
 $ substrate test -v
-ok hello/tests/page.sub:3 page
-ok hello/tests/square.sub:3 square
-hello: 2 passed (0.2 s)
+ok testing/tests/page.sub:3 page
+ok testing/tests/square.sub:3 square
+testing: 2 passed (0.2 s)
 ```
 
 Browser tests need Chrome or Chromium. Without either, `substrate test` skips

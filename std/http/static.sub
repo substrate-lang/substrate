@@ -1,16 +1,16 @@
-;; Files: http-send-file! answers with a file under the root, as Flask's send_from_directory does, and http-static! with
-;; the file at the request's path, a directory's index.html, or a redirect adding a final slash. Answers carry
+;; Files: http-send-file! answers with a file under the root, as Flask's send_from_directory does. http-static! answers
+;; with the file at the request's path, a directory's index.html, or a redirect adding a final slash. Answers carry
 ;; Last-Modified and an ETag, are 304 or 412 as preconditions require, hold one range when asked, and have Cache-Control
 ;; no-cache unless cache gives another value for the path. When a file has a gzipped copy beside it, named name.gz, a
 ;; request that takes gzip gets the copy. A part that is . or .., or that starts with a dot other than .well-known, is
 ;; not found. An empty root is the current directory. http-hashed-cache caches a path for a year when one of its
-;; directories is named by 16 hex digits, as in the sites that substrate site --release writes. An app has a page that
-;; runs in the browser, a path, and the url-check of its routes (routable.sub). The path starts and ends with a slash
-;; and is written as URLs write it. The app keeps the part of the site under it. When a request's path names no file,
-;; http-static! answers with the app whose path is the longest that the request's path starts with. It answers 200 for
-;; a route, 301 when the path moved, and 404 when no route matches. The routes take the app's path without its final
-;; slash as their base, so an app at /notes/ reads /notes/7/ as /7/. When neither a file nor an app answers, fallback
-;; can answer the request and return #t. sub serve gives one (cmd/serve.sub).
+;; directories is named by 16 hex digits, as in the sites that substrate build writes. When the request's path names no
+;; file, fallback can answer the request and return #t. sub serve gives one (cmd/serve.sub).
+;;
+;; A page can have a render (http-page), which is called whenever the page is sent. The render gets the request and the
+;; page as built, and it writes the page's HTML into a buffer. When it writes nothing, the page goes out as built. It
+;; returns a code from routable.sub: url-found sends the page, url-moved redirects to the target that the render writes,
+;; url-bad answers 400, and url-missing answers 404.
 (require-unqualified host/fs)
 (require-unqualified "http.sub")
 (require-unqualified "server.sub")
@@ -19,10 +19,10 @@
 (require-unqualified "routable.sub")
 (require-unqualified "../string.sub")
 
-(provide http-files http-app http-static! http-send-file! http-hashed-cache)
+(provide http-files http-page http-static! http-send-file! http-hashed-cache)
 
-(struct http-app [path string] [page string] [routes (fn ((ptr arena) string string (ptr buffer)) -> u32)])
-(struct http-files [root string] [cache (fn (string) -> string)] [apps (slice http-app)]
+(struct http-page [path string] [render (fn ((ptr http-request) (ptr buffer) string (ptr buffer)) -> u32)])
+(struct http-files [root string] [cache (fn (string) -> string)] [pages (slice http-page)]
                    [fallback (fn ((ptr http-request) (ptr http-files)) -> bool)])
 
 ;; Files up to this size are read and sent whole; larger ones are piped.
@@ -281,50 +281,58 @@
 
 (define (not-found! [r (ptr http-request)]) (http-answer-text! r 404 "not found"))
 
-(define (app-of [files (ptr http-files)] [path string]) -> (ptr http-app)
-  (let ([found (ptr http-app) 0] [longest u32 0])
-    (for ([i u32 0]) (< i (-> files apps length)) (+= i 1)
-      (let* ([app (+ (-> files apps items) i)] [at (-> app path)])
-        (unless (and (> (-> at length) 0) (== (@ at 0) #\/) (== (@ at (- (-> at length) 1)) #\/))
-          (host-trap "http: an app path that does not start and end with a slash"))
-        (unless (clean-and-escaped? at) (host-trap "http: an app path that a URL would write differently"))
-        (when (and (>= (-> path length) (-> at length)) (== (slice path 0 (-> at length)) at)
-                   (>= (-> at length) longest))
-          (set! found app)
-          (set! longest (-> at length)))))
-    found))
+(define (page-of [files (ptr http-files)] [path string]) -> (ptr http-page)
+  (for ([i u32 0]) (< i (-> files pages length)) (+= i 1)
+    (let ([p (+ (-> files pages items) i)]) (when (== (-> p path) path) (return p))))
+  0)
 
-(define (clean-and-escaped? [path string]) -> bool
-  (let ([a (make-arena)] [segments (slice string)] [b (make-buffer)] [same #f])
-    (when (== (url-segments (& a) path (& segments)) 0)
-      (url-add-clean! (& b) segments)
-      (set! same (== (buffer-string (& b)) path)))
-    (buffer-free! (& b))
-    (arena-free (& a))
-    same))
-
-(define (app! [r (ptr http-request)] [files (ptr http-files)] [app (ptr http-app)])
-  (let* ([base (slice (-> app path) 0 (- (-> app path length) 1))] [to (make-buffer)] [location (make-buffer)]
-         [checked ((-> app routes) (& (-> r arena)) (-> r target) base (& to))])
-    (cond [(== checked url-found) (http-send-file! r files (-> app page))]
-          [(== checked url-moved)
-           (buffer-add-string! (& location) (-> r base))
-           (buffer-add-string! (& location) (buffer-string (& to)))
-           (http-redirect! r 301 (buffer-string (& location)))]
-          [(== checked url-missing) (app-missing! r files app)]
-          [else (http-answer-text! r 400 "bad request")])
-    (buffer-free! (& to))
+(define (redirected! [r (ptr http-request)] [to string])
+  (let ([location (make-buffer)])
+    (buffer-add-string! (& location) (-> r base))
+    (buffer-add-string! (& location) to)
+    (http-redirect! r 301 (buffer-string (& location)))
     (buffer-free! (& location))))
 
-(define (app-missing! [r (ptr http-request)] [files (ptr http-files)] [app (ptr http-app)])
+(define (rendered [r (ptr http-request)] [files (ptr http-files)] [path string] [answered (ptr bool)]) -> u32
+  (let ([p (page-of files path)] [name (make-buffer)] [bytes (slice u8)] [out (make-buffer)] [to (make-buffer)]
+        [read u32 url-found])
+    (set! (@ answered) #f)
+    (unless (== p 0)
+      (rooted! (& name) files)
+      (buffer-add-byte! (& name) #\/)
+      (buffer-add-string! (& name) path)
+      (when (fs-read-file (buffer-string (& name)) (& bytes) 0)
+        (set! read ((-> p render) r (& out) (cast string bytes) (& to)))
+        (set! (@ answered) #t)
+        (cond [(== read url-moved) (redirected! r (buffer-string (& to)))]
+              [(== read url-bad) (http-answer-text! r 400 "bad request")]
+              [(> (-> out length) 0)
+               (http-respond! r (if (== read url-missing) 404 200))
+               (http-header! r "content-type" (content-type path))
+               (http-header! r "cache-control" "no-cache")
+               (http-send-text! r (buffer-string (& out)))]
+              [else (set! (@ answered) #f)])
+        (free (-> bytes items))))
+    (buffer-free! (& name))
+    (buffer-free! (& out))
+    (buffer-free! (& to))
+    read))
+
+(define (sent! [r (ptr http-request)] [files (ptr http-files)] [name string] [path string] [info (ptr fs-info)])
+  (let* ([answered #f] [read (rendered r files path (& answered))])
+    (cond [answered (begin)]
+          [(== read url-missing) (page-missing! r files path)]
+          [else (send! r files name path info)])))
+
+(define (page-missing! [r (ptr http-request)] [files (ptr http-files)] [path string])
   (let ([name (make-buffer)] [bytes (slice u8)])
     (rooted! (& name) files)
     (buffer-add-byte! (& name) #\/)
-    (buffer-add-string! (& name) (-> app page))
+    (buffer-add-string! (& name) path)
     (if (fs-read-file (buffer-string (& name)) (& bytes) 0)
         (begin
           (http-respond! r 404)
-          (http-header! r "content-type" (content-type (-> app page)))
+          (http-header! r "content-type" (content-type path))
           (http-header! r "cache-control" "no-cache")
           (http-send! r bytes)
           (free (-> bytes items)))
@@ -358,7 +366,7 @@
             (begin
               (joined! (& name) (slice parts n))
               (if (and (fs-stat (buffer-string (& name)) (& info) 0) (== (-> info kind) fs-file))
-                  (send! r files (buffer-string (& name)) (slice (buffer-string (& name)) (+ prefix 1)) (& info))
+                  (sent! r files (buffer-string (& name)) (slice (buffer-string (& name)) (+ prefix 1)) (& info))
                   (not-found! r)))
             (not-found! r))))
     (buffer-free! (& name))))
@@ -380,11 +388,8 @@
                        (let ([found (fs-stat (buffer-string (& name)) (& info) 0)])
                          (cond [(and found (== (-> info kind) fs-directory) (not slash)) (moved! r)]
                                [(or (not found) (!= (-> info kind) fs-file))
-                                (let ([app (app-of files (url-path (-> r target)))] [f (-> files fallback)])
-                                  (cond [(!= app 0) (app! r files app)]
-                                        [(and (!= f 0) (f r files)) (begin)]
-                                        [else (not-found! r)]))]
+                                (let ([f (-> files fallback)]) (unless (and (!= f 0) (f r files)) (not-found! r)))]
                                [else
-                                (send! r files (buffer-string (& name)) (slice (buffer-string (& name)) (+ prefix 1))
+                                (sent! r files (buffer-string (& name)) (slice (buffer-string (& name)) (+ prefix 1))
                                        (& info))])))])))))
     (buffer-free! (& name))))

@@ -176,7 +176,6 @@ export function run(options, names, wasm) {
     delivered: options.delivered,
     active: options.active,
     modules,
-    absent: options.absent,
     grants,
     parseGrants: (list) => requestOf(pairsFrom(list), (p) => resolvePath(cwd, p)),
     memoryPages: options.memoryPages || 0,
