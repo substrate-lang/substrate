@@ -138,6 +138,12 @@ booleans, strings, slices and closures:
 Integers wrap around when they overflow (like Wasm) so the `u8` holding 255
 holds 0 after `(+= byte 1)`. Dividing an integer by zero traps.
 
+Every type has a zero value, whose bytes are all zero. It is 0 for numbers,
+`#f` for bools, null for pointers and functions, and empty for strings and
+slices. A struct or array holds the zero values of its parts. A binding or
+global without a value starts at zero, and so does `(new a T)`. The literal
+`0` can also stand for a null pointer or function, or an empty slice.
+
 Closures (`lambda`) can access the variables of enclosing functions.
 A closure can be passed to a call or kept in a local, but can't be returned 
 or stored in memory.
