@@ -146,15 +146,6 @@ export async function gpu(options = {}) {
           const node = theDom && theDom.nodeOf ? theDom.nodeOf(w[i + 2]) : null;
           if (!node) caller.trap(`gpu: surface ${id}: this module has no dom, or node ${w[i + 2]} is not in the document`);
           if (!(node instanceof HTMLCanvasElement)) caller.trap(`gpu: surface ${id}: node ${w[i + 2]} is not a canvas`);
-          if (options.offscreen) {
-            const texture = device.createTexture({
-              label: `surface ${id}`, size: [node.width, node.height, 1], format: canvasFormat,
-              usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-            });
-            surfaces.set(id, { canvas: node, texture });
-            i += 3;
-            break;
-          }
           const context = node.getContext('webgpu');
           if (!context) caller.trap(`gpu: surface ${id}: the canvas cannot be used by WebGPU (it may already be used by a 2D context)`);
           context.configure({ device, format: canvasFormat, alphaMode: 'premultiplied', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
@@ -351,7 +342,7 @@ export async function gpu(options = {}) {
           if (!table) caller.trap(`gpu: there is no resource kind ${kind}`);
           const r = table.get(id);
           if (r !== undefined) {
-            if (kind === 1) { if (r.context) r.context.unconfigure(); else r.texture.destroy(); }
+            if (kind === 1) r.context.unconfigure();
             else if (kind === 4) r.destroy();
             else if (kind === 5) r.texture.destroy();
             table.delete(id);
@@ -402,7 +393,7 @@ export async function gpu(options = {}) {
             let view;
             if (kind === 1) {
               const surface = get(1, id);
-              const texture = surface.context ? surface.context.getCurrentTexture() : surface.texture;
+              const texture = surface.context.getCurrentTexture();
               drawn.set(id, texture);
               view = texture.createView();
             } else if (kind === 2) {
