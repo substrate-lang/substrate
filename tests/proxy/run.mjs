@@ -27,7 +27,7 @@ const freePort = async () => {
 };
 
 const startServer = () => new Promise((resolve, reject) => {
-  const p = spawn(`${root}/host/subhost.mjs`, ['--grant', 'net', '127.0.0.1', server],
+  const p = spawn(`${root}/substrate/host/subhost.mjs`, ['--grant', 'net', '127.0.0.1', server],
     { stdio: ['ignore', 'pipe', 'inherit'] });
   let text = '';
   p.stdout.on('data', (d) => {
