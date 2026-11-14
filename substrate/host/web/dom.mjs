@@ -269,29 +269,26 @@ export function dom(root) {
 
   // ---- claiming ----
 
-  // A claim takes a piece that a server rendered (app-render in web-ui) where a copy of its template would go: the
-  // template's HTML between <!--[DIGEST--> and <!--]-->, each text between <!--t--> and <!---->, and the pieces put in it
-  // at their places. DIGEST names the template. The claim numbers the piece's marked nodes as the copy's would be, and
-  // makes the piece what the copy would be. A flush's claims are checked before any is made. When one does not match,
-  // the rendered pieces are taken out, and each claim adds a copy instead.
+  // A claim takes a piece that a server rendered (app-render in web-ui) where a copy of its template would go. The piece
+  // holds the template's HTML between <!--[DIGEST--> and <!--]-->, where DIGEST names the template. Each of its texts is
+  // between <!--t--> and <!---->. A flush's claims are all checked before any is made. When one does not match, the
+  // rendered pieces are taken out, and each claim adds a copy instead.
 
   const isComment = (n, data) => n !== null && n.nodeType === Node.COMMENT_NODE && n.data === data;
   const isOpen = (n) => n !== null && n.nodeType === Node.COMMENT_NODE && n.data[0] === '[';
 
-  // The digest of a template's HTML, as the view macro writes it in a piece's <!--[DIGEST--> (ui.sub in web-ui).
+  // The digest that the view macro in web-ui's ui.sub computes.
   function digest(html) {
     let h = 2166136261;
     for (const b of utf8.encode(html)) h = Math.imul(h ^ b, 16777619) >>> 0;
     return h.toString(16).padStart(8, '0');
   }
 
-  // What a marked node is: an element's name, a text, or a place.
   function kindOf(n) {
     if (n.nodeType === Node.ELEMENT_NODE) return n.localName;
     return n.nodeType === Node.TEXT_NODE || n.data === 't' ? '#text' : '#place';
   }
 
-  // The <!--]--> that ends the piece that open starts, or null.
   function closeOf(open) {
     let depth = 0;
     for (let n = open.nextSibling; n; n = n.nextSibling) {
@@ -301,7 +298,6 @@ export function dom(root) {
     return null;
   }
 
-  // The <!--[DIGEST--> that starts the piece that close ends, or null.
   function openOf(close) {
     let depth = 0;
     for (let n = close.previousSibling; n; n = n.previousSibling) {
@@ -313,7 +309,6 @@ export function dom(root) {
 
   class Mismatch extends Error {}
 
-  // The marked nodes from n to end, in document order, without those of the pieces put among them.
   function marksIn(n, end, marks) {
     while (n !== end) {
       if (n === null) throw new Mismatch();
@@ -334,8 +329,6 @@ export function dom(root) {
     return marks;
   }
 
-  // plan checks a flush's claims, and gives each claim's piece, or null when a claim does not match or a rendered piece
-  // is left over.
   function plan(w, string) {
     const plans = [];
     const planned = new Map();
@@ -356,7 +349,6 @@ export function dom(root) {
         if (!planned.has(w[i + 5] || w[i + 4])) roots.add(into);
         let open;
         if (before) {
-          // The piece as many pieces back from the node as there are claims before it from this one on.
           const back = later.get(w[i + 5]);
           later.set(w[i + 5], back - 1);
           open = before;
@@ -399,7 +391,6 @@ export function dom(root) {
     return false;
   }
 
-  // The number of words in the patch at i.
   const sizes = [0, 4, 6, 3, 3, 4, 4, 6, 4, 5, 5, 0, 5, 3, 7, 0, 0, 5, 6];
   function size(w, i) {
     if (w[i] === 11) return 3 + w[i + 2];
@@ -409,7 +400,6 @@ export function dom(root) {
     return sizes[w[i]];
   }
 
-  // Makes the planned piece what a copy of its template would be, and numbers its nodes.
   function claim({ open, close, marks, t, first }) {
     const made = marks.map((m) => {
       if (m.nodeType === Node.ELEMENT_NODE) {
@@ -433,7 +423,6 @@ export function dom(root) {
     close.remove();
   }
 
-  // Takes out the rendered pieces where the flush's claims would go, for copies to take their places.
   function unrendered(w) {
     for (let i = 0; i < w.length; i += size(w, i)) {
       if (w[i] !== 18 || !nodes.has(w[i + 5] || w[i + 4])) continue;
@@ -574,7 +563,7 @@ export function dom(root) {
             i += 6;
             break;
           }
-        // falls through: without the rendered piece, a claim adds a copy
+        // falls through
         case 2: {
           const into = w[i + 5] ? nodeOf(w[i + 5]).parentNode : nodeOf(w[i + 4]);
           const svg = into !== null && into.namespaceURI === SVG && into.localName !== 'foreignObject';
