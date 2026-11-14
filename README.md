@@ -216,22 +216,7 @@ substrate 0.11.2 has 2 tags
 ## Packages
 
 A package is a folder with a `package.sub`, or a program whose first form is
-its manifest. The manifest declares everything the package builds and runs:
-
-```racket
-(package desk
-  (version "0.1.0")
-  (programs (serve "serve.sub"))
-  (sites (desk "desk.sub" (html "index.html")))
-  (tests "tests/*.sub"))
-```
-
-In the package's folder, `substrate build` builds each program into
-`build/programs` and each site into `build/sites`. `substrate build desk` builds
-one of them, and `substrate run serve` runs a program. Files outside packages
-run by themselves, as `hello.sub` does above.
-
-A dependency is the path of a folder, or the URL of a tar.gz
+its manifest. A dependency is the path of a folder, or the URL of a tar.gz
 archive, pinned by a hash of its files. `substrate fetch` prints the dependency
 for a URL, with its hash:
 
