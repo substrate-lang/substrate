@@ -70,14 +70,10 @@ the network and environment variables, and `--allow-run` grants running
 programs. Each can be limited to a list after `=`, as in `-R=hello.sub`. `-A`
 grants everything.
 
-A program can also run in a browser. Its first form says that it is a site:
+A program can also run in a browser. For example:
 
 ```racket
 ;; page.sub: put a heading on the page with std/web
-(package page
-  (version "0.1.0")
-  (sites (page "page.sub")))
-
 (require-unqualified std/web/dom)
 
 (define (main)
@@ -85,11 +81,10 @@ A program can also run in a browser. Its first form says that it is a site:
   (dom-flush!))
 ```
 
-`substrate build` builds the site, and `substrate serve` can serve it locally:
+`substrate serve` builds it as a site and serves it locally:
 
 ```console
-$ substrate build page.sub
-$ substrate serve build/sites/page
+$ substrate serve page.sub
 http://127.0.0.1:8000/
 ```
 
