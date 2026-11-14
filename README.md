@@ -178,8 +178,9 @@ itself, which may evolve before 1.0. Its modules, by directory:
 - `std/web`: the page's DOM, canvas drawing and WebGPU
 - `std/html`: writing HTML
 - `std/log`: structured logs
-- `std/vector`: growable arrays
-- `std/meta`: types as data at compile time
+- `std/vector`: growable arrays, `(vector T)`
+- `std/hash-map`: hash maps, `(hash-map K V)`
+- `std/meta`: types as data at compile time, and type functions
 - `std/test`: the test runner, and tests in a browser
 - `std/browser`: Chromium, driven over the DevTools protocol
 - `std/package`: manifests, package hashes and the package store
@@ -276,6 +277,36 @@ determinism and system safety. [examples/swap.sub](examples/swap.sub):
 ```console
 $ substrate run swap.sub
 2 1
+```
+
+Types can come from compile-time functions too. `define-type`, from
+`std/meta/type`, makes a type function: `(pair A B)` below is a type wherever a
+type can be written, and two modules that write `(pair string u32)` get the same
+type. The standard library's `(vector T)` and `(hash-map K V)` are type
+functions. [examples/types.sub](examples/types.sub):
+
+```racket
+(require-unqualified std/meta/type)
+(require-unqualified std/vector)
+
+;; A type function: (pair A B) is a struct of an A and a B
+(define-type (pair A B)
+  (struct [first A] [second B]))
+
+(typedef entry (pair string u32))
+
+(define (main)
+  (let ([v (vector entry)])
+    (vector-push! (& v) (entry #:first "apples" #:second 3))
+    (vector-push! (& v) (entry #:first "pears" #:second 5))
+    (vector-each ([e (& v)]) (printf "~a: ~a\n" (-> e first) (-> e second)))
+    (vector-free! (& v))))
+```
+
+```console
+$ substrate run types.sub
+apples: 3
+pears: 5
 ```
 
 Languages are packages too. [examples/bend2/proof.sub](examples/bend2/proof.sub)
