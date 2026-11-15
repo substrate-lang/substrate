@@ -138,17 +138,19 @@ booleans, strings, slices and closures:
 Integers wrap around when they overflow (like Wasm) so the `u8` holding 255
 holds 0 after `(+= byte 1)`. Dividing an integer by zero traps.
 
-A variant's cases belong to its type, as a struct's fields do, and so do an
-enum's. Code writes a case with a dot, and the case gets its type from the
-code around it, as a number literal does: `(area (.square 3))` makes a
-`shape`, since `area` takes one. Where nothing gives a type, the code names
-it, as in `(shape .square 3)`. `printf` prints the case that way too.
+A variant's cases belong to its type, as a struct's fields do. An enum's cases
+belong to its type too. Code writes a case with a dot, as in `.square`. The case
+gets its type from the code around it, as a number literal does.
+`(area (.square 3))` makes a `shape`, because `area` takes a `shape`. Where
+nothing gives the case a type, the code names the type, as in
+`(shape .square 3)`. `printf` prints cases the same way.
 
-Every type has a zero value, whose bytes are all zero. It is 0 for numbers,
-`#f` for bools, null for pointers and functions, and empty for strings and
-slices. A struct or array holds the zero values of its parts. A binding or
-global without a value starts at zero, and so does `(new a T)`. The literal
-`0` can also stand for a null pointer or function, or an empty slice.
+Every type has a zero value, and its bytes are all zero. The zero value is 0
+for numbers, `#f` for bools, null for pointers and functions, and empty for
+strings and slices. A struct or array holds the zero values of its parts. A
+binding or global without a value starts at zero. `(new a T)` makes a zero
+value as well. The literal `0` can also stand for a null pointer or function,
+or for an empty slice.
 
 Closures (`lambda`) can access the variables of enclosing functions.
 A closure can be passed to a call or kept in a local, but can't be returned 
@@ -284,17 +286,16 @@ $ substrate run swap.sub
 2 1
 ```
 
-Types can come from compile-time functions too. `define-type`, from
-`std/meta/type`, makes a type function: `(pair A B)` below is a type wherever a
-type can be written, and two modules that write `(pair string u32)` get the same
-type. The standard library's `(vector T)` is a type function.
-[examples/types.sub](examples/types.sub):
+Types can also come from functions that run at compile time. `define-type`,
+from `std/meta/type`, makes a type function. In the example below, `(pair A B)`
+is a type wherever a type can be written. Two modules that write
+`(pair string u32)` get the same type. The standard library's `(vector T)` is a
+type function too. [examples/types.sub](examples/types.sub):
 
 ```racket
 (require-unqualified std/meta/type)
 (require-unqualified std/vector)
 
-;; A type function: (pair A B) is a struct of an A and a B
 (define-type (pair A B)
   (struct [first A] [second B]))
 
@@ -315,12 +316,12 @@ pears: 5
 ```
 
 A type function's parameter can also be a count, written like a function's
-parameter: after `(define-type (ring T [N u32]) ...)`, `(ring i32 8)` is a type,
-and so is `(ring i32 size)` for a constant `size`. `define-generic` makes generic
-functions the same way. After
+parameter. After `(define-type (ring T [N u32]) ...)`, `(ring i32 8)` is a type.
+`(ring i32 size)` is also a type when `size` is a constant. `define-generic`
+makes generic functions in the same way. After
 `(define-generic ((largest T) [xs (slice T)]) -> T ...)`, the call
-`((largest i32) xs)` runs the `largest` made for `i32`. A macro can read a type's
-fields, cases, size and field offsets with `std/meta/type-info`.
+`((largest i32) xs)` runs the `largest` made for `i32`. A macro can read a
+type's fields, cases, size and field offsets with `std/meta/type-info`.
 
 Languages are packages too. [examples/bend2/proof.sub](examples/bend2/proof.sub)
 is written in bend2, a port of [Bend 2](https://github.com/bendlang/bend) whose
