@@ -233,10 +233,15 @@
 ;; A literal's type before it settles: lit, flit, blit (#t and #f) and slit (a string).
 (define (literal-type? [t datum]) -> bool (!= (memq t '(lit flit blit slit)) 0))
 
+;; The type of a case written with a dot until the code around it gives one: (case s env).
+(define (case-literal? [t datum]) -> bool (and (pair? t) (== (car t) 'case)))
+
 (define (promoted [t datum]) -> datum (if (memq t '(i8 u8 i16 u16)) 'i32 t))
 
 (define (settled-type [t datum]) -> datum
-  (case t [('lit) 'i32] [('flit) 'f64] [('blit) 'bool] [('slit) 'string] [else t]))
+  (if (case-literal? t)
+      (car (case-value (cadr t) (caddr t) 0))
+      (case t [('lit) 'i32] [('flit) 'f64] [('blit) 'bool] [('slit) 'string] [else t])))
 
 (define (wasm-type [t datum]) -> datum
   (cond [(or (memq t '(i64 u64)) (closure-type? t) (view-type? t)) 'i64]
@@ -1759,10 +1764,13 @@
 ;; ---- cases ----
 
 (define (check-case [s datum] [env datum] [hint datum]) -> datum
-  (let* ([p (case-production s hint)] [i (caddr p)] [n (cadddr p)] [args (list-ref p 4)])
-    (if (enum-type? hint)
-        (begin (case-fields s hint (syntax-e i) n args) (cons hint (enum-constant hint (syntax-e i))))
-        (cons hint (construct s hint i n args env (temp hint))))))
+  (if (or (variant-type? hint) (enum-type? hint)) (case-value s env hint) (cons `(case ,s ,env) 0)))
+
+(define (case-value [s datum] [env datum] [t datum]) -> datum
+  (let* ([p (case-production s t)] [i (caddr p)] [n (cadddr p)] [args (list-ref p 4)])
+    (if (enum-type? t)
+        (begin (case-fields s t (syntax-e i) n args) (cons t (enum-constant t (syntax-e i))))
+        (cons t (construct s t i n args env (temp t))))))
 
 ;; A case written .name or (.name arg ...), of the variant or enum t that the code expects where it is.
 (define (case-production [s datum] [t datum]) -> datum
@@ -1955,12 +1963,11 @@
           (unless (== (length x) (length fields))
             (substrate-error c "~a has ~a field~a, not ~a"
                              `(,(dotted-case t i) ,(fixnum (length fields)) ,(plural (length fields)) ,(fixnum (length x)))))
-          (settle (check-sequence c body
-                                  (append (for/list ([y x] [f fields] #:when (== (car y) 'binder))
-                                            `(,(cadddr y) ,(cadr f) alias (,(cadr f) memory ,(lref a) ,(fixnum (+ (fixnum-value o) (fixnum-value (caddr f)))))))
-                                          env)
-                                  hint)
-                  hint c)))))
+          (check-sequence c body
+                          (append (for/list ([y x] [f fields] #:when (== (car y) 'binder))
+                                    `(,(cadddr y) ,(cadr f) alias (,(cadr f) memory ,(lref a) ,(fixnum (+ (fixnum-value o) (fixnum-value (caddr f)))))))
+                                  env)
+                          hint)))))
 
 (define (joined [xs datum]) -> datum
   (if (null? xs)
@@ -2199,10 +2206,11 @@
     (if (== t (car r)) r (cons (promoted t) (convert r t where #f)))))
 
 (define (settled-for [t datum] [hint datum]) -> datum
-  (if (and (!= hint 0) (!= hint 'void) (literal-type? t)) hint (settled-type t)))
+  (if (and (!= hint 0) (!= hint 'void) (or (literal-type? t) (case-literal? t))) hint (settled-type t)))
 
 (define (as-void [r datum]) -> datum
   (cond [(memq (car r) '(void none)) (cdr r)]
+        [(case-literal? (car r)) (cdr (case-value (cadr (car r)) (caddr (car r)) 'void))]
         [(literal-type? (car r)) '(nop)]
         [(values-type? (car r)) (substrate-error (cdr r) "these ~a values are not used: bind them with let" `(,(fixnum (length (cdr (car r))))))]
         [else `(drop ,(cdr r))]))
@@ -2213,6 +2221,8 @@
   (cond [(== a 'none) b]
         [(== b 'none) a]
         [(or (== a 'void) (== b 'void)) 'void]
+        [(case-literal? a) (if (or (variant-type? b) (enum-type? b) (case-literal? b)) b 'void)]
+        [(case-literal? b) (join b a)]
         [(equal? a b) a]
         [(== a 'slit) (if (or (== b 'string) (pointer? b)) b (join (settled-type a) b))]
         [(== b 'slit) (join b a)]
@@ -2267,6 +2277,7 @@
 (define (convert [r datum] [t datum] [where datum] [stored bool]) -> datum
   (let ([from (car r)] [c (cdr r)] [normalize (not stored)])
     (cond [(== from 'none) c]
+          [(case-literal? from) (cdr (case-value (cadr from) (caddr from) t))]
           [(== from 'void) (substrate-error where "this has no value, but ~s is expected" `(,(shown t)))]
           [(== from 'lit) (constant c t where)]
           [(== from 'flit) (if (float-type? t) (const-code (wasm-type t) c) (convert (cons 'f64 (const-code 'f64 c)) t where stored))]
@@ -2375,9 +2386,7 @@
 ;; ---- operators ----
 
 (define (check-op [e datum] [o datum] [args datum] [env datum]) -> datum
-  (let* ([known (for/list ([a args]) (if (case-form? a) 0 (check a env 0)))]
-         [hint (let ([h datum 0]) (for/each ([r known]) (when (and (== h 0) (!= r 0)) (set! h (car r)))) h)]
-         [rs (for/list ([a args] [r known]) (if (== r 0) (check a env hint) r))] [n (length args)])
+  (let ([rs (for/list ([a args]) (check a env 0))] [n (length args)])
     (case o
       [('+ '* 'bit-and 'bit-or 'bit-xor)
        (arity! e o (>= n 2) '"two or more arguments")
@@ -2397,7 +2406,7 @@
 (define (arity! [e datum] [o datum] [ok bool] [what datum]) (unless ok (substrate-error e "~a takes ~a" `(,o ,what))))
 
 (define (binary [e datum] [o datum] [x datum] [y datum]) -> datum
-  (let* ([a (numbered x)] [b (numbered y)] [ta (car a)] [tb (car b)] [comparing (memq o '(== != < <= > >=))])
+  (let* ([a (numbered (cased x y))] [b (numbered (cased y x))] [ta (car a)] [tb (car b)] [comparing (memq o '(== != < <= > >=))])
     (cond [(and comparing (or (memq ta '(string slit)) (memq tb '(string slit))))
            (cond [(and (memq ta '(string slit)) (memq tb '(string slit)))
                   (string-comparison o (convert a 'string e #f) (convert b 'string e #f))]
@@ -2429,6 +2438,9 @@
           [else (substrate-error e "~a takes numbers, not ~s and ~s" `(,o ,(shown ta) ,(shown tb)))])))
 
 (define (numbered [r datum]) -> datum (cons (as-number (car r)) (cdr r)))
+
+;; r, with a case written with a dot given the type of the other side, o.
+(define (cased [r datum] [o datum]) -> datum (if (case-literal? (car r)) (case-value (cadr (car r)) (caddr (car r)) (car o)) r))
 
 ;; Strings compare by bytes: string-same? and string-order are in substrate.sub.
 (define (string-comparison [o datum] [a datum] [b datum]) -> datum
