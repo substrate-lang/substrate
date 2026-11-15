@@ -102,8 +102,8 @@ booleans, strings, slices and closures:
 
 (define (area [s shape]) -> i32
   (match s
-    [(square side) (* side side)]
-    [(rect w h) (* w h)]))
+    [(.square side) (* side side)]
+    [(.rect w h) (* w h)]))
 
 (define (largest [items (slice i32)]) -> i32
   (let ([best (@ items 0)])
@@ -120,7 +120,7 @@ booleans, strings, slices and closures:
 (define (main)
   (let ([p (point #:x 3 #:y 4)])
     (printf "point: ~a, ~a\n" (-> p x) (-> p y)))
-  (printf "areas: ~a, ~a\n" (area (square 3)) (area (rect 6 7)))
+  (printf "areas: ~a, ~a\n" (area (.square 3)) (area (.rect 6 7)))
   (let ([ok bool #t] [half f32 0.5] [third f64 (/ 1.0 3.0)] [byte u8 255])
     (+= byte 1)
     (printf "bool: ~a, f32: ~a, f64: ~a, u8 255 + 1: ~a\n" ok half third byte))
@@ -137,6 +137,12 @@ booleans, strings, slices and closures:
 
 Integers wrap around when they overflow (like Wasm) so the `u8` holding 255
 holds 0 after `(+= byte 1)`. Dividing an integer by zero traps.
+
+A variant's cases belong to its type, as a struct's fields do, and so do an
+enum's. Code writes a case with a dot, and the case comes from the type that
+the code expects there: `(area (.square 3))` makes a `shape`, since `area`
+takes one. Where no type is expected, the code names it, as in
+`(shape .square 3)`.
 
 Every type has a zero value, whose bytes are all zero. It is 0 for numbers,
 `#f` for bools, null for pointers and functions, and empty for strings and
