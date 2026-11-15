@@ -185,7 +185,7 @@ itself, which may evolve before 1.0. Its modules, by directory:
 - `std/html`: writing HTML
 - `std/log`: structured logs
 - `std/vector`: growable arrays, `(vector T)`
-- `std/meta`: types as data at compile time, and type functions
+- `std/meta`: types as data at compile time, type functions and generic functions
 - `std/test`: the test runner, and tests in a browser
 - `std/browser`: Chromium, driven over the DevTools protocol
 - `std/package`: manifests, package hashes and the package store
@@ -313,6 +313,14 @@ $ substrate run types.sub
 apples: 3
 pears: 5
 ```
+
+A type function's parameter can also be a count, written like a function's
+parameter: after `(define-type (ring T [N u32]) ...)`, `(ring i32 8)` is a type,
+and so is `(ring i32 size)` for a constant `size`. `define-generic` makes generic
+functions the same way. After
+`(define-generic ((largest T) [xs (slice T)]) -> T ...)`, the call
+`((largest i32) xs)` runs the `largest` made for `i32`. A macro can read a type's
+fields, cases, size and field offsets with `std/meta/type-info`.
 
 Languages are packages too. [examples/bend2/proof.sub](examples/bend2/proof.sub)
 is written in bend2, a port of [Bend 2](https://github.com/bendlang/bend) whose
