@@ -142,7 +142,7 @@ A variant's cases belong to its type, as a struct's fields do, and so do an
 enum's. Code writes a case with a dot, and the case comes from the type that
 the code expects there: `(area (.square 3))` makes a `shape`, since `area`
 takes one. Where no type is expected, the code names it, as in
-`(shape .square 3)`.
+`(shape .square 3)`. `printf` prints the case that way too.
 
 Every type has a zero value, whose bytes are all zero. It is 0 for numbers,
 `#f` for bools, null for pointers and functions, and empty for strings and
