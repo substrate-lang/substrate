@@ -179,7 +179,6 @@ itself, which may evolve before 1.0. Its modules, by directory:
 - `std/html`: writing HTML
 - `std/log`: structured logs
 - `std/vector`: growable arrays, `(vector T)`
-- `std/hash-map`: hash maps, `(hash-map K V)`
 - `std/meta`: types as data at compile time, and type functions
 - `std/test`: the test runner, and tests in a browser
 - `std/browser`: Chromium, driven over the DevTools protocol
@@ -282,8 +281,8 @@ $ substrate run swap.sub
 Types can come from compile-time functions too. `define-type`, from
 `std/meta/type`, makes a type function: `(pair A B)` below is a type wherever a
 type can be written, and two modules that write `(pair string u32)` get the same
-type. The standard library's `(vector T)` and `(hash-map K V)` are type
-functions. [examples/types.sub](examples/types.sub):
+type. The standard library's `(vector T)` is a type function.
+[examples/types.sub](examples/types.sub):
 
 ```racket
 (require-unqualified std/meta/type)
