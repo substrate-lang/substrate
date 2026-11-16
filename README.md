@@ -139,8 +139,9 @@ Integers wrap around when they overflow (like Wasm) so the `u8` holding 255
 holds 0 after `(+= byte 1)`. Dividing an integer by zero traps.
 
 A variant's cases belong to its type, as a struct's fields do. An enum's cases
-belong to its type too. Code writes a case with a dot, as in `.square`. The case
-gets its type from the code around it, as a number literal does.
+belong to its type too. So two types can each have a case named `none`. Code
+writes a case with a dot, as in `.square`. The case gets its type from the code
+around it, as a number literal does.
 `(area (.square 3))` makes a `shape`, because `area` takes a `shape`. Where
 nothing gives the case a type, the code names the type, as in
 `(shape .square 3)`. `printf` prints cases the same way.
