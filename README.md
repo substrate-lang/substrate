@@ -188,6 +188,7 @@ itself, which may evolve before 1.0. Its modules, by directory:
 - `std/html`: writing HTML
 - `std/log`: structured logs
 - `std/vector`: growable arrays, `(vector T)`
+- `std/sort`: sorting slices
 - `std/meta`: types as data at compile time, and generic types and functions
 - `std/test`: the test runner, and tests in a browser
 - `std/browser`: Chromium, driven over the DevTools protocol
@@ -287,14 +288,18 @@ $ substrate run swap.sub
 2 1
 ```
 
-The core example's `largest` only takes a slice of `i32`. Generic types and
-functions take types as parameters, so one definition serves every type. They
-come from `define-generic` in `std/meta/generic`, a library written with macros.
+The core example's `largest` only takes a slice of `i32`. A generic type or
+function takes types as parameters, so one definition serves every type.
+Substrate's generics come from a library. As in Zig, the compiler lets code
+that runs at compile time work with types: a macro can read a type's fields,
+size and field offsets, ask what type a variable has, and stand where a type is
+written. `std/meta/generic` builds `define-generic` from these.
 [examples/types.sub](examples/types.sub) defines a `pair` of any two types, and
 a `largest` for slices of any number type:
 
 ```racket
 (require-unqualified std/meta/generic)
+(require-unqualified std/sort)
 (require-unqualified std/vector)
 
 (define-generic (pair A B)
@@ -312,6 +317,7 @@ a `largest` for slices of any number type:
   (let ([v (vector entry)])
     (vector-push! (& v) (entry #:first "apples" #:second 3))
     (vector-push! (& v) (entry #:first "pears" #:second 5))
+    (sort! (vector-items (& v)) (a b) (> (-> a second) (-> b second)))
     (vector-each ([e (& v)]) (printf "~a: ~a\n" (-> e first) (-> e second)))
     (vector-free! (& v)))
   (printf "~a\n" ((largest u32) (slice (array-of u32 3 9 4))))
@@ -320,33 +326,36 @@ a `largest` for slices of any number type:
 
 ```console
 $ substrate run types.sub
-apples: 3
 pears: 5
+apples: 3
 9
 2.5
 ```
 
-`(pair string u32)` is a pair of a `string` and a `u32`. `typedef` gives it the
-shorter name `entry`. A call to a generic function names its types first, as in
-`((largest u32) items)`. Substrate writes a separate copy of a generic type or
-function for each list of types that a program uses. So generic code runs as
-fast as code written for one type. Every module that writes `(pair string u32)`
-gets the same type, so one module can pass a pair to another. `(vector T)` from
-`std/vector` is a generic type too. The binding `[v (vector entry)]` has no
-value, so `v` starts as an empty vector.
+`(pair string u32)` is a pair of a `string` and a `u32`, and `typedef` gives it
+the shorter name `entry`. The compiler runs the macro behind `pair` once for
+each list of types that a program uses. So every module that writes
+`(pair string u32)` gets the same type, and generic code runs as fast as code
+written for one type. A call to a generic function names its types first, as in
+`((largest u32) items)`. Zig's generic functions take their types the same way.
 
 A parameter can also be a count, written like a function's parameter. After
 `(define-generic (ring T [N u32]) (struct [items (array T N)] [count u32]))`,
 the type `(ring i32 8)` has room for 8 `i32`s. The count can also be a named
 constant, as in `(ring i32 size)`.
 
-`define-generic` is an ordinary macro, and other libraries can define generics
-in their own syntax. The compiler lets a name stand for a macro that writes
-types. When a program writes `(vector u32)`, the compiler asks the macro behind
-`vector` to write that type. `std/vector`'s macro writes each vector type
-together with its functions, which `vector-push!` and the other operations
-call. A macro can also read a type's fields, cases, size and field offsets with
-`std/meta/type-info`.
+`(vector T)` is generic too, but `std/vector` writes it with a macro of its
+own. `(define-generic vector vector-instance)` hands each `(vector T)` to
+`vector-instance`, which writes that vector type together with its functions.
+`vector-push!` and the other operations find their function from their first
+argument's type, as a method call does in Zig. The binding `[v (vector entry)]`
+has no value, so `v` starts as an empty vector.
+
+`sort!` from `std/sort` is a macro in front of a generic function. In the
+example, it reads the type of the vector's items, `(slice entry)`, and calls
+the generic function for `entry`. So the caller never names the type. Since
+`define-generic` is an ordinary macro, a library can also offer generics in a
+syntax of its own.
 
 Languages are packages too. [examples/bend2/proof.sub](examples/bend2/proof.sub)
 is written in bend2, a port of [Bend 2](https://github.com/bendlang/bend) whose
