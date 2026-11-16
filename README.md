@@ -189,7 +189,7 @@ itself, which may evolve before 1.0. Its modules, by directory:
 - `std/log`: structured logs
 - `std/vector`: growable arrays, `(vector T)`
 - `std/sort`: sorting slices
-- `std/meta`: types as data at compile time, and generic types and functions
+- `std/meta`: types as data at compile time, generic types and functions, and methods
 - `std/test`: the test runner, and tests in a browser
 - `std/browser`: Chromium, driven over the DevTools protocol
 - `std/package`: manifests, package hashes and the package store
@@ -320,8 +320,8 @@ a `largest` for slices of any number type:
     (sort! (vector-items (& v)) (a b) (> (-> a second) (-> b second)))
     (vector-each ([e (& v)]) (printf "~a: ~a\n" (-> e first) (-> e second)))
     (vector-free! (& v)))
-  (printf "~a\n" ((largest u32) (slice (array-of u32 3 9 4))))
-  (printf "~a\n" ((largest f64) (slice (array-of f64 0.5 2.5)))))
+  (printf "~a\n" (largest (slice (array-of u32 3 9 4))))
+  (printf "~a\n" (largest (slice (array-of f64 0.5 2.5)))))
 ```
 
 ```console
@@ -336,26 +336,27 @@ apples: 3
 the shorter name `entry`. The compiler runs the macro behind `pair` once for
 each list of types that a program uses. So every module that writes
 `(pair string u32)` gets the same type, and generic code runs as fast as code
-written for one type. A call to a generic function names its types first, as in
-`((largest u32) items)`. Zig's generic functions take their types the same way.
+written for one type. A call to a generic function finds its types from the
+types of its arguments, so `(largest items)` with `items` a `(slice u32)` calls
+the instance for `u32`. When the arguments do not decide a type, the call names
+it, as in `((largest u32) items)`.
 
 A parameter can also be a count, written like a function's parameter. After
 `(define-generic (ring T [N u32]) (struct [items (array T N)] [count u32]))`,
 the type `(ring i32 8)` has room for 8 `i32`s. The count can also be a named
 constant, as in `(ring i32 size)`.
 
-`(vector T)` is generic too, but `std/vector` writes it with a macro of its
-own. `(define-generic vector vector-instance)` hands each `(vector T)` to
-`vector-instance`, which writes that vector type together with its functions.
-`vector-push!` and the other operations find their function from their first
-argument's type, as a method call does in Zig. The binding `[v (vector entry)]`
-has no value, so `v` starts as an empty vector.
+`(vector T)` is a generic type too. `vector-push!` and the other vector
+operations come from `std/meta/method`: each calls the method that its first
+argument's type has for it, as a method call does in Zig. The methods for
+`(vector T)` are generic functions, and another type can have methods for these
+operations too. The binding `[v (vector entry)]` has no value, so `v` starts as
+an empty vector.
 
 `sort!` from `std/sort` is a macro in front of a generic function. In the
-example, it reads the type of the vector's items, `(slice entry)`, and calls
-the generic function for `entry`. So the caller never names the type. Since
-`define-generic` is an ordinary macro, a library can also offer generics in a
-syntax of its own.
+example, it reads the type of the vector's items, `(slice entry)`, and writes
+the comparison as a function of two `entry`s. Since `define-generic` is an
+ordinary macro, a library can also offer generics in a syntax of its own.
 
 Languages are packages too. [examples/bend2/proof.sub](examples/bend2/proof.sub)
 is written in bend2, a port of [Bend 2](https://github.com/bendlang/bend) whose
