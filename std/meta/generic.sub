@@ -1,0 +1,117 @@
+;; Generic types and functions, which take types as parameters.
+;;
+;; (define-generic (name param ...) form) defines a generic type. form is a struct, union, variant or enum form without
+;; a name. A param is a name for a type, or [n type] for a count of an integer type. The type (name arg ...) is an
+;; instance: form with each param replaced by its arg. A count's arg is an integer literal or a constant. An instance is
+;; the same type in every module that writes it.
+;;
+;; (define-generic ((name param ...) [x type] ...) -> result body ...) defines a generic function. Its params work as a
+;; generic type's do. (name arg ...) is the instance for those args, and ((name arg ...) value ...) calls it.
+;;
+;; (define-generic name writer) defines a generic type whose instances the macro writer writes. For (name arg ...), the
+;; compiler expands (writer name instance arg ...). The expansion defines a type named instance, and it can also define
+;; functions for that type. std/vector writes its vectors this way.
+(provide define-generic)
+
+(begin-for-syntax
+  (require-unqualified compiler/macros)
+  (require-unqualified "type-info.sub")
+
+  (define (define-generic-form [s datum]) -> datum
+    (syntax-match s
+      [(_ (((? identifier? name) param ...) formal ...) rest ...)
+       (for/each ([p param]) (param! p))
+       #`(define-syntax #,name (quote-syntax (substrate-generic-function function-instance (#,@param) (#,@formal) #,@rest)))]
+      [(_ ((? identifier? name) param ...) form ...)
+       (for/each ([p param]) (param! p))
+       (let ([bad datum (cond [(null? form) s] [(not (type-form? (car form))) (car form)]
+                              [(pair? (cdr form)) (cadr form)] [else 0])])
+         (unless (== bad 0)
+           (raise-syntax-error 'define-generic "expected one struct, union, variant or enum form without a name" bad)))
+       #`(define-syntax #,name (quote-syntax (substrate-generic-type type-instance (#,@param) #,(car form))))]
+      [(_ (? identifier? name) (? identifier? writer))
+       #`(define-syntax #,name (quote-syntax (substrate-generic-type #,writer)))]
+      [_ (raise-syntax-error
+          'define-generic
+          "expected (define-generic (name param ...) form), (define-generic ((name param ...) [x type] ...) body ...) or (define-generic name writer)"
+          s)]))
+
+  (define (param! [p datum])
+    (syntax-match p
+      [(? identifier? x) (begin)]
+      [((? identifier? x) (? identifier? t)) (when (== (memq (syntax-e t) counts) 0) (raise-syntax-error 'define-generic param-text p))]
+      [_ (raise-syntax-error 'define-generic param-text p)]))
+
+  (define param-text string "expected a type's name, or [name type] for a count of an integer type")
+
+  (define counts datum '(i8 u8 i16 u16 i32 u32 i64 u64))
+
+  (define (type-form? [f datum]) -> bool
+    (let ([l (syntax->list f)])
+      (and (!= l 0) (pair? l) (identifier? (car l)) (!= (memq (syntax-e (car l)) '(struct union variant enum)) 0)
+           (or (null? (cdr l)) (not (identifier? (cadr l)))))))
+
+  (define (type-instance-form [s datum]) -> datum
+    (syntax-match s
+      [(_ f name arg ...)
+       (syntax-match (syntax-local-value f)
+         [(_ _ (param ...) form)
+          (arguments! f param arg)
+          (let ([l (syntax->list form)] [names (param-names param)])
+            (datum->syntax form (cons (car l) (cons name (for/list ([x (cdr l)]) (replaced x names arg)))) form))])]))
+
+  (define (function-instance-form [s datum]) -> datum
+    (syntax-match s
+      [(_ f name arg ...)
+       (syntax-match (syntax-local-value f)
+         [(_ _ (param ...) (formal ...) rest ...)
+          (arguments! f param arg)
+          (let ([names (param-names param)])
+            #`(define (#,name #,@(for/list ([x formal]) (replaced x names arg)))
+                #,@(for/list ([x rest]) (replaced x names arg))))])]))
+
+  (define (arguments! [f datum] [params datum] [args datum])
+    (unless (== (length params) (length args))
+      (raise-syntax-error (syntax-e f) (format-message "takes ~a argument~a, not ~a"
+                                                       `(,(make-integer (length params)) ,(if (== (length params) 1) '"" '"s")
+                                                         ,(make-integer (length args))))
+                          f))
+    (for/each ([p params] [a args])
+      (let ([n (syntax-e a)])
+        (syntax-match p
+          [(? identifier? x)
+           (when (integer? n) (raise-syntax-error (syntax-e f) (format-message "~a is a type, not ~a" `(,(syntax-e x) ,n)) f))]
+          [(x t)
+           (unless (integer? n)
+             (raise-syntax-error (syntax-e f) (format-message "~a is a ~a, not ~s" `(,(syntax-e x) ,(syntax-e t) ,(type-datum a))) f))
+           (unless (fits? n (syntax-e t))
+             (raise-syntax-error (syntax-e f) (format-message "integer ~a does not fit in ~a" `(,n ,(syntax-e t))) f))]))))
+
+  (define (fits? [n datum] [t datum]) -> bool
+    (let ([v (integer-value n)] [m (cast u64 (integer-value n))])
+      (if (integer-negative? n)
+          (case t [('i8) (>= v -128)] [('i16) (>= v -32768)] [('i32) (>= v -2147483648)] [('i64) #t] [else #f])
+          (case t
+            [('u8) (<= m 255)] [('i8) (<= m 127)] [('u16) (<= m 65535)] [('i16) (<= m 32767)]
+            [('u32) (<= m 4294967295)] [('i32) (<= m 2147483647)] [('i64) (<= m 9223372036854775807)]
+            [else #t]))))
+
+  (define (param-names [params datum]) -> datum (for/list ([p params]) (if (identifier? p) p (car (syntax->list p)))))
+
+  (define (replaced [x datum] [params datum] [args datum]) -> datum
+    (if (identifier? x)
+        (let ([i (position-of (syntax-e x) params)]) (if (>= i 0) (list-ref args i) x))
+        (let ([l (syntax->list x)])
+          (if (or (== l 0) (null? l)) x (datum->syntax x (for/list ([y l]) (replaced y params args)) x)))))
+
+  (define (position-of [s datum] [ids datum]) -> i32
+    (let ([i 0] [l ids])
+      (while (pair? l)
+        (when (== (syntax-e (car l)) s) (return i))
+        (+= i 1)
+        (set! l (cdr l)))
+      -1)))
+
+(define-syntax define-generic define-generic-form)
+(define-syntax type-instance type-instance-form)
+(define-syntax function-instance function-instance-form)

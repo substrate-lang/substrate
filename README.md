@@ -187,7 +187,7 @@ itself, which may evolve before 1.0. Its modules, by directory:
 - `std/html`: writing HTML
 - `std/log`: structured logs
 - `std/vector`: growable arrays, `(vector T)`
-- `std/meta`: types as data at compile time, type functions and generic functions
+- `std/meta`: types as data at compile time, and generic types and functions
 - `std/test`: the test runner, and tests in a browser
 - `std/browser`: Chromium, driven over the DevTools protocol
 - `std/package`: manifests, package hashes and the package store
@@ -286,18 +286,24 @@ $ substrate run swap.sub
 2 1
 ```
 
-Types can also come from functions that run at compile time. `define-type`,
-from `std/meta/type`, makes a type function. In the example below, `(pair A B)`
-is a type wherever a type can be written. Two modules that write
-`(pair string u32)` get the same type. The standard library's `(vector T)` is a
-type function too. [examples/types.sub](examples/types.sub):
+The core example's `largest` only takes a slice of `i32`. Generic types and
+functions take types as parameters, so one definition serves every type. They
+come from `define-generic` in `std/meta/generic`, a library written with macros.
+[examples/types.sub](examples/types.sub) defines a `pair` of any two types, and
+a `largest` for slices of any number type:
 
 ```racket
-(require-unqualified std/meta/type)
+(require-unqualified std/meta/generic)
 (require-unqualified std/vector)
 
-(define-type (pair A B)
+(define-generic (pair A B)
   (struct [first A] [second B]))
+
+(define-generic ((largest T) [items (slice T)]) -> T
+  (let ([best (@ items 0)])
+    (for ([i u32 1]) (< i (-> items length)) (+= i 1)
+      (when (> (@ items i) best) (set! best (@ items i))))
+    best))
 
 (typedef entry (pair string u32))
 
@@ -306,22 +312,40 @@ type function too. [examples/types.sub](examples/types.sub):
     (vector-push! (& v) (entry #:first "apples" #:second 3))
     (vector-push! (& v) (entry #:first "pears" #:second 5))
     (vector-each ([e (& v)]) (printf "~a: ~a\n" (-> e first) (-> e second)))
-    (vector-free! (& v))))
+    (vector-free! (& v)))
+  (printf "~a\n" ((largest u32) (slice (array-of u32 3 9 4))))
+  (printf "~a\n" ((largest f64) (slice (array-of f64 0.5 2.5)))))
 ```
 
 ```console
 $ substrate run types.sub
 apples: 3
 pears: 5
+9
+2.5
 ```
 
-A type function's parameter can also be a count, written like a function's
-parameter. After `(define-type (ring T [N u32]) ...)`, `(ring i32 8)` is a type.
-`(ring i32 size)` is also a type when `size` is a constant. `define-generic`
-makes generic functions in the same way. After
-`(define-generic ((largest T) [xs (slice T)]) -> T ...)`, the call
-`((largest i32) xs)` runs the `largest` made for `i32`. A macro can read a
-type's fields, cases, size and field offsets with `std/meta/type-info`.
+`(pair string u32)` is a pair of a `string` and a `u32`. `typedef` gives it the
+shorter name `entry`. A call to a generic function names its types first, as in
+`((largest u32) items)`. Substrate writes a separate copy of a generic type or
+function for each list of types that a program uses. So generic code runs as
+fast as code written for one type. Every module that writes `(pair string u32)`
+gets the same type, so one module can pass a pair to another. `(vector T)` from
+`std/vector` is a generic type too. The binding `[v (vector entry)]` has no
+value, so `v` starts as an empty vector.
+
+A parameter can also be a count, written like a function's parameter. After
+`(define-generic (ring T [N u32]) (struct [items (array T N)] [count u32]))`,
+the type `(ring i32 8)` has room for 8 `i32`s. The count can also be a named
+constant, as in `(ring i32 size)`.
+
+`define-generic` is an ordinary macro, and other libraries can define generics
+in their own syntax. The compiler lets a name stand for a macro that writes
+types. When a program writes `(vector u32)`, the compiler asks the macro behind
+`vector` to write that type. `std/vector`'s macro writes each vector type
+together with its functions, which `vector-push!` and the other operations
+call. A macro can also read a type's fields, cases, size and field offsets with
+`std/meta/type-info`.
 
 Languages are packages too. [examples/bend2/proof.sub](examples/bend2/proof.sub)
 is written in bend2, a port of [Bend 2](https://github.com/bendlang/bend) whose
