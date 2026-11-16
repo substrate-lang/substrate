@@ -24,7 +24,7 @@ export function workerModule({ spawn }) {
     if (caller) caller.event(kind, w, tag, value, bytes);
   };
 
-  // end takes the worker's exit code, or -1 and the reason, and gives its ended event to give; with a null reason,
+  // end takes the worker's exit code, or -1 and the reason, and gives its ended event to give. With a null reason,
   // there is no event.
   const end = (w, code, reason, give = null) => {
     const worker = alive.get(w);
@@ -97,7 +97,7 @@ export function workerModule({ spawn }) {
       end() {
         for (const w of [...alive.keys()]) end(w, -1, null);
       },
-      // f is the function's index in the table; the thread finds it by its module and export name.
+      // f is the function's index in the table. The thread finds the function by its module and export name.
       start(f, bp, bl, time, size, heard, tag, gp, gl, err, ends, ap, al) {
         const entry = caller.named(f >>> 0);
         if (!entry) {

@@ -127,7 +127,7 @@ export function createStreams(host) {
   };
 }
 
-// readerSource reads the web stream reader that getReader gives; a null reader is an empty stream.
+// readerSource reads the web stream reader that getReader gives. A null reader is an empty stream.
 export function readerSource(getReader, cancel) {
   let reader = null;
   let none = false;

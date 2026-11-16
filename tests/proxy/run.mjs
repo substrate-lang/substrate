@@ -1,6 +1,7 @@
-// run.mjs OUT SERVER: Caddy, then nginx, over TLS with OUT/cert.pem, in front of a fresh SERVER each: the
-// client's address and scheme despite its own X-Forwarded-For; events arriving apart, as they are and gzipped; a
-// WebSocket kept open by pings past nginx's read timeout; and a request answered as the server shuts down.
+// run.mjs OUT SERVER puts Caddy, then nginx, over TLS with OUT/cert.pem, in front of a fresh SERVER each. It checks the
+// client's address and scheme despite the client's own X-Forwarded-For, and events that arrive apart, as they are and
+// gzipped. It also checks a WebSocket that pings keep open past nginx's read timeout, and a request answered as the
+// server shuts down.
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';

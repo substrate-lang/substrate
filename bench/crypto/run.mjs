@@ -1,5 +1,5 @@
-// run.mjs OUT REPS: ours (OUT/ours), mbedTLS as wasm (OUT/mbedtls.wasm, run here) and native (OUT/mbedtls.native);
-// each phase's best time in ms, and each result's first bytes, which must agree.
+// run.mjs OUT REPS runs ours (OUT/ours), mbedTLS as wasm (OUT/mbedtls.wasm, run here) and native (OUT/mbedtls.native).
+// It prints each phase's best time in ms, and each result's first bytes, which must agree.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';

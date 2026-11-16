@@ -44,9 +44,9 @@ const unsettled = unsettledOf(() => [network, ...((window.app && window.app.real
 const budget = 1000;
 let budgetEnds = 0;
 
-// settle lets the program finish what it can without moving the clock: due timers, the page's own tasks, the work the
-// page is waiting on (recorders.mjs), for at most 30 seconds, and real-time work while it makes progress and the
-// request's budget lasts.
+// settle lets the program finish what it can without moving the clock. That is due timers, the page's own tasks and
+// the work that the page is waiting on (install.js), for at most 30 seconds. It is also real-time work, while that work
+// makes progress and the request's budget lasts.
 export async function settle() {
   let steps = 0;
   const until = real.now() + patience;
@@ -114,8 +114,8 @@ const base64 = (bytes) => {
   return btoa(s);
 };
 
-// The RGBA pixels of a rectangle of a canvas, row by row: what a 2D canvas holds, or the last frame drawn on a WebGPU
-// canvas (recorders.mjs). A canvas with neither gives zeros.
+// The RGBA pixels of a rectangle of a canvas, row by row. They are what a 2D canvas holds, or the last frame drawn on a
+// WebGPU canvas (install.js). A canvas with neither gives zeros.
 async function pixels(canvas, x, y, w, h) {
   if (kinds.get(canvas) === '2d') return getContext.call(canvas, '2d').getImageData(x, y, w, h).data;
   const frame = frames.get(canvas);

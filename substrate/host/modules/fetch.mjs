@@ -27,7 +27,7 @@ const unwrapNotGranted = (e) => {
 };
 
 // fetchChecked fetches a URL that the grants reach. With redirects, it follows the redirects itself, as the fetch
-// standard says to, and checks each; without, the platform follows them.
+// standard says to, and checks each one. Without redirects, the platform follows them.
 async function fetchChecked(net, url, init, redirects, dispatcherFor) {
   let at = url;
   let { method, headers, body } = init;

@@ -12,7 +12,8 @@ const read = (file) => {
   }
 };
 
-// The next message on port, which the thread posting to it counts in signal, waiting up to ms for one.
+// receivedOn waits up to ms for the next message on port. The thread that posts to the port counts its messages in
+// signal.
 function receivedOn(port, signal, ms) {
   const until = Date.now() + ms;
   for (;;) {

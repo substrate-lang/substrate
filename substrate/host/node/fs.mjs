@@ -30,7 +30,7 @@ export const comparable = process.platform === 'darwin'
   ? (p) => p.normalize('NFKD').toUpperCase().toLowerCase()
   : windows ? (p) => p.replace(/\\/g, '/').toLowerCase() : (p) => p;
 
-// realPath gives an absolute path with its links followed; of a path that does not exist yet, it follows the part
+// realPath gives an absolute path with its links followed. For a path that does not exist yet, it follows the part
 // that does.
 export function realPath(abs) {
   try {
@@ -42,9 +42,10 @@ export function realPath(abs) {
   return parent === abs ? abs : path.join(realPath(parent), path.basename(abs));
 }
 
-// programFile gives the file a program runs, found as spawn finds it: from dir for a name with a slash, and otherwise
-// in the first directory of search with an executable file of that name; it gives null when there is none. On Windows,
-// as libuv finds it: the name, if it has an extension, then the name with .com and with .exe.
+// programFile gives the file that a program runs, found as spawn finds it. A name with a slash is found from dir. Any
+// other name is found in the first directory of search that has an executable file of that name. It gives null when
+// there is none. On Windows, it finds the file as libuv does: the name, if it has an extension, and then the name with
+// .com and with .exe.
 export function programFile(name, dir = '.', search = process.env.PATH ?? '') {
   const names = windows ? [...(path.extname(name) ? [name] : []), `${name}.com`, `${name}.exe`] : [name];
   const found = (d) => names.map((m) => path.resolve(dir, d, m)).find((p) => {
@@ -102,7 +103,7 @@ const unresolved = windows ? (p) => p.startsWith('\\\\.\\')
 const missing = () => Object.assign(new Error('ENOENT: no such file or directory'), { errno: -2, code: 'ENOENT' });
 const infoOf = (s) => [s.isFile() ? 1 : s.isDirectory() ? 2 : s.isSymbolicLink() ? 3 : 4, s.size, s.mtimeMs, s.mode];
 
-// literalPath gives p absolute, checked as a call that does not follow its links is.
+// literalPath gives p as an absolute path, checked as a call that does not follow links is checked.
 export function literalPath(grants, k, p) {
   const abs = path.resolve(p);
   if (allowsAll(grants)) return abs;
@@ -112,7 +113,7 @@ export function literalPath(grants, k, p) {
   return abs;
 }
 
-// A path as given is kept with its absolute form and the form the grants compare (key).
+// A path as given is kept with its absolute form, and with the form that the grants compare (key).
 export function nodeFiles(grants) {
   const everything = () => allowsAll(grants);
   const known = new Map();
@@ -136,8 +137,9 @@ export function nodeFiles(grants) {
   };
   // at gives the path a call that does not follow links works on, checked as Deno checks it.
   const at = (k, p) => (everything() ? p : checked(k, allowed(k, p)));
-  // opening gives open(where, flag) for where the links of p lead now, checked and opened without following a link
-  // at its end, which is reported as missing, as Deno opens a path; on Linux, Deno leaves /proc and /dev unresolved.
+  // opening gives open(where, flag) for where the links of p lead now. The path is checked and opened without
+  // following a link at its end, and such a link is reported as missing, as Deno opens a path. On Linux, Deno leaves
+  // /proc and /dev unresolved.
   const opening = (k, p, flag, open) => {
     const abs = allowed(k, p);
     if (unresolved(abs)) return open(checked(k, abs), flag);

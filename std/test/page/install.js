@@ -1,7 +1,8 @@
 // Runs in each page that a browser test opens, before the page's own scripts (std/test/page.sub). It installs the
-// test's clock, in which time moves only when a test advances it, and timers, animation frames at 60 a second, Date and
-// performance all follow it; seeded random bytes; and recorders of what tests read from a page: drawings, sounds, the
-// bytes behind images and sounds, and the work the page is waiting on. agent.mjs finds them all on the window.
+// test's clock, in which time moves only when a test advances it. Timers, animation frames at 60 a second, Date and
+// performance all follow that clock. It also installs seeded random bytes, and recorders of what tests read from a
+// page: drawings, sounds, the bytes behind images and sounds, and the work that the page is waiting on. agent.mjs finds
+// them all on the window.
 (() => {
   function makeClock(epoch = 1700000000000) {
     let now = 0;

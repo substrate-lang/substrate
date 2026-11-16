@@ -36,9 +36,10 @@ const urlHost = (bare) => {
   }
 };
 
-// canonicalHost writes a host as the URL standard does, with IPv4 in dotted decimal, IPv6 compressed and without its
-// %zone, and names in lowercase punycode, and without a final dot; an IPv6 address that maps an IPv4 one becomes that
-// IPv4 address. A host with a character the standard would cut it at, or decode, is left as it is, matching no grant.
+// canonicalHost writes a host as the URL standard does. IPv4 is in dotted decimal, IPv6 is compressed and without its
+// %zone, and names are in lowercase punycode without a final dot. An IPv6 address that maps an IPv4 address becomes
+// that IPv4 address. A host with a character that the standard would cut it at, or decode, is left as it is, and
+// matches no grant.
 export function canonicalHost(host) {
   const bare = host.replace(/^\[(.*)\]$/, '$1');
   const zone = bare.includes(':') ? bare.indexOf('%') : -1;
@@ -79,8 +80,8 @@ const portOf = (text, port) => {
   return Number(port);
 };
 
-// A host is a name or an address, in brackets for IPv6, or *.name for its subdomains, or a subnet, ADDRESS/BITS;
-// each with an optional port.
+// A host is a name, an address, in brackets for IPv6, *.name for a name's subdomains, or a subnet written ADDRESS/BITS.
+// Each can have a port.
 export function hostOf(text) {
   const subnet = /^\[?([^\]/]+)\]?\/(\d{1,3})(?::(.*))?$/.exec(text);
   if (subnet) {
@@ -181,7 +182,7 @@ const inside = (list, p) => {
   return false;
 };
 
-// mayPath takes a path absolute and without . or .. parts; its links are not followed.
+// mayPath takes an absolute path without . or .. parts. Its links are not followed.
 export const mayPath = (grant, p) => inside(grant, p) && !inside(grant.deny, p);
 // mayTree takes a path as mayPath does, for a call on everything under it, which a denied path inside also stops.
 export const mayTree = (grant, p) => mayPath(grant, p) && !grant.deny.items.some((root) => under(root, p));
@@ -220,8 +221,8 @@ export const allowsAll = (g) => kinds.every((k) => unlimited(g[k]));
 // The dynamic loader's variables, which only all of --allow-run lets a program change for a child (node/process.mjs).
 export const isLoaderVariable = (name) => /^\s*(LD_|DYLD_)/i.test(name);
 
-// addressDenials tells whether a deny list names addresses or subnets, and deniesAddress whether it denies an address
-// (node/resolve.mjs).
+// addressDenials tells whether a deny list names addresses or subnets, and deniesAddress tells whether it denies an
+// address (node/resolve.mjs).
 const isAddress = (item) => item.bits !== undefined || bytesOf(item.host) !== null;
 export const addressDenials = (grant) => grant.deny.items.some(isAddress);
 export const deniesAddress = (grant, address, port) => {
