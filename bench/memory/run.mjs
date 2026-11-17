@@ -1,6 +1,7 @@
-// run.mjs OUT REPS: the heap's growth and resident memory of a fresh server (OUT/server) for each phase, its
-// connections held open: idle, event streams plain and gzipped, WebSockets, after a 1 MB answer, and a burst of small
-// requests on 50 connections. Then the compiler building itself, the best of REPS.
+// run.mjs OUT REPS measures the heap's growth and resident memory of a fresh server (OUT/server) for each phase, with
+// its connections held open. The phases are idle connections, event streams plain and gzipped, WebSockets, after a
+// 1 MB answer, and a burst of small requests on 50 connections. Then it times the compiler building itself, the best
+// of REPS.
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';

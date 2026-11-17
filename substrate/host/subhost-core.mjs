@@ -404,7 +404,7 @@ export function createHost(platform) {
         const exports = registry.get(string(ip, il));
         const f = exports && exports[string(fp, fl)];
         if (typeof f !== 'function') return -1;
-        // WebKit cannot call a function that grow puts in a table
+        // WebKit cannot call a function that grow puts in a table.
         const at = table.grow(1);
         table.set(at, f);
         return at;

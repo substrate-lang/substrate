@@ -27,7 +27,7 @@ const agent = (lookup) => {
   return new Agent({ connect: { lookup } });
 };
 
-// dispatchers gives fetch an Agent for each port, and guards an Agent for each WebSocket; neither gives one when the
+// dispatchers gives fetch an Agent for each port, and guards an Agent for each WebSocket. Neither gives one when the
 // deny list names no address.
 export function dispatchers(grants) {
   if (!addressDenials(grants.net)) return () => undefined;

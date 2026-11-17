@@ -1,5 +1,6 @@
-// run.mjs OUT REPS FILE...: ours (OUT/ours), cJSON as wasm (OUT/cjson.wasm, run here) and native (OUT/cjson.native),
-// and V8's JSON, on each file; each phase's best time in ms, and each program's sum, which must agree.
+// run.mjs OUT REPS FILE... runs ours (OUT/ours), cJSON as wasm (OUT/cjson.wasm, run here) and native
+// (OUT/cjson.native), and V8's JSON, on each file. It prints each phase's best time in ms, and each program's sum,
+// which must agree.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';

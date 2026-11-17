@@ -1,5 +1,6 @@
-// run.mjs OUT SECONDS: the server in OUT/server, Node's own http server and nginx with one worker, each loaded by wrk
-// for SECONDS on 50 connections: /hello; a 16 KB page, plain and gzipped at level 6; a 1 MB file. Node answers /hello.
+// run.mjs OUT SECONDS loads the server in OUT/server, Node's own http server and nginx with one worker. wrk loads each
+// for SECONDS on 50 connections with /hello, a 16 KB page, plain and gzipped at level 6, and a 1 MB file. Node's
+// server answers only /hello.
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';

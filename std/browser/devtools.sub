@@ -1,20 +1,21 @@
 ;; The DevTools protocol, step by step. devtools-connect starts a worker that holds a WebSocket to a DevTools address
 ;; (chromium.sub) and relays its messages. devtools-call sends a command and waits up to 30 s for its reply, which it
-;; puts in the arena, giving each event that arrives meanwhile to the connection's handler with its method, parameters
-;; and session; devtools-send sends a command without waiting, and devtools-pump gives the handler events for a while. A
-;; handler may call and send in turn. params builds a command's parameters.
+;; puts in the arena. Meanwhile, it gives each event that arrives to the connection's handler, with its method,
+;; parameters and session. devtools-send sends a command without waiting, and devtools-pump gives the handler events
+;; for a while. A handler may call and send in turn. params builds a command's parameters.
 (require-unqualified host/events)
 (require-unqualified host/modules/clock)
 (require-unqualified host/worker)
 (require-unqualified host/modules/websocket)
 (require-unqualified std/encoding/json)
+(require-unqualified std/vector)
 
 (provide devtools devtools-connect devtools-close devtools-call devtools-send devtools-pump
          params params-of param-string! param-number! param-bool! param-raw! params-text)
 
 (struct devtools [head event-head] [relay u32] [next u32]
                  [handler (fn ((ptr devtools) string (ptr json-value) string))] [state (ptr void)]
-                 [pending buffer] [awaited buffer] [kept buffer] [why string])
+                 [pending (vector string)] [awaited (vector u32)] [kept (vector kept-reply)] [why string])
 
 ;; The reply to an outer call that arrived while a call made inside it was waiting.
 (struct kept-reply [id u32] [text string])
@@ -62,9 +63,9 @@
     (set! (-> d next) 0)
     (set! (-> d handler) handler)
     (set! (-> d state) state)
-    (set! (-> d pending) (make-buffer))
-    (set! (-> d awaited) (make-buffer))
-    (set! (-> d kept) (make-buffer))
+    (vector-clear! (& (-> d pending)))
+    (vector-clear! (& (-> d awaited)))
+    (vector-clear! (& (-> d kept)))
     (set! (-> d why) "")
     (unless (worker-start relay (cast (slice u8) address) 0 (cast (ptr void) (& (-> d head))) (& (-> d relay)) err)
       (return #f))
@@ -90,22 +91,19 @@
 (define (relay-heard [source u32] [kind u32] [id u32] [tag (ptr void)] [value i32])
   (let ([d (cast (ptr devtools) tag)])
     (cond [(== kind worker-message)
-           (let ([b (events-take)]) (pushed! (& (-> d pending)) (cast string b)))]
+           (let ([b (events-take)]) (vector-push! (& (-> d pending)) (cast string b)))]
           [(== kind worker-ended) (ended! d (events-take-text))])))
 
 (define (ended! [d (ptr devtools)] [why string])
   (set! (-> d relay) 0)
   (set! (-> d why) (if (> (-> why length) 0) why "the DevTools connection ended")))
 
-;; The next message from Chromium, which the caller frees, waiting until deadline; or #f when the deadline passes or the
-;; connection has ended.
+;; next! waits until deadline for the next message from Chromium, which the caller frees. It returns #f when the
+;; deadline passes or the connection has ended.
 (define (next! [d (ptr devtools)] [deadline f64] [text (ptr string)]) -> bool
-  (let ([p (& (-> d pending))])
-    (when (> (-> p length) 0)
-      (set! (@ text) (@ (cast (ptr string) (-> p bytes)) 0))
-      (memcpy (-> p bytes) (+ (-> p bytes) (sizeof string)) (- (-> p length) (sizeof string)))
-      (-= (-> p length) (sizeof string))
-      (return #t)))
+  (when (> (vector-count (& (-> d pending))) 0)
+    (set! (@ text) (vector-remove! (& (-> d pending)) 0))
+    (return #t))
   (while (!= (-> d relay) 0)
     (let ([left (- deadline (clock-monotonic))] [value i32 0] [bytes (slice u8)] [kind i32 0])
       (when (<= left 0.0) (return #f))
@@ -143,7 +141,7 @@
                        [result (ptr (ptr json-value))] [err (ptr error)]) -> bool
   (let ([id (devtools-send d method parameters session)] [deadline (+ (clock-monotonic) patience)] [text string]
         [ok #f] [done #f])
-    (buffer-add-u32! (& (-> d awaited)) id)
+    (vector-push! (& (-> d awaited)) id)
     (while (not done)
       (cond [(or (taken! d id (& text)) (next! d deadline (& text)))
              (let ([e (make-arena)] [m (ptr json-value) 0] [rid i64 0])
@@ -177,7 +175,7 @@
                (buffer-add-string! (& b) (if late "Chromium did not answer within 30 s" (-> d why)))
                (error-fail! err (if late error-timeout error-other) (buffer-string (& b)))
                (buffer-free! (& b)))]))
-    (-= (-> d awaited length) 4)
+    (vector-pop! (& (-> d awaited)))
     ok))
 
 (define (devtools-pump [d (ptr devtools)] [ms f64])
@@ -198,24 +196,23 @@
     ((-> d handler) d method (json-get m "params") session)))
 
 (define (awaited? [d (ptr devtools)] [id u32]) -> bool
-  (let ([ids (slice (cast (ptr u32) (-> d awaited bytes)) (/ (-> d awaited length) 4))])
-    (for ([i u32 0]) (< i (-> ids length)) (+= i 1) (when (== (@ ids i) id) (return #t)))
-    #f))
+  (vector-each ([x (& (-> d awaited))]) (when (== (@ x) id) (return #t)))
+  #f)
 
 (define (kept! [d (ptr devtools)] [id u32] [m (ptr json-value)])
   (let ([b (make-buffer)] [k kept-reply])
     (json-write! (& b) m "")
     (set! k (kept-reply #:id id #:text (buffer-string (& b))))
-    (buffer-add! (& (-> d kept)) (slice (cast (ptr u8) (& k)) (sizeof kept-reply)))))
+    (vector-push! (& (-> d kept)) k)))
 
 (define (taken! [d (ptr devtools)] [id u32] [text (ptr string)]) -> bool
-  (let* ([b (& (-> d kept))] [all (cast (ptr kept-reply) (-> b bytes))] [n (/ (-> b length) (sizeof kept-reply))])
-    (for ([i u32 0]) (< i n) (+= i 1)
-      (when (== (-> (+ all i) id) id)
-        (set! (@ text) (-> (+ all i) text))
-        (memcpy (cast (ptr u8) (+ all i)) (cast (ptr u8) (+ all (+ i 1))) (* (- n (+ i 1)) (sizeof kept-reply)))
-        (-= (-> b length) (sizeof kept-reply))
-        (return #t)))
+  (let ([all (vector-items (& (-> d kept)))])
+    (for ([i u32 0]) (< i (-> all length)) (+= i 1)
+      (let ([k (& (@ all i))])
+        (when (== (-> k id) id)
+          (set! (@ text) (-> k text))
+          (vector-remove! (& (-> d kept)) i)
+          (return #t))))
     #f))
 
 ;; ---- parameters ----
@@ -256,6 +253,4 @@
   (buffer-string (& (-> p text))))
 
 (define (quoted! [b (ptr buffer)] [s string])
-  (let ([v (json-string s)]) (json-write! b (& v) "")))
-
-(define (pushed! [b (ptr buffer)] [s string]) (buffer-add! b (slice (cast (ptr u8) (& s)) (sizeof string))))
+  (let ([v json-value (.string s)]) (json-write! b (& v) "")))
