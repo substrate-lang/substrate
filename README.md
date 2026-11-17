@@ -246,7 +246,7 @@ variant a JSON reader and writer:
 
 (define (main)
   (let ([a (make-arena)] [r release] [err json-error] [b (make-buffer)])
-    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.12.0\", \"tags\": [\"lisp\", \"wasm\"]}"
+    (if (release.json-read (& a) "{\"name\": \"substrate\", \"version\": \"0.13.0\", \"tags\": [\"lisp\", \"wasm\"]}"
                            (& r) (& err))
         (begin
           (printf "~a ~a has ~a tags\n" (-> r name) (-> r version) (-> r tags length))
@@ -258,7 +258,7 @@ variant a JSON reader and writer:
 
 ```console
 $ substrate run json.sub
-substrate 0.12.0 has 2 tags
+substrate 0.13.0 has 2 tags
 {"name":"substrate","version":"1.0.0","tags":["lisp","wasm"]}
 ```
 
