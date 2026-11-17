@@ -343,8 +343,8 @@ zero to a number gives the number back:
 (package proof
   (version "0.1.0")
   (dependencies
-   (bend2 (url "https://github.com/substrate-lang/substrate-bend2/archive/refs/tags/v0.11.0.tar.gz")
-          (hash "sha256:15d07c4ff74c44ed3aacafd5535cda6bd6a71b1579f49be7a9909e14e99d51e1"))))
+   (bend2 (url "https://github.com/substrate-lang/substrate-bend2/archive/refs/tags/v0.13.0.tar.gz")
+          (hash "sha256:ebdc501f83e6ac50a757288f9d70cb2e62ac146f57559750025d1e2b7d2dca72"))))
 
 (language bend2)
 
@@ -367,7 +367,7 @@ zero to a number gives the number back:
 
 ```console
 $ substrate run proof.sub
-substrate: fetching https://github.com/substrate-lang/substrate-bend2/archive/refs/tags/v0.11.0.tar.gz
+substrate: fetching https://github.com/substrate-lang/substrate-bend2/archive/refs/tags/v0.13.0.tar.gz
 (S (S (S Z)))
 ```
 
